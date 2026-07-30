@@ -21,6 +21,10 @@ export function detectFeatureFlags(): Record<string, boolean> {
   return {
     kilroy: isTruthy(process.env.KILROY_ENABLED),
     aiEnabled: AI_CONFIG.enabled(),
+    // Resume-by-id UI: only the Node server implements POST /api/sessions/resolve.
+    // The Rust server's featureFlags parity (crates/freshell-server/src/boot.rs)
+    // intentionally omits this key, hiding the Sidebar Resume button there.
+    sessionResolve: true,
   }
 }
 

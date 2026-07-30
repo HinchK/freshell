@@ -31,7 +31,9 @@ import { AmplifierSessionController } from './coding-cli/amplifier-session-contr
 import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
-import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { opencodeProvider, OpencodeProvider } from './coding-cli/providers/opencode.js'
+import { locateClaudeTranscript } from './coding-cli/claude-transcript-locator.js'
+import { getClaudeProjectsDir } from './claude-home.js'
 import { amplifierProvider } from './coding-cli/providers/amplifier.js'
 import { overrideKeysToClear } from './coding-cli/provider-title-cleanup.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
@@ -756,6 +758,21 @@ async function main() {
     sessionMetadataStore,
     serverInstanceId,
     validCliProviders: allCliNames,
+    getIndexReadiness: () => startupState.snapshot().tasks.codingCliIndexer === true,
+    resolveOpencodeSessionIds: (ids) => {
+      const opencode = codingCliProviders.find(
+        (provider): provider is OpencodeProvider => provider instanceof OpencodeProvider,
+      )
+      if (!opencode) {
+        return Promise.resolve({
+          rootsBySessionId: new Map<string, string>(),
+          unresolvedSessionIds: new Set(ids),
+        })
+      }
+      return opencode.resolveOpencodeSessionRoots(ids)
+    },
+    locateClaudeTranscript: (sessionId) =>
+      locateClaudeTranscript(sessionId, getClaudeProjectsDir()),
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))

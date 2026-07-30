@@ -31,6 +31,8 @@ const OPENCODE_ROOT_RESOLUTION_RETRY_MS = 50
 
 export type OpencodeRootResolution = {
   rootsBySessionId: Map<string, string>
+  /** Requested id -> that session row's NOT NULL `directory` (the resume cwd). */
+  directoriesBySessionId?: Map<string, string>
   unresolvedSessionIds: Set<string>
 }
 
@@ -248,17 +250,21 @@ export class OpencodeProvider implements CodingCliProvider {
         }
 
         const rowsById = new Map<string, string | null>()
+        const directoriesById = new Map<string, string>()
         let pending = requestedIds
         phase = 'query'
         while (pending.length > 0) {
           const placeholders = pending.map(() => '?').join(',')
           const rows = db.prepare(
-            `SELECT id, parent_id FROM session WHERE id IN (${placeholders})`,
-          ).all(...pending) as Array<{ id: string; parent_id: string | null }>
+            `SELECT id, parent_id, directory FROM session WHERE id IN (${placeholders})`,
+          ).all(...pending) as Array<{ id: string; parent_id: string | null; directory: string | null }>
           const nextPending: string[] = []
           for (const row of rows) {
             if (typeof row.id !== 'string') continue
             rowsById.set(row.id, typeof row.parent_id === 'string' ? row.parent_id : null)
+            if (typeof row.directory === 'string' && row.directory) {
+              directoriesById.set(row.id, row.directory)
+            }
             if (row.parent_id && !rowsById.has(row.parent_id)) {
               nextPending.push(row.parent_id)
             }
@@ -267,6 +273,13 @@ export class OpencodeProvider implements CodingCliProvider {
         }
 
         phase = 'map'
+        // Each REQUESTED id's own row directory (child rows carry the same
+        // directory as their root) — the resume cwd for exact-id fallbacks.
+        const directoriesBySessionId = new Map<string, string>()
+        for (const requestedId of requestedIds) {
+          const directory = directoriesById.get(requestedId)
+          if (directory) directoriesBySessionId.set(requestedId, directory)
+        }
         for (const requestedId of requestedIds) {
           let current: string | null | undefined = requestedId
           const seen = new Set<string>()
@@ -288,7 +301,7 @@ export class OpencodeProvider implements CodingCliProvider {
             current = parentId
           }
         }
-        return { rootsBySessionId, unresolvedSessionIds }
+        return { rootsBySessionId, directoriesBySessionId, unresolvedSessionIds }
       } catch (err) {
         lastError = err
         lastPhase = phase

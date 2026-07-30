@@ -19,6 +19,9 @@ import {
   SessionTypeMetadataSourceSchema,
 } from '../shared/session-flavor.js'
 import { querySessionDirectory } from './session-directory/service.js'
+import { ResumeResolveRequestSchema } from '../shared/resume-resolve-contract.js'
+import { resolveResumeInput } from './coding-cli/resolve-session.js'
+import type { ClaudeTranscriptHit } from './coding-cli/claude-transcript-locator.js'
 import { createRequestAbortSignal } from './read-models/request-abort.js'
 import {
   defaultReadModelScheduler,
@@ -55,6 +58,14 @@ export interface SessionsRouterDeps {
   serverInstanceId?: string
   validCliProviders?: string[]
   readModelScheduler?: ReadModelWorkScheduler
+  /** Global index readiness (startup-state codingCliIndexer task). Defaults to ready. */
+  getIndexReadiness?: () => boolean
+  /** Opencode by-id sqlite fallback (OpencodeProvider.resolveOpencodeSessionRoots). */
+  resolveOpencodeSessionIds?: (
+    ids: readonly string[],
+  ) => Promise<{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }>
+  /** Claude transcript exact-id fallback. */
+  locateClaudeTranscript?: (sessionId: string) => Promise<ClaudeTranscriptHit | null>
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
@@ -227,6 +238,22 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     await configStore.deleteSession(compositeKey)
     await codingCliIndexer.refresh()
     res.json({ ok: true })
+  })
+
+  router.post('/sessions/resolve', async (req, res) => {
+    const parsed = ResumeResolveRequestSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      return res
+        .status(400)
+        .json({ error: 'Invalid resolve request', details: parsed.error.issues })
+    }
+    const response = await resolveResumeInput(parsed.data.input, {
+      getProjects: () => deps.codingCliIndexer.getProjects(),
+      isIndexReady: deps.getIndexReadiness ?? (() => true),
+      resolveOpencodeSessionIds: deps.resolveOpencodeSessionIds,
+      locateClaudeTranscript: deps.locateClaudeTranscript,
+    })
+    res.json(response)
   })
 
   const SessionMetadataPostSchema = z.object({
