@@ -1748,8 +1748,9 @@ class pinned by permit_released_only_after_work_completes)."
 - **MCP precondition (V6-N1, corrected in fresheyes iteration 1):** there is NO settings- or env-level MCP off-switch. `settings.codingCli.mcpServer` is never read in the create path — it is only declared (`freshell-protocol/src/settings.rs:80`), defaulted (`freshell-server/src/settings.rs:44`), and key-whitelisted (`freshell-server/src/settings_store.rs:1467-1471`) — so pinning `"mcpServer": false` in a test settings fixture is a NO-OP; do not rely on it. `handle_create` runs `generate_mcp_injection` unconditionally for every non-shell mode (`terminal.rs:2043-2063`), and the codex arm requires `<worktree_root>/node_modules/tsx/dist/loader.mjs` (`mcp_inject.rs:123-128`); without it every codex create dies at MCP injection with `PTY_SPAWN_FAILED "Unable to resolve MCP dependency \"tsx\""` BEFORE spawn (this is exactly how `codex_session_ref_resume` fails in a bare worktree). The ONLY mechanism that makes these storm binaries (and every existing codex-create test) runnable is the Global Constraints environment precondition — node deps installed in the worktree root (`test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund`) BEFORE the test gates. Copy `test_settings_value()` (`restore_spawn_gate.rs:22-40`) verbatim, leaving `"mcpServer": true` untouched (the value is inert). Without the precondition, "12 settle with zero error frames" fails for a reason unrelated to anything this slice changes.
 - **Fresh-plan consistency (A4):** every storm codex frame carries a `sessionRef` (`codex_restore_frame` below), so every storm codex create derives a resume session id and is resume-planned PRE-GATE (`LaunchClass::Restore`) — consistent with the A4 exclusion (only a no-session codex restore, which no storm test sends, plans on-permit Interactive). Do not add a sessionRef-less codex restore frame to these binaries without also accepting that it exercises the inline Interactive path instead of the plan queue.
 - Copy `connect_and_hello` (`:165-208`) verbatim INCLUDING `set_nodelay(true)` (load-bearing for bursts) and `send_text`.
-- One installed global manager per test binary (set-once). All test fns in `restore_storm.rs` share it: budget `with_plan_budget(factory, 2, Duration::from_secs(30), 64)`; the shared runtime is switchable via atomics; serialize test fns with a `static TEST_LOCK: tokio::sync::Mutex<()>` (via `OnceLock`) and reset counters at each test start.
-- All PTY-spawning tests end with a `registry.kill_all()` assertion. CAUTION: killing an ADOPTED codex terminal triggers manager teardown too, so assert `shutdown_calls` BEFORE any `kill_all`, and only in tests where nothing was adopted.
+- One installed global manager per test binary (set-once). All test fns in `restore_storm.rs` share it: budget `with_plan_budget(factory, 2, Duration::from_secs(30), 64)`; the shared fake runtime is switchable via atomics; serialize test fns with a `static TEST_LOCK: tokio::sync::Mutex<()>` (via `OnceLock`) and reset counters at each test start.
+- **One shared tokio runtime for the WHOLE binary (fresheyes iteration 3):** write every test fn in `restore_storm.rs` as `#[test] fn name() { storm_rt().block_on(async { ... }); }` on a `static OnceLock<tokio::runtime::Runtime>` (multi-thread, `enable_all`) — NOT `#[tokio::test]`. Reason: the manager arms its adopted-terminal teardown worker lazily, ONCE, on whichever runtime first runs `plan_create_with_retry` (`ensure_teardown_worker`, Task 1 step 3g; today the arming is the `OnceLock` sender at `launch_lifecycle.rs:467` armed at `:513`, with a DETACHED `tokio::spawn` worker at `:632-643` whose `JoinHandle` is discarded). Under per-test `#[tokio::test]` runtimes that worker dies when the first arming test's runtime drops, and every later `notify_terminal_exit` hand-off is silently swallowed (`let _ = ...send(..)`, `launch_lifecycle.rs:602-612`) — adopted teardowns from later tests would never run, `shutdown_calls` would never reach its expected totals, and the drain rule below would time out. One never-dropped shared runtime keeps the worker alive for the whole binary.
+- **Teardown-drain rule (fresheyes iteration 3 — plugs the cross-test `shutdown_calls` bleed):** killing an ADOPTED codex terminal tears the sidecar down ASYNCHRONOUSLY — the kill path only QUEUES the teardown (the kill drops the `PtyTerminal`, whose `Drop` joins the reader thread, `pty.rs:440-453`; the reader's EOF hook runs `notify_terminal_exit`, `freshell-ws/src/terminal.rs:1333-1337`, which sends on the worker channel and returns), and the detached worker increments `shutdown_calls` some time AFTER `kill_all()` returns. Without a drain those late increments land after `TEST_LOCK` is released and corrupt the NEXT test's exact-count `shutdown_calls` asserts (the discard-arm tests). Therefore: every test that kills adopted codex terminals (the mandate storm and the deterministic-failure storm) MUST call `drain_adopted_teardowns(c, N).await` (harness helper below; N = number of ADOPTED codex terminals) after its final `kill_all()` assertion and before returning. The drain is deterministic, not a wall-clock bet: because the reader-thread join happens inside the kill, every teardown send is already queued when `kill_all()` returns — the poll only waits for the live worker to execute the queued shutdowns. Within-test exact `shutdown_calls` asserts (the discard arms) still belong BEFORE any `kill_all`, in tests where nothing was adopted.
 
 - [ ] **Step 1: Write the harness + shared runtime**
 
@@ -1871,6 +1872,42 @@ fn test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// One tokio runtime for the WHOLE binary, never dropped: the manager's
+/// lazily-armed teardown worker (see ground rules) must outlive every test
+/// fn, so every test is `#[test] fn .. { storm_rt().block_on(async { .. }); }`
+/// instead of `#[tokio::test]`.
+fn storm_rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("storm runtime")
+    })
+}
+
+/// Ground-rule drain: block until the manager's async teardowns of ADOPTED
+/// codex terminals have all executed, so no late `shutdown_calls` increment
+/// can bleed past TEST_LOCK into the next test's exact-count asserts.
+/// Deterministic (see ground rules): `kill_all()` joins each PTY reader
+/// thread, whose exit hook queues the teardown — every send is already on
+/// the worker channel when this poll starts; it only waits for execution.
+/// Call after the final `kill_all()` in every test that adopted codex
+/// terminals (`expected_total` = adopted count; counters reset at start).
+async fn drain_adopted_teardowns(c: &StormControls, expected_total: u64) {
+    for _ in 0..400 {
+        if c.shutdown_calls.load(Ordering::SeqCst) >= expected_total {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        c.shutdown_calls.load(Ordering::SeqCst),
+        expected_total,
+        "all adopted-terminal teardowns must drain before releasing TEST_LOCK"
+    );
+}
+
 /// `terminal.create` frames. Codex restores carry identity in sessionRef
 /// (the frozen client's shape — codex_session_ref_resume.rs precedent).
 fn codex_restore_frame(request_id: &str, session_id: &str, cwd: Option<&str>) -> String {
@@ -1934,6 +1971,8 @@ async fn drain_created(ws: &mut TestWs, expected: usize, deadline: std::time::Du
 
 - [ ] **Step 2: Write the five test fns**
 
+All five run on the shared `storm_rt()` runtime (`#[test]` + `block_on` — ground rules); the sketch keeps bodies at their original indentation inside `block_on(async { ... });`, `cargo fmt` settles the final shape.
+
 ```rust
 /// THE mandate pin (spec §8), DETERMINISTIC park/release form (V5 §A10):
 /// one burst of 8 codex + 4 shell restore creates -> zero error frames,
@@ -1943,8 +1982,9 @@ async fn drain_created(ws: &mut TestWs, expected: usize, deadline: std::time::Du
 /// one-sidedly under CI load: the fake plan sleep is load-INVARIANT while
 /// PTY spawn is load-SENSITIVE, so only the shell side of the race
 /// stretches. Plan concurrency <= 2 throughout.
-#[tokio::test(flavor = "multi_thread")]
-async fn restore_storm_settles_all_twelve_with_zero_error_frames_and_no_shell_starvation() {
+#[test]
+fn restore_storm_settles_all_twelve_with_zero_error_frames_and_no_shell_starvation() {
+    storm_rt().block_on(async {
     let _serial = test_lock().lock().await;
     let c = storm_controls();
     c.reset();
@@ -2015,13 +2055,16 @@ async fn restore_storm_settles_all_twelve_with_zero_error_frames_and_no_shell_st
     let peak = c.peak.load(Ordering::SeqCst);
     assert!(peak <= 2, "plan concurrency exceeded the budget: {peak}");
     assert_eq!(registry.kill_all(), 12, "exactly 12 PTYs, no duplicates");
+    drain_adopted_teardowns(c, 8).await; // 8 adopted codex sidecars — ground-rule drain
+    });
 }
 
 /// Negative pin (spec §8, adapted to S1's zero-protocol scope — the
 /// errorClass discriminator is Slice 2): a deterministic per-create plan
 /// failure is loud for THAT create only; the other 11 are unaffected.
-#[tokio::test(flavor = "multi_thread")]
-async fn deterministic_plan_failure_is_loud_for_that_create_only() {
+#[test]
+fn deterministic_plan_failure_is_loud_for_that_create_only() {
+    storm_rt().block_on(async {
     let _serial = test_lock().lock().await;
     let c = storm_controls();
     c.reset();
@@ -2073,14 +2116,17 @@ async fn deterministic_plan_failure_is_loud_for_that_create_only() {
         errors[0]
     );
     assert_eq!(registry.kill_all(), 11, "the doomed create must not spawn");
+    drain_adopted_teardowns(c, 7).await; // 7 adopted (codex-2 never produced a sidecar)
     *c.fail_cwd.lock().unwrap() = None;
+    });
 }
 
 /// T11 extension + discard arms (1)/(3): disconnect mid-storm drains the
 /// plan queue with no PTY spawns and no further plans; the two in-flight
 /// plans complete and are DISCARDED (fake runtime records the teardowns).
-#[tokio::test(flavor = "multi_thread")]
-async fn disconnect_mid_storm_drains_queue_without_spawns_and_discards_prepared_launches() {
+#[test]
+fn disconnect_mid_storm_drains_queue_without_spawns_and_discards_prepared_launches() {
+    storm_rt().block_on(async {
     let _serial = test_lock().lock().await;
     let c = storm_controls();
     c.reset();
@@ -2129,12 +2175,14 @@ async fn disconnect_mid_storm_drains_queue_without_spawns_and_discards_prepared_
     );
     assert_eq!(c.plans_started.load(Ordering::SeqCst), 2, "no further plans after disconnect");
     assert_eq!(registry.kill_all(), 0, "no PTY may have been spawned");
+    });
 }
 
 /// Discard arm (2): a prepared launch whose gate acquire rejects QueueFull
 /// gets RATE_LIMITED (ladder absorbs) and the sidecar is torn down.
-#[tokio::test(flavor = "multi_thread")]
-async fn gate_queue_full_after_prepare_sends_rate_limited_and_discards_the_sidecar() {
+#[test]
+fn gate_queue_full_after_prepare_sends_rate_limited_and_discards_the_sidecar() {
+    storm_rt().block_on(async {
     let _serial = test_lock().lock().await;
     let c = storm_controls();
     c.reset();
@@ -2157,12 +2205,14 @@ async fn gate_queue_full_after_prepare_sends_rate_limited_and_discards_the_sidec
     }
     assert_eq!(c.shutdown_calls.load(Ordering::SeqCst), 1, "prepared sidecar discarded");
     assert_eq!(registry.kill_all(), 0, "no PTY spawned");
+    });
 }
 
 /// Discard arm (4): shutdown beginning between prepare and spawn abandons
 /// the create silently and discards the prepared sidecar.
-#[tokio::test(flavor = "multi_thread")]
-async fn shutdown_after_prepare_abandons_silently_and_discards_the_sidecar() {
+#[test]
+fn shutdown_after_prepare_abandons_silently_and_discards_the_sidecar() {
+    storm_rt().block_on(async {
     let _serial = test_lock().lock().await;
     let c = storm_controls();
     c.reset();
@@ -2199,6 +2249,7 @@ async fn shutdown_after_prepare_abandons_silently_and_discards_the_sidecar() {
         let v: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_ne!(v["type"], serde_json::json!("error"), "shutdown abandon must be silent: {v}");
     }
+    });
 }
 ```
 
