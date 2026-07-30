@@ -11,6 +11,7 @@ import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { DeckTileStyle } from '@shared/settings'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { getTabDisplayTitle } from '@/lib/tab-title'
 
 export type TilePaneTint = 'blue' | 'green' | 'amber' | 'red' | 'mutedDim' | 'muted'
 export type TilePaneIcon = { provider: string; tint: TilePaneTint }
@@ -205,7 +206,10 @@ export function selectDeckModel(state: RootState): DeckModel {
     const flags = getTabStatusFlags(state, tab)
     return {
       id: tab.id,
-      title: tab.title,
+      // Same label the tab bar displays (custom title, else derived default such as
+      // the working-directory basename) — reuse the tab bar's derivation verbatim.
+      // extensions uses ?. because unit-test stores may omit that reducer.
+      title: getTabDisplayTitle(tab, state.panes.layouts[tab.id], state.panes.paneTitles?.[tab.id], state.extensions?.entries),
       active,
       busy: flags.busy,
       attention: flags.attention,

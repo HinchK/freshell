@@ -23,6 +23,8 @@ import { hueFromString } from '@/components/icons/RepoIcon'
 import {
   findApproveTarget, findStopTarget, getTabRepoIcons, getTabStatusFlags, getTabPaneIcons, selectDeckModel,
 } from '@/deck/deck-selectors'
+import { getTabDisplayTitle } from '@/lib/tab-title'
+import type { RootState } from '@/store/store'
 
 const reducer = {
   tabs: tabsReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
@@ -43,6 +45,8 @@ function makeState(overrides: {
   terminalMeta?: Record<string, TerminalMetaRecord>
   repoIcons?: Record<string, RepoIconEntry>
   t1Layout?: PaneNode
+  /** Extra tab fields merged into the default fixture's t1 (e.g. title/titleSetByUser for title-parity tests). */
+  t1Tab?: Partial<Tab>
   /** When set, replaces the default 2-tab fixture with tabs t1..tN, each a terminal leaf pane pN (terminalId term-N, mode 'claude'). */
   tabs?: number
   activeTab?: string
@@ -68,7 +72,7 @@ function makeState(overrides: {
     }
   } else {
     tabsList = [
-      { id: 't1', createRequestId: 'c1', title: 'build', status: 'running', mode: 'shell', createdAt: 1 },
+      { id: 't1', createRequestId: 'c1', title: 'build', status: 'running', mode: 'shell', createdAt: 1, ...overrides.t1Tab },
       { id: 't2', createRequestId: 'c2', title: 'claude', status: 'running', mode: 'shell', createdAt: 2 },
     ]
     layouts = {
@@ -274,8 +278,8 @@ function meta(terminalId: string, cwd: string): TerminalMetaRecord {
   return { terminalId, cwd, updatedAt: 1 }
 }
 
-function claudeLeaf(id: string, terminalId: string): PaneNode {
-  return { type: 'leaf', id, content: { kind: 'terminal', terminalId, createRequestId: 'c1', status: 'running', mode: 'claude' } }
+function claudeLeaf(id: string, terminalId: string, initialCwd?: string): PaneNode {
+  return { type: 'leaf', id, content: { kind: 'terminal', terminalId, createRequestId: 'c1', status: 'running', mode: 'claude', ...(initialCwd ? { initialCwd } : {}) } }
 }
 
 function split(id: string, a: PaneNode, b: PaneNode): PaneNode {
@@ -476,5 +480,46 @@ describe('getTabPaneIcons', () => {
     const model = selectDeckModel(state)
     const t1 = model.tabs.find((t) => t.id === 't1')!
     expect(t1.paneIcons).toEqual([{ provider: 'claude', tint: 'blue' }])
+  })
+})
+
+describe('deck titles match the tab bar (getTabDisplayTitle parity)', () => {
+  // The tab bar's exact call shape (TabBar.tsx:199, test/e2e/coding-agent-naming-flow.test.tsx:43).
+  // extensions uses ?. because this unit-test store does not register the extensions reducer.
+  function tabBarTitle(state: never, tab: Tab): string {
+    const s = state as unknown as RootState
+    return getTabDisplayTitle(tab, s.panes.layouts[tab.id], s.panes.paneTitles?.[tab.id], s.extensions?.entries)
+  }
+
+  it('replaces a "Tab N" placeholder with the tab bar derived label (cwd basename)', () => {
+    // One tab whose stored title is the raw placeholder and whose single
+    // claude pane has initialCwd '/home/dan/code/freshell'.
+    const state = makeState({
+      t1Tab: { title: 'Tab 1' },
+      t1Layout: claudeLeaf('p1', 'term-1', '/home/dan/code/freshell'),
+    })
+    const model = selectDeckModel(state)
+    const t1 = model.tabs.find((t) => t.id === 't1')!
+    expect(t1.title).toBe('freshell')
+    // Load-bearing parity assertion: byte-identical with the tab bar's call.
+    expect(t1.title).toBe(tabBarTitle(state, tabsOf(state)[0]))
+  })
+
+  it('keeps a user-set custom title verbatim', () => {
+    const state = makeState({
+      t1Tab: { title: 'my custom name', titleSetByUser: true },
+      t1Layout: claudeLeaf('p1', 'term-1', '/tmp/x'),
+    })
+    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.title).toBe('my custom name')
+  })
+
+  it('layout-less tab falls back to the stored title, exactly like the tab bar', () => {
+    const base = makeState({ t1Tab: { title: 'Tab 1' } })
+    // Clone idiom from the layout-less tests above: drop all pane layouts.
+    const noLayout = { ...(base as object), panes: { ...(base as { panes: Record<string, unknown> }).panes, layouts: {} } } as never
+    const tab = tabsOf(noLayout)[0]
+    const t1 = selectDeckModel(noLayout).tabs.find((t) => t.id === 't1')!
+    expect(t1.title).toBe('Tab 1')
+    expect(t1.title).toBe(tabBarTitle(noLayout, tab))
   })
 })
