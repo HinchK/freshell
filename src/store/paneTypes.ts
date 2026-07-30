@@ -68,6 +68,16 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
  * Terminal pane content with full lifecycle management.
  * Each terminal pane owns its backend terminal process.
  */
+/** Persistent crash trace (kata znhn item 1): "crashed & auto-resumed" —
+ * survives reload (pane-content persistence is a denylist) until the user
+ * dismisses it or the pane closes. */
+export type CrashTrace = {
+  /** Exit code of the crashed generation. */
+  exitCode: number
+  /** Wall-clock ms when the auto-resume succeeded. */
+  resumedAtMs: number
+}
+
 export type TerminalPaneContent = {
   kind: 'terminal'
   /** Backend terminal ID (undefined until created) */
@@ -100,6 +110,9 @@ export type TerminalPaneContent = {
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter. Incremented by applyReconcileAttach / resetPaneForReconcileCreate so a fold on an already-mounted pane (same createRequestId — never re-minted) re-fires TerminalView's create-or-attach effect (Task 12 adds it to the dep array). Stripped from persistence (Task 8). */
   reconcileEpoch?: number
+  /** znhn item 1: persisted deliberately — do NOT add to
+   * stripTransientSessionFields. Absent on old layouts = no trace. */
+  crashTrace?: CrashTrace
 }
 
 /**

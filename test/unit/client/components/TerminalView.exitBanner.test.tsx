@@ -6,7 +6,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import terminalLifecycleReducer, { AUTO_RESUME_NOTICE_TTL_MS, selectExitRecordFrom } from '@/store/terminalLifecycleSlice'
+import terminalLifecycleReducer, { selectExitRecordFrom } from '@/store/terminalLifecycleSlice'
 import { updatePaneContent } from '@/store/panesSlice'
 import { resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
@@ -95,6 +95,7 @@ class MockResizeObserver {
 }
 
 let messageHandler: ((msg: any) => void) | null = null
+let reconnectHandler: (() => void) | null = null
 let requestAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
 let cancelAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
 
@@ -119,10 +120,11 @@ interface StoreOptions {
   mode?: string
   status?: TerminalPaneContent['status']
   withSessionRef?: boolean
+  crashTrace?: { exitCode: number; resumedAtMs: number }
   lifecycle?: {
     lastTerminalId?: string
     exit?: { exitCode: number; at: number }
-    notice?: { kind: 'recovering' | 'resumed'; attempt: number; maxAttempts: number; exitCode: number; at: number }
+    notice?: { kind: 'recovering'; attempt: number; maxAttempts: number; exitCode: number; at: number }
   }
 }
 
@@ -134,6 +136,7 @@ function makeStore(opts: StoreOptions = {}) {
     status: opts.status ?? 'exited',
     mode: mode as TerminalPaneContent['mode'],
     shell: 'system',
+    ...(opts.crashTrace ? { crashTrace: opts.crashTrace } : {}),
     ...(opts.withSessionRef === false
       ? {}
       : { sessionRef: { provider: mode, sessionId: SESSION_ID } }),
@@ -198,6 +201,12 @@ describe('TerminalView exited-pane error banner', () => {
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
       messageHandler = callback
       return () => { messageHandler = null }
+    })
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        reconnectHandler = null
+      }
     })
     requestAnimationFrameSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       cb(0)
@@ -360,34 +369,216 @@ describe('TerminalView exited-pane error banner', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('degrades an orphaned recovering notice to the alert deterministically at TTL expiry (silent settle backstop)', async () => {
+  it('keeps the recovering notice up while the socket stays connected without a settle frame (no timer degradation — znhn#6 pin)', async () => {
+    // Scope (D-3, validated): "no timer degradation" holds WHILE CONNECTED.
+    // A disconnect/reconnect clears stale notices via the reconnect backstop
+    // (tested below) — missed-frame paths always pass through a reconnect.
     vi.useFakeTimers()
     const at = Date.now()
     const { store, paneContent } = makeStore({
       mode: 'claude',
       status: 'exited',
       lifecycle: {
+        lastTerminalId: 'term-crashed',
         exit: { exitCode: 1, at },
         notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
       },
     })
     await renderPane(store, paneContent)
 
-    // While the notice is active: notice strip, no alert. (Text-anchored:
-    // TerminalView also renders an unrelated role='status' offline strip in
-    // this harness; the banner's role='status' semantics are covered by
-    // TerminalExitBanner.test.tsx.)
-    expect(screen.queryByRole('alert')).toBeNull()
-    expect(screen.getByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeInTheDocument()
-
-    // No frame ever arrives (respawn_failed / lease-held / owned-live settle
-    // silently). The scheduled re-render must flip notice → alert on its own.
     await act(async () => {
-      vi.advanceTimersByTime(AUTO_RESUME_NOTICE_TTL_MS + 2)
+      vi.advanceTimersByTime(120_000)
+    })
+    expect(screen.getByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+    vi.useRealTimers()
+  })
+
+  it('an out-of-order exited settle frame never touches pane content or status (D-1 allowlist pin)', async () => {
+    // Cross-channel ordering (broadcast settle vs per-connection
+    // terminal.exit) is NOT guaranteed (unbiased select!,
+    // terminal.rs:325-334): the settle handler is lifecycle-only, and the
+    // running|recovering content-write allowlist must block 'exited' from
+    // pane content/status.
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      lifecycle: { lastTerminalId: 'term-live' },
+    })
+    const contentWithTid = { ...paneContent, terminalId: 'term-live' }
+    act(() => {
+      store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: contentWithTid }))
+    })
+    await renderPane(store, paneState(store))
+
+    await act(async () => {
+      messageHandler!({ type: 'terminal.status', terminalId: 'term-live', status: 'exited', reason: 'retries_exhausted' })
     })
 
-    expect(screen.queryByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeNull()
+    const content = paneState(store)
+    expect(content.status).toBe('running')
+    expect(content.terminalId).toBe('term-live')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a recovering notice does not survive a reconnect (D-3 backstop pin)', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 1, at },
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    await renderPane(store, paneContent)
+    expect(screen.getByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeInTheDocument()
+    expect(reconnectHandler).not.toBeNull()
+
+    await act(async () => {
+      reconnectHandler!()
+    })
+    expect(screen.queryByText(/auto-resuming/)).toBeNull()
+  })
+
+  it('clears the recovering notice the moment the settle frame arrives', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 1, at },
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    await renderPane(store, paneContent)
+
+    await act(async () => {
+      messageHandler!({ type: 'terminal.status', terminalId: 'term-crashed', status: 'exited', reason: 'pane_closed' })
+    })
+    expect(screen.queryByText(/auto-resuming/)).toBeNull()
     expect(screen.getByRole('alert')).toHaveTextContent('process exited (code 1)')
+  })
+
+  it('terminal.replaced writes a persistent crash trace onto pane content and shows the trace strip', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(messageHandler).not.toBeNull()
+
+    await act(async () => {
+      messageHandler!({ type: 'terminal.replaced', oldTerminalId: 'term-crashed', newTerminalId: 'term-new', exitCode: 1, attempt: 1, maxAttempts: 2 })
+    })
+
+    // The store now carries it on pane CONTENT (the persisted home):
+    const content = paneState(store)
+    expect(content.crashTrace?.exitCode).toBe(1)
+    expect(typeof content.crashTrace?.resumedAtMs).toBe('number')
+
+    // Re-render with the updated content (in production the parent passes
+    // fresh store content on every render).
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneState(store)} />
+      </Provider>
+    )
+    const trace = screen.getByTestId('crash-trace')
+    expect(trace).toHaveTextContent(/claude crashed \(exit 1\) & auto-resumed at \d{2}:\d{2}/)
+    expect(trace).toHaveAttribute('role', 'status')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('dismissing the crash trace clears it from pane content', async () => {
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      crashTrace: { exitCode: 1, resumedAtMs: Date.now() },
+    })
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId('crash-trace')).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss claude crash notice' }))
+    })
+    expect(paneState(store).crashTrace).toBeUndefined()
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneState(store)} />
+      </Provider>
+    )
+    expect(screen.queryByTestId('crash-trace')).toBeNull()
+  })
+
+  it('cancel button sends terminal.autoResumeCancel with the old terminal id', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 1, at },
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    await renderPane(store, paneContent)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel auto-resume for claude' }))
+    expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.autoResumeCancel', terminalId: 'term-crashed' })
+  })
+
+  it('renders the circuit-breaker banner from the typed resumeCycles settle field (znhn#2)', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 1, at },
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    await renderPane(store, paneContent)
+
+    await act(async () => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-crashed',
+        status: 'exited',
+        reason: 'flap_circuit_breaker',
+        resumeCycles: 3,
+      })
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('claude crashed 3 times — auto-resume paused')
+    // canResume derives from the seeded sessionRef (provider matches mode):
+    // the button copy is honest about resuming this conversation.
+    expect(screen.getByRole('button', { name: 'Relaunch claude session' }))
+      .toHaveTextContent('Relaunch — resumes this conversation')
   })
 
   it('renders the recovering notice from the frame FIELDS — prose is presentational, never parsed', async () => {
