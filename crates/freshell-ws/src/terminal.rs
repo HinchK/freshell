@@ -3886,9 +3886,7 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
             .expect("auto_resume_cancels lock");
         cancels.iter().cloned().collect()
     };
-    let stale = snapshot
-        .into_iter()
-        .filter(|id| !state.registry.exists(id));
+    let stale = snapshot.into_iter().filter(|id| !state.registry.exists(id));
     {
         let mut cancels = state
             .auto_resume_cancels
