@@ -290,6 +290,17 @@ async fn main() -> ExitCode {
     // `freshell_ws::spawn_idle_monitor` for the periodic sweep this feeds.
     registry.set_auto_kill_idle_minutes(settings.safety.auto_kill_idle_minutes);
     freshell_ws::spawn_idle_monitor(registry.clone(), std::time::Duration::from_secs(30));
+    // e2e knob (kata znhn item 2): sub-second flap cycles would trip the
+    // registry generation cap (3 per 30s liveness window) before the hub's
+    // circuit breaker can ever fire. Production default unchanged.
+    if let Some(ms) = std::env::var("FRESHELL_RESPAWN_LIVENESS_WINDOW_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+    {
+        registry.set_respawn_liveness_window_ms(ms);
+        tracing::info!(ms, "respawn_liveness_window_override");
+    }
     // TERM-13 fix: honor `settings.terminal.scrollback` at boot (the Rust
     // registry previously used a fixed 8MiB replay-log cap for every
     // terminal, ignoring the configured value entirely).
