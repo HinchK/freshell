@@ -30,6 +30,14 @@ lines 245–320; §6 fences; §8 reconciliation). The spec is authoritative.
 (branch `feat/codex-managed-launch-s5`, based on `main` @ `6d0e285b`). Work from committed
 HEAD only — the main repo's working tree has unrelated uncommitted changes; never touch it.
 
+**Workspace setup (verified 2026-07-30, load-bearing ledger A27):** before trusting the
+`freshell-freshagent` suite, run `npm ci` in the worktree root — 12 of its tests resolve the
+`tsx` MCP dependency via `node_modules/` and fail with
+`Unable to resolve MCP dependency "tsx"` on a fresh worktree (environmental, not code).
+Baseline otherwise: `cargo check --workspace --all-targets` clean; codex/activity/platform/
+ws(--lib) suites green. Known flake: `pane_ledger::new_locked_degrades_to_disabled_when_another_holder_exists`
+is load-flaky under WSL2 (flock EWOULDBLOCK) — rerun it isolated before blaming a change.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section. All are copied from the spec.
@@ -186,6 +194,12 @@ timeout/failure the held frames are answered with JSON-RPC `-32000` errors (neve
 all connections closed, and a `repair_trigger{kind:'candidate_capture_timeout'}` is emitted.
 `pauseCandidateCapture`/`resumeCandidateCapture` belong to the fork-handoff gate and are NOT
 ported (codexForkHandoff is fenced off — record a one-line code comment saying so).
+
+Verified nuances (2026-07-30 load-bearing validation, ledger A28 — mirror all three): legacy
+pushes the 33rd frame and THEN fails the gate (overflow = capture failure, not a silent
+drop); a cumulative held-bytes cap (`heldBytes <= maxRawForwardBytes`) also fails the gate;
+and `repair_trigger{kind:'candidate_capture_timeout'}` fires on ANY initial-capture failure
+(overflow/refusal included), not only the 45 s timer.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -429,8 +443,11 @@ If `futures_util` is not already a (dev-)dependency of `freshell-codex`, add
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p freshell-codex --test candidate_gate` (add `--features real-transport` if
-`remote_proxy_relay.rs`'s gating requires it — use the same invocation that runs that file).
+Run: `cargo test -p freshell-codex --features real-transport --test candidate_gate`
+(verified 2026-07-30, ledger A26: tokio-tungstenite/futures-util are OPTIONAL dependencies of
+`freshell-codex` behind the default-off `real-transport` feature — there is no
+`[dev-dependencies]` section — so without the flag this file compiles to zero tests. Copy
+`remote_proxy_relay.rs`'s `#![cfg(...)]` gating verbatim, per Step 1).
 Expected: compile errors — `mark_candidate_persisted`, `fail_candidate_capture`,
 `candidate_capture_timeout_ms`, and `CandidateCaptureTimeout` do not exist.
 
@@ -1059,16 +1076,25 @@ Design (the "extend the dedupe" the spec demands, minimal blast radius): the pro
 clock domain. Two new one-shot directed swallow flags generalize CE1:
 
 - `swallow_next_proxy_complete: bool` — armed by **reconcile-initiated** clears (next to the
-  existing `swallow_next_bel = true` at `:346` and `:354`); consumed one-shot at the top of
-  `note_proxy_turn_completed`.
+  existing `swallow_next_bel = true` at `:346` and `:354`) AND by **BEL-initiated** clears
+  (it is a new flag, so the two pinned counterexample tests are untouched); consumed one-shot
+  at the top of `note_proxy_turn_completed`; DISARMED by `note_proxy_turn_started` (a new
+  proxy turn is beginning — a stale swallow must not eat its completion).
 - `swallow_next_reconcile_clear: bool` — armed by **proxy-initiated** clears; consumed
   one-shot in `reconcile_rollout`'s `is_new_clear` branch (skip that one transition).
 - Proxy-initiated clears also arm the existing `swallow_next_bel` (the PTY echo of the same
   physical turn).
 - `note_input`'s fresh-pending branch (`:418-422`) clears ALL three flags.
-- BEL-initiated clears keep today's behavior exactly (no new arming) — the two pinned
-  counterexample tests stay untouched. Proxy completions arriving while `phase == Idle` are
-  naturally ignored (`record_completion_if_idle` requires a transition).
+- BEL-initiated clears keep today's BEL/reconcile behavior exactly (the two pinned
+  counterexample tests stay untouched) but DO arm the new `swallow_next_proxy_complete` —
+  validated finding (2026-07-30, ledger A11): the proxy stream has NO emission dedupe and its
+  `TurnCompleted` carries no timestamps (`remote_proxy.rs:1146-1161`), so a proxy echo landing
+  after a BEL clear with a queued follow-up submit would otherwise prematurely complete the
+  new turn. Proxy completions arriving while `phase == Idle` are naturally ignored
+  (`record_completion_if_idle` requires a transition).
+- Proxy event payloads carry `threadId`/`turnId` but no timestamps; server receipt time is
+  the key. Recorded option (not built now): if double-counting is ever observed in practice,
+  upgrade the one-shot flags to `turn_id`-keyed dedupe.
 - New per-terminal field `last_proxy_started_at: Option<i64>` (server-clock receipt time)
   is the proxy lane's turn key for Busy/Unknown clears; Pending clears reuse
   `pending_submit_at` (both are server-clock — same key space, no cross-domain compare).
@@ -1164,6 +1190,44 @@ assert on `TrackerEffect::TurnComplete`):
         // A REAL turn end for the NEW turn must complete, not be swallowed.
         let done = tracker.note_proxy_turn_completed("t", 5_000);
         assert!(done
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+    }
+
+    #[test]
+    fn proxy_start_disarms_a_stale_proxy_swallow() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 1_000);
+        tracker.note_input("t", b"\r", 2_000);
+        // Reconcile ends turn 1 and arms swallow_next_proxy_complete…
+        let events = CodexTaskEvents {
+            latest_task_completed_at: Some(2_500),
+            ..Default::default()
+        };
+        tracker.reconcile_rollout("t", &events, 3_000);
+        // …but turn 2 STARTS on the proxy lane before any proxy echo of turn 1
+        // arrived: the stale swallow must be disarmed, not eat turn 2's end.
+        tracker.note_proxy_turn_started("t", 4_000);
+        let done = tracker.note_proxy_turn_completed("t", 5_000);
+        assert!(done
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+    }
+
+    #[test]
+    fn bel_clear_swallows_the_late_proxy_echo() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 1_000);
+        tracker.note_input("t", b"\r", 2_000);
+        // The PTY BEL ends the turn first (BEL-initiated clear)…
+        let cleared = tracker.note_output("t", b"\x07", 3_000);
+        assert!(cleared
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+        // …then the proxy echo of the SAME physical turn must not double-count
+        // (nor prematurely complete a queued follow-up submit).
+        let echo = tracker.note_proxy_turn_completed("t", 3_050);
+        assert!(!echo
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
     }
@@ -1565,6 +1629,11 @@ If `test_state()` in `codex_association.rs` isn't reusable directly (private), c
 into this module's tests verbatim. If the ledger inside `apply_codex_identity` needs a temp
 dir in tests, mirror how the `codex_association.rs` test satisfies it.
 
+Also add a filter test mirroring `ephemeral_candidates_are_skipped`: a candidate with an
+empty thread id, and one with a relative rollout path, must not adopt (extend the local
+`candidate(..)` test helper to take the path; the happy-path candidates above must use an
+absolute path so they still bind).
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-ws codex_proxy_route`
@@ -1582,6 +1651,12 @@ Expected: FAIL to compile — module/functions missing.
 //! `codex_association::should_arm_codex_locator`); on the SAME terminal, first
 //! bind wins — a later proxy candidate with a different id is ignored here
 //! (identity moves only through the fork rebind lane).
+//!
+//! The first-bind check below is router-task check-then-act (accepted
+//! residual, load-bearing ledger A22): safe because this task is the ONLY
+//! proxy-candidate writer (single mpsc consumer), create-time session-ref
+//! binds complete before any candidate can arrive, and the locator is
+//! suppressed for managed panes (Task 7).
 //!
 //! D-FORK RULE (recorded; spec S5.a "route … or ignore"): proxy fork
 //! candidates (`CandidateSource::ThreadForkResponse`) are deliberately
@@ -1660,6 +1735,22 @@ async fn route_candidate(
             "codex_proxy_candidate_skipped: ephemeral thread");
         return;
     }
+    // Legacy bind-predicate parity (terminal-registry.ts:2144/2175 — verified,
+    // ledger A25): bind only candidates with a non-empty thread id AND an
+    // absolute rollout path (the reconcile activity lane also requires the
+    // path — ledger A9).
+    if candidate.thread.id.is_empty()
+        || !candidate
+            .thread
+            .path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(Path::is_absolute)
+    {
+        tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+            "codex_proxy_candidate_skipped: empty thread id or missing/relative rollout path");
+        return;
+    }
     // D-03: first bind wins on this terminal.
     if let Some(existing) = state.identity.get(terminal_id) {
         if let (Some("codex"), Some(existing_id)) =
@@ -1686,6 +1777,10 @@ async fn route_candidate(
     if adopted {
         // S5.c release: the awaited ledger write inside the tail IS the
         // "persisted" signal (fsync-before-announce). Idempotent on re-adopt.
+        // Verified (ledger A7): atomic_write_durable fsyncs file + parent dir.
+        // Documented durability.degraded policy: a disabled/degraded ledger
+        // still returns adopted=true — accepted, matches existing identity
+        // durability semantics.
         CodexTerminalLaunchManager::global()
             .mark_candidate_persisted(terminal_id)
             .await;
@@ -1712,9 +1807,15 @@ Expected: PASS.
 
 - [ ] **Step 5: Boot wiring**
 
-In `crates/freshell-server/src/main.rs`, immediately next to the existing
-`spawn_codex_locator_sweep` wiring (search for `spawn_codex_locator_sweep`), add — using the
-same `WsState` variable that call uses:
+In `crates/freshell-server/src/main.rs`, near the existing `spawn_codex_locator_sweep`
+wiring (search for `spawn_codex_locator_sweep`) but — verified placement constraint
+(2026-07-30, ledger A3) — NOT inside the `if codex_locator.is_some()` conditional that call
+sits in: the sink + router must be installed UNCONDITIONALLY (a managed pane's gate release
+depends on the router even when the locator is absent). Place it just after that `if` block,
+using the same `WsState` variable; it must execute before the HTTP listener bind/serve
+(currently much later in `main`). Note: `spawn_auto_resume_hub` runs earlier in boot, which
+is safe — no crash events exist pre-serve, so no adopt can precede this line — but do not
+move the install any later:
 
 ```rust
     // DEV-0006 S5.a: proxy-event sink + router (the ONE consumer of managed
@@ -1747,6 +1848,9 @@ git commit -m "feat(ws): route codex proxy events into the existing identity/act
 - Modify: `crates/freshell-ws/src/codex_association.rs`
 - Modify: `crates/freshell-ws/src/terminal.rs` (arm sites `:2405-2450` and the respawn twin
   `:3001-3018`)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (the REST door's own arm helper —
+  see Step 3's REST item; added 2026-07-30 after validation falsified the two-site claim,
+  ledger A10)
 - Test: in-module tests in `codex_association.rs`
 
 **Interfaces:**
@@ -1819,18 +1923,32 @@ the move). Leave the `watch_fork` registration for resume panes in those blocks 
 Fix any other `maybe_arm` caller `cargo check -p freshell-ws` reports (pass `false` anywhere
 a managed launch is impossible).
 
+ALSO suppress the REST door (2026-07-30 validation FALSIFIED the "two arm sites" claim,
+ledger A10): `crates/freshell-freshagent/src/terminal_tabs.rs` has a third arm path —
+`arm_locators_for_fresh_pane` (~`:477`, called from the REST create door ~`:1622`; re-anchor
+by searching the function name) arms the shared `CodexLocator` directly, and REST panes are
+managed-capable. Thread a `managed_codex: bool` parameter into `arm_locators_for_fresh_pane`
+(derive it in the caller's scope from the managed codex launch being present — use whatever
+local that scope actually has, e.g. the codex launch `Option`/remote URL produced by the plan
+block ~`:1300-1331`), and when it is `true` skip the CODEX locator arm only (leave opencode
+arming untouched), with a one-line D-03 comment mirroring `should_arm_codex_locator`'s rule.
+Managed REST panes get their fork watch from the router (Task 6), same as WS panes. Update
+any freshagent test that pins the arming behavior.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-ws --lib && cargo check -p freshell-ws --all-targets`
-Expected: PASS / clean.
+Run: `cargo test -p freshell-ws --lib && cargo check -p freshell-ws --all-targets && cargo test -p freshell-freshagent && cargo check -p freshell-freshagent --all-targets`
+Expected: PASS / clean (see the Workspace setup note — the freshagent suite needs
+`node_modules/` for its 12 tsx-dependent tests).
 
 - [ ] **Step 5: fmt/clippy + commit**
 
 ```bash
 cargo fmt --all
 cargo clippy -p freshell-ws --all-targets -- -D warnings
-git add crates/freshell-ws
-git commit -m "feat(ws): suppress the rollout locator for managed codex panes (S5.b, D-03)"
+cargo clippy -p freshell-freshagent --all-targets -- -D warnings
+git add crates/freshell-ws crates/freshell-freshagent
+git commit -m "feat(ws): suppress the rollout locator for managed codex panes, incl. the REST door (S5.b, D-03)"
 ```
 
 ---
@@ -1870,9 +1988,10 @@ Run: `cargo check -p freshell-codex` — Expected: clean.
 
 In `crates/freshell-freshagent/src/codex.rs`:
 1. Delete the private `CODEX_MANAGED_CONFIG_ARGS` (`:79`) and use
-   `freshell_codex::launch_plan::CODEX_MANAGED_CONFIG_ARGS` (the `launch_plan.rs:33`
-   original — confirm its exact name there and re-export it `pub` from `launch_plan` if it
-   is not already).
+   `freshell_codex::launch_plan::CODEX_MANAGED_REMOTE_CONFIG_ARGS` (the `launch_plan.rs:33`
+   original — verified 2026-07-30, ledger A26: the canonical const's name differs from the
+   freshagent copy's; the VALUES are identical `["-c","features.apps=false"]`. Re-export it
+   `pub` from `launch_plan` if it is not already).
 2. Delete the private `SIDECAR_START_BUDGET` (`:81`) and use
    `freshell_codex::launch_lifecycle::SIDECAR_START_BUDGET`.
 3. Delete `allocate_loopback_port` (`:3550-3553`) and `drain_reader` (`:3556-3566`); use the
@@ -1887,8 +2006,16 @@ In `crates/freshell-freshagent/src/codex.rs`:
 - [ ] **Step 3: Run the nets**
 
 Run: `cargo test -p freshell-codex && cargo test -p freshell-freshagent`
-Expected: PASS (byte-identical sidecar argv/env — if a freshagent test pins argv and fails,
-the refactor changed bytes: fix the refactor, not the test).
+Expected: PASS. Validated caveat (2026-07-30, ledger A23): NO freshagent test pins the
+sidecar argv bytes — the pins live in freshell-codex's `launch_plan` tests and the platform
+goldens — so the suites alone are NOT a sufficient net for this refactor. Do an explicit
+pre/post parity check yourself: before refactoring, note the exact argv/env `spawn_sidecar`
+assembles (`codex.rs:1986-1995`); after, confirm `codex_sidecar_spawn_spec` + shared helpers
+yield the same bytes. The two paths were verified semantically equivalent (same config args,
+same 45 s budget) but the helpers are NOT byte-identical — `drain_reader` (generic
+`AsyncRead`) vs `drain_child_io(&mut Child)` differ in signature and error strings; keep the
+canonical freshell-codex behavior. PRESERVE the `CODEX_CMD` test-override affordance
+(`codex.rs:1976`) — freshagent tests rely on it.
 
 - [ ] **Step 4: fmt/clippy + commit**
 
@@ -2082,7 +2209,9 @@ In `crates/freshell-freshagent/src/terminal_tabs.rs`:
 
    (Find the existing PTY-spawn-failure arm in `settle_gated_create` — the one the
    `create_gate.rs:87-93` comment calls "its own failed-spawn arm cleans them up" — and copy
-   its MCP-cleanup and stub-GC statements into the rejection arm above.)
+   its MCP-cleanup and stub-GC statements into the rejection arm above. Do NOT copy that
+   arm's `AlreadyExists`→409 branch — it is PTY-failure-specific; gate rejection keeps
+   `spawn_gate_error_response` (verified 2026-07-30, ledger A15).)
 4. The old acquire-site's stub-GC arm (`:1085-1088`) moves with it (covered by step 3's
    cleanup copy). Delete any now-unused imports.
 5. Update the D-C-REVISIT marker comment (`:1283-1289`) to:
@@ -2103,6 +2232,12 @@ Expected: tests that pinned acquire-before-plan ordering or `GatedSettleInputs.p
 to compile or assert — update them to the new ordering (the observable contract they should
 now pin: gate rejection still returns the same `spawn_gate_error_response`, and a rejected
 codex create discards its launch). All other tests must pass unchanged.
+
+Two deliberate behavioral deltas to pin in the updated tests (2026-07-30 validation,
+accepted): (a) a client abort during the permit wait no longer abandons the create — the
+acquire now runs on the detached settle task; (b) codex plan-budget exhaustion surfaces as
+the plan-failure error shape (`codex_launch_error_response`), not the gate's 503 — assert
+the new shapes deliberately rather than restoring the old ones.
 
 Also run: `cargo test -p freshell-ws --lib` (no WS behavior change expected).
 
@@ -2507,6 +2642,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p freshell-codex --features real-transport --all-targets -- -D warnings
 cargo test -p freshell-codex
+cargo test -p freshell-codex --features real-transport   # candidate_gate + relay suites live behind this feature
 cargo test -p freshell-activity
 cargo test -p freshell-platform
 cargo test -p freshell-ws
