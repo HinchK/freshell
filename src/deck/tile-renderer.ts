@@ -1,5 +1,9 @@
 import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
+import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
+import { DECK_FONT_STACK } from './deck-font'
+import { providerIconDataUrl } from './provider-icon-svg'
+import { PANE_TINT_COLORS, STATUS_BLUE, STATUS_MUTED } from './pane-tint-colors'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -7,7 +11,7 @@ import type { DeckAction, KeySpec, RingColor } from './frame'
 
 export type Ctx2D = Pick<
   CanvasRenderingContext2D,
-  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage'
+  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage' | 'beginPath' | 'arc' | 'fill'
 > & { fillStyle: string | CanvasGradient | CanvasPattern; font: string; textBaseline: CanvasTextBaseline }
 
 export type IconSource = (url: string) => CanvasImageSource | null
@@ -29,25 +33,57 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
-export const ACTIVE_COLOR = '#ffffff'
-export const TILE_BG = '#0a0a0a'
-/** Light green fill - the tab bar's emerald attention fill, tuned for the LCD (emerald-200). */
-export const TILE_FILL_GREEN = '#a7f3d0'
-/** The tab bar's bar-on-top green (--success, hsl(142 71% 45%)). */
+
+// ============================================================================
+// DECK PALETTE — derived from freshell's own UI palette so the deck reads as
+// part of the app. KEEP IN SYNC: when an app token changes, update the deck
+// constant to match. Lightness/opacity may be tuned for the small dark LCD;
+// hues must stay the app's (see docs/plans/2026-07-29-deck-icons-polish.md).
+//
+//   deck constant     <- app source token (where it lives)                 value
+//   TILE_BG           <- --background dark  (src/theme-variables.css)      hsl(240 10% 4%)  = #09090b
+//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab) #d1fae5
+//                        light-theme variant: the dark-theme emerald-900/40
+//                        fill is illegible at key size on the LCD.
+//   BAR_TOP_BORDER    <- border-t-success / --success (TabItem bar-on-top) hsl(142 71% 45%) = #21c45d
+//   STATUS_* pane-icon tints (text-success, text-blue-500, ...) live in
+//   pane-tint-colors.ts — shared with frame.ts, which computes the tinted
+//   data URLs at frame-build time.
+//   ACTIVE_COLOR      <- white active ring (deck-only affordance)          #ffffff
+//   BANNER_FILL       <- black scrim over the tile (shared w/ previews)    rgba(0,0,0,0.667)
+//   CONTROL_BG        <- bg-muted dark      (src/theme-variables.css)      hsl(240 4% 16%)  = #27272a
+//   CONTROL_DIM       <- text-muted-foreground dark                        hsl(240 5% 65%)  = #a1a1aa
+//   APPROVE_COLOR     <- --success                                         #21c45d
+//   STOP_COLOR        <- --destructive light: hsl(0 72% 51%)               #dc2828
+//                        (light variant: the dark-theme destructive is too
+//                        dull for an action ring on the LCD)
+//   PREVIEW_* / RING_COLORS: classic terminal-previews style — PINNED,
+//   deliberately not re-derived (that style must not change).
+// ============================================================================
+
+export const TILE_BG = '#09090b'
+export const TILE_FILL_GREEN = '#d1fae5'
 export const BAR_TOP_BORDER = '#21c45d'
-/** Status dot: the tab bar's icon tint colors (text-success / text-blue-500). */
-export const DOT_GREEN = '#21c45d'
-export const DOT_BLUE = '#3b82f6'
-export const DOT_SIZE = 8
+export const ACTIVE_COLOR = '#ffffff'
 export const ICON_GAP = 3
-export const STOP_COLOR = '#ef4444'
-export const APPROVE_COLOR = '#22c55e'
+export const CONTROL_BG = '#27272a'
+export const CONTROL_DIM = '#a1a1aa'
+export const APPROVE_COLOR = '#21c45d'
+export const STOP_COLOR = '#dc2828'
 export const DISABLED_ACTION_COLOR = '#555555'
-export const CONTROL_BG = '#101036'
-export const CONTROL_DIM = '#8888aa'
 export const EMPTY_BG = '#000000'
 export const STRIP_FONT_SIZE = 22
+export const CONTROL_LABEL_FONT_SIZE = 11
+export const CONTROL_VALUE_FONT_SIZE = 15
 export const MAX_TITLE_CHARS = 10
+export const MAX_KEY_PANE_ICONS = 2
+export const OVERFLOW_FONT_SIZE = 10
+/**
+ * Max row slots (icons + badge). iconLayout guarantees on-key fit only up to
+ * 3 slots (4 slots overflow an 80px key by 1px and a 72px key by 9px), so the
+ * +N badge COUNTS AS A SLOT and drawn agent icons shrink to make room for it.
+ */
+const MAX_ROW_SLOTS = 3
 
 export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
   return {
@@ -145,9 +181,25 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   ctx.fillStyle = spec.fill === 'none' ? TILE_BG : TILE_FILL_GREEN
   ctx.fillRect(0, 0, w, h)
 
-  // 2. Centered repo icons; letter avatar while loading, on failure, or when the repo has no icon.
-  const slots = iconLayout(w, h, spec.icons.length)
-  spec.icons.forEach((icon, i) => {
+  // 2. Center row mirrors the tab bar's pane-icon presentation (TabItem.tsx
+  //    renderIcons): repo icon (or circle letter avatar) first, then up to
+  //    MAX_KEY_PANE_ICONS tinted agent icons, then a +N badge for hidden agent
+  //    panes (blue when a hidden pane is busy). Unlike TabItem's flex row
+  //    (badge = additive 4th sibling), canvas has no auto-layout and
+  //    iconLayout only fits 3 slots on-key, so the badge OCCUPIES A ROW SLOT:
+  //    when it appears, drawn agent icons shrink so repo + agents + badge
+  //    never exceed MAX_ROW_SLOTS — the whole row (badge included) stays
+  //    centered and fully on-key. Tabs with no agent panes keep the
+  //    repo-icons-only row (up to 3, as before).
+  const repoIcons = spec.paneIcons.length > 0 ? spec.icons.slice(0, 1) : spec.icons
+  let drawnCount = Math.min(spec.paneIcons.length, MAX_KEY_PANE_ICONS)
+  if (spec.paneIcons.length > drawnCount && repoIcons.length + drawnCount + 1 > MAX_ROW_SLOTS) {
+    drawnCount = MAX_ROW_SLOTS - 1 - repoIcons.length // give the badge its slot
+  }
+  const paneIcons = spec.paneIcons.slice(0, drawnCount)
+  const hidden = spec.paneIcons.slice(drawnCount)
+  const slots = iconLayout(w, h, repoIcons.length + paneIcons.length + (hidden.length > 0 ? 1 : 0))
+  repoIcons.forEach((icon, i) => {
     const { x, y, size } = slots[i]
     const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
     if (bitmap) {
@@ -158,32 +210,54 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
       ctx.drawImage(bitmap, x, y, size, size)
       return
     }
-    // Letter avatar (canvas analogue of RepoIcon's SVG circle): hue swatch + white letter.
-    ctx.fillStyle = `hsl(${icon.hue}, 60%, 42%)`
-    ctx.fillRect(x, y, size, size)
-    ctx.font = `600 ${Math.round(size * 0.6)}px sans-serif`
-    ctx.textBaseline = 'top'
+    // Letter avatar: exact canvas replica of RepoIcon's SVG — circle filling
+    // the slot, letter at 9/16 of the diameter, weight 600, white, with
+    // RepoIcon's +0.5/16 optical nudge below true center (y=8.5 in a 16-unit box).
+    const cx = x + size / 2
+    const cy = y + size / 2
+    ctx.fillStyle = repoAvatarColor(icon.hue)
+    ctx.beginPath()
+    ctx.arc(cx, cy, size / 2, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.font = `600 ${Math.round(size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`
+    ctx.textBaseline = 'middle'
     ctx.fillStyle = '#ffffff'
     const letterWidth = ctx.measureText(icon.letter).width
-    ctx.fillText(icon.letter, Math.round(x + (size - letterWidth) / 2), Math.round(y + size * 0.2))
+    ctx.fillText(icon.letter, Math.round(cx - letterWidth / 2), Math.round(cy + size * (0.5 / 16)))
   })
-
-  // 3. Status dot: the tab bar's green/blue icon-tint states, visible on the deck.
-  if (spec.dot) {
-    ctx.fillStyle = spec.dot === 'green' ? DOT_GREEN : DOT_BLUE
-    ctx.fillRect(Math.round((w - DOT_SIZE) / 2), h - DOT_SIZE - 5, DOT_SIZE, DOT_SIZE)
+  paneIcons.forEach((icon, i) => {
+    const { x, y, size } = slots[repoIcons.length + i]
+    // Mirror the repo-icon pattern above: draw ONLY when buildFrame stamped
+    // ready (it consulted the cache with this same memoized URL, which also
+    // started the async load). An unready slot stays empty; when the decode
+    // completes, the cache notify repaints, buildFrame flips `ready` in the
+    // spec JSON, and the controller's diff un-skips this key. 5-arg
+    // drawImage is mandatory (see the repo-icon comment above).
+    const bitmap = icon.ready ? getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])) : null
+    if (bitmap) ctx.drawImage(bitmap, x, y, size, size)
+  })
+  if (hidden.length > 0) {
+    // The badge renders horizontally centered inside the row slot reserved
+    // for it above (slots.length >= 1 is guaranteed: the badge itself was
+    // counted in the iconLayout call), so it can never clip off the key.
+    const slot = slots[slots.length - 1]
+    const label = `+${hidden.length}`
+    ctx.font = `600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = hidden.some((p) => p.tint === 'blue') ? STATUS_BLUE : STATUS_MUTED
+    ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)
   }
 
-  // 4. Title banner across the top (unchanged treatment).
+  // 3. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
-  ctx.font = `${TITLE_FONT_SIZE}px sans-serif`
+  ctx.font = `600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
   drawCenteredText(ctx, label, w, 2)
 
-  // 5. Borders/rings: barTop green border; white ring marks the active tab.
+  // 4. Borders/rings: barTop green border; white ring marks the active tab.
   if (spec.fill === 'barTop') {
     drawRing(ctx, w, h, BAR_TOP_BORDER, 3, 0)
     if (spec.active) drawRing(ctx, w, h, ACTIVE_COLOR, 2, 3)
@@ -205,17 +279,17 @@ function drawPager(
   ctx.fillRect(0, 0, w, h)
   ctx.textBaseline = 'top'
 
-  ctx.font = '11px sans-serif'
+  ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = CONTROL_DIM
   drawCenteredText(ctx, 'PAGE', w, 2)
 
-  ctx.font = '15px sans-serif'
+  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = ACTIVE_COLOR
-  drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - 15) / 2)
+  drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
-  ctx.font = '11px sans-serif'
+  ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = CONTROL_DIM
-  drawCenteredText(ctx, 'NEXT >', w, h - 11 - 4)
+  drawCenteredText(ctx, 'NEXT >', w, h - CONTROL_LABEL_FONT_SIZE - 4)
 }
 
 function drawAction(
@@ -225,10 +299,10 @@ function drawAction(
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
 
-  ctx.font = '15px sans-serif'
+  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
-  drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - 15) / 2)
+  drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
   drawRing(ctx, w, h, spec.enabled ? ACTION_RING[spec.action] : DISABLED_ACTION_COLOR, 3, 0)
 }
@@ -264,7 +338,7 @@ export function renderStrip(text: string, width: number, height: number, createC
   const ctx = createCtx(width, height)
   ctx.fillStyle = EMPTY_BG
   ctx.fillRect(0, 0, width, height)
-  ctx.font = `${STRIP_FONT_SIZE}px sans-serif`
+  ctx.font = `400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, text, width, (height - STRIP_FONT_SIZE) / 2)

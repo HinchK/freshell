@@ -1,13 +1,16 @@
 import type { DeckCapabilities } from './deck-device'
-import type { DeckModel } from './deck-selectors'
-import type { TileFill, TileDot } from './tile-state'
+import type { DeckModel, TilePaneIcon } from './deck-selectors'
+import type { TileFill } from './tile-state'
+import { PANE_TINT_COLORS } from './pane-tint-colors'
+import { providerIconDataUrl } from './provider-icon-svg'
 
 export type RingColor = 'amber' | 'green' | 'blue' | null
 export type DeckAction = 'back' | 'approve' | 'stop'
 export type TileIcon = { url: string | null; letter: string; hue: number; ready: boolean }
+export type TilePaneIconSpec = TilePaneIcon & { ready: boolean }
 export type KeySpec =
   | { kind: 'empty' }
-  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
+  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; paneIcons: TilePaneIconSpec[]; icons: TileIcon[] }
   | { kind: 'tab'; style: 'preview'; tabId: string; title: string; active: boolean; previewLines: string[]; ring: RingColor }
   | { kind: 'pager'; page: number; pageCount: number }
   | { kind: 'action'; action: DeckAction; enabled: boolean }
@@ -119,7 +122,18 @@ export function buildFrame({ model, caps, page, actionLayer, iconReady, previewF
           }
         : {
             kind: 'tab', style: 'icons', tabId: tab.id, title: tab.title, active: tab.active,
-            fill: tab.fill, dot: tab.dot,
+            fill: tab.fill,
+            // Readiness must live IN the spec: the controller's repaint() skips
+            // keys whose JSON is unchanged, so the decode completing has to flip
+            // a spec field to trigger the repaint — same mechanism as the repo
+            // icons below. iconReady (bitmapFor in production) also STARTS the
+            // async load on first miss, so the first frame kicks off the fetch.
+            // The URL is recomputed, never stored: providerIconDataUrl is
+            // memoized, and the spec stays small (no multi-KB data URLs).
+            paneIcons: tab.paneIcons.map((icon) => ({
+              ...icon,
+              ready: iconReady(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])),
+            })),
             icons: tab.repoIcons.map((icon) => ({
               ...icon,
               ready: icon.url !== null && iconReady(icon.url),

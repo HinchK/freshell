@@ -25,6 +25,18 @@ export function hueFromString(input: string): number {
 }
 
 /**
+ * Canonical letter-avatar fill. 60% saturation / 42% lightness keeps white
+ * text readable in both themes. Shared with the deck's canvas replica
+ * (src/deck/tile-renderer.ts) — change it here and both surfaces follow.
+ */
+export function repoAvatarColor(hue: number): string {
+  return `hsl(${hue}, 60%, 42%)`
+}
+
+/** Letter font-size as a fraction of the avatar diameter (SVG: 9 units / 16-unit viewBox). */
+export const REPO_AVATAR_FONT_RATIO = 9 / 16
+
+/**
  * Decorative repo identity icon: the repo's own icon via the server when
  * available, else a letter avatar (uppercase first letter on a circle with a
  * deterministic per-repo hue). Rendered ONLY via <img src> for server bytes —
@@ -44,18 +56,16 @@ export default function RepoIcon({ info, className }: RepoIconProps) {
     )
   }
   const letter = (info.repoName.trim()[0] || '?').toUpperCase()
-  // 60% saturation / 42% lightness keeps white text readable on the circle
-  // in both light and dark themes.
   const hue = hueFromString(info.repoName)
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" className={cn('shrink-0', className)}>
-      <circle cx="8" cy="8" r="8" fill={`hsl(${hue}, 60%, 42%)`} />
+      <circle cx="8" cy="8" r="8" fill={repoAvatarColor(hue)} />
       <text
         x="8"
         y="8.5"
         textAnchor="middle"
         dominantBaseline="central"
-        fontSize="9"
+        fontSize={16 * REPO_AVATAR_FONT_RATIO}
         fontWeight="600"
         fill="white"
       >

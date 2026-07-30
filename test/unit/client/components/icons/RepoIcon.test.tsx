@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
-import RepoIcon, { hueFromString } from '@/components/icons/RepoIcon'
+import RepoIcon, { hueFromString, repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 
 afterEach(cleanup)
 
@@ -39,5 +39,21 @@ describe('RepoIcon', () => {
   it('renders ? for an empty repo name', () => {
     render(<RepoIcon info={{ repoKey: '/r', repoName: '' }} />)
     expect(screen.getByText('?')).toBeTruthy()
+  })
+
+  describe('shared avatar constants', () => {
+    it('repoAvatarColor formats the canonical 60%/42% HSL fill', () => {
+      expect(repoAvatarColor(200)).toBe('hsl(200, 60%, 42%)')
+      expect(repoAvatarColor(0)).toBe('hsl(0, 60%, 42%)')
+    })
+
+    it('the letter-avatar circle fill and font size use the shared constants', () => {
+      render(<RepoIcon info={{ repoKey: '/r/alpha', repoName: 'alpha' }} />)
+      const circle = document.querySelector('circle')
+      expect(circle?.getAttribute('fill')).toBe(repoAvatarColor(hueFromString('alpha')))
+      const text = document.querySelector('text')
+      // viewBox is 16 units; fontSize must be 16 * ratio = 9
+      expect(text?.getAttribute('font-size')).toBe(String(16 * REPO_AVATAR_FONT_RATIO))
+    })
   })
 })

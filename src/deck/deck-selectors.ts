@@ -10,6 +10,10 @@ import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-i
 import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { DeckTileStyle } from '@shared/settings'
+import { isNonShellMode } from '@/lib/coding-cli-utils'
+
+export type TilePaneTint = 'blue' | 'green' | 'amber' | 'red' | 'mutedDim' | 'muted'
+export type TilePaneIcon = { provider: string; tint: TilePaneTint }
 
 export type DeckTab = {
   id: string
@@ -22,6 +26,7 @@ export type DeckTab = {
   dot: TileDot
   priority: number
   repoIcons: TileRepoIcon[]
+  paneIcons: TilePaneIcon[]
 }
 export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null; tileStyle: DeckTileStyle }
 
@@ -122,6 +127,48 @@ export function getTabRepoIcons(state: RootState, tab: Tab): TileRepoIcon[] {
   return icons
 }
 
+/** Mirrors getTerminalStatusIconClassName (src/lib/terminal-status-indicator.ts). */
+function paneStatusTint(status: string): TilePaneTint {
+  switch (status) {
+    case 'running': return 'green'      // text-success
+    case 'recovering': return 'amber'   // text-warning
+    case 'exited': return 'mutedDim'    // text-muted-foreground/40
+    case 'error': return 'red'          // text-destructive
+    default: return 'muted'             // creating etc. -> text-muted-foreground
+  }
+}
+
+/**
+ * Agent pane icons for a tab, in layout order, UNCAPPED (the renderer caps
+ * drawn icons and folds the rest into a +N badge — TabItem's MAX_PANE_ICONS
+ * overflow rule adapted to key size). Agent panes are non-shell terminals
+ * (provider = mode) and fresh-agent panes (provider = sessionType);
+ * shell/browser/editor/picker/extension panes draw no agent icon on a key
+ * this small. Tint mirrors TabItem.tsx renderIcons: busy -> blue (wins),
+ * else the pane's effective status (non-terminal kinds count as 'running').
+ */
+export function getTabPaneIcons(state: RootState, tab: Tab): TilePaneIcon[] {
+  const busyIds = getBusyPaneIdsForTab({
+    tab,
+    paneLayouts: state.panes.layouts as Record<string, PaneNode | undefined>,
+    ...activityInputs(state),
+  })
+  const icons: TilePaneIcon[] = []
+  for (const { paneId, content } of panesForTab(state, tab)) {
+    let provider: string | null = null
+    let status = 'running'
+    if (content.kind === 'terminal' && isNonShellMode(content.mode)) {
+      provider = content.mode
+      status = content.status
+    } else if (content.kind === 'fresh-agent') {
+      provider = content.sessionType
+    }
+    if (!provider) continue
+    icons.push({ provider, tint: busyIds.includes(paneId) ? 'blue' : paneStatusTint(status) })
+  }
+  return icons
+}
+
 /**
  * Per-tab status flags, derived from the SAME conditions the tab bar uses:
  * - busy: any pane busy (getBusyPaneIdsForTab, TabBar.tsx:329-338)
@@ -167,6 +214,7 @@ export function selectDeckModel(state: RootState): DeckModel {
       dot: tileDot(flags),
       priority: tilePriority(active, flags),
       repoIcons: getTabRepoIcons(state, tab),
+      paneIcons: getTabPaneIcons(state, tab),
     }
   })
   if (tileStyle === 'status-icons') {

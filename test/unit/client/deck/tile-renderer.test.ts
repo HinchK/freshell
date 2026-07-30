@@ -1,21 +1,30 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
-  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, truncateTitle,
-  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, RING_COLORS,
-  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_GREEN, DOT_BLUE, DOT_SIZE,
+  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
+  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
+  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
+  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
+  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
 } from '@/deck/tile-renderer'
+import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM, PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
+import { providerIconDataUrl } from '@/deck/provider-icon-svg'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
+import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
+import { DECK_FONT_STACK } from '@/deck/deck-font'
 import type { KeySpec, RingColor } from '@/deck/frame'
 
 type Rect = { x: number; y: number; w: number; h: number; style: string }
 type Text = { text: string; x: number; y: number; style: string; font: string }
 type Img = { x: number; y: number; w: number; h: number }
+type Circle = { cx: number; cy: number; r: number; style: string }
 
 function recordingCtx(width: number, height: number) {
   const rects: Rect[] = []
   const texts: Text[] = []
   const images: Img[] = []
+  const circles: Circle[] = []
+  let pendingArc: { cx: number; cy: number; r: number } | null = null
   const ctx = {
     fillStyle: '#000000' as string,
     font: '',
@@ -29,10 +38,20 @@ function recordingCtx(width: number, height: number) {
     drawImage(_src: CanvasImageSource, x: number, y: number, w: number, h: number) {
       images.push({ x, y, w, h })
     },
+    beginPath() {
+      pendingArc = null
+    },
+    arc(cx: number, cy: number, r: number) {
+      pendingArc = { cx, cy, r }
+    },
+    fill() {
+      if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
+      pendingArc = null
+    },
     measureText(t: string) { return { width: t.length * 6 } as TextMetrics },
     getImageData() { return { data: new Uint8ClampedArray(width * height * 4) } as ImageData },
   } as unknown as Ctx2D
-  return { ctx, rects, texts, images }
+  return { ctx, rects, texts, images, circles }
 }
 
 describe('title fitting', () => {
@@ -77,7 +96,7 @@ describe('cropPreviewLines', () => {
 
 const tabSpec = (over: Partial<Extract<KeySpec, { kind: 'tab'; style: 'icons' }>> = {}): KeySpec => ({
   kind: 'tab', style: 'icons', tabId: 't1', title: 'build',
-  active: false, fill: 'none', dot: null, icons: [], ...over,
+  active: false, fill: 'none', paneIcons: [], icons: [], ...over,
 })
 
 function previewSpec(overrides: Partial<Extract<KeySpec, { kind: 'tab'; style: 'preview' }>> = {}): KeySpec {
@@ -95,8 +114,8 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
     return captured.ctx
   }
   const out = renderKey(spec, MINI_CAPS, factory, getIcon)
-  const { rects, texts, images } = captured!
-  return { out, rects, texts, images }
+  const { rects, texts, images, circles } = captured!
+  return { out, rects, texts, images, circles }
 }
 
 describe('renderKey', () => {
@@ -107,7 +126,7 @@ describe('renderKey', () => {
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
     expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
-    expect(texts.filter((t) => t.style === '#a8a8a8')).toHaveLength(0) // no preview text anywhere on the tile
+    expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
   it('green fill state paints the light-green background', () => {
@@ -138,22 +157,28 @@ describe('renderKey', () => {
     expect(images).toEqual([{ x: slot.x, y: slot.y, w: slot.size, h: slot.size }])
   })
 
-  it('unready or letter-only icon draws the hue swatch + white letter fallback', () => {
-    const { rects, texts, images } = renderTab(
+  it('unready or letter-only icon draws RepoIcon\'s circle avatar + centered white letter', () => {
+    const { rects, texts, images, circles } = renderTab(
       tabSpec({ icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     expect(images).toHaveLength(0)
-    expect(rects.some((r) => r.style === 'hsl(200, 60%, 42%)')).toBe(true)
-    expect(texts.some((t) => t.text === 'B' && t.style === '#ffffff')).toBe(true)
+    const slot = iconLayout(80, 80, 1)[0]
+    // Exact replica of RepoIcon's SVG: full-slot circle, shared color function.
+    expect(circles).toEqual([
+      { cx: slot.x + slot.size / 2, cy: slot.y + slot.size / 2, r: slot.size / 2, style: repoAvatarColor(200) },
+    ])
+    // The old square swatch is gone.
+    expect(rects.some((r) => r.style === repoAvatarColor(200))).toBe(false)
+    const letter = texts.find((t) => t.text === 'B')
+    expect(letter?.style).toBe('#ffffff')
+    // 9/16 of the diameter, weight 600 (slot.size is 30 on the 80x80 Mini -> 17px).
+    expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
-  it('status dot: green and blue variants at bottom-center; absent when null', () => {
-    const green = renderTab(tabSpec({ dot: 'green' }))
-    expect(green.rects.some((r) => r.style === DOT_GREEN && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
-    const blue = renderTab(tabSpec({ dot: 'blue' }))
-    expect(blue.rects.some((r) => r.style === DOT_BLUE && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
-    const none = renderTab(tabSpec())
-    expect(none.rects.some((r) => r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(false)
+  it('no status dot: a plain icons tile draws only the background and the banner', () => {
+    const { rects } = renderTab(tabSpec())
+    // background + banner — nothing else (the dot used to be a third rect)
+    expect(rects).toHaveLength(2)
   })
 
   it('iconLayout: 1 icon centered large; 3 icons in a centered row below the banner', () => {
@@ -172,7 +197,7 @@ describe('renderKey', () => {
     let cap: ReturnType<typeof recordingCtx> | null = null
     renderKey({ kind: 'pager', page: 2, pageCount: 3 }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
     const { rects, texts } = cap!
-    expect(rects[0].style).toBe('#101036')
+    expect(rects[0].style).toBe(CONTROL_BG)
     expect(texts.map((t) => t.text)).toEqual(expect.arrayContaining(['PAGE', '2/3', 'NEXT >']))
   })
 
@@ -207,6 +232,153 @@ describe('renderKey preview style', () => {
 
   it('icons style still renders fills (dispatch regression)', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects.some((r) => r.style === '#a7f3d0')).toBe(true) // emerald-200 green fill
+    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // emerald-100 green fill
+  })
+})
+
+describe('fonts (Inter)', () => {
+  it('icons tile: banner title and avatar letter render in 600-weight Inter', () => {
+    const { texts } = renderTab(
+      tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
+    )
+    const title = texts.find((t) => t.text === 'build')
+    expect(title?.font).toBe(`600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    const letter = texts.find((t) => t.text === 'B')
+    expect(letter?.font).toContain(`px ${DECK_FONT_STACK}`)
+    expect(letter?.font.startsWith('600 ')).toBe(true)
+  })
+
+  it('pager: dim labels are 400 Inter, the page count is 600 Inter', () => {
+    const { texts } = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
+    expect(texts.find((t) => t.text === 'PAGE')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === 'NEXT >')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('action key labels render in 600 Inter', () => {
+    const { texts } = renderTab({ kind: 'action', action: 'approve', enabled: true })
+    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('strip text renders in 400 Inter', () => {
+    let captured: ReturnType<typeof recordingCtx> | null = null
+    const factory = (w: number, h: number) => {
+      captured = recordingCtx(w, h)
+      return captured.ctx
+    }
+    renderStrip('hello', 800, 100, factory)
+    expect(captured!.texts.find((t) => t.text === 'hello')?.font).toBe(`400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('classic preview tile is PINNED: monospace body, sans-serif banner', () => {
+    const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
+    expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
+    expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+  })
+})
+
+describe('palette derives from the app UI tokens (mapping block in tile-renderer.ts)', () => {
+  it('matches the documented app-token values', () => {
+    expect(TILE_BG).toBe('#09090b')          // --background dark: hsl(240 10% 4%)
+    expect(TILE_FILL_GREEN).toBe('#d1fae5')  // bg-emerald-100 (TabItem green-filled tab)
+    expect(BAR_TOP_BORDER).toBe('#21c45d')   // --success: hsl(142 71% 45%)
+    expect(STATUS_GREEN).toBe('#21c45d')     // text-success (pane running tint)
+    expect(STATUS_BLUE).toBe('#3b82f6')      // text-blue-500 (pane busy tint)
+    expect(STATUS_AMBER).toBe('#f59f0a')     // --warning: hsl(38 92% 50%) (text-warning)
+    expect(STATUS_RED).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%) (text-destructive)
+    expect(STATUS_MUTED).toBe('#a1a1aa')     // text-muted-foreground dark: hsl(240 5% 65%)
+    expect(STATUS_MUTED_DIM).toBe('rgba(161,161,170,0.4)') // text-muted-foreground/40 dark
+    expect(ACTIVE_COLOR).toBe('#ffffff')     // white active ring
+    expect(CONTROL_BG).toBe('#27272a')       // bg-muted dark
+    expect(CONTROL_DIM).toBe('#a1a1aa')      // text-muted-foreground dark
+    expect(APPROVE_COLOR).toBe('#21c45d')    // --success
+    expect(STOP_COLOR).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%)
+  })
+
+  it('classic previews palette is PINNED', () => {
+    expect(PREVIEW_BG).toBe('#0a0a0a')
+    expect(PREVIEW_TEXT_COLOR).toBe('#a8a8a8')
+    expect(RING_COLORS).toEqual({ amber: '#f59e0b', green: '#22c55e', blue: '#3b82f6' })
+  })
+})
+
+describe('agent pane icons (tab-bar presentation)', () => {
+  const repoIcon = { url: null, letter: 'B', hue: 200, ready: false }
+  const bitmap = {} as CanvasImageSource
+
+  it('requests the tinted provider icon (only when ready) and draws it beside the repo avatar', () => {
+    const requested: string[] = []
+    const { images, circles } = renderTab(
+      tabSpec({ icons: [repoIcon], paneIcons: [{ provider: 'claude', tint: 'blue', ready: true }] }),
+      (url) => { requested.push(url); return bitmap },
+    )
+    expect(requested).toEqual([providerIconDataUrl('claude', STATUS_BLUE)])
+    const slots = iconLayout(80, 80, 2)
+    // Slot 0: letter avatar circle; slot 1: the tinted agent icon.
+    expect(circles[0].cx).toBe(slots[0].x + slots[0].size / 2)
+    expect(images).toEqual([{ x: slots[1].x, y: slots[1].y, w: slots[1].size, h: slots[1].size }])
+  })
+
+  it('folds hidden agent icons into a +N badge that occupies a centered, on-key row slot', () => {
+    const paneIcons = [
+      { provider: 'claude', tint: 'green' as const, ready: true },
+      { provider: 'codex', tint: 'green' as const, ready: true },
+      { provider: 'gemini', tint: 'green' as const, ready: true },
+      { provider: 'opencode', tint: 'blue' as const, ready: true },
+    ]
+    const requested: string[] = []
+    const { texts } = renderTab(tabSpec({ icons: [repoIcon], paneIcons }), (url) => { requested.push(url); return bitmap })
+    // The badge occupies the third row slot, so with a repo icon present only
+    // ONE agent icon is drawn (repo + 1 agent + badge = MAX_ROW_SLOTS = 3);
+    // the other three panes fold into +3.
+    expect(requested).toEqual([providerIconDataUrl('claude', PANE_TINT_COLORS.green)])
+    const badge = texts.find((t) => t.text === '+3')
+    expect(badge).toBeDefined()
+    // A hidden pane is busy -> blue badge (TabItem's overflow rule).
+    expect(badge?.style).toBe(STATUS_BLUE)
+    expect(badge?.font).toBe(`600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    // Badge geometry: horizontally centered in the reserved LAST slot of the
+    // 3-slot row, vertically at slot middle - so the whole composition (badge
+    // included) is centered and never clips off the key. The harness stubs
+    // measureText at 6px/char ('+3' -> 12).
+    const last = iconLayout(80, 80, 3)[2]
+    expect(badge?.x).toBe(Math.round(last.x + (last.size - 12) / 2))
+    expect(badge?.y).toBe(last.y + last.size / 2)
+    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80) // fully on-key
+  })
+
+  it('badge is muted when no hidden pane is busy; MAX_KEY_PANE_ICONS binds when no repo icon competes for slots', () => {
+    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
+    const { texts, images } = renderTab(tabSpec({ icons: [], paneIcons }), () => bitmap)
+    // No repo icon: 2 agent icons + badge fill the 3 slots exactly.
+    expect(images).toHaveLength(MAX_KEY_PANE_ICONS)
+    expect(texts.find((t) => t.text === '+1')?.style).toBe(STATUS_MUTED)
+  })
+
+  it('with agent icons present, repo icons collapse to the first one', () => {
+    const icons = [repoIcon, { ...repoIcon, letter: 'C', hue: 10 }, { ...repoIcon, letter: 'D', hue: 20 }]
+    const { circles } = renderTab(tabSpec({ icons, paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => bitmap)
+    expect(circles).toHaveLength(1) // only the first repo avatar
+  })
+
+  it('without agent panes, up to 3 repo icons render exactly as before', () => {
+    const icons = [repoIcon, { ...repoIcon, letter: 'C', hue: 10 }, { ...repoIcon, letter: 'D', hue: 20 }]
+    const { circles } = renderTab(tabSpec({ icons, paneIcons: [] }))
+    expect(circles).toHaveLength(3)
+  })
+
+  it('an unready pane icon draws nothing and never hits the icon source (slot fills on the cache-notify repaint, which flips ready in the spec)', () => {
+    const requested: string[] = []
+    const { images } = renderTab(
+      tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] }),
+      (url) => { requested.push(url); return bitmap },
+    )
+    expect(images).toHaveLength(0)
+    expect(requested).toHaveLength(0) // buildFrame owns load-starting; the renderer only draws
+  })
+
+  it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
+    const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
+    expect(images).toHaveLength(0)
   })
 })
