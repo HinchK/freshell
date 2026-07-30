@@ -1997,6 +1997,11 @@ export const panesSlice = createSlice({
         content.sessionRef = undefined
         content.resumeSessionId = undefined
         content.codexDurability = undefined
+        // znhn item 1 (fresh-eyes fix): a fresh create is a genuinely NEW
+        // identity-less conversation — the persisted "crashed & auto-resumed"
+        // trace belongs to the retired session and must not leak onto it.
+        // The 'respawn' branch deliberately KEEPS it (same conversation).
+        content.crashTrace = undefined
       }
       content.pendingReconcile = intent
       // A1 fix: same-createRequestId folds are only observable via the epoch bump.
