@@ -1559,10 +1559,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             let binder = std::sync::Arc::clone(binder);
             let (sid, tid, m) = (session_id.to_string(), terminal_id.clone(), mode.clone());
             let (c, rid) = (cwd.clone(), create_request_id.clone());
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(join_err) = tokio::task::spawn_blocking(move || {
                 binder.record_prespawn_claude_binding(&sid, &tid, &m, c.as_deref(), Some(&rid));
             })
-            .await; // JoinError only — write failures are warned inside the binder
+            .await
+            {
+                // JoinError means the closure panicked — write failures are warned inside the binder
+                tracing::warn!(target: "freshell_freshagent::invariants", error = %join_err, "prespawn-claude-binding binder task panicked");
+            }
         }
     }
 
@@ -1618,10 +1622,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             {
                 let binder = std::sync::Arc::clone(binder);
                 let sid = session_id.to_string();
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(join_err) = tokio::task::spawn_blocking(move || {
                     binder.delete_prespawn_claude_binding(&sid);
                 })
-                .await;
+                .await
+                {
+                    // JoinError means the closure panicked
+                    tracing::warn!(target: "freshell_freshagent::invariants", error = %join_err, "prespawn-claude-binding delete binder task panicked");
+                }
             }
         }
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
@@ -1731,10 +1739,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             cwd.clone(),
             create_request_id.clone(),
         );
-        let _ = tokio::task::spawn_blocking(move || {
+        if let Err(join_err) = tokio::task::spawn_blocking(move || {
             binder.register_create_identity(&tid, &m, sid.as_deref(), c.as_deref(), Some(&rid));
         })
-        .await;
+        .await
+        {
+            // JoinError means the closure panicked
+            tracing::warn!(target: "freshell_freshagent::invariants", error = %join_err, "create-identity binder task panicked");
+        }
     }
 
     // Restore-across-restart fix (amplifier) + OpenCode terminal-pane restore
