@@ -762,17 +762,17 @@ it('reversed: press-snapshot guard - a tab opened mid-press cannot retarget the 
   // on key 1 - the press must still focus t3, not t4.
 })
 
-it('switching key layout live re-arranges keys and resets to page 1', () => {
+it('switching key layout live re-arranges keys and preserves the page when tabsPerPage is unchanged', () => {
   const { store, device } = setup({ tabCount: 8, keyLayout: 'status-sorted' })
   expect(decodeKey(device, 5)).toMatchObject({ kind: 'pager' }) // standard overflow pager, bottom-right
   shortPress(device, 5) // go to page 2 in standard
   store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
-  expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 }) // tabsPerPage changed 5->5? see note
-  expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't8' })
+  expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 2, pageCount: 2 }) // page preserved: tabsPerPage unchanged (5), clampPage(2, 2) === 2
+  expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' }) // reversed page 2 shows t3, t2, t1
 })
 ```
 
-Note on the last test: on a 6-key deck with 8 tabs, `tabsPerPage` is 5 in BOTH arrangements, so the existing `tabsPerPage`-change page reset does not fire — the page must still be clamped/valid and the frame must repaint into the reversed arrangement (the model JSON diff includes `keyLayout`). Assert the observable outcome shown above; if the implementer finds page 2 preserved (also valid: `clampPage(2, 2) === 2`), pin THAT observable outcome and adjust the expected `page:` values — do not add a speculative reset.
+Note on the last test: on a 6-key deck with 8 tabs, `tabsPerPage` is 5 in BOTH arrangements, so the existing `tabsPerPage`-change page reset (deck-controller.ts:238-240) does not fire, and `clampPage(2, 2) === 2` preserves page 2 — the deterministic outcome is: page 2 preserved, pager repainted at key 0, reversed page 2 showing `t3, t2, t1` (so key 1 → `t3`). The frame must still repaint into the reversed arrangement (the model JSON diff includes `keyLayout`). The literals above pin exactly that outcome; the reset-to-page-1 behavior is covered by the next test, where `tabsPerPage` genuinely changes.
 
 Also add the layout-change page-reset behavior test where `tabsPerPage` DOES change (Plus, explicit switch): `setup({ tabCount: 9, keyLayout: 'status-sorted' }, PLUS_CAPS)` is full-mode (8/page); dispatching `keyLayout: 'newest-first'` makes it 7/page and must reset to page 1 via the existing `tabsPerPage`-change reset (`deck-controller.ts:238-240`).
 
