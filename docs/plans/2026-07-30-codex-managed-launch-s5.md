@@ -133,6 +133,9 @@ implement them; Task 13 records them in the ledgers.
   new `HubMsg` variants, options timeouts, `RemoteProxyRepairTrigger::CandidateCaptureTimeout`.
 - `crates/freshell-codex/tests/candidate_gate.rs` — NEW: gate integration tests (pure-Rust
   fake upstream).
+- `crates/freshell-codex/tests/remote_proxy_relay.rs` — gate release added to the two
+  `thread/fork` rewrite tests (every relay test constructs the proxy with
+  `require_candidate_persistence == true`, so the new gate holds their fork frames otherwise).
 - `crates/freshell-codex/src/launch_lifecycle.rs` — persistence plumbing on sidecar+manager,
   drain task + set-once sink, sidecar planning budget, pub spawn helpers.
 - `crates/freshell-codex/src/launch_plan.rs` — flag default flip, binding_reason decision doc.
@@ -171,6 +174,8 @@ test estate; 13 closes the records.
 
 **Files:**
 - Modify: `crates/freshell-codex/src/remote_proxy.rs`
+- Modify: `crates/freshell-codex/tests/remote_proxy_relay.rs` (release the gate in the two
+  fork-rewrite tests — see Step 3i)
 - Test: `crates/freshell-codex/tests/candidate_gate.rs` (new)
 
 **Interfaces:**
@@ -701,12 +706,31 @@ Also update the now-stale module doc at `remote_proxy.rs:16-26` ("deliberately O
 for this slice") to say the initial_capture gate IS now ported (S5.c), fork_handoff gate
 remains unported (fence).
 
+3i. Update the EXISTING relay suite, `crates/freshell-codex/tests/remote_proxy_relay.rs`:
+every test there constructs the proxy with
+`CodexRemoteProxyOptions::new(&upstream.ws_url, true)`, so after 3e the gate initializes to
+Holding in ALL of them. Only the two `thread/fork` rewrite tests actually send a gated
+method (re-anchor by searching the file for `thread/fork`; approx `:351/:364` and
+`:390/:398` as of this writing) — without a release, their fork frames are held, the
+upstream-receive waits time out, and the 5s hold timer fails the gate. In each of those two
+tests, call `proxy.mark_candidate_persisted()` right after the proxy/client connection is
+established and BEFORE the fork frame is sent, with a one-line comment:
+`// S5.c: release the identity gate up front — this test exercises fork rewrite, not the gate.`
+(Ordering is safe either way: a frame that lands before the release is held, then flushed
+upstream on release — the rewrite assertion still observes it.) This doubles as coverage
+that a released gate forwards gated methods. The remaining relay tests send only non-gated
+traffic (the gate holds `turn/start` / `thread/fork` requests exclusively) and need no
+change.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-codex --test candidate_gate` (same feature flags as Step 2), then
-the whole crate: `cargo test -p freshell-codex`.
-Expected: all PASS (pre-existing tests must stay green — the gate is inert when
-`require_candidate_persistence == false`).
+Run: `cargo test -p freshell-codex --features real-transport --test candidate_gate` (same
+feature flag as Step 2), then the relay suite:
+`cargo test -p freshell-codex --features real-transport --test remote_proxy_relay`, then the
+whole default-feature crate: `cargo test -p freshell-codex`.
+Expected: all PASS. The relay suite passes ONLY because of Step 3i's gate releases — its
+proxies are all built with `require_candidate_persistence == true`; the gate is inert only
+when that flag is `false`. If the two fork-rewrite tests hang/fail here, Step 3i was missed.
 
 - [ ] **Step 5: fmt/clippy + commit**
 
@@ -758,7 +782,10 @@ body is what matters.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p freshell-codex --test launch_lifecycle mark_candidate_persisted_is_a_noop_for_unknown_terminals`
+Run: `cargo test -p freshell-codex --features real-transport --test launch_lifecycle mark_candidate_persisted_is_a_noop_for_unknown_terminals`
+(the `--features real-transport` flag is REQUIRED: both the `launch_lifecycle` module
+(`lib.rs:50-51`) and `tests/launch_lifecycle.rs` (`:13`) are cfg-gated behind that default-off
+feature — ledger A26; without it the test binary compiles empty and exits 0, proving nothing.)
 Expected: FAIL to compile — methods do not exist.
 
 - [ ] **Step 3: Implement**
@@ -823,7 +850,8 @@ On `impl CodexTerminalLaunchManager`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-codex --test launch_lifecycle`
+Run: `cargo test -p freshell-codex --features real-transport --test launch_lifecycle`
+(same feature flag as Step 2 — without it the binary is empty and the pass is vacuous.)
 Expected: PASS.
 
 - [ ] **Step 5: fmt/clippy + commit**
@@ -912,7 +940,10 @@ new one if none exists in-module):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p freshell-codex drain_forwards_tagged_events`
+Run: `cargo test -p freshell-codex --features real-transport drain_forwards_tagged_events`
+(the `--features real-transport` flag is REQUIRED: the `launch_lifecycle` module — and these
+in-module tests with it — is cfg-gated behind that default-off feature at `lib.rs:50-51`,
+ledger A26; without the flag nothing here compiles and the command passes vacuously.)
 Expected: FAIL to compile — `spawn_proxy_event_drain` / `TerminalProxyEvent` do not exist.
 
 - [ ] **Step 3: Implement**
@@ -1040,7 +1071,9 @@ In `crates/freshell-codex/src/launch_plan.rs`, extend the `binding_reason` field
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-codex`
+Run: `cargo test -p freshell-codex --features real-transport` (compiles and runs the drain
+tests plus the pre-existing feature-gated suites), then `cargo test -p freshell-codex` for
+the default-feature estate.
 Expected: PASS (including the pre-existing launch_lifecycle integration tests — `adopt`'s
 observable contract is unchanged).
 
@@ -2090,7 +2123,10 @@ construct it inline inside each spawned task as shown for `input`.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p freshell-codex --test launch_lifecycle third_concurrent_plan_fails_fast`
+Run: `cargo test -p freshell-codex --features real-transport --test launch_lifecycle third_concurrent_plan_fails_fast`
+(the `--features real-transport` flag is REQUIRED — `tests/launch_lifecycle.rs` is cfg-gated
+behind that default-off feature (`:13`, ledger A26); without it the binary is empty and
+exits 0.)
 Expected: FAIL to compile — `with_plan_budget` does not exist.
 
 - [ ] **Step 3: Implement the budget**
@@ -2158,7 +2194,8 @@ Wrap the manager's `plan_create_with_retry` body:
     }
 ```
 
-Run: `cargo test -p freshell-codex --test launch_lifecycle` — Expected: PASS.
+Run: `cargo test -p freshell-codex --features real-transport --test launch_lifecycle` (same
+feature flag as Step 2) — Expected: PASS.
 
 - [ ] **Step 4: Move the REST spawn-gate acquire (plan no longer under the permit)**
 
