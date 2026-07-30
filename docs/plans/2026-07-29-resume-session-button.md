@@ -27,7 +27,7 @@ Playwright for browser e2e.
 ## Global Constraints
 
 - Providers are exactly `DEFAULT_ENABLED_CLI_PROVIDERS = ['claude', 'codex', 'opencode', 'amplifier']` from `shared/coding-cli-defaults.ts`.
-- Target backend is the **Node server** (`server/index.ts`) — confirmed: `npm run dev` runs `tsx watch server/index.ts` and `npm start` runs `dist/server/index.js`. The "server/ is FROZEN" comments found in some e2e files (e.g. `test/e2e-browser/playwright.config.ts:212`, `test/e2e-browser/specs/sidebar-click-resume.spec.ts:31`) are **stale**: that freeze was branch-scoped parity discipline for the `feat/rust-tauri-port` branch, which merged into main on 2026-07-27; `server/` is actively developed and is the shipping backend. Rust-server parity is **out of scope** — record `POST /api/sessions/resolve` **and the new `sessionResolve` feature flag** as a Rust-parity follow-up item (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`); the parity implementation itself stays out of scope.
+- Target backend is the **Node server** (`server/index.ts`) — confirmed: `npm run dev` runs `tsx watch server/index.ts` and `npm start` runs `dist/server/index.js`. The "server/ is FROZEN" comments found in some e2e files (e.g. `test/e2e-browser/playwright.config.ts:212`, `test/e2e-browser/specs/sidebar-click-resume.spec.ts:31`) are **stale**: that freeze was branch-scoped parity discipline for the `feat/rust-tauri-port` branch, which merged into main on 2026-07-27; `server/` is actively developed and is the shipping backend. Rust-server parity is **out of scope** — record `POST /api/sessions/resolve` **and the new `sessionResolve` feature flag** as a Rust-parity follow-up item (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` — this edit is performed in Task 6 Step 5); the parity implementation itself stays out of scope.
 - The Resume button is **feature-flag gated**: the Node server declares `sessionResolve: true` in `detectFeatureFlags()` (`server/platform-router.ts:20-25`, Task 3), served in `/api/platform` (`server/platform-router.ts:37-38`) and `/api/bootstrap` (`server/index.ts:223`); the client stores it via `setFeatureFlags` into `connection.featureFlags` (`src/App.tsx:601-602`, `src/store/connectionSlice.ts:16,68-69`) and the Sidebar renders the Resume footer only when the flag is true (Task 5; selector precedent `src/components/panes/PanePicker.tsx:105`). The Rust server serves the **same** `dist/client` bundle and 404s cleanly on unmatched `/api/*`; its `/api/platform` featureFlags parity (`crates/freshell-server/src/boot.rs:12,58,167`) intentionally does NOT declare the flag, so the button stays hidden on Rust/Tauri deployments **by design**. Both sides type featureFlags as `Record<string, boolean>`, so the new key forces no type changes.
 - **Accepted limitation (per spec):** prefix matching only matches **indexed** sessions. Exact-id misses additionally consult the claude transcript locator and the opencode by-id query. "Provider unavailable" is approximated by the single global index-readiness flag (`startup-state.ts` task `codingCliIndexer`) — the Node server has no per-provider readiness. A **time-extension** of the same limitation (real-store verified): the snapshot stays partial until the first FULL scan completes even after the readiness flag flips (codex worst-case ~4% coverage right after cold start); the exact-id fallbacks still cover claude (locator) and opencode (by-id query) in that window.
 - Real-store note: ~20% of indexed cwds no longer exist on disk. Terminal create already handles a missing cwd by defaulting (`server/terminal-registry.ts:1575` — homedir on Linux); a cwd-existence policy is deliberately out of scope for this plan.
@@ -2322,17 +2322,56 @@ Expected: 3 tests PASS. (If the suite requires a build first, follow the same
 pre-steps the repo uses for `sidebar-click-resume.spec.ts` runs — see the
 `test:e2e` script and Playwright config `webServer`/global-setup.)
 
-- [ ] **Step 5: Add the user-facing feature line**
+- [ ] **Step 5: Mirror the Resume button in the docs mock + record the Rust-parity follow-up**
 
-In `docs/index.html`, find the feature list that documents sidebar/session
-capabilities and add one entry:
+Two documentation edits (the AGENTS.md user-facing-docs rule, plus the Global
+Constraints parity commitment). Note `docs/index.html` is a **nonfunctional
+HTML mock** of the default app experience — it contains NO `<ul>`/`<li>`
+feature list; the sidebar is `<aside class="sidebar" id="sidebar">` (lines
+603–643) built from div rows (`.sb-list` spans 633–641; `.sb-footer` is line
+642). Mirror the real UI change in that mock:
+
+1. Markup — insert one line between the `</div>` that closes `.sb-list`
+   (line 641, 6-space indent) and the `.sb-footer` div (line 642):
 
 ```html
-<li><strong>Resume by id:</strong> a pinned Resume button below the session list — paste any session id or resume command and freshell finds the right agent and reopens it in a tab.</li>
+      <div class="sb-resume"><button class="sb-resume-btn"><i data-lucide="rotate-ccw" class="icon"></i> Resume session…</button></div>
 ```
 
-(Match the exact markup of sibling entries in that file — copy an adjacent `<li>`
-and edit its text.)
+2. CSS — in the `<style>` block, add between the `.sb-item-meta` rule
+   (~line 206) and the `.sb-footer` rule (~line 207), copying the
+   `.sb-nav-btn` styling conventions (lines 183–190):
+
+```css
+    .sb-resume { padding: 8px; border-top: 1px solid hsl(var(--border)); }
+    .sb-resume-btn { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: none; background: none; border-radius: 6px; cursor: pointer; transition: all .12s; color: hsl(var(--muted-foreground)); font: inherit; font-size: 13px; }
+    .sb-resume-btn:hover { color: hsl(var(--foreground)); background: hsl(var(--muted) / .5); }
+```
+
+3. Inert-control wiring — add `'.sb-resume-btn'` to the `inertSelectors`
+   array (lines ~1679–1688) so clicking the mock button shows the standard
+   mock overlay like every other fake control there.
+
+No layout surgery is needed: `.sidebar` is `display:flex; flex-direction:column`
+and `.sb-list` is `flex: 1; overflow-y: auto`, so a sibling inserted between the
+list and `.sb-footer` renders pinned below the scroll area automatically.
+
+Verify: open `docs/index.html` in a browser — a "Resume session…" row sits
+pinned between the session list and the "★ Star on GitHub" footer; clicking it
+triggers the same inert-control overlay as the other mock buttons.
+
+4. Parity checklist — in
+   `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, append a
+   new item at the END of the ``## P2 — Current `main` catch-up not otherwise
+   covered above`` section (after the SYNC-05 item ending at line 801, before
+   the `## Final release gates` heading at line 803), using the section's next
+   free `SYNC-NN` id (`SYNC-06` at time of writing — SYNC-00…05 exist at lines
+   783–801) and the file's exact item format (cf. SYNC-01 at lines 786–787):
+
+```markdown
+- [ ] **SYNC-06 — Session resume-by-id parity: `POST /api/sessions/resolve` + `sessionResolve` feature flag.** The Node server (`server/sessions-router.ts`) resolves pasted session ids/resume commands across claude/codex/opencode/amplifier and gates the sidebar Resume button via the `sessionResolve` flag in `detectFeatureFlags()`; the Rust server intentionally omits the flag (button stays hidden) until it implements the endpoint. See `docs/plans/2026-07-29-resume-session-button.md`.
+  - **Playwright validation (`PW-RUST`, `PW-TAURI-WIN`):** With the flag declared, the sidebar shows the pinned Resume button; pasting a known session id resumes it in a tab (mirror `test/e2e-browser/specs/resume-button.spec.ts`).
+```
 
 - [ ] **Step 6: Full verification pass**
 
@@ -2348,8 +2387,10 @@ Expected: all PASS, no lint errors (a11y rules are CI-gated on `src/`).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add test/e2e-browser/specs/resume-button.spec.ts docs/index.html
+git add test/e2e-browser/specs/resume-button.spec.ts
 git commit -m "test(e2e): resume button pinned placement and paste-to-resume proof"
+git add docs/index.html docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
+git commit -m "docs: mirror pinned Resume button in UI mock; record Rust-parity follow-up"
 ```
 
 ---
