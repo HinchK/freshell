@@ -13,7 +13,7 @@ import settingsReducer from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import type { DeckTileStyle } from '@shared/settings'
+import type { DeckKeyLayout, DeckTileStyle } from '@shared/settings'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
@@ -232,6 +232,12 @@ function withTileStyle(state: never, tileStyle: DeckTileStyle): never {
   return clone as never
 }
 
+function withKeyLayout(state: never, keyLayout: DeckKeyLayout): never {
+  const clone = structuredClone(state) as { settings: { settings: { streamDeck: { keyLayout: string } } } }
+  clone.settings.settings.streamDeck.keyLayout = keyLayout
+  return clone as never
+}
+
 describe('getTabStatusFlags', () => {
   it('greenIcon: running non-busy pane sets greenIcon (tab bar green icon condition)', () => {
     const state = makeState() // default fixture: t1 has a claude terminal pane, status running, not busy
@@ -407,6 +413,29 @@ describe('selectDeckModel (sorted, tile fields)', () => {
     expect(model.tileStyle).toBe('terminal-previews')
     expect(model.tabs.map((t) => t.id)).toEqual(tabsOf(state).map((t) => t.id))
     expect(tabsOf(state).map((t) => t.id)).toEqual(['t1', 't2', 't3', 't4', 't5'])
+  })
+
+  it('exposes keyLayout on the model (default auto)', () => {
+    const base = makeState({ tabs: 1 })
+    expect(selectDeckModel(base).keyLayout).toBe('auto')
+    expect(selectDeckModel(withKeyLayout(base, 'newest-first')).keyLayout).toBe('newest-first')
+  })
+
+  it('stamps tabIndex with the tab-bar position, surviving the priority sort', () => {
+    // Reuse the sort fixture from 'sorts tabs by priority...': after the
+    // sort, each DeckTab.tabIndex still equals its position in state.tabs.tabs.
+    const sortFixtureState = makeState({
+      tabs: 5,
+      activeTab: 't5',
+      paneStatus: { p1: 'exited' },
+      busy: ['term-2'],
+      attention: { t4: true, t5: true },
+    })
+    const model = selectDeckModel(sortFixtureState)
+    expect(model.tabs.map((t) => t.id)).toEqual(['t5', 't4', 't3', 't2', 't1']) // sort actually reordered
+    for (const t of model.tabs) {
+      expect(t.tabIndex).toBe(tabsOf(sortFixtureState).findIndex((tab) => tab.id === t.id))
+    }
   })
 
   it('quiet tabs report pendingApproval false', () => {

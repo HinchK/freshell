@@ -17,7 +17,7 @@ import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer, { upsertTerminalMeta } from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import type { DeckTileStyle } from '@shared/settings'
+import type { DeckKeyLayout, DeckTileStyle } from '@shared/settings'
 import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
@@ -55,6 +55,15 @@ type StoreOpts = {
    * streamDeck settings object, so the two are always consistent there.
    */
   tileStyle?: DeckTileStyle
+  /**
+   * Key layout. Seeds the store settings (selectDeckModel reads
+   * state.settings.settings.streamDeck.keyLayout); the controller's settings()
+   * thunk does not carry keyLayout. Defaults to 'status-sorted': existing tests
+   * document the STANDARD arrangement explicitly ('auto' resolves REVERSED on
+   * <= 6-key decks and would silently flip Mini-based fixtures); 'auto'
+   * resolution and the reversed arrangement have dedicated tests.
+   */
+  keyLayout?: DeckKeyLayout
 }
 
 // Mirrors the Task 3 fixture builder, parameterized by tab count: tabs t1..tN,
@@ -123,6 +132,7 @@ function makeStore(opts: StoreOpts = {}) {
   if (opts.tileStyle !== undefined) {
     store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
   }
+  store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: opts.keyLayout ?? 'status-sorted' } }))
   return store
 }
 

@@ -1,5 +1,6 @@
+import type { DeckKeyLayout } from '@shared/settings'
 import type { DeckCapabilities } from './deck-device'
-import type { DeckModel, TilePaneIcon } from './deck-selectors'
+import type { DeckModel, DeckTab, TilePaneIcon } from './deck-selectors'
 import type { TileFill } from './tile-state'
 import { PANE_TINT_COLORS } from './pane-tint-colors'
 import { providerIconDataUrl } from './provider-icon-svg'
@@ -29,8 +30,46 @@ export type LayoutPlan = {
   useStrip: boolean
 }
 
-export function planLayout(caps: DeckCapabilities, tabCount: number): LayoutPlan {
+export type DeckArrangement = 'standard' | 'reversed'
+
+/** Smallest decks (<= 6 keys, e.g. the 6-key Mini) default to the reversed
+ * "newest first" arrangement under keyLayout 'auto'; larger decks keep the
+ * status-sorted standard. */
+export const AUTO_REVERSED_MAX_KEYS = 6
+
+export function resolveArrangement(keyLayout: DeckKeyLayout, keyCount: number): DeckArrangement {
+  if (keyLayout === 'newest-first') return 'reversed'
+  if (keyLayout === 'status-sorted') return 'standard'
+  return keyCount <= AUTO_REVERSED_MAX_KEYS ? 'reversed' : 'standard'
+}
+
+/** Reversed = strictly reverse tab-bar order (newest first while tabs are
+ * unreordered; after a manual reorder or cross-device order sync it mirrors
+ * the reversed tab bar) with NO status sorting, so key positions are
+ * deterministic and muscle-memory-stable (status still shows via
+ * fills/icons/rings). Standard keeps the model's order: status-sorted for
+ * status-icons, raw tab-bar order for previews. */
+export function arrangeTabs(tabs: DeckTab[], arrangement: DeckArrangement): DeckTab[] {
+  if (arrangement !== 'reversed') return tabs
+  return [...tabs].sort((a, b) => b.tabIndex - a.tabIndex)
+}
+
+export function planLayout(caps: DeckCapabilities, tabCount: number, arrangement: DeckArrangement = 'standard'): LayoutPlan {
   const range = (n: number) => Array.from({ length: n }, (_, i) => i)
+  if (arrangement === 'reversed') {
+    const full = caps.dialCount >= 2 && caps.hasTouchStrip
+    return {
+      mode: full ? 'full' : 'keys',
+      keyCount: caps.keyCount,
+      // Pager ALWAYS reserved at top-left (key 0) — even when all tabs fit —
+      // so tab positions never shift as the tab count crosses capacity.
+      tabSlots: range(caps.keyCount - 1).map((i) => i + 1),
+      pagerKey: 0,
+      tabsPerPage: caps.keyCount - 1,
+      useDials: full,
+      useStrip: caps.hasTouchStrip,
+    }
+  }
   if (caps.dialCount >= 2 && caps.hasTouchStrip) {
     return {
       mode: 'full', keyCount: caps.keyCount, tabSlots: range(caps.keyCount),
@@ -94,7 +133,8 @@ export type FrameInputs = {
 }
 
 export function buildFrame({ model, caps, page, actionLayer, iconReady, previewFor }: FrameInputs): FrameSpec {
-  const plan = planLayout(caps, model.tabs.length)
+  const arrangement = resolveArrangement(model.keyLayout, caps.keyCount)
+  const plan = planLayout(caps, model.tabs.length, arrangement)
   const pages = pageCount(model.tabs.length, plan.tabsPerPage)
   const keys: KeySpec[] = Array.from({ length: plan.keyCount }, () => ({ kind: 'empty' as const }))
   const strip: StripSpec = plan.useStrip ? { text: stripText(model, clampPage(page, pages), pages) } : null
@@ -109,7 +149,7 @@ export function buildFrame({ model, caps, page, actionLayer, iconReady, previewF
   }
 
   const current = clampPage(page, pages)
-  const visible = visibleTabs(model.tabs, current, plan.tabsPerPage)
+  const visible = visibleTabs(arrangeTabs(model.tabs, arrangement), current, plan.tabsPerPage)
   plan.tabSlots.forEach((keyIndex, slot) => {
     const tab = visible[slot]
     if (!tab) return

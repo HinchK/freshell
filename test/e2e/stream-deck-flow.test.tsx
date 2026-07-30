@@ -22,7 +22,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import type { Tab } from '@/store/types'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import type { DeckTileStyle } from '@shared/settings'
+import type { DeckKeyLayout, DeckTileStyle } from '@shared/settings'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
@@ -61,6 +61,14 @@ type DeckStoreOpts = {
    * live-settings setup (setupLive) sees it on its first paint.
    */
   tileStyle?: DeckTileStyle
+  /**
+   * Seed settings.localSettings.streamDeck.keyLayout the same way. Defaults to
+   * 'status-sorted': existing tests document the STANDARD arrangement
+   * explicitly ('auto' resolves REVERSED on <= 6-key decks and would silently
+   * flip Mini-based fixtures); 'auto' resolution and the reversed arrangement
+   * have dedicated tests.
+   */
+  keyLayout?: DeckKeyLayout
 }
 
 // Local extraction of the deck-controller unit-suite fixture builder: tabs
@@ -130,6 +138,7 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
   if (opts.tileStyle !== undefined) {
     store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
   }
+  store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: opts.keyLayout ?? 'status-sorted' } }))
   return store
 }
 
