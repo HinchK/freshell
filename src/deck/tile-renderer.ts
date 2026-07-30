@@ -105,9 +105,10 @@ export const MAX_TITLE_CHARS = 10
 export const MAX_KEY_PANE_ICONS = 2
 export const OVERFLOW_FONT_SIZE = 10
 /**
- * Max row slots (icons + badge). iconLayout guarantees on-key fit only up to
- * 3 slots (4 slots overflow an 80px key by 1px and a 72px key by 9px), so the
- * +N badge COUNTS AS A SLOT and drawn agent icons shrink to make room for it.
+ * Max row slots (icons + badge). iconLayout's row-fit clamp guarantees any
+ * slot count fits inside the rounded frame, but 3 remains the visual maximum
+ * to mirror TabItem's row, so the +N badge COUNTS AS A SLOT and drawn agent
+ * icons shrink to make room for it.
  */
 const MAX_ROW_SLOTS = 3
 
@@ -154,13 +155,19 @@ export function fitLabel(measure: (t: string) => number, text: string, maxWidth:
   return `${t}…`
 }
 
+/** Keeps multi-icon rows clear of the rounded key frame's corners/edges. */
+export const ICON_ROW_SIDE_INSET = 6
+
 /** Centered icon slots in the area below the title banner. */
 export function iconLayout(w: number, h: number, count: number): Array<{ x: number; y: number; size: number }> {
   if (count <= 0) return []
   const areaTop = BANNER_HEIGHT
   const areaH = h - areaTop
-  const scale = count === 1 ? 0.5 : 0.3
-  const size = Math.round(Math.min(w, areaH) * scale)
+  const scale = count === 1 ? 0.75 : 0.45
+  let size = Math.round(Math.min(w, areaH) * scale)
+  // Row-fit clamp: the whole row (icons + gaps) stays inside the rounded frame.
+  const innerW = w - 2 * ICON_ROW_SIDE_INSET
+  size = Math.min(size, Math.floor((innerW - (count - 1) * ICON_GAP) / count))
   const rowW = count * size + (count - 1) * ICON_GAP
   const x0 = Math.round((w - rowW) / 2)
   const y = Math.round(areaTop + (areaH - size) / 2)
@@ -289,7 +296,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     // counted in the iconLayout call), so it can never clip off the key.
     const slot = slots[slots.length - 1]
     const label = `+${hidden.length}`
-    ctx.font = `600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`
+    ctx.font = `600 ${Math.max(OVERFLOW_FONT_SIZE, Math.round(slot.size / 2))}px ${DECK_FONT_STACK}`
     ctx.textBaseline = 'middle'
     ctx.fillStyle = hidden.some((p) => p.tint === 'blue') ? STATUS_BLUE : STATUS_MUTED
     ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)

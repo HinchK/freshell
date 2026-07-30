@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { MINI_CAPS } from '@/deck/fake-deck-device'
+import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
   cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
-  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
+  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE, BANNER_HEIGHT, ICON_ROW_SIDE_INSET,
   TEXT_LETTER_SPACING, TITLE_SIDE_PADDING,
   ensureRoundRect,
 } from '@/deck/tile-renderer'
@@ -212,7 +212,7 @@ describe('renderKey', () => {
     expect(rects.some((r) => r.style === repoAvatarColor(200))).toBe(false)
     const letter = texts.find((t) => t.text === 'B')
     expect(letter?.style).toBe('#ffffff')
-    // 9/16 of the diameter, weight 600 (slot.size is 30 on the 80x80 Mini -> 17px).
+    // 9/16 of the diameter, weight 600 (slot.size is 45 on the 80x80 Mini -> 25px).
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
@@ -224,16 +224,25 @@ describe('renderKey', () => {
     expect(rects[2]).toMatchObject({ x: 0, y: 0, w: 80, h: 20, style: BANNER_FILL })
   })
 
-  it('iconLayout: 1 icon centered large; 3 icons in a centered row below the banner', () => {
+  it('iconLayout: 1 icon centered ~50% larger; 3 icons clamp to fit inside the rounded frame', () => {
     const one = iconLayout(80, 80, 1)
-    expect(one).toHaveLength(1)
-    expect(one[0].size).toBe(30) // round(min(80, 60) * 0.5)
-    expect(one[0].x).toBe(Math.round((80 - 30) / 2))
-    expect(one[0].y).toBe(Math.round(20 + (60 - 30) / 2))
+    expect(one[0].size).toBe(45) // round(min(80, 60) * 0.75)
+    expect(one[0].x).toBe(Math.round((80 - 45) / 2)) // 18
+    expect(one[0].y).toBe(Math.round(20 + (60 - 45) / 2)) // 28
+    expect(one[0].y).toBeGreaterThanOrEqual(BANNER_HEIGHT) // clear of the banner
+
+    const two = iconLayout(80, 80, 2)
+    expect(two.every((s) => s.size === 27)).toBe(true) // round(60 * 0.45), fits unclamped
+
     const three = iconLayout(80, 80, 3)
-    expect(three).toHaveLength(3)
-    expect(three.every((s) => s.size === 18)).toBe(true) // round(60 * 0.3)
-    expect(three[1].x - three[0].x).toBe(18 + 3)         // size + gap
+    expect(three.every((s) => s.size === 20)).toBe(true) // clamped: floor((80 - 12 - 2*3) / 3)
+    expect(three[1].x - three[0].x).toBe(20 + 3) // size + gap
+    const last = three[2]
+    expect(last.x + last.size).toBeLessThanOrEqual(80 - ICON_ROW_SIDE_INSET) // on-frame guarantee
+
+    const threeSmall = iconLayout(72, 72, 3)
+    expect(threeSmall.every((s) => s.size === 18)).toBe(true) // floor((72 - 12 - 6) / 3)
+    expect(threeSmall[0].x).toBeGreaterThanOrEqual(ICON_ROW_SIDE_INSET)
   })
 
   it('pager key renders PAGE / n/m / NEXT > on the control background', () => {
@@ -474,7 +483,24 @@ describe('agent pane icons (tab-bar presentation)', () => {
     const last = iconLayout(80, 80, 3)[2]
     expect(badge?.x).toBe(Math.round(last.x + (last.size - 12) / 2))
     expect(badge?.y).toBe(last.y + last.size / 2)
-    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80) // fully on-key
+    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80 - ICON_ROW_SIDE_INSET) // fully inside the rounded frame
+  })
+
+  it('+N badge font scales with its slot (Plus-size key exercises the scaling branch)', () => {
+    // 120px key, repo avatar + 4 agent panes => repo + 1 agent + badge = 3 slots.
+    const paneIcons = [
+      { provider: 'claude', tint: 'green' as const, ready: true },
+      { provider: 'codex', tint: 'green' as const, ready: true },
+      { provider: 'gemini', tint: 'green' as const, ready: true },
+      { provider: 'opencode', tint: 'green' as const, ready: true },
+    ]
+    let cap: ReturnType<typeof recordingCtx> | null = null
+    renderKey(tabSpec({ icons: [repoIcon], paneIcons }), PLUS_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx, () => bitmap)
+    const badge = cap!.texts.find((t) => t.text === '+3')
+    const slot = iconLayout(120, 120, 3)[2]
+    expect(badge?.font).toBe(`600 ${Math.max(OVERFLOW_FONT_SIZE, Math.round(slot.size / 2))}px ${DECK_FONT_STACK}`)
+    // The scaling branch is live here: slot 34 => 17px, not the 10px floor.
+    expect(badge?.font).toBe(`600 17px ${DECK_FONT_STACK}`)
   })
 
   it('badge is muted when no hidden pane is busy; MAX_KEY_PANE_ICONS binds when no repo icon competes for slots', () => {
