@@ -1411,6 +1411,92 @@ pub(crate) fn build_pty_exit_hook(
     })
 }
 
+/// Spawn-time launch intent + resume identity, derived before spawn.
+/// PURE with respect to server state: create-body reads + local RNG only
+/// (V6 rung table). The claude restore ladder deliberately does NOT live
+/// here — it stays in handle_create, after the adopt/D8 arms.
+pub(crate) struct LaunchPrep {
+    pub launch_intent: LaunchIntent,
+    pub resume_session_id: Option<String>,
+    pub claude_fresh_prealloc: bool,
+}
+
+/// Extraction of handle_create's PURE derivation rungs
+/// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
+/// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
+/// extracted, so there is no error path.
+pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchPrep {
+    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
+    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
+    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
+    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
+    let mut launch_intent = LaunchIntent::Resume;
+    let mut resume_session_id: Option<String> = None;
+    // PIN 2 (Step 4b): whether THIS create minted a fresh claude identity.
+    // Only such a create may delete its pre-spawn binding row on spawn
+    // failure — a resume-create's row belongs to the prior epoch and must
+    // stay recoverable.
+    let mut claude_fresh_prealloc = false;
+    if mode != "shell" {
+        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
+        // Shared with the REST spawn pipeline (kata hbsa) — one predicate,
+        // two doors: freshell_platform::should_preallocate_fresh_claude.
+        let should_preallocate_fresh_claude = freshell_platform::should_preallocate_fresh_claude(
+            mode,
+            create.restore,
+            create.session_ref.is_some(),
+            create.resume_session_id.as_deref(),
+        );
+        // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
+        // preallocation's sibling: a FRESH amplifier pane gets a
+        // server-minted session id, and (below, in the pre-create block) a
+        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
+        // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
+        // amplifier's manifest has resumeArgs only; `Start` without
+        // createSessionArgs is a hard StartIntentUnsupported error
+        // (cli_launch.rs:431-445; pinned by golden G-A4).
+        let should_preallocate_fresh_amplifier = mode == "amplifier"
+            && create.restore != Some(true)
+            && create.session_ref.is_none()
+            && create
+                .resume_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none();
+        if should_preallocate_fresh_claude {
+            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
+            // per-requestId dedupe cache is a retry concern this single-shot
+            // handler does not have.
+            resume_session_id = Some(Uuid::new_v4().to_string());
+            launch_intent = LaunchIntent::Start;
+            claude_fresh_prealloc = true;
+        } else if should_preallocate_fresh_amplifier {
+            resume_session_id = Some(Uuid::new_v4().to_string());
+        } else {
+            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
+            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
+            // derives the codex resume id from the sessionRef too (the
+            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
+            // codex-special arm here read ONLY `create.resumeSessionId` -- but
+            // the frozen client carries identity ONLY in `sessionRef`
+            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
+            // sidebar reopen spawned plain `codex` with no resume args
+            // (2026-07-22 incident; regression test:
+            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
+            // 'resume' (`tr:1570-1571`).
+            resume_session_id = requested_ref
+                .map(|r| r.session_id.clone())
+                .or_else(|| create.resume_session_id.clone())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    LaunchPrep {
+        launch_intent,
+        resume_session_id,
+        claude_fresh_prealloc,
+    }
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
@@ -1619,106 +1705,53 @@ pub(crate) async fn handle_create(
         host_os,
     );
 
-    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
-    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
-    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
-    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
-    let mut launch_intent = LaunchIntent::Resume;
-    let mut resume_session_id: Option<String> = None;
-    // PIN 2 (Step 4b): whether THIS create minted a fresh claude identity.
-    // Only such a create may delete its pre-spawn binding row on spawn
-    // failure — a resume-create's row belongs to the prior epoch and must
-    // stay recoverable.
-    let mut claude_fresh_prealloc = false;
-    if mode != "shell" {
-        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
-        // Shared with the REST spawn pipeline (kata hbsa) — one predicate,
-        // two doors: freshell_platform::should_preallocate_fresh_claude.
-        let should_preallocate_fresh_claude = freshell_platform::should_preallocate_fresh_claude(
-            &mode,
-            create.restore,
-            create.session_ref.is_some(),
-            create.resume_session_id.as_deref(),
-        );
-        // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
-        // preallocation's sibling: a FRESH amplifier pane gets a
-        // server-minted session id, and (below, in the pre-create block) a
-        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
-        // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
-        // amplifier's manifest has resumeArgs only; `Start` without
-        // createSessionArgs is a hard StartIntentUnsupported error
-        // (cli_launch.rs:431-445; pinned by golden G-A4).
-        let should_preallocate_fresh_amplifier = mode == "amplifier"
-            && create.restore != Some(true)
-            && create.session_ref.is_none()
-            && create
-                .resume_session_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none();
-        if should_preallocate_fresh_claude {
-            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
-            // per-requestId dedupe cache is a retry concern this single-shot
-            // handler does not have.
-            resume_session_id = Some(Uuid::new_v4().to_string());
-            launch_intent = LaunchIntent::Start;
-            claude_fresh_prealloc = true;
-        } else if should_preallocate_fresh_amplifier {
-            resume_session_id = Some(Uuid::new_v4().to_string());
-        } else {
-            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
-            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
-            // derives the codex resume id from the sessionRef too (the
-            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
-            // codex-special arm here read ONLY `create.resumeSessionId` -- but
-            // the frozen client carries identity ONLY in `sessionRef`
-            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
-            // sidebar reopen spawned plain `codex` with no resume args
-            // (2026-07-22 incident; regression test:
-            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
-            // 'resume' (`tr:1570-1571`).
-            resume_session_id = requested_ref
-                .map(|r| r.session_id.clone())
-                .or_else(|| create.resume_session_id.clone())
-                .filter(|s| !s.is_empty());
-            // P0.4 (campaign plan §2.2): a restore:true claude create with no
-            // client-supplied id must NEVER silently launch a bare `claude`
-            // (neither --resume nor --session-id => permanently un-resumable).
-            // Try the server-side ladder; auto-resume on success (never ask);
-            // reject loudly when nothing can resolve. Claude-only: gemini/kimi
-            // behavior is deliberately untouched, and fresh (non-restore)
-            // claude keeps the preallocation branch above.
-            if mode == "claude" && create.restore == Some(true) {
-                // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
-                // a client-supplied claude id that is not canonical-UUID-shaped
-                // is NOT a usable restore identity -- treat it as unresolvable
-                // (fall to the ladder, then the loud reject). Scoped to the
-                // restore gate ONLY; non-restore resume derivation above is
-                // untouched.
-                if resume_session_id
-                    .as_deref()
-                    .is_some_and(|s| !is_canonical_claude_session_id(s))
-                {
-                    resume_session_id = None;
-                }
-                if resume_session_id.is_none() {
-                    resume_session_id =
-                        resolve_claude_restore_session_id(state, &create.request_id);
-                }
-                if resume_session_id.is_none() {
-                    crate::invariants::error_claude_restore_unresolved(&create.request_id);
-                    return send_create_error(
-                        out,
-                        ErrorCode::RestoreUnavailable,
-                        // Node parity (`server/ws-handler.ts:2130-2159`): the
-                        // frozen client's create-error handler shows
-                        // "[Restore failed] <this message>".
-                        "Restore requires a canonical session reference.".to_string(),
-                        &create.request_id,
-                    )
-                    .await;
-                }
-            }
+    let LaunchPrep {
+        launch_intent,
+        mut resume_session_id,
+        claude_fresh_prealloc,
+    } = derive_launch_prep(&create, &mode);
+    // A12 (V6): the claude P0.4 ladder stays HERE — at its original
+    // position AFTER the keyed-create adopt (:1443-1461) and the D8
+    // lease/attach arms (:1484-1558) — because it reads mutable liveness
+    // state whose meaning depends on those arms having run first (the
+    // ladder's own doc comment, :3122-3125). Hoisting it pre-gate would
+    // turn a duplicate claude restore in the two-connection reconcile
+    // race into a loud "[Restore failed]" instead of adopting the winner.
+    // P0.4 (campaign plan §2.2): a restore:true claude create with no
+    // client-supplied id must NEVER silently launch a bare `claude`
+    // (neither --resume nor --session-id => permanently un-resumable).
+    // Try the server-side ladder; auto-resume on success (never ask);
+    // reject loudly when nothing can resolve. Claude-only: gemini/kimi
+    // behavior is deliberately untouched, and fresh (non-restore)
+    // claude keeps the preallocation branch above.
+    if mode == "claude" && create.restore == Some(true) {
+        // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
+        // a client-supplied claude id that is not canonical-UUID-shaped
+        // is NOT a usable restore identity -- treat it as unresolvable
+        // (fall to the ladder, then the loud reject). Scoped to the
+        // restore gate ONLY; non-restore resume derivation above is
+        // untouched.
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| !is_canonical_claude_session_id(s))
+        {
+            resume_session_id = None;
+        }
+        if resume_session_id.is_none() {
+            resume_session_id = resolve_claude_restore_session_id(state, &create.request_id);
+        }
+        if resume_session_id.is_none() {
+            crate::invariants::error_claude_restore_unresolved(&create.request_id);
+            return send_create_error(
+                out,
+                ErrorCode::RestoreUnavailable,
+                // Node parity (`server/ws-handler.ts:2130-2159`): the
+                // frozen client's create-error handler shows
+                // "[Restore failed] <this message>".
+                "Restore requires a canonical session reference.".to_string(),
+                &create.request_id,
+            )
+            .await;
         }
     }
 
