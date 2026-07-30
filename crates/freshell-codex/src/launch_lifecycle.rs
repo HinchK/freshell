@@ -384,10 +384,70 @@ impl CodexLaunchPlanner {
 
 // ─── the terminal-keyed manager (the ONE shared seam for both create paths) ─────────────
 
+/// S5.a: one proxy event, tagged with its adopting terminal.
+#[derive(Debug)]
+pub struct TerminalProxyEvent {
+    pub terminal_id: String,
+    /// The plan's create cwd (`CodexLaunchPlan.runtime_cwd`) — the identity
+    /// adoption tail's cwd hint.
+    pub cwd: Option<String>,
+    pub event: RemoteProxyEvent,
+}
+
+/// S5.d.2 DECISION (recorded): the manager stays a process-global singleton.
+/// Instead of DI'ing the 12 `::global()` call sites, freshell-ws installs this
+/// set-once sink at boot (the spawn-gate set-once-handle precedent) and runs
+/// the WsState-aware router on its far side. The drain task itself never
+/// needs WsState, so no singleton→DI conversion is required.
+static PROXY_EVENT_SINK: Mutex<Option<mpsc::UnboundedSender<TerminalProxyEvent>>> =
+    Mutex::new(None);
+
+/// Install the process-wide proxy-event sink. Called exactly once at server
+/// boot (before any codex terminal can be adopted); later calls replace the
+/// sink (test affordance).
+pub fn set_codex_proxy_event_sink(tx: mpsc::UnboundedSender<TerminalProxyEvent>) {
+    *PROXY_EVENT_SINK.lock().unwrap() = Some(tx);
+}
+
+fn codex_proxy_event_sink() -> Option<mpsc::UnboundedSender<TerminalProxyEvent>> {
+    PROXY_EVENT_SINK.lock().unwrap().clone()
+}
+
+/// S5.a: the ONE per-terminal drain task, spawned at adopt (covers all three
+/// adopt sites: WS create, WS auto-resume respawn, REST /api/tabs). Ends when
+/// the proxy's event senders drop (sidecar shutdown) or the sink closes.
+fn spawn_proxy_event_drain(
+    terminal_id: String,
+    cwd: Option<String>,
+    mut events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    sink: Option<mpsc::UnboundedSender<TerminalProxyEvent>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let Some(sink) = sink.as_ref() else {
+                // No consumer installed (tests / bare servers): drop, matching
+                // the pre-S5 parked-receiver behavior.
+                continue;
+            };
+            if sink
+                .send(TerminalProxyEvent {
+                    terminal_id: terminal_id.clone(),
+                    cwd: cwd.clone(),
+                    event,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 struct AdoptedTerminalLaunch {
     sidecar: Arc<CodexLaunchSidecar>,
-    /// Held (unconsumed) so the proxy's event senders stay connected for S5.
-    _events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    /// S5.a: the per-terminal proxy-event drain. Ends on its own when the
+    /// proxy's senders drop; aborted by the teardown worker as a belt.
+    drain: tokio::task::JoinHandle<()>,
 }
 
 /// The shared `resolve_codex_launch` seam (spec §5 Slice 4): plan → adopt-by-terminal-id →
@@ -442,11 +502,21 @@ impl CodexTerminalLaunchManager {
         generation: u64,
     ) -> Result<(), String> {
         launch.sidecar.adopt(terminal_id, generation).await?;
+        // S5.d.3 DECISION (recorded): `launch.plan.binding_reason` is
+        // deliberately DROPPED here — the identity tail derives adopt-vs-rebind
+        // from context, and no Rust wire frame carries sessionBindingReason.
+        // See CodexLaunchPlan::binding_reason's doc.
+        let drain = spawn_proxy_event_drain(
+            terminal_id.to_string(),
+            launch.plan.runtime_cwd.clone(),
+            launch.events,
+            codex_proxy_event_sink(),
+        );
         self.adopted.lock().unwrap().insert(
             terminal_id.to_string(),
             AdoptedTerminalLaunch {
                 sidecar: launch.sidecar,
-                _events: launch.events,
+                drain,
             },
         );
         Ok(())
@@ -519,6 +589,7 @@ impl CodexTerminalLaunchManager {
         };
         for entry in adopted {
             let _ = entry.sidecar.shutdown().await;
+            entry.drain.abort();
         }
     }
 
@@ -528,6 +599,7 @@ impl CodexTerminalLaunchManager {
             tokio::spawn(async move {
                 while let Some(entry) = rx.recv().await {
                     let _ = entry.sidecar.shutdown().await;
+                    entry.drain.abort();
                 }
             });
             tx
@@ -727,5 +799,58 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_forwards_tagged_events_to_the_sink() {
+        let (proxy_tx, proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_proxy_event_drain(
+            "term-1".to_string(),
+            Some("/tmp/work".to_string()),
+            proxy_rx,
+            Some(sink_tx),
+        );
+        proxy_tx
+            .send(crate::remote_proxy::RemoteProxyEvent::RepairTrigger(
+                crate::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+            ))
+            .unwrap();
+        let tagged = tokio::time::timeout(std::time::Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("drain must forward within 2s")
+            .expect("sink open");
+        assert_eq!(tagged.terminal_id, "term-1");
+        assert_eq!(tagged.cwd.as_deref(), Some("/tmp/work"));
+        assert!(matches!(
+            tagged.event,
+            crate::remote_proxy::RemoteProxyEvent::RepairTrigger(_)
+        ));
+        drop(proxy_tx); // senders gone -> drain exits
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("drain task must end when the proxy senders drop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_without_a_sink_discards_and_survives() {
+        let (proxy_tx, proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_proxy_event_drain("term-2".to_string(), None, proxy_rx, None);
+        proxy_tx
+            .send(crate::remote_proxy::RemoteProxyEvent::RepairTrigger(
+                crate::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+            ))
+            .unwrap();
+        drop(proxy_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("no-sink drain must still terminate")
+            .unwrap();
     }
 }

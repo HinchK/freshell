@@ -185,6 +185,11 @@ pub struct CodexLaunchPlan {
     /// leave it unset, `:158-163`).
     pub session_id: Option<String>,
     /// `getCodexSessionBindingReason('codex', resume)` (`ws-handler.ts:2496-2498`).
+    /// S5.d.3 DECISION (2026-07-30, recorded — spec S5.d.3): computed for plan
+    /// parity and the wire-string pin test, then deliberately DROPPED at
+    /// `CodexTerminalLaunchManager::adopt`. The Rust registry has no
+    /// sessionBindingReason consumer; the adoption tail (`codex_identity.rs`)
+    /// has its own adopt/rebind vocabulary. Do not wire without a new decision.
     pub binding_reason: CodexSessionBindingReason,
     /// Codex terminal mode ALWAYS launches managed — both `planCreate` branches spin
     /// up runtime + proxy (spec §1.1); there is no unmanaged branch.
