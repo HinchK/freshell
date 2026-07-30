@@ -35,7 +35,9 @@ pub struct CreateProtectConfig {
     /// Max creates queued waiting on the gate before failing loud.
     pub spawn_queue_cap: usize,
     /// Max wait for a spawn-gate permit before failing loud, ms. Must stay
-    /// far below the frozen client's ~38s RATE_LIMITED ladder patience.
+    /// far below the frozen client's ~38s RATE_LIMITED ladder patience
+    /// (interactive, REST, and auto-resume doors — the WS restore door
+    /// waits unbounded-cancel-aware since graceful restore/resume S1).
     pub spawn_timeout_ms: u64,
 }
 

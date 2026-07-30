@@ -99,6 +99,21 @@ pub type CodexRuntimeFactory = Box<dyn Fn() -> Arc<dyn CodexLaunchRuntime> + Sen
 
 // ─── errors ──────────────────────────────────────────────────────────────────────────────
 
+/// Which class of caller is asking for a codex launch plan (graceful
+/// restore/resume S1, spec P2 — docs/plans/2026-07-30-graceful-restore-resume.md).
+/// `Interactive` keeps the D-C-REVISIT fail-fast: a human is actively
+/// waiting, so loud-at-30s is defensible. `Restore` is the bounce-restore
+/// fleet: anticipatable contention must never kill it (the D-GATE-SOFT
+/// generalization), so it queues cancel-aware with no wall-clock death —
+/// the wait is bounded structurally (queue depth x per-plan attempt budget;
+/// honest worst case ~251s/plan, ~2.2h for a full 64-deep queue — see the
+/// D-C-REVISIT block below) and by cancellation (disconnect/shutdown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchClass {
+    Interactive,
+    Restore,
+}
+
 /// A launch-planning failure, split exactly the way the retry policy needs
 /// (`launch-retry.ts:35`: config errors are never retried).
 #[derive(Debug)]
@@ -107,6 +122,14 @@ pub enum CodexLaunchError {
     Config(CodexLaunchConfigError),
     /// Retryable launch failure (runtime/proxy IO, planner shutdown).
     Failed(String),
+    /// Restore-class plan queue overflow (more than the configured cap of
+    /// waiters). The true backpressure backstop: the WS door maps it to
+    /// RATE_LIMITED (frozen-client ladder absorbs it), the REST door to 429.
+    QueueFull,
+    /// The restore-class caller's cancel watch fired (or its sender dropped)
+    /// while queued — the client is gone (disconnect/shutdown). Never
+    /// user-visible: callers abandon silently.
+    Cancelled,
 }
 
 impl std::fmt::Display for CodexLaunchError {
@@ -114,6 +137,10 @@ impl std::fmt::Display for CodexLaunchError {
         match self {
             CodexLaunchError::Config(error) => f.write_str(&error.message),
             CodexLaunchError::Failed(message) => f.write_str(message),
+            CodexLaunchError::QueueFull => {
+                f.write_str("codex plan queue full; too many queued codex launches")
+            }
+            CodexLaunchError::Cancelled => f.write_str("codex launch planning cancelled"),
         }
     }
 }
@@ -450,12 +477,58 @@ struct AdoptedTerminalLaunch {
     drain: tokio::task::JoinHandle<()>,
 }
 
-/// D-C-REVISIT — RESOLVED (2026-07-30, spec S5.e precondition): sidecar
-/// planning budget covering BOTH doors. Bounds concurrent codex plans
-/// server-wide so a burst can never stack ~226s plan holds; waiters fail fast
-/// instead of queueing behind them.
+/// D-C-REVISIT — SUPERSEDED IN PART (2026-07-30, graceful restore/resume S1;
+/// spec docs/plans/2026-07-30-graceful-restore-resume.md §9.2): the
+/// concurrency bound of 2 STANDS (a burst may never stack ~226s plan holds —
+/// the half of the 2026-07-30 resolution that mattered). The fail-fast half
+/// is superseded for `LaunchClass::Restore`: the S5.e flag-flip bounce
+/// analysis is the revisit evidence (tabs 3+ died at >=5 codex tabs), so
+/// restore-class waiters now QUEUE cancel-aware with no wall-clock death,
+/// bounded by the plan queue cap below. `LaunchClass::Interactive` (WS
+/// interactive, REST /api/tabs, auto-resume respawn) keeps the 30s fail-fast.
+/// Honest arithmetic (V3 bounded-hold audit): worst-case per-plan hold
+/// ~251s (5 attempts x (45s probe budget + 5s teardown) + 1s retry sleeps),
+/// so a full 64-deep restore queue drains worst-case in ~2.2h, and an
+/// Interactive waiter behind K queued restores waits ~ceil(K/2) x T
+/// (T = healthy plan time, seconds).
 pub const CODEX_SIDECAR_PLAN_CONCURRENCY: usize = 2;
 pub const CODEX_SIDECAR_PLAN_WAIT: Duration = Duration::from_secs(30);
+
+/// Env knob for the restore-class plan queue cap. Mirrors
+/// `FRESHELL_SPAWN_GATE_QUEUE_CAP` semantics (create_limit.rs): unset,
+/// `0`, or non-numeric fall back to the default.
+pub const FRESHELL_CODEX_PLAN_QUEUE_CAP_ENV: &str = "FRESHELL_CODEX_PLAN_QUEUE_CAP";
+const CODEX_PLAN_QUEUE_CAP_DEFAULT: usize = 64;
+
+fn plan_queue_cap_from_env() -> usize {
+    std::env::var(FRESHELL_CODEX_PLAN_QUEUE_CAP_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(CODEX_PLAN_QUEUE_CAP_DEFAULT)
+}
+
+/// Cancel-safe accounting for the restore-class plan queue depth: the
+/// decrement lives in Drop so success, cancellation, and futures dropped
+/// mid-wait all reclaim the slot (the SpawnGate::WaitingGuard discipline,
+/// crates/freshell-freshagent/src/spawn_gate.rs:80-87).
+struct PlanWaitingGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for PlanWaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+static GLOBAL_MANAGER: OnceLock<CodexTerminalLaunchManager> = OnceLock::new();
+
+/// Test-only global installer (mirrors the `set_codex_proxy_event_sink`
+/// seam): lets integration suites make [`CodexTerminalLaunchManager::global`]
+/// resolve to a manager over a fake runtime. Set-once: returns `false` (and
+/// installs nothing) if the global was already initialized. Production code
+/// must never call this.
+pub fn set_global_codex_launch_manager_for_tests(manager: CodexTerminalLaunchManager) -> bool {
+    GLOBAL_MANAGER.set(manager).is_ok()
+}
 
 /// The shared `resolve_codex_launch` seam (spec §5 Slice 4): plan → adopt-by-terminal-id →
 /// teardown-on-terminal-exit, used by BOTH the WS `terminal.create` codex branch and the
@@ -467,6 +540,8 @@ pub struct CodexTerminalLaunchManager {
     teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
     plan_budget: Arc<tokio::sync::Semaphore>,
     plan_budget_wait: Duration,
+    plan_queue_cap: usize,
+    plan_waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CodexTerminalLaunchManager {
@@ -477,6 +552,10 @@ impl CodexTerminalLaunchManager {
             teardown_tx: OnceLock::new(),
             plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
             plan_budget_wait: CODEX_SIDECAR_PLAN_WAIT,
+            // The env read MUST live here — `global()` calls `new()`, so
+            // `with_plan_budget` alone would never reach production.
+            plan_queue_cap: plan_queue_cap_from_env(),
+            plan_waiting: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -485,18 +564,25 @@ impl CodexTerminalLaunchManager {
         runtime_factory: CodexRuntimeFactory,
         concurrency: usize,
         wait: Duration,
+        queue_cap: usize,
     ) -> Self {
         let mut manager = Self::new(runtime_factory);
         manager.plan_budget = Arc::new(tokio::sync::Semaphore::new(concurrency));
         manager.plan_budget_wait = wait;
+        manager.plan_queue_cap = queue_cap;
         manager
+    }
+
+    /// Current depth of the restore-class plan queue (waiters parked on the
+    /// budget). Observability for tests and diagnostics.
+    pub fn plan_queue_depth(&self) -> usize {
+        self.plan_waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
     /// `CodexLaunchPlanner` per server (`server/index.ts:359`).
     pub fn global() -> &'static CodexTerminalLaunchManager {
-        static GLOBAL: OnceLock<CodexTerminalLaunchManager> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
+        GLOBAL_MANAGER.get_or_init(|| {
             CodexTerminalLaunchManager::new(Box::new(|| {
                 Arc::new(SpawnedCodexAppServerRuntime::new()) as Arc<dyn CodexLaunchRuntime>
             }))
@@ -505,27 +591,101 @@ impl CodexTerminalLaunchManager {
 
     /// Must be called from async (tokio) context; the teardown worker is spawned lazily
     /// here so [`CodexTerminalLaunchManager::notify_terminal_exit`] can stay sync-safe.
+    ///
+    /// Budget semantics by class (graceful restore/resume S1, P2):
+    /// - `Interactive`: today's fail-fast, unchanged — the 30s wait races the
+    ///   semaphore; on loss the caller gets the loud budget-exhausted error.
+    /// - `Restore`: queue cancel-aware with NO wall-clock death. Bounded
+    ///   structurally (restore storms are known-finite: N panes existed, N
+    ///   restores arrive, the queue drains N; per-plan hold worst ~251s,
+    ///   full 64-deep queue worst ~2.2h — see the D-C-REVISIT block) and by
+    ///   the queue cap (overflow => QueueFull, the backpressure backstop).
     pub async fn plan_create_with_retry(
         &self,
         input: &CodexLaunchPlanInput<'_>,
         attempts: u32,
+        class: LaunchClass,
+        cancel: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        use std::sync::atomic::Ordering;
         self.ensure_teardown_worker();
-        let _budget =
-            match tokio::time::timeout(
-                self.plan_budget_wait,
-                self.plan_budget.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => permit,
-                _ => return Err(CodexLaunchError::Failed(
-                    "codex sidecar planning budget exhausted; too many concurrent codex launches"
-                        .to_string(),
-                )),
-            };
+        let _budget = match class {
+            LaunchClass::Interactive => {
+                match tokio::time::timeout(
+                    self.plan_budget_wait,
+                    self.plan_budget.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        return Err(CodexLaunchError::Failed(
+                            "codex sidecar planning budget exhausted; too many concurrent codex launches"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+            LaunchClass::Restore => {
+                if *cancel.borrow() {
+                    return Err(CodexLaunchError::Cancelled);
+                }
+                // Fast path mirrors SpawnGate::acquire: tokio's fair semaphore
+                // fails try_acquire while waiters queue, so no barging.
+                match self.plan_budget.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let waiting_before = self.plan_waiting.fetch_add(1, Ordering::SeqCst);
+                        if waiting_before >= self.plan_queue_cap {
+                            self.plan_waiting.fetch_sub(1, Ordering::SeqCst);
+                            tracing::warn!(
+                                target: "freshell_codex::launch",
+                                waiting = waiting_before,
+                                queue_cap = self.plan_queue_cap,
+                                "codex_plan_queue_full"
+                            );
+                            return Err(CodexLaunchError::QueueFull);
+                        }
+                        let _waiting_guard = PlanWaitingGuard(&self.plan_waiting);
+                        tokio::select! {
+                            acquired = self.plan_budget.clone().acquire_owned() => match acquired {
+                                Ok(permit) => permit,
+                                // Semaphore closed = planner shutdown.
+                                Err(_) => return Err(CodexLaunchError::Failed(
+                                    "codex launch planner is shut down".to_string(),
+                                )),
+                            },
+                            // Ok(()) = the watch changed (we only ever send true);
+                            // Err(_) = the sender dropped (connection loop exited).
+                            // Both mean this waiter's client is gone: cancel.
+                            _ = cancel.changed() => {
+                                tracing::info!(
+                                    target: "freshell_codex::launch",
+                                    "codex_plan_wait_cancelled"
+                                );
+                                return Err(CodexLaunchError::Cancelled);
+                            }
+                        }
+                    }
+                }
+            }
+        };
         self.planner
             .plan_create_with_retry(input, attempts, CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS)
+            .await
+    }
+
+    /// No-cancel doors — WS interactive create, REST /api/tabs, auto-resume
+    /// respawn. The never-fired watch lives HERE, not at call sites (the
+    /// kata bccd discipline the spawn gate's `acquire_uncancellable` set).
+    pub async fn plan_create_with_retry_uncancellable(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        attempts: u32,
+        class: LaunchClass,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        self.plan_create_with_retry(input, attempts, class, &mut cancel_rx)
             .await
     }
 
@@ -563,6 +723,40 @@ impl CodexTerminalLaunchManager {
     /// the create error the caller is already surfacing is the primary failure.
     pub async fn discard(&self, launch: CodexTerminalLaunch) {
         let _ = launch.sidecar.shutdown().await;
+    }
+
+    /// [`Self::discard`] for sync contexts (RAII Drop guards): fire-and-forget
+    /// the sidecar teardown on the runtime. Same best-effort semantics —
+    /// teardown errors are swallowed; the create failure the caller is
+    /// surfacing (or the silent cancel) is the primary event.
+    ///
+    /// A8 hardening (V4): `tokio::spawn` PANICS when no ambient runtime
+    /// exists, and this fn is called from Drop (`PreparedCodexLaunch`),
+    /// where panicking is never acceptable (double-panic abort during
+    /// unwind). Spawn only when a handle exists; otherwise degrade to a
+    /// best-effort SYNCHRONOUS kill of the sidecar child (or, if no sync
+    /// kill seam is reachable from here, `tracing::warn!` and leak) —
+    /// NEVER panic.
+    pub fn discard_sync(&self, launch: CodexTerminalLaunch) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = launch.sidecar.shutdown().await;
+                });
+            }
+            Err(_) => {
+                // No runtime (e.g. Drop during unwind after runtime
+                // teardown): no sync kill seam is reachable from here — the
+                // sidecar's shutdown path is async-only (`CodexLaunchRuntime::
+                // shutdown` returns a future, and the runtime handle lives
+                // behind an async mutex) — so log-and-leak. Leaking is
+                // acceptable; panicking is not.
+                tracing::warn!(
+                    target: "freshell_codex::launch",
+                    "discard_sync outside runtime context; best-effort kill/leak"
+                );
+            }
+        }
     }
 
     /// S5.c: release the candidate-persistence gate for an adopted terminal's
@@ -787,26 +981,44 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             // Wait for the listener: probe-dial until accepted or the budget expires.
             let deadline = tokio::time::Instant::now() + self.start_budget;
             loop {
-                match tokio_tungstenite::connect_async(&ws_url).await {
-                    Ok((probe, _)) => {
+                // A6 fix (V3 bounded-hold audit, reports/V3-bounded-holds.md §A6): the 45s
+                // SIDECAR_START_BUDGET was only checked in the Err arm — an
+                // individual `connect_async` has NO deadline of its own (TCP connect +
+                // HTTP upgrade + response read), so a child that binds/listens but stalls
+                // the WS handshake parks this await FOREVER, permanently losing 1 of the
+                // 2 plan permits (uncancellable: cancellation covers only the queue wait,
+                // never the held plan). Timeout-per-probe restores the structural bound.
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                let probe_error = match tokio::time::timeout(
+                    remaining,
+                    tokio_tungstenite::connect_async(&ws_url),
+                )
+                .await
+                {
+                    Ok(Ok((probe, _))) => {
                         drop(probe);
                         break;
                     }
-                    Err(error) => {
-                        if let Ok(Some(status)) = child.try_wait() {
-                            reap_owned_codex_sidecars(&ownership_id);
-                            return Err(format!(
-                                "codex app-server exited before listening: {status}"
-                            ));
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            let _ = child.start_kill();
-                            reap_owned_codex_sidecars(&ownership_id);
-                            return Err(format!("codex app-server WS never came up: {error}"));
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
+                    // Failed probe and stalled-handshake probe take the SAME path:
+                    // the existing child-exit check, deadline check (now guaranteed
+                    // reached), and 100ms retry sleep run unchanged below.
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_elapsed) => "probe timed out awaiting the WS handshake".to_string(),
+                };
+                if let Ok(Some(status)) = child.try_wait() {
+                    reap_owned_codex_sidecars(&ownership_id);
+                    return Err(format!(
+                        "codex app-server exited before listening: {status}"
+                    ));
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = child.start_kill();
+                    reap_owned_codex_sidecars(&ownership_id);
+                    return Err(format!("codex app-server WS never came up: {probe_error}"));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
             *state = Some(SpawnedSidecar {

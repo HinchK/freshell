@@ -13,8 +13,10 @@
 //! - Bounded queue: more than `queue_cap` waiters fails LOUD (`QueueFull`)
 //!   instead of queueing unboundedly.
 //! - Bounded wait: a waiter that cannot get a permit within the timeout
-//!   fails LOUD (`Timeout`). Both bounds must resolve far below the frozen
-//!   client's ~38s RATE_LIMITED ladder patience.
+//!   fails LOUD (`Timeout`) — interactive/REST/auto-resume doors only; the
+//!   WS restore door uses `acquire_unbounded` (cancel-aware, no wall-clock
+//!   death — graceful restore/resume S1). Both bounds must resolve far below
+//!   the frozen client's ~38s RATE_LIMITED ladder patience.
 //! - CANCELLABLE: a queued waiter whose per-connection cancel watch fires
 //!   (or whose sender drops — the connection loop exited) unblocks with
 //!   `Cancelled` immediately. This is what lets a disconnecting client or a
@@ -182,6 +184,81 @@ impl SpawnGate {
                     "spawn_gate_cancelled"
                 );
                 Err(SpawnGateError::Cancelled)
+            }
+        }
+    }
+
+    /// Acquire a spawn permit with NO wall-clock timeout (graceful
+    /// restore/resume S1: the WS restore door — contention may not kill a
+    /// restore, the D-GATE-SOFT generalization). Still cancel-aware
+    /// (disconnect/shutdown unblocks as `Cancelled`) and still bounded by
+    /// the queue cap (`QueueFull` fails loud BEFORE the wait). The wait is
+    /// bounded structurally: permits recycle per settled create, and with
+    /// planning moved off-permit every hold is fast and mode-uniform.
+    ///
+    /// OBSERVABILITY (A5, V3 bounded-hold audit — the accepted residual):
+    /// permit-held awaits are deadline-free (PTY spawn terminal.rs:2253-2269,
+    /// association fs walk :2431-2454, fsync ledger writes :2517-2545), so a
+    /// correlated fs hang (the gate's founding WSL RCA) now hangs restores
+    /// SILENTLY where today they died loud at 10s. The periodic warn below
+    /// replaces that deleted ops signal WITHOUT protocol changes.
+    pub async fn acquire_unbounded(
+        &self,
+        cancel: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<OwnedSemaphorePermit, SpawnGateError> {
+        if *cancel.borrow() {
+            self.cancellations.fetch_add(1, Ordering::Relaxed);
+            return Err(SpawnGateError::Cancelled);
+        }
+        if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        let waiting_before = self.waiting.fetch_add(1, Ordering::SeqCst);
+        if waiting_before >= self.queue_cap {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            self.queue_rejections.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "freshell_ws::spawn_gate",
+                waiting = waiting_before,
+                queue_cap = self.queue_cap,
+                "spawn_gate_queue_full"
+            );
+            return Err(SpawnGateError::QueueFull);
+        }
+        let _waiting_guard = WaitingGuard(&self.waiting);
+        self.queued_total.fetch_add(1, Ordering::Relaxed);
+        // CRITICAL: create the acquire future ONCE and pin it — recreating
+        // it per loop iteration would forfeit FIFO queue position (first-poll
+        // order, V4 A16-N1). The sleep arm only logs; it never restarts the
+        // acquire.
+        let wait_started = tokio::time::Instant::now();
+        let acquire = self.semaphore.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            tokio::select! {
+                acquired = &mut acquire => match acquired {
+                    Ok(permit) => return Ok(permit),
+                    // Closed semaphore = server teardown; map like a cancel.
+                    Err(_) => {
+                        self.cancellations.fetch_add(1, Ordering::Relaxed);
+                        return Err(SpawnGateError::Cancelled);
+                    }
+                },
+                _ = cancel.changed() => {
+                    self.cancellations.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(target: "freshell_ws::spawn_gate", "spawn_gate_cancelled");
+                    return Err(SpawnGateError::Cancelled);
+                }
+                // A5 residual signal: while parked, warn every 30s with the
+                // waited duration and queue depth (no frames, no protocol).
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    tracing::warn!(
+                        target: "freshell_ws::spawn_gate",
+                        waited_s = wait_started.elapsed().as_secs(),
+                        queue_depth = self.waiting.load(Ordering::SeqCst),
+                        "spawn_gate_unbounded_wait_slow"
+                    );
+                }
             }
         }
     }
@@ -508,6 +585,51 @@ mod tests {
         let res = waiter.await.expect("join");
         assert_eq!(res.unwrap_err(), SpawnGateError::Cancelled);
         assert_eq!(gate.cancellations(), 1);
+    }
+
+    #[tokio::test]
+    async fn unbounded_acquire_waits_past_any_timeout_and_gets_the_released_permit() {
+        let gate = std::sync::Arc::new(SpawnGate::new(1, 4));
+        let first = gate
+            .acquire_uncancellable(std::time::Duration::from_secs(5))
+            .await
+            .expect("first permit");
+        let g2 = gate.clone();
+        let waiter = tokio::spawn(async move {
+            let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+            g2.acquire_unbounded(&mut cancel).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // park it
+        drop(first);
+        let permit = waiter
+            .await
+            .expect("join")
+            .expect("unbounded waiter must receive the released permit");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn unbounded_acquire_cancels_when_the_watch_fires() {
+        let gate = std::sync::Arc::new(SpawnGate::new(0, 4));
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let g = gate.clone();
+        let waiter = tokio::spawn(async move { g.acquire_unbounded(&mut cancel_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_tx.send(true).expect("fire cancel");
+        let err = waiter.await.expect("join").expect_err("must cancel");
+        assert_eq!(err, SpawnGateError::Cancelled);
+        assert_eq!(gate.cancellations(), 1);
+    }
+
+    #[tokio::test]
+    async fn unbounded_acquire_still_fails_loud_on_queue_full() {
+        let gate = SpawnGate::new(0, 0);
+        let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let err = gate
+            .acquire_unbounded(&mut cancel)
+            .await
+            .expect_err("cap 0 must reject");
+        assert_eq!(err, SpawnGateError::QueueFull);
     }
 
     #[tokio::test]

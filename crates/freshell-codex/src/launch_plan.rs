@@ -53,7 +53,9 @@ pub const CODEX_REMOTE_NON_LOOPBACK_MESSAGE: &str =
 /// consumers (proxy-event drain → identity/activity tails, candidate-
 /// persistence gate) are live, closing DEV-0006/DEV-0008. D-C-REVISIT: RESOLVED
 /// before this flip (sidecar planning budget + REST acquire move;
-/// docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum).
+/// docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum). The fail-fast
+/// half of that resolution was later superseded for the Restore class
+/// (graceful restore/resume S1, §D-C ADDENDUM 2).
 pub const FRESHELL_CODEX_MANAGED_LAUNCH_ENV: &str = "FRESHELL_CODEX_MANAGED_LAUNCH";
 
 /// Whether the managed-launch flag value enables the wiring. S5.e default ON:

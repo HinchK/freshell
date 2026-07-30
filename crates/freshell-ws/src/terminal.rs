@@ -592,6 +592,7 @@ async fn handle_client_text(
                 let request_id = create.request_id.clone();
                 let sent = handle_create(
                     create,
+                    None,
                     &mut out,
                     state,
                     conn_id,
@@ -1091,6 +1092,29 @@ fn cli_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
+/// WS-side projection of [`CodexLaunchError`] keeping exactly the
+/// distinctions the create doors need (graceful restore/resume S1).
+pub(crate) enum PlanLaunchError {
+    /// Restore-class plan queue overflow -> RATE_LIMITED (ladder absorbs).
+    QueueFull,
+    /// Cancel watch fired while queued -> silent abandon.
+    Cancelled,
+    /// Everything else -> PTY_SPAWN_FAILED with this message (today's shape).
+    Failed(String),
+}
+
+impl PlanLaunchError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            PlanLaunchError::QueueFull => {
+                "codex plan queue full; too many queued codex launches".to_string()
+            }
+            PlanLaunchError::Cancelled => "codex launch planning cancelled".to_string(),
+            PlanLaunchError::Failed(message) => message,
+        }
+    }
+}
+
 /// codex `--remote <wsUrl>` planning (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH`
 /// default ON since S5.e): plan the managed app-server launch
 /// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
@@ -1102,13 +1126,17 @@ fn cli_provider_settings(
 /// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
 /// plans identically. `Err` carries the thrown planCodexLaunch message —
 /// `handle_create` surfaces it as `error{code:PTY_SPAWN_FAILED}`, the respawn
-/// seam as `RespawnError::LaunchUnresolvable`.
+/// seam as `RespawnError::LaunchUnresolvable`. Restore-class callers thread
+/// their per-connection cancel watch; the WS interactive and auto-resume
+/// doors pass `None` (never-fired watch minted in the manager).
 async fn plan_codex_managed_launch(
     state: &WsState,
     mode: &str,
     raw_cwd: Option<&str>,
     resume_session_id: Option<&str>,
-) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
+    class: freshell_codex::launch_lifecycle::LaunchClass,
+    cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, PlanLaunchError> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
@@ -1132,14 +1160,33 @@ async fn plan_codex_managed_launch(
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
     };
-    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .plan_create_with_retry(
-            &input,
-            freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
-        )
-        .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+    let result = match cancel {
+        Some(cancel_rx) => {
+            manager
+                .plan_create_with_retry(
+                    &input,
+                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                    class,
+                    cancel_rx,
+                )
+                .await
+        }
+        None => {
+            manager
+                .plan_create_with_retry_uncancellable(
+                    &input,
+                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                    class,
+                )
+                .await
+        }
+    };
+    result.map(Some).map_err(|error| match error {
+        freshell_codex::launch_lifecycle::CodexLaunchError::QueueFull => PlanLaunchError::QueueFull,
+        freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
+        other => PlanLaunchError::Failed(other.to_string()),
+    })
 }
 
 /// RAII release of a §5.4 keyed-create reservation
@@ -1410,17 +1457,219 @@ pub(crate) fn build_pty_exit_hook(
     })
 }
 
+/// Spawn-time launch intent + resume identity, derived before spawn.
+/// PURE with respect to server state: create-body reads + local RNG only
+/// (V6 rung table). The claude restore ladder deliberately does NOT live
+/// here — it stays in handle_create, after the adopt/D8 arms.
+pub(crate) struct LaunchPrep {
+    pub launch_intent: LaunchIntent,
+    pub resume_session_id: Option<String>,
+    pub claude_fresh_prealloc: bool,
+}
+
+/// Extraction of handle_create's PURE derivation rungs
+/// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
+/// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
+/// extracted, so there is no error path.
+pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchPrep {
+    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
+    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
+    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
+    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
+    let mut launch_intent = LaunchIntent::Resume;
+    let mut resume_session_id: Option<String> = None;
+    // PIN 2 (Step 4b): whether THIS create minted a fresh claude identity.
+    // Only such a create may delete its pre-spawn binding row on spawn
+    // failure — a resume-create's row belongs to the prior epoch and must
+    // stay recoverable.
+    let mut claude_fresh_prealloc = false;
+    if mode != "shell" {
+        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
+        // Shared with the REST spawn pipeline (kata hbsa) — one predicate,
+        // two doors: freshell_platform::should_preallocate_fresh_claude.
+        let should_preallocate_fresh_claude = freshell_platform::should_preallocate_fresh_claude(
+            mode,
+            create.restore,
+            create.session_ref.is_some(),
+            create.resume_session_id.as_deref(),
+        );
+        // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
+        // preallocation's sibling: a FRESH amplifier pane gets a
+        // server-minted session id, and (below, in the pre-create block) a
+        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
+        // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
+        // amplifier's manifest has resumeArgs only; `Start` without
+        // createSessionArgs is a hard StartIntentUnsupported error
+        // (cli_launch.rs:431-445; pinned by golden G-A4).
+        let should_preallocate_fresh_amplifier = mode == "amplifier"
+            && create.restore != Some(true)
+            && create.session_ref.is_none()
+            && create
+                .resume_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none();
+        if should_preallocate_fresh_claude {
+            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
+            // per-requestId dedupe cache is a retry concern this single-shot
+            // handler does not have.
+            resume_session_id = Some(Uuid::new_v4().to_string());
+            launch_intent = LaunchIntent::Start;
+            claude_fresh_prealloc = true;
+        } else if should_preallocate_fresh_amplifier {
+            resume_session_id = Some(Uuid::new_v4().to_string());
+        } else {
+            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
+            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
+            // derives the codex resume id from the sessionRef too (the
+            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
+            // codex-special arm here read ONLY `create.resumeSessionId` -- but
+            // the frozen client carries identity ONLY in `sessionRef`
+            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
+            // sidebar reopen spawned plain `codex` with no resume args
+            // (2026-07-22 incident; regression test:
+            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
+            // 'resume' (`tr:1570-1571`).
+            resume_session_id = requested_ref
+                .map(|r| r.session_id.clone())
+                .or_else(|| create.resume_session_id.clone())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    LaunchPrep {
+        launch_intent,
+        resume_session_id,
+        claude_fresh_prealloc,
+    }
+}
+
+/// RAII holder for a planned-but-unadopted codex launch (graceful
+/// restore/resume S1, P1). Once planning happens BEFORE the spawn-gate
+/// permit, a live sidecar+proxy exists across every early-exit arm of
+/// `spawn_gated_restore_create` AND every pre-plan early return inside
+/// `handle_create` (keyed-create adopt, D8 lease, unknown mode, D7 guard,
+/// opencode port). Enumerating those arms is fragile; Drop is not. Dropping
+/// this guard without `take()` tears the sidecar down via `discard_sync`
+/// (which is `Handle::try_current()`-guarded — Task 2 — so this Drop can
+/// NEVER panic, even outside runtime context).
+pub(crate) struct PreparedCodexLaunch(
+    Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+);
+
+impl PreparedCodexLaunch {
+    pub(crate) fn new(
+        launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+    ) -> Self {
+        Self(launch)
+    }
+    /// Hand the launch to the adoption path; the guard becomes inert.
+    pub(crate) fn take(&mut self) -> Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> {
+        self.0.take()
+    }
+}
+
+impl Drop for PreparedCodexLaunch {
+    fn drop(&mut self) {
+        if let Some(launch) = self.0.take() {
+            tracing::info!(
+                target: "freshell_ws::create",
+                "prepared_codex_launch_discarded"
+            );
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .discard_sync(launch);
+        }
+    }
+}
+
+/// Everything a restore-class create computes BEFORE the spawn-gate permit.
+pub(crate) struct PreparedLaunch {
+    pub prep: LaunchPrep,
+    /// Some(..) ONLY when a resume session id was derived; None means
+    /// "not planned pre-gate" and handle_create plans on-permit inline.
+    pub codex_launch: Option<PreparedCodexLaunch>,
+}
+
+pub(crate) enum PrepareError {
+    // No Reject variant: post-A12, derive_launch_prep is infallible (the
+    // claude RESTORE_UNAVAILABLE ladder stays inside handle_create, after
+    // the adopt/D8 arms).
+    /// Restore-class plan queue overflow -> error{code:RATE_LIMITED}.
+    PlanQueueFull,
+    /// Cancel fired while queued -> silent abandon (no frame, no PTY).
+    Cancelled,
+    /// Plan failed (T4/T6 residue) -> error{code:PTY_SPAWN_FAILED}.
+    PlanFailed(String),
+}
+
+/// P1's prepare phase: resume-identity derivation + the codex managed plan,
+/// run BEFORE the spawn-gate permit so permits only ever cover fast,
+/// mode-uniform PTY-spawn->settle work. Restore-class only.
+pub(crate) async fn prepare_launch(
+    create: &TerminalCreate,
+    state: &WsState,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<PreparedLaunch, PrepareError> {
+    // Same mode derivation handle_create uses (copy the exact expression
+    // from handle_create's `mode` binding so the two sites can never
+    // disagree).
+    let mode = create.mode.clone();
+    let prep = derive_launch_prep(create, &mode);
+    // A4 (V2 codex-sidecar audit): pre-gate planning ONLY when a resume
+    // session id was derived. A fresh plan (resume_session_id == None,
+    // i.e. `require_candidate_persistence`) arms a 45s candidate-capture
+    // timer AT PROXY START (remote_proxy.rs:248-258); parked past 45s on
+    // the unbounded gate wait, the identity gate permanently fails and
+    // every post-adopt turn/start is rejected -32000 — an adoptable but
+    // functionally broken pane. So a `restore:true` codex create with no
+    // sessionRef/resumeSessionId keeps today's EXACT on-permit inline
+    // planning path (LaunchClass::Interactive inside handle_create),
+    // byte-identical to today.
+    let codex_launch = if prep.resume_session_id.is_some() {
+        match plan_codex_managed_launch(
+            state,
+            &mode,
+            create.cwd.as_deref(),
+            prep.resume_session_id.as_deref(),
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            Some(cancel),
+        )
+        .await
+        {
+            Ok(launch) => Some(PreparedCodexLaunch::new(launch)),
+            Err(PlanLaunchError::QueueFull) => return Err(PrepareError::PlanQueueFull),
+            Err(PlanLaunchError::Cancelled) => return Err(PrepareError::Cancelled),
+            Err(PlanLaunchError::Failed(message)) => return Err(PrepareError::PlanFailed(message)),
+        }
+    } else {
+        None
+    };
+    Ok(PreparedLaunch { prep, codex_launch })
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
 pub(crate) async fn handle_create(
     create: TerminalCreate,
+    prepared: Option<PreparedLaunch>,
     out: &mut crate::create_gate::CreateOutput<'_>,
     state: &WsState,
     conn_id: u64,
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
+    // P1 (graceful restore/resume S1): destructure the prepared values at
+    // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
+    // pre-plan early return below (keyed-create adopt, D8 lease, rate
+    // limit, unknown mode, claude ladder, D7 guard, opencode port).
+    let (prep, mut prepared_codex) = match prepared {
+        // p.codex_launch is None for non-codex modes AND for the A4
+        // fresh-plan exclusion (no derived resume session id) — the None
+        // arm of the plan site below then plans on-permit, byte-identical
+        // to today.
+        Some(p) => (Some(p.prep), p.codex_launch),
+        None => (None, None),
+    };
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
     // a create whose `createRequestId` already has a live terminal ADOPTS it —
@@ -1618,106 +1867,59 @@ pub(crate) async fn handle_create(
         host_os,
     );
 
-    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
-    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
-    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
-    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
-    let mut launch_intent = LaunchIntent::Resume;
-    let mut resume_session_id: Option<String> = None;
-    // PIN 2 (Step 4b): whether THIS create minted a fresh claude identity.
-    // Only such a create may delete its pre-spawn binding row on spawn
-    // failure — a resume-create's row belongs to the prior epoch and must
-    // stay recoverable.
-    let mut claude_fresh_prealloc = false;
-    if mode != "shell" {
-        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
-        // Shared with the REST spawn pipeline (kata hbsa) — one predicate,
-        // two doors: freshell_platform::should_preallocate_fresh_claude.
-        let should_preallocate_fresh_claude = freshell_platform::should_preallocate_fresh_claude(
-            &mode,
-            create.restore,
-            create.session_ref.is_some(),
-            create.resume_session_id.as_deref(),
-        );
-        // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
-        // preallocation's sibling: a FRESH amplifier pane gets a
-        // server-minted session id, and (below, in the pre-create block) a
-        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
-        // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
-        // amplifier's manifest has resumeArgs only; `Start` without
-        // createSessionArgs is a hard StartIntentUnsupported error
-        // (cli_launch.rs:431-445; pinned by golden G-A4).
-        let should_preallocate_fresh_amplifier = mode == "amplifier"
-            && create.restore != Some(true)
-            && create.session_ref.is_none()
-            && create
-                .resume_session_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none();
-        if should_preallocate_fresh_claude {
-            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
-            // per-requestId dedupe cache is a retry concern this single-shot
-            // handler does not have.
-            resume_session_id = Some(Uuid::new_v4().to_string());
-            launch_intent = LaunchIntent::Start;
-            claude_fresh_prealloc = true;
-        } else if should_preallocate_fresh_amplifier {
-            resume_session_id = Some(Uuid::new_v4().to_string());
-        } else {
-            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
-            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
-            // derives the codex resume id from the sessionRef too (the
-            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
-            // codex-special arm here read ONLY `create.resumeSessionId` -- but
-            // the frozen client carries identity ONLY in `sessionRef`
-            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
-            // sidebar reopen spawned plain `codex` with no resume args
-            // (2026-07-22 incident; regression test:
-            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
-            // 'resume' (`tr:1570-1571`).
-            resume_session_id = requested_ref
-                .map(|r| r.session_id.clone())
-                .or_else(|| create.resume_session_id.clone())
-                .filter(|s| !s.is_empty());
-            // P0.4 (campaign plan §2.2): a restore:true claude create with no
-            // client-supplied id must NEVER silently launch a bare `claude`
-            // (neither --resume nor --session-id => permanently un-resumable).
-            // Try the server-side ladder; auto-resume on success (never ask);
-            // reject loudly when nothing can resolve. Claude-only: gemini/kimi
-            // behavior is deliberately untouched, and fresh (non-restore)
-            // claude keeps the preallocation branch above.
-            if mode == "claude" && create.restore == Some(true) {
-                // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
-                // a client-supplied claude id that is not canonical-UUID-shaped
-                // is NOT a usable restore identity -- treat it as unresolvable
-                // (fall to the ladder, then the loud reject). Scoped to the
-                // restore gate ONLY; non-restore resume derivation above is
-                // untouched.
-                if resume_session_id
-                    .as_deref()
-                    .is_some_and(|s| !is_canonical_claude_session_id(s))
-                {
-                    resume_session_id = None;
-                }
-                if resume_session_id.is_none() {
-                    resume_session_id =
-                        resolve_claude_restore_session_id(state, &create.request_id);
-                }
-                if resume_session_id.is_none() {
-                    crate::invariants::error_claude_restore_unresolved(&create.request_id);
-                    return send_create_error(
-                        out,
-                        ErrorCode::RestoreUnavailable,
-                        // Node parity (`server/ws-handler.ts:2130-2159`): the
-                        // frozen client's create-error handler shows
-                        // "[Restore failed] <this message>".
-                        "Restore requires a canonical session reference.".to_string(),
-                        &create.request_id,
-                    )
-                    .await;
-                }
-            }
+    let LaunchPrep {
+        launch_intent,
+        mut resume_session_id,
+        claude_fresh_prealloc,
+    } = match prep {
+        Some(prep) => prep,
+        None => derive_launch_prep(&create, &mode),
+    };
+    // The claude P0.4 ladder (Task 3) runs HERE for BOTH branches —
+    // prepared and inline — at its original post-adopt/attach position
+    // (A12/V6). Do not move it.
+    // A12 (V6): the claude P0.4 ladder stays HERE — at its original
+    // position AFTER the keyed-create adopt (:1443-1461) and the D8
+    // lease/attach arms (:1484-1558) — because it reads mutable liveness
+    // state whose meaning depends on those arms having run first (the
+    // ladder's own doc comment, :3122-3125). Hoisting it pre-gate would
+    // turn a duplicate claude restore in the two-connection reconcile
+    // race into a loud "[Restore failed]" instead of adopting the winner.
+    // P0.4 (campaign plan §2.2): a restore:true claude create with no
+    // client-supplied id must NEVER silently launch a bare `claude`
+    // (neither --resume nor --session-id => permanently un-resumable).
+    // Try the server-side ladder; auto-resume on success (never ask);
+    // reject loudly when nothing can resolve. Claude-only: gemini/kimi
+    // behavior is deliberately untouched, and fresh (non-restore)
+    // claude keeps the preallocation branch above.
+    if mode == "claude" && create.restore == Some(true) {
+        // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
+        // a client-supplied claude id that is not canonical-UUID-shaped
+        // is NOT a usable restore identity -- treat it as unresolvable
+        // (fall to the ladder, then the loud reject). Scoped to the
+        // restore gate ONLY; non-restore resume derivation above is
+        // untouched.
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| !is_canonical_claude_session_id(s))
+        {
+            resume_session_id = None;
+        }
+        if resume_session_id.is_none() {
+            resume_session_id = resolve_claude_restore_session_id(state, &create.request_id);
+        }
+        if resume_session_id.is_none() {
+            crate::invariants::error_claude_restore_unresolved(&create.request_id);
+            return send_create_error(
+                out,
+                ErrorCode::RestoreUnavailable,
+                // Node parity (`server/ws-handler.ts:2130-2159`): the
+                // frozen client's create-error handler shows
+                // "[Restore failed] <this message>".
+                "Restore requires a canonical session reference.".to_string(),
+                &create.request_id,
+            )
+            .await;
         }
     }
 
@@ -2011,21 +2213,40 @@ pub(crate) async fn handle_create(
     // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
     // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
     // passes `m.cwd`).
-    let codex_launch = match plan_codex_managed_launch(
-        state,
-        &mode,
-        create.cwd.as_deref(),
-        resume_session_id.as_deref(),
-    )
-    .await
-    {
-        Ok(launch) => launch,
-        Err(message) => {
-            // A thrown planCodexLaunch surfaces through the generic create catch
-            // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+    let codex_launch = match prepared_codex.as_mut() {
+        // Restore path with a derived resume id: planned pre-gate (P1).
+        // take() disarms the guard — from here the existing failed-spawn
+        // arm and adopt path own the launch exactly as today. The None arm
+        // below serves interactive creates AND the A4 fresh-plan exclusion
+        // (restore:true codex with no derived resume session id): both plan
+        // on-permit inline, byte-identical to today.
+        Some(guard) => guard.take(),
+        None => match plan_codex_managed_launch(
+            state,
+            &mode,
+            create.cwd.as_deref(),
+            resume_session_id.as_deref(),
+            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+            None,
+        )
+        .await
+        {
+            Ok(launch) => launch,
+            Err(error) => {
+                // A thrown planCodexLaunch surfaces through the generic create catch
+                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
+                // QueueFull/Cancelled are unreachable for Interactive-class
+                // `None`-cancel calls; `message()` keeps the frame text
+                // identical for `Failed`.
+                return send_create_error(
+                    out,
+                    ErrorCode::PtySpawnFailed,
+                    error.message(),
+                    &create.request_id,
+                )
                 .await;
-        }
+            }
+        },
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -2743,11 +2964,13 @@ pub async fn respawn_agent_terminal(
         &mode,
         req.cwd.as_deref(),
         resume_session_id.as_deref(),
+        freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+        None,
     )
     .await
     {
         Ok(launch) => launch,
-        Err(message) => return Err(RespawnError::LaunchUnresolvable(message)),
+        Err(error) => return Err(RespawnError::LaunchUnresolvable(error.message())),
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());

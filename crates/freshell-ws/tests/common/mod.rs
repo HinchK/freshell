@@ -674,15 +674,39 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
 
 /// [`spawn_server`] variant with injectable `terminal.create` protection
 /// knobs (rate limit + spawn gate). Identical `WsState` otherwise; returns
-/// only the ws URL (the create-protection tests never need the registry).
+/// only the ws URL (most create-protection tests never need the registry).
 pub async fn spawn_server_with_create_protect(
     cfg: freshell_ws::create_limit::CreateProtectConfig,
 ) -> String {
+    spawn_server_with_create_protect_probes(cfg).await.0
+}
+
+/// [`spawn_server_with_create_protect`] variant that also returns the
+/// registry and the gate handle (mirrors `restore_spawn_gate.rs`'s
+/// `spawn_server` return shape) so timeout-free restore-side gate pins can
+/// probe `queued_total()`/`cancellations()` and registry emptiness
+/// (graceful restore/resume S1: gate `Timeout` is unreachable for the
+/// restore class, so those pins assert queue-until-cancel instead).
+pub async fn spawn_server_with_create_protect_probes(
+    cfg: freshell_ws::create_limit::CreateProtectConfig,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    std::sync::Arc<freshell_ws::spawn_gate::SpawnGate>,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
+    // NOTE: SpawnGate::new passes 0 through (no sanitizing) — the
+    // zero-permit test in create_protection.rs depends on this.
+    // (`from_config` stayed behind when the gate moved to
+    // freshell-freshagent; it referenced this crate's CreateProtectConfig.)
+    let gate = std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
+        cfg.spawn_concurrency,
+        cfg.spawn_queue_cap,
+    ));
 
     let state = WsState {
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
@@ -719,14 +743,7 @@ pub async fn spawn_server_with_create_protect(
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: cfg,
-        // NOTE: SpawnGate::new passes 0 through (no sanitizing) — the
-        // zero-permit test in create_protection.rs depends on this.
-        // (`from_config` stayed behind when the gate moved to
-        // freshell-freshagent; it referenced this crate's CreateProtectConfig.)
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
-            cfg.spawn_concurrency,
-            cfg.spawn_queue_cap,
-        )),
+        spawn_gate: std::sync::Arc::clone(&gate),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
@@ -747,7 +764,7 @@ pub async fn spawn_server_with_create_protect(
         let _ = axum::serve(listener, router).await;
     });
 
-    format!("ws://{addr}/ws", addr = addr)
+    (format!("ws://{addr}/ws", addr = addr), registry, gate)
 }
 
 pub type TestWs =

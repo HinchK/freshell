@@ -128,6 +128,47 @@ carries this forward.
 > (`create_gate.rs`); the budget bounds that to ≤2 long holds server-wide. Revisit if a
 > restore-fleet incident implicates it. The in-code D-C-REVISIT markers now point here.
 
+### D-C ADDENDUM 2 (2026-07-30 — graceful restore/resume S1)
+
+The residual recorded above is discharged. The revisit condition fired: the
+S5.e managed-launch default flip made codex planning (sidecar spawn + proxy
+start, seconds each; up to a 30s budget wait) run under the caller-held
+permit for every WS restore-create, and the bounce analysis showed a
+>=5-codex-tab restore storm starving shell/claude/opencode restores into the
+10s queue-timeout death (spec: docs/plans/2026-07-30-graceful-restore-resume.md,
+F1/F2).
+
+As of S1, WS restore-creates run a **prepare phase** (pure resume-identity
+derivation + `plan_codex_managed_launch`, `LaunchClass::Restore`) BEFORE
+`spawn_gate.acquire` (`create_gate.rs`). Two scope guards from the S1
+load-bearing review: only resume-planned codex restores prepare pre-gate
+(a fresh plan arms a 45s candidate-capture timer at proxy start —
+`remote_proxy.rs:248-258` — so no-session codex restores keep on-permit
+Interactive planning), and the claude restore ladder stays inside
+`handle_create` after the adopt/D8 arms (its liveness reads presume those
+arms ran first). This adopts what §D-C's "latency
+exposure" DECISION rejected as alternative (a) — plan-before-acquire with
+discard-on-rejection — because the ground has moved since 2026-07-27: the
+sidecar planning budget (concurrency 2) now bounds concurrent plans, and the
+prepared launch is discarded on EVERY early exit by an RAII guard
+(`PreparedCodexLaunch`), not by hand-audited cleanup.
+
+Unchanged and still load-bearing:
+- The permit scope still brackets PTY spawn -> settle exactly (the da5d9b5c
+  regression class cannot recur; pinned by
+  `permit_released_only_after_work_completes`, `create_gate.rs`).
+- The REST door is untouched by S1: it plans before its own acquire (D-C-R
+  2026-07-30, above) with `LaunchClass::Interactive` fail-fast semantics and
+  the same bounded `acquire_uncancellable` wait.
+- "Rejection needs NO cleanup" now holds only for the REST/interactive
+  doors; the WS restore door's rejections DO hold a prepared sidecar, which
+  the RAII guard discards.
+
+The WS restore door's gate wait is now `acquire_unbounded` (cancel-aware, no
+wall-clock death; QueueFull still fails loud as RATE_LIMITED). Timeout death
+for restores is gone by design — see the D-GATE-SOFT generalization in the
+S1 spec ("contention may not kill a restore").
+
 **D-D. Codex sidecar evaluation.** (The kata has NO numbered items — its
 sidecar mention is the un-numbered aside *"Also noted: the codex-sidecar
 launch path bypasses the gate similarly"*, and it is NOT in the kata's

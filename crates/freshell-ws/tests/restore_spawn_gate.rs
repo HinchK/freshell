@@ -321,11 +321,12 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
     // gated. Zero-permit gate: any create that actually consults the gate
     // can never proceed — the wiring proof in both directions (an inert
     // gate would let the restore create through; an over-broad gate would
-    // block the plain create).
-    let cfg = CreateProtectConfig {
-        spawn_timeout_ms: 300,
-        ..CreateProtectConfig::default()
-    };
+    // block the plain create). Since graceful restore/resume S1 the restore
+    // direction is proven by queue+cancel — the restore gate wait is
+    // acquire_unbounded (cancel-aware, no wall-clock death), so gate
+    // Timeout is unreachable on this path and the parked create is
+    // observably queued, then cancelled on disconnect without spawning.
+    let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
@@ -335,22 +336,39 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
     let reply = next_json_of_type(&mut client, "terminal.created").await;
     assert_eq!(reply["requestId"], "plain");
 
-    // Restore create consults the gate, times out, fails loud with theirs'
-    // pinned error string.
+    // Restore create consults the gate: it parks on the 0-permit queue —
+    // the wiring proof in the restore direction.
     send_text(&mut client, &create_frame("restore-1", true)).await;
-    let err = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err["code"], "PTY_SPAWN_FAILED");
-    assert_eq!(err["requestId"], "restore-1");
-    assert!(err["message"]
-        .as_str()
-        .expect("message")
-        .contains("terminal spawn slot"));
-    assert_eq!(gate.timeouts(), 1, "only the restore create hit the gate");
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        gate.queued_total(),
+        1,
+        "the restore create must consult (and park on) the gate"
+    );
+
+    // Disconnect: the parked restore create is cancelled without spawning.
+    drop(client);
+    for _ in 0..200 {
+        if gate.cancellations() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.cancellations(),
+        1,
+        "disconnect must cancel the parked restore create"
+    );
 
     assert_eq!(
         registry.kill_all(),
         1,
-        "only the non-restore create spawned"
+        "only the bypassing non-restore create spawned"
     );
 }
 
@@ -740,14 +758,13 @@ async fn resend_on_new_connection_never_swallowed_while_inflight() {
     // The A2 wedge guard: a duplicate landing while the original is in
     // flight must NEVER be silently dropped -- the original's reply goes to
     // the ORIGINAL connection's sink (dead after a real reconnect), so the
-    // waiter path is the resend's ONLY reply path. A zero-permit gate plus
-    // a short timeout parks the original InFlight deterministically; when
-    // it exits non-settled, the waiter must receive the fail-loud error
-    // (which re-drives the frozen client's retry ladder).
-    let cfg = CreateProtectConfig {
-        spawn_timeout_ms: 500,
-        ..CreateProtectConfig::default()
-    };
+    // waiter path is the resend's ONLY reply path. A zero-permit gate parks
+    // the original InFlight deterministically; its non-settled exit trigger
+    // is now DISCONNECT-CANCEL (since graceful restore/resume S1 the
+    // restore gate wait is acquire_unbounded, so gate timeout can no longer
+    // trigger it), and clear_if_in_flight must fail the cross-connection
+    // waiter LOUD (which re-drives the frozen client's retry ladder).
+    let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client1 = connect_and_hello(&ws_url).await;
@@ -769,8 +786,11 @@ async fn resend_on_new_connection_never_swallowed_while_inflight() {
         "a cross-connection duplicate registers as a waiter, never enqueues"
     );
 
-    let err1 = next_json_of_type(&mut client1, "error").await;
-    assert_eq!(err1["requestId"], "xq");
+    // Disconnect the ORIGINAL connection: its create exits non-settled via
+    // disconnect-cancel, and clear_if_in_flight must fail the waiter loud
+    // on the second socket.
+    drop(client1);
+
     let err2 = next_json_of_type(&mut client2, "error").await;
     assert_eq!(err2["code"], "PTY_SPAWN_FAILED");
     assert_eq!(
