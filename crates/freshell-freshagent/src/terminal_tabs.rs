@@ -3621,6 +3621,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_pane_claude_preallocates_fresh_session_identity() {
+        // kata hbsa P2: POST /api/panes/:id/split shares spawn_terminal_pane,
+        // so a claude split must mint its OWN fresh identity (distinct from
+        // the source pane's).
+        let (state, registry, _capture) = state_with_claude_capture_spec("claude-split");
+        let router = app(state);
+
+        let (status, tab) = post(
+            router.clone(),
+            "/api/tabs",
+            serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // The /api/tabs body is {tabId, paneId, terminalId} — no paneContent.
+        // Identity is read from the registry rows (rung 0), keyed by terminalId.
+        let pane_id = tab["data"]["paneId"]
+            .as_str()
+            .expect("pane id in create response")
+            .to_string();
+        let first_tid = tab["data"]["terminalId"]
+            .as_str()
+            .expect("terminal id in create response")
+            .to_string();
+        let first_sid = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.terminal_id == first_tid)
+            .expect("create registry row")
+            .resume_session_id
+            .expect("first pane minted");
+
+        let (status, split) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            serde_json::json!({"mode":"claude"}),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "split failed: {split}");
+        // The split body is {paneId, terminalId} — again, identity via registry.
+        let split_tid = split["data"]["terminalId"]
+            .as_str()
+            .expect("terminal id in split response")
+            .to_string();
+        let split_sid = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.terminal_id == split_tid)
+            .expect("split registry row")
+            .resume_session_id
+            .expect("split minted");
+        uuid::Uuid::parse_str(&split_sid).expect("canonical UUID");
+        assert_ne!(split_sid, first_sid, "split must mint its OWN identity");
+
+        // Registry rows for BOTH panes carry their ids.
+        let rows = registry.identity_probe_rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.resume_session_id.is_some())
+                .count(),
+            2,
+            "both claude panes carry resume identity: {rows:?}"
+        );
+        for r in rows {
+            registry.kill(&r.terminal_id);
+        }
+        let _ = std::fs::remove_file(&_capture);
+    }
+
+    #[tokio::test]
+    async fn respawn_pane_claude_ends_with_session_identity() {
+        // kata hbsa P2: POST /api/panes/:id/respawn also funnels through
+        // spawn_terminal_pane. The pin is the identity GAP being closed: the
+        // respawned claude pane must end with a real sessionRef (whether the
+        // respawn resumes the prior id or mints fresh is respawn policy, pinned
+        // elsewhere — the bug here was ending with NO identity at all).
+        // NOTE: respawn identity is BODY-driven, not pane-inherited — the
+        // client body is forwarded untouched (pane_ops.rs:716) and
+        // spawn_terminal_pane derives mode solely from body["mode"], defaulting
+        // to "shell" (terminal_tabs.rs:710-715). An empty body respawns a SHELL
+        // pane (no mint). The body below must therefore carry mode:"claude".
+        let (state, registry, _capture) = state_with_claude_capture_spec("claude-respawn");
+        let router = app(state);
+
+        let (status, tab) = post(
+            router.clone(),
+            "/api/tabs",
+            serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let pane_id = tab["data"]["paneId"].as_str().expect("pane id").to_string();
+
+        let (status, respawned) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            serde_json::json!({"mode":"claude"}),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "respawn failed: {respawned}"
+        );
+        // The respawn body is {terminalId} only — identity via the registry row.
+        let respawn_tid = respawned["data"]["terminalId"]
+            .as_str()
+            .expect("terminal id in respawn response")
+            .to_string();
+        let sid = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.terminal_id == respawn_tid)
+            .expect("respawn registry row")
+            .resume_session_id
+            .expect("respawned pane has identity");
+        uuid::Uuid::parse_str(&sid).expect("canonical UUID");
+
+        for r in registry.identity_probe_rows() {
+            registry.kill(&r.terminal_id);
+        }
+        let _ = std::fs::remove_file(&_capture);
+    }
+
+    #[tokio::test]
     async fn create_codex_tab_rejects_raw_resume_session_id_without_session_ref() {
         let argv_file = unique_argv_file("codex-reject");
         let state =
