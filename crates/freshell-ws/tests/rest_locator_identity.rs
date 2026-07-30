@@ -415,6 +415,10 @@ async fn rest_created_codex_pane_binds_identity_row_and_ledger() {
     let sessions_root = unique_temp_dir("codex-sessions");
     let sessions_day = sessions_root.join("2026").join("07").join("27");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sleeper fake codex, no app-server), so pin OFF.
+    // (Added at the 2026-07-30 merge of origin/main: this test predates the flip.)
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     let h = spawn_merged_server(
         vec![common::sleeper_cli_spec("codex")],

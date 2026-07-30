@@ -279,7 +279,9 @@ fn resume_pair_position(argv: &[String], session_id: &str) -> Option<usize> {
 async fn codex_create_derives_resume_from_session_ref() {
     let fake = write_fake_codex();
     std::env::set_var("CODEX_CMD", &fake);
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     let (ws_url, registry) = spawn_server().await;
     let mut ws = connect_and_handshake(&ws_url).await;

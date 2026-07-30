@@ -456,6 +456,89 @@ async fn manager_exit_for_unknown_terminal_is_a_noop() {
     manager.notify_terminal_exit("never-created");
 }
 
+// ── D-C-R sidecar planning budget (S5.e precondition) ─────────────────────────────
+
+/// A [`FakeRuntime`]-shaped runtime whose `ensure_ready` blocks on a shared
+/// [`tokio::sync::Notify`] so plans stay in flight until the test releases
+/// them — the knob that keeps budget permits occupied.
+struct BlockingRuntime {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl CodexLaunchRuntime for BlockingRuntime {
+    fn ensure_ready(
+        &self,
+        cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+        Box::pin(async move {
+            self.release.notified().await;
+            // Released: stand up the file's real loopback echo upstream so
+            // the plan completes against a real socket.
+            let inner = FakeRuntime::start().await;
+            inner.ensure_ready(cwd).await
+        })
+    }
+
+    fn update_ownership_metadata(
+        &self,
+        _terminal_id: String,
+        _generation: u64,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+fn blocking_test_runtime_factory() -> (
+    freshell_codex::launch_lifecycle::CodexRuntimeFactory,
+    Arc<tokio::sync::Notify>,
+) {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let factory_release = release.clone();
+    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move || {
+        Arc::new(BlockingRuntime {
+            release: factory_release.clone(),
+        }) as Arc<dyn CodexLaunchRuntime>
+    });
+    (factory, release)
+}
+
+#[tokio::test]
+async fn third_concurrent_plan_fails_fast_on_the_sidecar_budget() {
+    let (blocking_runtime_factory, release) = blocking_test_runtime_factory();
+    let manager = std::sync::Arc::new(
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
+            blocking_runtime_factory,
+            2,
+            std::time::Duration::from_millis(200),
+        ),
+    );
+    let input = freshell_codex::launch_plan::CodexLaunchPlanInput::default();
+    let m1 = manager.clone();
+    let a = tokio::spawn(async move {
+        m1.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
+            .await
+    });
+    let m2 = manager.clone();
+    let b = tokio::spawn(async move {
+        m2.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // both hold the budget
+    let third = manager.plan_create_with_retry(&input, 1).await;
+    let err = third.expect_err("third concurrent plan must fail fast on the budget");
+    assert!(
+        err.to_string().contains("planning budget exhausted"),
+        "{err}"
+    );
+    release.notify_waiters();
+    let _ = a.await;
+    let _ = b.await;
+}
+
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────
 
 fn fake_app_server_command() -> String {
@@ -527,4 +610,42 @@ async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() 
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ────── S5.c persistence plumbing (mark_candidate_persisted, fail_candidate_capture) ──────
+
+#[tokio::test]
+async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
+        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+    // Must not panic, hang, or error for a terminal that was never adopted.
+    manager.mark_candidate_persisted("no-such-terminal").await;
+    manager
+        .fail_candidate_capture("no-such-terminal", "test refusal")
+        .await;
+    // Observe the no-op: create and adopt a real launch, verify calling the
+    // no-op methods on unknown terminals does not affect it (observable: the
+    // adopted launch can still be shut down cleanly).
+    let planner_runtime = runtime.clone();
+    let planner = CodexLaunchPlanner::new(Box::new(move || {
+        planner_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+    let launch = planner
+        .plan_create(&CodexLaunchPlanInput::default())
+        .await
+        .expect("plan_create");
+    manager
+        .adopt("known-terminal", launch, 0)
+        .await
+        .expect("adopt");
+    // Calling operations on other unknown terminals is still a no-op.
+    manager.mark_candidate_persisted("still-unknown").await;
+    manager
+        .fail_candidate_capture("still-unknown", "test")
+        .await;
+    // The adopted terminal is unaffected (observable: manager can shut down cleanly).
+    manager.shutdown().await;
 }

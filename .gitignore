@@ -59,3 +59,8 @@ port/vm-bridge/outbox-*/
 port/vm-bridge/quarantine-*/
 port/vm-bridge/alive-*.txt
 port/vm-bridge/outbound/
+
+# agent/tool scratch
+.ai/
+.amp-council/
+.verify-vantages.env

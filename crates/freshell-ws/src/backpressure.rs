@@ -76,21 +76,7 @@ impl Default for Term09Config {
     }
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(default)
-}
+use crate::env_parse;
 
 impl Term09Config {
     /// Resolve from process env, mirroring `server/terminal-stream/constants.ts`
@@ -98,12 +84,12 @@ impl Term09Config {
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            queue_max_bytes: env_usize("TERMINAL_CLIENT_QUEUE_MAX_BYTES", defaults.queue_max_bytes),
-            catastrophic_buffered_bytes: env_usize(
+            queue_max_bytes: env_parse("TERMINAL_CLIENT_QUEUE_MAX_BYTES", defaults.queue_max_bytes),
+            catastrophic_buffered_bytes: env_parse(
                 "TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES",
                 defaults.catastrophic_buffered_bytes,
             ),
-            catastrophic_stall_ms: env_u64(
+            catastrophic_stall_ms: env_parse(
                 "TERMINAL_WS_CATASTROPHIC_STALL_MS",
                 defaults.catastrophic_stall_ms,
             ),

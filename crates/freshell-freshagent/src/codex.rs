@@ -55,6 +55,10 @@ use axum::{
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
+use freshell_codex::launch_lifecycle::{
+    allocate_loopback_port, drain_child_io, SIDECAR_START_BUDGET,
+};
+use freshell_codex::launch_plan::codex_sidecar_spawn_spec;
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
@@ -74,11 +78,6 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
-/// The managed-config args every codex app-server launch carries
-/// (`CODEX_MANAGED_REMOTE_CONFIG_ARGS`, `codex-managed-config.ts`).
-const CODEX_MANAGED_CONFIG_ARGS: &[&str] = &["-c", "features.apps=false"];
-/// Cold-boot budget for the sidecar's WS listener + `initialize` handshake.
-const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
 /// Default TTL for the [`FreshCodexState::dead_threads`] negative cache (CODEX-FIRST
 /// triage Finding 2). Long enough to absorb a burst of retries from a client with no
 /// backoff (the empirically-observed storm), short enough that a thread this process was
@@ -1973,6 +1972,9 @@ impl FreshCodexState {
         let port = allocate_loopback_port()?;
         let ws_url = format!("ws://127.0.0.1:{port}");
         let ownership_id = mint_ownership_id();
+        // The canonical argv + env: `-c features.apps=false app-server --listen <ws_url>`
+        // plus the ownership tag the /proc reaper keys on (S5.d.1 unification).
+        let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id);
         let codex_cmd = std::env::var("CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
         // Whitespace-split so a test fixture can point `CODEX_CMD` at an interpreter plus
         // script (e.g. `CODEX_CMD="node /path/fake-app-server.mjs"`) without needing the
@@ -1985,14 +1987,16 @@ impl FreshCodexState {
 
         let mut cmd = tokio::process::Command::new(codex_program);
         cmd.args(&codex_leading_args);
-        cmd.args(CODEX_MANAGED_CONFIG_ARGS);
-        cmd.args(["app-server", "--listen", &ws_url]);
+        cmd.args(&spec.args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
         // Inherit the parent env (HOME=<isolated>, CODEX_HOME unset → <HOME>/.codex) and
-        // layer the ownership tag so the /proc reaper can find exactly our sidecar.
-        cmd.env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id);
+        // layer the spec's env (the ownership tag, so the /proc reaper can find exactly
+        // our sidecar).
+        for (key, value) in &spec.env {
+            cmd.env(key, value);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2002,12 +2006,7 @@ impl FreshCodexState {
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
-        if let Some(out) = child.stdout.take() {
-            drain_reader(out);
-        }
-        if let Some(err) = child.stderr.take() {
-            drain_reader(err);
-        }
+        drain_child_io(&mut child);
 
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
 
@@ -3543,27 +3542,6 @@ fn sandbox_policy_value(sandbox: &str) -> Value {
         "danger-full-access" => json!({ "type": "dangerFullAccess" }),
         other => json!({ "type": other }),
     }
-}
-
-/// Allocate an ephemeral loopback port (bind→read→release; the tiny race window matches
-/// the reference's `allocateLocalhostPort`).
-fn allocate_loopback_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
-    Ok(listener.local_addr().map_err(|e| e.to_string())?.port())
-}
-
-/// Drain an async child pipe to /dev/null so it never back-pressures the app-server.
-fn drain_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut reader: R) {
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
 }
 
 /// `Date.now()` — epoch milliseconds (the turn-complete clock's `now`).

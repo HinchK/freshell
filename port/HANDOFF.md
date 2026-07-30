@@ -760,8 +760,9 @@ every result from committed files alone.
 7. **Interchange + robustness** (§7.F, §7.I). DONE 2026-07-14 (reports under
    `port/oracle/{robustness,interchange}/`). Tracked remaining-work out of this item:
    **terminal-metadata push subsystem** (`terminal.meta.updated` / TerminalMetadataService) —
-   documented gap DEV-0008, closes together with DEV-0006's coding-CLI
-   sidecar-lifecycle scope (`port/machine/specs/coding-cli.md`).
+   documented gap DEV-0008 (closed 2026-07-30 — DEV-0006 S5; see port/oracle/DEVIATIONS.md),
+   closes together with DEV-0006's coding-CLI (closed 2026-07-30 — DEV-0006 S5; see
+   port/oracle/DEVIATIONS.md) sidecar-lifecycle scope (`port/machine/specs/coding-cli.md`).
 8. **T2 live** on this host (needs credentials — if absent, escalate loudly as the
    one human dependency). DONE 2026-07-14 (969933ed): claude + codex PASS deep-equal;
    opencode ESCALATED — credentials absent on this host

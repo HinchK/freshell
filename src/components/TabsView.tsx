@@ -34,7 +34,7 @@ import {
   type SessionLocator,
 } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
-import { RestoreErrorSchema } from '@shared/session-contract'
+import { sanitizeRestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
@@ -173,14 +173,14 @@ export function sanitizePaneSnapshot(
       fallbackSessionId: resumeSessionId,
     })
     const style = normalizeFreshAgentStyleOverride(payload.style)
-    const restoreError = RestoreErrorSchema.safeParse(payload.restoreError)
+    const restoreError = sanitizeRestoreError(payload.restoreError)
     return {
       kind: 'fresh-agent',
       sessionType,
       provider,
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
-      ...(restoreError.success && !sessionRef ? { restoreError: restoreError.data } : {}),
+      ...(restoreError && !sessionRef ? { restoreError } : {}),
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,

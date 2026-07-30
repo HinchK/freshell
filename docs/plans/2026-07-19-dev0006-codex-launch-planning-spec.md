@@ -8,6 +8,19 @@
 
 > **Concurrency note:** five implementer agents are editing the live tree. Every `file:line` below is against the committed state at `8e7482e1` and will drift. Re-anchor with `grep`/LSP before editing.
 
+> **RECONCILED vs `main` 2026-07-30 (Parallax investigation, 3 perspectives; artifacts in
+> `.discovery/investigation/modules/dev0006-spec/`).** Slices 1–4 are all LANDED (dark,
+> flag default OFF; G-X0 still the live golden; DEV-0006 + DEV-0008 records still open).
+> **S5 as originally worded is largely pre-empted**: durable codex identity binding,
+> turn/activity events, and `terminal.meta.updated` all now exist via the restart-resilience
+> campaign's disk-based lane (rollout locator + pane-identity ledger + `freshell-activity`),
+> flag-independent and proxy-independent. See the rewritten **Slice 5** below and the new
+> **§8 reconciliation** for the revised remaining scope. Dated `> 2026-07-30:` annotations
+> throughout mark claims that are now historical. §7 anchors re-anchored to the 2026-07-30
+> `main` working tree.
+> **2026-07-30 (later):** Revised Slice 5 LANDED (docs/plans/2026-07-30-codex-managed-launch-s5.md):
+> flag default ON, G-X0 retired, DEV-0006 + DEV-0008 closed. The status lines above are historical.
+
 ---
 
 ## 0. The deviation record (quoted verbatim)
@@ -28,6 +41,13 @@ From `port/oracle/DEVIATIONS.md:517-526`:
 ```
 
 Council record: **a PARTIAL port (create-upsert/exit-remove only) was REJECTED** (`DEVIATIONS.md:608`, in DEV-0008). DEV-0008 (`terminal.meta.updated` metadata badges) is explicitly tracked to **close together with DEV-0006** (`DEVIATIONS.md:643-652`, `HANDOFF.md:763`).
+
+> **2026-07-30:** The DEV-0006 record is now `DEVIATIONS.md:517-527` (a `closure_progress`
+> line :526 records S4 landed dark; status :527). The DEV-0008 record is now :588-653 — and
+> its text is **factually stale**: it still says "rust emits NO terminal.meta.updated frames"
+> while shipping code emits them at create time (`terminal.rs:3198-3270`, since `b9e0c1a3`
+> 2026-07-16) and at association time (`codex_identity.rs:258`, `opencode_association.rs:194`).
+> S5 must append a `closure_progress`/amendment to DEV-0008 rather than trust its text.
 
 ---
 
@@ -80,6 +100,15 @@ REST path is the same shape: `agent-api/router.ts:160-195` (`planCodexLaunchWith
 
 ## 2. The port's current state
 
+> **2026-07-30:** §2 is HISTORICAL — it describes the pre-S1 state. Everything in §2.3's
+> "missing" list items 1–4 is now built and landed dark (see the S4 LANDED note in §5 and the
+> re-anchored §7). Item 5 (the DEV-0008-entangled consumers) landed via a DIFFERENT lane than
+> anticipated — see §8. The WS raw-resume note in §2.1 has been overtaken by sessionRef-first
+> derivation (`terminal.rs:1668-1682`, pinned by `tests/codex_session_ref_resume.rs`, guarded
+> by D7 live-session refusal + D8 leases + `SESSION_IDENTITY_MISMATCH`); REST still hard-rejects
+> raw codex resume (`terminal_tabs.rs:65,:127-131`). Rust intentionally exceeds legacy here
+> (recorded as EDEVs incl. EDEV-07) — "align to legacy" is no longer the frame.
+
 ### 2.1 What the two create paths do for codex today (the gap)
 
 - **WS** `crates/freshell-ws/src/terminal.rs:831-835`: `let codex_remote_ws_url: Option<String> = None;` with a DEV-0006 comment. Codex terminal panes spawn plain `codex` with notif + MCP argv but **no `--remote` 4-tuple**. Raw codex `resumeSessionId` is accepted unconditionally (`:779-782`) — the legacy REST rejection is NOT enforced here (noted at `terminal_tabs.rs:100-107`).
@@ -131,6 +160,20 @@ The EQUIVALENCE-REPORT disclosure (`EQUIVALENCE-REPORT.md:109`): *"codex panes i
 4. **DEV-0008 metadata badges** (`terminal.meta.updated`: git branch/dirty, token usage) stay absent for codex panes — the producer is entangled with this same session-association subsystem and is tracked to close **with** DEV-0006 (`DEVIATIONS.md:641-652`).
 
 No crash / no stale-confident data: absent, not wrong. That is exactly why council accepted the gap as ship-safe but keeps it tracked for closure.
+
+> **2026-07-30: three of the four impact claims above are now STALE.** The restart-resilience
+> campaign (2026-07-24…29) closed them via a disk-based lane, flag-independent:
+> 1. Durable session binding: **exists.** Server-side rollout locator → `adopt_codex_identity`
+>    → pane-identity ledger (`codex_association.rs` armed at create with a 150ms sweep;
+>    `codex_identity.rs:185-229` does identity upsert → registry meta → fsync'd ledger row →
+>    broadcasts → activity bind).
+> 2. `features.apps` not forced off: **still TRUE** — the only surviving impact claim (flag
+>    default OFF, `launch_plan.rs:59-66`).
+> 3. Turn/activity tracking: **exists in effect.** `crates/freshell-activity` (explicit port of
+>    `codex-activity-tracker.ts`, PTY BEL + rollout-reconcile lanes with cross-lane dedupe).
+>    Not the *managed proxy* stream, but the user-visible absence is gone.
+> 4. `terminal.meta.updated`: **partly exists** — emitted at create time and association time.
+>    Git branch/dirty + tokenUsage enrichment and exit-remove remain unported everywhere.
 
 ---
 
@@ -203,7 +246,80 @@ A single `resolve_codex_launch(...) -> Option<CodexLaunchInto>` used by both `cr
 
 ### Slice 5 (SEPARATE stage, gated) — durability binding + activity + `terminal.meta.updated` (DEV-0008)
 
-Consume the proxy's captured candidates to mint a durable `sessionRef`, drive `codex-activity-tracker`-equivalent turn events, and emit `terminal.meta.updated`. **Do not ship Slices 1-4 with Slice 5 half-wired** (see §6). Land Slice 5 as its own tracked change that closes DEV-0008 alongside DEV-0006.
+> Original wording (historical): *"Consume the proxy's captured candidates to mint a durable
+> `sessionRef`, drive `codex-activity-tracker`-equivalent turn events, and emit
+> `terminal.meta.updated`. Do not ship Slices 1-4 with Slice 5 half-wired (see §6). Land Slice 5
+> as its own tracked change that closes DEV-0008 alongside DEV-0006."*
+
+**REVISED 2026-07-30 (reconciled vs main — see §8).** The three outcomes above now exist via
+the disk-based identity lane (rollout locator + `adopt_codex_identity` + pane-identity ledger +
+`freshell-activity`), flag-independent. S5 must NOT rebuild them from proxy events — that would
+create a second identity writer, violating the single-writer discipline established 2026-07-26
+(`4767b7ec` retired the client candidate channel; accept-and-ignore pinned by
+`tests/codex_candidate_inert.rs`; misbind guards `857c9d48`). The revised S5:
+
+**S5.a — Drain the proxy event stream into the EXISTING identity/activity tail.**
+The stream (`RemoteProxyEvent`, `remote_proxy.rs:185-193`) currently dead-ends in
+`AdoptedTerminalLaunch._events` (`launch_lifecycle.rs:373-376`, "unconsumed until S5") and is
+dropped at teardown. Spawn ONE per-terminal drain task at `CodexTerminalLaunchManager::adopt`
+(covers all three adopt sites: WS create `terminal.rs:2374`, auto-resume respawn `:2977`, REST
+`terminal_tabs.rs:1588`). Route events through the existing tails — do not build new ones:
+- `Candidate` → `codex_identity::adopt_codex_identity` (`codex_identity.rs:60`): gives sessionRef
+  minting, ledger row, `terminal.session.associated` + `terminal.meta.updated`, and activity bind
+  in the pinned order, with hijack/misbind guards. The pane ledger IS the durability store — do
+  NOT port `durability-store.ts`.
+- `TurnStarted`/`TurnCompleted` → `freshell-activity` codex tracker — but its dedupe currently
+  covers TWO lanes (PTY BEL + rollout reconcile, `freshell-activity/src/codex.rs:30-36`); the
+  proxy is a THIRD clock domain (legacy dedupes all three, `codex-activity-tracker.ts:438`).
+  Extend the dedupe or double-chimes of `terminal.turn.complete` result.
+- Fork candidates → route through the landed `rebind_codex_identity` lane
+  (`codex_fork_rebind.rs`, D7/A13 guards) or ignore; do NOT port `codexForkHandoff`.
+- `RepairTrigger`/lifecycle-loss: minimal — log + rely on auto-resume orchestrator; sidecar-level
+  re-plan-on-loss stays deferred (§6 fence) and must compose with auto-resume + the spawn gate.
+
+**S5.b — Locator/proxy arbitration.** The rollout locator (`codex_association.rs`, armed at
+`terminal.rs:2405-2450`) keeps running for managed panes; a foreign same-cwd rollout can win the
+first-bind race before the candidate lands. Suppress arming (or `locator.disarm`,
+`codex_locator.rs:263`) for managed panes, and define a deliberate rule for candidate-vs-locator
+precedence on THIS terminal (re-adopt with a different id is currently allowed by
+`identity.upsert` — make it a decision, not an accident).
+
+**S5.c — Enforce `require_candidate_persistence`.** Recorded but never gated
+(`remote_proxy.rs:262-271`); no `candidate_capture_timeout`. Legacy gates relay on persist and
+fails identity on capture timeout (`terminal-registry.ts:1911-1917,1946-1951`). Shipping binding
+without the gate is the exact "confidently divergent" class council rejected — port the gate or
+obtain an explicit adjudicated waiver.
+
+**S5.d — Structural prerequisites (from the S4 review, all still open as of 2026-07-30):**
+1. Spawn-helper unification (`codex.rs:1959+` still duplicates `SpawnedCodexAppServerRuntime`).
+2. Singleton→DI if the drain task needs `WsState` access (the manager lives in `freshell-codex`
+   and cannot see `WsState`; ~13 `::global()` call sites now; DI precedents exist:
+   `PaneIdentitySink`, `SessionIdentityLookup`, spawn-gate set-once handle).
+3. `binding_reason`: computed (`launch_plan.rs:216-222`) but dropped at adoption, zero consumers.
+   DECIDE: wire a registry `sessionBindingReason` consumer, feed the ledger/adoption tail
+   (which has its own reason vocabulary), or explicitly drop it — record the decision.
+
+**S5.e — Flag flip + closure (the payoff).** Default `FRESHELL_CODEX_MANAGED_LAUNCH` ON:
+- **Precondition (NEW since spec):** resolve `D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH)`
+  (`launch_plan.rs:56-59`, `terminal_tabs.rs:1271`; `2026-07-27-rest-spawn-gate.md:91-123`) —
+  managed planning runs under the held spawn permit, worst case ~226 s (5×45 s sidecar budget)
+  vs 10 s waits at every other door. Likely needs a separate sidecar budget before the flip.
+- Retire G-X0 (`cli_launch_goldens.rs:731-758`), promote G-X1/G-X2 as live-path pins; add a
+  resume golden; invert the e2e OFF-control leg.
+- **Fix the silent test breakers:** fake-codex suites that `remove_var` the flag and assume plain
+  CLI spawn would post-flip run a real managed plan against a fake codex script and hang through
+  5×45 s probes — `codex_fork_rebind.rs:351,501,588,702`, `codex_locator_activity.rs:151`,
+  `codex_session_ref_resume.rs:282`, `codex_candidate_inert.rs:136`. Pin the flag OFF explicitly
+  or give them a fake app-server harness.
+- Close records: DEV-0006 → `closed` with the closing commit; DEV-0008 → append
+  `closure_progress` correcting its stale "no terminal.meta.updated" text and close per its
+  adjudicated closure condition (`DEVIATIONS.md:644-650` — git/tokenUsage enrichment NOT
+  required for closure). Update the EQUIVALENCE-REPORT disclosure.
+
+Out of scope for S5 (unchanged fences + new): display-id wiring; resolver rework;
+`codexForkHandoff` port; `durability-store.ts` port; meta enrichment (git branch/dirty,
+tokenUsage) unless separately adjudicated; WS raw-resume "alignment" (overtaken by
+sessionRef-first derivation + D7/D8 guards — see §2 note).
 
 ### e2e leg (one)
 
@@ -228,6 +344,11 @@ A host-gated live integration test (`#[ignore]`, opt-in like `FRESHELL_RUN_REAL_
 
 - **NO display-id wiring.** `codexDisplayIdSecret` is a fresh-agent chat concern (§1.5); it has nothing to do with terminal `--remote`.
 - **NO partial DEV-0008 shipment.** Council REJECTED create-upsert/exit-remove-only metadata (`DEVIATIONS.md:608`) as strictly worse than honest absence. Slice 5 lands whole or not at all.
+  > **2026-07-30:** Overtaken in practice: create-time `terminal.meta.updated` shipped 07-16
+  > and association-time shipped 07-24/26, each with its own review trail. The fence's SPIRIT
+  > survives as S5.c (`require_candidate_persistence` enforcement — no confidently-divergent
+  > identity records); its LETTER (no meta.updated before S5) is historical. The DEV-0008
+  > record text is stale — see §0 note.
 - **NO resolver rework.** The argv resolver is done (G-X1/G-X2/G-W2 pass). Feed it a URL; don't touch it.
 - **NO new codex app-server client.** Reuse `freshell-codex::CodexAppServerClient` + `spawn_sidecar` mechanics; the proxy is additive, not a replacement.
 - **NO behavior change to non-codex modes** and no touching `server/ shared/ src/` (campaign additive-only purity rule).
@@ -237,23 +358,99 @@ A host-gated live integration test (`#[ignore]`, opt-in like `FRESHELL_RUN_REAL_
 
 ## 7. Key file:line index (anchor before editing — will drift)
 
-Legacy (frozen `server/`):
-- `coding-cli/codex-launch-config.ts:22-28` — `getCodexSessionBindingReason`
-- `coding-cli/codex-managed-config.ts:1-4` — `['-c','features.apps=false']`
-- `coding-cli/codex-app-server/restore-decision.ts:32-77` — restore-identity validator
-- `coding-cli/codex-app-server/launch-planner.ts:125-175,221-316` — `planCreate` + sidecar lifecycle
-- `coding-cli/codex-app-server/remote-proxy.ts` (~52 KB) — the proxy (unported)
-- `coding-cli/codex-app-server/{json-rpc-envelope,json-rpc-side-effects}.ts` — scan/extract (unported)
-- `ws-handler.ts:928-950,2438-2519` — `planCodexLaunch` + WS create wiring
-- `agent-api/router.ts:160-195,737-749,1175,1335,1572-1584` — REST create wiring
-- `terminal-registry.ts:295-307` — argv assembly (`--remote`)
-- `index.ts:322-326,359-365` — display-id→chat adapter; launch planner ctor (no secret)
+> **Re-anchored 2026-07-30 against the `main` working tree** (original 8e7482e1 anchors
+> retained in strikethrough-style parens where moved). Working-tree caveat: uncommitted hunks
+> exist in `terminal.rs` (~:3862, :3921 — auto-resume-cancel, not codex regions), `lib.rs`
+> (ws), and `terminal_tabs.rs` (net −11 lines above ~:600, so committed anchors below :600
+> there are ~+11). Full old→new table:
+> `.discovery/investigation/modules/dev0006-spec/agents/code-tracer/findings.md`.
 
-Port (`crates/`):
-- `freshell-ws/src/terminal.rs:779-782,800,831-835` — WS gap + resume + strip
-- `freshell-freshagent/src/terminal_tabs.rs:90-129,566-609` — REST gap + raw-resume reject
-- `freshell-platform/src/cli_launch_goldens.rs:623-650` — G-X0 pin (to retire)
-- `freshell-codex/src/lib.rs` — reusable client core surface
-- `freshell-freshagent/src/codex.rs:79,1343-1449` — `spawn_sidecar` (reusable mechanics)
-- `port/machine/specs/coding-cli.md:380-387` — §4e launch-planning scope note
-- `port/oracle/DEVIATIONS.md:517-526` — the record to flip to `closed`
+Legacy (`server/` on main, Jul-8 — newer than the frozen snapshot the original anchors used):
+- `coding-cli/codex-launch-config.ts:22-28` — `getCodexSessionBindingReason` (valid)
+- `coding-cli/codex-managed-config.ts:1-4` — `['-c','features.apps=false']` (valid)
+- `coding-cli/codex-app-server/restore-decision.ts:32-77` — restore-identity validator (valid)
+- `coding-cli/codex-app-server/launch-planner.ts` — `planCreate` :125, shutdown :177, sidecar adopt :236
+- `coding-cli/codex-app-server/remote-proxy.ts` (~52 KB) — the proxy (**now PORTED**, see below)
+- `coding-cli/codex-app-server/{json-rpc-envelope,json-rpc-side-effects}.ts` — scan/extract (**now PORTED**)
+- `coding-cli/codex-activity-tracker.ts` — triple-lane turn dedupe :438 (S5.a parity reference)
+- `coding-cli/codex-activity-wiring.ts:50-91` — tracker↔registry wiring
+- `ws-handler.ts` — `planCodexLaunch` :970-990 (was 928-950); WS create wiring :2528-2612 (was 2438-2519; binding :2587, adopt :2601, publish :2605); `broadcastTerminalMetaUpdated` :3842
+- `agent-api/router.ts:161-193,737-749,1175,1335,1572-1585` — REST create wiring (binding :742,:1577)
+- `terminal-registry.ts` — argv assembly :305-317 (was 295-307); onCandidate→persist + turn events :1909-1966; `bindSession` :4740-4810; candidate-persistence gate :1911-1917,:1946-1951
+- `index.ts` — display-id→chat adapter :366-368 (was 322-326); launch planner ctor :403 (was 359-365)
+
+Port (`crates/`) — the landed S1–S4 machinery:
+- `freshell-codex/src/remote_proxy_envelope.rs` — `scan_json_rpc_envelope` :88; byte limits :27-35 (S1)
+- `freshell-codex/src/remote_proxy_side_effects.rs` — all 8 extractors :356-726; tests :781+ (S1)
+- `freshell-codex/src/json_scan.rs` — shared byte-scan engine (S1, not in original spec)
+- `freshell-codex/src/remote_proxy.rs` — `start()` :211, `close()` :272; **`RemoteProxyEvent` :185-193** (single ordered stream replacing the six TS `on*` hook sets); `require_candidate_persistence` recorded-not-enforced :262-271 (S2)
+- `freshell-codex/src/launch_plan.rs` — flag env + `D-C-REVISIT` :56-66; `CodexLaunchPlan` :183 (binding_reason :188); `plan_codex_launch` :211; `codex_sidecar_spawn_spec` :321 (S3 pure half)
+- `freshell-codex/src/launch_lifecycle.rs` — `CodexLaunchSidecar.adopt` :167; `CodexTerminalLaunch` :202 (events "unconsumed until S5" :210-211); `plan_create` :259 / `_with_retry` :327; **`CodexTerminalLaunchManager::global()` :399** (process singleton); **`AdoptedTerminalLaunch._events` :373-376 — the S5 tap point**; `SpawnedCodexAppServerRuntime` :504 (S3/S4)
+- `freshell-ws/src/terminal.rs` — gate :1040; plan :1106-1143; resume derivation (sessionRef-first) :1668-1682 (was 779-782); settings strip :1078-1094 (was :800); create branch + `codex_remote_ws_url` :2004-2032 (was 831-835); adopt :2374; locator arm :2405-2450; respawn adopt :2977; exit hook :1336; meta.updated broadcast :3256 (DEV-0008 comment :3198)
+- `freshell-ws/src/codex_identity.rs` — `adopt_codex_identity` :60; `apply_codex_identity` :186-227; broadcasts :229-260 (**the S5.a reuse tail**)
+- `freshell-ws/src/codex_association.rs`, `codex_locator.rs` (disarm :263), `codex_fork_rebind.rs`, `pane_ledger.rs` — locator lane + ledger (the incumbent durable store)
+- `freshell-activity/src/codex.rs` — tracker; two-lane dedupe :30-36 (S5.a must add third lane)
+- `freshell-freshagent/src/terminal_tabs.rs` — raw-resume reject :65,:117-135 (was 90-129); gate :524-532; plan+wire :1271-1358 (was 566-609); adopt :1588
+- `freshell-platform/src/cli_launch_goldens.rs` — G-X0 :731-758 (was 623-650, to retire); G-X1 :262, G-X2 :290, G-W2 :609
+- `freshell-freshagent/src/codex.rs` — `CODEX_MANAGED_CONFIG_ARGS` :79 (valid); `spawn_sidecar` :1959+ (was 1343-1449; still-duplicated mechanics)
+- `freshell-server/src/main.rs:1197-1206` — shutdown owner
+- `freshell-ws/tests/codex_managed_launch_e2e.rs` — e2e leg (`#[ignore]` :260)
+- `port/machine/specs/coding-cli.md:380-388` — §4e launch-planning scope note (valid)
+- `port/oracle/DEVIATIONS.md:517-527` — DEV-0006 record (was 517-526); DEV-0008 :588-653 (text stale, see §0 note)
+
+---
+
+## 8. Reconciliation vs `main`, 2026-07-30 (Parallax investigation)
+
+Three independent fresh-context agents (code tracer / behavior observer / integration mapper)
+verified this spec against the `main` working tree; ~263 commits landed on the four relevant
+crates since the S4 LANDED note (2026-07-22). Full artifacts:
+`.discovery/investigation/modules/dev0006-spec/agents/*/`.
+
+### 8.1 Status verdict
+
+| Claim | Verdict |
+|---|---|
+| S1–S4 landed dark, flag default OFF | **CONFIRMED** (only exact `"1"` enables, `launch_plan.rs:64-66`) |
+| G-X0 still the live golden; no G-X1 swap | **CONFIRMED** (moved to `cli_launch_goldens.rs:731-758`) |
+| DEV-0006 / DEV-0008 records open | **CONFIRMED** (but DEV-0008 text contradicted by code — D-01 below) |
+| S5 "not yet built" as originally scoped | **STALE** — outcomes pre-empted by the disk lane; only the proxy-fed path and the flip remain (see revised Slice 5) |
+| All four S4-review follow-ups still open | **CONFIRMED** (spawn-helper UNTOUCHED; singleton entrenched ~13 call sites; binding_reason zero consumers; re-plan-on-loss deferred but reshaped by the auto-resume orchestrator `6379f24f`) |
+
+### 8.2 What changed the picture (landed 2026-07-23…29, none of it proxy-fed)
+
+- **Identity**: rollout locator + `adopt_codex_identity` + pane-identity ledger (single-writer
+  discipline; client candidate channel retired `4767b7ec`, pinned inert by
+  `tests/codex_candidate_inert.rs`).
+- **Activity**: `crates/freshell-activity` (port of `codex-activity-tracker.ts`, PTY+rollout
+  lanes with cross-lane dedupe).
+- **Meta**: `terminal.meta.updated` at create + association time (create-time slice actually
+  pre-dates this spec — `b9e0c1a3` 07-16 — which the spec missed).
+- **Resume**: sessionRef-first derivation + D7 live-session refusal + D8 leases +
+  `SESSION_IDENTITY_MISMATCH`; fork-rebind lane (`codex_fork_rebind.rs`).
+- **Substrate deletions**: `35cf2864` removed the `durability.rs` store exports S5 was assumed
+  to write into (−114 lines); the ledger is the incumbent store. `2a68d027` removed 447 lines
+  of restore-decision machinery from `launch_plan.rs`.
+- **New flip precondition**: `D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH)` spawn-permit hold
+  (~226 s worst case) — the flip is no longer a one-line change + golden swap.
+
+### 8.3 Discrepancy log (no-fiat)
+
+- **D-01 — DEV-0008 record vs code.** Record (`DEVIATIONS.md:588-653`) says "rust emits NO
+  terminal.meta.updated frames"; code emits them at create + association. RESOLVED in favor of
+  code (two agents, independent file:line evidence). Action: S5.e appends the correcting
+  `closure_progress`.
+- **D-02 — "whole-or-not" fence vs practice.** Council fence said no partial DEV-0008; two
+  partial meta.updated slices shipped anyway, each with its own review trail. RESOLVED as:
+  fence letter historical, fence spirit lives on as S5.c. Noted in §6.
+- **D-03 — locator-vs-candidate precedence on the SAME terminal.** `identity.upsert` allows a
+  later re-adopt with a different id; whether candidate should override locator (or vice versa)
+  is currently an accident of arrival order. OPEN — S5.b must make it a rule.
+
+### 8.4 Where the original spec was simply right
+
+§1 (legacy behavior), §4 (not-moot verdict), the S4 LANDED note, and the resolver/fences in §6
+(display-id, resolver, no-new-client, additive-only) all held up under verification. The port
+also made two deliberate improvements the spec should acknowledge: the six TS `on*` hook sets
+collapsed into one ordered `RemoteProxyEvent` stream, and the two hand-rolled TS byte-scanners
+consolidated into `json_scan.rs`.

@@ -9,7 +9,7 @@ import connectionReducer from '@/store/connectionSlice'
 import terminalLifecycleReducer, { selectExitRecordFrom } from '@/store/terminalLifecycleSlice'
 import { updatePaneContent } from '@/store/panesSlice'
 import { resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { CrashTrace, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
 import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { installPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -120,7 +120,7 @@ interface StoreOptions {
   mode?: string
   status?: TerminalPaneContent['status']
   withSessionRef?: boolean
-  crashTrace?: { exitCode: number; resumedAtMs: number }
+  crashTrace?: CrashTrace
   lifecycle?: {
     lastTerminalId?: string
     exit?: { exitCode: number; at: number }

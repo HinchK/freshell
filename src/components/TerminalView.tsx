@@ -4386,7 +4386,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               recordAutoResumeSettled({
                 paneId: paneIdRef.current,
                 resumeCycles: msg.resumeCycles,
-                at: Date.now(),
               })
             )
           }
