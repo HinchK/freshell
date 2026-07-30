@@ -419,7 +419,7 @@ async fn capture_timeout_rejects_held_frames_and_emits_repair_trigger() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fail_candidate_capture_rejects_held_frames() {
     let (upstream, _seen) = spawn_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(gate_options(&upstream, true))
+    let (proxy, mut events) = CodexRemoteProxy::start(gate_options(&upstream, true))
         .await
         .unwrap();
     let mut ws = connect_client(proxy.ws_url()).await;
@@ -438,6 +438,112 @@ async fn fail_candidate_capture_rejects_held_frames() {
         }
     }
     assert!(got_error, "fail_candidate_capture must answer held frames with -32000");
+    // Ledger A28: ANY initial-capture failure (identity-guard refusal included)
+    // fires repair_trigger{kind:'candidate_capture_timeout'}, not proxy_error.
+    let mut saw_trigger = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), events.recv()).await
+    {
+        if matches!(
+            event,
+            RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::CandidateCaptureTimeout)
+        ) {
+            saw_trigger = true;
+            break;
+        }
+    }
+    assert!(saw_trigger, "fail_candidate_capture must emit CandidateCaptureTimeout");
+    proxy.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hold_queue_overflow_fails_the_capture() {
+    // Legacy parity (ledger A28): the 33rd gated frame is PUSHED and then the
+    // gate FAILS (overflow = capture failure) — every held frame gets -32000,
+    // nothing reaches upstream, and candidate_capture_timeout fires.
+    let (upstream, mut seen) = spawn_fake_upstream().await;
+    let (proxy, mut events) = CodexRemoteProxy::start(gate_options(&upstream, true))
+        .await
+        .unwrap();
+    let mut ws = connect_client(proxy.ws_url()).await;
+    for i in 0..33 {
+        ws
+            .send(text(serde_json::json!({"jsonrpc":"2.0","id":i,"method":"turn/start","params":{}})))
+            .await
+            .ok();
+    }
+    let mut errors = 0;
+    while let Some(frame) = recv_text_with_timeout(&mut ws, 2_000).await {
+        if frame.contains("-32000") {
+            errors += 1;
+            if errors == 33 {
+                break;
+            }
+        }
+    }
+    assert_eq!(errors, 33, "all 33 held frames (incl. the overflowing one) get -32000");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), seen.recv())
+            .await
+            .is_err(),
+        "no gated frame may reach upstream after an overflow failure"
+    );
+    let mut saw_trigger = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), events.recv()).await
+    {
+        if matches!(
+            event,
+            RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::CandidateCaptureTimeout)
+        ) {
+            saw_trigger = true;
+            break;
+        }
+    }
+    assert!(saw_trigger, "overflow is a capture failure: it must emit CandidateCaptureTimeout");
+    proxy.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_bytes_cap_fails_the_capture() {
+    // Legacy parity (ledger A28): the CUMULATIVE held bytes are capped by
+    // max_raw_forward_bytes — two frames each under the per-frame raw-forward
+    // check but together over the cap fail the gate as a capture failure.
+    let (upstream, _seen) = spawn_fake_upstream().await;
+    let mut options = gate_options(&upstream, true);
+    options.max_raw_forward_bytes = 2_048;
+    let (proxy, mut events) = CodexRemoteProxy::start(options).await.unwrap();
+    let mut ws = connect_client(proxy.ws_url()).await;
+    let blob = "x".repeat(1_200); // each frame ~1.3 KB < 2 KB; two frames > 2 KB
+    for i in 0..2 {
+        ws
+            .send(text(serde_json::json!({"jsonrpc":"2.0","id":i,"method":"turn/start","params":{"blob":&blob}})))
+            .await
+            .ok();
+    }
+    let mut errors = 0;
+    while let Some(frame) = recv_text_with_timeout(&mut ws, 2_000).await {
+        if frame.contains("-32000") {
+            errors += 1;
+            if errors == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(errors, 2, "both held frames get -32000 when the byte cap trips");
+    let mut saw_trigger = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), events.recv()).await
+    {
+        if matches!(
+            event,
+            RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::CandidateCaptureTimeout)
+        ) {
+            saw_trigger = true;
+            break;
+        }
+    }
+    assert!(saw_trigger, "the held-bytes cap must emit CandidateCaptureTimeout");
     proxy.close().await;
 }
 ```
@@ -524,8 +630,9 @@ struct HeldGateFrame {
 enum IdentityGate {
     /// require_candidate_persistence=false, or the candidate was persisted.
     Open,
-    /// Fresh managed launch awaiting candidate persistence.
-    Holding { held: Vec<HeldGateFrame>, hold_timer_armed: bool },
+    /// Fresh managed launch awaiting candidate persistence. `held_bytes` is
+    /// the cumulative size of the held frames (legacy `heldBytes`, ledger A28).
+    Holding { held: Vec<HeldGateFrame>, held_bytes: usize, hold_timer_armed: bool },
     /// Capture failed or timed out: gated methods are rejected outright.
     Failed,
 }
@@ -546,7 +653,8 @@ from `start()`:
         ));
 ```
 
-`run_hub` initializes `identity_gate` to `Holding { held: Vec::new(), hold_timer_armed: false }`
+`run_hub` initializes `identity_gate` to
+`Holding { held: Vec::new(), held_bytes: 0, hold_timer_armed: false }`
 when `require_candidate_persistence`, else `Open`. In `start()`, after spawning the hub, arm
 the capture timer:
 
@@ -569,16 +677,10 @@ the capture timer:
         // launch, hold turn/start + thread/fork until the durability consumer
         // persists the candidate. Everything else flows so the pane boots.
         if matches!(method.as_deref(), Some("turn/start") | Some("thread/fork")) {
+            let mut frame_held = false;
+            let mut capture_failure: Option<&'static str> = None;
             match &mut self.identity_gate {
-                IdentityGate::Holding { held, hold_timer_armed } => {
-                    if held.len() >= MAX_HELD_IDENTITY_GATE_FRAMES {
-                        self.send_json_rpc_error_to_client(
-                            conn_id,
-                            id.as_ref(),
-                            "Codex remote proxy identity gate hold queue is full.",
-                        );
-                        return;
-                    }
+                IdentityGate::Holding { held, held_bytes, hold_timer_armed } => {
                     if !*hold_timer_armed {
                         *hold_timer_armed = true;
                         let timer_tx = self.hub_tx.clone();
@@ -588,8 +690,21 @@ the capture timer:
                             let _ = timer_tx.send(HubMsg::IdentityGateHoldTimedOut);
                         });
                     }
+                    // Legacy parity (ledger A28): push FIRST, then evaluate the
+                    // caps — queue overflow and the cumulative held-bytes cap
+                    // are capture FAILURES (legacy pushes the 33rd frame and
+                    // THEN fails the gate), never silent per-frame refusals.
+                    *held_bytes = held_bytes.saturating_add(data.len());
                     held.push(HeldGateFrame { conn_id, data, binary });
-                    return;
+                    frame_held = true;
+                    if held.len() > MAX_HELD_IDENTITY_GATE_FRAMES {
+                        capture_failure =
+                            Some("Codex remote proxy identity gate hold queue overflowed.");
+                    } else if *held_bytes > self.max_raw_forward_bytes {
+                        capture_failure = Some(
+                            "Codex remote proxy identity gate held bytes exceeded the raw-forward cap.",
+                        );
+                    }
                 }
                 IdentityGate::Failed => {
                     self.send_json_rpc_error_to_client(
@@ -601,8 +716,22 @@ the capture timer:
                 }
                 IdentityGate::Open => {}
             }
+            if frame_held {
+                if let Some(message) = capture_failure {
+                    // A28: ANY initial-capture failure (overflow/refusal
+                    // included) fires candidate_capture_timeout.
+                    self.fail_identity_gate(
+                        message,
+                        Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
+                    );
+                }
+                return;
+            }
         }
 ```
+
+(The `frame_held`/`capture_failure` locals keep the `fail_identity_gate(&mut self, ...)` call
+OUTSIDE the `match &mut self.identity_gate` borrow.)
 
 3g. Hub methods + `run_hub` arms:
 
@@ -648,9 +777,11 @@ the capture timer:
             HubMsg::FailCandidateCapture { message } => {
                 if matches!(hub.identity_gate, IdentityGate::Holding { .. }) {
                     let msg = format!("Codex candidate capture failed: {message}");
+                    // A28: any initial-capture failure (identity-guard refusal
+                    // included) fires candidate_capture_timeout, not proxy_error.
                     hub.fail_identity_gate(
                         &msg,
-                        Some(RemoteProxyRepairTrigger::ProxyError { message: msg.clone() }),
+                        Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
                     );
                 }
             }
@@ -1179,14 +1310,14 @@ assert on `TrackerEffect::TurnComplete`):
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
         // A pending PTY turn…
-        tracker.note_input("t", b"\r", 2_000);
+        tracker.note_input("t", "\r", 2_000);
         // …cleared by the PROXY lane (the authoritative turn end)…
         let cleared = tracker.note_proxy_turn_completed("t", 3_000);
         assert!(cleared
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
         // Late BEL echo of the SAME physical turn: swallowed, no second completion.
-        let echo = tracker.note_output("t", b"\x07", 3_050);
+        let echo = tracker.note_output("t", "\u{7}", 3_050);
         assert!(!echo
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1196,7 +1327,7 @@ assert on `TrackerEffect::TurnComplete`):
     fn reconcile_clear_swallows_the_late_proxy_echo() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_input("t", b"\r", 2_000);
+        tracker.note_input("t", "\r", 2_000);
         // Rollout reconcile ends the turn first…
         let events = CodexTaskEvents {
             latest_task_completed_at: Some(2_500),
@@ -1217,9 +1348,9 @@ assert on `TrackerEffect::TurnComplete`):
     fn fresh_submit_disarms_all_swallow_flags() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_input("t", b"\r", 2_000);
+        tracker.note_input("t", "\r", 2_000);
         tracker.note_proxy_turn_completed("t", 3_000); // arms bel + reconcile swallows
-        tracker.note_input("t", b"\r", 4_000); // fresh pending turn: disarm
+        tracker.note_input("t", "\r", 4_000); // fresh pending turn: disarm
         // A REAL turn end for the NEW turn must complete, not be swallowed.
         let done = tracker.note_proxy_turn_completed("t", 5_000);
         assert!(done
@@ -1231,7 +1362,7 @@ assert on `TrackerEffect::TurnComplete`):
     fn proxy_start_disarms_a_stale_proxy_swallow() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_input("t", b"\r", 2_000);
+        tracker.note_input("t", "\r", 2_000);
         // Reconcile ends turn 1 and arms swallow_next_proxy_complete…
         let events = CodexTaskEvents {
             latest_task_completed_at: Some(2_500),
@@ -1251,14 +1382,18 @@ assert on `TrackerEffect::TurnComplete`):
     fn bel_clear_swallows_the_late_proxy_echo() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_input("t", b"\r", 2_000);
-        // The PTY BEL ends the turn first (BEL-initiated clear)…
-        let cleared = tracker.note_output("t", b"\x07", 3_000);
+        tracker.note_input("t", "\r", 2_000);
+        // A follow-up submit is QUEUED behind the pending turn (`:425-427`)…
+        tracker.note_input("t", "\r", 2_500);
+        // …then the PTY BEL ends turn 1 (BEL-initiated clear): one completion,
+        // and the queued submit re-arms phase = Pending for turn 2.
+        let cleared = tracker.note_output("t", "\u{7}", 3_000);
         assert!(cleared
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
-        // …then the proxy echo of the SAME physical turn must not double-count
-        // (nor prematurely complete a queued follow-up submit).
+        // The proxy echo of the SAME physical turn lands next. Without the
+        // BEL-clear arming it hits phase == Pending and PREMATURELY completes
+        // queued turn 2 (ledger A11) — it must be swallowed instead.
         let echo = tracker.note_proxy_turn_completed("t", 3_050);
         assert!(!echo
             .iter()
@@ -1266,9 +1401,9 @@ assert on `TrackerEffect::TurnComplete`):
     }
 ```
 
-Adapt the effect-type name (`TrackerEffect` vs a crate alias) and `note_input`/`note_output`
-byte signatures to what the neighboring tests in this file actually use — copy their call
-shapes exactly.
+Adapt the effect-type name (`TrackerEffect` vs a crate alias) to what the neighboring tests
+in this file actually use — copy their call shapes exactly (`note_input`/`note_output` take
+`data: &str`, verified at `:385`/`:436`; the snippets above already use `&str` literals).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1283,9 +1418,9 @@ In `crates/freshell-activity/src/codex.rs`:
 initialize `false`/`None` wherever `TerminalActivity` is constructed):
 
 ```rust
-    /// S5.a third lane (proxy): one-shot — a reconcile- or BEL-independent
-    /// proxy clear already ended this physical turn; swallow its late proxy
-    /// echo. Armed by reconcile-initiated clears.
+    /// S5.a third lane (proxy): one-shot — another lane already ended this
+    /// physical turn; swallow its late proxy echo. Armed by BOTH
+    /// reconcile-initiated AND BEL-initiated clears (ledger A11).
     swallow_next_proxy_complete: bool,
     /// S5.a third lane: one-shot — a proxy-initiated clear already ended this
     /// physical turn; swallow the rollout reconcile echo of the same turn.
@@ -1325,6 +1460,9 @@ THEN add the two new lane methods:
             return Vec::new();
         };
         let previous = state.to_record();
+        // Design invariant (see above): a NEW proxy turn is beginning — a
+        // stale directed swallow must not eat THIS turn's completion.
+        state.swallow_next_proxy_complete = false;
         state.last_proxy_started_at = Some(at);
         state.last_observed_at = at;
         if matches!(
@@ -1394,6 +1532,24 @@ don't reimplement it.
   (i.e., wrap the existing transition body in the `else if` arm), and inside BOTH existing
   transition arms, next to each `state.swallow_next_bel = true;` (`:346`, `:354`) add
   `state.swallow_next_proxy_complete = true;`.
+
+- BEL-initiated clears (design bullet above, ledger A11): `note_output`'s single BEL-clear
+  site is the `consume_turn_complete_signal(...)` call (`:490-492` — the
+  `if !consume_turn_complete_signal(...) { break; }` inside the BEL loop; swallowed BEL
+  echoes `continue` at `:486-489` before reaching it, idle BELs return `false` and `break`).
+  Immediately AFTER that `if` — i.e., only when the call returned `true` and a real
+  BEL-initiated transition ran — add:
+
+```rust
+            // S5.a (A11): a BEL clear ended this physical turn — swallow its
+            // late proxy echo (it could otherwise prematurely complete a
+            // queued follow-up submit that is now Pending).
+            state.swallow_next_proxy_complete = true;
+```
+
+  Do NOT arm inside `transition_pending_after_turn_clear`/`transition_after_turn_clear`
+  themselves: `reconcile_rollout` also calls those (`:337`, `:341`), and its arming is the
+  explicit `:346`/`:354` additions above.
 
 - In `note_input`'s fresh-pending branch (`:418-422`), extend the disarm:
 
@@ -2134,7 +2290,7 @@ Expected: FAIL to compile — `with_plan_budget` does not exist.
 In `launch_lifecycle.rs`:
 
 ```rust
-/// D-C-REVISIT resolution (2026-07-30, spec S5.e precondition): sidecar
+/// D-C-REVISIT — RESOLVED (2026-07-30, spec S5.e precondition): sidecar
 /// planning budget covering BOTH doors. Bounds concurrent codex plans
 /// server-wide so a burst can never stack ~226s plan holds; waiters fail fast
 /// instead of queueing behind them.
@@ -2357,8 +2513,8 @@ Run: `cargo test -p freshell-codex --lib managed_launch_defaults_on` — Expecte
 /// The env var that opts a server process OUT of DEV-0006's managed codex
 /// terminal launches. S5.e (2026-07-30): the default flipped ON — S5's
 /// consumers (proxy-event drain → identity/activity tails, candidate-
-/// persistence gate) are live, closing DEV-0006/DEV-0008. D-C-REVISIT was
-/// resolved before this flip (sidecar planning budget + REST acquire move;
+/// persistence gate) are live, closing DEV-0006/DEV-0008. D-C-REVISIT: RESOLVED
+/// before this flip (sidecar planning budget + REST acquire move;
 /// docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum).
 pub const FRESHELL_CODEX_MANAGED_LAUNCH_ENV: &str = "FRESHELL_CODEX_MANAGED_LAUNCH";
 
