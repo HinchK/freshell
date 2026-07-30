@@ -11,8 +11,28 @@ import { PANE_TINT_COLORS, STATUS_BLUE, STATUS_MUTED } from './pane-tint-colors'
 
 export type Ctx2D = Pick<
   CanvasRenderingContext2D,
-  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage' | 'beginPath' | 'arc' | 'fill'
-> & { fillStyle: string | CanvasGradient | CanvasPattern; font: string; textBaseline: CanvasTextBaseline }
+  | 'fillRect'
+  | 'fillText'
+  | 'measureText'
+  | 'getImageData'
+  | 'drawImage'
+  | 'beginPath'
+  | 'arc'
+  | 'fill'
+  | 'save'
+  | 'restore'
+  | 'clip'
+  | 'stroke'
+> & {
+  fillStyle: string | CanvasGradient | CanvasPattern
+  strokeStyle: string | CanvasGradient | CanvasPattern
+  lineWidth: number
+  font: string
+  /** Chromium-only canvas API (the deck runs in Chromium/Electron; WebHID requires it). */
+  letterSpacing: string
+  textBaseline: CanvasTextBaseline
+  roundRect(x: number, y: number, w: number, h: number, radii?: number): void
+}
 
 export type IconSource = (url: string) => CanvasImageSource | null
 export type CtxFactory = (width: number, height: number) => Ctx2D
@@ -33,6 +53,12 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
+/** Subtle tracking for deck text. Chromium-only canvas API — the deck's only
+ * supported surface. Set BEFORE measureText so fitLabel includes the tracking
+ * (Chromium adds it after every glyph, matching the test stub's model). */
+export const TEXT_LETTER_SPACING = '0.4px'
+/** Side padding for the icons-style banner label inside the rounded frame. */
+export const TITLE_SIDE_PADDING = 6
 
 // ============================================================================
 // DECK PALETTE — derived from freshell's own UI palette so the deck reads as
@@ -79,11 +105,31 @@ export const MAX_TITLE_CHARS = 10
 export const MAX_KEY_PANE_ICONS = 2
 export const OVERFLOW_FONT_SIZE = 10
 /**
- * Max row slots (icons + badge). iconLayout guarantees on-key fit only up to
- * 3 slots (4 slots overflow an 80px key by 1px and a 72px key by 9px), so the
- * +N badge COUNTS AS A SLOT and drawn agent icons shrink to make room for it.
+ * Max row slots (icons + badge). iconLayout's row-fit clamp guarantees any
+ * slot count fits inside the rounded frame, but 3 remains the visual maximum
+ * to mirror TabItem's row, so the +N badge COUNTS AS A SLOT and drawn agent
+ * icons shrink to make room for it.
  */
 const MAX_ROW_SLOTS = 3
+
+/** Rounded key frame: every key draws inside a rounded rect with pure black
+ * outside it, so each button reads as a rounded tile floating on the deck. */
+export const KEY_FRAME_RADIUS_RATIO = 0.12
+
+export function keyFrameGeometry(w: number, h: number): { margin: number; radius: number } {
+  const s = Math.min(w, h)
+  return { margin: s >= 96 ? 4 : 3, radius: Math.round(s * KEY_FRAME_RADIUS_RATIO) }
+}
+
+function beginKeyFrame(ctx: Ctx2D, w: number, h: number): void {
+  ctx.fillStyle = EMPTY_BG
+  ctx.fillRect(0, 0, w, h)
+  const { margin, radius } = keyFrameGeometry(w, h)
+  ctx.save()
+  ctx.beginPath()
+  ctx.roundRect(margin, margin, w - 2 * margin, h - 2 * margin, radius)
+  ctx.clip()
+}
 
 export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
   return {
@@ -109,28 +155,36 @@ export function fitLabel(measure: (t: string) => number, text: string, maxWidth:
   return `${t}…`
 }
 
+/** Keeps multi-icon rows clear of the rounded key frame's corners/edges. */
+export const ICON_ROW_SIDE_INSET = 6
+
 /** Centered icon slots in the area below the title banner. */
 export function iconLayout(w: number, h: number, count: number): Array<{ x: number; y: number; size: number }> {
   if (count <= 0) return []
   const areaTop = BANNER_HEIGHT
   const areaH = h - areaTop
-  const scale = count === 1 ? 0.5 : 0.3
-  const size = Math.round(Math.min(w, areaH) * scale)
+  const scale = count === 1 ? 0.75 : 0.45
+  let size = Math.round(Math.min(w, areaH) * scale)
+  // Row-fit clamp: the whole row (icons + gaps) stays inside the rounded frame.
+  const innerW = w - 2 * ICON_ROW_SIDE_INSET
+  size = Math.min(size, Math.floor((innerW - (count - 1) * ICON_GAP) / count))
   const rowW = count * size + (count - 1) * ICON_GAP
   const x0 = Math.round((w - rowW) / 2)
   const y = Math.round(areaTop + (areaH - size) / 2)
   return Array.from({ length: count }, (_, i) => ({ x: x0 + i * (size + ICON_GAP), y, size }))
 }
 
+/** Ring/border that follows the rounded key frame: a rounded-rect stroke of
+ * `width` px, `inset` px inside the frame edge. (Replaces the old nested
+ * 1px square fillRect frames — strokes keep the rounded shape at corners.) */
 export function drawRing(ctx: Ctx2D, w: number, h: number, color: string, width: number, inset = 0): void {
-  ctx.fillStyle = color
-  for (let i = 0; i < width; i++) {
-    const o = inset + i
-    ctx.fillRect(o, o, w - 2 * o, 1) // top
-    ctx.fillRect(o, h - 1 - o, w - 2 * o, 1) // bottom
-    ctx.fillRect(o, o, 1, h - 2 * o) // left
-    ctx.fillRect(w - 1 - o, o, 1, h - 2 * o) // right
-  }
+  const { margin, radius } = keyFrameGeometry(w, h)
+  const off = margin + inset + width / 2
+  ctx.strokeStyle = color
+  ctx.lineWidth = width
+  ctx.beginPath()
+  ctx.roundRect(off, off, w - 2 * off, h - 2 * off, Math.max(1, radius - inset - width / 2))
+  ctx.stroke()
 }
 
 function drawCenteredText(ctx: Ctx2D, text: string, w: number, y: number): void {
@@ -242,19 +296,24 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     // counted in the iconLayout call), so it can never clip off the key.
     const slot = slots[slots.length - 1]
     const label = `+${hidden.length}`
-    ctx.font = `600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`
+    ctx.font = `600 ${Math.max(OVERFLOW_FONT_SIZE, Math.round(slot.size / 2))}px ${DECK_FONT_STACK}`
     ctx.textBaseline = 'middle'
     ctx.fillStyle = hidden.some((p) => p.tint === 'blue') ? STATUS_BLUE : STATUS_MUTED
     ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)
   }
 
-  // 3. Title banner across the top (unchanged treatment).
+  // 3. Title banner across the top. Tracking is set HERE — after the
+  //    icons/avatar/badge draws above (they keep the default spacing) and
+  //    before measurement, so fitLabel accounts for it.
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
-  ctx.font = `600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.letterSpacing = TEXT_LETTER_SPACING
+  // Weight rule: 400 everywhere, EXCEPT where the deck mirrors the app UI —
+  // the letter avatar and +N badge keep RepoIcon's 600 (see RepoIcon.tsx).
+  ctx.font = `400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
-  const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
+  const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 2 * TITLE_SIDE_PADDING)
   drawCenteredText(ctx, label, w, 2)
 
   // 4. Borders/rings: barTop green border; white ring marks the active tab.
@@ -277,13 +336,14 @@ function drawPager(
 ): void {
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
   ctx.textBaseline = 'top'
 
   ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = CONTROL_DIM
   drawCenteredText(ctx, 'PAGE', w, 2)
 
-  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
@@ -298,8 +358,9 @@ function drawAction(
 ): void {
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
 
-  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
@@ -316,6 +377,7 @@ export function renderKey(
   const w = caps.keyPixelWidth
   const h = caps.keyPixelHeight
   const ctx = createCtx(w, h)
+  beginKeyFrame(ctx, w, h)
   switch (spec.kind) {
     case 'empty':
       ctx.fillStyle = EMPTY_BG
@@ -331,6 +393,7 @@ export function renderKey(
       drawAction(ctx, w, h, spec)
       break
   }
+  ctx.restore()
   return ctx.getImageData(0, 0, w, h).data
 }
 
@@ -338,11 +401,26 @@ export function renderStrip(text: string, width: number, height: number, createC
   const ctx = createCtx(width, height)
   ctx.fillStyle = EMPTY_BG
   ctx.fillRect(0, 0, width, height)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
   ctx.font = `400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, text, width, (height - STRIP_FONT_SIZE) / 2)
   return ctx.getImageData(0, 0, width, height).data
+}
+
+/** Pre-Baseline-2023 canvases (Firefox <=111, Safari <=15) lack roundRect; an
+ * unguarded call would crash VirtualDeckPanel rendering in those browsers.
+ * Degrade to square corners instead. (ctx.letterSpacing needs no guard:
+ * assigning it on a non-supporting canvas is an inert expando — no throw, and
+ * text stays self-consistent since measureText excludes the tracking there too.) */
+export function ensureRoundRect(ctx: CanvasRenderingContext2D): void {
+  const c = ctx as CanvasRenderingContext2D & { roundRect?: unknown }
+  if (typeof c.roundRect !== 'function') {
+    c.roundRect = function (this: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+      this.rect(x, y, w, h)
+    }
+  }
 }
 
 export function defaultCtxFactory(width: number, height: number): Ctx2D {
@@ -351,5 +429,7 @@ export function defaultCtxFactory(width: number, height: number): Ctx2D {
   canvas.height = height
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Canvas 2D context unavailable (defaultCtxFactory is runtime-only; inject a CtxFactory in tests)')
-  return ctx
+  ensureRoundRect(ctx)
+  // lib.dom may predate ctx.letterSpacing; the runtime (Chromium) always has it.
+  return ctx as unknown as Ctx2D
 }

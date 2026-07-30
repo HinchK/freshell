@@ -8,7 +8,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setVirtualDeckOpen } from '@/store/deckSlice'
 import { FakeDeckDevice, MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import { DeckController } from '@/deck/deck-controller'
-import { renderKey, renderStrip, type Ctx2D, type CtxFactory } from '@/deck/tile-renderer'
+import { renderKey, renderStrip, type Ctx2D, type CtxFactory, ensureRoundRect } from '@/deck/tile-renderer'
 import { getIconImageCache } from '@/deck/icon-image-cache'
 import { SegmentedControl } from '@/components/settings/settings-controls'
 
@@ -22,7 +22,10 @@ const PROFILE_CAPS = { mini: MINI_CAPS, plus: PLUS_CAPS } as const
 function noopCtx(width: number, height: number): Ctx2D {
   return {
     fillStyle: '',
+    strokeStyle: '',
+    lineWidth: 0,
     font: '',
+    letterSpacing: '',
     textBaseline: 'top' as CanvasTextBaseline,
     fillRect: () => {},
     fillText: () => {},
@@ -30,6 +33,11 @@ function noopCtx(width: number, height: number): Ctx2D {
     beginPath: () => {},
     arc: () => {},
     fill: () => {},
+    save: () => {},
+    restore: () => {},
+    clip: () => {},
+    stroke: () => {},
+    roundRect: () => {},
     measureText: () => ({ width: 0 }) as TextMetrics,
     getImageData: () => ({ data: new Uint8ClampedArray(width * height * 4) }) as ImageData,
   }
@@ -39,7 +47,10 @@ const safeCtxFactory: CtxFactory = (width, height) => {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
-  return canvas.getContext('2d') ?? noopCtx(width, height)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return noopCtx(width, height)
+  ensureRoundRect(ctx)
+  return ctx as unknown as Ctx2D
 }
 
 const DIAL_BUTTON_CLASS =
