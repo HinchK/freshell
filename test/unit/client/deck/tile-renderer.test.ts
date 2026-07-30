@@ -336,7 +336,7 @@ describe('renderKey preview style', () => {
 
   it('icons style still renders fills (dispatch regression)', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // emerald-100 green fill
+    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // composited green fill (emerald-100 @ 50% over black)
   })
 })
 
