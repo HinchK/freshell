@@ -4,7 +4,7 @@ import {
   cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
-  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
+  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, ICONS_TITLE_FONT_SIZE, STRIP_FONT_SIZE,
   MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE, BANNER_HEIGHT, ICON_ROW_SIDE_INSET,
   TEXT_LETTER_SPACING, TITLE_SIDE_PADDING,
   ensureRoundRect,
@@ -105,6 +105,19 @@ describe('title fitting', () => {
     const measure = (t: string) => t.length * 6
     expect(fitLabel(measure, 'abcdef', 100)).toBe('abcdef')
     expect(fitLabel(measure, 'abcdefghij', 30)).toBe('abcd…')
+  })
+  it('icons banner title is 14px and vertically centered in the 20px banner', () => {
+    // Literal pins on purpose: an interpolated pin cannot catch drift.
+    expect(ICONS_TITLE_FONT_SIZE).toBe(14)
+    const { texts } = renderTab(tabSpec({ title: 'build' }))
+    const title = texts.find((t) => t.text === 'build')
+    expect(title?.font).toBe('400 14px Inter, sans-serif')
+    // y = Math.round((BANNER_HEIGHT - ICONS_TITLE_FONT_SIZE) / 2) = (20 - 14) / 2 = 3
+    expect(title?.y).toBe(3)
+  })
+  it('classic preview banner stays PINNED at literal 16px sans-serif (does not follow the icons shrink)', () => {
+    const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
+    expect(texts.find((t) => t.text === 'build')?.font).toBe('16px sans-serif')
   })
 })
 
@@ -333,7 +346,7 @@ describe('fonts (Inter)', () => {
       tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     const title = texts.find((t) => t.text === 'build')
-    expect(title?.font).toBe(`400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(title?.font).toBe('400 14px Inter, sans-serif')
     const letter = texts.find((t) => t.text === 'B')
     const slot = iconLayout(80, 80, 1)[0]
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * (9 / 16))}px ${DECK_FONT_STACK}`)
@@ -364,7 +377,7 @@ describe('fonts (Inter)', () => {
   it('classic preview tile is PINNED: monospace body, sans-serif banner', () => {
     const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
     expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
-    expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+    expect(texts.find((t) => t.text === 'build')?.font).toBe('16px sans-serif')
   })
 })
 

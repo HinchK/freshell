@@ -53,6 +53,11 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
+/** Icons-style banner title. 2px smaller than the classic banner: 16px read
+ * too large on 72-80px keys. The classic terminal-previews banner is PINNED
+ * and keeps TITLE_FONT_SIZE = 16. Fit math needs no change: fitLabel is
+ * measure-driven and Chromium's measureText scales with ctx.font. */
+export const ICONS_TITLE_FONT_SIZE = 14
 /** Subtle tracking for deck text. Chromium-only canvas API — the deck's only
  * supported surface. Set BEFORE measureText so fitLabel includes the tracking
  * (Chromium adds it after every glyph, matching the test stub's model). */
@@ -310,11 +315,11 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   ctx.letterSpacing = TEXT_LETTER_SPACING
   // Weight rule: 400 everywhere, EXCEPT where the deck mirrors the app UI —
   // the letter avatar and +N badge keep RepoIcon's 600 (see RepoIcon.tsx).
-  ctx.font = `400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${ICONS_TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 2 * TITLE_SIDE_PADDING)
-  drawCenteredText(ctx, label, w, 2)
+  drawCenteredText(ctx, label, w, Math.round((BANNER_HEIGHT - ICONS_TITLE_FONT_SIZE) / 2))
 
   // 4. Borders/rings: barTop green border; white ring marks the active tab.
   if (spec.fill === 'barTop') {
