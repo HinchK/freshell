@@ -69,6 +69,23 @@ async fn consume_handshake(ws: &mut TestWs) {
     }
 }
 
+/// Send one terminal.create WITHOUT awaiting a reply (the parked-restore
+/// pin needs a create that observably produces no frame).
+async fn send_create(ws: &mut TestWs, request_id: &str, restore: bool) {
+    let mut msg = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": request_id,
+        "mode": "shell",
+        "shell": "system",
+    });
+    if restore {
+        msg["restore"] = serde_json::json!(true);
+    }
+    ws.send(WsMessage::Text(msg.to_string()))
+        .await
+        .expect("send terminal.create");
+}
+
 /// Send one terminal.create; return the first error/created frame whose
 /// requestId matches.
 async fn send_create_and_await_reply(
@@ -210,35 +227,49 @@ async fn gate_at_concurrency_one_never_breaks_a_restore_storm() {
 }
 
 #[tokio::test]
-async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
+async fn zero_permit_gate_parks_restore_create_until_disconnect_cancels() {
     // spawn_concurrency: 0 => the harness builds a 0-permit semaphore
     // (legal: only from_env treats 0 as "fall back to default"; the test
     // harness passes 0 straight through to SpawnGate::new).
-    // acquire() can therefore never succeed: a create that consults the
-    // gate queues (under the 64-cap) and times out after spawn_timeout_ms.
+    // acquire_unbounded() can therefore never succeed: a create that
+    // consults the gate queues (under the 64-cap) until its cancel watch
+    // fires.
     //
-    // RESTORE-ONLY gate scope (user decision, PR #552): only restore:true
-    // creates consult the gate; interactive (non-restore) creates bypass it
-    // entirely for an instant create.
+    // RESTORE-ONLY gate scope (user decision, PR #552) stands: only
+    // restore:true creates consult the gate; interactive (non-restore)
+    // creates bypass it entirely for an instant create. The restore-side
+    // CONSEQUENCE changed with graceful restore/resume S1 (the D-GATE-SOFT
+    // generalization): a parked restore create queues until cancel
+    // (disconnect/shutdown) instead of dying loud at the gate timeout.
     let cfg = CreateProtectConfig {
         spawn_concurrency: 0,
         spawn_queue_cap: 64,
-        spawn_timeout_ms: 250,
         ..Default::default()
     };
-    let url = common::spawn_server_with_create_protect(cfg).await;
+    let (url, registry, gate) = common::spawn_server_with_create_protect_probes(cfg).await;
     let mut ws = connect_and_hello(&url).await;
 
     // restore:true is exempt from the RATE limit but goes THROUGH the gate:
-    // the pinned error frame the frozen client ladder matches on.
-    let rejected = send_create_and_await_reply(&mut ws, "cr-gate-timeout", true).await;
-    assert_eq!(rejected["type"], "error", "gate must reject: {rejected}");
-    assert_eq!(rejected["code"], "PTY_SPAWN_FAILED");
+    // it parks on the 0-permit queue...
+    send_create(&mut ws, "cr-gate-parked", true).await;
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
-        rejected["message"],
-        "Timed out waiting for a terminal spawn slot"
+        gate.queued_total(),
+        1,
+        "restore create must park on the zero-permit gate"
     );
-    assert_eq!(rejected["requestId"], "cr-gate-timeout");
+    // ...and NO frame arrives within a short quiet-drain window (queued,
+    // not rejected).
+    let quiet = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+    assert!(
+        quiet.is_err(),
+        "a parked restore create must produce no frame: {quiet:?}"
+    );
 
     // Non-restore creates BYPASS the gate: instant create even with zero
     // permits.
@@ -246,6 +277,25 @@ async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
     assert_eq!(
         plain["type"], "terminal.created",
         "non-restore creates bypass the gate for an instant create: {plain}"
+    );
+
+    // Disconnect: the parked restore create is cancelled without spawning.
+    drop(ws);
+    for _ in 0..200 {
+        if gate.cancellations() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.cancellations(),
+        1,
+        "disconnect must cancel the parked restore create"
+    );
+    assert_eq!(
+        registry.kill_all(),
+        1,
+        "only the bypassing non-restore create spawned"
     );
 }
 

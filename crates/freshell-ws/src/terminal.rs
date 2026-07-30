@@ -592,6 +592,7 @@ async fn handle_client_text(
                 let request_id = create.request_id.clone();
                 let sent = handle_create(
                     create,
+                    None,
                     &mut out,
                     state,
                     conn_id,
@@ -1091,6 +1092,29 @@ fn cli_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
+/// WS-side projection of [`CodexLaunchError`] keeping exactly the
+/// distinctions the create doors need (graceful restore/resume S1).
+pub(crate) enum PlanLaunchError {
+    /// Restore-class plan queue overflow -> RATE_LIMITED (ladder absorbs).
+    QueueFull,
+    /// Cancel watch fired while queued -> silent abandon.
+    Cancelled,
+    /// Everything else -> PTY_SPAWN_FAILED with this message (today's shape).
+    Failed(String),
+}
+
+impl PlanLaunchError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            PlanLaunchError::QueueFull => {
+                "codex plan queue full; too many queued codex launches".to_string()
+            }
+            PlanLaunchError::Cancelled => "codex launch planning cancelled".to_string(),
+            PlanLaunchError::Failed(message) => message,
+        }
+    }
+}
+
 /// codex `--remote <wsUrl>` planning (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH`
 /// default ON since S5.e): plan the managed app-server launch
 /// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
@@ -1102,13 +1126,17 @@ fn cli_provider_settings(
 /// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
 /// plans identically. `Err` carries the thrown planCodexLaunch message —
 /// `handle_create` surfaces it as `error{code:PTY_SPAWN_FAILED}`, the respawn
-/// seam as `RespawnError::LaunchUnresolvable`.
+/// seam as `RespawnError::LaunchUnresolvable`. Restore-class callers thread
+/// their per-connection cancel watch; the WS interactive and auto-resume
+/// doors pass `None` (never-fired watch minted in the manager).
 async fn plan_codex_managed_launch(
     state: &WsState,
     mode: &str,
     raw_cwd: Option<&str>,
     resume_session_id: Option<&str>,
-) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
+    class: freshell_codex::launch_lifecycle::LaunchClass,
+    cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, PlanLaunchError> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
@@ -1132,15 +1160,33 @@ async fn plan_codex_managed_launch(
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
     };
-    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .plan_create_with_retry_uncancellable(
-            &input,
-            freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
-            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
-        )
-        .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
+    let result = match cancel {
+        Some(cancel_rx) => {
+            manager
+                .plan_create_with_retry(
+                    &input,
+                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                    class,
+                    cancel_rx,
+                )
+                .await
+        }
+        None => {
+            manager
+                .plan_create_with_retry_uncancellable(
+                    &input,
+                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                    class,
+                )
+                .await
+        }
+    };
+    result.map(Some).map_err(|error| match error {
+        freshell_codex::launch_lifecycle::CodexLaunchError::QueueFull => PlanLaunchError::QueueFull,
+        freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
+        other => PlanLaunchError::Failed(other.to_string()),
+    })
 }
 
 /// RAII release of a §5.4 keyed-create reservation
@@ -1497,17 +1543,133 @@ pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchP
     }
 }
 
+/// RAII holder for a planned-but-unadopted codex launch (graceful
+/// restore/resume S1, P1). Once planning happens BEFORE the spawn-gate
+/// permit, a live sidecar+proxy exists across every early-exit arm of
+/// `spawn_gated_restore_create` AND every pre-plan early return inside
+/// `handle_create` (keyed-create adopt, D8 lease, unknown mode, D7 guard,
+/// opencode port). Enumerating those arms is fragile; Drop is not. Dropping
+/// this guard without `take()` tears the sidecar down via `discard_sync`
+/// (which is `Handle::try_current()`-guarded — Task 2 — so this Drop can
+/// NEVER panic, even outside runtime context).
+pub(crate) struct PreparedCodexLaunch(
+    Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+);
+
+impl PreparedCodexLaunch {
+    pub(crate) fn new(
+        launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+    ) -> Self {
+        Self(launch)
+    }
+    /// Hand the launch to the adoption path; the guard becomes inert.
+    pub(crate) fn take(&mut self) -> Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> {
+        self.0.take()
+    }
+}
+
+impl Drop for PreparedCodexLaunch {
+    fn drop(&mut self) {
+        if let Some(launch) = self.0.take() {
+            tracing::info!(
+                target: "freshell_ws::create",
+                "prepared_codex_launch_discarded"
+            );
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .discard_sync(launch);
+        }
+    }
+}
+
+/// Everything a restore-class create computes BEFORE the spawn-gate permit.
+pub(crate) struct PreparedLaunch {
+    pub prep: LaunchPrep,
+    /// Some(..) ONLY when a resume session id was derived; None means
+    /// "not planned pre-gate" and handle_create plans on-permit inline.
+    pub codex_launch: Option<PreparedCodexLaunch>,
+}
+
+pub(crate) enum PrepareError {
+    // No Reject variant: post-A12, derive_launch_prep is infallible (the
+    // claude RESTORE_UNAVAILABLE ladder stays inside handle_create, after
+    // the adopt/D8 arms).
+    /// Restore-class plan queue overflow -> error{code:RATE_LIMITED}.
+    PlanQueueFull,
+    /// Cancel fired while queued -> silent abandon (no frame, no PTY).
+    Cancelled,
+    /// Plan failed (T4/T6 residue) -> error{code:PTY_SPAWN_FAILED}.
+    PlanFailed(String),
+}
+
+/// P1's prepare phase: resume-identity derivation + the codex managed plan,
+/// run BEFORE the spawn-gate permit so permits only ever cover fast,
+/// mode-uniform PTY-spawn->settle work. Restore-class only.
+pub(crate) async fn prepare_launch(
+    create: &TerminalCreate,
+    state: &WsState,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<PreparedLaunch, PrepareError> {
+    // Same mode derivation handle_create uses (copy the exact expression
+    // from handle_create's `mode` binding so the two sites can never
+    // disagree).
+    let mode = create.mode.clone();
+    let prep = derive_launch_prep(create, &mode);
+    // A4 (V2 codex-sidecar audit): pre-gate planning ONLY when a resume
+    // session id was derived. A fresh plan (resume_session_id == None,
+    // i.e. `require_candidate_persistence`) arms a 45s candidate-capture
+    // timer AT PROXY START (remote_proxy.rs:248-258); parked past 45s on
+    // the unbounded gate wait, the identity gate permanently fails and
+    // every post-adopt turn/start is rejected -32000 — an adoptable but
+    // functionally broken pane. So a `restore:true` codex create with no
+    // sessionRef/resumeSessionId keeps today's EXACT on-permit inline
+    // planning path (LaunchClass::Interactive inside handle_create),
+    // byte-identical to today.
+    let codex_launch = if prep.resume_session_id.is_some() {
+        match plan_codex_managed_launch(
+            state,
+            &mode,
+            create.cwd.as_deref(),
+            prep.resume_session_id.as_deref(),
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            Some(cancel),
+        )
+        .await
+        {
+            Ok(launch) => Some(PreparedCodexLaunch::new(launch)),
+            Err(PlanLaunchError::QueueFull) => return Err(PrepareError::PlanQueueFull),
+            Err(PlanLaunchError::Cancelled) => return Err(PrepareError::Cancelled),
+            Err(PlanLaunchError::Failed(message)) => return Err(PrepareError::PlanFailed(message)),
+        }
+    } else {
+        None
+    };
+    Ok(PreparedLaunch { prep, codex_launch })
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
 pub(crate) async fn handle_create(
     create: TerminalCreate,
+    prepared: Option<PreparedLaunch>,
     out: &mut crate::create_gate::CreateOutput<'_>,
     state: &WsState,
     conn_id: u64,
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
+    // P1 (graceful restore/resume S1): destructure the prepared values at
+    // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
+    // pre-plan early return below (keyed-create adopt, D8 lease, rate
+    // limit, unknown mode, claude ladder, D7 guard, opencode port).
+    let (prep, mut prepared_codex) = match prepared {
+        // p.codex_launch is None for non-codex modes AND for the A4
+        // fresh-plan exclusion (no derived resume session id) — the None
+        // arm of the plan site below then plans on-permit, byte-identical
+        // to today.
+        Some(p) => (Some(p.prep), p.codex_launch),
+        None => (None, None),
+    };
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
     // a create whose `createRequestId` already has a live terminal ADOPTS it —
@@ -1709,7 +1871,13 @@ pub(crate) async fn handle_create(
         launch_intent,
         mut resume_session_id,
         claude_fresh_prealloc,
-    } = derive_launch_prep(&create, &mode);
+    } = match prep {
+        Some(prep) => prep,
+        None => derive_launch_prep(&create, &mode),
+    };
+    // The claude P0.4 ladder (Task 3) runs HERE for BOTH branches —
+    // prepared and inline — at its original post-adopt/attach position
+    // (A12/V6). Do not move it.
     // A12 (V6): the claude P0.4 ladder stays HERE — at its original
     // position AFTER the keyed-create adopt (:1443-1461) and the D8
     // lease/attach arms (:1484-1558) — because it reads mutable liveness
@@ -2045,21 +2213,40 @@ pub(crate) async fn handle_create(
     // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
     // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
     // passes `m.cwd`).
-    let codex_launch = match plan_codex_managed_launch(
-        state,
-        &mode,
-        create.cwd.as_deref(),
-        resume_session_id.as_deref(),
-    )
-    .await
-    {
-        Ok(launch) => launch,
-        Err(message) => {
-            // A thrown planCodexLaunch surfaces through the generic create catch
-            // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+    let codex_launch = match prepared_codex.as_mut() {
+        // Restore path with a derived resume id: planned pre-gate (P1).
+        // take() disarms the guard — from here the existing failed-spawn
+        // arm and adopt path own the launch exactly as today. The None arm
+        // below serves interactive creates AND the A4 fresh-plan exclusion
+        // (restore:true codex with no derived resume session id): both plan
+        // on-permit inline, byte-identical to today.
+        Some(guard) => guard.take(),
+        None => match plan_codex_managed_launch(
+            state,
+            &mode,
+            create.cwd.as_deref(),
+            resume_session_id.as_deref(),
+            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+            None,
+        )
+        .await
+        {
+            Ok(launch) => launch,
+            Err(error) => {
+                // A thrown planCodexLaunch surfaces through the generic create catch
+                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
+                // QueueFull/Cancelled are unreachable for Interactive-class
+                // `None`-cancel calls; `message()` keeps the frame text
+                // identical for `Failed`.
+                return send_create_error(
+                    out,
+                    ErrorCode::PtySpawnFailed,
+                    error.message(),
+                    &create.request_id,
+                )
                 .await;
-        }
+            }
+        },
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -2777,11 +2964,13 @@ pub async fn respawn_agent_terminal(
         &mode,
         req.cwd.as_deref(),
         resume_session_id.as_deref(),
+        freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+        None,
     )
     .await
     {
         Ok(launch) => launch,
-        Err(message) => return Err(RespawnError::LaunchUnresolvable(message)),
+        Err(error) => return Err(RespawnError::LaunchUnresolvable(error.message())),
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());

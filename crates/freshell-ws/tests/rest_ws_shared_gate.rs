@@ -31,7 +31,10 @@ use freshell_ws::WsState;
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_and_rest_creates_share_one_spawn_budget() {
     // ONE gate, 1 permit, generous queue; short permit-wait timeout so the
-    // starved door fails fast and deterministically.
+    // starved REST door fails fast and deterministically (the WS restore
+    // door waits unbounded-cancel-aware since graceful restore/resume S1,
+    // so its starvation is proven by a queue-depth probe on the SAME gate
+    // instance, not by timeout death).
     let gate = Arc::new(SpawnGate::new(1, 64));
 
     let cfg = freshell_ws::create_limit::CreateProtectConfig {
@@ -50,44 +53,58 @@ async fn ws_and_rest_creates_share_one_spawn_budget() {
         .await
         .expect("hold the permit");
 
-    // 2) REST door is starved -> 503 SPAWN_TIMEOUT.
+    // 2) REST door is starved -> 503 SPAWN_TIMEOUT (REST keeps the timed
+    //    Interactive acquire).
     let client = reqwest_like_post(&base_url, "/api/tabs", &auth_token).await;
     assert_eq!(client.status, 503, "REST starved: {}", client.body);
     assert_eq!(client.json["code"], serde_json::json!("SPAWN_TIMEOUT"));
 
-    // 3) WS door is starved by the SAME budget -> PTY_SPAWN_FAILED frame
-    //    with the pinned message (unchanged WS wire shape). restore:true is
-    //    the WS path that consults the gate (PR #552 restore-only scope).
-    let ws_reply = ws_create_and_await_reply(&ws_url, &auth_token, "req-starved").await;
-    assert_eq!(ws_reply["type"], serde_json::json!("error"));
-    assert_eq!(ws_reply["code"], serde_json::json!("PTY_SPAWN_FAILED"));
+    // 3) WS door waits on the SAME budget: with the external permit held,
+    //    the restore create parks on the gate queue. `queued_total` is
+    //    CUMULATIVE (step 2's starved REST acquire already incremented it),
+    //    so snapshot before sending and poll for the +1 delta — same gate
+    //    instance, so the WS door demonstrably waits on the SAME budget.
+    let queued_before = gate.queued_total();
+    let mut starved_ws = ws_connect_and_send_create(&ws_url, &auth_token, "req-starved").await;
+    for _ in 0..200 {
+        if gate.queued_total() == queued_before + 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
-        ws_reply["message"],
-        serde_json::json!("Timed out waiting for a terminal spawn slot")
+        gate.queued_total(),
+        queued_before + 1,
+        "the WS restore create must queue on the SAME gate budget"
     );
 
     // 4) Release the permit: BOTH doors recover through the one budget.
+    //    The PARKED WS create consumes the released permit and SPAWNS —
+    //    that is the recovery proof (A13-N1).
     drop(held);
+    let ws_reply = ws_await_reply(&mut starved_ws, "req-starved").await;
+    assert_eq!(
+        ws_reply["type"],
+        serde_json::json!("terminal.created"),
+        "the formerly-starved WS create recovers after release: {ws_reply}"
+    );
+    // REST recovery: it acquires after the WS create settles and releases.
     let client = reqwest_like_post(&base_url, "/api/tabs", &auth_token).await;
     assert_eq!(client.status, 200, "REST recovered: {}", client.body);
-    let rest_terminal_id = client.json["data"]["terminalId"]
-        .as_str()
-        .expect("REST create returns data.terminalId")
-        .to_string();
     let ws_reply = ws_create_and_await_reply(&ws_url, &auth_token, "req-recovered").await;
     assert_eq!(
         ws_reply["type"],
         serde_json::json!("terminal.created"),
         "{ws_reply}"
     );
-    let ws_terminal_id = ws_reply["terminalId"]
-        .as_str()
-        .expect("terminal.created carries terminalId")
-        .to_string();
 
-    // Cleanup: kill the two real PTYs this test spawned.
-    registry.kill(&rest_terminal_id);
-    registry.kill(&ws_terminal_id);
+    // Cleanup: kill EVERY spawned terminal (the formerly-starved WS
+    // create's PTY included — no stray un-killed PTY).
+    assert_eq!(
+        registry.kill_all(),
+        3,
+        "exactly the three recovered creates spawned"
+    );
 }
 
 /// The combined production shape: `freshell_ws::router` merged with
@@ -248,15 +265,15 @@ async fn reqwest_like_post(base_url: &str, path: &str, token: &str) -> RestRespo
     }
 }
 
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 /// Fresh WS connection: hello (4-frame handshake — `config_fallback` is None
-/// in this harness), then ONE shell `terminal.create`; returns the first
-/// `terminal.created`/`error` frame for that requestId. Shape copied from
+/// in this harness), then ONE shell `terminal.create` sent WITHOUT awaiting
+/// its reply — the starved-door probe needs the create parked on the gate
+/// while the test inspects `queued_total`. Shape copied from
 /// `tests/create_protection.rs::send_create_and_await_reply`.
-async fn ws_create_and_await_reply(
-    ws_url: &str,
-    auth_token: &str,
-    request_id: &str,
-) -> serde_json::Value {
+async fn ws_connect_and_send_create(ws_url: &str, auth_token: &str, request_id: &str) -> TestWs {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
         .await
         .expect("ws connect");
@@ -294,7 +311,11 @@ async fn ws_create_and_await_reply(
     ))
     .await
     .expect("send terminal.create");
+    ws
+}
 
+/// Await the first `terminal.created`/`error` frame for `request_id`.
+async fn ws_await_reply(ws: &mut TestWs, request_id: &str) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -315,4 +336,15 @@ async fn ws_create_and_await_reply(
         }
     }
     panic!("no reply for {request_id}");
+}
+
+/// [`ws_connect_and_send_create`] + [`ws_await_reply`] in one shot — the
+/// non-parked (recovered) create shape.
+async fn ws_create_and_await_reply(
+    ws_url: &str,
+    auth_token: &str,
+    request_id: &str,
+) -> serde_json::Value {
+    let mut ws = ws_connect_and_send_create(ws_url, auth_token, request_id).await;
+    ws_await_reply(&mut ws, request_id).await
 }
