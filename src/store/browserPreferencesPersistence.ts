@@ -148,6 +148,7 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'idleBrightness')
   assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'idleTimeoutSeconds')
   assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'tileStyle')
+  assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'keyLayout')
   if (Object.keys(streamDeck).length > 0) {
     patch.streamDeck = streamDeck
   }

@@ -25,6 +25,13 @@ const TERMINAL_RENDERER_VALUES = ['auto', 'webgl', 'canvas'] as const
 const DEFAULT_NEW_PANE_VALUES = ['ask', 'shell', 'browser', 'editor'] as const
 const TAB_ATTENTION_STYLE_VALUES = ['highlight', 'pulse', 'darken', 'none'] as const
 export const DECK_TILE_STYLE_VALUES = ['status-icons', 'terminal-previews'] as const
+/** Key layout for the Stream Deck. 'auto' resolves per device: reversed
+ * ("newest first", pager pinned top-left) on the smallest decks
+ * (keyCount <= 6, e.g. the 6-key Mini), status-sorted on larger decks.
+ * 'newest-first' = strictly reverse tab-bar order: newest tab first while
+ * tabs are unreordered; after a manual reorder (or cross-device order sync)
+ * the deck mirrors the reversed tab bar. Deliberate — see plan naming note. */
+export const DECK_KEY_LAYOUT_VALUES = ['auto', 'newest-first', 'status-sorted'] as const
 const ATTENTION_DISMISS_VALUES = ['click', 'type'] as const
 const SESSION_OPEN_MODE_VALUES = ['tab', 'split'] as const
 const SIDEBAR_SORT_MODE_VALUES = ['recency', 'recency-pinned', 'activity', 'project'] as const
@@ -97,6 +104,7 @@ export type TerminalRendererMode = (typeof TERMINAL_RENDERER_VALUES)[number]
 export type DefaultNewPane = (typeof DEFAULT_NEW_PANE_VALUES)[number]
 export type TabAttentionStyle = (typeof TAB_ATTENTION_STYLE_VALUES)[number]
 export type DeckTileStyle = (typeof DECK_TILE_STYLE_VALUES)[number]
+export type DeckKeyLayout = (typeof DECK_KEY_LAYOUT_VALUES)[number]
 export type AttentionDismiss = (typeof ATTENTION_DISMISS_VALUES)[number]
 export type SessionOpenMode = (typeof SESSION_OPEN_MODE_VALUES)[number]
 export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number]
@@ -228,6 +236,7 @@ export type LocalSettings = {
     idleBrightness: number
     idleTimeoutSeconds: number
     tileStyle: DeckTileStyle
+    keyLayout: DeckKeyLayout
   }
 }
 
@@ -264,6 +273,7 @@ const TerminalRendererSchema = z.enum(TERMINAL_RENDERER_VALUES)
 const DefaultNewPaneSchema = z.enum(DEFAULT_NEW_PANE_VALUES)
 const TabAttentionStyleSchema = z.enum(TAB_ATTENTION_STYLE_VALUES)
 const DeckTileStyleSchema = z.enum(DECK_TILE_STYLE_VALUES)
+const DeckKeyLayoutSchema = z.enum(DECK_KEY_LAYOUT_VALUES)
 const AttentionDismissSchema = z.enum(ATTENTION_DISMISS_VALUES)
 const SessionOpenModeSchema = z.enum(SESSION_OPEN_MODE_VALUES)
 const ExternalEditorSchema = z.enum(EXTERNAL_EDITOR_VALUES)
@@ -649,6 +659,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (DeckTileStyleSchema.safeParse(patch.streamDeck.tileStyle).success) {
       streamDeck.tileStyle = patch.streamDeck.tileStyle as DeckTileStyle
     }
+    if (DeckKeyLayoutSchema.safeParse(patch.streamDeck.keyLayout).success) {
+      streamDeck.keyLayout = patch.streamDeck.keyLayout as DeckKeyLayout
+    }
     if (Object.keys(streamDeck).length > 0) {
       normalized.streamDeck = streamDeck
     }
@@ -905,6 +918,7 @@ export const defaultLocalSettings: LocalSettings = {
     idleBrightness: 10,
     idleTimeoutSeconds: 300,
     tileStyle: 'status-icons',
+    keyLayout: 'auto',
   },
 }
 
@@ -1460,7 +1474,7 @@ export function extractLegacyLocalSettingsSeed(
     maybeAssignNested(
       patch,
       'streamDeck',
-      pickKeys(raw.streamDeck, ['enabled', 'brightness', 'idleBrightness', 'idleTimeoutSeconds', 'tileStyle']),
+      pickKeys(raw.streamDeck, ['enabled', 'brightness', 'idleBrightness', 'idleTimeoutSeconds', 'tileStyle', 'keyLayout']),
     )
   }
 

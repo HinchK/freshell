@@ -21,7 +21,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 
 function renderSection(
-  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const },
+  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const, keyLayout: 'auto' as const },
 ) {
   const store = configureStore({ reducer: { deck: deckReducer, settings: settingsReducer } })
   const applyLocalSetting = vi.fn()
