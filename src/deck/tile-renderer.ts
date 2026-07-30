@@ -105,6 +105,25 @@ export const OVERFLOW_FONT_SIZE = 10
  */
 const MAX_ROW_SLOTS = 3
 
+/** Rounded key frame: every key draws inside a rounded rect with pure black
+ * outside it, so each button reads as a rounded tile floating on the deck. */
+export const KEY_FRAME_RADIUS_RATIO = 0.12
+
+export function keyFrameGeometry(w: number, h: number): { margin: number; radius: number } {
+  const s = Math.min(w, h)
+  return { margin: s >= 96 ? 4 : 3, radius: Math.round(s * KEY_FRAME_RADIUS_RATIO) }
+}
+
+function beginKeyFrame(ctx: Ctx2D, w: number, h: number): void {
+  ctx.fillStyle = EMPTY_BG
+  ctx.fillRect(0, 0, w, h)
+  const { margin, radius } = keyFrameGeometry(w, h)
+  ctx.save()
+  ctx.beginPath()
+  ctx.roundRect(margin, margin, w - 2 * margin, h - 2 * margin, radius)
+  ctx.clip()
+}
+
 export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
   return {
     lines: Math.max(1, Math.floor((height - BANNER_HEIGHT - 2) / PREVIEW_LINE_HEIGHT) + 1),
@@ -336,6 +355,7 @@ export function renderKey(
   const w = caps.keyPixelWidth
   const h = caps.keyPixelHeight
   const ctx = createCtx(w, h)
+  beginKeyFrame(ctx, w, h)
   switch (spec.kind) {
     case 'empty':
       ctx.fillStyle = EMPTY_BG

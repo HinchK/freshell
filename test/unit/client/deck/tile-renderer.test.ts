@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
-  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
-  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
-  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
+  cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
+  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
+  TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
   MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
   ensureRoundRect,
@@ -153,7 +153,7 @@ describe('renderKey', () => {
   it('no-fill tile: near-black bg, banner, white title, no rings, no dot, no preview text', () => {
     const { out, rects, texts } = renderTab(tabSpec())
     expect(out).toBeInstanceOf(Uint8ClampedArray)
-    expect(rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
     expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
@@ -162,12 +162,12 @@ describe('renderKey', () => {
 
   it('green fill state paints the light-green background', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
   })
 
   it('barTop state paints light-green background + 3px green border ring', () => {
     const { rects } = renderTab(tabSpec({ fill: 'barTop', active: true }))
-    expect(rects[0].style).toBe(TILE_FILL_GREEN)
+    expect(rects[1].style).toBe(TILE_FILL_GREEN)
     expect(rects.filter((r) => r.style === BAR_TOP_BORDER).length).toBeGreaterThan(0)
     // active tab keeps its white ring nested inside the border
     expect(rects.filter((r) => r.style === ACTIVE_COLOR && r.h <= 1).length).toBeGreaterThan(0)
@@ -206,10 +206,12 @@ describe('renderKey', () => {
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
-  it('no status dot: a plain icons tile draws only the background and the banner', () => {
+  it('no status dot: a plain icons tile draws only the frame surround, the background and the banner', () => {
     const { rects } = renderTab(tabSpec())
-    // background + banner — nothing else (the dot used to be a third rect)
-    expect(rects).toHaveLength(2)
+    // frame surround + background + banner — nothing else (the dot used to be an extra rect)
+    expect(rects).toHaveLength(3)
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
+    expect(rects[2]).toMatchObject({ x: 0, y: 0, w: 80, h: 20, style: BANNER_FILL })
   })
 
   it('iconLayout: 1 icon centered large; 3 icons in a centered row below the banner', () => {
@@ -228,7 +230,7 @@ describe('renderKey', () => {
     let cap: ReturnType<typeof recordingCtx> | null = null
     renderKey({ kind: 'pager', page: 2, pageCount: 3 }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
     const { rects, texts } = cap!
-    expect(rects[0].style).toBe(CONTROL_BG)
+    expect(rects[1].style).toBe(CONTROL_BG)
     expect(texts.map((t) => t.text)).toEqual(expect.arrayContaining(['PAGE', '2/3', 'NEXT >']))
   })
 
@@ -240,6 +242,34 @@ describe('renderKey', () => {
     }
     expect(rectsFor(false).some((r) => r.style === DISABLED_ACTION_COLOR)).toBe(true)
     expect(rectsFor(true).some((r) => r.style === APPROVE_COLOR)).toBe(true)
+  })
+})
+
+describe('rounded key frame', () => {
+  it('keyFrameGeometry: margin 3 below 96px (else 4), radius 12% of key size', () => {
+    expect(keyFrameGeometry(72, 72)).toEqual({ margin: 3, radius: 9 })
+    expect(keyFrameGeometry(80, 80)).toEqual({ margin: 3, radius: 10 })
+    expect(keyFrameGeometry(96, 96)).toEqual({ margin: 4, radius: 12 })
+    expect(keyFrameGeometry(120, 120)).toEqual({ margin: 4, radius: 14 })
+  })
+
+  it('every key kind paints a pure-black surround then clips to the rounded frame', () => {
+    // 80x80 Mini caps => frame margin 3, radius 10, inner 74x74.
+    const empty = renderTab({ kind: 'empty' })
+    for (const rec of [
+      empty,
+      renderTab(tabSpec()),
+      renderTab(previewSpec()),
+      renderTab({ kind: 'pager', page: 2, pageCount: 3 }),
+      renderTab({ kind: 'action', action: 'approve', enabled: true }),
+    ]) {
+      expect(rec.rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
+      expect(rec.clips[0]).toEqual({ x: 3, y: 3, w: 74, h: 74, r: 10 })
+    }
+    // Empty kind: the frame surround plus the empty case's own fill (now
+    // clipped and pixel-identical) - two full-bleed EMPTY_BG rects.
+    expect(empty.rects).toHaveLength(2)
+    expect(empty.rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
   })
 })
 
