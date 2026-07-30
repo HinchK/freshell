@@ -1,13 +1,17 @@
-//! DEV-0006 S4 e2e leg (spec §5 "e2e leg (one)"): `terminal.create {mode:'codex'}` over
-//! the REAL Rust WS server, capturing the spawned child argv.
+//! DEV-0006 S5.e e2e legs: `terminal.create {mode:'codex'}` over the REAL Rust WS
+//! server, capturing the spawned child argv. The managed-launch default is ON, so
+//! the legs are inverted from the S4 shape:
 //!
-//! - **Flag ON** (`FRESHELL_CODEX_MANAGED_LAUNCH=1`): the first four argv tokens are
-//!   `--remote ws://127.0.0.1:<port> -c features.apps=false`, the app-server sidecar is
-//!   spawned, the proxy is listening, and the relay works (a fake TUI dials the
-//!   `--remote` URL and completes an `initialize` round-trip against the spawned fake
-//!   app-server through the proxy).
-//! - **Flag OFF control**: today's argv — the bel notification pair, NO `--remote`
-//!   (the shipped DEV-0006 deviation shape, golden G-X0).
+//! - **Default (`FRESHELL_CODEX_MANAGED_LAUNCH` unset)**: managed launch — the first
+//!   four argv tokens are `--remote ws://127.0.0.1:<port> -c features.apps=false`,
+//!   the app-server sidecar is spawned, the proxy is listening, and the relay works
+//!   (a fake TUI dials the `--remote` URL and completes an `initialize` round-trip
+//!   against the spawned fake app-server through the proxy).
+//! - **Explicit `"0"` opt-out**: the plain-CLI argv — the bel notification pair, NO
+//!   `--remote` (the retired G-X0 shape, now the opt-out shape).
+//! - **Managed resume**: default (unset) + `resumeSessionId` — the managed `--remote`
+//!   argv with the `resume <id>` pair riding LAST (the S5.e "resume golden" at the
+//!   integration level — G-X2 already pins the resolver level).
 //!
 //! Host-gated `#[ignore]` (needs `node` + the repo's `node_modules/ws`), opt-in like
 //! `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS`. It mutates process env (`CODEX_CMD`,
@@ -238,6 +242,47 @@ async fn create_codex_terminal(ws: &mut TestWs, request_id: &str, cwd: &str) -> 
     }
 }
 
+/// Create a codex terminal with a `resumeSessionId` (the raw WS-path resume field,
+/// same shape as `codex_session_ref_resume.rs`'s create message) and return the
+/// `terminal.created` frame (or the `error` frame, panicking with it for diagnosis).
+async fn create_codex_terminal_resume(
+    ws: &mut TestWs,
+    request_id: &str,
+    cwd: &str,
+    resume_session_id: &str,
+) -> serde_json::Value {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "codex",
+            "shell": "system",
+            "cwd": cwd,
+            "resumeSessionId": resume_session_id,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, ws.next())
+            .await
+            .expect("terminal.created within timeout")
+            .expect("stream open")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = msg {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            match value["type"].as_str() {
+                Some("terminal.created") if value["requestId"] == json!(request_id) => {
+                    return value;
+                }
+                Some("error") => panic!("terminal.create failed: {value}"),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Poll the capture file the dispatcher writes until it appears, then parse the argv.
 fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
@@ -256,73 +301,55 @@ fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
     }
 }
 
+fn resume_pair_position(argv: &[String], session_id: &str) -> Option<usize> {
+    argv.windows(2)
+        .position(|w| w[0] == "resume" && w[1] == session_id)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
-async fn codex_terminal_create_argv_flag_off_control_and_flag_on_managed_launch() {
+async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
     let dispatcher = write_codex_dispatcher();
     let tmp_cwd = std::env::temp_dir().join(format!("freshell-codex-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_cwd).unwrap();
     std::env::set_var("CODEX_CMD", &dispatcher);
-    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
-    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
-    // (Phase 1 is the explicit flag-OFF control; Phase 2 re-enables with "1".)
-    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    // DEV-0006 S5.e: the managed-launch default is ON, so "unset" IS the managed
+    // leg. (Phase 1 is the default; Phase 2 opts out with "0"; Phase 3 resumes
+    // under the default.)
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
     let (ws_url, registry) = spawn_server().await;
     let mut ws = connect_and_handshake(&ws_url).await;
 
-    // ── Phase 1: flag OFF control — today's argv, no --remote (G-X0 shape) ────────
-    let off_capture = std::env::temp_dir().join(format!(
-        "freshell-codex-e2e-argv-off-{}.json",
+    // ── Phase 1: default (unset) must plan the managed launch (--remote 4-tuple
+    // ── + live relay) ─────────────────────────────────────────────────────────────
+    let default_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-argv-default-{}.json",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&off_capture);
-    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &off_capture);
+    let _ = std::fs::remove_file(&default_capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &default_capture);
 
-    let created = create_codex_terminal(&mut ws, "req-off", tmp_cwd.to_str().unwrap()).await;
-    let off_terminal_id = created["terminalId"].as_str().unwrap().to_string();
-    let off_argv = wait_for_captured_argv(&off_capture);
-
-    assert!(
-        !off_argv.iter().any(|a| a == "--remote"),
-        "flag OFF must launch the plain CLI (no --remote): {off_argv:?}"
-    );
-    assert_eq!(
-        &off_argv[0..2],
-        &["-c".to_string(), "tui.notification_method=bel".to_string()],
-        "flag OFF argv must keep today's shape (G-X0): {off_argv:?}"
-    );
-    registry.kill(&off_terminal_id);
-
-    // ── Phase 2: flag ON — managed launch (--remote 4-tuple + live relay) ─────────
-    let on_capture = std::env::temp_dir().join(format!(
-        "freshell-codex-e2e-argv-on-{}.json",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&on_capture);
-    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &on_capture);
-    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
-
-    let created = create_codex_terminal(&mut ws, "req-on", tmp_cwd.to_str().unwrap()).await;
-    let on_terminal_id = created["terminalId"].as_str().unwrap().to_string();
-    let on_argv = wait_for_captured_argv(&on_capture);
+    let created = create_codex_terminal(&mut ws, "req-default", tmp_cwd.to_str().unwrap()).await;
+    let default_terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let default_argv = wait_for_captured_argv(&default_capture);
 
     // The first four tokens (terminal-registry.ts:295-307; DEV-0006 live capture).
-    assert_eq!(on_argv[0], "--remote", "argv: {on_argv:?}");
-    let remote_ws_url = on_argv[1].clone();
+    assert_eq!(default_argv[0], "--remote", "argv: {default_argv:?}");
+    let remote_ws_url = default_argv[1].clone();
     assert!(
         remote_ws_url.starts_with("ws://127.0.0.1:"),
         "the --remote URL must be the loopback proxy: {remote_ws_url}"
     );
     assert_eq!(
-        &on_argv[2..4],
+        &default_argv[2..4],
         &["-c".to_string(), "features.apps=false".to_string()]
     );
     // The bel notification pair still follows (byte order per G-X1).
     assert_eq!(
-        &on_argv[4..6],
+        &default_argv[4..6],
         &["-c".to_string(), "tui.notification_method=bel".to_string()],
-        "argv: {on_argv:?}"
+        "argv: {default_argv:?}"
     );
 
     // The proxy accepts a TUI connection and relays to the spawned fake app-server:
@@ -352,9 +379,71 @@ async fn codex_terminal_create_argv_flag_off_control_and_flag_on_managed_launch(
         reply.get("result").is_some(),
         "initialize through the relay failed: {reply}"
     );
+    // Kill the pane; the exit hook tears the managed launch down.
+    registry.kill(&default_terminal_id);
 
-    // ── Cleanup: kill the pane; the exit hook tears the managed launch down ───────
-    registry.kill(&on_terminal_id);
+    // ── Phase 2: explicit "0" must keep the plain-CLI shape (opt-out) ─────────────
+    let off_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-argv-off-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&off_capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &off_capture);
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+
+    let created = create_codex_terminal(&mut ws, "req-off", tmp_cwd.to_str().unwrap()).await;
+    let off_terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let off_argv = wait_for_captured_argv(&off_capture);
+
+    assert!(
+        !off_argv.iter().any(|a| a == "--remote"),
+        "explicit \"0\" must launch the plain CLI (no --remote): {off_argv:?}"
+    );
+    assert_eq!(
+        &off_argv[0..2],
+        &["-c".to_string(), "tui.notification_method=bel".to_string()],
+        "explicit \"0\" argv must keep the plain-CLI shape (retired G-X0): {off_argv:?}"
+    );
+    registry.kill(&off_terminal_id);
+
+    // ── Phase 3: managed resume — default (unset) + resumeSessionId; the resume
+    // ── pair rides LAST (the S5.e resume golden at the integration level) ─────────
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    let resume_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-argv-resume-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&resume_capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &resume_capture);
+
+    let created = create_codex_terminal_resume(
+        &mut ws,
+        "req-resume",
+        tmp_cwd.to_str().unwrap(),
+        "thread-e2e-resume",
+    )
+    .await;
+    let resume_terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let resume_argv = wait_for_captured_argv(&resume_capture);
+    assert_eq!(
+        resume_argv[0], "--remote",
+        "managed resume argv: {resume_argv:?}"
+    );
+    assert_eq!(
+        &resume_argv[2..4],
+        &["-c".to_string(), "features.apps=false".to_string()]
+    );
+    // The resume pair rides LAST (G-X2's resolver shape, now pinned live).
+    let position = resume_pair_position(&resume_argv, "thread-e2e-resume")
+        .expect("managed resume argv must contain `resume thread-e2e-resume`");
+    assert_eq!(
+        position + 2,
+        resume_argv.len(),
+        "resume pair must be last: {resume_argv:?}"
+    );
+    registry.kill(&resume_terminal_id);
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────────
     std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
     std::env::remove_var("CODEX_CMD");
