@@ -7,7 +7,7 @@
 
 **Goal:** Claude panes created via the REST agent API (`POST /api/tabs`, `POST /api/panes/:id/split`, `POST /api/panes/:id/respawn`) acquire full session identity at create time — preallocated `--session-id` in argv, pre-spawn pane-ledger binding (PIN 2), `TerminalIdentityRegistry` row, and a real `sessionRef` on every reporting surface — exactly like the WS `terminal.create` fresh-claude path, so REST panes are resumable and visible to the A13 live-owner guard.
 
-**Architecture:** Three moves. (1) Extract the WS fresh-claude preallocation *predicate* into `freshell-platform` (both crates already depend on it) and mint the UUID on the REST path, flipping `LaunchIntent` to `Start` so `claude --session-id <uuid>` lands in argv — this alone populates the registry row, `paneContent.sessionRef`, and `GET /api/terminals` rung 0. (2) Bridge the crate boundary for the two write-side identity homes (`TerminalIdentityRegistry` + `PaneLedger`, both `freshell-ws`-owned and unreachable from `freshell-freshagent`) with a new `PaneIdentityBinder` trait defined in `freshell-terminal` (same seam pattern as the existing read-only `SessionIdentityLookup`), implemented in `freshell-ws`, injected in `freshell-server::main` — carrying the create-time writes AND the exit-time retire hygiene the REST exit hook could never reach (load-bearing validation A2: un-retired rows leave dead panes live-looking to the session directory and durably rebindable by late signals). (3) Regression tests at the merged REST+WS server level proving resume identity, A13 refusal, and SessionStart signal consumption, plus pinning tests for the codex/opencode REST lanes.
+**Architecture:** Three moves. (1) Extract the WS fresh-claude preallocation *predicate* into `freshell-platform` (both crates already depend on it) and mint the UUID on the REST path, flipping `LaunchIntent` to `Start` so `claude --session-id <uuid>` lands in argv — this alone populates the registry row, `paneContent.sessionRef` on the broadcast `ui.command` frame (the REST HTTP bodies carry only ids — `{tabId, paneId, terminalId}` — and are deliberately unchanged), and `GET /api/terminals` rung 0. (2) Bridge the crate boundary for the two write-side identity homes (`TerminalIdentityRegistry` + `PaneLedger`, both `freshell-ws`-owned and unreachable from `freshell-freshagent`) with a new `PaneIdentityBinder` trait defined in `freshell-terminal` (same seam pattern as the existing read-only `SessionIdentityLookup`), implemented in `freshell-ws`, injected in `freshell-server::main` — carrying the create-time writes AND the exit-time retire hygiene the REST exit hook could never reach (load-bearing validation A2: un-retired rows leave dead panes live-looking to the session directory and durably rebindable by late signals). (3) Regression tests at the merged REST+WS server level proving resume identity, A13 refusal, and SessionStart signal consumption, plus pinning tests for the codex/opencode REST lanes.
 
 **Tech Stack:** Rust (toolchain pinned 1.96.0), axum, tokio, `uuid` — no new dependencies (the binder trait is synchronous, matching the `SessionIdentityLookup` precedent; the codebase deliberately declines `async-trait`, see `identity_sink.rs:37`); existing test harnesses in `crates/freshell-ws/tests/common/mod.rs` and `crates/freshell-freshagent/src/terminal_tabs.rs mod tests`.
 
@@ -210,8 +210,17 @@ In `crates/freshell-freshagent/src/terminal_tabs.rs` `mod tests` (starts `:2190`
 async fn create_fresh_claude_tab_preallocates_session_identity() {
     // kata hbsa P1: REST parity with the WS fresh-claude special case.
     // A fresh POST /api/tabs {mode:"claude"} must mint a --session-id,
-    // carry it in the registry row, and expose it as paneContent.sessionRef.
+    // carry it in the registry row, and expose it as paneContent.sessionRef
+    // on the broadcast `ui.command` frame. NOTE the surfaces: the REST HTTP
+    // body carries ONLY {tabId, paneId, terminalId} (terminal_tabs.rs:
+    // 1828-1832) — paneContent (and its sessionRef) travels on the broadcast
+    // frame, because the REST route always calls with broadcast=true
+    // (terminal_tabs.rs:196-197).
     let (state, registry, argv_capture_path) = state_with_claude_capture_spec(); // build per :3321's harness
+    // Subscribe BEFORE the POST, exactly the way the sibling test at :3383
+    // captures its ui.command frames off the state's broadcast channel —
+    // reuse that subscription + frame-reading code verbatim.
+    let mut frames = subscribe_broadcast_frames(&state); // per :3383's capture idiom
     let (status, body) = post(
         app(state),
         "/api/tabs",
@@ -224,16 +233,19 @@ async fn create_fresh_claude_tab_preallocates_session_identity() {
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "create failed: {body}");
 
-    // 1. sessionRef surfaced on the create response (paneContent promotion).
-    let session_ref = body["data"]["paneContent"]["sessionRef"].clone();
-    assert_eq!(session_ref["provider"], serde_json::json!("claude"), "sessionRef: {body}");
+    // 1. sessionRef surfaced on the broadcast paneContent (the create-time
+    //    reporting surface — the HTTP body has NO paneContent). Read the
+    //    ui.command frame the same way the :3383 sibling does.
+    let pane_content = next_ui_command_pane_content(&mut frames).await; // per :3383's frame-reading idiom
+    let session_ref = pane_content["sessionRef"].clone();
+    assert_eq!(session_ref["provider"], serde_json::json!("claude"), "sessionRef: {pane_content}");
     let sid = session_ref["sessionId"].as_str().expect("sessionId string").to_string();
     uuid::Uuid::parse_str(&sid).expect("preallocated id is a canonical UUID");
 
     // 2. Registry row carries the id (this is GET /api/terminals rung 0,
     //    terminals.rs:686-698 — populating it makes sessionRef real there
     //    with zero changes to terminals.rs).
-    let terminal_id = body["data"]["paneContent"]["terminalId"]
+    let terminal_id = body["data"]["terminalId"]
         .as_str()
         .expect("terminalId")
         .to_string();
@@ -256,13 +268,13 @@ async fn create_fresh_claude_tab_preallocates_session_identity() {
 ```
 
 Notes for the implementer:
-- If the response JSON shape differs (e.g. `paneContent` nested differently), print `body` from the failing run and adjust the *accessor paths only* — the three assertions (response sessionRef, registry row, argv pair) are the contract.
+- The REST HTTP body never carries `paneContent` — it is `{tabId, paneId, terminalId}` only (`terminal_tabs.rs:1828-1832`). The sessionRef surface at create time is the broadcast `ui.command` frame (the REST route always passes `broadcast=true`, `terminal_tabs.rs:196-197`); capture it exactly the way the sibling test at `:3383` does. If the captured frame's shape differs from the sketch, print the frame and adjust the accessor paths *within the frame* — the three assertions (broadcast `paneContent.sessionRef`, registry row, argv pair) are the contract.
 - If no argv-capture helper exists locally in this `mod tests`, port `write_fake_claude_capture()` from `crates/freshell-ws/tests/claude_session_rebind.rs:53-79` (a `#!/bin/sh` script dumping `"$@"` to `$CLAUDE_ARGV_CAPTURE_PATH` then `exec sleep 300`, chmod 0755, written to `std::env::temp_dir()`), and point the spec's `default_cmd` at it directly (avoid `env_var`/process-global env in this shared test binary if a direct path works).
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p freshell-freshagent create_fresh_claude_tab_preallocates_session_identity -- --exact`
-Expected: FAIL — `sessionRef` absent from `paneContent` (today's behavior: no mint, `resume_session_id = None`).
+Expected: FAIL — `sessionRef` absent from the broadcast frame's `paneContent` (today's behavior: no mint, `resume_session_id = None`).
 
 - [ ] **Step 3: Implement the mint in `spawn_terminal_pane`**
 
@@ -305,7 +317,7 @@ async fn create_fresh_claude_tab_with_null_session_ref_still_mints() {
     // Same harness and assertions as
     // create_fresh_claude_tab_preallocates_session_identity, with
     // `"sessionRef": serde_json::Value::Null` added to the POST body —
-    // the response must still carry a minted claude sessionRef.
+    // the broadcast paneContent must still carry a minted claude sessionRef.
 }
 ```
 
@@ -412,7 +424,7 @@ git commit -m "fix(freshagent): REST claude creates mint a preallocated --sessio
 
 - [ ] **Step 1: Write the failing-or-passing pin tests**
 
-Same harness as Task 2's test (fake claude spec with `create_session_args`; the split/respawn spawns will each need their own argv-capture file if argv is asserted — asserting `sessionRef` + registry row is sufficient here and avoids capture-path races):
+Same harness as Task 2's test (fake claude spec with `create_session_args`; the split/respawn spawns will each need their own argv-capture file if argv is asserted — asserting the registry rows is sufficient here and avoids both capture-path races and broadcast-frame plumbing; remember the REST bodies carry only `{tabId, paneId, terminalId}` / `{paneId, terminalId}` / `{terminalId}`, so identity is read from the registry):
 
 ```rust
 #[tokio::test]
@@ -426,18 +438,25 @@ async fn split_pane_claude_preallocates_fresh_session_identity() {
     let (status, tab) = post(router.clone(), "/api/tabs",
         serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let pane_id = tab["data"]["paneContent"]["paneId"].as_str()
-        .or_else(|| tab["data"]["paneId"].as_str())
+    // The /api/tabs body is {tabId, paneId, terminalId} — no paneContent.
+    // Identity is read from the registry rows (rung 0), keyed by terminalId.
+    let pane_id = tab["data"]["paneId"].as_str()
         .expect("pane id in create response").to_string();
-    let first_sid = tab["data"]["paneContent"]["sessionRef"]["sessionId"]
-        .as_str().expect("first pane minted").to_string();
+    let first_tid = tab["data"]["terminalId"].as_str()
+        .expect("terminal id in create response").to_string();
+    let first_sid = registry.identity_probe_rows().into_iter()
+        .find(|r| r.terminal_id == first_tid).expect("create registry row")
+        .resume_session_id.expect("first pane minted");
 
     let (status, split) = post(router, &format!("/api/panes/{pane_id}/split"),
         serde_json::json!({"mode":"claude"}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "split failed: {split}");
-    let split_ref = split["data"]["paneContent"]["sessionRef"].clone();
-    assert_eq!(split_ref["provider"], serde_json::json!("claude"), "split sessionRef: {split}");
-    let split_sid = split_ref["sessionId"].as_str().expect("split minted").to_string();
+    // The split body is {paneId, terminalId} — again, identity via registry.
+    let split_tid = split["data"]["terminalId"].as_str()
+        .expect("terminal id in split response").to_string();
+    let split_sid = registry.identity_probe_rows().into_iter()
+        .find(|r| r.terminal_id == split_tid).expect("split registry row")
+        .resume_session_id.expect("split minted");
     uuid::Uuid::parse_str(&split_sid).expect("canonical UUID");
     assert_ne!(split_sid, first_sid, "split must mint its OWN identity");
 
@@ -464,22 +483,25 @@ async fn respawn_pane_claude_ends_with_session_identity() {
     let (status, tab) = post(router.clone(), "/api/tabs",
         serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let pane_id = tab["data"]["paneContent"]["paneId"].as_str()
-        .or_else(|| tab["data"]["paneId"].as_str())
+    let pane_id = tab["data"]["paneId"].as_str()
         .expect("pane id").to_string();
 
     let (status, respawned) = post(router, &format!("/api/panes/{pane_id}/respawn"),
         serde_json::json!({}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "respawn failed: {respawned}");
-    let sid = respawned["data"]["paneContent"]["sessionRef"]["sessionId"]
-        .as_str().expect("respawned pane has identity").to_string();
+    // The respawn body is {terminalId} only — identity via the registry row.
+    let respawn_tid = respawned["data"]["terminalId"].as_str()
+        .expect("terminal id in respawn response").to_string();
+    let sid = registry.identity_probe_rows().into_iter()
+        .find(|r| r.terminal_id == respawn_tid).expect("respawn registry row")
+        .resume_session_id.expect("respawned pane has identity");
     uuid::Uuid::parse_str(&sid).expect("canonical UUID");
 
     for r in registry.identity_probe_rows() { registry.kill(&r.terminal_id); }
 }
 ```
 
-(Adjust response accessor paths against actual bodies as in Task 2; look at the existing split/respawn tests in `pane_ops.rs`/`terminal_tabs.rs mod tests` for the exact request/response shapes — `pane_ops.rs:1011` shows a helper POSTing `/api/tabs` you can crib.)
+(The REST bodies carry only ids — the identity assertions read the registry rows, never the HTTP body; look at the existing split/respawn tests in `pane_ops.rs`/`terminal_tabs.rs mod tests` for the exact request/response shapes — `pane_ops.rs:1011` shows a helper POSTing `/api/tabs` you can crib.)
 
 - [ ] **Step 2: Run them**
 
@@ -923,8 +945,12 @@ async fn fresh_claude_rest_create_drives_binder_prespawn_then_register() {
     let (status, body) = post(app(state), "/api/tabs",
         serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    let sid = body["data"]["paneContent"]["sessionRef"]["sessionId"].as_str().unwrap().to_string();
-    let tid = body["data"]["paneContent"]["terminalId"].as_str().unwrap().to_string();
+    // The REST body carries only ids; the minted sid comes from the
+    // registry row (same read as Task 2's assertion 2).
+    let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+    let sid = registry.identity_probe_rows().into_iter()
+        .find(|r| r.terminal_id == tid).and_then(|r| r.resume_session_id)
+        .expect("minted id in the registry row");
 
     let events = binder.events();
     let prespawn = events.iter().position(|e| e == &format!("prespawn:{tid}:{sid}"))
@@ -957,7 +983,7 @@ async fn resume_claude_rest_create_registers_identity_without_prespawn_write() {
             "sessionRef": {"provider": "claude", "sessionId": S},
         }), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    let tid = body["data"]["paneContent"]["terminalId"].as_str().unwrap().to_string();
+    let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
 
     let events = binder.events();
     assert!(!events.iter().any(|e| e.starts_with("prespawn:")),
@@ -1000,7 +1026,7 @@ async fn rest_pane_exit_retires_identity_via_binder() {
     let (status, body) = post(app(state), "/api/tabs",
         serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    let tid = body["data"]["paneContent"]["terminalId"].as_str().unwrap().to_string();
+    let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
 
     registry.kill(&tid);
     // The exit hook runs asynchronously — poll with a bounded deadline.
@@ -1234,14 +1260,19 @@ async fn spawn_merged_server() -> Harness {
 async fn rest_create_claude(h: &Harness) -> (String, String) {
     // PORT: rest_ws_shared_gate.rs's raw HTTP POST helper, verbatim —
     // POST /api/tabs {"mode":"claude","cwd":<temp dir>} with x-auth-token.
-    // Returns (terminal_id, session_id) read from the response's
-    // paneContent.sessionRef, panicking with the full body on any miss.
+    // Returns (terminal_id, session_id): terminal_id from the response
+    // body's data.terminalId (the REST HTTP body carries ONLY
+    // {tabId, paneId, terminalId} — paneContent.sessionRef travels on the
+    // broadcast ui.command frame, not the body), session_id from the
+    // harness's registry row (registry.identity_probe_rows() ->
+    // resume_session_id for that terminal). Panic with the full body /
+    // row set on any miss.
 }
 
 /// 4a — a REST-created claude pane has a USABLE RESUME IDENTITY that does
 /// not depend on any signal file existing: preallocated id in the registry
-/// row, identity row, durable Bound ledger binding, sessionRef in the
-/// create response — with the signal directory EMPTY throughout.
+/// row (readable at create time — the rung-0 feed), identity row, and a
+/// durable Bound ledger binding — with the signal directory EMPTY throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_created_claude_pane_has_durable_resume_identity_without_signals() {
     let h = spawn_merged_server().await;
@@ -1397,7 +1428,7 @@ Fill the two `todo!()` helpers by porting the cited code (`rest_ws_shared_gate.r
 - [ ] **Step 2: Run the suite**
 
 Run: `cargo test -p freshell-ws --test rest_claude_identity`
-Expected: all PASS. (These are green-on-arrival pins for Tasks 2+5's behavior — the value is that they fail loudly if anyone reintroduces the split. Verify each is a REAL pin by spot-reverting: `git stash` nothing — instead temporarily flip the `launch_intent` conditional in `terminal_tabs.rs` back to bare `LaunchIntent::Resume`, rerun, confirm 4a/4b/4c go red, restore.)
+Expected: all PASS. (These are green-on-arrival pins for Tasks 2+5's behavior — the value is that they fail loudly if anyone reintroduces the split. Verify each is a REAL pin by spot-reverting the MINT itself: temporarily force `claude_fresh_prealloc` to `false` in `spawn_terminal_pane` — i.e. replace the `should_preallocate_fresh_claude(..)` call's result with a literal `false` — rerun, confirm 4a/4b/4c go red, restore. Do NOT use the `launch_intent` conditional as the spot-revert: flipping it only changes argv, while 4a/4b/4c assert identity/ledger/refusal properties gated on `claude_fresh_prealloc`, so they would stay green and prove nothing.)
 
 - [ ] **Step 3: Reconcile `pane_ledger_restore.rs:237-302`**
 
@@ -1557,7 +1588,7 @@ Expected: branch pushed. STOP — do not open a PR, do not close kata hbsa (the 
 | P1 mint preallocated UUID + `--session-id` argv | Tasks 1–2 (argv asserted in Task 2 Step 1) |
 | P1 pre-spawn ledger binding (PIN 2, eaa25b7d scoping) | Tasks 4–5 (write + failure-delete, same gate; ordering pinned in Task 5 Step 1) |
 | P1 identity row registration | Tasks 4–5 (unit) + Task 6 4a (e2e) |
-| P1 sessionRef exposed (REST response, `GET /api/terminals` rung 0, `paneContent`) | Task 2 (response + registry row = rung 0 input; `terminals.rs` needs no change) |
+| P1 sessionRef exposed (broadcast `ui.command` `paneContent`, `GET /api/terminals` rung 0, registry row — the REST HTTP bodies carry only ids and are deliberately unchanged) | Task 2 (broadcast paneContent + registry row = rung 0 input; `terminals.rs` needs no change) |
 | P1 SessionStart signal consumed as confirmation | Task 6 4c |
 | 2 split + respawn entry points | Task 3 (shared `spawn_terminal_pane`, pinned) |
 | 2 other entry points audit | Settled by load-bearing validation (ledger A12): exactly THREE live REST spawn routes (tabs, split, respawn), all funnel through `spawn_terminal_pane` (`terminal_tabs.rs:704`); `POST /api/tabs-sync/restore` was deliberately deleted (docs/plans/2026-07-26-recover-my-panes.md Task 9, kata h9vt) — the `:193-195` comment is stale; the deferred-restore variant (`:203`) has zero callers and inherits the fix if revived; the WS auto-resume respawn door (`terminal.rs:2945`) is identity-preserving by reuse and out of scope |
