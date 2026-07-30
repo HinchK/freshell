@@ -1,0 +1,458 @@
+//! S5.a (DEV-0006): the proxy-event router — the ONLY consumer of the managed
+//! launch's `RemoteProxyEvent` stream. Routes into the EXISTING tails; builds
+//! no new identity writer (single-writer discipline, campaign §2.3.2).
+//!
+//! D-03 RULE (recorded; spec §8.3): for managed panes the proxy candidate is
+//! authoritative and the association locator never arms (see
+//! `codex_association::should_arm_codex_locator`); on the SAME terminal, first
+//! bind wins — a later proxy candidate with a different id is ignored here
+//! (identity moves only through the fork rebind lane).
+//!
+//! The first-bind check below is router-task check-then-act (accepted
+//! residual, load-bearing ledger A22): safe because this task is the ONLY
+//! proxy-candidate writer (single mpsc consumer), create-time session-ref
+//! binds complete before any candidate can arrive, and the locator is
+//! suppressed for managed panes (Task 7).
+//!
+//! D-FORK RULE (recorded; spec S5.a "route … or ignore"): proxy fork
+//! candidates (`CandidateSource::ThreadForkResponse`) are deliberately
+//! IGNORED — the landed disk fork-watch lane (`watch_fork` → `tick_forks` →
+//! `rebind_codex_identity`, D7/A13/A8 guards) owns fork rebinds. The router
+//! registers `watch_fork` after each adoption so managed fresh panes get the
+//! same coverage resume panes get at create (`terminal.rs:2442-2446`).
+
+use std::path::Path;
+
+use freshell_codex::launch_lifecycle::{CodexTerminalLaunchManager, TerminalProxyEvent};
+use freshell_codex::remote_proxy::RemoteProxyEvent;
+use freshell_codex::remote_proxy_side_effects::CandidateSource;
+use tokio::sync::mpsc;
+
+use crate::codex_identity::CodexAdoption;
+use crate::WsState;
+
+/// Boot entry: consume the set-once sink channel installed into
+/// `freshell-codex` (see `set_codex_proxy_event_sink`) for the whole server.
+pub fn spawn_codex_proxy_router(
+    state: WsState,
+    mut rx: mpsc::UnboundedReceiver<TerminalProxyEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(tagged) = rx.recv().await {
+            route_proxy_event(&state, tagged).await;
+        }
+    })
+}
+
+async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
+    let TerminalProxyEvent {
+        terminal_id,
+        cwd,
+        event,
+    } = tagged;
+    match event {
+        RemoteProxyEvent::Candidate(candidate) => {
+            route_candidate(state, &terminal_id, cwd.as_deref(), candidate).await;
+        }
+        RemoteProxyEvent::TurnStarted(_) => {
+            if let Some(hub) = &state.activity {
+                hub.note_codex_proxy_turn(&terminal_id, false);
+            }
+        }
+        RemoteProxyEvent::TurnCompleted(_) => {
+            if let Some(hub) = &state.activity {
+                hub.note_codex_proxy_turn(&terminal_id, true);
+            }
+        }
+        RemoteProxyEvent::ThreadStarted(_) | RemoteProxyEvent::ThreadLifecycle(_) => {
+            tracing::debug!(terminal_id = %terminal_id, "codex_proxy_lifecycle_event");
+        }
+        RemoteProxyEvent::ThreadLifecycleLoss(loss) => {
+            // S5.a: minimal by fence — re-plan-on-loss stays deferred; the
+            // auto-resume orchestrator owns recovery.
+            tracing::warn!(terminal_id = %terminal_id, ?loss, "codex_proxy_lifecycle_loss");
+        }
+        RemoteProxyEvent::RepairTrigger(trigger) => {
+            // S5.a + D-GATE-SOFT: log only (includes CandidateCaptureTimeout).
+            tracing::warn!(terminal_id = %terminal_id, ?trigger, "codex_proxy_repair_trigger");
+        }
+    }
+}
+
+async fn route_candidate(
+    state: &WsState,
+    terminal_id: &str,
+    cwd: Option<&str>,
+    candidate: freshell_codex::remote_proxy_side_effects::RemoteProxyCandidate,
+) {
+    if candidate.source == CandidateSource::ThreadForkResponse {
+        tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+            "codex_proxy_fork_candidate_ignored: disk fork-watch lane owns rebinds (D-FORK)");
+        return;
+    }
+    if candidate.thread.ephemeral {
+        tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+            "codex_proxy_candidate_skipped: ephemeral thread");
+        return;
+    }
+    // Legacy bind-predicate parity (terminal-registry.ts:2144/2175 — verified,
+    // ledger A25): bind only candidates with a non-empty thread id AND an
+    // absolute rollout path (the reconcile activity lane also requires the
+    // path — ledger A9).
+    if candidate.thread.id.is_empty()
+        || !candidate
+            .thread
+            .path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(Path::is_absolute)
+    {
+        tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+            "codex_proxy_candidate_skipped: empty thread id or missing/relative rollout path");
+        return;
+    }
+    // D-03: first bind wins on this terminal.
+    if let Some(existing) = state.identity.get(terminal_id) {
+        if let (Some("codex"), Some(existing_id)) =
+            (existing.provider.as_deref(), existing.session_id.as_deref())
+        {
+            if existing_id != candidate.thread.id {
+                tracing::debug!(terminal_id = %terminal_id, existing = %existing_id,
+                    incoming = %candidate.thread.id,
+                    "codex_proxy_candidate_ignored: terminal already bound (D-03 first-bind-wins)");
+                return;
+            }
+        }
+    }
+    let adopted = crate::codex_identity::adopt_codex_identity(
+        state,
+        CodexAdoption {
+            terminal_id,
+            thread_id: &candidate.thread.id,
+            rollout_path: candidate.thread.path.as_deref().map(Path::new),
+            cwd,
+        },
+    )
+    .await;
+    if adopted {
+        // S5.c release: the awaited ledger write inside the tail IS the
+        // "persisted" signal (fsync-before-announce). Idempotent on re-adopt.
+        // Verified (ledger A7): atomic_write_durable fsyncs file + parent dir.
+        // Documented durability.degraded policy: a disabled/degraded ledger
+        // still returns adopted=true — accepted, matches existing identity
+        // durability semantics.
+        CodexTerminalLaunchManager::global()
+            .mark_candidate_persisted(terminal_id)
+            .await;
+        // D-FORK: give managed panes the disk fork watch resume panes get.
+        if let Some(locator) = &state.codex_locator {
+            locator.watch_fork(terminal_id, &candidate.thread.id);
+        }
+    } else {
+        CodexTerminalLaunchManager::global()
+            .fail_candidate_capture(terminal_id, "codex candidate refused by identity guards")
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freshell_codex::launch_lifecycle::TerminalProxyEvent;
+    use freshell_codex::remote_proxy::RemoteProxyEvent;
+    use freshell_codex::remote_proxy_side_effects::{
+        CandidateSource, CandidateThread, RemoteProxyCandidate,
+    };
+    use std::sync::Arc as StdArc;
+
+    /// WsState test-construction, copied from `codex_association.rs`'s
+    /// in-module test builder (`state_with_locator`) — same construction,
+    /// including a subscribable `broadcast_tx`; the locator is backed by a
+    /// unique temp dir so the post-adopt `watch_fork` registration has a
+    /// real (empty) sessions root to snapshot.
+    fn test_state() -> WsState {
+        let data_home = unique_temp_dir("proxy-route");
+        let auth_token = StdArc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            auth_token: StdArc::clone(&auth_token),
+            server_instance_id: StdArc::new("srv-1111".to_string()),
+            boot_id: StdArc::new("boot-2222".to_string()),
+            settings: StdArc::new(
+                serde_json::from_value(serde_json::json!({
+                    "ai": {},
+                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+                    "editor": { "externalEditor": "auto" },
+                    "extensions": { "disabled": [] },
+                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+                    "logging": { "debug": false },
+                    "network": { "configured": true, "host": "127.0.0.1" },
+                    "panes": { "defaultNewPane": "ask" },
+                    "safety": { "autoKillIdleMinutes": 15 },
+                    "sidebar": {
+                        "autoGenerateTitles": true,
+                        "excludeFirstChatMustStart": false,
+                        "excludeFirstChatSubstrings": []
+                    },
+                    "terminal": { "scrollback": 10000 }
+                }))
+                .unwrap(),
+            ),
+            broadcast_tx: StdArc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                StdArc::clone(&auth_token),
+                StdArc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(StdArc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, StdArc::clone(&broadcast_tx)),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: StdArc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            terminals_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: StdArc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: StdArc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: Some(StdArc::new(
+                freshell_sessions::codex_locator::CodexLocator::new(data_home),
+            )),
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-codex-proxy-route-test-{label}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Brief's helper, extended per the brief's prose: takes the rollout
+    /// path — the router's bind predicate requires an ABSOLUTE path, so
+    /// happy-path candidates pass one and filter tests pass None/relative.
+    fn candidate(
+        source: CandidateSource,
+        id: &str,
+        path: Option<&str>,
+        ephemeral: bool,
+    ) -> RemoteProxyEvent {
+        RemoteProxyEvent::Candidate(RemoteProxyCandidate {
+            source,
+            thread: CandidateThread {
+                id: id.to_string(),
+                path: path.map(str::to_string),
+                ephemeral,
+            },
+        })
+    }
+
+    fn tagged(terminal_id: &str, event: RemoteProxyEvent) -> TerminalProxyEvent {
+        TerminalProxyEvent {
+            terminal_id: terminal_id.to_string(),
+            cwd: Some("/tmp/x".to_string()),
+            event,
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_adopts_identity_through_the_single_writer_tail() {
+        let state = test_state();
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-a",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-1",
+                    Some("/tmp/rollouts/rollout-sess-1.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-a").and_then(|i| i.session_id),
+            Some("sess-1".to_string())
+        );
+        // Pinned order: associated FIRST, then meta.updated.
+        let first = frames.recv().await.unwrap();
+        assert!(first.contains("terminal.session.associated"), "{first}");
+        let second = frames.recv().await.unwrap();
+        assert!(second.contains("terminal.meta.updated"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn fork_source_candidates_are_deliberately_ignored() {
+        let state = test_state();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-b",
+                candidate(
+                    CandidateSource::ThreadForkResponse,
+                    "sess-2",
+                    Some("/tmp/rollouts/rollout-sess-2.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert!(state
+            .identity
+            .get("term-b")
+            .and_then(|i| i.session_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_candidates_are_skipped() {
+        let state = test_state();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-c",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-3",
+                    Some("/tmp/rollouts/rollout-sess-3.jsonl"),
+                    true,
+                ),
+            ),
+        )
+        .await;
+        assert!(state
+            .identity
+            .get("term-c")
+            .and_then(|i| i.session_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn candidates_with_empty_id_or_non_absolute_path_are_skipped() {
+        let state = test_state();
+        // Empty thread id (absolute path, so the id filter is what rejects).
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-f",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "",
+                    Some("/tmp/rollouts/rollout-empty.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert!(state.identity.get("term-f").is_none());
+        // Relative rollout path.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-g",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-rel",
+                    Some("relative/rollout-sess-rel.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert!(state.identity.get("term-g").is_none());
+        // Missing rollout path.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-h",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-nopath",
+                    None,
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert!(state.identity.get("term-h").is_none());
+    }
+
+    #[tokio::test]
+    async fn first_bind_wins_on_the_same_terminal_d03() {
+        let state = test_state();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-d",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-first",
+                    Some("/tmp/rollouts/rollout-sess-first.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-d",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-second",
+                    Some("/tmp/rollouts/rollout-sess-second.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-d").and_then(|i| i.session_id),
+            Some("sess-first".to_string()),
+            "D-03: a later different-id proxy candidate must not re-adopt"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_and_repair_events_only_log() {
+        let state = test_state();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-e",
+                RemoteProxyEvent::RepairTrigger(
+                    freshell_codex::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+                ),
+            ),
+        )
+        .await;
+        // Minimal handling: no identity write, no panic.
+        assert!(state.identity.get("term-e").is_none());
+    }
+}
