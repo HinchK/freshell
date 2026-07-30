@@ -6,6 +6,7 @@ import {
   TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
   MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
+  TEXT_LETTER_SPACING, TITLE_SIDE_PADDING,
   ensureRoundRect,
 } from '@/deck/tile-renderer'
 import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM, PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
@@ -351,6 +352,58 @@ describe('fonts (Inter)', () => {
     const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
     expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
     expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+  })
+})
+
+describe('letter spacing', () => {
+  it('icons banner, pager, action, and strip text carry TEXT_LETTER_SPACING; avatar, badge, and classic preview do not', () => {
+    // Icons tile: letter avatar + enough agent panes that two fold into a +2 badge.
+    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
+    const icons = renderTab(
+      tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }], paneIcons }),
+      () => ({} as CanvasImageSource),
+    )
+    expect(icons.texts.find((t) => t.text === 'build')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+    expect(icons.texts.find((t) => t.text === 'B')?.letterSpacing).toBe('')  // avatar keeps default
+    expect(icons.texts.find((t) => t.text === '+2')?.letterSpacing).toBe('') // badge keeps default
+
+    // Pager: all three texts carry the tracking.
+    const pager = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
+    for (const label of ['PAGE', '2/3', 'NEXT >']) {
+      expect(pager.texts.find((t) => t.text === label)?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+    }
+
+    // Action label carries the tracking.
+    const action = renderTab({ kind: 'action', action: 'approve', enabled: true })
+    expect(action.texts.find((t) => t.text === 'APPROVE')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // Touch-strip text carries the tracking.
+    let strip: ReturnType<typeof recordingCtx> | null = null
+    renderStrip('hello', 800, 100, (w, h) => (strip = recordingCtx(w, h)).ctx)
+    expect(strip!.texts.find((t) => t.text === 'hello')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // Classic preview is PINNED: body lines AND banner keep the default ''.
+    const preview = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls', 'PASS'] }))
+    expect(preview.texts.length).toBeGreaterThan(0)
+    for (const t of preview.texts) expect(t.letterSpacing).toBe('')
+  })
+
+  it('the icons title is measured with spacing applied and fits within w - 2 * TITLE_SIDE_PADDING', () => {
+    // 72px-wide caps: maxWidth = 72 - 2 * 6 = 60. With spacing set the stub
+    // measures chars * 6.4, so a 10-char title (64 > 60) must truncate to
+    // 'ABCDEFGH…' (9 * 6.4 = 57.6 <= 60).
+    expect(72 - 2 * TITLE_SIDE_PADDING).toBe(60)
+    const caps = { ...MINI_CAPS, keyPixelWidth: 72, keyPixelHeight: 72 }
+    const rec = recordingCtx(72, 72)
+    renderKey(tabSpec({ title: 'ABCDEFGHIJ' }), caps, () => rec.ctx)
+    const title = rec.texts.find((t) => t.text.includes('…'))
+    expect(title?.text).toBe('ABCDEFGH…')
+    // Measurement happened WITH the spacing already set:
+    expect(rec.measures.find((m) => m.text === 'ABCDEFGHIJ')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // On the 80px key the same 10-char title still fits: 64 <= 80 - 12.
+    const wide = renderTab(tabSpec({ title: 'ABCDEFGHIJ' }))
+    expect(wide.texts.find((t) => t.text === 'ABCDEFGHIJ')).toBeDefined()
   })
 })
 

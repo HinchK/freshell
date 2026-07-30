@@ -53,6 +53,12 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
+/** Subtle tracking for deck text. Chromium-only canvas API — the deck's only
+ * supported surface. Set BEFORE measureText so fitLabel includes the tracking
+ * (Chromium adds it after every glyph, matching the test stub's model). */
+export const TEXT_LETTER_SPACING = '0.4px'
+/** Side padding for the icons-style banner label inside the rounded frame. */
+export const TITLE_SIDE_PADDING = 6
 
 // ============================================================================
 // DECK PALETTE — derived from freshell's own UI palette so the deck reads as
@@ -289,15 +295,18 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)
   }
 
-  // 3. Title banner across the top (unchanged treatment).
+  // 3. Title banner across the top. Tracking is set HERE — after the
+  //    icons/avatar/badge draws above (they keep the default spacing) and
+  //    before measurement, so fitLabel accounts for it.
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
   // Weight rule: 400 everywhere, EXCEPT where the deck mirrors the app UI —
   // the letter avatar and +N badge keep RepoIcon's 600 (see RepoIcon.tsx).
   ctx.font = `400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
-  const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
+  const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 2 * TITLE_SIDE_PADDING)
   drawCenteredText(ctx, label, w, 2)
 
   // 4. Borders/rings: barTop green border; white ring marks the active tab.
@@ -320,6 +329,7 @@ function drawPager(
 ): void {
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
   ctx.textBaseline = 'top'
 
   ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
@@ -341,6 +351,7 @@ function drawAction(
 ): void {
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
 
   ctx.font = `400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
@@ -383,6 +394,7 @@ export function renderStrip(text: string, width: number, height: number, createC
   const ctx = createCtx(width, height)
   ctx.fillStyle = EMPTY_BG
   ctx.fillRect(0, 0, width, height)
+  ctx.letterSpacing = TEXT_LETTER_SPACING
   ctx.font = `400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
