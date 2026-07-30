@@ -477,6 +477,11 @@ async fn respawn_pane_claude_ends_with_session_identity() {
     // respawned claude pane must end with a real sessionRef (whether the
     // respawn resumes the prior id or mints fresh is respawn policy, pinned
     // elsewhere — the bug here was ending with NO identity at all).
+    // NOTE: respawn identity is BODY-driven, not pane-inherited — the
+    // client body is forwarded untouched (pane_ops.rs:716) and
+    // spawn_terminal_pane derives mode solely from body["mode"], defaulting
+    // to "shell" (terminal_tabs.rs:710-715). An empty body respawns a SHELL
+    // pane (no mint). The body below must therefore carry mode:"claude".
     let (state, registry, _capture) = state_with_claude_capture_spec();
     let router = app(state);
 
@@ -487,7 +492,7 @@ async fn respawn_pane_claude_ends_with_session_identity() {
         .expect("pane id").to_string();
 
     let (status, respawned) = post(router, &format!("/api/panes/{pane_id}/respawn"),
-        serde_json::json!({}), true).await;
+        serde_json::json!({"mode":"claude"}), true).await;
     assert_eq!(status, axum::http::StatusCode::OK, "respawn failed: {respawned}");
     // The respawn body is {terminalId} only — identity via the registry row.
     let respawn_tid = respawned["data"]["terminalId"].as_str()
@@ -570,19 +575,27 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
         cwd: Option<&str>,
         create_request_id: Option<&str>,
     );
-    /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS kill path
-    /// (terminal.rs:1334-1342, :3860-3868, :3896) — retire the identity row
-    /// (in-memory flag flip), delete any pending marker, retire closed
-    /// ledger bindings for this terminal. Without it, dead REST panes stay
-    /// live-looking: the session directory lists them as running
-    /// (session_directory.rs:716-766), the reverse rename cascade fires on
-    /// them (sessions.rs:167-187), and a late new-id SessionStart skips the
-    /// `current.retired -> Acted` no-op arm and durably rebinds a dead pane
-    /// (claude_signal.rs:253-342). Idempotent; harmless no-op for terminals
-    /// with no identity row. Called from the pane exit hook for ALL
-    /// non-shell creates. SYNC ON PURPOSE: the exit hook is a plain FnOnce
-    /// on the PTY reader thread — blocking IO is safe there, .await is
-    /// impossible (mirrors the WS exit hook, terminal.rs:1334-1342).
+    /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS pane
+    /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row
+    /// (in-memory flag flip) and delete any pending marker. Deliberately
+    /// does NOT touch the ledger binding: `retire_closed` is the
+    /// explicit-user-close trigger only ("P1.8 trigger (e)", the WS kill
+    /// command path, terminal.rs:3849-3868), never the natural-exit path,
+    /// and the Bound-after-natural-exit ledger row is load-bearing —
+    /// `auto_resume::pre_respawn_guard` reads a still-Bound row as "pane
+    /// still wants this session" (auto_resume.rs:445-450) and the recovery
+    /// inventory keys on `RetiredReason::Closed` meaning deliberate close
+    /// (recovery_inventory.rs:299-301). Both A2 hazards are closed by the
+    /// identity-row retire alone: the session directory joins identity
+    /// rows for liveness (session_directory.rs:716-766, and the rename
+    /// cascade with it, sessions.rs:167-187), and the claude drain's no-op
+    /// arm checks `current.retired` (claude_signal.rs:253-342), so a late
+    /// new-id SessionStart cannot durably rebind a dead pane. Idempotent;
+    /// harmless no-op for terminals with no identity row. Called from the
+    /// pane exit hook for ALL non-shell creates. SYNC ON PURPOSE: the exit
+    /// hook is a plain FnOnce on the PTY reader thread — blocking IO is
+    /// safe there, .await is impossible (mirrors the WS exit hook,
+    /// terminal.rs:1334-1342).
     fn retire_pane_identity(&self, terminal_id: &str);
 }
 ```
@@ -682,15 +695,28 @@ mod tests {
         // Ledger A2: exit-side hygiene — retired rows must stop looking live.
         // Sync test on purpose: retire MUST be callable with no runtime,
         // because production calls it from the PTY reader thread's exit hook.
-        let (b, _ledger, identity, dir) = binder("retire");
+        let (b, ledger, identity, dir) = binder("retire");
         b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None);
         b.retire_pane_identity("t-rest-4");
-        // Retired == invisible to live lookups, exactly what the WS kill path
-        // produces (match the accessor the identity.rs retire tests use —
-        // e.g. the live find_by_session no longer returns the terminal,
-        // while the retired-inclusive lookup still does).
+        // Retired == invisible to live lookups, exactly what the WS pane
+        // EXIT hook produces (match the accessor the identity.rs retire
+        // tests use — e.g. the live find_by_session no longer returns the
+        // terminal, while the retired-inclusive lookup still does).
         assert!(identity.find_by_session("claude", SID).is_none(),
             "retired row is not a live owner");
+        // NATURAL-EXIT contract pin: the durable ledger binding must STAY
+        // Bound — retire_closed is the explicit-kill trigger
+        // (terminal.rs:3849-3868), never the exit hook's. A still-Bound row
+        // after natural exit is load-bearing for
+        // auto_resume::pre_respawn_guard and the recovery inventory's
+        // RetiredReason::Closed keying. Assert with the ledger read API the
+        // pane_ledger tests use (e.g. load_binding("claude", SID)) that the
+        // row still exists and is Bound (not retired/Closed).
+        let binding = ledger.load_binding("claude", SID)
+            .expect("natural exit must NOT retire the ledger binding");
+        // assert the row state is Bound — match the RowState/retired
+        // accessor the pane_ledger tests use.
+        let _ = binding;
         // And the pending-marker delete arm: register a marker-mode pane,
         // retire it, assert its pending/<tid>.json is gone (same
         // marker-read idiom as the markers test above).
@@ -840,11 +866,17 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
     }
 
     fn retire_pane_identity(&self, terminal_id: &str) {
-        // PORT (not new design): the WS kill-path hygiene — identity retire
-        // (terminal.rs:1334 / :3896), pending-marker delete (:1342 / :3866),
-        // and retire_closed for the terminal's ledger rows (:3860-3868) —
+        // PORT (not new design): the WS pane EXIT hook ONLY — identity
+        // retire (terminal.rs:1334) + pending-marker delete (:1342) —
         // substituting self.identity / self.ledger and warn_write_failure,
-        // all called directly (sync). This method MUST stay runtime-free:
+        // both called directly (sync). Do NOT port `retire_closed` from
+        // the kill path (:3860-3868): that is the explicit-user-close
+        // trigger (P1.8 trigger (e)); a natural exit or crash must leave
+        // the ledger binding Bound, exactly like a WS pane, so
+        // auto_resume::pre_respawn_guard (auto_resume.rs:445-450) and the
+        // recovery inventory (RetiredReason::Closed keying,
+        // recovery_inventory.rs:299-301) still read the row correctly.
+        // This method MUST stay runtime-free:
         // production calls it from the PTY reader thread's exit hook, where
         // blocking IO is safe and tokio does not exist. The identity retire
         // is an in-memory flag flip; this method changes NO drain logic
