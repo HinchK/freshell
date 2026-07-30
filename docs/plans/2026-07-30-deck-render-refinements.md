@@ -512,7 +512,7 @@ git commit -m "feat(settings): Key layout control (Auto / Newest first / Status 
 
 First, migrate fixtures so the whole suite stays green and arrangement-explicit at this task's boundary (settings default `keyLayout: 'auto'` resolves REVERSED on the 6-key Mini, which would silently flip every Mini-based fixture):
 
-1. `test/unit/client/deck/frame.test.ts`: `makeDeckTab` gains a `tabIndex: 0` default (overridable); the `model(n)` helper stamps `tabIndex: i` on each tab and adds `keyLayout: 'status-sorted' as const` to the returned model, with this comment: `// Existing tests document the STANDARD arrangement explicitly; 'auto' resolution and the reversed arrangement have dedicated tests.`
+1. `test/unit/client/deck/frame.test.ts`: `makeDeckTab` gains a `tabIndex: 0` default (overridable); the `model(n)` helper stamps `tabIndex: i` on each tab and adds `keyLayout: 'status-sorted' as const` to the returned model, with this comment: `// Existing tests document the STANDARD arrangement explicitly; 'auto' resolution and the reversed arrangement have dedicated tests.` ALSO migrate the two tests that build inline `DeckModel` literals WITHOUT the `model(n)` helper — `'buildFrame carries fill/paneIcons/icons onto tab keys, with iconReady resolving readiness'` (`:86-112`, local `const model: DeckModel` shadows the helper) and `'pane icon readiness is stamped from iconReady using the tinted data URL'` (`:113-133`, local `m`) — by adding `keyLayout: 'status-sorted' as const` to each literal (their tabs come from `makeDeckTab`, so the new `tabIndex: 0` default covers them). Without this, `undefined` falls into the `'auto'` branch, MINI_CAPS (6 keys) resolves REVERSED, key 0 becomes the pager, and both tests' `frame.keys[0]` assertions fail. CAUTION: test files sit outside every tsconfig include, so tsc will NOT flag a missed literal — before Step 4, grep the file for `activeTabId:` to enumerate every inline model and confirm each has an explicit `keyLayout`.
 2. `test/unit/client/deck/deck-controller.test.ts`: add `keyLayout?: DeckKeyLayout` to `StoreOpts` (`:38-59`), seeded wherever `tileStyle` is seeded (store settings AND the controller `settings()` thunk if it carries it — mirror the `tileStyle` mechanism and its invariant comment at `:50-56`), defaulting to `'status-sorted'` with the same rationale comment. This keeps every existing expectation (pager at key 5, sorted tile order, press-snapshot tests) valid and meaningful once the controller becomes arrangement-aware in Task 7, and keeps this task's intermediate state (buildFrame arrangement-aware, controller not yet) consistent.
 3. `test/e2e/stream-deck-flow.test.tsx`: same for `DeckStoreOpts` — `keyLayout?: DeckKeyLayout` applied via the production action mirroring `tileStyle` at `:127-129` (`store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout } }))`), defaulting existing tests to `'status-sorted'`.
 
@@ -841,7 +841,7 @@ In `test/e2e/stream-deck-flow.test.tsx`: the `DeckStoreOpts.keyLayout` option (d
 
 ```ts
 it('newest-first on the 6-key profile: pager top-left, newest tab beside it, older tabs on page 2', async () => {
-  const { store, device } = setupLive({ tabCount: 8, keyLayout: 'newest-first' })
+  const { store, device } = setupLive({ tabs: 8, keyLayout: 'newest-first' })
   expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
   expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't8' })
   expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't7' })
@@ -852,15 +852,15 @@ it('newest-first on the 6-key profile: pager top-left, newest tab beside it, old
 })
 
 it('auto default: the 6-key deck is newest-first, the 8-key Plus stays status-sorted', async () => {
-  const mini = setupLive({ tabCount: 3, keyLayout: 'auto' })
+  const mini = setupLive({ tabs: 3, keyLayout: 'auto' })
   expect(decodeKey(mini.device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
   expect(decodeKey(mini.device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' })
-  const plus = setupLive({ tabCount: 3, keyLayout: 'auto' }, PLUS_CAPS)
+  const plus = setupLive({ tabs: 3, keyLayout: 'auto' }, PLUS_CAPS)
   expect(decodeKey(plus.device, 0)).toMatchObject({ kind: 'tab' }) // full mode, no pager
 })
 
 it('changing Key layout in settings re-arranges the deck live, without reconnecting', async () => {
-  const { store, device } = setupLive({ tabCount: 4, keyLayout: 'status-sorted' })
+  const { store, device } = setupLive({ tabs: 4, keyLayout: 'status-sorted' })
   expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' }) // standard: no pager when tabs fit
   store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
   expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
@@ -874,7 +874,7 @@ it('tiles and the touch strip show the tab bar displayed label (getTabDisplayTit
   // pane layout is a claude leaf with initialCwd '/home/dan/code/freshell'
   // (extend makeDeckStore's tab builder the same way the deck-selectors
   // fixtures seed initialCwd), on the PLUS profile so the strip renders.
-  const { store, device } = setupLive({ tabCount: 1, keyLayout: 'status-sorted', /* cwd seeding */ }, PLUS_CAPS)
+  const { store, device } = setupLive({ tabs: 1, keyLayout: 'status-sorted', /* cwd seeding */ }, PLUS_CAPS)
   const s = store.getState()
   const tab = s.tabs.tabs[0]
   const expected = getTabDisplayTitle(tab, s.panes.layouts[tab.id], s.panes.paneTitles?.[tab.id], s.extensions?.entries)
@@ -945,6 +945,6 @@ git commit -m "test(deck): e2e + virtual-deck coverage for reversed layout, auto
 
 **2. Placeholder scan:** two test bodies in Task 7 and two in Task 8 are specified as "mirror test X at line Y" with the exact scenario, actions, and assertions spelled out in the comment — the repo-specific fixture builders (`makeState`, `setupLive` option shapes) are the only detail delegated to the implementer, with the exact template test named each time. No TBD/TODO/"handle edge cases" items remain.
 
-**2b. Load-bearing validation updates (Stage 2, 2026-07-30):** all 10 surfaced assumptions resolved (ledger: `.worktrees/.the-usual-logs/deck-render-refinements/load-bearing-ledger.md`). Verified: Chromium `measureText` scales with `ctx.font` incl. letterSpacing (headless probe) — Task 1's no-fit-math-change stands; VirtualDeckPanel/deck-manager suites have zero arrangement-sensitive assertions — Task 6's three-file migration list is complete (caution added: do not touch `deck-controller.ts` in Task 6); both reload-path gates traced (reload-proxy test added to Task 4 Step 1); `?.` pattern has compiled production precedent; baseline green (typecheck + all plan-touched suites on HEAD ceee98a6; full-check flake documented in Task 8 Step 4). Falsified & fixed: (a) Task 4's `defaultSettings()` "typecheck ripple" — that object is the controller callback shape and tests sit outside every tsconfig include, so the instruction was corrected (StreamDeckSettings runtime fixture only) and Task 8's seeding note re-pointed; (b) "last tab-bar position ≡ newest tab" — tab reordering is fully wired (drag/keyboard/context menu) and cross-device sync can adopt remote order, so `'newest-first'` semantics (strictly reverse tab-bar order) are now documented deliberately at every surface (Global Constraints naming note, Task 4 comment, Task 5 UI copy, Task 6 `arrangeTabs` comment); the spec's value name is kept, with a normalizer-alias rename path noted.
+**2b. Load-bearing validation updates (Stage 2, 2026-07-30):** all 10 surfaced assumptions resolved (ledger: `.worktrees/.the-usual-logs/deck-render-refinements/load-bearing-ledger.md`). Verified: Chromium `measureText` scales with `ctx.font` incl. letterSpacing (headless probe) — Task 1's no-fit-math-change stands; VirtualDeckPanel/deck-manager suites have zero arrangement-sensitive assertions (caution added: do not touch `deck-controller.ts` in Task 6); both reload-path gates traced (reload-proxy test added to Task 4 Step 1); `?.` pattern has compiled production precedent; baseline green (typecheck + all plan-touched suites on HEAD ceee98a6; full-check flake documented in Task 8 Step 4). Falsified & fixed: (a) Task 4's `defaultSettings()` "typecheck ripple" — that object is the controller callback shape and tests sit outside every tsconfig include, so the instruction was corrected (StreamDeckSettings runtime fixture only) and Task 8's seeding note re-pointed; (b) "last tab-bar position ≡ newest tab" — tab reordering is fully wired (drag/keyboard/context menu) and cross-device sync can adopt remote order, so `'newest-first'` semantics (strictly reverse tab-bar order) are now documented deliberately at every surface (Global Constraints naming note, Task 4 comment, Task 5 UI copy, Task 6 `arrangeTabs` comment); the spec's value name is kept, with a normalizer-alias rename path noted.
 
 **3. Type consistency:** `DeckKeyLayout` (Task 4) is consumed by `resolveArrangement(keyLayout, keyCount)` and `DeckModel.keyLayout` (Task 6) and `StoreOpts.keyLayout` (Tasks 7-8). `DeckArrangement = 'standard' | 'reversed'` is produced in Task 6 and consumed in Task 7's `layout()` helper. `planLayout(caps, tabCount, arrangement)` third param is optional in Task 6 and made required in Task 7 (explicitly sequenced). `DeckTab.tabIndex: number` is produced in Task 6's selector and consumed by `arrangeTabs`. `ICONS_TITLE_FONT_SIZE`/`TILE_BG`/`TILE_FILL_GREEN` names match between implementation and test steps.
