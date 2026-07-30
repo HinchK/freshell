@@ -502,6 +502,17 @@ describe('DeckController', () => {
     expect(store.getState().tabs.activeTabId).toBe('t3')
   })
 
+  it('reversed: dial 0 cycles the ARRANGED tab list, not the model order (Plus, newest-first)', () => {
+    const { store, device } = setup({ tabCount: 3, keyLayout: 'newest-first' }, PLUS_CAPS)
+    // Focus t3 (the newest): reversed layout pins the pager to key 0, newest tab on key 1.
+    shortPress(device, 1)
+    expect(store.getState().tabs.activeTabId).toBe('t3')
+    // Arranged list is tabIndex-descending [t3, t2, t1]: +1 from t3 must land on t2.
+    // Cycling the un-arranged model order [t1, t2, t3] would wrap t3 -> t1 instead.
+    device.emit({ type: 'dialRotate', dialIndex: 0, ticks: 1 })
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
   it('reversed: press-snapshot guard - a tab opened mid-press cannot retarget the press', () => {
     // Mirrors 'acts on the tab displayed at press-down even if the sort changes
     // mid-press' (:225): keyDown on key 1 (currently t3, the newest), dispatch
