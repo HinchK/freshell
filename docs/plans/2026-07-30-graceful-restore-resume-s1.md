@@ -918,9 +918,9 @@ test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund
 cargo test -p freshell-ws --test claude_restore_unavailable 2>&1 | tail -5
 cargo test -p freshell-ws --test codex_session_ref_resume 2>&1 | tail -5
 cargo test -p freshell-ws --test restore_spawn_gate 2>&1 | tail -5
-cargo test -p freshell-ws --test terminal_create_ordering_tests 2>&1 | tail -5
+cargo test -p freshell-ws --lib terminal_create_ordering 2>&1 | tail -5
 ```
-Expected: all PASS (record the counts). NOTE: if `terminal_create_ordering_tests` does not exist under that exact name, find it: `ls crates/freshell-ws/tests/ | grep -i ordering` — it asserts source ordering inside `handle_create` (claude binding write precedes PTY spawn); read its mechanism BEFORE moving code and keep it satisfied.
+Expected: all PASS (record the counts). NOTE: the source-ordering pin is NOT an integration test under `crates/freshell-ws/tests/` — it is a lib unit-test module (`crates/freshell-ws/src/terminal_create_ordering_tests.rs`, declared via `#[path]` in `terminal.rs:72-73`), so it must be invoked with `--lib` plus the filter above, which runs `terminal::terminal_create_ordering_tests::claude_binding_write_precedes_pty_spawn_in_handle_create` (verified: 1 passed at worktree HEAD). If the filter ever matches nothing, find it: `grep -rn "terminal_create_ordering" crates/freshell-ws/src/` — it asserts source ordering inside `handle_create` (claude binding write precedes PTY spawn); read its mechanism BEFORE moving code and keep it satisfied.
 
 ORDERING NOTE (V5 §A13): `restore_spawn_gate.rs` still contains its gate-timeout pins at this point — that is CORRECT here (Task 3 changes no gate behavior, so they pass pre-change). Task 4 Step 8 rewrites four such pins to timeout-free mechanisms BEFORE Task 4's own all-green gate; do not "pre-fix" them in this task.
 
