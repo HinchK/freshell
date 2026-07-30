@@ -237,6 +237,7 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
             match decide(&ctx, delays) {
                 AutoResumeDecision::SettleExited { reason } => {
                     if ev.mode != "shell" {
+                        driver.emit_settled(&ev.terminal_id, reason, None);
                         driver.log_settled(&ev.terminal_id, reason);
                     }
                     if reason == "clean_exit" || ev.lifetime_ms >= AUTO_RESUME_HEALTHY_LIFETIME_MS {
@@ -261,10 +262,12 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     if let Some(reason) =
                         driver.pre_respawn_guard(&provider, &session_id, &ev.terminal_id)
                     {
+                        driver.emit_settled(&ev.terminal_id, reason, None);
                         driver.log_settled(&ev.terminal_id, reason);
                         continue;
                     }
                     if !driver.claim_session(&provider, &session_id, &key).await {
+                        driver.emit_settled(&ev.terminal_id, "session_lease_held", None);
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
                         continue;
                     }
@@ -292,12 +295,14 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                 // Binding raced away between claim and completion; the
                                 // driver already killed its own orphan child. No
                                 // terminal.replaced — the pane stays settled exited.
+                                driver.emit_settled(&ev.terminal_id, "lease_completion_lost", None);
                                 driver.log_settled(&ev.terminal_id, "lease_completion_lost");
                             }
                         }
                         Err(err) => {
                             driver.fail_claim(&provider, &session_id, &key);
                             tracing::warn!(terminal_id = %ev.terminal_id, error = %err, "terminal.auto_resume.respawn_failed");
+                            driver.emit_settled(&ev.terminal_id, "respawn_failed", None);
                             driver.log_settled(&ev.terminal_id, "respawn_failed");
                         }
                     }
@@ -373,6 +378,11 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         max_attempts: u32,
     );
     fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32);
+    /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
+    /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
+    /// it: the client clears the recovering notice on a FRAME, never on a
+    /// timer. `resume_cycles` is Some only for flap-circuit-breaker settles.
+    fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>);
     fn log_settled(&self, terminal_id: &str, reason: &str);
 }
 
@@ -649,6 +659,27 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         }
     }
 
+    fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
+        let msg =
+            freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+                status: freshell_protocol::RuntimeStatus::Exited,
+                terminal_id: terminal_id.to_string(),
+                attempt: None,
+                max_attempts: None,
+                exit_code: None,
+                reason: Some(reason.to_string()),
+                resume_cycles: resume_cycles.map(i64::from),
+            });
+        match serde_json::to_string(&msg) {
+            Ok(json) => {
+                let _ = self.state.broadcast_tx.send(json);
+            }
+            Err(err) => {
+                tracing::error!(terminal_id, error = %err, "terminal.auto_resume.settled_frame_serialize_failed");
+            }
+        }
+    }
+
     fn log_settled(&self, terminal_id: &str, reason: &str) {
         tracing::info!(terminal_id, reason, "terminal.auto_resume.settled");
     }
@@ -880,6 +911,9 @@ mod tests {
         completes: Vec<String>,
         fails: Vec<String>,
         settled: Vec<(String, String)>,
+        /// (terminal_id, reason, resume_cycles) — settle FRAMES broadcast
+        /// (znhn item 3), distinct from the `settled` log records.
+        settled_frames: Vec<(String, String, Option<u32>)>,
     }
 
     /// Records every orchestrator effect; each knob is mutable mid-test so
@@ -908,6 +942,7 @@ mod tests {
                     completes: Vec::new(),
                     fails: Vec::new(),
                     settled: Vec::new(),
+                    settled_frames: Vec::new(),
                 })),
             }
         }
@@ -960,6 +995,10 @@ mod tests {
         }
         fn settled_reasons(&self) -> Vec<String> {
             self.lock().settled.iter().map(|(_, r)| r.clone()).collect()
+        }
+        /// (terminal_id, reason, resume_cycles) settle FRAMES (znhn item 3).
+        fn settled_frames(&self) -> Vec<(String, String, Option<u32>)> {
+            self.lock().settled_frames.clone()
         }
     }
 
@@ -1059,6 +1098,13 @@ mod tests {
             self.lock()
                 .replaced
                 .push((old.to_string(), new.to_string(), attempt));
+        }
+        fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
+            self.lock().settled_frames.push((
+                terminal_id.to_string(),
+                reason.to_string(),
+                resume_cycles,
+            ));
         }
         fn log_settled(&self, terminal_id: &str, reason: &str) {
             self.lock()
@@ -1199,6 +1245,11 @@ mod tests {
             fake.settled_reasons(),
             vec!["session_owned_live".to_string()]
         );
+        // znhn #3: even the "silent" guard-abort broadcasts the settle frame.
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "session_owned_live".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1219,6 +1270,10 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
         assert_eq!(fake.settled_reasons(), vec!["pane_closed".to_string()]);
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "pane_closed".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1240,6 +1295,10 @@ mod tests {
             fake.settled_reasons(),
             vec!["session_lease_held".to_string()]
         );
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "session_lease_held".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1260,6 +1319,10 @@ mod tests {
         assert_eq!(fake.fail_calls(), vec!["cr-1".to_string()]);
         assert!(fake.complete_calls().is_empty());
         assert_eq!(fake.settled_reasons(), vec!["respawn_failed".to_string()]);
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "respawn_failed".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1287,6 +1350,10 @@ mod tests {
         assert_eq!(
             fake.settled_reasons(),
             vec!["lease_completion_lost".to_string()]
+        );
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "lease_completion_lost".to_string(), None)]
         );
     }
 
@@ -1319,6 +1386,69 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.recovering_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
+        // znhn #3: agent-mode settles are LOUD (frame emitted), shell is not.
+        assert_eq!(
+            fake.settled_frames(),
+            vec![
+                ("t1".to_string(), "respawn_cap_exhausted".to_string(), None),
+                ("t2".to_string(), "no_resumable_identity".to_string(), None),
+                ("t3".to_string(), "clean_exit".to_string(), None),
+            ],
+            "shell-mode settles must NOT emit a settle frame"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_abort_emits_a_settle_frame() {
+        // pane_closed guard-abort must broadcast the settle frame so the
+        // client clears the recovering notice deterministically (znhn #3).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        fake.set_guard(Some("pane_closed"));
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        let settled = fake.settled_frames();
+        assert_eq!(
+            settled,
+            vec![("t1".to_string(), "pane_closed".to_string(), None)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_exhausted_emits_a_settle_frame() {
+        // Same shape as second_crash_uses_second_delay_then_exhausts: after
+        // the budget drains, the final crash must broadcast a settle frame.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        tx.send(crash("t-new", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 2);
+
+        tx.send(crash("t-new2", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        let settled = fake.settled_frames();
+        assert!(
+            settled
+                .iter()
+                .any(|(t, r, _)| t == "t-new2" && r == "retries_exhausted"),
+            "exhaustion must be a LOUD settle frame: {settled:?}"
+        );
     }
 
     /// Council MEDIUM fix (crusty, 7w4h/xkhx review): a driver panic must not
