@@ -356,6 +356,13 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             }
                         }
                     }
+                    // Fresh-eyes fix: a cancel whose terminal settles without
+                    // ever reaching the Resume arm's take_cancel check would
+                    // otherwise leak in auto_resume_cancels forever — the
+                    // "removed on consumption" invariant must hold on EVERY
+                    // settle tail. Consumed silently: the pane is already
+                    // settled, there is nothing left to abort.
+                    let _ = driver.take_cancel(&ev.terminal_id);
                 }
                 AutoResumeDecision::Resume { attempt, delay_ms } => {
                     let (provider, session_id, cwd) = sref.expect("checked by decide");
@@ -386,11 +393,17 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     {
                         driver.emit_settled(&ev.terminal_id, reason, None);
                         driver.log_settled(&ev.terminal_id, reason);
+                        // Cancel-set hygiene (fresh-eyes fix): a cancel that
+                        // landed after the take_cancel check above must not
+                        // leak — every settle tail cleans it up.
+                        let _ = driver.take_cancel(&ev.terminal_id);
                         continue;
                     }
                     if !driver.claim_session(&provider, &session_id, &key).await {
                         driver.emit_settled(&ev.terminal_id, "session_lease_held", None);
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
+                        // Cancel-set hygiene (see the guard tail above).
+                        let _ = driver.take_cancel(&ev.terminal_id);
                         continue;
                     }
                     let spec = RespawnSpec {
@@ -436,6 +449,13 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             driver.log_settled(&ev.terminal_id, "respawn_failed");
                         }
                     }
+                    // Cancel-set hygiene (fresh-eyes fix): a cancel landing
+                    // DURING the respawn await — after the post-sleep
+                    // take_cancel check — would otherwise leak forever. Too
+                    // late to abort (the resume already ran); clean up on
+                    // every tail of the respawn match (replaced /
+                    // lease_completion_lost / respawn_failed).
+                    let _ = driver.take_cancel(&ev.terminal_id);
                 }
             }
         }
@@ -1096,6 +1116,11 @@ mod tests {
         guard: Option<&'static str>,
         /// Pending user cancels (znhn item 2) — consumed by `take_cancel`.
         cancels: std::collections::HashSet<String>,
+        /// Test knob: when true, `respawn` inserts the spec's OLD terminal id
+        /// into `cancels` — simulates a user cancel landing DURING the
+        /// respawn await, i.e. after the hub's post-sleep take_cancel check
+        /// (the leak window the fresh-eyes review flagged).
+        insert_cancel_on_respawn: bool,
         claim_ok: bool,
         complete_ok: bool,
         panic_next_recovering: bool,
@@ -1128,6 +1153,7 @@ mod tests {
                     session: Some(("claude".into(), "sess-1".into(), None)),
                     guard: None,
                     cancels: std::collections::HashSet::new(),
+                    insert_cancel_on_respawn: false,
                     claim_ok: true,
                     complete_ok: true,
                     panic_next_recovering: false,
@@ -1171,6 +1197,14 @@ mod tests {
         }
         fn set_cancelled(&self, terminal_id: &str) {
             self.lock().cancels.insert(terminal_id.to_string());
+        }
+        fn set_insert_cancel_on_respawn(&self, v: bool) {
+            self.lock().insert_cancel_on_respawn = v;
+        }
+        /// Pending (unconsumed) cancel entries — the leak the fresh-eyes
+        /// review flagged: must drain to zero on every settle/replaced tail.
+        fn pending_cancels(&self) -> usize {
+            self.lock().cancels.len()
         }
 
         /// (old_terminal_id, attempt, max_attempts)
@@ -1257,6 +1291,17 @@ mod tests {
             let result = {
                 let mut s = self.lock();
                 s.respawns.push(req.clone());
+                if s.insert_cancel_on_respawn {
+                    // Simulate a user cancel landing DURING the respawn —
+                    // after the hub's post-sleep take_cancel check. The hub
+                    // must still clean this entry up on the replaced tail.
+                    let old_tid = s
+                        .recovering
+                        .last()
+                        .map(|(tid, _, _)| tid.clone())
+                        .unwrap_or_default();
+                    s.cancels.insert(old_tid);
+                }
                 s.respawn_result.clone()
             };
             std::future::ready(result)
@@ -1811,6 +1856,57 @@ mod tests {
             vec![("t1".to_string(), "auto-resume cancelled".to_string(), None)]
         );
         assert_eq!(fake.settled_reasons(), vec!["user_cancelled".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_for_a_settling_terminal_is_cleaned_up_not_leaked() {
+        // Fresh-eyes fix: a cancel whose terminal settles WITHOUT reaching
+        // the post-sleep take_cancel check (here: decide settles on
+        // cap_exhausted, no Resume arm at all) must still be removed from
+        // the set — "removed on consumption" has to hold on every path.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_cap_exhausted(true);
+        fake.set_cancelled("t1");
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "respawn_cap_exhausted".to_string(), None)]
+        );
+        assert_eq!(
+            fake.pending_cancels(),
+            0,
+            "the stale cancel entry must be cleaned up on the settle tail"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_landing_during_the_respawn_is_cleaned_up_on_the_replaced_tail() {
+        // Fresh-eyes fix: a cancel that lands AFTER the hub's post-sleep
+        // take_cancel check (simulated: inserted during the respawn await)
+        // used to leak in auto_resume_cancels forever. The replaced tail
+        // must remove it. (It is too late to abort — the resume already
+        // happened — so cleanup, not abort, is the correct semantics.)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_insert_cancel_on_respawn(true);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.replaced_calls().len(), 1, "the resume completed");
+        assert_eq!(
+            fake.pending_cancels(),
+            0,
+            "the late cancel entry must be cleaned up on the replaced tail"
+        );
     }
 
     #[tokio::test(start_paused = true)]
