@@ -59,9 +59,9 @@ pub const CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE: &str =
 pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
     "Codex launch sidecar is shutting down; it cannot be adopted.";
 
-/// How long a spawned app-server gets to bring its WS listener up — matches
-/// `freshell-freshagent/src/codex.rs::SIDECAR_START_BUDGET`.
-const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+/// How long a spawned app-server gets to bring its WS listener up — the shared
+/// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
+pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -677,8 +677,9 @@ impl SpawnedCodexAppServerRuntime {
 }
 
 /// Allocate a loopback ephemeral port (`allocateLocalhostPort`-shaped: bind
-/// `127.0.0.1:0`, read the assigned port, release). Never a fixed port.
-fn allocate_loopback_port() -> Result<u16, String> {
+/// `127.0.0.1:0`, read the assigned port, release). Never a fixed port. Shared
+/// sidecar-spawn mechanics (S5.d.1 unification; also `freshell-freshagent`'s spawn).
+pub fn allocate_loopback_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("loopback port allocation failed: {error}"))?;
     let port = listener
@@ -689,7 +690,10 @@ fn allocate_loopback_port() -> Result<u16, String> {
     Ok(port)
 }
 
-fn drain_child_io(child: &mut tokio::process::Child) {
+/// Drain the child's piped stdout/stderr to a sink so verbose app-server logs never
+/// back-pressure it. Shared sidecar-spawn mechanics (S5.d.1 unification; also
+/// `freshell-freshagent`'s spawn).
+pub fn drain_child_io(child: &mut tokio::process::Child) {
     if let Some(mut stdout) = child.stdout.take() {
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
