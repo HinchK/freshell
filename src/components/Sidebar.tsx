@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import NetworkQuickAccess from '@/components/NetworkQuickAccess'
+import { ResumeSessionDialog } from '@/components/ResumeSessionDialog'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
@@ -248,6 +249,12 @@ export default function Sidebar({
   // The custom comparator on SidebarItem ensures only the timestamp text node
   // updates — no DOM flicker despite the frequent ticks.
   const [timestampTick, setTimestampTick] = useState(0)
+  const [resumeDialogOpen, setResumeDialogOpen] = useState(false)
+  // Server-declared capability gate: only the Node server declares
+  // `sessionResolve` (Task 3, server/platform-router.ts). The Rust server
+  // serves the same bundle WITHOUT the flag or the resolve endpoint, so the
+  // footer must not render there.
+  const resumeEnabled = useAppSelector((s) => s.connection?.featureFlags?.sessionResolve === true)
   useEffect(() => {
     const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
     return () => window.clearInterval(id)
@@ -898,6 +905,29 @@ export default function Sidebar({
         </div>
       </div>
 
+      {resumeEnabled && (
+        <div
+          data-testid="sidebar-resume-footer"
+          className="flex-shrink-0 border-t border-border p-2"
+        >
+          <button
+            type="button"
+            data-testid="sidebar-resume-button"
+            aria-label="Resume a session by id"
+            onClick={() => setResumeDialogOpen(true)}
+            className="w-full min-h-11 md:min-h-0 md:h-7 px-2 text-xs bg-muted/50 hover:bg-muted rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+          >
+            Resume session…
+          </button>
+        </div>
+      )}
+      {resumeEnabled && resumeDialogOpen && (
+        <ResumeSessionDialog
+          open
+          onClose={() => setResumeDialogOpen(false)}
+          onNavigate={onNavigate}
+        />
+      )}
     </div>
   )
 }
