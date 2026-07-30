@@ -2555,6 +2555,19 @@ mod tests {
         .await
         .expect("turn complete");
         assert_eq!(complete["provider"], "codex");
+
+        // Assert: no second terminal.turn.complete frame (duplicate echo must not double).
+        let no_second = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "t"
+            }),
+        )
+        .await;
+        assert!(
+            no_second.is_err(),
+            "must emit exactly one turn.complete, not a duplicate"
+        );
     }
 
     /// Write a rollout line and return the (dir-guard, path).
