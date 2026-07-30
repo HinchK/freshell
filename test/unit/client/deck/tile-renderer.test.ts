@@ -176,7 +176,7 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
 }
 
 describe('renderKey', () => {
-  it('no-fill tile: near-black bg, banner, white title, no rings, no dot, no preview text', () => {
+  it('no-fill tile: pure-black bg, banner, white title, no rings, no dot, no preview text', () => {
     const { out, rects, texts, strokes } = renderTab(tabSpec())
     expect(out).toBeInstanceOf(Uint8ClampedArray)
     expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
@@ -186,12 +186,12 @@ describe('renderKey', () => {
     expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
-  it('green fill state paints the light-green background', () => {
+  it('green fill state paints the darker composited green background', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
     expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
   })
 
-  it('barTop state paints light-green background + 3px green border ring', () => {
+  it('barTop state paints the darker composited green background + full-strength 3px green border ring', () => {
     const { rects, strokes } = renderTab(tabSpec({ fill: 'barTop', active: true }))
     expect(rects[1].style).toBe(TILE_FILL_GREEN)
     expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: BAR_TOP_BORDER, lineWidth: 3 })
@@ -435,8 +435,8 @@ describe('letter spacing', () => {
 
 describe('palette derives from the app UI tokens (mapping block in tile-renderer.ts)', () => {
   it('matches the documented app-token values', () => {
-    expect(TILE_BG).toBe('#09090b')          // --background dark: hsl(240 10% 4%)
-    expect(TILE_FILL_GREEN).toBe('#d1fae5')  // bg-emerald-100 (TabItem green-filled tab)
+    expect(TILE_BG).toBe('#000000')          // deck-only pure black (matches EMPTY_BG surround)
+    expect(TILE_FILL_GREEN).toBe('#697d73')  // emerald-100 #d1fae5 @ 50% over black, precomputed
     expect(BAR_TOP_BORDER).toBe('#21c45d')   // --success: hsl(142 71% 45%)
     expect(STATUS_GREEN).toBe('#21c45d')     // text-success (pane running tint)
     expect(STATUS_BLUE).toBe('#3b82f6')      // text-blue-500 (pane busy tint)
@@ -449,6 +449,17 @@ describe('palette derives from the app UI tokens (mapping block in tile-renderer
     expect(CONTROL_DIM).toBe('#a1a1aa')      // text-muted-foreground dark
     expect(APPROVE_COLOR).toBe('#21c45d')    // --success
     expect(STOP_COLOR).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%)
+  })
+
+  it('TILE_FILL_GREEN is emerald-100 composited at 50% opacity over black (round(c/2) per channel)', () => {
+    // #d1fae5 = rgb(209,250,229) -> rgb(105,125,115) = #697d73. Same hue, darker.
+    const composite = ['d1', 'fa', 'e5']
+      .map((h) => Math.round(parseInt(h, 16) / 2).toString(16).padStart(2, '0'))
+      .join('')
+    expect(TILE_FILL_GREEN).toBe(`#${composite}`)
+    // Borders stay full strength: the barTop BORDER is NOT darkened.
+    expect(BAR_TOP_BORDER).toBe('#21c45d')
+    expect(ACTIVE_COLOR).toBe('#ffffff')
   })
 
   it('classic previews palette is PINNED', () => {

@@ -72,10 +72,15 @@ export const TITLE_SIDE_PADDING = 6
 // hues must stay the app's (see docs/plans/2026-07-29-deck-icons-polish.md).
 //
 //   deck constant     <- app source token (where it lives)                 value
-//   TILE_BG           <- --background dark  (src/theme-variables.css)      hsl(240 10% 4%)  = #09090b
-//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab) #d1fae5
-//                        light-theme variant: the dark-theme emerald-900/40
-//                        fill is illegible at key size on the LCD.
+//   TILE_BG           <- deck-only pure black (was --background dark #09090b).
+//                        Matches EMPTY_BG, so unfilled tiles read as plain
+//                        black keys: only banner/icons/rings carry state.     #000000
+//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab)    #d1fae5
+//                        precomposited at 50% opacity over the black tile:
+//                        round(c/2) per channel -> rgb(105,125,115) = #697d73.
+//                        Same hue as the tab bar's green, dark enough for the
+//                        LCD. Both fill states (green + barTop) use it; the
+//                        barTop BORDER stays full-strength BAR_TOP_BORDER.
 //   BAR_TOP_BORDER    <- border-t-success / --success (TabItem bar-on-top) hsl(142 71% 45%) = #21c45d
 //   STATUS_* pane-icon tints (text-success, text-blue-500, ...) live in
 //   pane-tint-colors.ts — shared with frame.ts, which computes the tinted
@@ -92,8 +97,8 @@ export const TITLE_SIDE_PADDING = 6
 //   deliberately not re-derived (that style must not change).
 // ============================================================================
 
-export const TILE_BG = '#09090b'
-export const TILE_FILL_GREEN = '#d1fae5'
+export const TILE_BG = '#000000'
+export const TILE_FILL_GREEN = '#697d73'
 export const BAR_TOP_BORDER = '#21c45d'
 export const ACTIVE_COLOR = '#ffffff'
 export const ICON_GAP = 3
