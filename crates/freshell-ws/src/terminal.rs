@@ -1627,14 +1627,14 @@ pub(crate) async fn handle_create(
     let mut claude_fresh_prealloc = false;
     if mode != "shell" {
         let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
-        let should_preallocate_fresh_claude = mode == "claude"
-            && create.restore != Some(true)
-            && create.session_ref.is_none()
-            && create
-                .resume_session_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none();
+        // Shared with the REST spawn pipeline (kata hbsa) — one predicate,
+        // two doors: freshell_platform::should_preallocate_fresh_claude.
+        let should_preallocate_fresh_claude = freshell_platform::should_preallocate_fresh_claude(
+            &mode,
+            create.restore,
+            create.session_ref.is_some(),
+            create.resume_session_id.as_deref(),
+        );
         // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
         // preallocation's sibling: a FRESH amplifier pane gets a
         // server-minted session id, and (below, in the pre-create block) a

@@ -64,6 +64,7 @@ pub mod firewall;
 pub mod network;
 pub mod port_forward;
 
+pub use cli_launch::should_preallocate_fresh_claude;
 pub use detect::{HostOs, Platform};
 pub use elevated::{
     build_elevated_powershell_args, ConfirmationAction, ConfirmationGate,
