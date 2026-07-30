@@ -146,6 +146,12 @@ pub struct FreshAgentState {
     /// narrows the guard to the registry-row arm.
     pub(crate) session_identity:
         Option<Arc<dyn freshell_terminal::registry::SessionIdentityLookup>>,
+    /// Write-side pane-identity seam (kata hbsa): lets the REST spawn
+    /// pipeline write TerminalIdentityRegistry rows and PaneLedger bindings
+    /// across the freshagent->ws crate boundary. Read-side twin:
+    /// `session_identity`. `None` (tests without identity concerns) = the
+    /// legacy no-write behavior.
+    pub(crate) pane_identity: Option<Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -275,6 +281,7 @@ impl FreshAgentState {
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
             session_identity: None,
+            pane_identity: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -457,6 +464,19 @@ impl FreshAgentState {
         identity: Arc<dyn freshell_terminal::registry::SessionIdentityLookup>,
     ) -> Self {
         self.session_identity = Some(identity);
+        self
+    }
+
+    /// Write-side twin of [`Self::with_session_identity`] (kata hbsa): wire
+    /// in the pane-identity binder so the REST spawn pipeline
+    /// (`spawn_terminal_pane` -> `settle_gated_create`) can write identity
+    /// rows and durable ledger bindings exactly like the WS create path.
+    /// Unwired (`None`), REST creates keep the legacy no-write behavior.
+    pub fn with_pane_identity_binder(
+        mut self,
+        binder: Arc<dyn freshell_terminal::registry::PaneIdentityBinder>,
+    ) -> Self {
+        self.pane_identity = Some(binder);
         self
     }
 

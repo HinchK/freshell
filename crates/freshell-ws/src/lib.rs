@@ -37,6 +37,7 @@ pub mod invariants;
 pub mod opencode_association;
 pub mod opencode_signal;
 pub mod origin;
+pub mod pane_identity_binder;
 pub mod pane_ledger;
 pub mod reconcile;
 pub mod reconcile_freshagent;

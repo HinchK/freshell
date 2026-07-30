@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { MINI_CAPS } from '@/deck/fake-deck-device'
+import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
-  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
-  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
-  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
+  cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
+  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
+  TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
-  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
+  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE, BANNER_HEIGHT, ICON_ROW_SIDE_INSET,
+  TEXT_LETTER_SPACING, TITLE_SIDE_PADDING,
+  ensureRoundRect,
 } from '@/deck/tile-renderer'
 import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM, PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 import { providerIconDataUrl } from '@/deck/provider-icon-svg'
@@ -15,43 +17,82 @@ import { DECK_FONT_STACK } from '@/deck/deck-font'
 import type { KeySpec, RingColor } from '@/deck/frame'
 
 type Rect = { x: number; y: number; w: number; h: number; style: string }
-type Text = { text: string; x: number; y: number; style: string; font: string }
+type Text = { text: string; x: number; y: number; style: string; font: string; letterSpacing: string }
 type Img = { x: number; y: number; w: number; h: number }
 type Circle = { cx: number; cy: number; r: number; style: string }
+type RRect = { x: number; y: number; w: number; h: number; r: number }
+type Stroke = RRect & { style: string; lineWidth: number }
+type Measure = { text: string; letterSpacing: string }
 
 function recordingCtx(width: number, height: number) {
   const rects: Rect[] = []
   const texts: Text[] = []
   const images: Img[] = []
   const circles: Circle[] = []
+  const clips: RRect[] = []
+  const strokes: Stroke[] = []
+  const measures: Measure[] = []
   let pendingArc: { cx: number; cy: number; r: number } | null = null
+  let pendingRound: RRect | null = null
+  let saves = 0
+  let restores = 0
   const ctx = {
     fillStyle: '#000000' as string,
+    strokeStyle: '#000000' as string,
+    lineWidth: 0,
     font: '',
+    letterSpacing: '',
     textBaseline: 'alphabetic' as CanvasTextBaseline,
     fillRect(x: number, y: number, w: number, h: number) {
       rects.push({ x, y, w, h, style: String(this.fillStyle) })
     },
     fillText(text: string, x: number, y: number) {
-      texts.push({ text, x, y, style: String(this.fillStyle), font: this.font })
+      texts.push({ text, x, y, style: String(this.fillStyle), font: this.font, letterSpacing: this.letterSpacing })
     },
     drawImage(_src: CanvasImageSource, x: number, y: number, w: number, h: number) {
       images.push({ x, y, w, h })
     },
     beginPath() {
       pendingArc = null
+      pendingRound = null
     },
     arc(cx: number, cy: number, r: number) {
       pendingArc = { cx, cy, r }
     },
+    roundRect(x: number, y: number, w: number, h: number, r = 0) {
+      pendingRound = { x, y, w, h, r }
+    },
+    clip() {
+      if (pendingRound) clips.push(pendingRound)
+      pendingRound = null
+      pendingArc = null
+    },
+    stroke() {
+      if (pendingRound) strokes.push({ ...pendingRound, style: String(this.strokeStyle), lineWidth: this.lineWidth })
+      pendingRound = null
+      pendingArc = null
+    },
     fill() {
       if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
       pendingArc = null
+      pendingRound = null
     },
-    measureText(t: string) { return { width: t.length * 6 } as TextMetrics },
-    getImageData() { return { data: new Uint8ClampedArray(width * height * 4) } as ImageData },
+    save() {
+      saves++
+    },
+    restore() {
+      restores++
+    },
+    measureText(t: string) {
+      measures.push({ text: t, letterSpacing: this.letterSpacing })
+      const ls = parseFloat(this.letterSpacing) || 0
+      return { width: t.length * (6 + ls) } as TextMetrics
+    },
+    getImageData() {
+      return { data: new Uint8ClampedArray(width * height * 4) } as ImageData
+    },
   } as unknown as Ctx2D
-  return { ctx, rects, texts, images, circles }
+  return { ctx, rects, texts, images, circles, clips, strokes, measures, getSaves: () => saves, getRestores: () => restores }
 }
 
 describe('title fitting', () => {
@@ -68,14 +109,17 @@ describe('title fitting', () => {
 })
 
 describe('drawRing', () => {
-  it('paints width nested 1px frames at the given inset', () => {
-    const { ctx, rects } = recordingCtx(80, 80)
-    drawRing(ctx, 80, 80, '#3b82f6', 2, 1)
-    // each 1px frame = 4 rects (top, bottom, left, right) => 8 rects
-    expect(rects).toHaveLength(8)
-    expect(rects.every((r) => r.style === '#3b82f6')).toBe(true)
-    // first frame at offset 1: top strip spans full width at y=1
-    expect(rects[0]).toMatchObject({ x: 1, y: 1, w: 78, h: 1 })
+  it('drawRing strokes a rounded rect that follows the key frame', () => {
+    const rec = recordingCtx(80, 80)
+    drawRing(rec.ctx, 80, 80, '#ffffff', 3, 0)
+    // margin 3, radius 10 => off = 3 + 0 + 1.5 = 4.5, r = 10 - 1.5 = 8.5
+    expect(rec.strokes[0]).toEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: '#ffffff', lineWidth: 3 })
+    expect(rec.rects).toHaveLength(0)
+
+    const inner = recordingCtx(80, 80)
+    drawRing(inner.ctx, 80, 80, '#ffffff', 2, 3)
+    // off = 3 + 3 + 1 = 7, r = 10 - 3 - 1 = 6
+    expect(inner.strokes[0]).toEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: '#ffffff', lineWidth: 2 })
   })
 })
 
@@ -114,37 +158,37 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
     return captured.ctx
   }
   const out = renderKey(spec, MINI_CAPS, factory, getIcon)
-  const { rects, texts, images, circles } = captured!
-  return { out, rects, texts, images, circles }
+  const { rects, texts, images, circles, clips, strokes, measures, getSaves, getRestores } = captured!
+  return { out, rects, texts, images, circles, clips, strokes, measures, getSaves, getRestores }
 }
 
 describe('renderKey', () => {
   it('no-fill tile: near-black bg, banner, white title, no rings, no dot, no preview text', () => {
-    const { out, rects, texts } = renderTab(tabSpec())
+    const { out, rects, texts, strokes } = renderTab(tabSpec())
     expect(out).toBeInstanceOf(Uint8ClampedArray)
-    expect(rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
+    expect(strokes).toHaveLength(0) // no rings
     expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
   it('green fill state paints the light-green background', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
   })
 
   it('barTop state paints light-green background + 3px green border ring', () => {
-    const { rects } = renderTab(tabSpec({ fill: 'barTop', active: true }))
-    expect(rects[0].style).toBe(TILE_FILL_GREEN)
-    expect(rects.filter((r) => r.style === BAR_TOP_BORDER).length).toBeGreaterThan(0)
+    const { rects, strokes } = renderTab(tabSpec({ fill: 'barTop', active: true }))
+    expect(rects[1].style).toBe(TILE_FILL_GREEN)
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: BAR_TOP_BORDER, lineWidth: 3 })
     // active tab keeps its white ring nested inside the border
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR && r.h <= 1).length).toBeGreaterThan(0)
+    expect(strokes).toContainEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: ACTIVE_COLOR, lineWidth: 2 })
   })
 
   it('active tab without fill gets the plain white ring', () => {
-    const { rects } = renderTab(tabSpec({ active: true }))
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR).length).toBeGreaterThan(0)
+    const { strokes } = renderTab(tabSpec({ active: true }))
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: ACTIVE_COLOR, lineWidth: 3 })
   })
 
   it('ready icon draws via drawImage at the centered layout slot', () => {
@@ -171,44 +215,91 @@ describe('renderKey', () => {
     expect(rects.some((r) => r.style === repoAvatarColor(200))).toBe(false)
     const letter = texts.find((t) => t.text === 'B')
     expect(letter?.style).toBe('#ffffff')
-    // 9/16 of the diameter, weight 600 (slot.size is 30 on the 80x80 Mini -> 17px).
+    // 9/16 of the diameter, weight 600 (slot.size is 45 on the 80x80 Mini -> 25px).
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
-  it('no status dot: a plain icons tile draws only the background and the banner', () => {
+  it('no status dot: a plain icons tile draws only the frame surround, the background and the banner', () => {
     const { rects } = renderTab(tabSpec())
-    // background + banner — nothing else (the dot used to be a third rect)
-    expect(rects).toHaveLength(2)
+    // frame surround + background + banner — nothing else (the dot used to be an extra rect)
+    expect(rects).toHaveLength(3)
+    expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
+    expect(rects[2]).toMatchObject({ x: 0, y: 0, w: 80, h: 20, style: BANNER_FILL })
   })
 
-  it('iconLayout: 1 icon centered large; 3 icons in a centered row below the banner', () => {
+  it('iconLayout: 1 icon centered ~50% larger; 3 icons clamp to fit inside the rounded frame', () => {
     const one = iconLayout(80, 80, 1)
-    expect(one).toHaveLength(1)
-    expect(one[0].size).toBe(30) // round(min(80, 60) * 0.5)
-    expect(one[0].x).toBe(Math.round((80 - 30) / 2))
-    expect(one[0].y).toBe(Math.round(20 + (60 - 30) / 2))
+    expect(one[0].size).toBe(45) // round(min(80, 60) * 0.75)
+    expect(one[0].x).toBe(Math.round((80 - 45) / 2)) // 18
+    expect(one[0].y).toBe(Math.round(20 + (60 - 45) / 2)) // 28
+    expect(one[0].y).toBeGreaterThanOrEqual(BANNER_HEIGHT) // clear of the banner
+
+    const two = iconLayout(80, 80, 2)
+    expect(two).toHaveLength(2)
+    expect(two.every((s) => s.size === 27)).toBe(true) // round(60 * 0.45), fits unclamped
+
     const three = iconLayout(80, 80, 3)
     expect(three).toHaveLength(3)
-    expect(three.every((s) => s.size === 18)).toBe(true) // round(60 * 0.3)
-    expect(three[1].x - three[0].x).toBe(18 + 3)         // size + gap
+    expect(three.every((s) => s.size === 20)).toBe(true) // clamped: floor((80 - 12 - 2*3) / 3)
+    expect(three[1].x - three[0].x).toBe(20 + 3) // size + gap
+    const last = three[2]
+    expect(last.x + last.size).toBeLessThanOrEqual(80 - ICON_ROW_SIDE_INSET) // on-frame guarantee
+
+    const threeSmall = iconLayout(72, 72, 3)
+    expect(threeSmall).toHaveLength(3)
+    expect(threeSmall.every((s) => s.size === 18)).toBe(true) // floor((72 - 12 - 6) / 3)
+    expect(threeSmall[0].x).toBeGreaterThanOrEqual(ICON_ROW_SIDE_INSET)
   })
 
   it('pager key renders PAGE / n/m / NEXT > on the control background', () => {
     let cap: ReturnType<typeof recordingCtx> | null = null
     renderKey({ kind: 'pager', page: 2, pageCount: 3 }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
     const { rects, texts } = cap!
-    expect(rects[0].style).toBe(CONTROL_BG)
+    expect(rects[1].style).toBe(CONTROL_BG)
     expect(texts.map((t) => t.text)).toEqual(expect.arrayContaining(['PAGE', '2/3', 'NEXT >']))
   })
 
   it('disabled action key gets the grey ring; enabled approve gets green', () => {
-    const rectsFor = (enabled: boolean) => {
+    const strokesFor = (enabled: boolean) => {
       let cap: ReturnType<typeof recordingCtx> | null = null
       renderKey({ kind: 'action', action: 'approve', enabled }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
-      return cap!.rects
+      return cap!.strokes
     }
-    expect(rectsFor(false).some((r) => r.style === DISABLED_ACTION_COLOR)).toBe(true)
-    expect(rectsFor(true).some((r) => r.style === APPROVE_COLOR)).toBe(true)
+    expect(strokesFor(false)).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: DISABLED_ACTION_COLOR, lineWidth: 3 })
+    expect(strokesFor(true)).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: APPROVE_COLOR, lineWidth: 3 })
+  })
+})
+
+describe('rounded key frame', () => {
+  it('keyFrameGeometry: margin 3 below 96px (else 4), radius 12% of key size', () => {
+    expect(keyFrameGeometry(72, 72)).toEqual({ margin: 3, radius: 9 })
+    expect(keyFrameGeometry(80, 80)).toEqual({ margin: 3, radius: 10 })
+    expect(keyFrameGeometry(96, 96)).toEqual({ margin: 4, radius: 12 })
+    expect(keyFrameGeometry(120, 120)).toEqual({ margin: 4, radius: 14 })
+  })
+
+  it('every key kind paints a pure-black surround then clips to the rounded frame', () => {
+    // 80x80 Mini caps => frame margin 3, radius 10, inner 74x74.
+    const empty = renderTab({ kind: 'empty' })
+    for (const rec of [
+      empty,
+      renderTab(tabSpec()),
+      renderTab(previewSpec()),
+      renderTab({ kind: 'pager', page: 2, pageCount: 3 }),
+      renderTab({ kind: 'action', action: 'approve', enabled: true }),
+    ]) {
+      expect(rec.rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
+      expect(rec.clips[0]).toEqual({ x: 3, y: 3, w: 74, h: 74, r: 10 })
+      // Verify save/restore balance: each key rendering saves and restores
+      const saves = typeof rec.getSaves === 'function' ? rec.getSaves() : 0
+      const restores = typeof rec.getRestores === 'function' ? rec.getRestores() : 0
+      expect(saves).toBe(restores)
+      expect(saves).toBeGreaterThanOrEqual(1)
+    }
+    // Empty kind: the frame surround plus the empty case's own fill (now
+    // clipped and pixel-identical) - two full-bleed EMPTY_BG rects.
+    expect(empty.rects).toHaveLength(2)
+    expect(empty.rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
   })
 })
 
@@ -220,14 +311,14 @@ describe('renderKey preview style', () => {
   })
 
   it('status ring + active tab draws the status ring plus the white inner ring', () => {
-    const { rects } = renderTab(previewSpec({ ring: 'green', active: true }))
-    expect(rects.some((r) => r.style === RING_COLORS.green)).toBe(true)
-    expect(rects.some((r) => r.style === ACTIVE_COLOR)).toBe(true) // white inner ring
+    const { strokes } = renderTab(previewSpec({ ring: 'green', active: true }))
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: RING_COLORS.green, lineWidth: 3 })
+    expect(strokes).toContainEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: ACTIVE_COLOR, lineWidth: 2 }) // white inner ring
   })
 
   it('amber ring renders for a waiting-for-approval tab', () => {
-    const { rects } = renderTab(previewSpec({ ring: 'amber' }))
-    expect(rects.some((r) => r.style === RING_COLORS.amber)).toBe(true)
+    const { strokes } = renderTab(previewSpec({ ring: 'amber' }))
+    expect(strokes).toContainEqual({ x: 5, y: 5, w: 70, h: 70, r: 8, style: RING_COLORS.amber, lineWidth: 4 })
   })
 
   it('icons style still renders fills (dispatch regression)', () => {
@@ -237,27 +328,27 @@ describe('renderKey preview style', () => {
 })
 
 describe('fonts (Inter)', () => {
-  it('icons tile: banner title and avatar letter render in 600-weight Inter', () => {
+  it('icons tile: banner title renders regular-weight (400) Inter; avatar letter keeps RepoIcon 600', () => {
     const { texts } = renderTab(
       tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     const title = texts.find((t) => t.text === 'build')
-    expect(title?.font).toBe(`600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(title?.font).toBe(`400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
     const letter = texts.find((t) => t.text === 'B')
-    expect(letter?.font).toContain(`px ${DECK_FONT_STACK}`)
-    expect(letter?.font.startsWith('600 ')).toBe(true)
+    const slot = iconLayout(80, 80, 1)[0]
+    expect(letter?.font).toBe(`600 ${Math.round(slot.size * (9 / 16))}px ${DECK_FONT_STACK}`)
   })
 
-  it('pager: dim labels are 400 Inter, the page count is 600 Inter', () => {
+  it('pager: labels and page count render 400 Inter', () => {
     const { texts } = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
     expect(texts.find((t) => t.text === 'PAGE')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
     expect(texts.find((t) => t.text === 'NEXT >')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
-    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
   })
 
-  it('action key labels render in 600 Inter', () => {
+  it('action key labels render in 400 Inter', () => {
     const { texts } = renderTab({ kind: 'action', action: 'approve', enabled: true })
-    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
   })
 
   it('strip text renders in 400 Inter', () => {
@@ -274,6 +365,58 @@ describe('fonts (Inter)', () => {
     const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
     expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
     expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+  })
+})
+
+describe('letter spacing', () => {
+  it('icons banner, pager, action, and strip text carry TEXT_LETTER_SPACING; avatar, badge, and classic preview do not', () => {
+    // Icons tile: letter avatar + enough agent panes that two fold into a +2 badge.
+    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
+    const icons = renderTab(
+      tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }], paneIcons }),
+      () => ({} as CanvasImageSource),
+    )
+    expect(icons.texts.find((t) => t.text === 'build')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+    expect(icons.texts.find((t) => t.text === 'B')?.letterSpacing).toBe('')  // avatar keeps default
+    expect(icons.texts.find((t) => t.text === '+2')?.letterSpacing).toBe('') // badge keeps default
+
+    // Pager: all three texts carry the tracking.
+    const pager = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
+    for (const label of ['PAGE', '2/3', 'NEXT >']) {
+      expect(pager.texts.find((t) => t.text === label)?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+    }
+
+    // Action label carries the tracking.
+    const action = renderTab({ kind: 'action', action: 'approve', enabled: true })
+    expect(action.texts.find((t) => t.text === 'APPROVE')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // Touch-strip text carries the tracking.
+    let strip: ReturnType<typeof recordingCtx> | null = null
+    renderStrip('hello', 800, 100, (w, h) => (strip = recordingCtx(w, h)).ctx)
+    expect(strip!.texts.find((t) => t.text === 'hello')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // Classic preview is PINNED: body lines AND banner keep the default ''.
+    const preview = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls', 'PASS'] }))
+    expect(preview.texts.length).toBeGreaterThan(0)
+    for (const t of preview.texts) expect(t.letterSpacing).toBe('')
+  })
+
+  it('the icons title is measured with spacing applied and fits within w - 2 * TITLE_SIDE_PADDING', () => {
+    // 72px-wide caps: maxWidth = 72 - 2 * 6 = 60. With spacing set the stub
+    // measures chars * 6.4, so a 10-char title (64 > 60) must truncate to
+    // 'ABCDEFGH…' (9 * 6.4 = 57.6 <= 60).
+    expect(72 - 2 * TITLE_SIDE_PADDING).toBe(60)
+    const caps = { ...MINI_CAPS, keyPixelWidth: 72, keyPixelHeight: 72 }
+    const rec = recordingCtx(72, 72)
+    renderKey(tabSpec({ title: 'ABCDEFGHIJ' }), caps, () => rec.ctx)
+    const title = rec.texts.find((t) => t.text.includes('…'))
+    expect(title?.text).toBe('ABCDEFGH…')
+    // Measurement happened WITH the spacing already set:
+    expect(rec.measures.find((m) => m.text === 'ABCDEFGHIJ')?.letterSpacing).toBe(TEXT_LETTER_SPACING)
+
+    // On the 80px key the same 10-char title still fits: 64 <= 80 - 12.
+    const wide = renderTab(tabSpec({ title: 'ABCDEFGHIJ' }))
+    expect(wide.texts.find((t) => t.text === 'ABCDEFGHIJ')).toBeDefined()
   })
 })
 
@@ -344,7 +487,24 @@ describe('agent pane icons (tab-bar presentation)', () => {
     const last = iconLayout(80, 80, 3)[2]
     expect(badge?.x).toBe(Math.round(last.x + (last.size - 12) / 2))
     expect(badge?.y).toBe(last.y + last.size / 2)
-    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80) // fully on-key
+    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80 - ICON_ROW_SIDE_INSET) // fully inside the rounded frame
+  })
+
+  it('+N badge font scales with its slot (Plus-size key exercises the scaling branch)', () => {
+    // 120px key, repo avatar + 4 agent panes => repo + 1 agent + badge = 3 slots.
+    const paneIcons = [
+      { provider: 'claude', tint: 'green' as const, ready: true },
+      { provider: 'codex', tint: 'green' as const, ready: true },
+      { provider: 'gemini', tint: 'green' as const, ready: true },
+      { provider: 'opencode', tint: 'green' as const, ready: true },
+    ]
+    let cap: ReturnType<typeof recordingCtx> | null = null
+    renderKey(tabSpec({ icons: [repoIcon], paneIcons }), PLUS_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx, () => bitmap)
+    const badge = cap!.texts.find((t) => t.text === '+3')
+    const slot = iconLayout(120, 120, 3)[2]
+    expect(badge?.font).toBe(`600 ${Math.max(OVERFLOW_FONT_SIZE, Math.round(slot.size / 2))}px ${DECK_FONT_STACK}`)
+    // The scaling branch is live here: slot 34 => 17px, not the 10px floor.
+    expect(badge?.font).toBe(`600 17px ${DECK_FONT_STACK}`)
   })
 
   it('badge is muted when no hidden pane is busy; MAX_KEY_PANE_ICONS binds when no repo icon competes for slots', () => {
@@ -380,5 +540,31 @@ describe('agent pane icons (tab-bar presentation)', () => {
   it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
     const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
     expect(images).toHaveLength(0)
+  })
+})
+
+describe('ensureRoundRect', () => {
+  it('installs roundRect delegate on stubs lacking it', () => {
+    const recta: unknown[] = []
+    const stub = {
+      rect: function (x: number, y: number, w: number, h: number) {
+        recta.push({ x, y, w, h })
+      },
+    } as unknown as CanvasRenderingContext2D
+    ensureRoundRect(stub)
+    ;(stub.roundRect as any)(10, 20, 30, 40, 5)
+    expect(recta).toEqual([{ x: 10, y: 20, w: 30, h: 40 }])
+  })
+
+  it('leaves existing roundRect function untouched', () => {
+    const calls: unknown[] = []
+    const existing = function (x: number) {
+      calls.push({ x })
+    }
+    const stub = { roundRect: existing } as unknown as CanvasRenderingContext2D
+    ensureRoundRect(stub)
+    expect(stub.roundRect).toBe(existing)
+    ;(stub.roundRect as any)(42)
+    expect(calls).toEqual([{ x: 42 }])
   })
 })

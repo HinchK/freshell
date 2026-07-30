@@ -640,6 +640,69 @@ pub trait SessionIdentityLookup: Send + Sync + std::fmt::Debug {
     fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String>;
 }
 
+/// Write-side pane-identity seam — [`SessionIdentityLookup`]'s twin for the
+/// REST spawn pipeline (kata hbsa). Consumed by `freshell-freshagent`'s REST
+/// create/split/respawn call sites (which cannot depend on `freshell-ws` —
+/// circular); produced by `freshell-ws`'s `LedgerPaneIdentityBinder`
+/// (identity registry + pane ledger), wired in `freshell-server::main`.
+///
+/// Fully synchronous ON PURPOSE: every underlying operation is sync (the
+/// identity registry is a plain `RwLock`, every ledger writer a plain
+/// `fn -> io::Result<()>`), and the one caller that CANNOT be async is the
+/// pane exit hook — [`crate::pty::ExitHook`] is a `FnOnce` invoked on the
+/// plain OS reader thread where no tokio runtime exists. Async REST call
+/// sites hop ledger-touching calls through `tokio::task::spawn_blocking`.
+pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
+    /// PIN 2 durability-before-argv: durable claude binding row written
+    /// BEFORE the spawn makes the preallocated id observable. Callers gate
+    /// this on their fresh-prealloc flag ONLY (eaa25b7d).
+    fn record_prespawn_claude_binding(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+        mode: &str,
+        cwd: Option<&str>,
+        create_request_id: Option<&str>,
+    );
+    /// Compensating delete when the spawn that minted the id fails.
+    /// MUST be gated on the SAME predicate as the record (eaa25b7d).
+    fn delete_prespawn_claude_binding(&self, session_id: &str);
+    /// Post-spawn identity registration, mirroring the WS post-spawn block
+    /// (freshell-ws/src/terminal.rs): identity row + durable binding for any
+    /// non-shell create with a session id; pending marker for the
+    /// locator-resolved providers (codex/opencode/amplifier) without one.
+    fn register_create_identity(
+        &self,
+        terminal_id: &str,
+        mode: &str,
+        resume_session_id: Option<&str>,
+        cwd: Option<&str>,
+        create_request_id: Option<&str>,
+    );
+    /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS pane
+    /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row
+    /// (in-memory flag flip) and delete any pending marker. Deliberately
+    /// does NOT touch the ledger binding: `retire_closed` is the
+    /// explicit-user-close trigger only ("P1.8 trigger (e)", the WS kill
+    /// command path, terminal.rs:3849-3868), never the natural-exit path,
+    /// and the Bound-after-natural-exit ledger row is load-bearing —
+    /// `auto_resume::pre_respawn_guard` reads a still-Bound row as "pane
+    /// still wants this session" (auto_resume.rs:445-450) and the recovery
+    /// inventory keys on `RetiredReason::Closed` meaning deliberate close
+    /// (recovery_inventory.rs:299-301). Both A2 hazards are closed by the
+    /// identity-row retire alone: the session directory joins identity
+    /// rows for liveness (session_directory.rs:716-766, and the rename
+    /// cascade with it, sessions.rs:167-187), and the claude drain's no-op
+    /// arm checks `current.retired` (claude_signal.rs:253-342), so a late
+    /// new-id SessionStart cannot durably rebind a dead pane. Idempotent;
+    /// harmless no-op for terminals with no identity row. Called from the
+    /// pane exit hook for ALL non-shell creates. SYNC ON PURPOSE: the exit
+    /// hook is a plain FnOnce on the PTY reader thread — blocking IO is
+    /// safe there, .await is impossible (mirrors the WS exit hook,
+    /// terminal.rs:1334-1342).
+    fn retire_pane_identity(&self, terminal_id: &str);
+}
+
 impl TerminalRegistry {
     pub fn new() -> Self {
         Self {

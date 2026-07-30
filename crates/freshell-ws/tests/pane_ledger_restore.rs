@@ -237,12 +237,22 @@ async fn claude_restore_still_fails_loud_when_the_ledger_row_was_closed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_restore_is_refused_while_a_rest_shaped_live_claude_owns_the_session() {
-    // A13 SAFETY red test (V6.md): a claude resumed via the freshagent REST
-    // API is invisible to identity.find_by_session (never upserted) AND to
-    // createRequestId lineage (REST mints none) — its ONLY footprint is a
-    // registry row {mode:"claude", resume_session_id:S, status:Running}.
-    // The ledger rung's live-guard must scan registry rows, or it would
-    // green-light a second live claude on S.
+    // A13 SAFETY red test (V6.md): a claude whose ONLY footprint is a
+    // registry row {mode:"claude", resume_session_id:S, status:Running} —
+    // no identity row, no createRequestId lineage. The ledger rung's
+    // live-guard must scan registry rows, or it would green-light a second
+    // live claude on S.
+    //
+    // HISTORY (kata hbsa): this was the REST lane's real shape — REST
+    // creates never upserted identity.find_by_session and minted no
+    // createRequestId. Since Tasks 2+5 the REST lane mints a preallocated
+    // id AND writes identity rows + durable ledger bindings through
+    // `PaneIdentityBinder` (see tests/rest_claude_identity.rs), so a live
+    // REST claude is no longer invisible to the identity arm. The
+    // hand-built footprint below (register_headless, no identity upsert)
+    // now models the DEGRADED case — an identity/ledger write failure, or
+    // a pane from an older server generation — which the registry-row scan
+    // must still catch. Still a valid pin; keep it.
     let dir = unique_ledger_dir("ladder-rest-live");
     use futures_util::SinkExt;
     let (url, registry, server_ledger) =
