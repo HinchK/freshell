@@ -31,6 +31,8 @@ import { providerIconDataUrl } from '@/deck/provider-icon-svg'
 import { PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
+import { getTabDisplayTitle } from '@/lib/tab-title'
+import type { RootState } from '@/store/store'
 
 const reducer = {
   tabs: tabsReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
@@ -69,6 +71,16 @@ type DeckStoreOpts = {
    * have dedicated tests.
    */
   keyLayout?: DeckKeyLayout
+  /**
+   * Override stored tab titles by 1-based tab index (default `tab${i}`), e.g.
+   * { 1: 'Tab 1' } to exercise the raw-placeholder replacement path.
+   */
+  titles?: Record<number, string>
+  /**
+   * Seed the claude terminal leaf's initialCwd by 1-based tab index — the same
+   * seeding the deck-selectors parity fixtures use (claudeLeaf's initialCwd).
+   */
+  initialCwd?: Record<number, string>
 }
 
 // Local extraction of the deck-controller unit-suite fixture builder: tabs
@@ -77,7 +89,7 @@ type DeckStoreOpts = {
 function makeDeckStore(opts: DeckStoreOpts = {}) {
   const tabCount = opts.tabs ?? 2
   const tabs = Array.from({ length: tabCount }, (_, i) => ({
-    id: `t${i + 1}`, createRequestId: `c${i + 1}`, title: `tab${i + 1}`, status: 'running', mode: 'shell', createdAt: i + 1,
+    id: `t${i + 1}`, createRequestId: `c${i + 1}`, title: opts.titles?.[i + 1] ?? `tab${i + 1}`, status: 'running', mode: 'shell', createdAt: i + 1,
   }))
   const layouts: Record<string, unknown> = {}
   const activePane: Record<string, string> = {}
@@ -87,7 +99,7 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
       type: 'leaf', id: `p${i}`,
       content: isAgent
         ? { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: `c${i}`, status: 'running' }
-        : { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: opts.paneStatus?.[`p${i}`] ?? 'running', mode: 'claude' },
+        : { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: opts.paneStatus?.[`p${i}`] ?? 'running', mode: 'claude', ...(opts.initialCwd?.[i] ? { initialCwd: opts.initialCwd[i] } : {}) },
     }
     activePane[`t${i}`] = `p${i}`
   }
@@ -585,5 +597,57 @@ describe('tile styles', () => {
     expect(decodeKey(device, 0)).toMatchObject({
       paneIcons: [{ provider: 'claude', tint: 'green', ready: true }],
     })
+  })
+})
+
+describe('key layout (reversed arrangement + auto default)', () => {
+  it('newest-first on the 6-key profile: pager top-left, newest tab beside it, older tabs on page 2', async () => {
+    const { device } = setupLive({ tabs: 8, keyLayout: 'newest-first' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't8' })
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't7' })
+    device.press(0)
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' })
+    device.press(0) // wraps back
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't8' })
+  })
+
+  it('auto default: the 6-key deck is newest-first, the 8-key Plus stays status-sorted', async () => {
+    const mini = setupLive({ tabs: 3, keyLayout: 'auto' })
+    expect(decodeKey(mini.device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
+    expect(decodeKey(mini.device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' })
+    // stop the mini controller before starting the Plus one (afterEach only
+    // stops the LAST controller) - same idiom as the classic-style test above.
+    mini.controller.stop()
+    const plus = setupLive({ tabs: 3, keyLayout: 'auto' }, PLUS_CAPS)
+    expect(decodeKey(plus.device, 0)).toMatchObject({ kind: 'tab' }) // full mode, no pager
+  })
+
+  it('changing Key layout in settings re-arranges the deck live, without reconnecting', async () => {
+    const { store, device } = setupLive({ tabs: 4, keyLayout: 'status-sorted' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' }) // standard: no pager when tabs fit
+    store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't4' })
+    store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'status-sorted' } }))
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' })
+  })
+
+  it('tiles and the touch strip show the tab bar displayed label (getTabDisplayTitle parity)', async () => {
+    // Stored title is the raw 'Tab 1' placeholder; the single claude leaf
+    // carries initialCwd '/home/dan/code/freshell' (same seeding as the
+    // deck-selectors parity fixtures), on the PLUS profile so the strip renders.
+    const { store, device } = setupLive(
+      { tabs: 1, keyLayout: 'status-sorted', titles: { 1: 'Tab 1' }, initialCwd: { 1: '/home/dan/code/freshell' } },
+      PLUS_CAPS,
+    )
+    // The tab bar's exact call shape (TabBar.tsx getDisplayTitle); this fixture
+    // store has no extensions reducer, hence the RootState cast + ?.
+    const s = store.getState() as unknown as RootState
+    const tab = s.tabs.tabs[0]
+    const expected = getTabDisplayTitle(tab, s.panes.layouts[tab.id], s.panes.paneTitles?.[tab.id], s.extensions?.entries)
+    expect(expected).toBe('freshell') // and NOT 'Tab 1'
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', title: expected })
+    expect(decodeStrip(device)).toContain(expected) // active-tab text on the strip
   })
 })
