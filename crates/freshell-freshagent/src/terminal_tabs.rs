@@ -3424,6 +3424,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_codex_tab_accepts_session_ref_and_derives_resume_args() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let argv_file = unique_argv_file("codex-accept");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
