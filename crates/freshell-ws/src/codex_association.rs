@@ -147,6 +147,35 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             );
             continue;
         }
+        // Fork watch BEFORE the adoption tail (ordering is load-bearing):
+        // `adopt_codex_identity` broadcasts `terminal.session.associated`,
+        // and that frame is the client's cue that the pane is bound -- an
+        // in-TUI /resume fork driven immediately after it must find the
+        // watch already registered with its known-files snapshot already
+        // taken. Registered after the broadcast (the old order), the watch
+        // raced the client's next Enter two ways under load: (1) the Enter's
+        // `note_fork_submit` found no watch, so no fork window ever opened;
+        // (2) the snapshot ran after the fork child's rollout appeared and
+        // swallowed it into `known_files` (permanently excluded). Observed
+        // as the intermittent `codex_fork_rebind.rs::after_rebind_*` phase-2
+        // rebind timeout. `watch_fork` snapshots the sessions tree (bounded
+        // fs walk), so it runs on the blocking pool like the adoption tick
+        // above.
+        {
+            let watch_locator = std::sync::Arc::clone(locator);
+            let terminal_id = hit.terminal_id.clone();
+            let thread_id = hit.thread_id.clone();
+            if let Err(join_error) = tokio::task::spawn_blocking(move || {
+                watch_locator.watch_fork(&terminal_id, &thread_id);
+            })
+            .await
+            {
+                tracing::warn!(
+                    error = %join_error,
+                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
+                );
+            }
+        }
         // The shared adoption tail (codex_identity.rs): binds both identity
         // homes, awaits the durable ledger row, broadcasts the pinned
         // associated/meta pair, and feeds the activity hub (including the
@@ -161,22 +190,14 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             },
         )
         .await;
-        if adopted {
-            // `watch_fork` snapshots the sessions tree (bounded fs walk), so
-            // it runs on the blocking pool like the adoption tick above.
-            let watch_locator = std::sync::Arc::clone(locator);
-            let terminal_id = hit.terminal_id.clone();
-            let thread_id = hit.thread_id.clone();
-            if let Err(join_error) = tokio::task::spawn_blocking(move || {
-                watch_locator.watch_fork(&terminal_id, &thread_id);
-            })
-            .await
-            {
-                tracing::warn!(
-                    error = %join_error,
-                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
-                );
-            }
+        if !adopted {
+            // Adoption refused by the tail's guards: an unbound pane must
+            // carry no fork watch, so drop the eagerly-registered one.
+            // `disarm` clears both locator homes; the armed entry was
+            // already consumed by this tick's resolution, so this removes
+            // exactly the watch -- restoring the refused pane to the same
+            // end state the old (watch-after-adopt) order produced.
+            locator.disarm(&hit.terminal_id);
         }
     }
 
