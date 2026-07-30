@@ -25,7 +25,7 @@ use tokio_tungstenite::{accept_async, connect_async};
 
 use freshell_codex::launch_lifecycle::{
     CodexLaunchError, CodexLaunchPlanner, CodexLaunchRuntime, CodexRuntimeReady,
-    CodexTerminalLaunchManager, SpawnedCodexAppServerRuntime,
+    CodexTerminalLaunchManager, LaunchClass, SpawnedCodexAppServerRuntime,
     CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE, CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE,
 };
 use freshell_codex::launch_plan::{codex_remote_args, CodexLaunchPlanInput};
@@ -362,7 +362,11 @@ async fn manager_adopts_by_terminal_id_and_tears_down_on_exit() {
     }));
 
     let launch = manager
-        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
         .await
         .unwrap();
     let remote_ws_url = launch.remote_ws_url.clone();
@@ -398,7 +402,11 @@ async fn manager_discard_tears_down_an_unadopted_plan() {
         factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
     }));
     let launch = manager
-        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
         .await
         .unwrap();
     manager.discard(launch).await;
@@ -419,12 +427,20 @@ async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans
 
     // One adopted launch + one unadopted plan.
     let adopted = manager
-        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
         .await
         .unwrap();
     manager.adopt("term-live", adopted, 0).await.unwrap();
     let _unadopted = manager
-        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
         .await
         .unwrap();
 
@@ -435,7 +451,11 @@ async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans
 
     // New plans are rejected with the legacy planner-shutdown message.
     let err = manager
-        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
         .await
         .unwrap_err();
     match err {
@@ -514,21 +534,32 @@ async fn third_concurrent_plan_fails_fast_on_the_sidecar_budget() {
             blocking_runtime_factory,
             2,
             std::time::Duration::from_millis(200),
+            64,
         ),
     );
     let input = freshell_codex::launch_plan::CodexLaunchPlanInput::default();
     let m1 = manager.clone();
     let a = tokio::spawn(async move {
-        m1.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
-            .await
+        m1.plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
     });
     let m2 = manager.clone();
     let b = tokio::spawn(async move {
-        m2.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
-            .await
+        m2.plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await; // both hold the budget
-    let third = manager.plan_create_with_retry(&input, 1).await;
+    let third = manager
+        .plan_create_with_retry_uncancellable(&input, 1, LaunchClass::Interactive)
+        .await;
     let err = third.expect_err("third concurrent plan must fail fast on the budget");
     assert!(
         err.to_string().contains("planning budget exhausted"),
@@ -537,6 +568,230 @@ async fn third_concurrent_plan_fails_fast_on_the_sidecar_budget() {
     release.notify_waiters();
     let _ = a.await;
     let _ = b.await;
+}
+
+// ── graceful restore/resume S1 (P2): restore-class plans queue, never die ─────────
+
+/// Graceful restore/resume S1 (P2): a runtime that counts CONCURRENT
+/// `ensure_ready` bodies and sleeps, so "max plan concurrency <= budget"
+/// is observable without wall-clock racing. All trait methods other than
+/// `ensure_ready` are copied from [`FakeRuntime`]'s impl (delegate to an
+/// inner FakeRuntime started on demand, exactly like BlockingRuntime does).
+struct CountingRuntime {
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    plan_delay: std::time::Duration,
+}
+
+impl CodexLaunchRuntime for CountingRuntime {
+    fn ensure_ready(
+        &self,
+        cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.plan_delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let inner = FakeRuntime::start().await;
+            inner.ensure_ready(cwd).await
+        })
+    }
+
+    fn update_ownership_metadata(
+        &self,
+        _terminal_id: String,
+        _generation: u64,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// The mandate's unit pin: 8 restore-class plans on a 2-permit budget with a
+/// wait FAR smaller than the drain time — all 8 succeed (no wall-clock
+/// death), and observed plan concurrency never exceeds 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn eight_restore_class_plans_queue_and_drain_without_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+    let peak = std::sync::Arc::new(AtomicUsize::new(0));
+    let (rt_in, rt_peak) = (in_flight.clone(), peak.clone());
+    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move || {
+        std::sync::Arc::new(CountingRuntime {
+            in_flight: rt_in.clone(),
+            peak: rt_peak.clone(),
+            plan_delay: std::time::Duration::from_millis(200),
+        }) as std::sync::Arc<dyn CodexLaunchRuntime>
+    });
+    // wait = 200ms: 8 plans / 2 permits * 200ms = ~800ms of queueing.
+    // Interactive would die; Restore must drain.
+    let manager = std::sync::Arc::new(
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
+            factory,
+            2,
+            std::time::Duration::from_millis(200),
+            64,
+        ),
+    );
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let m = manager.clone();
+        handles.push(tokio::spawn(async move {
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            m.plan_create_with_retry(
+                &CodexLaunchPlanInput::default(),
+                1,
+                freshell_codex::launch_lifecycle::LaunchClass::Restore,
+                &mut cancel_rx,
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let launch = h
+            .await
+            .expect("join")
+            .expect("restore-class plan must never die on the budget");
+        manager.discard(launch).await;
+    }
+    let seen_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        seen_peak <= 2,
+        "plan concurrency bound violated: {seen_peak}"
+    );
+}
+
+/// Cancel-aware queueing: a restore-class waiter parked on a zero-permit
+/// budget unblocks as Cancelled the moment the watch fires.
+#[tokio::test]
+async fn restore_class_plan_wait_cancels_when_the_watch_fires() {
+    let (factory, _release) = blocking_test_runtime_factory();
+    let manager = std::sync::Arc::new(
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
+            factory,
+            0,
+            std::time::Duration::from_millis(50),
+            64,
+        ),
+    );
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let m = manager.clone();
+    let waiter = tokio::spawn(async move {
+        m.plan_create_with_retry(
+            &CodexLaunchPlanInput::default(),
+            1,
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            &mut cancel_rx,
+        )
+        .await
+    });
+    // Let the waiter park (0 permits => it can only be waiting or done-wrong).
+    for _ in 0..200 {
+        if manager.plan_queue_depth() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(manager.plan_queue_depth(), 1, "waiter must be queued");
+    cancel_tx.send(true).expect("fire cancel");
+    let err = waiter
+        .await
+        .expect("join")
+        .expect_err("cancel must unblock the queued restore-class plan");
+    assert!(
+        matches!(
+            err,
+            freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        manager.plan_queue_depth(),
+        0,
+        "queue slot reclaimed on cancel"
+    );
+}
+
+/// The backpressure backstop: restore-class waiters beyond the queue cap
+/// fail loud as QueueFull (the WS door maps this to RATE_LIMITED).
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_class_queue_overflow_fails_loud_as_queue_full() {
+    let (factory, release) = blocking_test_runtime_factory();
+    // 1 permit, cap 1: holder + one queued waiter fill the system.
+    let manager = std::sync::Arc::new(
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
+            factory,
+            1,
+            std::time::Duration::from_millis(50),
+            1,
+        ),
+    );
+    let m1 = manager.clone();
+    let holder = tokio::spawn(async move {
+        let (_tx, mut c) = tokio::sync::watch::channel(false);
+        m1.plan_create_with_retry(
+            &CodexLaunchPlanInput::default(),
+            1,
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            &mut c,
+        )
+        .await
+    });
+    // Let the holder take the permit (it parks inside ensure_ready).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let m2 = manager.clone();
+    let queued = tokio::spawn(async move {
+        let (_tx, mut c) = tokio::sync::watch::channel(false);
+        m2.plan_create_with_retry(
+            &CodexLaunchPlanInput::default(),
+            1,
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            &mut c,
+        )
+        .await
+    });
+    for _ in 0..200 {
+        if manager.plan_queue_depth() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        manager.plan_queue_depth(),
+        1,
+        "one waiter queued at the cap"
+    );
+    // Third arrival overflows the cap.
+    let (_tx3, mut c3) = tokio::sync::watch::channel(false);
+    let err = manager
+        .plan_create_with_retry(
+            &CodexLaunchPlanInput::default(),
+            1,
+            freshell_codex::launch_lifecycle::LaunchClass::Restore,
+            &mut c3,
+        )
+        .await
+        .expect_err("overflow past the plan queue cap must fail loud");
+    assert!(
+        matches!(
+            err,
+            freshell_codex::launch_lifecycle::CodexLaunchError::QueueFull
+        ),
+        "{err}"
+    );
+    // Drain: release the parked plans (BlockingRuntime parks on a Notify;
+    // the queued waiter parks again after the holder finishes, so notify twice).
+    release.notify_waiters();
+    let launch = holder.await.expect("join").expect("holder plan completes");
+    manager.discard(launch).await;
+    release.notify_waiters();
+    let launch2 = queued.await.expect("join").expect("queued plan completes");
+    manager.discard(launch2).await;
 }
 
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────

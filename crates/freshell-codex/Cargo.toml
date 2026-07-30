@@ -44,6 +44,10 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # Codex thread/ownership id minting (UUID) — the app-server thread id is a UUID and the
 # sidecar ownership tag is `codex-sidecar-<uuid>` (runtime.ts:924).
 uuid = { version = "1", features = ["v4"] }
+# Structured launch diagnostics (restore-class plan queue: codex_plan_queue_full /
+# codex_plan_wait_cancelled) — flows to the global `tracing` subscriber the server
+# installs, matching the freshell-ws/freshell-freshagent convention.
+tracing = "0.1"
 # Real WS client (the `ws` transport, client.ts:1) + its stream combinators, gated behind
 # `real-transport`. The app-server listener is always loopback plain-WS, so no TLS features
 # are pulled — keeps the dependency tree (and Cargo.lock) lean.

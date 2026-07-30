@@ -594,6 +594,11 @@ fn codex_launch_error_response(
     let status = match &error {
         CodexLaunchError::Config(_) => StatusCode::BAD_REQUEST,
         CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // Restore-class-only variants. The REST door is Interactive by
+        // construction, so these are defensively mapped, mirroring
+        // spawn_gate_error_response's QueueFull -> 429.
+        CodexLaunchError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+        CodexLaunchError::Cancelled => StatusCode::INTERNAL_SERVER_ERROR,
     };
     fail_json(status, error.to_string())
 }
@@ -1288,7 +1293,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // (DEV-0006 S5.e precondition): this plan no longer runs under the
         // held spawn permit (acquire moved below the plan, WS-auto-resume
         // mirror), and concurrent plans are bounded by the manager's sidecar
-        // planning budget (CODEX_SIDECAR_PLAN_CONCURRENCY=2, fail-fast).
+        // planning budget (CODEX_SIDECAR_PLAN_CONCURRENCY=2; fail-fast for
+        // LaunchClass::Interactive — this door; restore-class queues per
+        // graceful restore/resume S1).
         // Decision record: docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum.
         //
         // DEV-0006 S4 inc.2 (FLAG-GATED, default OFF — council fence): with
@@ -1311,9 +1318,10 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 approval_policy: permission_mode.as_deref(),
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .plan_create_with_retry(
+                .plan_create_with_retry_uncancellable(
                     &input,
                     freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                    freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 )
                 .await
             {

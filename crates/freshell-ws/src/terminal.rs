@@ -1133,9 +1133,10 @@ async fn plan_codex_managed_launch(
         approval_policy: plan_approval.as_deref(),
     };
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .plan_create_with_retry(
+        .plan_create_with_retry_uncancellable(
             &input,
             freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
         )
         .await
         .map(Some)
