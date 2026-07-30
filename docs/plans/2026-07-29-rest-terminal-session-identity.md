@@ -7,7 +7,7 @@
 
 **Goal:** Claude panes created via the REST agent API (`POST /api/tabs`, `POST /api/panes/:id/split`, `POST /api/panes/:id/respawn`) acquire full session identity at create time — preallocated `--session-id` in argv, pre-spawn pane-ledger binding (PIN 2), `TerminalIdentityRegistry` row, and a real `sessionRef` on every reporting surface — exactly like the WS `terminal.create` fresh-claude path, so REST panes are resumable and visible to the A13 live-owner guard.
 
-**Architecture:** Three moves. (1) Extract the WS fresh-claude preallocation *predicate* into `freshell-platform` (both crates already depend on it) and mint the UUID on the REST path, flipping `LaunchIntent` to `Start` so `claude --session-id <uuid>` lands in argv — this alone populates the registry row, `paneContent.sessionRef`, and `GET /api/terminals` rung 0. (2) Bridge the crate boundary for the two write-side identity homes (`TerminalIdentityRegistry` + `PaneLedger`, both `freshell-ws`-owned and unreachable from `freshell-freshagent`) with a new `PaneIdentityBinder` trait defined in `freshell-terminal` (same seam pattern as the existing read-only `SessionIdentityLookup`), implemented in `freshell-ws`, injected in `freshell-server::main`. (3) Regression tests at the merged REST+WS server level proving resume identity, A13 refusal, and SessionStart signal consumption, plus pinning tests for the codex/opencode REST lanes.
+**Architecture:** Three moves. (1) Extract the WS fresh-claude preallocation *predicate* into `freshell-platform` (both crates already depend on it) and mint the UUID on the REST path, flipping `LaunchIntent` to `Start` so `claude --session-id <uuid>` lands in argv — this alone populates the registry row, `paneContent.sessionRef`, and `GET /api/terminals` rung 0. (2) Bridge the crate boundary for the two write-side identity homes (`TerminalIdentityRegistry` + `PaneLedger`, both `freshell-ws`-owned and unreachable from `freshell-freshagent`) with a new `PaneIdentityBinder` trait defined in `freshell-terminal` (same seam pattern as the existing read-only `SessionIdentityLookup`), implemented in `freshell-ws`, injected in `freshell-server::main` — carrying the create-time writes AND the exit-time retire hygiene the REST exit hook could never reach (load-bearing validation A2: un-retired rows leave dead panes live-looking to the session directory and durably rebindable by late signals). (3) Regression tests at the merged REST+WS server level proving resume identity, A13 refusal, and SessionStart signal consumption, plus pinning tests for the codex/opencode REST lanes.
 
 **Tech Stack:** Rust (toolchain pinned 1.96.0), axum, tokio, `async-trait`, `uuid`; existing test harnesses in `crates/freshell-ws/tests/common/mod.rs` and `crates/freshell-freshagent/src/terminal_tabs.rs mod tests`.
 
@@ -46,11 +46,11 @@ What Requirement 5 therefore reduces to in this plan: (a) zero `server/` changes
 |---|---|---|
 | `crates/freshell-platform/src/cli_launch.rs` | Modify | New shared pure predicate `should_preallocate_fresh_claude(..)` + unit tests (truth table). Single source of the "fresh claude" policy for both doors. |
 | `crates/freshell-ws/src/terminal.rs` | Modify | `handle_create` adopts the shared predicate (behavior-preserving swap of `terminal.rs:1630-1637`). |
-| `crates/freshell-terminal/src/registry.rs` | Modify | New `PaneIdentityBinder` trait next to `SessionIdentityLookup` (`registry.rs:638-641`) — the write-side seam. |
+| `crates/freshell-terminal/src/registry.rs` | Modify | New `PaneIdentityBinder` trait next to `SessionIdentityLookup` (`registry.rs:638-641`) — the write-side + exit-retire seam. |
 | `crates/freshell-terminal/Cargo.toml` | Modify | Add `async-trait` dependency (workspace version). |
 | `crates/freshell-ws/src/pane_identity_binder.rs` | Create | `LedgerPaneIdentityBinder` — the production impl over `TerminalIdentityRegistry` + `Arc<PaneLedger>`, mirroring `terminal.rs:2211-2236`, `:2281-2292`, `:2487-2538`. In-module unit tests with tempdir ledger. |
 | `crates/freshell-ws/src/lib.rs` | Modify | `pub mod pane_identity_binder;` |
-| `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify | UUID mint after `derive_resume_identity` (`:767`); `claude_fresh_prealloc` threading through `GatedSettleInputs`; `LaunchIntent` conditional (`:1335`); binder call sites (pre-spawn, failure-delete, post-spawn); `tab_create_missing_session_identity` condition update (`:1792-1805`); unit tests in `mod tests`. |
+| `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify | UUID mint after `derive_resume_identity` (`:767`); `claude_fresh_prealloc` threading through `GatedSettleInputs`; `LaunchIntent` conditional (`:1335`); binder call sites (pre-spawn, failure-delete, post-spawn, exit-retire); `tab_create_missing_session_identity` condition update (`:1792-1805`); unit tests in `mod tests`. |
 | `crates/freshell-freshagent/src/lib.rs` | Modify | `FreshAgentState.pane_identity: Option<Arc<dyn PaneIdentityBinder>>` + `with_pane_identity_binder(..)` builder (mirror `with_session_identity`, `lib.rs:455-461`). |
 | `crates/freshell-server/src/main.rs` | Modify | Wire `LedgerPaneIdentityBinder` into the freshagent state (next to the `with_session_identity` wiring at `main.rs:286`). |
 | `crates/freshell-ws/tests/rest_claude_identity.rs` | Create | End-to-end merged REST+WS server tests: resume identity survives signal destruction (4a), A13 refusal of WS resume of a REST-live session (4b), SessionStart signal consumed Acted (4c), REST resume-direction ledger/identity writes. |
@@ -270,7 +270,8 @@ Expected: FAIL — `sessionRef` absent from `paneContent` (today's behavior: no 
 In `crates/freshell-freshagent/src/terminal_tabs.rs`, immediately after the `derive_resume_identity` call at `:767`:
 
 ```rust
-    let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+    let (mut resume_session_id, accepted_session_ref, session_ref_locator_present) =
+        derive_resume_identity(body, &mode)?;
 
     // Fresh-claude preallocation (kata hbsa): WS parity. The WS door's
     // fresh-claude special case (freshell-ws/src/terminal.rs, LIVE-PATH LAW
@@ -286,7 +287,7 @@ In `crates/freshell-freshagent/src/terminal_tabs.rs`, immediately after the `der
     let claude_fresh_prealloc = freshell_platform::should_preallocate_fresh_claude(
         &mode,
         body.get("restore").and_then(serde_json::Value::as_bool),
-        body.get("sessionRef").is_some(),
+        session_ref_locator_present,
         resume_session_id.as_deref(),
     );
     if claude_fresh_prealloc {
@@ -296,7 +297,18 @@ In `crates/freshell-freshagent/src/terminal_tabs.rs`, immediately after the `der
 
 (`uuid::Uuid::new_v4()` is already in use in this file at `:831` for the amplifier mint — same import path.)
 
-Note the predicate uses `body.get("sessionRef").is_some()` — the raw-field check, exact WS semantics (`create.session_ref.is_none()`), not `accepted_session_ref.is_some()`: a wire `sessionRef` of ANY provider disables the mint on both doors.
+Note the predicate's `has_session_ref` argument: it MUST be the PARSED locator presence, not the raw `body.get("sessionRef").is_some()`. The load-bearing validation (ledger A1) falsified the raw-field check: WS deserializes `"sessionRef": null` to `None` (serde `Option` semantics, `client_messages.rs:233-234`) and MINTS, while the raw check sees `Some(Value::Null)` and skips the mint — recreating the identity-less pane on a shape BOTH doors accept. Change `derive_resume_identity` (`terminal_tabs.rs:491-510`) to also return the pre-provider-filter parse result (`session_ref_locator_present: bool` = the `:495-498` `serde_json::from_value::<SessionLocator>` parse succeeded) and feed THAT. It matches WS on every mutually-accepted shape (absent / null / well-formed locator of ANY provider — any parsed locator disables the mint, matching `create.session_ref.is_none()`), and it matches `derive_resume_identity`'s own view of malformed locator objects (treated as absent → mint fires; WS would silently drop the whole frame, `ws terminal.rs:495-519` accept-and-strip — an acceptance-domain asymmetry accepted and recorded in the load-bearing ledger, not fixable by any predicate input). Do NOT use `accepted_session_ref.is_some()` (provider-filtered — would mint under a non-claude sessionRef, unlike WS). Add this REST-side regression pin next to the Step 1 test:
+
+```rust
+#[tokio::test]
+async fn create_fresh_claude_tab_with_null_session_ref_still_mints() {
+    // Ledger A1 regression: `"sessionRef": null` is ABSENT on both doors.
+    // Same harness and assertions as
+    // create_fresh_claude_tab_preallocates_session_identity, with
+    // `"sessionRef": serde_json::Value::Null` added to the POST body —
+    // the response must still carry a minted claude sessionRef.
+}
+```
 
 Placement matters: this sits BEFORE the amplifier block (`:794-950`) and BEFORE the D7 guard (`:961-990`). The D7/D8 machinery keys off `accepted_session_ref`, which is `None` here, so a minted id claims no lease and trips no guard — matching the WS doctrine that fresh preallocs never route through D8.
 
@@ -356,7 +368,7 @@ The warn at `:1792-1805` fires when the create *request* carried neither `sessio
     {
 ```
 
-(If `payload` in that function does not embed `paneContent`, gate on the spawn result's sessionRef instead — the `TerminalSpawnResult`/local variable that carried `paneContent` into the payload a few lines earlier in `create_terminal_tab`. The semantic is fixed: *skip the warn when the finished create has a sessionRef*.)
+(If `payload` in that function does not embed `paneContent`, gate on the spawn result's sessionRef instead — the `TerminalSpawnResult`/local variable that carried `paneContent` into the payload a few lines earlier in `create_terminal_tab`. The semantic is fixed: *skip the warn when the finished create has a sessionRef*. Validation note, ledger A11: the payload copy at `:1780-1782` may already carry `paneContent.sessionRef` post-mint, in which case the warn goes quiet without this edit — keep the edit as an explicit guard, but don't be surprised if the warn-site test already passes before it.)
 
 Then fix the tests:
 - If `create_fresh_session_provider_tab_without_identity_warns_invariant` used `mode:"claude"`, switch it to a session-provider mode that still has no create-time identity source (`"gemini"`) — the alarm is still correct for those.
@@ -473,7 +485,7 @@ async fn respawn_pane_claude_ends_with_session_identity() {
 - [ ] **Step 2: Run them**
 
 Run: `cargo test -p freshell-freshagent -- split_pane_claude respawn_pane_claude`
-Expected: PASS (Task 2 fixed the shared pipeline). If respawn FAILS because `respawn_pane` rebuilds a body that carries the old pane's `sessionRef`/`resumeSessionId` and the prior session is refused by a guard, that's a real finding: fix by letting the respawn body flow through `derive_resume_identity` + the Task 2 mint unchanged (a respawn body WITH identity resumes, one WITHOUT mints) and record the behavior in the test's comment.
+Expected: PASS (Task 2 fixed the shared pipeline). Validated (ledger A5): `split_pane` and `respawn_pane` forward the client body untouched (`pane_ops.rs:99-156`, `:696-742` — respawn never kills the old pane, it orphans it), and a minted id leaves `accepted_session_ref = None`, so the D7 guard is skipped and no self-409 is possible. One intentional behavior to leave alone: a client-SUPPLIED live `sessionRef` in a respawn body DOES 409 (`terminal_tabs.rs:963-966`, "No self-exemption for respawn") — that is deliberate D7 policy; do not pin the opposite.
 
 - [ ] **Step 3: Commit**
 
@@ -526,6 +538,18 @@ pub trait PaneIdentityBinder: Send + Sync {
         cwd: Option<&str>,
         create_request_id: Option<&str>,
     );
+    /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS kill path
+    /// (terminal.rs:1334-1342, :3860-3868, :3896) — retire the identity row
+    /// (in-memory flag flip), delete any pending marker, retire closed
+    /// ledger bindings for this terminal. Without it, dead REST panes stay
+    /// live-looking: the session directory lists them as running
+    /// (session_directory.rs:716-766), the reverse rename cascade fires on
+    /// them (sessions.rs:167-187), and a late new-id SessionStart skips the
+    /// `current.retired -> Acted` no-op arm and durably rebinds a dead pane
+    /// (claude_signal.rs:253-342). Idempotent; harmless no-op for terminals
+    /// with no identity row. Called from the pane exit hook for ALL
+    /// non-shell creates.
+    async fn retire_pane_identity(&self, terminal_id: &str);
 }
 ```
 
@@ -613,6 +637,28 @@ mod tests {
         b.register_create_identity("t-x", "claude", Some(SID), None, None).await;
         // identity row still lands even when durability is degraded:
         assert!(identity.get("t-x").is_some());
+    }
+
+    #[tokio::test]
+    async fn retire_pane_identity_retires_row_and_clears_pending() {
+        use freshell_terminal::registry::PaneIdentityBinder as _;
+        // Ledger A2: exit-side hygiene — retired rows must stop looking live.
+        let (b, _ledger, identity, dir) = binder("retire");
+        b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None).await;
+        b.retire_pane_identity("t-rest-4").await;
+        // Retired == invisible to live lookups, exactly what the WS kill path
+        // produces (match the accessor the identity.rs retire tests use —
+        // e.g. the live find_by_session no longer returns the terminal,
+        // while the retired-inclusive lookup still does).
+        assert!(identity.find_by_session("claude", SID).is_none(),
+            "retired row is not a live owner");
+        // And the pending-marker delete arm: register a marker-mode pane,
+        // retire it, assert its pending/<tid>.json is gone (same
+        // marker-read idiom as the markers test above).
+        b.register_create_identity("t-codex-r", "codex", None, Some("/tmp"), None).await;
+        b.retire_pane_identity("t-codex-r").await;
+        // assert pending marker absent for "t-codex-r"
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 ```
@@ -771,6 +817,16 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             // terminal.rs if it is private today.
         }
     }
+
+    async fn retire_pane_identity(&self, terminal_id: &str) {
+        // PORT (not new design): the WS kill-path hygiene — identity retire
+        // (terminal.rs:1334 / :3896), pending-marker delete (:1342 / :3866),
+        // and retire_closed for the terminal's ledger rows (:3860-3868) —
+        // substituting self.identity / self.ledger and warn_write_failure,
+        // ledger I/O wrapped in spawn_blocking like the methods above. The
+        // identity retire is an in-memory flag flip; this method changes NO
+        // drain logic (the #573/#578-pinned drains stay untouched).
+    }
 }
 ```
 
@@ -781,7 +837,7 @@ The two `...port from terminal.rs...` spots are literal ports: open `crates/fres
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p freshell-ws pane_identity_binder`
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Full-crate checks for the touched crates**
 
@@ -803,13 +859,13 @@ git commit -m "feat(ws,terminal): PaneIdentityBinder seam — write-side identit
 
 **Files:**
 - Modify: `crates/freshell-freshagent/src/lib.rs` (state field + builder)
-- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (`GatedSettleInputs`, three call sites in `settle_gated_create`, `mod tests`)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (`GatedSettleInputs`, four call sites in `settle_gated_create` — pre-spawn, failure-delete, post-spawn, exit-retire — `mod tests`)
 - Modify: `crates/freshell-freshagent/Cargo.toml` (add `async-trait` if not already a direct dep)
 - Modify: `crates/freshell-server/src/main.rs` (wiring)
 
 **Interfaces:**
 - Consumes: `freshell_terminal::registry::PaneIdentityBinder` (Task 4), `GatedSettleInputs.claude_fresh_prealloc` (Task 2), `freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder` (Task 4, wiring only — freshagent code references only the trait).
-- Produces: `FreshAgentState::with_pane_identity_binder(self, binder: Arc<dyn freshell_terminal::registry::PaneIdentityBinder>) -> Self`; call ordering inside `settle_gated_create`: `record_prespawn_claude_binding` (fresh preallocs only) → spawn → on failure `delete_prespawn_claude_binding` (same gate) / on success `register_create_identity` (all creates). Task 6's e2e tests and the production wiring rely on this ordering.
+- Produces: `FreshAgentState::with_pane_identity_binder(self, binder: Arc<dyn freshell_terminal::registry::PaneIdentityBinder>) -> Self`; call ordering inside `settle_gated_create`: `record_prespawn_claude_binding` (fresh preallocs only) → spawn → on failure `delete_prespawn_claude_binding` (same gate) / on success `register_create_identity` (all creates); and exit-side `retire_pane_identity` from the pane exit hook (all non-shell creates, ledger A2). Task 6's e2e tests and the production wiring rely on this ordering.
 
 - [ ] **Step 1: Write the failing unit tests with a recording fake binder**
 
@@ -845,6 +901,9 @@ impl freshell_terminal::registry::PaneIdentityBinder for RecordingBinder {
         self.events.lock().unwrap().push(format!(
             "register:{terminal_id}:{mode}:{}", resume_session_id.unwrap_or("-")
         ));
+    }
+    async fn retire_pane_identity(&self, terminal_id: &str) {
+        self.events.lock().unwrap().push(format!("retire:{terminal_id}"));
     }
 }
 
@@ -925,11 +984,34 @@ async fn failed_fresh_claude_spawn_deletes_its_prespawn_binding() {
         "failure-delete for the minted id: {events:?}");
     assert!(!events.iter().any(|e| e.starts_with("register:")), "{events:?}");
 }
+
+#[tokio::test]
+async fn rest_pane_exit_retires_identity_via_binder() {
+    // Ledger A2: dead REST panes must not keep live-looking identity rows.
+    let binder = std::sync::Arc::new(RecordingBinder::default());
+    let (state, registry, _capture) = state_with_claude_capture_spec();
+    let state = state.with_pane_identity_binder(binder.clone());
+
+    let (status, body) = post(app(state), "/api/tabs",
+        serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}), true).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let tid = body["data"]["paneContent"]["terminalId"].as_str().unwrap().to_string();
+
+    registry.kill(&tid);
+    // The exit hook runs asynchronously — poll with a bounded deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if binder.events().contains(&format!("retire:{tid}")) { break; }
+        assert!(std::time::Instant::now() < deadline,
+            "exit hook never retired the pane: {:?}", binder.events());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p freshell-freshagent -- drives_binder registers_identity_without_prespawn deletes_its_prespawn`
+Run: `cargo test -p freshell-freshagent -- drives_binder registers_identity_without_prespawn deletes_its_prespawn exit_retires_identity`
 Expected: FAIL to compile — `with_pane_identity_binder` doesn't exist.
 
 - [ ] **Step 3: Implement state field + builder**
@@ -957,7 +1039,7 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
     }
 ```
 
-- [ ] **Step 4: Implement the three call sites in `settle_gated_create`**
+- [ ] **Step 4: Implement the four call sites in `settle_gated_create`**
 
 1. Add `pane_identity: Option<Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>` to `GatedSettleInputs` (`:1130`), populate from `state.pane_identity.clone()` at the `tokio::spawn` site (`:1096`), destructure at `:1168`.
 
@@ -990,7 +1072,7 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
 
 (Use the locally destructured variable names — `terminal_id`/`cwd`/`create_request_id` exist under whatever names `GatedSettleInputs` destructures them to at `:1168`; keep the argument *meanings* fixed.)
 
-3. **Spawn-failure arm** (inside the error branch of the `create_result` match after `:1481-1493`, before the error is returned):
+3. **Spawn-failure arm** — inside the error branch of the `create_result` match, **at the TOP of the branch, before the AlreadyExists 409 early-return at `:1525` and before the "ORDER IS LOAD-BEARING" cleanup cluster (`:1534+`)**. The load-bearing validation (ledger A3) proved this error branch is the only exit between the pre-spawn write and spawn success — but it contains TWO returns, so the delete MUST precede the first:
 
 ```rust
             // PIN 2 compensating delete — SAME gate as the write (eaa25b7d).
@@ -1026,14 +1108,16 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
         }
 ```
 
+5. **Exit hook** — the pane exit hook built in `settle_gated_create` (~`:1396-1463`; its KNOWN GAP comment at `:1401-1409` documents that it cannot call `identity.retire` across the crate boundary — the binder is exactly that bridge). Capture `pane_identity` and the terminal id into the hook and call `binder.retire_pane_identity(&terminal_id).await` when the pane exits, for ALL non-shell creates (idempotent; no-op for panes without identity rows). Rewrite the stale KNOWN GAP comment to describe the binder seam. Validated stakes (ledger A2): without this, the session directory lists dead REST panes as running (`session_directory.rs:716-766`), the rename cascade persists `titleOverride` for dead terminals (`sessions.rs:167-187`), and a late new-id SessionStart durably rebinds a dead pane (`claude_signal.rs:253-342`).
+
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p freshell-freshagent -- drives_binder registers_identity_without_prespawn deletes_its_prespawn`
+Run: `cargo test -p freshell-freshagent -- drives_binder registers_identity_without_prespawn deletes_its_prespawn exit_retires_identity`
 Expected: PASS. Then `cargo test -p freshell-freshagent` — full crate PASS.
 
 - [ ] **Step 6: Wire production in `freshell-server::main`**
 
-In `crates/freshell-server/src/main.rs`, find where the freshagent state is built with `.with_session_identity(..)` (`main.rs:286`) and where the WS `TerminalIdentityRegistry` and `Arc<PaneLedger>` locals are constructed (they're the same values passed into `WsState`). Chain:
+In `crates/freshell-server/src/main.rs`: the freshagent builder chain runs at `main.rs:255-286` (`.with_session_identity(..)` at `:286`, `terminal_identity` already in scope at `:283`), but `pane_ledger` is constructed LATER, at `:527` (validated, ledger A8). Prefer HOISTING the `PaneLedger` construction above the `FreshAgentState` build — it depends only on `home` (resolved ~`:144`), so the hoist is mechanical — and keep the builder-chain wiring. (Alternative: the `set_identity_sink` post-construction-setter precedent at `:531-542`; if taken, the setter must run before the state's consumers at `:956`/`:1017`, and note `FreshOpencodeState::new(fresh_agent_state.clone())` at `:260` will not see a plain field set after it — acceptable for the REST-only scope, but the hoist avoids the question entirely.) Chain:
 
 ```rust
         .with_pane_identity_binder(std::sync::Arc::new(
@@ -1224,6 +1308,38 @@ async fn rest_pane_session_start_signal_is_consumed_not_retained() {
     assert_eq!(h.ws_state.identity.get(&tid).unwrap().session_id.as_deref(), Some(sid.as_str()));
 
     h.registry.kill(&tid);
+}
+
+/// Ledger A2 regression: REST pane EXIT retires identity. Without retire, a
+/// dead REST pane stays live-looking (session directory `is_running: true`,
+/// session_directory.rs:716-766) and a late SessionStart with a NEW id skips
+/// the `current.retired -> Acted` arm and durably rebinds the dead pane
+/// (claude_signal.rs:253-342).
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_rest_pane_is_retired_and_late_signal_does_not_rebind_it() {
+    let h = spawn_merged_server().await;
+    let (tid, _sid) = rest_create_claude(&h).await;
+
+    h.registry.kill(&tid);
+    // The exit hook drives binder.retire_pane_identity asynchronously: poll
+    // (bounded, <=5s) until the identity row for `tid` reports retired (use
+    // the same retired-row probe the WS kill-path tests use).
+
+    // Late signal carrying a NEW session id for the dead pane:
+    let watcher = freshell_ws::claude_signal::ClaudeSignalWatcher::new(h.signal_root.clone());
+    const NEW_SID: &str = "29a53649-9999-4888-8777-666655554444";
+    std::fs::write(
+        h.signal_root.join(format!("{tid}__2.json")),
+        format!(r#"{{"session_id":"{NEW_SID}","source":"startup","hook_event_name":"SessionStart"}}"#),
+    ).expect("write signal file");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&h.ws_state, &watcher).await;
+
+    // Retired no-op arm: signal consumed; NO rebind of the dead pane, NO
+    // durable ledger row naming the dead terminal.
+    assert_eq!(std::fs::read_dir(&h.signal_root).unwrap().count(), 0,
+        "signal consumed via the retired arm, not retained");
+    assert!(h.ledger.load_binding("claude", NEW_SID).is_none(),
+        "no durable binding to a dead terminal id");
 }
 
 /// Resume direction (Required Outcome 2): a REST claude create WITH a
@@ -1421,8 +1537,9 @@ Expected: branch pushed. STOP — do not open a PR, do not close kata hbsa (the 
 | P1 sessionRef exposed (REST response, `GET /api/terminals` rung 0, `paneContent`) | Task 2 (response + registry row = rung 0 input; `terminals.rs` needs no change) |
 | P1 SessionStart signal consumed as confirmation | Task 6 4c |
 | 2 split + respawn entry points | Task 3 (shared `spawn_terminal_pane`, pinned) |
-| 2 other entry points audit | Exploration verdict encoded in File Structure: all four REST entry points funnel through `spawn_terminal_pane` (`terminal_tabs.rs:704`); the deferred-restore variant (`:203`) has zero Rust callers today and inherits the fix through `create_terminal_tab` when wired |
+| 2 other entry points audit | Settled by load-bearing validation (ledger A12): exactly THREE live REST spawn routes (tabs, split, respawn), all funnel through `spawn_terminal_pane` (`terminal_tabs.rs:704`); `POST /api/tabs-sync/restore` was deliberately deleted (docs/plans/2026-07-26-recover-my-panes.md Task 9, kata h9vt) — the `:193-195` comment is stale; the deferred-restore variant (`:203`) has zero callers and inherits the fix if revived; the WS auto-resume respawn door (`terminal.rs:2945`) is identity-preserving by reuse and out of scope |
 | 2 REST resume direction identity-row/ledger gap | Task 5 (register on resume) + Task 6 resume test + Task 6 Step 3 (`pane_ledger_restore.rs` reconciliation) |
+| Ledger A2 (validation finding): dead REST panes must not look live | Tasks 4–5 (`retire_pane_identity` + exit hook) + Task 5 exit-retire unit pin + Task 6 dead-pane retire e2e pin |
 | 3 codex/opencode verification + pinning tests | Task 7 (identity row + ledger + pending marker, end to end) |
 | 4a resume identity survives signal destruction | Task 6 `rest_created_claude_pane_has_durable_resume_identity_without_signals` |
 | 4b A13 refusal of WS resume of REST-live session | Task 6 `ws_resume_of_session_live_in_rest_pane_is_refused_a13` |
