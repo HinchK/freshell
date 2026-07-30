@@ -9,6 +9,9 @@
 //     once   — invocation #1 prints output then exits 1; later invocations stay alive
 //     always — every invocation prints then exits 1 immediately
 //     clean  — prints then exits 0 (the default when neither env is set)
+//   FAKE_CRASH_LIVE_MS=N — with FAKE_CRASH_MODE=always: stay alive N ms, then
+//     exit 1 (a "healthy flap": long enough to reset the retry budget when the
+//     server's healthy-lifetime knob is shrunk below N).
 // Every invocation appends {pid,t,argv} to FAKE_CLAUDE_ARGV_LOG (JSONL) and
 // bumps the invocation counter in FAKE_CRASH_STATE_FILE.
 import fs from 'node:fs'
@@ -39,7 +42,15 @@ if (crashUntil > 0) {
   const mode = process.env.FAKE_CRASH_MODE || 'clean'
   if (mode === 'always' || (mode === 'once' && invocation === 1)) {
     process.stdout.write('fake-claude: simulated crash\r\n')
-    process.exit(1)
+    const liveMs = Number(process.env.FAKE_CRASH_LIVE_MS || '0')
+    if (liveMs > 0) {
+      // Flap mode (kata znhn item 2 e2e): stay alive liveMs, THEN exit 1 —
+      // keep the event loop alive exactly like the SURVIVE path does.
+      setTimeout(() => process.exit(1), liveMs)
+      process.stdin.resume()
+    } else {
+      process.exit(1)
+    }
   }
   if (mode === 'clean') {
     process.stdout.write('fake-claude: clean exit\r\n')
