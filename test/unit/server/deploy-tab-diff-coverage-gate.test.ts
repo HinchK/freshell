@@ -144,3 +144,164 @@ describe('deploy-tab-diff verify coverage guard (pinned: decision + output must 
     }
   })
 })
+
+// --- capture-side fixtures: a URL-routed fake curl serving canned responses.
+// Route on the URL (curl's last argv), not call order: capture fetches the
+// index twice (coherence re-check) and identical content keeps it coherent.
+async function makeRoutedCurl(
+  tmp: string,
+  fixtures: { index: unknown; device: unknown; terminals: unknown },
+) {
+  const binDir = path.join(tmp, 'bin')
+  await fs.mkdir(binDir, { recursive: true })
+  const indexFile = path.join(tmp, 'fixture-index.json')
+  const deviceFile = path.join(tmp, 'fixture-device.json')
+  const terminalsFile = path.join(tmp, 'fixture-terminals.json')
+  await fs.writeFile(indexFile, JSON.stringify(fixtures.index))
+  await fs.writeFile(deviceFile, JSON.stringify(fixtures.device))
+  await fs.writeFile(terminalsFile, JSON.stringify(fixtures.terminals))
+  await fs.writeFile(
+    path.join(binDir, 'curl'),
+    '#!/usr/bin/env bash\n' +
+    'set -euo pipefail\n' +
+    'url="${!#}"\n' +
+    'case "$url" in\n' +
+    '  */api/tabs-sync/snapshots/dev-1) cat "$FAKE_DEVICE" ;;\n' +
+    '  */api/tabs-sync/snapshots) cat "$FAKE_INDEX" ;;\n' +
+    '  */api/terminals) cat "$FAKE_TERMINALS" ;;\n' +
+    '  *) echo "unexpected URL: $url" >&2; exit 91 ;;\n' +
+    'esac\n',
+    { mode: 0o755 },
+  )
+  return {
+    binDir,
+    env: { FAKE_INDEX: indexFile, FAKE_DEVICE: deviceFile, FAKE_TERMINALS: terminalsFile },
+  }
+}
+
+const INDEX = {
+  devices: [
+    {
+      deviceId: 'dev-1',
+      capturedAt: 20,
+      generations: [
+        { generation: 1, generationId: 'g-1', clientInstanceId: 'c-1', capturedAt: 10, snapshotRevision: 1 },
+      ],
+    },
+  ],
+}
+
+const DEVICE = (records: unknown[]) => ({
+  deviceId: 'dev-1',
+  deviceLabel: 'Device',
+  snapshotRevision: 1,
+  capturedAt: 20,
+  records,
+})
+
+describe('deploy-tab-diff capture coverage gate', () => {
+  it('halts with exit 4 on uncovered running terminals, still writes the artifact, and lists them enriched with mode/cwd/title/session', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const terminals = [
+        term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' }),
+        // sessionRef present -> the report must classify it session=claude
+        // (session identity survives a restart via manual recovery even though
+        // the pane/PTY is lost). /api/terminals emits sessionRef as an OBJECT
+        // {provider, sessionId}, omitted entirely for plain shells.
+        term('term-orphan', 'running', {
+          mode: 'claude',
+          title: 'Orphan work',
+          cwd: '/home/dan/proj',
+          sessionRef: { provider: 'claude', sessionId: 's-orphan' },
+        }),
+      ]
+      const { binDir, env } = await makeRoutedCurl(tmp, {
+        index: INDEX,
+        device: DEVICE([openRecord('t1', [pane('p1', 'term-covered')])]),
+        terminals,
+      })
+      const out = path.join(tmp, 'before.json')
+      const r = await runScript(
+        ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out],
+        { ...env, PATH: `${binDir}:${process.env.PATH}` },
+      )
+      // DISTINCT exit code: 4 = "capture succeeded but restore would lose
+      // terminals" (1 = capture unusable, 2 = usage, 3 = internal-only).
+      expect(r.code).toBe(4)
+      expect(r.out).toContain(
+        'FAIL: 1 running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):',
+      )
+      // Enriched list: id + mode/cwd/title/session pulled from the artifact's
+      // own .terminals[] (session=<provider> because sessionRef is present).
+      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work, session=claude)')
+      expect(r.out).not.toMatch(/- term-covered/)
+      // The artifact WAS written (needed for diagnosis) and messaging says so.
+      expect(r.out).toMatch(/WAS written to/)
+      expect(r.out).toContain('captured 1 device snapshot(s), 2 running terminal(s)')
+      const artifact = JSON.parse(await fs.readFile(out, 'utf8'))
+      expect(artifact.terminals).toHaveLength(2)
+      expect(Object.keys(artifact.devices)).toEqual(['dev-1'])
+      // The override is advertised on the failure path.
+      expect(r.out).toContain('--allow-uncovered')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('exits 0 with the normal summary when every running terminal is covered', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const { binDir, env } = await makeRoutedCurl(tmp, {
+        index: INDEX,
+        device: DEVICE([openRecord('t1', [pane('p1', 'term-covered')])]),
+        terminals: [term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' })],
+      })
+      const out = path.join(tmp, 'before.json')
+      const r = await runScript(
+        ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out],
+        { ...env, PATH: `${binDir}:${process.env.PATH}` },
+      )
+      expect(r.code).toBe(0)
+      expect(r.out).toContain('captured 1 device snapshot(s), 1 running terminal(s)')
+      expect(r.out).not.toContain('FAIL')
+      expect(r.out).not.toContain('WARNING')
+      const artifact = JSON.parse(await fs.readFile(out, 'utf8'))
+      expect(artifact.terminals).toHaveLength(1)
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('--allow-uncovered downgrades the gap to a WARNING and exits 0', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const terminals = [
+        term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' }),
+        // Deliberately NO sessionRef here: this test exercises the other
+        // classifier branch (session=none = unrecoverable outright).
+        term('term-orphan', 'running', { mode: 'claude', title: 'Orphan work', cwd: '/home/dan/proj' }),
+      ]
+      const { binDir, env } = await makeRoutedCurl(tmp, {
+        index: INDEX,
+        device: DEVICE([openRecord('t1', [pane('p1', 'term-covered')])]),
+        terminals,
+      })
+      const out = path.join(tmp, 'before.json')
+      const r = await runScript(
+        ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out, '--allow-uncovered'],
+        { ...env, PATH: `${binDir}:${process.env.PATH}` },
+      )
+      expect(r.code).toBe(0)
+      expect(r.out).toContain(
+        'WARNING: 1 running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):',
+      )
+      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work, session=none)')
+      expect(r.out).not.toContain('FAIL')
+      const artifact = JSON.parse(await fs.readFile(out, 'utf8'))
+      expect(artifact.terminals).toHaveLength(2)
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+})
