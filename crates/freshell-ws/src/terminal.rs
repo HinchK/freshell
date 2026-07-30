@@ -3857,23 +3857,44 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
         tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.cancel_unknown_id_ignored");
         return;
     }
-    state
-        .auto_resume_cancels
-        .lock()
-        .expect("auto_resume_cancels lock")
-        .insert(cancel.terminal_id.clone());
-    let msg = freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
-        status: freshell_protocol::RuntimeStatus::Exited,
-        terminal_id: cancel.terminal_id.clone(),
-        attempt: None,
-        max_attempts: None,
-        exit_code: None,
-        reason: Some("auto-resume cancelled".to_string()),
-        resume_cycles: None,
-    });
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = state.broadcast_tx.send(json);
+    // Self-healing sweep: kill paths that bypass `kill_and_broadcast` (idle
+    // reaper's `kill_internal`, raw `registry.kill` callers) remove the
+    // registry row without touching this set; `kill_and_broadcast` is the
+    // eager primary removal, this sweep is opportunistic hygiene for the
+    // bypass paths. Exited-but-unkilled rows are RETAINED by the registry,
+    // so pending cancels for crashed terminals survive; only row-less
+    // (killed/reaped) ids are dropped. Probe the registry with NO cancels
+    // lock held — nesting `registry.exists` inside the cancels guard would
+    // mint a cancels→registry lock order that exists nowhere else in the
+    // crate. Safe outside the lock: terminal ids are never reused, so
+    // `exists == false` is final. Bounded work: the set holds at most one
+    // entry per un-consumed Stop click.
+    let snapshot: Vec<String> = {
+        let cancels = state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock");
+        cancels.iter().cloned().collect()
+    };
+    let stale = snapshot
+        .into_iter()
+        .filter(|id| !state.registry.exists(id));
+    {
+        let mut cancels = state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock");
+        for id in stale {
+            cancels.remove(&id);
+        }
+        cancels.insert(cancel.terminal_id.clone());
     }
+    crate::auto_resume::broadcast_settled_frame(
+        state,
+        &cancel.terminal_id,
+        crate::auto_resume::SETTLE_REASON_CANCELLED,
+        None,
+    );
     tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.user_cancelled");
 }
 
@@ -3927,6 +3948,16 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
         // path too (the natural-exit `on_exit` hook handles the other path); a
         // kill that never established an identity is a harmless no-op `retire()`.
         state.identity.retire(terminal_id);
+        // Cancel-set hygiene: a kill removes the registry row, so NO
+        // CrashEvent (and therefore no hub settle tail) will ever consume a
+        // pending auto-resume cancel for this id — drop it here or a Stop
+        // click followed by a pane close leaks the entry for the process
+        // lifetime.
+        state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock")
+            .remove(terminal_id);
         broadcast_terminals_changed(state);
         return true;
     }

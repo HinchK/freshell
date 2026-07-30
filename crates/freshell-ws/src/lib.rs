@@ -48,6 +48,21 @@ pub mod terminal;
 pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;
 
+/// Sanitizing env-var parse shared by this crate's config knobs
+/// (`auto_resume`, `backpressure`, `create_limit`): unset, unparseable,
+/// zero, or negative -> `default`. Deliberately saner than legacy
+/// `Number(env || default)` — see `create_limit`'s module doc.
+/// Assumes `T::default()` is the invalid floor (true for the unsigned /
+/// positive-duration knobs here); don't instantiate with a type where the
+/// default is a meaningful value.
+pub(crate) fn env_parse<T: std::str::FromStr + PartialOrd + Default>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<T>().ok())
+        .filter(|v| *v > T::default())
+        .unwrap_or(default)
+}
+
 use std::sync::Arc;
 
 use axum::{
@@ -109,7 +124,10 @@ pub struct WsState {
     /// ONLY after registry validation (unknown ids never enter — D-4),
     /// consumed by the hub's post-sleep guard, which re-emits the settle
     /// frame so a consumed cancel is always loud. Bounded: one
-    /// registry-known entry per cancel click, removed on consumption.
+    /// registry-known entry per cancel click, removed on consumption (every
+    /// hub settle/replaced tail) and on the kill path (`kill_and_broadcast`
+    /// — a killed terminal never produces the CrashEvent that would consume
+    /// it).
     pub auto_resume_cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The freshcodex WS fresh-agent slice: the post-handshake loop dispatches
     /// `freshAgent.create` / `freshAgent.send` (codex) here, which spawns the codex

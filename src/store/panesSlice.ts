@@ -25,7 +25,7 @@ import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
+import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
@@ -53,24 +53,9 @@ function buildPreservedSessionRef(
   return sanitizeSessionRef(localContent.sessionRef)
 }
 
-function readRestoreError(value: unknown): RestoreError | undefined {
-  const parsed = RestoreErrorSchema.safeParse(value)
-  return parsed.success ? parsed.data : undefined
-}
-
 /**
  * Normalize pane content to the full persisted/runtime shape.
  */
-/** Shape guard for the persisted crash trace (znhn item 1). */
-function isCrashTrace(value: unknown): value is CrashTrace {
-  return (
-    typeof value === 'object'
-    && value !== null
-    && typeof (value as { exitCode?: unknown }).exitCode === 'number'
-    && typeof (value as { resumedAtMs?: unknown }).resumedAtMs === 'number'
-  )
-}
-
 function normalizePaneContent(
   rawInput: PaneContentInput | PaneContent | Record<string, unknown>,
   previous?: PaneContent,
@@ -89,7 +74,8 @@ function normalizePaneContent(
     const resumeSessionId = inputResumeSessionId
     const sessionRef = sanitizeSessionRef(input.sessionRef)
     const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
-    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
+    const restoreError = sanitizeRestoreError((input as { restoreError?: unknown }).restoreError)
+    const crashTrace = sanitizeCrashTrace((input as { crashTrace?: unknown }).crashTrace)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -104,7 +90,7 @@ function normalizePaneContent(
       ...(codexDurability ? { codexDurability } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       streamId: typeof input.streamId === 'string' && input.streamId.length > 0 ? input.streamId : undefined,
-      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
+      ...(restoreError ? { restoreError } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
       reconcileNotice: typeof input.reconcileNotice === 'string' ? input.reconcileNotice : undefined,
       pendingReconcile: input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
@@ -115,9 +101,7 @@ function normalizePaneContent(
       // normalize (this function is a whitelist — without this line the
       // "survives reload" property silently dies here even though the
       // persistMiddleware strip and persistedState load both keep it).
-      ...(isCrashTrace((input as { crashTrace?: unknown }).crashTrace)
-        ? { crashTrace: (input as { crashTrace: CrashTrace }).crashTrace }
-        : {}),
+      ...(crashTrace ? { crashTrace } : {}),
     }
   }
   if (input.kind === 'browser') {
@@ -139,7 +123,7 @@ function normalizePaneContent(
       options?.inheritCreateRequestId && previous?.kind === 'fresh-agent'
         ? previous.createRequestId
         : undefined
-    const existingRestoreError = readRestoreError(rawFreshAgent.restoreError)
+    const existingRestoreError = sanitizeRestoreError(rawFreshAgent.restoreError)
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const status = input.status || (pendingLocalEcho ? 'running' : 'creating')

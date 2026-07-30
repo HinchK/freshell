@@ -34,8 +34,7 @@ use std::collections::HashSet;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -592,23 +591,12 @@ fn spawn_gate_error_response(
     retry_after: std::time::Duration,
 ) -> Response {
     match err {
-        crate::spawn_gate::SpawnGateError::QueueFull => {
-            let secs = retry_after.as_secs().max(1);
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from(secs),
-                )],
-                Json(json!({
-                    "status": "error",
-                    "code": "SPAWN_QUEUE_FULL",
-                    "message": "Too many concurrent terminal spawns; retry shortly",
-                    "retryAfterMs": retry_after.as_millis() as u64,
-                })),
-            )
-                .into_response()
-        }
+        crate::spawn_gate::SpawnGateError::QueueFull => crate::fail_json_code_retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SPAWN_QUEUE_FULL",
+            "Too many concurrent terminal spawns; retry shortly".to_string(),
+            retry_after,
+        ),
         crate::spawn_gate::SpawnGateError::Timeout => crate::fail_json_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "SPAWN_TIMEOUT",

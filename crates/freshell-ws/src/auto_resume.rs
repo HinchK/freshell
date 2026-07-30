@@ -37,13 +37,13 @@ pub(crate) const AUTO_RESUME_HEALTHY_LIFETIME_MS: i64 = 30_000;
 pub(crate) const AUTO_RESUME_DEFAULT_MAX_CYCLES: u32 = 5;
 pub(crate) const AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS: i64 = 3_600_000;
 
-fn env_parse<T: std::str::FromStr + PartialOrd + Default>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<T>().ok())
-        .filter(|v| *v > T::default())
-        .unwrap_or(default)
-}
+/// Settle reason for a user cancel — shared by the WS cancel handler's
+/// immediate frame (`terminal::handle_auto_resume_cancel`) and the hub's
+/// post-sleep re-emit below, so the two frames can never drift. Tests pin
+/// the literal on purpose (protocol value, not an internal name).
+pub(crate) const SETTLE_REASON_CANCELLED: &str = "auto-resume cancelled";
+
+use crate::env_parse;
 
 pub(crate) fn auto_resume_max_cycles() -> u32 {
     env_parse(
@@ -307,9 +307,17 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
             // Prune the cycle record to the rolling window BEFORE deciding
             // (znhn item 2): recent_cycles feeds the breaker threshold.
             let now = crate::terminal::now_ms();
-            let (prior_attempts, recent_cycles) = match &ev.create_request_id {
-                Some(k) => {
-                    let h = attempts.entry(k.clone()).or_default();
+            // Read-only lookup: entries are materialized ONLY by the Resume
+            // arm. Inserting here would grow the map by one entry per
+            // terminal ever exited (shell panes and clean exits included)
+            // with nothing to evict it — and an absent entry is
+            // semantically identical to a zeroed one.
+            let (prior_attempts, recent_cycles) = match ev
+                .create_request_id
+                .as_deref()
+                .and_then(|k| attempts.get_mut(k))
+            {
+                Some(h) => {
                     h.cycles.retain(|t| now - *t <= cfg.cycle_window_ms);
                     (h.attempts, h.cycles.len() as u32)
                 }
@@ -353,6 +361,13 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             // healthy-lifetime as `decide`).
                             if let Some(h) = attempts.get_mut(k) {
                                 h.attempts = 0;
+                                // A zeroed budget with no cycles left in the
+                                // window is indistinguishable from an absent
+                                // entry — evict, or the map grows one dead
+                                // entry per healthy terminal ever run.
+                                if h.cycles.is_empty() {
+                                    attempts.remove(k);
+                                }
                             }
                         }
                     }
@@ -384,7 +399,7 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         // late-consumed or pre-seeded cancel is loud and can
                         // never strand a recovering notice. Idempotent
                         // client-side (recordAutoResumeSettled).
-                        driver.emit_settled(&ev.terminal_id, "auto-resume cancelled", None);
+                        driver.emit_settled(&ev.terminal_id, SETTLE_REASON_CANCELLED, None);
                         driver.log_settled(&ev.terminal_id, "user_cancelled");
                         continue;
                     }
@@ -781,14 +796,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             )),
             resume_cycles: None,
         });
-        match serde_json::to_string(&msg) {
-            Ok(json) => {
-                let _ = self.state.broadcast_tx.send(json);
-            }
-            Err(err) => {
-                tracing::error!(terminal_id, error = %err, "terminal.auto_resume.recovering_frame_serialize_failed");
-            }
-        }
+        broadcast_frame(&self.state, terminal_id, "recovering", &msg);
     }
 
     fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32) {
@@ -801,35 +809,11 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 max_attempts,
             },
         );
-        match serde_json::to_string(&msg) {
-            Ok(json) => {
-                let _ = self.state.broadcast_tx.send(json);
-            }
-            Err(err) => {
-                tracing::error!(old_terminal_id = old, new_terminal_id = new, error = %err, "terminal.auto_resume.replaced_frame_serialize_failed");
-            }
-        }
+        broadcast_frame(&self.state, old, "replaced", &msg);
     }
 
     fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
-        let msg =
-            freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
-                status: freshell_protocol::RuntimeStatus::Exited,
-                terminal_id: terminal_id.to_string(),
-                attempt: None,
-                max_attempts: None,
-                exit_code: None,
-                reason: Some(reason.to_string()),
-                resume_cycles: resume_cycles.map(i64::from),
-            });
-        match serde_json::to_string(&msg) {
-            Ok(json) => {
-                let _ = self.state.broadcast_tx.send(json);
-            }
-            Err(err) => {
-                tracing::error!(terminal_id, error = %err, "terminal.auto_resume.settled_frame_serialize_failed");
-            }
-        }
+        broadcast_settled_frame(&self.state, terminal_id, reason, resume_cycles);
     }
 
     fn take_cancel(&self, terminal_id: &str) -> bool {
@@ -842,6 +826,50 @@ impl AutoResumeDriver for WsAutoResumeDriver {
 
     fn log_settled(&self, terminal_id: &str, reason: &str) {
         tracing::info!(terminal_id, reason, "terminal.auto_resume.settled");
+    }
+}
+
+/// Build + broadcast the settle frame (`terminal.status status:exited`).
+/// The ONE constructor for this frame — used by both the hub driver
+/// ([`WsAutoResumeDriver::emit_settled`]) and the WS cancel handler
+/// (`terminal::handle_auto_resume_cancel`), so the two paths can never
+/// drift in shape or serialize-error policy.
+pub(crate) fn broadcast_settled_frame(
+    state: &crate::WsState,
+    terminal_id: &str,
+    reason: &str,
+    resume_cycles: Option<u32>,
+) {
+    let msg = freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+        status: freshell_protocol::RuntimeStatus::Exited,
+        terminal_id: terminal_id.to_string(),
+        attempt: None,
+        max_attempts: None,
+        exit_code: None,
+        reason: Some(reason.to_string()),
+        resume_cycles: resume_cycles.map(i64::from),
+    });
+    broadcast_frame(state, terminal_id, "settled", &msg);
+}
+
+/// Serialize + broadcast one auto-resume protocol frame. The ONE home for
+/// the serialize/send/log-on-failure policy shared by every emitter in this
+/// module (`emit_recovering`, `emit_replaced`, [`broadcast_settled_frame`]),
+/// so the paths can never drift. `frame` names the frame kind in the
+/// (should-be-impossible) serialize-failure log.
+fn broadcast_frame(
+    state: &crate::WsState,
+    terminal_id: &str,
+    frame: &str,
+    msg: &freshell_protocol::ServerMessage,
+) {
+    match serde_json::to_string(msg) {
+        Ok(json) => {
+            let _ = state.broadcast_tx.send(json);
+        }
+        Err(err) => {
+            tracing::error!(terminal_id, frame, error = %err, "terminal.auto_resume.frame_serialize_failed");
+        }
     }
 }
 

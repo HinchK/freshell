@@ -31,6 +31,41 @@ export const RestoreErrorSchema = z.object({
 
 export type RestoreError = z.infer<typeof RestoreErrorSchema>
 
+/** Persistent crash trace (kata znhn item 1): "crashed & auto-resumed" —
+ * lives on pane content, survives reload until dismissed or the pane
+ * closes. Schema-validated on hydrate like its persisted siblings
+ * (`RestoreErrorSchema`, `sanitizeSessionRef`). */
+export const CrashTraceSchema = z.object({
+  /** Exit code of the crashed generation. */
+  exitCode: z.number(),
+  /** Wall-clock ms when the auto-resume succeeded. */
+  resumedAtMs: z.number(),
+}).strict()
+
+export type CrashTrace = z.infer<typeof CrashTraceSchema>
+
+/** Schema-gated read shared by the persisted-field sanitizers below.
+ * The `undefined` short-circuit is deliberate: callers run on every
+ * pane-content merge and per-pane on hydrate, and these fields are absent
+ * in ~all calls — skip zod's parse + issue construction on the
+ * overwhelmingly-common miss. */
+function parseOrUndefined<S extends z.ZodTypeAny>(schema: S, value: unknown): z.infer<S> | undefined {
+  if (value === undefined) return undefined
+  const parsed = schema.safeParse(value)
+  return parsed.success ? parsed.data : undefined
+}
+
+/** Sanitizer for the persisted restore error — lives beside its schema like
+ * `sanitizeSessionRef`, so consumers don't re-roll the safeParse dance. */
+export function sanitizeRestoreError(value: unknown): RestoreError | undefined {
+  return parseOrUndefined(RestoreErrorSchema, value)
+}
+
+/** Sanitizer for the persisted crash trace (znhn item 1). */
+export function sanitizeCrashTrace(value: unknown): CrashTrace | undefined {
+  return parseOrUndefined(CrashTraceSchema, value)
+}
+
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 function isRecord(value: unknown): value is Record<string, unknown> {

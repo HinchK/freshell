@@ -4,7 +4,7 @@ import {
   type FreshAgentModelSelection,
 } from '@shared/fresh-agent-model-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
-import type { RestoreError } from '@shared/session-contract'
+import type { RestoreError, CrashTrace } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { FreshAgentStyle } from '@shared/settings'
@@ -70,13 +70,10 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
  */
 /** Persistent crash trace (kata znhn item 1): "crashed & auto-resumed" —
  * survives reload (pane-content persistence is a denylist) until the user
- * dismisses it or the pane closes. */
-export type CrashTrace = {
-  /** Exit code of the crashed generation. */
-  exitCode: number
-  /** Wall-clock ms when the auto-resume succeeded. */
-  resumedAtMs: number
-}
+ * dismisses it or the pane closes. Shape + schema live in
+ * `@shared/session-contract` (`CrashTraceSchema`) beside its persisted
+ * siblings; re-exported here where pane content consumers import from. */
+export type { CrashTrace }
 
 export type TerminalPaneContent = {
   kind: 'terminal'

@@ -51,24 +51,7 @@ impl Default for CreateProtectConfig {
     }
 }
 
-/// Sanitizing env parse (same shape as the private helpers in
-/// `crate::backpressure`): unset, unparseable, zero, or negative -> default.
-/// Deliberately saner than legacy `Number(env || default)` — see module doc.
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(default)
-}
+use crate::env_parse;
 
 impl CreateProtectConfig {
     /// Resolve from process env. Rate-limit names mirror legacy
@@ -76,11 +59,11 @@ impl CreateProtectConfig {
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
-            rate_limit: env_usize("TERMINAL_CREATE_RATE_LIMIT", d.rate_limit),
-            rate_window_ms: env_u64("TERMINAL_CREATE_RATE_WINDOW_MS", d.rate_window_ms),
-            spawn_concurrency: env_usize("FRESHELL_SPAWN_GATE_CONCURRENCY", d.spawn_concurrency),
-            spawn_queue_cap: env_usize("FRESHELL_SPAWN_GATE_QUEUE_CAP", d.spawn_queue_cap),
-            spawn_timeout_ms: env_u64("FRESHELL_SPAWN_GATE_TIMEOUT_MS", d.spawn_timeout_ms),
+            rate_limit: env_parse("TERMINAL_CREATE_RATE_LIMIT", d.rate_limit),
+            rate_window_ms: env_parse("TERMINAL_CREATE_RATE_WINDOW_MS", d.rate_window_ms),
+            spawn_concurrency: env_parse("FRESHELL_SPAWN_GATE_CONCURRENCY", d.spawn_concurrency),
+            spawn_queue_cap: env_parse("FRESHELL_SPAWN_GATE_QUEUE_CAP", d.spawn_queue_cap),
+            spawn_timeout_ms: env_parse("FRESHELL_SPAWN_GATE_TIMEOUT_MS", d.spawn_timeout_ms),
         }
     }
 }

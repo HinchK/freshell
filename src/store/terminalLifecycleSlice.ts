@@ -21,7 +21,7 @@ export interface PaneLifecycleEntry {
   notice?: AutoResumeNotice
   /** Settle frame record (znhn item 3) — resumeCycles is present only for
    * flap-circuit-breaker settles and feeds the "crashed N times" banner. */
-  settle?: { resumeCycles?: number; at: number }
+  settle?: { resumeCycles?: number }
 }
 
 interface TerminalLifecycleState {
@@ -76,16 +76,24 @@ const slice = createSlice({
     // replacement for the old 30s TTL guess (znhn item 3).
     recordAutoResumeSettled(
       state,
-      action: PayloadAction<{ paneId: string; resumeCycles?: number; at: number }>
+      action: PayloadAction<{ paneId: string; resumeCycles?: number }>
     ) {
-      const e = entry(state, action.payload.paneId)
+      const { paneId, resumeCycles } = action.payload
+      // Settle frames are redelivered by design (the cancel handler's
+      // immediate frame + the hub's post-sleep re-emit). Bail before
+      // touching the draft (entry() materializes missing entries — itself
+      // a state change) so a redelivery keeps the same state reference and
+      // subscribers see no change — not merely value-idempotent.
+      const existing = state.byPaneId[paneId]
+      if (
+        existing !== undefined
+        && existing.notice === undefined
+        && existing.settle !== undefined
+        && existing.settle.resumeCycles === resumeCycles
+      ) return
+      const e = entry(state, paneId)
       delete e.notice
-      e.settle = {
-        at: action.payload.at,
-        ...(action.payload.resumeCycles !== undefined
-          ? { resumeCycles: action.payload.resumeCycles }
-          : {}),
-      }
+      e.settle = resumeCycles !== undefined ? { resumeCycles } : {}
     },
     // D-3 backstop (validated): the settle/replaced frames are fire-and-forget
     // on a bounded broadcast (no replay; lagged receivers are force-closed),
