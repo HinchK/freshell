@@ -11,8 +11,28 @@ import { PANE_TINT_COLORS, STATUS_BLUE, STATUS_MUTED } from './pane-tint-colors'
 
 export type Ctx2D = Pick<
   CanvasRenderingContext2D,
-  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage' | 'beginPath' | 'arc' | 'fill'
-> & { fillStyle: string | CanvasGradient | CanvasPattern; font: string; textBaseline: CanvasTextBaseline }
+  | 'fillRect'
+  | 'fillText'
+  | 'measureText'
+  | 'getImageData'
+  | 'drawImage'
+  | 'beginPath'
+  | 'arc'
+  | 'fill'
+  | 'save'
+  | 'restore'
+  | 'clip'
+  | 'stroke'
+> & {
+  fillStyle: string | CanvasGradient | CanvasPattern
+  strokeStyle: string | CanvasGradient | CanvasPattern
+  lineWidth: number
+  font: string
+  /** Chromium-only canvas API (the deck runs in Chromium/Electron; WebHID requires it). */
+  letterSpacing: string
+  textBaseline: CanvasTextBaseline
+  roundRect(x: number, y: number, w: number, h: number, radii?: number): void
+}
 
 export type IconSource = (url: string) => CanvasImageSource | null
 export type CtxFactory = (width: number, height: number) => Ctx2D
@@ -345,11 +365,27 @@ export function renderStrip(text: string, width: number, height: number, createC
   return ctx.getImageData(0, 0, width, height).data
 }
 
+/** Pre-Baseline-2023 canvases (Firefox <=111, Safari <=15) lack roundRect; an
+ * unguarded call would crash VirtualDeckPanel rendering in those browsers.
+ * Degrade to square corners instead. (ctx.letterSpacing needs no guard:
+ * assigning it on a non-supporting canvas is an inert expando — no throw, and
+ * text stays self-consistent since measureText excludes the tracking there too.) */
+export function ensureRoundRect(ctx: CanvasRenderingContext2D): void {
+  const c = ctx as CanvasRenderingContext2D & { roundRect?: unknown }
+  if (typeof c.roundRect !== 'function') {
+    c.roundRect = function (this: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+      this.rect(x, y, w, h)
+    }
+  }
+}
+
 export function defaultCtxFactory(width: number, height: number): Ctx2D {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Canvas 2D context unavailable (defaultCtxFactory is runtime-only; inject a CtxFactory in tests)')
-  return ctx
+  ensureRoundRect(ctx)
+  // lib.dom may predate ctx.letterSpacing; the runtime (Chromium) always has it.
+  return ctx as unknown as Ctx2D
 }

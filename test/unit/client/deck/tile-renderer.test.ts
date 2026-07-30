@@ -6,6 +6,7 @@ import {
   TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
   MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
+  ensureRoundRect,
 } from '@/deck/tile-renderer'
 import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM, PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 import { providerIconDataUrl } from '@/deck/provider-icon-svg'
@@ -15,43 +16,73 @@ import { DECK_FONT_STACK } from '@/deck/deck-font'
 import type { KeySpec, RingColor } from '@/deck/frame'
 
 type Rect = { x: number; y: number; w: number; h: number; style: string }
-type Text = { text: string; x: number; y: number; style: string; font: string }
+type Text = { text: string; x: number; y: number; style: string; font: string; letterSpacing: string }
 type Img = { x: number; y: number; w: number; h: number }
 type Circle = { cx: number; cy: number; r: number; style: string }
+type RRect = { x: number; y: number; w: number; h: number; r: number }
+type Stroke = RRect & { style: string; lineWidth: number }
+type Measure = { text: string; letterSpacing: string }
 
 function recordingCtx(width: number, height: number) {
   const rects: Rect[] = []
   const texts: Text[] = []
   const images: Img[] = []
   const circles: Circle[] = []
+  const clips: RRect[] = []
+  const strokes: Stroke[] = []
+  const measures: Measure[] = []
   let pendingArc: { cx: number; cy: number; r: number } | null = null
+  let pendingRound: RRect | null = null
   const ctx = {
     fillStyle: '#000000' as string,
+    strokeStyle: '#000000' as string,
+    lineWidth: 0,
     font: '',
+    letterSpacing: '',
     textBaseline: 'alphabetic' as CanvasTextBaseline,
     fillRect(x: number, y: number, w: number, h: number) {
       rects.push({ x, y, w, h, style: String(this.fillStyle) })
     },
     fillText(text: string, x: number, y: number) {
-      texts.push({ text, x, y, style: String(this.fillStyle), font: this.font })
+      texts.push({ text, x, y, style: String(this.fillStyle), font: this.font, letterSpacing: this.letterSpacing })
     },
     drawImage(_src: CanvasImageSource, x: number, y: number, w: number, h: number) {
       images.push({ x, y, w, h })
     },
     beginPath() {
       pendingArc = null
+      pendingRound = null
     },
     arc(cx: number, cy: number, r: number) {
       pendingArc = { cx, cy, r }
+    },
+    roundRect(x: number, y: number, w: number, h: number, r = 0) {
+      pendingRound = { x, y, w, h, r }
+    },
+    clip() {
+      if (pendingRound) clips.push(pendingRound)
+      pendingRound = null
+    },
+    stroke() {
+      if (pendingRound) strokes.push({ ...pendingRound, style: String(this.strokeStyle), lineWidth: this.lineWidth })
+      pendingRound = null
     },
     fill() {
       if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
       pendingArc = null
     },
-    measureText(t: string) { return { width: t.length * 6 } as TextMetrics },
-    getImageData() { return { data: new Uint8ClampedArray(width * height * 4) } as ImageData },
+    save() {},
+    restore() {},
+    measureText(t: string) {
+      measures.push({ text: t, letterSpacing: this.letterSpacing })
+      const ls = parseFloat(this.letterSpacing) || 0
+      return { width: t.length * (6 + ls) } as TextMetrics
+    },
+    getImageData() {
+      return { data: new Uint8ClampedArray(width * height * 4) } as ImageData
+    },
   } as unknown as Ctx2D
-  return { ctx, rects, texts, images, circles }
+  return { ctx, rects, texts, images, circles, clips, strokes, measures }
 }
 
 describe('title fitting', () => {
@@ -114,8 +145,8 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
     return captured.ctx
   }
   const out = renderKey(spec, MINI_CAPS, factory, getIcon)
-  const { rects, texts, images, circles } = captured!
-  return { out, rects, texts, images, circles }
+  const { rects, texts, images, circles, clips, strokes, measures } = captured!
+  return { out, rects, texts, images, circles, clips, strokes, measures }
 }
 
 describe('renderKey', () => {
@@ -380,5 +411,31 @@ describe('agent pane icons (tab-bar presentation)', () => {
   it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
     const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
     expect(images).toHaveLength(0)
+  })
+})
+
+describe('ensureRoundRect', () => {
+  it('installs roundRect delegate on stubs lacking it', () => {
+    const recta: unknown[] = []
+    const stub = {
+      rect: function (x: number, y: number, w: number, h: number) {
+        recta.push({ x, y, w, h })
+      },
+    } as unknown as CanvasRenderingContext2D
+    ensureRoundRect(stub)
+    ;(stub.roundRect as any)(10, 20, 30, 40, 5)
+    expect(recta).toEqual([{ x: 10, y: 20, w: 30, h: 40 }])
+  })
+
+  it('leaves existing roundRect function untouched', () => {
+    const calls: unknown[] = []
+    const existing = function (x: number) {
+      calls.push({ x })
+    }
+    const stub = { roundRect: existing } as unknown as CanvasRenderingContext2D
+    ensureRoundRect(stub)
+    expect(stub.roundRect).toBe(existing)
+    ;(stub.roundRect as any)(42)
+    expect(calls).toEqual([{ x: 42 }])
   })
 })
