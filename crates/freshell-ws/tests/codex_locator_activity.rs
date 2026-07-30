@@ -148,7 +148,9 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
         .join("24");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
     std::env::set_var("CODEX_HOME", codex_home.path());
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let capture = std::env::temp_dir().join(format!(
         "codex-locator-activity-argv-{}.txt",
         std::process::id()

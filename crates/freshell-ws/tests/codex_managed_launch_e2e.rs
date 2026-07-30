@@ -263,7 +263,10 @@ async fn codex_terminal_create_argv_flag_off_control_and_flag_on_managed_launch(
     let tmp_cwd = std::env::temp_dir().join(format!("freshell-codex-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_cwd).unwrap();
     std::env::set_var("CODEX_CMD", &dispatcher);
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    // (Phase 1 is the explicit flag-OFF control; Phase 2 re-enables with "1".)
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     let (ws_url, registry) = spawn_server().await;
     let mut ws = connect_and_handshake(&ws_url).await;

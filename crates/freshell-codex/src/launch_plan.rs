@@ -48,21 +48,19 @@ pub const CODEX_REMOTE_NON_LOOPBACK_MESSAGE: &str =
 
 // ─── S4 flag gate (council fence) ────────────────────────────────────────────────────────────────
 
-/// The env var that opts a server process into DEV-0006 S4's managed codex terminal
-/// launches. Council fence: S4's wiring is FLAG-GATED, default OFF — legacy's proxy path
-/// exists to feed durability binding (S5), so the launch mechanism ships dark until S5's
-/// consumers land; S5 + the flag-default flip land together.
-///
-/// D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH): flipping this default ON must
-/// revisit the ~226s REST permit-hold (grep for D-C-REVISIT; decision in
-/// docs/plans/2026-07-27-rest-spawn-gate.md §D-C).
+/// The env var that opts a server process OUT of DEV-0006's managed codex
+/// terminal launches. S5.e (2026-07-30): the default flipped ON — S5's
+/// consumers (proxy-event drain → identity/activity tails, candidate-
+/// persistence gate) are live, closing DEV-0006/DEV-0008. D-C-REVISIT: RESOLVED
+/// before this flip (sidecar planning budget + REST acquire move;
+/// docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum).
 pub const FRESHELL_CODEX_MANAGED_LAUNCH_ENV: &str = "FRESHELL_CODEX_MANAGED_LAUNCH";
 
-/// Whether the managed-launch flag value enables the S4 wiring. Only the exact string
-/// `"1"` enables; unset/anything else keeps today's plain-CLI codex behavior
-/// byte-identical (golden G-X0 stays the live shape while OFF).
+/// Whether the managed-launch flag value enables the wiring. S5.e default ON:
+/// only the exact string "0" disables; unset/anything else plans managed codex
+/// launches (goldens G-X1/G-X2 pin the live-path argv).
 pub fn codex_managed_launch_enabled(value: Option<&str>) -> bool {
-    value == Some("1")
+    value != Some("0")
 }
 
 // ─── CodexLaunchConfigError (codex-launch-config.ts:5-10) ───────────────────────────────
@@ -761,20 +759,15 @@ mod tests {
         );
     }
 
-    // ── S4 flag gate (council fence: managed launch is FLAG-GATED, default OFF) ──
+    // ── S5.e flag gate (default ON; only the exact string "0" opts out) ──
 
     #[test]
-    fn managed_launch_flag_defaults_off() {
-        // Unset env → OFF: today's plain-CLI codex behavior stays byte-identical.
-        assert!(!codex_managed_launch_enabled(None));
-    }
-
-    #[test]
-    fn managed_launch_flag_enables_only_on_exactly_1() {
+    fn managed_launch_defaults_on_and_only_zero_disables() {
+        assert!(codex_managed_launch_enabled(None)); // S5.e: default ON
         assert!(codex_managed_launch_enabled(Some("1")));
-        for value in ["", "0", "true", "yes", "on", " 1", "1 ", "2"] {
-            assert!(!codex_managed_launch_enabled(Some(value)), "{value:?}");
-        }
+        assert!(codex_managed_launch_enabled(Some("")));
+        assert!(codex_managed_launch_enabled(Some("true")));
+        assert!(!codex_managed_launch_enabled(Some("0"))); // the only opt-out
     }
 
     #[test]

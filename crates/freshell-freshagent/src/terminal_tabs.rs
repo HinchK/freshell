@@ -528,12 +528,12 @@ pub(crate) struct TerminalSpawnResult {
     pub(crate) cwd: Option<String>,
 }
 
-/// DEV-0006 S4 gate, REST side (council fence: FLAG-GATED, default OFF): a codex
-/// `POST /api/tabs` / pane-split create plans a managed app-server launch ONLY when the
-/// mode is codex AND the `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"1"` — the
-/// SAME predicate the WS `terminal.create` branch gates on
-/// (`crates/freshell-ws/src/terminal.rs::codex_create_uses_managed_launch`). Flag OFF
-/// keeps the shipped plain-CLI REST codex behavior byte-identical.
+/// DEV-0006 gate, REST side (S5.e: default ON): a codex `POST /api/tabs` /
+/// pane-split create plans a managed app-server launch when the mode is codex,
+/// unless the `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"0"` — the only
+/// opt-out back to the plain-CLI REST codex behavior. SAME predicate the WS
+/// `terminal.create` branch gates on
+/// (`crates/freshell-ws/src/terminal.rs::codex_create_uses_managed_launch`).
 fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> bool {
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
@@ -2307,18 +2307,18 @@ mod tests {
 
     // ── DEV-0006 S4 inc.2: the REST codex managed-launch gate + resume echo ─────────────
 
-    /// Same council fence as the WS path: managed codex launch is FLAG-GATED,
-    /// default OFF; only mode=codex + flag exactly "1" plans a launch. Flag OFF
-    /// keeps the shipped REST codex behavior byte-identical.
+    /// DEV-0006 S5.e, same gate as the WS path: managed codex launch defaults ON;
+    /// only the exact string "0" opts out. Mode scoping is unchanged: non-codex
+    /// modes never plan.
     #[test]
     fn rest_codex_managed_launch_gate_is_mode_and_flag_scoped() {
         assert!(codex_create_uses_managed_launch("codex", Some("1")));
-        assert!(!codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("codex", Some("0")));
-        assert!(!codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("shell", Some("1")));
-        assert!(!codex_create_uses_managed_launch("claude", Some("1")));
-        assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
+        assert!(!codex_create_uses_managed_launch("claude", None));
+        assert!(!codex_create_uses_managed_launch("opencode", None));
     }
 
     /// `agentRouteErrorStatus` (`router.ts:54-59`): a `CodexLaunchConfigError` (invalid
@@ -4562,6 +4562,9 @@ mod tests {
     /// re-opens); non-submit text must not touch either.
     #[tokio::test]
     async fn send_keys_enter_feeds_codex_locator() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let root = unique_temp_home("codex-submit");
         let argv_file = unique_argv_file("codex-submit");
         let locator = std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(
