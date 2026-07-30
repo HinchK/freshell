@@ -1091,13 +1091,13 @@ fn cli_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
-/// codex `--remote <wsUrl>` planning (DEV-0006 S4, FLAG-GATED default OFF —
-/// council fence): with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed
-/// app-server launch (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote
-/// proxy, 5-attempt initial budget); the codex provider settings route through
-/// the PLAN, not argv (the `ws:2464-2465` strip). Flag OFF: `Ok(None)` —
-/// today's plain-CLI launch, byte-identical to the shipped deviation shape
-/// (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+/// codex `--remote <wsUrl>` planning (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH`
+/// default ON since S5.e): plan the managed app-server launch
+/// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
+/// initial budget); the codex provider settings route through the PLAN, not
+/// argv (the `ws:2464-2465` strip). Flag `"0"` opts out to the plain-CLI shape
+/// (`Ok(None)` — the retired G-X0 shape; G-X1/G-X2 pin the live path since the
+/// S5.e flip).
 ///
 /// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
 /// plans identically. `Err` carries the thrown planCodexLaunch message —
@@ -2001,13 +2001,13 @@ pub(crate) async fn handle_create(
         None
     };
 
-    // codex `--remote <wsUrl>` (DEV-0006 S4, FLAG-GATED default OFF — council fence):
-    // with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch
-    // (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
-    // initial budget) and point the TUI at the PROXY's ws URL; the codex provider
-    // settings route through the PLAN, not argv (the `ws:2464-2465` strip above).
-    // Flag OFF: today's plain-CLI launch, byte-identical to the shipped deviation
-    // shape (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+    // codex `--remote <wsUrl>` (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH` default
+    // ON since S5.e): plan the managed app-server launch (`planCodexLaunch`,
+    // ws:2442-2449: sidecar spawn + remote proxy, 5-attempt initial budget) and
+    // point the TUI at the PROXY's ws URL; the codex provider settings route
+    // through the PLAN, not argv (the `ws:2464-2465` strip above). Flag `"0"`
+    // opts out to the plain-CLI shape (the retired G-X0 shape; G-X1/G-X2 pin the
+    // live path since the S5.e flip).
     // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
     // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
     // passes `m.cwd`).

@@ -643,6 +643,8 @@ program `powershell.exe`, args
 not powershell, is the default native-Windows shell, tr:949-953.)
 
 ### G-X1 — codex, linux, live path, fresh (no resume)
+(S5.e 2026-07-30: G-X1/G-X2 are THE live-path pins; G-X0 — the shipped-deviation
+no-remote shape — is retired. Its env-empty assertion folded into G-X1.)
 Inputs: `codex_remote_ws_url="ws://127.0.0.1:45012/codex"`, no model/sandbox
 (stripped per ws:2464-2465).
 ```
