@@ -145,8 +145,23 @@ async fn route_candidate(
             .mark_candidate_persisted(terminal_id)
             .await;
         // D-FORK: give managed panes the disk fork watch resume panes get.
+        // `watch_fork` snapshots the sessions tree (bounded fs walk), so it
+        // runs on the blocking pool like the association sweep's lane -- a
+        // panic there must not kill the proxy-event router task.
         if let Some(locator) = &state.codex_locator {
-            locator.watch_fork(terminal_id, &candidate.thread.id);
+            let watch_locator = std::sync::Arc::clone(locator);
+            let terminal_id = terminal_id.to_string();
+            let thread_id = candidate.thread.id.clone();
+            if let Err(join_error) = tokio::task::spawn_blocking(move || {
+                watch_locator.watch_fork(&terminal_id, &thread_id);
+            })
+            .await
+            {
+                tracing::warn!(
+                    error = %join_error,
+                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
+                );
+            }
         }
     } else {
         CodexTerminalLaunchManager::global()
