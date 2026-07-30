@@ -106,7 +106,7 @@ pub(crate) fn now_ms() -> i64 {
 /// by design; kimi/gemini/custom extension modes have no resolver, so a
 /// marker for them could never resolve and would only leak until the TTL
 /// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
-const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+pub(crate) const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
 
 /// Map the protocol `shell` enum to the platform `ShellType`.
 fn map_shell(shell: Shell) -> ShellType {
