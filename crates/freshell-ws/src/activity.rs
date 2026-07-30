@@ -133,6 +133,11 @@ enum HubEvent {
     CodexFsChange {
         terminal_id: String,
     },
+    /// S5.a: a proxy TurnStarted/TurnCompleted for a managed codex terminal.
+    CodexProxyTurn {
+        terminal_id: String,
+        completed: bool,
+    },
 }
 
 struct AmplifierLane {
@@ -258,6 +263,15 @@ impl ActivityHub {
         let _ = self.tx.send(HubEvent::CodexBind {
             terminal_id: terminal_id.to_string(),
             session_id: session_id.to_string(),
+        });
+    }
+
+    /// S5.a: proxy (managed-launch) turn lane — channel-deferred like
+    /// `bind_codex_session` so all frame emission stays on the hub task.
+    pub fn note_codex_proxy_turn(&self, terminal_id: &str, completed: bool) {
+        let _ = self.tx.send(HubEvent::CodexProxyTurn {
+            terminal_id: terminal_id.to_string(),
+            completed,
         });
     }
 
@@ -491,6 +505,23 @@ impl ActivityHub {
             }
             HubEvent::CodexFsChange { terminal_id } => {
                 self.drain_codex_lane(&terminal_id);
+            }
+            HubEvent::CodexProxyTurn {
+                terminal_id,
+                completed,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = if completed {
+                        inner.codex.note_proxy_turn_completed(&terminal_id, at)
+                    } else {
+                        inner.codex.note_proxy_turn_started(&terminal_id, at)
+                    };
+                    let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                    frames
+                };
+                self.emit(frames);
             }
         }
     }
@@ -2462,6 +2493,67 @@ mod tests {
         .await
         .expect("turn complete");
         assert_eq!(complete["sessionId"], "thread-1");
+        assert_eq!(complete["provider"], "codex");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_turn_events_reach_the_codex_tracker_and_emit_turn_complete() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: crate::terminal::now_ms(),
+            },
+        );
+        // Initial idle upsert (no sessionId -- the G3 gap state).
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Exercise: proxy turn lane.
+        hub.note_codex_proxy_turn("t", false); // started
+        hub.note_codex_proxy_turn("t", true); // completed
+        hub.note_codex_proxy_turn("t", true); // duplicate echo — must not double
+
+        // Assert: busy→idle transition via activity update.
+        let busy = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t" && r["phase"] == "busy")
+                })
+                .unwrap_or(false)
+        })
+        .await
+        .expect("busy upsert");
+        assert_eq!(busy["upsert"][0]["terminalId"], "t");
+
+        // Assert: at least one codex.activity.updated showing idle phase (from completed).
+        let idle = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t" && r["phase"] == "idle")
+                })
+                .unwrap_or(false)
+        })
+        .await
+        .expect("idle upsert");
+        assert_eq!(idle["upsert"][0]["terminalId"], "t");
+
+        // Assert: exactly ONE terminal.turn.complete frame.
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "t"
+        })
+        .await
+        .expect("turn complete");
         assert_eq!(complete["provider"], "codex");
     }
 
