@@ -11,6 +11,7 @@ import { parseResumeInput } from '@shared/resume-input-parser'
 import {
   ResumeResolveResponseSchema,
   type ResumeResolveMatch,
+  type ResumeResolveProviderError,
 } from '@shared/resume-resolve-contract'
 
 const WARMING_RETRY_MS = 2000
@@ -28,8 +29,14 @@ type Phase =
   | { kind: 'warming' }
   | { kind: 'index-unavailable' }
   | { kind: 'no-token' }
-  | { kind: 'no-match' }
+  | { kind: 'no-match'; unsearchedProviders: string[] }
   | { kind: 'disambiguate'; matches: ResumeResolveMatch[] }
+  // Provider unavailable ≠ not found: some agent stores could not be searched.
+  // MANUAL retry only (the server fire-and-forgets an index refresh on every
+  // degraded response, so Retry converges once the provider recovers) — never
+  // the warming auto-retry budget, and NEVER auto-resume (a failed higher-
+  // priority exact search may have hidden the right session).
+  | { kind: 'degraded'; matches: ResumeResolveMatch[]; providerErrors: ResumeResolveProviderError[] }
   | { kind: 'resumed'; note: string }
   | { kind: 'request-failed' }
 
@@ -41,6 +48,21 @@ export interface ResumeSessionDialogProps {
 
 const providers = DEFAULT_ENABLED_CLI_PROVIDERS as readonly string[]
 
+// Focus-trap helper — same pattern as src/components/ui/confirm-modal.tsx
+// (repo modal a11y convention: trap Tab, restore focus, lock scroll).
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  const selectors = [
+    'button',
+    '[href]',
+    'input',
+    'select',
+    'textarea',
+    '[tabindex]:not([tabindex="-1"])',
+  ]
+  return Array.from(container.querySelectorAll<HTMLElement>(selectors.join(',')))
+    .filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
+}
+
 export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSessionDialogProps) {
   const dispatch = useAppDispatch()
   const store = useStore<RootState>()
@@ -49,9 +71,16 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
   const [agentTouched, setAgentTouched] = useState(false)
   const [anywayCwd, setAnywayCwd] = useState('~')
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
+  // Inline error for confirming a cwd-less match with a blank cwd field.
+  const [matchCwdError, setMatchCwdError] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const dialogRef = useRef<HTMLDivElement | null>(null)
   const closeTimerRef = useRef<number | undefined>(undefined)
   const warmingRetriesRef = useRef(0)
+  // Stale-response guard: only the LATEST resolve request may mutate state.
+  const resolveSeqRef = useRef(0)
+  // homeDir prefill never overwrites a USER-edited working directory.
+  const cwdTouchedRef = useRef(false)
 
   // Advisory hint pre-fills the picker; never overrides a manual choice.
   useEffect(() => {
@@ -77,6 +106,11 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
         setPhase({ kind: 'no-token' })
         return
       }
+      // Stale-response guard: bump the sequence; only the LATEST request may
+      // mutate state. A stale single-match response must NEVER auto-resume —
+      // it could open the WRONG session.
+      const seq = ++resolveSeqRef.current
+      setMatchCwdError(false)
       setPhase({ kind: 'resolving' })
       let response
       try {
@@ -84,10 +118,31 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
           await api.post<unknown>('/api/sessions/resolve', { input: trimmed }),
         )
       } catch {
+        if (seq !== resolveSeqRef.current) return // stale — ignore
         setPhase({ kind: 'request-failed' })
         return
       }
-      if (response.status === 'warming') {
+      if (seq !== resolveSeqRef.current) return // stale — ignore
+      // Prefill the working directory with the server's CONCRETE home instead
+      // of the '~' sentinel — but never clobber a user-edited value.
+      if (response.homeDir && !cwdTouchedRef.current) setAnywayCwd(response.homeDir)
+      if (response.status === 'degraded') {
+        // Provider unavailable ≠ not found — and it must NEVER reach the
+        // auto-resume below: a failed provider means a higher-priority exact
+        // match may have been missed, so auto-opening a surviving match could
+        // open the WRONG session. Surviving matches render for MANUAL
+        // confirmation; retry is MANUAL only (the server already schedules an
+        // index refresh on every degraded response, so Retry converges).
+        setPhase({
+          kind: 'degraded',
+          matches: response.matches,
+          providerErrors: response.providerErrors,
+        })
+        return
+      }
+      if (response.status !== 'ready') {
+        // Warming is a retry state, never "not found" — and it must NEVER
+        // reach the auto-resume below.
         if (warmingRetriesRef.current >= WARMING_RETRY_LIMIT) {
           setPhase({ kind: 'index-unavailable' })
           return
@@ -96,16 +151,21 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
         setPhase({ kind: 'warming' })
         return
       }
-      if (response.matches.length === 1) {
+      // Auto-resume needs a healthy response AND a concrete recorded cwd: a
+      // lone match without one renders in the match list below alongside an
+      // editable working-directory field (spec: never open without a cwd).
+      if (response.matches.length === 1 && response.matches[0].cwd) {
         const found = response.matches[0]
         finishResume(found, `Found in ${found.provider}`)
         return
       }
-      if (response.matches.length > 1) {
+      if (response.matches.length >= 1) {
         setPhase({ kind: 'disambiguate', matches: response.matches })
         return
       }
-      setPhase({ kind: 'no-match' })
+      // Absence claims must name what was NOT searched (disabled providers) —
+      // otherwise "not found" implies the id does not exist anywhere.
+      setPhase({ kind: 'no-match', unsearchedProviders: response.unsearchedProviders })
     },
     [finishResume],
   )
@@ -137,8 +197,23 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
     [],
   )
 
+  // Closing invalidates any in-flight resolve.
   useEffect(() => {
-    if (open) inputRef.current?.focus()
+    if (!open) resolveSeqRef.current += 1
+  }, [open])
+
+  // Modal a11y (mirrors src/components/ui/confirm-modal.tsx): capture + restore
+  // the previously focused element, lock background scroll, focus the paste field.
+  useEffect(() => {
+    if (!open) return
+    const previousFocus = document.activeElement as HTMLElement | null
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    inputRef.current?.focus()
+    return () => {
+      document.body.style.overflow = previousOverflow || ''
+      previousFocus?.focus()
+    }
   }, [open])
 
   if (!open) return null
@@ -149,15 +224,44 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
       setPhase({ kind: 'no-token' })
       return
     }
+    // cwd-required gating: the button is disabled while the field is blank;
+    // this is the backstop. '~' stays the documented server-home default.
     const cwd = anywayCwd.trim()
+    if (cwd === '') return
     finishResume(
       {
         provider: agent,
         sessionId: token,
         sessionType: agent,
-        cwd: cwd === '' || cwd === '~' ? undefined : cwd,
+        cwd: cwd === '~' ? undefined : cwd,
       },
       `Resuming with ${agent}`,
+    )
+  }
+
+  // Confirming a listed match: a match with a recorded cwd resumes directly; a
+  // cwd-less match (exact-id fallback hit) requires the editable
+  // working-directory field — a session must NEVER open from a blank field.
+  const confirmMatch = (candidate: ResumeResolveMatch) => {
+    if (candidate.cwd) {
+      finishResume(candidate, `Found in ${candidate.provider}`)
+      return
+    }
+    const cwd = anywayCwd.trim()
+    if (cwd === '') {
+      setMatchCwdError(true)
+      return
+    }
+    finishResume(
+      {
+        provider: candidate.provider,
+        sessionId: candidate.sessionId,
+        sessionType: candidate.sessionType,
+        cwd: cwd === '~' ? undefined : cwd,
+        title: candidate.title,
+        firstUserMessage: candidate.firstUserMessage,
+      },
+      `Found in ${candidate.provider}`,
     )
   }
 
@@ -171,6 +275,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
     >
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- same convention as App.tsx's update-instructions dialog: the container's onClick is a stopPropagation shield and onKeyDown handles Escape; the dialog's real controls are native buttons/inputs. */}
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Resume a session"
@@ -178,7 +283,31 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
         className="bg-background border border-border rounded-lg shadow-lg w-full max-w-md mx-4 p-5 flex flex-col gap-3"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
-          if (event.key === 'Escape') onClose()
+          if (event.key === 'Escape') {
+            onClose()
+            return
+          }
+          if (event.key !== 'Tab') return
+          // Focus trap — repo modal pattern (see src/components/ui/confirm-modal.tsx).
+          const dialog = dialogRef.current
+          if (!dialog) return
+          const focusables = getFocusable(dialog)
+          if (focusables.length === 0) {
+            event.preventDefault()
+            return
+          }
+          const first = focusables[0]
+          const last = focusables[focusables.length - 1]
+          const active = document.activeElement as HTMLElement | null
+          if (event.shiftKey) {
+            if (active === first || !dialog.contains(active)) {
+              event.preventDefault()
+              last.focus()
+            }
+          } else if (active === last) {
+            event.preventDefault()
+            first.focus()
+          }
         }}
       >
         <h2 className="text-sm font-medium">Resume a session</h2>
@@ -192,7 +321,16 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
           value={input}
           rows={3}
           className="w-full text-xs bg-muted/50 border-0 rounded-md p-2 focus:outline-none focus:ring-1 focus:ring-border resize-none"
-          onChange={(event) => setInput(event.target.value)}
+          onChange={(event) => {
+            setInput(event.target.value)
+            // EDITING invalidates everything derived from the previous text:
+            // bump the sequence so in-flight responses go stale, and reset the
+            // phase so stale "Resume anyway"/disambiguation actions can never
+            // act on old tokens.
+            resolveSeqRef.current += 1
+            setMatchCwdError(false)
+            setPhase({ kind: 'idle' })
+          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
@@ -269,6 +407,29 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
             </button>
           </div>
         )}
+        {phase.kind === 'degraded' && (
+          <div data-testid="resume-degraded" role="alert" className="text-xs text-destructive">
+            Some agents could not be searched:{' '}
+            {phase.providerErrors
+              .map(
+                (entry) =>
+                  `${entry.provider}${entry.code ? ` (${entry.code})` : ''}${entry.message ? ` — ${entry.message}` : ''}`,
+              )
+              .join('; ')}
+            .
+            {phase.matches.length > 0
+              ? ' The matches below may be incomplete — confirm one manually or retry.'
+              : ' This is not a "not found".'}
+            <button
+              type="button"
+              data-testid="resume-degraded-retry"
+              className="ml-2 underline"
+              onClick={() => void resolveFromUser(input)}
+            >
+              Retry
+            </button>
+          </div>
+        )}
         {phase.kind === 'no-token' && (
           <div data-testid="resume-error" role="alert" className="text-xs text-destructive">
             No session id found in the pasted text.
@@ -284,7 +445,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
             {phase.note}
           </div>
         )}
-        {phase.kind === 'disambiguate' && (
+        {(phase.kind === 'disambiguate' || phase.kind === 'degraded') && phase.matches.length > 0 && (
           <ul data-testid="resume-match-list" className="flex flex-col gap-1 max-h-64 overflow-y-auto">
             {phase.matches.map((candidate) => (
               <li key={`${candidate.provider}:${candidate.sessionId}`}>
@@ -292,7 +453,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
                   type="button"
                   data-testid="resume-match"
                   className="w-full text-left text-xs p-2 rounded-md bg-muted/50 hover:bg-muted focus:outline-none focus:ring-1 focus:ring-border"
-                  onClick={() => finishResume(candidate, `Found in ${candidate.provider}`)}
+                  onClick={() => confirmMatch(candidate)}
                 >
                   <span className="font-medium">
                     {candidate.title ?? candidate.firstUserMessage ?? candidate.sessionId}
@@ -309,10 +470,42 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
             ))}
           </ul>
         )}
+        {(phase.kind === 'disambiguate' || phase.kind === 'degraded') &&
+          phase.matches.some((candidate) => !candidate.cwd) && (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-muted-foreground" htmlFor="resume-anyway-cwd">
+                cwd
+              </label>
+              <input
+                id="resume-anyway-cwd"
+                data-testid="resume-anyway-cwd"
+                value={anywayCwd}
+                onChange={(event) => {
+                  cwdTouchedRef.current = true
+                  setAnywayCwd(event.target.value)
+                  setMatchCwdError(false)
+                }}
+                className={controlClass}
+              />
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              Required for sessions without a recorded working directory. ~ resolves to the
+              server&apos;s home directory.
+            </p>
+            {matchCwdError && (
+              <div data-testid="resume-error" role="alert" className="text-xs text-destructive">
+                Enter a working directory to open this session.
+              </div>
+            )}
+          </div>
+        )}
         {phase.kind === 'no-match' && (
           <div className="flex flex-col gap-2">
             <div data-testid="resume-error" role="alert" className="text-xs text-destructive">
-              No matching session found in any agent&apos;s store.
+              {phase.unsearchedProviders.length > 0
+                ? `No matching session found. Not searched (disabled): ${phase.unsearchedProviders.join(', ')}.`
+                : "No matching session found in any agent's store."}
             </div>
             <div className="flex items-center gap-2">
               <label className="text-xs text-muted-foreground" htmlFor="resume-anyway-cwd">
@@ -322,7 +515,10 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
                 id="resume-anyway-cwd"
                 data-testid="resume-anyway-cwd"
                 value={anywayCwd}
-                onChange={(event) => setAnywayCwd(event.target.value)}
+                onChange={(event) => {
+                  cwdTouchedRef.current = true
+                  setAnywayCwd(event.target.value)
+                }}
                 className={controlClass}
               />
             </div>
@@ -333,7 +529,8 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
               type="button"
               data-testid="resume-anyway-button"
               onClick={resumeAnyway}
-              className="h-8 px-3 text-xs rounded-md bg-muted/50 hover:bg-muted focus:outline-none focus:ring-1 focus:ring-border"
+              disabled={anywayCwd.trim() === ''}
+              className="h-8 px-3 text-xs rounded-md bg-muted/50 hover:bg-muted focus:outline-none focus:ring-1 focus:ring-border disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Resume anyway with {agent}
             </button>
