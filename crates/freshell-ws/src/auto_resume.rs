@@ -617,6 +617,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             reason: Some(format!(
                 "{mode} crashed (exit {exit_code}) — auto-resuming, attempt {attempt}/{max_attempts}"
             )),
+            resume_cycles: None,
         });
         match serde_json::to_string(&msg) {
             Ok(json) => {

@@ -247,6 +247,12 @@ pub enum SessionRepairEvent {
 pub enum RuntimeStatus {
     Running,
     Recovering,
+    /// The auto-resume SETTLE frame (kata znhn item 3): broadcast with the
+    /// OLD terminal id whenever a planned auto-resume settles without a
+    /// replacement (guard-abort, retries exhausted, flap circuit breaker,
+    /// user cancel) so the client clears the recovering notice on a FRAME,
+    /// never on a timer.
+    Exited,
 }
 
 /// Terminal lifecycle status in the inventory (`running | exited`).
@@ -1114,6 +1120,12 @@ pub struct TerminalStatus {
     pub exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Flap-circuit-breaker settle frames only: successful auto-resumes
+    /// inside the rolling window. The client renders the "crashed N times"
+    /// banner from this FIELD — `reason` prose is presentational and must
+    /// never be parsed (council 7w4h/xkhx).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_cycles: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

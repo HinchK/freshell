@@ -772,7 +772,7 @@ export type TerminalExitMessage = {
 export type TerminalStatusMessage = {
   type: 'terminal.status'
   terminalId: string
-  status: 'running' | 'recovering'
+  status: 'running' | 'recovering' | 'exited'
   reason?: string
   attempt?: number
   /** Auto-resume 'recovering' frames only: the bounded retry budget. The
@@ -781,6 +781,10 @@ export type TerminalStatusMessage = {
   maxAttempts?: number
   /** Auto-resume 'recovering' frames only: the crashed generation's exit code. */
   exitCode?: number
+  /** Flap-circuit-breaker settle frames ('exited') only: successful
+   * auto-resumes inside the rolling window — the typed source for the
+   * "crashed N times" banner. */
+  resumeCycles?: number
 }
 
 /** Lane D1: server-initiated crash auto-resume replaced a pane's terminal.

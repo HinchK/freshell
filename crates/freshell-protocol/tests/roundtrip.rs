@@ -484,3 +484,29 @@ fn terminal_input_blocked_unknown_terminal_roundtrips_and_conforms() {
         other => panic!("expected TerminalInputBlocked, got {other:?}"),
     }
 }
+
+#[test]
+fn terminal_status_exited_settle_frame_roundtrips() {
+    // znhn item 3: the auto-resume SETTLE frame — status 'exited' on the
+    // existing terminal.status message, with the typed resumeCycles field
+    // (flap-circuit-breaker settles only).
+    let msg = ServerMessage::TerminalStatus(TerminalStatus {
+        status: RuntimeStatus::Exited,
+        terminal_id: "t1".into(),
+        attempt: None,
+        max_attempts: None,
+        exit_code: None,
+        reason: Some("pane_closed".into()),
+        resume_cycles: Some(3),
+    });
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json["type"], "terminal.status");
+    assert_eq!(json["status"], "exited");
+    assert_eq!(json["resumeCycles"], 3);
+    assert!(
+        json.get("attempt").is_none(),
+        "None fields are skip-serialized"
+    );
+    let back: ServerMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(back, msg);
+}
