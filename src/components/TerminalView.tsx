@@ -32,10 +32,11 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import {
-  AUTO_RESUME_NOTICE_TTL_MS,
+  clearRecoveringNotices,
   clearTerminalLifecycle,
   foldTerminalReplacement,
   recordAutoResumeRecovering,
+  recordAutoResumeSettled,
   recordTerminalExit,
   selectActiveNotice,
   selectExitRecord,
@@ -604,19 +605,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // terminalId — the exit handler clears paneContent.terminalId, so an exited
   // pane has no terminal id to key by.
   const exitRecord = useAppSelector((s) => selectExitRecord(s, paneId))
-  const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId, Date.now()))
-  // Deterministic notice→alert degradation: a 'recovering' notice orphaned by
-  // a SILENT auto-resume settle (respawn_failed / session_lease_held /
-  // session_owned_live / pane_closed — none emits a frame) would otherwise
-  // only flip to the error bar "whenever something else re-renders". Schedule
-  // exactly one re-render at TTL expiry so selectActiveNotice re-evaluates.
-  const [, setNoticeExpiryTick] = useState(0)
-  useEffect(() => {
-    if (!activeNotice) return
-    const delay = Math.max(0, activeNotice.at + AUTO_RESUME_NOTICE_TTL_MS - Date.now() + 1)
-    const timer = window.setTimeout(() => setNoticeExpiryTick((n) => n + 1), delay)
-    return () => window.clearTimeout(timer)
-  }, [activeNotice])
+  // Frame-driven notice (znhn item 3): every settle path now broadcasts a
+  // terminal.status{exited} settle frame, so the old 30s TTL guessing
+  // apparatus (selector filter + expiry re-render timer) is deleted. A
+  // missed frame is corrected by the reconnect backstop (D-3) below.
+  const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId))
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -4374,6 +4367,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               at: Date.now(),
             }))
           }
+          // Settle frame (znhn item 3): the deterministic end of an
+          // auto-resume story — clears the recovering notice on a FRAME,
+          // never a timer. Hard rule (D-1, validated A1/A6): dispatches ONLY
+          // into terminalLifecycleSlice — NEVER pane content/status. Cross-
+          // channel ordering vs terminal.exit is unguaranteed (unbiased
+          // select!, terminal.rs:325-334); the running|recovering content-
+          // write allowlist below is the load-bearing barrier that keeps an
+          // out-of-order 'exited' frame away from pane content.
+          if (statusMine && msg.status === 'exited') {
+            dispatch(
+              recordAutoResumeSettled({
+                paneId: paneIdRef.current,
+                resumeCycles: msg.resumeCycles,
+                at: Date.now(),
+              })
+            )
+          }
           if (msg.terminalId === tid) {
             if (
               msg.status === 'running'
@@ -4932,6 +4942,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
 
       unsubReconnect = ws.onReconnect(() => {
+        // D-3 backstop: any missed settle/replaced frame necessarily passed
+        // through this reconnect (bounded broadcast, no replay; lag force-
+        // closes the socket). Stale recovering notices must not survive it.
+        dispatch(clearRecoveringNotices())
         const tid = terminalIdRef.current
         if (debugRef.current) log.debug('[TRACE resumeSessionId] onReconnect', {
           paneId: paneIdRef.current,
@@ -5350,6 +5364,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 intent: 'respawn',
                 sessionRef: terminalContent.sessionRef,
               }))
+            }}
+            onCancelAutoResume={() => {
+              // znhn item 2: the recovering frame carries the OLD terminal id
+              // — the same id the server keys the pending resume by.
+              const lastTid = selectLastTerminalIdFrom(
+                appStore.getState().terminalLifecycle,
+                paneId
+              )
+              if (lastTid) ws.send({ type: 'terminal.autoResumeCancel', terminalId: lastTid })
             }}
           />
         </div>

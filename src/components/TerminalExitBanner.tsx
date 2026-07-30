@@ -10,19 +10,30 @@ export interface TerminalExitBannerProps {
   exitCode: number | null
   notice: AutoResumeNotice | null
   onRelaunch: () => void
+  onCancelAutoResume: () => void
 }
 
-export function TerminalExitBanner({ mode, exitCode, notice, onRelaunch }: TerminalExitBannerProps) {
+export function TerminalExitBanner({ mode, exitCode, notice, onRelaunch, onCancelAutoResume }: TerminalExitBannerProps) {
   if (notice) {
     const verb = notice.kind === 'recovering' ? 'auto-resuming' : 'auto-resumed'
     return (
       <div
         role="status"
-        className="flex items-center gap-2 border-t border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-sm text-amber-600 dark:text-amber-400"
+        className="flex items-center justify-between gap-2 border-t border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-sm text-amber-600 dark:text-amber-400"
       >
         <span>
           {mode} crashed (exit {notice.exitCode}) — {verb}, attempt {notice.attempt}/{notice.maxAttempts}
         </span>
+        {notice.kind === 'recovering' && (
+          <button
+            type="button"
+            aria-label={`Cancel auto-resume for ${mode}`}
+            className="shrink-0 rounded border border-amber-500/40 px-2 py-0.5 text-xs font-medium hover:bg-amber-500/20"
+            onClick={onCancelAutoResume}
+          >
+            Stop
+          </button>
+        )}
       </div>
     )
   }
