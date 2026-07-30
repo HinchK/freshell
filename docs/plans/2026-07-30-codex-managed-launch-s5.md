@@ -1700,7 +1700,14 @@ git commit -m "feat(ws): activity-hub lane for codex proxy turn events (S5.a)"
 - [ ] **Step 1: Write the failing tests**
 
 Create `crates/freshell-ws/src/codex_proxy_route.rs` with the module skeleton and tests
-FIRST (tests drive the routing contract). For WsState construction, copy the test-state
+FIRST (tests drive the routing contract), and IN THIS SAME STEP add
+`pub mod codex_proxy_route;` to `crates/freshell-ws/src/lib.rs` (next to
+`codex_association`'s declaration). The declaration must land with the tests: an
+undeclared `src/*.rs` file is not part of the crate graph, so without it Step 2's
+`cargo test -p freshell-ws codex_proxy_route` would compile the unchanged crate, run 0
+tests, and exit 0 — a vacuous pass instead of the required RED (same trap class as
+ledger A26). With the module declared, the tests reference the not-yet-written router
+functions and the compile fails for the right reason. For WsState construction, copy the test-state
 builder used by the in-module test in `codex_association.rs` (its test at `:254` constructs a
 `WsState` directly — reuse the same construction, including a subscribable `broadcast_tx`):
 
@@ -1985,9 +1992,10 @@ async fn route_candidate(
 }
 ```
 
-Add `pub mod codex_proxy_route;` to `crates/freshell-ws/src/lib.rs` (next to
-`codex_association`'s declaration). Note `CodexAdoption` is `pub(crate)` — the router lives
-in the same crate, so no visibility change is needed.
+The `pub mod codex_proxy_route;` declaration in `crates/freshell-ws/src/lib.rs` already
+landed in Step 1 (it must accompany the tests so Step 2's RED is real). Note
+`CodexAdoption` is `pub(crate)` — the router lives in the same crate, so no visibility
+change is needed.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
