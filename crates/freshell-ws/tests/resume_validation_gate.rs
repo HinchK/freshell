@@ -904,3 +904,148 @@ async fn server_allocated_fresh_amplifier_id_is_never_gated() {
 
     registry.kill_all();
 }
+
+// ── gate-vs-plan ORDER probe (case 7b) ──────────────────────────────────────
+
+/// [`StubProbe`] + a gate-before-plan ORDER latch: on the FIRST `exists`
+/// consult for the watched `(provider, session_id)`, records whether
+/// managed-launch planning had ALREADY spawned the codex app-server sidecar
+/// (the fixture's `FAKE_CODEX_APP_SERVER_ARG_LOG` file exists on disk).
+///
+/// Determinism: the fixture writes the arg-log SYNCHRONOUSLY at process
+/// startup, before it ever listens, and `plan_codex_managed_launch` awaits
+/// the sidecar listening — so by the time any plan completes the marker
+/// exists. Both orderings under test are sequential awaits on the same task
+/// (plan-then-gate pre-fix, gate-then-plan post-fix), so the latch value is
+/// not load-sensitive.
+struct GateOrderProbe {
+    provider: String,
+    session_id: String,
+    answer: SessionExistence,
+    planning_marker: std::path::PathBuf,
+    planning_started_before_gate: std::sync::Mutex<Option<bool>>,
+}
+
+impl SessionExistenceProbe for GateOrderProbe {
+    fn exists(&self, provider: &str, session_id: &str) -> SessionExistence {
+        if provider == self.provider && session_id == self.session_id {
+            let mut latch = self.planning_started_before_gate.lock().unwrap();
+            if latch.is_none() {
+                *latch = Some(self.planning_marker.exists());
+            }
+            return self.answer;
+        }
+        SessionExistence::Unknown
+    }
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        false
+    }
+}
+
+/// Case 7b — the ORDER behind case 7's pin, made directly observable: the
+/// disk-existence gate must consult the probe for a stale WIRE codex resume
+/// id BEFORE managed-launch planning spawns any app-server sidecar
+/// (gate-before-plan). Post-#589, restore-class codex planning runs
+/// OFF-permit in `prepare_launch`; without an off-permit gate the stale id
+/// undergoes sidecar planning FIRST and the gate only fires afterwards.
+/// Case 7 is blind to that ordering (the stale-planned sidecar is silently
+/// adopted and the TUI argv derives from post-gate state) — this pin is not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
+async fn managed_default_stale_codex_id_probe_consulted_before_any_planning() {
+    // Managed leg: the flag stays UNSET (default ON), mirroring case 7.
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+
+    let stale_id = "3f9d2c81-6a4e-4b7f-9c0d-5e8a1b2c3d4f"; // definitively absent
+    let capture_path = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-argv-{}.json",
+        std::process::id()
+    ));
+    // The committed fake-app-server fixture writes this file synchronously at
+    // startup (before `new WebSocketServer`) when the env var is set — it
+    // exists on disk ⟺ sidecar planning has begun.
+    let planning_marker = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-planned-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture_path);
+    let _ = std::fs::remove_file(&planning_marker);
+    let dispatcher = write_codex_dispatcher();
+    std::env::set_var("CODEX_CMD", &dispatcher);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture_path);
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &planning_marker);
+    let codex_home = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-codex-home-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::env::set_var("CODEX_HOME", &codex_home);
+
+    let probe = Arc::new(GateOrderProbe {
+        provider: "codex".into(),
+        session_id: stale_id.into(),
+        answer: SessionExistence::Absent,
+        planning_marker: planning_marker.clone(),
+        planning_started_before_gate: std::sync::Mutex::new(None),
+    });
+    let (url, registry, _ledger, _state) =
+        spawn_managed_codex_server_with_probe(probe.clone(), true).await;
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(
+        &mut ws,
+        &restore_create_with_legacy_resume_id("req-gate-7b", "codex", stale_id),
+    )
+    .await;
+
+    // Preconditions (case 7's own pins): the gate fired as a fresh spawn with
+    // the operator notice…
+    let created = next_created_or_error(&mut ws, "req-gate-7b").await;
+    assert_eq!(
+        created["type"], "terminal.created",
+        "the gate-fired create must SUCCEED as a fresh spawn, got {created}"
+    );
+    let notice = notice_of(&created).expect("gate must set the stale-resume notice");
+    assert!(
+        notice.contains(stale_id),
+        "notice names the stale id: {notice}"
+    );
+
+    // …and the fresh spawn still went managed — planning DID run (this guards
+    // the ordering latch against a vacuous pass where nothing was planned).
+    let argv = wait_for_captured_argv(&capture_path);
+    assert_eq!(
+        argv[0], "--remote",
+        "fresh spawn must still plan managed launch"
+    );
+    assert!(
+        planning_marker.exists(),
+        "the codex app-server sidecar must have spawned (planning happened)"
+    );
+
+    let planning_before_gate = *probe.planning_started_before_gate.lock().unwrap();
+
+    // Cleanup BEFORE the ordering assertion so a RED run still tears down.
+    registry.kill_all();
+    std::env::remove_var("CODEX_CMD");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+    std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
+    std::env::remove_var("CODEX_HOME");
+    let _ = std::fs::remove_file(&capture_path);
+    let _ = std::fs::remove_file(&planning_marker);
+
+    // THE pin: gate-before-plan. `Some(true)` means the app-server sidecar
+    // was already up when the gate first consulted the probe for the stale
+    // id — i.e. the stale WIRE resume id underwent off-permit
+    // `plan_codex_managed_launch` BEFORE the disk-existence gate could drop
+    // it, and the create then silently inherited the stale-planned sidecar.
+    let planning_before_gate = planning_before_gate
+        .expect("the disk-existence gate must consult the probe for the stale codex id");
+    assert!(
+        !planning_before_gate,
+        "GATE-BEFORE-PLAN VIOLATED: managed-launch planning spawned a codex app-server \
+         sidecar BEFORE the disk-existence gate consulted the probe for stale id \
+         {stale_id} — the stale wire resume id underwent off-permit \
+         plan_codex_managed_launch ahead of the gate"
+    );
+}
