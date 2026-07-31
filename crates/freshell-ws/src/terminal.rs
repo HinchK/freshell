@@ -72,6 +72,10 @@ use crate::WsState;
 #[path = "terminal_create_ordering_tests.rs"]
 mod terminal_create_ordering_tests;
 
+#[cfg(test)]
+#[path = "terminal_launch_prep_tests.rs"]
+mod terminal_launch_prep_tests;
+
 /// The write half of a split axum WebSocket.
 pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
