@@ -6,7 +6,7 @@ import { setVirtualDeckOpen, type DeckSliceState } from '@/store/deckSlice'
 import { requestDeckConnect } from '@/deck/deck-manager'
 import { isElectronClient, isWebHidSupported } from '@/lib/webhid-support'
 import type { SettingsSectionProps } from './settings-types'
-import type { DeckTileStyle } from '../../../shared/settings'
+import type { DeckTileStyle, DeckKeyLayout } from '../../../shared/settings'
 import {
   SettingsSection,
   SettingsRow,
@@ -90,6 +90,25 @@ export default function StreamDeckSettings({
           onChange={(v: string) => {
             const tileStyle = v as DeckTileStyle
             applyLocalSetting({ streamDeck: { tileStyle } })
+          }}
+        />
+      </SettingsRow>
+
+      <SettingsRow
+        label="Key layout"
+        description="Auto uses Newest first on small decks (6 keys or fewer) and Status sorted on larger ones. Newest first pins the pager top-left and mirrors the tab bar in reverse — newest tabs first — in stable positions. Status sorted orders keys by attention, with a pager only on overflow."
+      >
+        <SegmentedControl
+          value={streamDeck.keyLayout}
+          aria-label="Key layout"
+          options={[
+            { value: 'auto', label: 'Auto' },
+            { value: 'newest-first', label: 'Newest first' },
+            { value: 'status-sorted', label: 'Status sorted' },
+          ]}
+          onChange={(v: string) => {
+            const keyLayout = v as DeckKeyLayout
+            applyLocalSetting({ streamDeck: { keyLayout } })
           }}
         />
       </SettingsRow>

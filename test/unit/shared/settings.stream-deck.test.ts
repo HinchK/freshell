@@ -7,6 +7,7 @@ import {
   resolveLocalSettings,
 } from '@shared/settings'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
+import { parseBrowserPreferencesRaw } from '@/lib/browser-preferences'
 
 describe('streamDeck local settings section', () => {
   it('has safe defaults', () => {
@@ -16,6 +17,7 @@ describe('streamDeck local settings section', () => {
       idleBrightness: 10,
       idleTimeoutSeconds: 300,
       tileStyle: 'status-icons',
+      keyLayout: 'auto',
     })
   })
 
@@ -29,6 +31,7 @@ describe('streamDeck local settings section', () => {
       idleBrightness: 10,
       idleTimeoutSeconds: 60,
       tileStyle: 'status-icons',
+      keyLayout: 'auto',
     })
     const patch = buildLocalSettingsPatch(resolved)
     expect(patch.streamDeck).toEqual({ enabled: true, idleTimeoutSeconds: 60 })
@@ -83,5 +86,38 @@ describe('streamDeck.tileStyle', () => {
   it('produces no persisted entry at the default value', () => {
     const local = resolveLocalSettings({})
     expect(buildLocalSettingsPatch(local).streamDeck?.tileStyle).toBeUndefined()
+  })
+})
+
+describe('streamDeck.keyLayout', () => {
+  it('defaults to auto', () => {
+    expect(defaultLocalSettings.streamDeck.keyLayout).toBe('auto')
+  })
+
+  it('round-trips newest-first through patch normalization and persistence', () => {
+    const resolved = resolveLocalSettings({
+      streamDeck: { keyLayout: 'newest-first' },
+    })
+    expect(resolved.streamDeck.keyLayout).toBe('newest-first')
+    const patch = buildLocalSettingsPatch(resolved)
+    expect(patch.streamDeck?.keyLayout).toBe('newest-first')
+  })
+
+  it('drops invalid keyLayout values during extraction', () => {
+    const seed = extractLegacyLocalSettingsSeed({
+      streamDeck: { keyLayout: 'sideways' },
+    })
+    expect(seed?.streamDeck?.keyLayout).toBeUndefined()
+  })
+
+  it('produces no persisted entry at the default value', () => {
+    const local = resolveLocalSettings({})
+    expect(buildLocalSettingsPatch(local).streamDeck?.keyLayout).toBeUndefined()
+  })
+
+  it('survives the reload path: a parsed browser-preferences record preserves streamDeck.keyLayout', () => {
+    const raw = JSON.stringify({ settings: { streamDeck: { keyLayout: 'newest-first' } } })
+    const record = parseBrowserPreferencesRaw(raw)
+    expect(record?.settings?.streamDeck?.keyLayout).toBe('newest-first')
   })
 })

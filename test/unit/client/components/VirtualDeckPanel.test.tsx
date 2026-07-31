@@ -15,7 +15,7 @@ import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
 import deckReducer, { setVirtualDeckOpen } from '@/store/deckSlice'
@@ -88,13 +88,61 @@ describe('VirtualDeckPanel', () => {
     expect(screen.getAllByRole('button', { name: /deck key/i })).toHaveLength(6)
   })
 
-  it('clicking key 2 focuses tab 2 in the store (short press)', () => {
+  it('clicking key 2 focuses the last tab in tab-bar order (default auto layout is reversed on Mini; key 1 is the pager)', () => {
+    // The real settings reducer defaults keyLayout to 'auto', which resolves
+    // REVERSED on the 6-key Mini: physical key 0 ('Deck key 1') is the pager,
+    // and 'Deck key 2' (physical key 1) shows the LAST tab in tab-bar order (t2).
     const store = renderPanel()
     openPanel(store)
     expect(store.getState().tabs.activeTabId).toBe('t1')
     const key2 = screen.getByRole('button', { name: 'Deck key 2' })
     fireEvent.pointerDown(key2)
     fireEvent.pointerUp(key2)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+    // Pressing the pager key is a page wrap, never a focus change.
+    const key1 = screen.getByRole('button', { name: 'Deck key 1' })
+    fireEvent.pointerDown(key1)
+    fireEvent.pointerUp(key1)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('Mini defaults to newest-first: Deck key 1 is the pager and Deck key 2 focuses the newest tab', () => {
+    // Default settings keyLayout 'auto' + MINI_CAPS (6 keys) => reversed
+    // arrangement. This test pins the DEFAULT itself, not a seeded value.
+    const store = renderPanel()
+    openPanel(store)
+    expect(store.getState().settings.settings.streamDeck.keyLayout).toBe('auto')
+    expect(store.getState().tabs.activeTabId).toBe('t1')
+    // Deck key 2 (physical key index 1) shows the LAST tab in tab-bar order.
+    const key2 = screen.getByRole('button', { name: 'Deck key 2' })
+    fireEvent.pointerDown(key2)
+    fireEvent.pointerUp(key2)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+    // Deck key 1 is the pager; with a single page pressing it changes no tab.
+    const key1 = screen.getByRole('button', { name: 'Deck key 1' })
+    fireEvent.pointerDown(key1)
+    fireEvent.pointerUp(key1)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('Plus profile honors an explicit Newest first selection (pager on Deck key 1)', () => {
+    const store = renderPanel()
+    openPanel(store)
+    act(() => {
+      store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Plus' }))
+    expect(screen.getAllByRole('button', { name: /deck key/i })).toHaveLength(8)
+    // Reversed on the 8-key Plus too: Deck key 2 (physical index 1) is the
+    // newest tab (t2, last in tab-bar order).
+    const key2 = screen.getByRole('button', { name: 'Deck key 2' })
+    fireEvent.pointerDown(key2)
+    fireEvent.pointerUp(key2)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+    // Deck key 1 stays the pager: pressing it never changes the active tab.
+    const key1 = screen.getByRole('button', { name: 'Deck key 1' })
+    fireEvent.pointerDown(key1)
+    fireEvent.pointerUp(key1)
     expect(store.getState().tabs.activeTabId).toBe('t2')
   })
 

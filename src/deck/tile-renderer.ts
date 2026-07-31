@@ -53,6 +53,11 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
+/** Icons-style banner title. 2px smaller than the classic banner: 16px read
+ * too large on 72-80px keys. The classic terminal-previews banner is PINNED
+ * and keeps TITLE_FONT_SIZE = 16. Fit math needs no change: fitLabel is
+ * measure-driven and Chromium's measureText scales with ctx.font. */
+export const ICONS_TITLE_FONT_SIZE = 14
 /** Subtle tracking for deck text. Chromium-only canvas API — the deck's only
  * supported surface. Set BEFORE measureText so fitLabel includes the tracking
  * (Chromium adds it after every glyph, matching the test stub's model). */
@@ -67,10 +72,15 @@ export const TITLE_SIDE_PADDING = 6
 // hues must stay the app's (see docs/plans/2026-07-29-deck-icons-polish.md).
 //
 //   deck constant     <- app source token (where it lives)                 value
-//   TILE_BG           <- --background dark  (src/theme-variables.css)      hsl(240 10% 4%)  = #09090b
-//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab) #d1fae5
-//                        light-theme variant: the dark-theme emerald-900/40
-//                        fill is illegible at key size on the LCD.
+//   TILE_BG           <- deck-only pure black (was --background dark #09090b).
+//                        Matches EMPTY_BG, so unfilled tiles read as plain
+//                        black keys: only banner/icons/rings carry state.     #000000
+//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab)    #d1fae5
+//                        precomposited at 50% opacity over the black tile:
+//                        round(c/2) per channel -> rgb(105,125,115) = #697d73.
+//                        Same hue as the tab bar's green, dark enough for the
+//                        LCD. Both fill states (green + barTop) use it; the
+//                        barTop BORDER stays full-strength BAR_TOP_BORDER.
 //   BAR_TOP_BORDER    <- border-t-success / --success (TabItem bar-on-top) hsl(142 71% 45%) = #21c45d
 //   STATUS_* pane-icon tints (text-success, text-blue-500, ...) live in
 //   pane-tint-colors.ts — shared with frame.ts, which computes the tinted
@@ -87,8 +97,8 @@ export const TITLE_SIDE_PADDING = 6
 //   deliberately not re-derived (that style must not change).
 // ============================================================================
 
-export const TILE_BG = '#09090b'
-export const TILE_FILL_GREEN = '#d1fae5'
+export const TILE_BG = '#000000'
+export const TILE_FILL_GREEN = '#697d73'
 export const BAR_TOP_BORDER = '#21c45d'
 export const ACTIVE_COLOR = '#ffffff'
 export const ICON_GAP = 3
@@ -310,11 +320,11 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   ctx.letterSpacing = TEXT_LETTER_SPACING
   // Weight rule: 400 everywhere, EXCEPT where the deck mirrors the app UI —
   // the letter avatar and +N badge keep RepoIcon's 600 (see RepoIcon.tsx).
-  ctx.font = `400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${ICONS_TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 2 * TITLE_SIDE_PADDING)
-  drawCenteredText(ctx, label, w, 2)
+  drawCenteredText(ctx, label, w, Math.round((BANNER_HEIGHT - ICONS_TITLE_FONT_SIZE) / 2))
 
   // 4. Borders/rings: barTop green border; white ring marks the active tab.
   if (spec.fill === 'barTop') {

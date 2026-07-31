@@ -4,7 +4,7 @@ import {
   cropPreviewLines, drawRing, fitLabel, iconLayout, keyFrameGeometry, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, EMPTY_BG, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BANNER_FILL, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
-  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
+  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, ICONS_TITLE_FONT_SIZE, STRIP_FONT_SIZE,
   MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE, BANNER_HEIGHT, ICON_ROW_SIDE_INSET,
   TEXT_LETTER_SPACING, TITLE_SIDE_PADDING,
   ensureRoundRect,
@@ -106,6 +106,19 @@ describe('title fitting', () => {
     expect(fitLabel(measure, 'abcdef', 100)).toBe('abcdef')
     expect(fitLabel(measure, 'abcdefghij', 30)).toBe('abcd…')
   })
+  it('icons banner title is 14px and vertically centered in the 20px banner', () => {
+    // Literal pins on purpose: an interpolated pin cannot catch drift.
+    expect(ICONS_TITLE_FONT_SIZE).toBe(14)
+    const { texts } = renderTab(tabSpec({ title: 'build' }))
+    const title = texts.find((t) => t.text === 'build')
+    expect(title?.font).toBe('400 14px Inter, sans-serif')
+    // y = Math.round((BANNER_HEIGHT - ICONS_TITLE_FONT_SIZE) / 2) = (20 - 14) / 2 = 3
+    expect(title?.y).toBe(3)
+  })
+  it('classic preview banner stays PINNED at literal 16px sans-serif (does not follow the icons shrink)', () => {
+    const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
+    expect(texts.find((t) => t.text === 'build')?.font).toBe('16px sans-serif')
+  })
 })
 
 describe('drawRing', () => {
@@ -163,7 +176,7 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
 }
 
 describe('renderKey', () => {
-  it('no-fill tile: near-black bg, banner, white title, no rings, no dot, no preview text', () => {
+  it('no-fill tile: pure-black bg, banner, white title, no rings, no dot, no preview text', () => {
     const { out, rects, texts, strokes } = renderTab(tabSpec())
     expect(out).toBeInstanceOf(Uint8ClampedArray)
     expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
@@ -173,12 +186,12 @@ describe('renderKey', () => {
     expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
-  it('green fill state paints the light-green background', () => {
+  it('green fill state paints the darker composited green background', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
     expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_FILL_GREEN })
   })
 
-  it('barTop state paints light-green background + 3px green border ring', () => {
+  it('barTop state paints the darker composited green background + full-strength 3px green border ring', () => {
     const { rects, strokes } = renderTab(tabSpec({ fill: 'barTop', active: true }))
     expect(rects[1].style).toBe(TILE_FILL_GREEN)
     expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: BAR_TOP_BORDER, lineWidth: 3 })
@@ -323,7 +336,7 @@ describe('renderKey preview style', () => {
 
   it('icons style still renders fills (dispatch regression)', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // emerald-100 green fill
+    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // composited green fill (emerald-100 @ 50% over black)
   })
 })
 
@@ -333,7 +346,7 @@ describe('fonts (Inter)', () => {
       tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     const title = texts.find((t) => t.text === 'build')
-    expect(title?.font).toBe(`400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(title?.font).toBe('400 14px Inter, sans-serif')
     const letter = texts.find((t) => t.text === 'B')
     const slot = iconLayout(80, 80, 1)[0]
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * (9 / 16))}px ${DECK_FONT_STACK}`)
@@ -364,7 +377,7 @@ describe('fonts (Inter)', () => {
   it('classic preview tile is PINNED: monospace body, sans-serif banner', () => {
     const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
     expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
-    expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+    expect(texts.find((t) => t.text === 'build')?.font).toBe('16px sans-serif')
   })
 })
 
@@ -422,8 +435,8 @@ describe('letter spacing', () => {
 
 describe('palette derives from the app UI tokens (mapping block in tile-renderer.ts)', () => {
   it('matches the documented app-token values', () => {
-    expect(TILE_BG).toBe('#09090b')          // --background dark: hsl(240 10% 4%)
-    expect(TILE_FILL_GREEN).toBe('#d1fae5')  // bg-emerald-100 (TabItem green-filled tab)
+    expect(TILE_BG).toBe('#000000')          // deck-only pure black (matches EMPTY_BG surround)
+    expect(TILE_FILL_GREEN).toBe('#697d73')  // emerald-100 #d1fae5 @ 50% over black, precomputed
     expect(BAR_TOP_BORDER).toBe('#21c45d')   // --success: hsl(142 71% 45%)
     expect(STATUS_GREEN).toBe('#21c45d')     // text-success (pane running tint)
     expect(STATUS_BLUE).toBe('#3b82f6')      // text-blue-500 (pane busy tint)
@@ -436,6 +449,17 @@ describe('palette derives from the app UI tokens (mapping block in tile-renderer
     expect(CONTROL_DIM).toBe('#a1a1aa')      // text-muted-foreground dark
     expect(APPROVE_COLOR).toBe('#21c45d')    // --success
     expect(STOP_COLOR).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%)
+  })
+
+  it('TILE_FILL_GREEN is emerald-100 composited at 50% opacity over black (round(c/2) per channel)', () => {
+    // #d1fae5 = rgb(209,250,229) -> rgb(105,125,115) = #697d73. Same hue, darker.
+    const composite = ['d1', 'fa', 'e5']
+      .map((h) => Math.round(parseInt(h, 16) / 2).toString(16).padStart(2, '0'))
+      .join('')
+    expect(TILE_FILL_GREEN).toBe(`#${composite}`)
+    // Borders stay full strength: the barTop BORDER is NOT darkened.
+    expect(BAR_TOP_BORDER).toBe('#21c45d')
+    expect(ACTIVE_COLOR).toBe('#ffffff')
   })
 
   it('classic previews palette is PINNED', () => {

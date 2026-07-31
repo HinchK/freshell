@@ -21,7 +21,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 
 function renderSection(
-  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const },
+  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const, keyLayout: 'auto' as const },
 ) {
   const store = configureStore({ reducer: { deck: deckReducer, settings: settingsReducer } })
   const applyLocalSetting = vi.fn()
@@ -156,5 +156,19 @@ describe('StreamDeckSettings', () => {
     const { applyLocalSetting } = renderSection()
     fireEvent.click(screen.getByRole('button', { name: /terminal previews/i }))
     expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { tileStyle: 'terminal-previews' } })
+  })
+
+  it('offers the key layout choice with Auto selected by default', () => {
+    renderSection()
+    const group = screen.getByRole('group', { name: /key layout/i })
+    expect(within(group).getByRole('button', { name: 'Auto' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(group).getByRole('button', { name: 'Newest first' })).toHaveAttribute('aria-pressed', 'false')
+    expect(within(group).getByRole('button', { name: 'Status sorted' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('selecting Newest first patches streamDeck.keyLayout', () => {
+    const { applyLocalSetting } = renderSection()
+    fireEvent.click(within(screen.getByRole('group', { name: /key layout/i })).getByRole('button', { name: 'Newest first' }))
+    expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { keyLayout: 'newest-first' } })
   })
 })

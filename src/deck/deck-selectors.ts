@@ -9,8 +9,9 @@ import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-icon'
 import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import type { DeckTileStyle } from '@shared/settings'
+import type { DeckKeyLayout, DeckTileStyle } from '@shared/settings'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { getTabDisplayTitle } from '@/lib/tab-title'
 
 export type TilePaneTint = 'blue' | 'green' | 'amber' | 'red' | 'mutedDim' | 'muted'
 export type TilePaneIcon = { provider: string; tint: TilePaneTint }
@@ -25,10 +26,12 @@ export type DeckTab = {
   fill: TileFill
   dot: TileDot
   priority: number
+  /** Position in the tab bar (index into state.tabs.tabs), surviving any model-level sort. */
+  tabIndex: number
   repoIcons: TileRepoIcon[]
   paneIcons: TilePaneIcon[]
 }
-export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null; tileStyle: DeckTileStyle }
+export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null; tileStyle: DeckTileStyle; keyLayout: DeckKeyLayout }
 
 function activityInputs(state: RootState) {
   return {
@@ -200,12 +203,15 @@ export function getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags {
 export function selectDeckModel(state: RootState): DeckModel {
   const activeTabId = state.tabs.activeTabId
   const tileStyle = state.settings.settings.streamDeck.tileStyle
-  const tabs = state.tabs.tabs.map((tab) => {
+  const tabs = state.tabs.tabs.map((tab, index) => {
     const active = tab.id === activeTabId
     const flags = getTabStatusFlags(state, tab)
     return {
       id: tab.id,
-      title: tab.title,
+      // Same label the tab bar displays (custom title, else derived default such as
+      // the working-directory basename) — reuse the tab bar's derivation verbatim.
+      // extensions uses ?. because unit-test stores may omit that reducer.
+      title: getTabDisplayTitle(tab, state.panes.layouts[tab.id], state.panes.paneTitles?.[tab.id], state.extensions?.entries),
       active,
       busy: flags.busy,
       attention: flags.attention,
@@ -213,6 +219,7 @@ export function selectDeckModel(state: RootState): DeckModel {
       fill: tileFill(active, flags),
       dot: tileDot(flags),
       priority: tilePriority(active, flags),
+      tabIndex: index,
       repoIcons: getTabRepoIcons(state, tab),
       paneIcons: getTabPaneIcons(state, tab),
     }
@@ -224,7 +231,7 @@ export function selectDeckModel(state: RootState): DeckModel {
     // Classic terminal-previews style keeps raw tab-bar order (pre-redesign behavior).
     tabs.sort((a, b) => a.priority - b.priority)
   }
-  return { activeTabId, tabs, tileStyle }
+  return { activeTabId, tabs, tileStyle, keyLayout: state.settings.settings.streamDeck.keyLayout }
 }
 
 export type ApproveTarget = {

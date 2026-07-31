@@ -4,7 +4,7 @@ const sendMock = vi.fn()
 vi.mock('@/lib/ws-client', () => ({ getWsClient: () => ({ send: sendMock }) }))
 
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { closeTab } from '@/store/tabsSlice'
+import tabsReducer, { addTab, closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import turnCompletionReducer, { markTabAttention } from '@/store/turnCompletionSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
@@ -17,7 +17,7 @@ import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer, { upsertTerminalMeta } from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import type { DeckTileStyle } from '@shared/settings'
+import type { DeckKeyLayout, DeckTileStyle } from '@shared/settings'
 import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
@@ -55,6 +55,15 @@ type StoreOpts = {
    * streamDeck settings object, so the two are always consistent there.
    */
   tileStyle?: DeckTileStyle
+  /**
+   * Key layout. Seeds the store settings (selectDeckModel reads
+   * state.settings.settings.streamDeck.keyLayout); the controller's settings()
+   * thunk does not carry keyLayout. Defaults to 'status-sorted': existing tests
+   * document the STANDARD arrangement explicitly ('auto' resolves REVERSED on
+   * <= 6-key decks and would silently flip Mini-based fixtures); 'auto'
+   * resolution and the reversed arrangement have dedicated tests.
+   */
+  keyLayout?: DeckKeyLayout
 }
 
 // Mirrors the Task 3 fixture builder, parameterized by tab count: tabs t1..tN,
@@ -123,6 +132,7 @@ function makeStore(opts: StoreOpts = {}) {
   if (opts.tileStyle !== undefined) {
     store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
   }
+  store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: opts.keyLayout ?? 'status-sorted' } }))
   return store
 }
 
@@ -455,5 +465,91 @@ describe('DeckController', () => {
     expect(store.getState().repoIcons.byCwd['/repos/alpha']).toBeUndefined()
     store.dispatch(upsertTerminalMeta([{ terminalId: 'term-1', cwd: '/repos/alpha', updatedAt: Date.now() }]))
     expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
+  })
+
+  it('reversed: pager pinned to key 0; newest tab on key 1; press advances and wraps', () => {
+    const { device } = setup({ tabCount: 8, keyLayout: 'newest-first' }) // MINI: 5 tabs/page -> 2 pages
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't8' }) // last tab in the bar
+    expect(decodeKey(device, 5)).toMatchObject({ kind: 'tab', tabId: 't4' })
+    shortPress(device, 0)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 2, pageCount: 2 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' })
+    shortPress(device, 0) // wraps
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
+  })
+
+  it('reversed: pager press with a single page is a harmless wrap to the same page', () => {
+    const { device } = setup({ tabCount: 2, keyLayout: 'newest-first' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
+    shortPress(device, 0)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2' }) // unchanged
+  })
+
+  it('auto resolves reversed on the 6-key Mini and standard on the 8-key Plus', () => {
+    const mini = setup({ tabCount: 3, keyLayout: 'auto' })
+    expect(decodeKey(mini.device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 1 })
+    expect(decodeKey(mini.device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' })
+    const plus = setup({ tabCount: 3, keyLayout: 'auto' }, PLUS_CAPS)
+    expect(decodeKey(plus.device, 0)).toMatchObject({ kind: 'tab', tabId: 't1' }) // full mode, no pager
+  })
+
+  it('reversed: short press on key 1 focuses the newest tab', () => {
+    const { store, device } = setup({ tabCount: 3, keyLayout: 'newest-first' })
+    shortPress(device, 1)
+    // Mirror the assertion style of 'short press focuses the tab in the browser' (:204)
+    expect(store.getState().tabs.activeTabId).toBe('t3')
+  })
+
+  it('reversed: dial 0 cycles the ARRANGED tab list, not the model order (Plus, newest-first)', () => {
+    const { store, device } = setup({ tabCount: 3, keyLayout: 'newest-first' }, PLUS_CAPS)
+    // Focus t3 (the newest): reversed layout pins the pager to key 0, newest tab on key 1.
+    shortPress(device, 1)
+    expect(store.getState().tabs.activeTabId).toBe('t3')
+    // Arranged list is tabIndex-descending [t3, t2, t1]: +1 from t3 must land on t2.
+    // Cycling the un-arranged model order [t1, t2, t3] would wrap t3 -> t1 instead.
+    device.emit({ type: 'dialRotate', dialIndex: 0, ticks: 1 })
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('reversed: press-snapshot guard - a tab opened mid-press cannot retarget the press', () => {
+    // Mirrors 'acts on the tab displayed at press-down even if the sort changes
+    // mid-press' (:225): keyDown on key 1 (currently t3, the newest), dispatch
+    // the store action that adds a new tab t4 (shifting t3 to key 2), then keyUp
+    // on key 1 - the press must still focus t3, not t4.
+    const { store, device } = setup({ tabCount: 3, keyLayout: 'newest-first' })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' }) // pre-press: newest on key 1
+    device.emit({ type: 'keyDown', keyIndex: 1 }) // user is pressing "t3"
+    // Mid-press: a new tab t4 arrives -> the reversed arrangement moves it to key 1, shifting t3 to key 2.
+    store.dispatch(addTab({ id: 't4', createRequestId: 'c4', title: 'tab4', status: 'running', mode: 'shell' }))
+    // Sanity: the RED gate is armed - t4 really exists and took key 1; t3 moved to key 2.
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3', 't4'])
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't4' })
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3' })
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    // Snapshot guard: the press focuses t3 (what the user saw), not t4 (what the slot shows now)
+    expect(store.getState().tabs.activeTabId).toBe('t3')
+  })
+
+  it('switching key layout live re-arranges keys and preserves the page when tabsPerPage is unchanged', () => {
+    const { store, device } = setup({ tabCount: 8, keyLayout: 'status-sorted' })
+    expect(decodeKey(device, 5)).toMatchObject({ kind: 'pager' }) // standard overflow pager, bottom-right
+    shortPress(device, 5) // go to page 2 in standard
+    store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 2, pageCount: 2 }) // page preserved: tabsPerPage unchanged (5), clampPage(2, 2) === 2
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't3' }) // reversed page 2 shows t3, t2, t1
+  })
+
+  it('switching key layout resets to page 1 when tabsPerPage changes (Plus: 8/page -> 7/page)', () => {
+    const { store, device } = setup({ tabCount: 9, keyLayout: 'status-sorted' }, PLUS_CAPS)
+    // Full mode standard: no pager key, 8 tabs/page -> 2 pages; page via dial 1.
+    device.emit({ type: 'dialRotate', dialIndex: 1, ticks: 1 })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't9' }) // page 2 in standard
+    store.dispatch(updateSettingsLocal({ streamDeck: { keyLayout: 'newest-first' } }))
+    // tabsPerPage changed 8 -> 7: the existing tabsPerPage-change reset fires -> page 1.
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't9' }) // reversed page 1 starts with the newest
   })
 })
