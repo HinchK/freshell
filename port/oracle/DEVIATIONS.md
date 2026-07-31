@@ -716,6 +716,84 @@ path itself is intact).
   b7a1a8f0a0104fb3-20260726-232357 (distinct from adjudicating reviewer).
 - status: accepted.
 
+### DEV-0010 — Resume validation at the spawn doors (2026-07-29)
+
+**Deviation:** The Node reference passes cached resume session ids straight to
+the coding CLI (`server/terminal-registry.ts` `resolveCodingCliCommand`;
+`normalizeResumeForSpawn` is the identity function — no on-disk existence
+check exists in Node). The Rust server now validates the id against the
+provider's on-disk session store before constructing resume argv, at all three
+spawn doors (WS `terminal.create`, headless auto-resume respawn, freshagent
+REST create). On POSITIVE absence (store readable, session definitively
+absent) it spawns fresh in the same cwd/mode, surfaces an operator notice
+naming the stale id, and retires the pane-ledger binding
+(`RetiredReason::SessionMissing`). Unknown/unreadable stores fail OPEN
+(resume attempted, byte-for-byte Node behavior). Providers validated:
+claude — for SAME-BOOT deletions only (a zero-turn carve-out keeps
+Absent + never-observed-on-disk resuming, and the disk-observation signal
+is a per-boot in-memory set, so a transcript deleted while the server was
+DOWN is indistinguishable from never-conversed and fails OPEN post-restart;
+deliberate, fail-open) — codex, opencode, amplifier. gemini/kimi/third-party
+are never blocked. Known accepted consequence for amplifier (AD-5 in the
+plan): freshell's designed never-used-stub GC deletes a never-typed pane's
+session stub at terminal exit and the spawn doors re-stub the SAME id via
+`ensure_session` on the next resume — after a restart such a pane now spawns
+fresh under a minted id WITH a notice instead of silently re-stubbing the
+same id. Decided and accepted: on disk the GC'd stub is indistinguishable
+from the incident's stale id, and for a never-typed pane the outcome is an
+equivalent empty session either way (reconcile's amplifier Absent carve-out,
+which prevents PARKING such panes in the dead-sessions dialog, is untouched).
+Additive protocol field: optional `notice` on `terminal.created`.
+
+**Reconciliation note (2026-07-30, rebased onto 39010cb57):** codex managed
+sidecar app-server + remote proxy. For codex restore-class creates the gate runs OFF-permit
+inside `prepare_launch`, BEFORE `plan_codex_managed_launch` — gate ⇒ plan (off-permit) ⇒ permit ⇒ spawn — so a
+definitively-absent codex id never consumes a sidecar planning slot. All other modes (WS
+create, headless respawn, REST) keep the on-permit gate in `handle_create` (post-ladder,
+post-D7); the gate outcome is carried via `PreparedLaunch.resume_gate` so notice emission
+and D8 stale-ref lease release stay single-sited. For the fresh spawn it falls back to,
+all modes plan managed launch normally. Pinned by
+`managed_default_stale_codex_id_is_gated_before_planning` in
+`freshell-ws/tests/resume_validation_gate.rs`. The REST door additionally
+threads `claude_fresh_prealloc` through `RestResumeOutcome` so a gate-minted
+fresh claude id receives the #584 PIN 2 pre-spawn identity binding.
+
+**Why:** Production incident 2026-07-29 — after a server restart, freshell
+resumed stored amplifier session id 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 which
+existed nowhere under ~/.amplifier/projects/*/sessions/; the amplifier CLI
+silently created a new empty session under that id and the user saw a broken
+restore with no explanation.
+
+**Pinning tests:** `freshell-platform` `resume_gate` unit tests;
+`freshell-ws/tests/resume_validation_gate.rs` (incl. the live-session/D7
+ordering and legacy-carrier liveness cases — registry AND sidecar arms);
+`freshell-ws/tests/auto_resume_respawn.rs`
+(`respawn_with_absent_session_spawns_fresh_and_retires_binding`, incl. the
+fresh-id bookkeeping assertions);
+`freshell-freshagent` `rest_resume_*` unit tests (incl. minted-v4
+plausibility, healed pane_content stamping, and the live-session
+precondition cases — registry arm with D7-REST-reject preservation AND
+the sidecar-liveness arm);
+`freshell-server` `existence.rs` amplifier/codex by-id fallback,
+cold-index, and sub-root permission tests;
+`freshell-protocol/tests/roundtrip.rs` `notice` wire test.
+
+- objective_defect: *corrupts data / contradicts documented restore behavior* — resuming a
+  session id that no longer exists on disk makes the coding CLI silently mint a NEW empty
+  session under that id (`server/terminal-registry.ts` `resolveCodingCliCommand` passes the
+  cached id to the CLI unchecked; `normalizeResumeForSpawn` is the identity function), so
+  the user's "restored" pane is a broken, empty impostor with no explanation (production
+  incident 2026-07-29, detailed under **Why** above).
+- original_behavior / port_behavior / pinning_test: see **Deviation** and **Pinning tests**
+  above.
+- fingerprint: spawn-door behavior — on positive on-disk absence the port constructs fresh
+  (non-resume) CLI argv where the original constructs resume argv, retires the pane-ledger
+  binding, and emits one additive optional wire field (`notice` on `terminal.created`,
+  absent whenever no stale id was detected — backward-compatible on read).
+- adjudicated_by: pending antagonist review (entry filed by the implementer per the
+  resume-validation plan, Task 9).
+- status: proposed.
+
 ## E2E-discovered intentional divergences (EDEV-xx)
 
 **Scope — READ THIS FIRST.** This section is DELIBERATELY SEPARATE from the DEV-NNNN

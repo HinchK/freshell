@@ -529,6 +529,102 @@ pub(crate) fn derive_resume_identity(
     ))
 }
 
+/// Door 3 (resume-validation): what [`validate_rest_resume`] decided for a
+/// REST create's cached resume id. Mirrors `freshell-ws`'s
+/// `ResumeValidationOutcome` (Task 6), including the claude-prealloc flag
+/// (the healed pane_content stamping falls out of
+/// `plausible_resume_session_id` on the minted id instead).
+struct RestResumeOutcome {
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    /// True when the gate minted a fresh claude id as an absence fallback.
+    /// The REST consumer must run the PIN 2 pre-spawn ledger write exactly
+    /// as a natural fresh-claude create would (main #584), even though a
+    /// resume_session_id is present (it is minted, not resumed).
+    claude_fresh_prealloc: bool,
+    /// Some(stale_id) iff the gate fired: caller clears the accepted wire
+    /// ref (never stamp the stale sessionRef), invokes `on_stale_resume`,
+    /// and injects the notice into the returned `paneContent`.
+    stale_session_id: Option<String>,
+    notice: Option<String>,
+}
+
+/// The Proceed shape — shared by [`validate_rest_resume`] and the wiring
+/// site's live-candidate skip (a LIVE session must never be gated).
+fn rest_resume_passthrough(
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+) -> RestResumeOutcome {
+    RestResumeOutcome {
+        resume_session_id,
+        launch_intent,
+        claude_fresh_prealloc: false,
+        stale_session_id: None,
+        notice: None,
+    }
+}
+
+/// Door 3 gate (resume-validation): before the REST create pipeline turns a
+/// cached session id into resume argv, ask the disk-existence probe. On
+/// POSITIVE absence, fall back to the same shape a genuinely fresh pane of
+/// that mode uses (claude → new UUID + `Start`; amplifier → new UUID +
+/// `Resume`; codex/opencode → `None`). Unknown/unavailable, unvalidated
+/// providers, and `probe: None` (feature not wired — bare unit-test states)
+/// all fail open. Body mirrors `freshell_ws::resume_validation::
+/// validate_wire_resume`, using the `ResumeProbeFn` injection shape because
+/// this crate must not depend on `freshell-ws`. SYNC by design: the wiring
+/// site runs it inside `tokio::task::spawn_blocking` (A13 — the probe does
+/// real filesystem walks). Minted UUIDs MUST be RFC-4122 v4 (`Uuid::new_v4()`,
+/// the crate's existing mint convention) — `is_canonical_claude_session_id`
+/// enforces version 1..=5 + RFC-4122 variant, so a v7 or nil UUID would fail
+/// [`plausible_resume_session_id`] and break the healed identity stamping.
+fn validate_rest_resume(
+    mode: &str,
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    probe: Option<&freshell_platform::resume_gate::ResumeProbeFn>,
+) -> RestResumeOutcome {
+    use freshell_platform::resume_gate::{
+        evaluate_resume_gate, provider_validated, stale_resume_notice, ResumeGateDecision,
+    };
+    let Some(probe) = probe else {
+        return rest_resume_passthrough(resume_session_id, launch_intent);
+    };
+    let Some(sid) = resume_session_id.clone().filter(|s| !s.is_empty()) else {
+        return rest_resume_passthrough(resume_session_id, launch_intent);
+    };
+    if !provider_validated(mode) {
+        return rest_resume_passthrough(resume_session_id, launch_intent);
+    }
+    let answer = probe(mode, &sid);
+    match evaluate_resume_gate(mode, answer.existence, answer.ever_observed_on_disk) {
+        ResumeGateDecision::Proceed => rest_resume_passthrough(resume_session_id, launch_intent),
+        ResumeGateDecision::SpawnFresh => {
+            let notice = stale_resume_notice(mode, &sid);
+            let (fresh_id, intent, claude_fresh_prealloc) = match mode {
+                // Mirror the genuine fresh-pane shapes (same per-provider
+                // fallbacks as the WS door's validate_wire_resume). The
+                // claude arm MINTS a fresh id, so it must also carry the
+                // prealloc marker (PIN 2 coupling, main #584).
+                "claude" => (Some(Uuid::new_v4().to_string()), LaunchIntent::Start, true),
+                "amplifier" => (
+                    Some(Uuid::new_v4().to_string()),
+                    LaunchIntent::Resume,
+                    false,
+                ),
+                _ => (None, LaunchIntent::Resume, false),
+            };
+            RestResumeOutcome {
+                resume_session_id: fresh_id,
+                launch_intent: intent,
+                claude_fresh_prealloc,
+                stale_session_id: Some(sid),
+                notice: Some(notice),
+            }
+        }
+    }
+}
+
 /// The successful result of [`spawn_terminal_pane`]: the `paneContent` JSON + the
 /// resolved `mode`/`shell`/`cwd`/`terminal_id`, everything a caller (tab-create or
 /// pane-split) needs to build its own `ui.command` payload and success envelope
@@ -792,8 +888,90 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
-    let (mut resume_session_id, accepted_session_ref, session_ref_locator_present) =
+    let (mut resume_session_id, mut accepted_session_ref, session_ref_locator_present) =
         derive_resume_identity(body, &mode)?;
+
+    // Door 3 (resume-validation): gate the cached resume id on disk existence
+    // BEFORE the amplifier ensure_session below (or the re-stub would
+    // resurrect the stale dir) and before CliLaunchInputs is built.
+    //
+    // In-gate liveness precondition (MANDATORY — ordering hazard, the A11
+    // door-1 hazard with the constraint INVERTED: in THIS pipeline the
+    // amplifier ensure comes BEFORE the REST D7 live-session guard and the D8
+    // lease, so the gate cannot get liveness protection by after-D7 placement;
+    // placed here, a gate fire on a LIVE candidate would clear
+    // accepted_session_ref / replace resume_session_id and FALSIFY the D7-REST
+    // applicability filter — its loud RESTORE_UNAVAILABLE/CONFLICT reject and
+    // the D8 lease silently bypassed, and on_stale_resume → retire_missing
+    // would destroy the Bound ledger row of a RUNNING session. Reachable: a
+    // live zero-turn codex session genuinely has no rollout on disk.):
+    // a LIVE session must never be gated. TWO ARMS, both load-bearing:
+    // the registry arm reuses the REST D7 guard's own consult (below, which
+    // owns the loud reject for registry-live sessions downstream); the
+    // sidecar arm exists because that consult is PTY-scoped and blind to
+    // sessions live inside the fresh-agent sidecars — the very
+    // live-zero-turn-with-no-rollout-on-disk case. Dropping either arm
+    // silently un-protects a class of live sessions (the live-session tests
+    // pin BOTH arms).
+    let candidate_is_live = match resume_session_id.as_deref() {
+        None => false,
+        Some(sid) => {
+            // Arm 1 (registry): the SAME consult the REST D7 guard below
+            // performs — shared, not reimplemented.
+            let registry_live = registry
+                .live_session_owner(state.session_identity.as_deref(), &mode, sid)
+                .is_some();
+            // Arm 2 (sidecar): the injected async probe. None (not wired,
+            // e.g. bare unit-test states) => arm contributes false.
+            let sidecar_live = if registry_live {
+                true // short-circuit: already live
+            } else {
+                match &state.sidecar_liveness {
+                    Some(probe) => probe(&mode, sid).await,
+                    None => false,
+                }
+            };
+            registry_live || sidecar_live
+        }
+    };
+    // Today's hardcoded intent for this pipeline (see the CliLaunchInputs
+    // comment in settle_gated_create) — the gate's claude fallback is the
+    // one path that rewrites it to Start.
+    let launch_intent = LaunchIntent::Resume;
+    // Probe does real filesystem walks — never inline on the async runtime
+    // (A13); run the sync helper in spawn_blocking. A LIVE candidate skips
+    // the gate entirely (passthrough — same shape validate_rest_resume
+    // returns for Proceed), so the unchanged create flows into the D7-REST
+    // guard and D8 lease exactly as today.
+    let rest_outcome = if candidate_is_live {
+        rest_resume_passthrough(resume_session_id.take(), launch_intent)
+    } else {
+        let probe = state.resume_probe.clone();
+        let mode_for_gate = mode.clone();
+        let rid = resume_session_id.take();
+        let intent = launch_intent;
+        tokio::task::spawn_blocking(move || {
+            validate_rest_resume(&mode_for_gate, rid, intent, probe.as_ref())
+        })
+        .await
+        .expect("resume validation task panicked")
+    };
+    let mut resume_session_id = rest_outcome.resume_session_id;
+    let launch_intent = rest_outcome.launch_intent;
+    if let Some(stale) = rest_outcome.stale_session_id.as_deref() {
+        // MANDATORY stale-ref guard (V7 row 10): the pane_content identity
+        // stamping PREFERS accepted_session_ref — left in place, the STALE
+        // wire ref would be stamped into the new tab's pane_content,
+        // poisoning client persistence + tabs-sync replay and re-firing the
+        // gate every restart. Clearing it makes stamping fall through to the
+        // minted-ref branch, so gate-fired claude/amplifier panes are born
+        // with the HEALED ref and codex/opencode panes with no ref.
+        accepted_session_ref = None;
+        if let Some(cb) = &state.on_stale_resume {
+            cb(&mode, stale);
+        }
+    }
+    let resume_notice = rest_outcome.notice;
 
     // Fresh-claude preallocation (kata hbsa): WS parity. The WS door's
     // fresh-claude special case (freshell-ws/src/terminal.rs, LIVE-PATH LAW
@@ -806,15 +984,25 @@ pub(crate) async fn spawn_terminal_pane(
     // the id — the pre-spawn ledger write and its spawn-failure delete (Task 5
     // call sites in settle_gated_create) are BOTH gated on this exact flag,
     // never on `mode == "claude"`.
-    let claude_fresh_prealloc = freshell_platform::should_preallocate_fresh_claude(
+    //
+    // The MINT stays keyed on main's raw predicate ("no resume id"): a
+    // gate-fired create already carries the gate-minted id, and re-minting
+    // would overwrite it with a second UUID.
+    let claude_prealloc_mint = freshell_platform::should_preallocate_fresh_claude(
         &mode,
         body.get("restore").and_then(serde_json::Value::as_bool),
         session_ref_locator_present,
         resume_session_id.as_deref(),
     );
-    if claude_fresh_prealloc {
+    if claude_prealloc_mint {
         resume_session_id = Some(Uuid::new_v4().to_string());
     }
+    // Door 3 (resume-validation) × PIN 2: a gate-fired claude fallback ALSO
+    // minted a fresh id (in `validate_rest_resume`), so it must get the same
+    // PIN 2 pre-spawn write / failure delete / `Start` intent as a natural
+    // fresh claude create — fold the outcome flag in (WS door parity:
+    // freshell-ws/src/terminal.rs does this exact OR-fold).
+    let claude_fresh_prealloc = claude_prealloc_mint || rest_outcome.claude_fresh_prealloc;
 
     // Hoisted spawn-environment inputs, computed ONCE (Task 8's WS pattern,
     // REST twin): the amplifier windows-arm guard below and the spawn-spec
@@ -1109,6 +1297,8 @@ pub(crate) async fn spawn_terminal_pane(
         shell_str,
         cwd,
         resume_session_id,
+        launch_intent,
+        resume_notice,
         accepted_session_ref,
         claude_fresh_prealloc,
         pane_identity: state.pane_identity.clone(),
@@ -1144,6 +1334,13 @@ struct GatedSettleInputs {
     shell_str: Option<String>,
     cwd: Option<String>,
     resume_session_id: Option<String>,
+    /// Door 3 (resume-validation): the gate's outcome intent — today's
+    /// hardcoded `Resume` everywhere EXCEPT the gate-fired claude fallback,
+    /// whose minted fresh id launches with `Start`.
+    launch_intent: LaunchIntent,
+    /// Door 3: the operator-visible stale-resume notice when the gate fired,
+    /// injected into the returned `paneContent` as `reconcileNotice`.
+    resume_notice: Option<String>,
     accepted_session_ref: Option<SessionLocator>,
     /// Fresh-claude preallocation (kata hbsa): `true` iff THIS create minted
     /// its own `--session-id` (the [`freshell_platform::should_preallocate_fresh_claude`]
@@ -1194,6 +1391,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         shell_str,
         cwd,
         mut resume_session_id,
+        launch_intent,
+        resume_notice,
         accepted_session_ref,
         claude_fresh_prealloc,
         pane_identity,
@@ -1365,10 +1564,20 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // `Start` would hard-error `StartIntentUnsupported`,
             // cli_launch.rs:496-510). Mirrors the WS door
             // (freshell-ws/src/terminal.rs fresh-claude special case).
+            //
+            // Door 3 (resume-validation): the non-prealloc arm threads the
+            // gate outcome through `GatedSettleInputs.launch_intent` — the
+            // gate-fired claude fallback's minted fresh id must launch with
+            // `Start` (the claude spec's `createSessionArgs`); every
+            // non-gated `Some(resume_session_id)` is still a genuine resume
+            // (accepted `sessionRef` or legacy `resumeSessionId`), exactly
+            // as before. (A gate-fired claude fallback yields `Start` via
+            // the outcome anyway; the prealloc override only matters for
+            // main's no-resume-id mint path.)
             launch_intent: if claude_fresh_prealloc {
                 LaunchIntent::Start
             } else {
-                LaunchIntent::Resume
+                launch_intent
             },
             // Managed codex (flag ON): model/sandbox/permissionMode route through the
             // PLAN, not argv (legacy's spawn providerSettings for codex carry ONLY
@@ -1846,6 +2055,15 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // optional: absent for ordinary creates, and only ever an object.
     if let Some(cd) = body.get("codexDurability").filter(|v| v.is_object()) {
         pane_content["codexDurability"] = cd.clone();
+    }
+    // Door 3 (resume-validation): the gate-fired stale-resume notice rides
+    // the returned `paneContent` as `reconcileNotice` — the SAME key the
+    // frozen client's reconcile chip/xterm rendering already consumes, so no
+    // client change. (Accepted caveat: a hidden/background tab defers the
+    // render until a later visible attach pass — the notice is preserved in
+    // pane content, never dropped.)
+    if let Some(notice) = &resume_notice {
+        pane_content["reconcileNotice"] = json!(notice);
     }
     // `paneContent` sessionRef/resumeSessionId, still mutually exclusive like
     // `router.ts:762-771` -- but with the EDEV-07 upgrade over legacy: a legacy
@@ -4659,6 +4877,416 @@ mod tests {
     }
 
     // ── REST spawn-gate tests (kata enn3) ──────────────────────────────────
+
+    // ── Door 3: REST create resume validation (resume-validation Task 8) ────
+
+    fn probe_answering(
+        existence: freshell_platform::resume_gate::ResumeExistence,
+        ever_on_disk: bool,
+    ) -> freshell_platform::resume_gate::ResumeProbeFn {
+        std::sync::Arc::new(move |_provider: &str, _sid: &str| {
+            freshell_platform::resume_gate::ResumeProbeAnswer {
+                existence,
+                ever_observed_on_disk: ever_on_disk,
+            }
+        })
+    }
+
+    #[test]
+    fn rest_resume_amplifier_absent_mints_fresh_and_notices() {
+        use freshell_platform::resume_gate::ResumeExistence;
+        let probe = probe_answering(ResumeExistence::Absent, true);
+        let out = validate_rest_resume(
+            "amplifier",
+            Some("stale-amp".into()),
+            LaunchIntent::Resume,
+            Some(&probe),
+        );
+        assert_ne!(out.resume_session_id.as_deref(), Some("stale-amp"));
+        assert!(out.resume_session_id.is_some());
+        assert_eq!(out.stale_session_id.as_deref(), Some("stale-amp"));
+        assert!(out.notice.as_deref().unwrap().contains("stale-amp"));
+    }
+
+    #[test]
+    fn rest_resume_without_probe_is_passthrough() {
+        let out = validate_rest_resume(
+            "amplifier",
+            Some("anything".into()),
+            LaunchIntent::Resume,
+            None,
+        );
+        assert_eq!(out.resume_session_id.as_deref(), Some("anything"));
+        assert!(out.stale_session_id.is_none());
+        assert!(out.notice.is_none());
+    }
+
+    #[test]
+    fn rest_resume_unknown_and_present_fail_open() {
+        use freshell_platform::resume_gate::ResumeExistence;
+        for e in [ResumeExistence::Unknown, ResumeExistence::Present] {
+            let probe = probe_answering(e, false);
+            let out = validate_rest_resume(
+                "opencode",
+                Some("ses_x".into()),
+                LaunchIntent::Resume,
+                Some(&probe),
+            );
+            assert_eq!(out.resume_session_id.as_deref(), Some("ses_x"));
+            assert!(out.notice.is_none());
+        }
+    }
+
+    #[test]
+    fn rest_resume_codex_absent_drops_resume() {
+        use freshell_platform::resume_gate::ResumeExistence;
+        let probe = probe_answering(ResumeExistence::Absent, true);
+        let out = validate_rest_resume(
+            "codex",
+            Some("stale-cx".into()),
+            LaunchIntent::Resume,
+            Some(&probe),
+        );
+        assert!(out.resume_session_id.is_none());
+        assert_eq!(out.stale_session_id.as_deref(), Some("stale-cx"));
+    }
+
+    #[test]
+    fn rest_resume_minted_claude_id_is_v4_and_plausible() {
+        // Pins the Uuid::new_v4() requirement (V9): is_canonical_claude_
+        // session_id enforces version 1..=5 + RFC-4122 variant — v7/nil
+        // would fail and the healed pane_content stamping would silently
+        // fall through.
+        use freshell_platform::resume_gate::ResumeExistence;
+        let probe = probe_answering(ResumeExistence::Absent, true);
+        let out = validate_rest_resume(
+            "claude",
+            Some("stale-cl".into()),
+            LaunchIntent::Resume,
+            Some(&probe),
+        );
+        assert_eq!(out.launch_intent, LaunchIntent::Start);
+        let minted = out.resume_session_id.expect("fresh claude id minted");
+        assert!(plausible_resume_session_id("claude", &minted));
+    }
+
+    /// Invocation counter + callback pair returned by `counting_on_stale_resume`.
+    type CountingStaleResume = (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>,
+    );
+
+    /// Counting `on_stale_resume` fake: the Bound ledger row of a running
+    /// session must survive, so the live-session tests pin "never invoked".
+    fn counting_on_stale_resume() -> CountingStaleResume {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cb = {
+            let count = std::sync::Arc::clone(&count);
+            std::sync::Arc::new(move |_provider: &str, _sid: &str| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }) as std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>
+        };
+        (count, cb)
+    }
+
+    /// A recording claude spec with the REAL manifest's `createSessionArgs`
+    /// (`extensions/claude-code/freshell.json:11`) so the gate's `Start` +
+    /// minted-id fallback resolves (V9 — no `StartIntentUnsupported`).
+    fn claude_recording_cli_spec_with_start(
+        argv_file: &std::path::Path,
+    ) -> freshell_platform::CliCommandSpec {
+        let mut spec = recording_cli_spec("claude", argv_file);
+        spec.create_session_args = Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]);
+        spec
+    }
+
+    /// Gate fires (claude, positive absence): the built pane_content carries
+    /// the notice AND the HEALED ref — `sessionRef.sessionId` equals the
+    /// minted fresh id, NOT the stale wire ref (pins the stale-ref guard's
+    /// fall-through to the minted-ref stamping branch).
+    #[tokio::test]
+    async fn rest_gate_fire_heals_pane_content_ref_and_injects_notice() {
+        const STALE: &str = "99999999-8888-4777-8666-555555555555";
+        let argv_file = unique_argv_file("door3-claude-heal");
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![claude_recording_cli_spec_with_start(
+                &argv_file,
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Absent,
+                true,
+            ))
+            .with_on_stale_resume(on_stale);
+        let registry = state.terminal_registry.clone().unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": STALE },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        let pane_content = &msg["payload"]["paneContent"];
+        let notice = pane_content["reconcileNotice"]
+            .as_str()
+            .expect("gate fire injects reconcileNotice");
+        assert!(
+            notice.contains(STALE),
+            "notice names the stale id: {notice}"
+        );
+        let healed = pane_content["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("healed sessionRef stamped");
+        assert_ne!(healed, STALE, "stale wire ref must never be stamped");
+        assert!(
+            plausible_resume_session_id("claude", healed),
+            "healed ref is a canonical claude id: {healed}"
+        );
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "on_stale_resume invoked exactly once"
+        );
+        // The claude fallback launches with Start: createSessionArgs argv,
+        // carrying the MINTED id (never the stale one).
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(argv.contains("--session-id"), "Start argv: {argv}");
+        assert!(argv.contains(healed), "minted id in argv: {argv}");
+        assert!(
+            !argv.contains(STALE),
+            "stale id must not reach argv: {argv}"
+        );
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// PIN 2 coupling (main #584 × Door 3): a gate-fired claude fallback
+    /// carries a gate-MINTED `resume_session_id`, so main's
+    /// `should_preallocate_fresh_claude` (keyed on "no resume id") returns
+    /// false — without the outcome's `claude_fresh_prealloc` fold the minted
+    /// fresh pane silently skips the pre-spawn ledger binding every natural
+    /// fresh claude create gets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_gate_fired_claude_fallback_preallocates_fresh_identity() {
+        // Same arrangement as rest_gate_fire_heals_pane_content_ref_and_
+        // injects_notice (claude REST create carrying a stale resume id,
+        // probe answers Absent + ever_observed_on_disk=true, gate fires and
+        // mints a fresh id) — PLUS the #584 identity seam wired so the PIN 2
+        // write is observable (skipped entirely when no binder is wired).
+        const STALE: &str = "99999999-8888-4777-8666-555555555555";
+        let argv_file = unique_argv_file("door3-claude-prealloc");
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![claude_recording_cli_spec_with_start(
+                &argv_file,
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Absent,
+                true,
+            ))
+            .with_on_stale_resume(on_stale)
+            .with_pane_identity_binder(binder.clone());
+        let registry = state.terminal_registry.clone().unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": STALE },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "precondition: the gate fired"
+        );
+
+        // Extract the minted id from the healed pane content, as the
+        // neighbor test does.
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        let minted = msg["payload"]["paneContent"]["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("healed sessionRef stamped")
+            .to_string();
+        assert_ne!(minted, STALE, "stale wire ref must never be stamped");
+
+        // The gate-minted fresh claude pane must get the same PIN 2
+        // pre-spawn treatment as a natural fresh claude create.
+        let events = binder.events();
+        let prespawn = events
+            .iter()
+            .position(|e| e == &format!("prespawn:{tid}:{minted}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "gate-minted fresh claude id must receive the PIN 2 pre-spawn \
+                     identity binding: {events:?}"
+                )
+            });
+        let register = events
+            .iter()
+            .position(|e| e == &format!("register:{tid}:claude:{minted}"))
+            .unwrap_or_else(|| panic!("register event missing: {events:?}"));
+        assert!(
+            prespawn < register,
+            "PIN 2: durability before registration: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("delete:")),
+            "no failure-delete on success: {events:?}"
+        );
+
+        registry.kill(&tid);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// MANDATORY liveness precondition, arm 1 (registry): a REGISTRY-LIVE
+    /// candidate skips the gate entirely — the D7-REST guard then issues its
+    /// loud reject exactly as today, `on_stale_resume` is never invoked (the
+    /// Bound ledger row of the running session survives), and no notice is
+    /// injected. Fails RED if the gate runs before the liveness check.
+    #[tokio::test]
+    async fn rest_gate_skips_registry_live_candidate_d7_reject_still_fires() {
+        let argv_file = unique_argv_file("door3-live-skip");
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Absent,
+                true,
+            ))
+            .with_on_stale_resume(on_stale);
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-live-owner-door3");
+        let rows_before = registry.identity_probe_rows().len();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        // The D7-REST loud reject, NOT a gate-fired fresh spawn.
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "on_stale_resume must never fire for a live session"
+        );
+        assert_eq!(
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no new terminal (no gate-fired fresh spawn)"
+        );
+
+        registry.kill("t-live-owner-door3");
+    }
+
+    /// MANDATORY liveness precondition, arm 2 (sidecar — mirrors Task 6 case
+    /// 6): the registry holds NO row for the candidate, but a fresh-agent
+    /// sidecar owns it live. The registry-live test above stays GREEN if this
+    /// arm is dropped, so it cannot pin it. The create must proceed UNCHANGED
+    /// (resume id reaches CliLaunchInputs intact — today's behavior for a
+    /// sidecar-live resume; no D7-REST reject since the registry has no row),
+    /// `on_stale_resume` never invoked, no notice injected.
+    #[tokio::test]
+    async fn rest_gate_skips_sidecar_live_candidate_create_proceeds_unchanged() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+        const SIDECAR_LIVE: &str = "stale-cx";
+        let argv_file = unique_argv_file("door3-sidecar-skip");
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let sidecar: crate::SidecarLivenessProbe =
+            std::sync::Arc::new(move |mode: &str, sid: &str| {
+                let live = mode == "codex" && sid == SIDECAR_LIVE;
+                Box::pin(async move { live })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            });
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("codex", &argv_file)]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Absent,
+                true,
+            ))
+            .with_on_stale_resume(on_stale)
+            .with_sidecar_liveness(sidecar);
+        let registry = state.terminal_registry.clone().unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "codex",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "codex", "sessionId": SIDECAR_LIVE },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // The resume id reaching CliLaunchInputs is STILL the live one — the
+        // registry row records it, and no gate-fired fresh spawn happened.
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id)
+            .expect("directory entry");
+        assert_eq!(entry.resume_session_id.as_deref(), Some(SIDECAR_LIVE));
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "on_stale_resume must never fire for a sidecar-live session"
+        );
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        let pane_content = &msg["payload"]["paneContent"];
+        assert!(
+            pane_content.get("reconcileNotice").is_none(),
+            "no notice for a skipped (live) candidate: {pane_content}"
+        );
+        assert_eq!(
+            pane_content["sessionRef"],
+            json!({ "provider": "codex", "sessionId": SIDECAR_LIVE }),
+            "wire ref stamped unchanged: {pane_content}"
+        );
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
 
     fn shell_create_body() -> Value {
         json!({

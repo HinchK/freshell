@@ -290,6 +290,65 @@ pub fn gc_stub_if_unused(session_dir: &Path) -> bool {
     std::fs::remove_dir_all(session_dir).is_ok()
 }
 
+/// Read-only disk-existence answer for one amplifier session id, scanning ALL
+/// project slugs under `<amplifier_home>/projects/` (a session may live under
+/// a different slug than the current cwd — see `ensure_session`'s divergent-
+/// slug handling). Never creates anything.
+///
+/// Semantics (resume-validation feature — errors-seen accumulator, V3):
+/// * session dir found under any project => `Present` (short-circuits);
+/// * `projects/` missing (NotFound, parent readable) or scanned WITHOUT any
+///   error and without a hit => `Absent` (store readable, definitively
+///   absent — AD-1: missing root is positive absence, matching today's
+///   warm-path steady state);
+/// * `projects/` unreadable at the root, OR any per-entry error during the
+///   scan (unreadable project subdir, EACCES stat, dropped dir entry) with
+///   no hit => `Unreadable` (callers must fail OPEN — treat as unknown,
+///   never as absent). NEVER adjudicate via `.is_dir()` alone: it returns
+///   `false` on EACCES and would manufacture a false Absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmplifierSessionAnswer {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+pub fn session_on_disk(
+    amplifier_home: &std::path::Path,
+    session_id: &str,
+) -> AmplifierSessionAnswer {
+    let projects = amplifier_home.join("projects");
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return AmplifierSessionAnswer::Absent; // AD-1: root missing, parent readable
+        }
+        Err(_) => return AmplifierSessionAnswer::Unreadable,
+    };
+    let mut saw_error = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                saw_error = true; // dropped dir entry (EIO, network fs) — cannot rule out
+                continue;
+            }
+        };
+        let candidate = entry.path().join("sessions").join(session_id);
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_dir() => return AmplifierSessionAnswer::Present,
+            Ok(_) => {} // stray FILE named like the id — not a session dir
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => saw_error = true, // EACCES etc. — the session may be hiding here
+        }
+    }
+    if saw_error {
+        AmplifierSessionAnswer::Unreadable
+    } else {
+        AmplifierSessionAnswer::Absent
+    }
+}
+
 /// Outcome of the boot-time layout canary ([`verify_amplifier_layout_contract`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanaryOutcome {
@@ -841,3 +900,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "amplifier_stub_scan_tests.rs"]
+mod scan_tests;
