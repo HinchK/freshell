@@ -33,6 +33,7 @@ mod recovery_inventory;
 mod repo_icon;
 mod repo_icon_detect;
 mod repo_icon_git;
+mod resolve;
 mod screenshots;
 mod serve_client;
 mod session_directory;
@@ -1021,6 +1022,9 @@ async fn main() -> ExitCode {
             freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root),
         );
     }
+    // SYNC-06: the resolve endpoint reads the SAME session index the History
+    // surfaces read (clone before the move below into `session_directory_state`).
+    let resolve_session_index = session_index.clone();
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
@@ -1105,7 +1109,7 @@ async fn main() -> ExitCode {
     let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
-        store: session_metadata_store,
+        store: session_metadata_store.clone(),
         // W5 fix-forward: the SAME shared `sessions.changed` bus + revision
         // counter minted above (and already wired into
         // `ws_state`/`fresh_agent_state`/`sessions::SessionsState`) so a
@@ -1211,6 +1215,99 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
+        }))
+        .merge(resolve::router(resolve::ResolveState {
+            auth_token: Arc::clone(&auth_token),
+            // SYNC-06 deleted-override filter: the SAME settings store the
+            // sidebar overlay (`SessionDirectoryState.settings`) and
+            // `PATCH /api/sessions/{id}` write path use (constructed once
+            // at ~line 196; Clone shares the Arc-backed innards).
+            settings: settings_store.clone(),
+            session_index: resolve_session_index,
+            // SYNC-06 sessionType overlay: the SAME store `POST
+            // /api/session-metadata` writes (Node overlays it in
+            // `session-indexer.ts:1159-1161`).
+            session_metadata: session_metadata_store.clone(),
+            // Resolve fallbacks mirror Node's buildResolveFallbacks over the
+            // FIXED provider registry (server/index.ts wires ALL FOUR
+            // codingCliProviders into it unconditionally): settings do NOT
+            // gate the exact-id fallbacks — they only gate INDEXING and feed
+            // unsearchedProviders. Both closures are therefore ALWAYS wired;
+            // gating them on boot-time settings would produce false misses
+            // after a live settings change and diverge from Node for
+            // disabled-provider exact IDs.
+            //
+            // opencode `ses_*` exact-id fallback: the SAME data home the
+            // OpencodeSource uses, answered by the hardened direct by-id row
+            // query (`opencode_session_row_by_id`, Node's
+            // `opencode-by-id-query.ts`) — archived + child sessions
+            // included, full row (title/lastActivityAt) returned. Read
+            // errors REPORT as `Err(ProviderFailure)` (the provider-health
+            // channel) — never a silent `Ok(None)` miss.
+            opencode_session_by_id: Some({
+                std::sync::Arc::new(|session_id: &str| {
+                    let data_home = freshell_sessions::parse::default_opencode_data_home();
+                    freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
+                        .map(|row| {
+                            row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
+                                session_id: r.session_id,
+                                cwd: r.cwd,
+                                title: r.title,
+                                last_activity_at: r.last_activity_at,
+                            })
+                        })
+                        .map_err(|e| {
+                            // Node production parity: the opencode worker
+                            // boundary STRIPS `.code` — the worker serializes
+                            // only {name, message}
+                            // (`opencode-by-id.worker.ts:41-42`) and the
+                            // runner rebuilds the Error without it
+                            // (`opencode-by-id-runner.ts:103-106`), so Node's
+                            // wire entry is message-only
+                            // (`sessions-resolve-router.test.ts:308-320`).
+                            // Emitting SQLITE_* codes here would DIVERGE from
+                            // Node. Task 4's OpencodeByIdError still carries
+                            // the code — log it (structured, with provider +
+                            // code) for diagnosability, then drop it from the
+                            // wire.
+                            tracing::warn!(
+                                provider = "opencode",
+                                code = ?e.code,
+                                message = %e.message,
+                                "opencode by-id lookup failed"
+                            );
+                            freshell_sessions::resume_resolve::ProviderFailure {
+                                code: None,
+                                message: e.message,
+                            }
+                        })
+                }) as crate::resolve::OpencodeByIdLookup
+            }),
+            // claude transcript exact-id fallback: the CHECKED locator over
+            // Node's authoritative two layouts (direct + `<parent>/subagents/
+            // <id>.jsonl`) with the CHECKED bounded cwd reader — read errors
+            // REPORT as `Err(ProviderFailure)` carrying the symbolic errno
+            // (Node preserves `cause.code` verbatim). Node's locator
+            // lowercases the id before scanning and returns the lowercased
+            // id — mirrored here.
+            locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
+                resolve_claude_exact_id_fallback(session_id)
+            }) as crate::resolve::ClaudeLocator),
+            // See `resolve_wire_home_dir` for the Node `os.homedir()` parity
+            // derivation (USERPROFILE on Windows; HOME else passwd-entry
+            // home on POSIX).
+            home_dir: resolve_wire_home_dir(),
+            // Node's hard 15 s by-id worker timeout, applied to EACH
+            // blocking fallback dispatch (permit wait + fallback) — never
+            // the in-memory resolver around it (see `resolve.rs` for the
+            // abandonment semantics).
+            resolve_deadline: resolve::RESOLVE_FALLBACK_DEADLINE,
+            // Admission cap on concurrent blocking fallback tasks — see
+            // `RESOLVE_MAX_CONCURRENCY` for why abandoned (uncancellable)
+            // blocking tasks must be bounded in COUNT, not just latency.
+            resolve_permits: Arc::new(tokio::sync::Semaphore::new(
+                resolve::RESOLVE_MAX_CONCURRENCY,
+            )),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
@@ -1568,12 +1665,119 @@ fn resolve_amplifier_events_path(projects_root: &Path, session_id: &str) -> Opti
     None
 }
 
+/// Wire error code for a provider-error summary. Node preserves the ORIGINAL
+/// `cause.code` VERBATIM (`ClaudeTranscriptLocatorError`,
+/// `claude-transcript-locator.ts:19-27`): EPERM stays EPERM, EIO stays EIO.
+/// So derive the symbolic errno name from the RAW OS errno — do NOT map from
+/// `ErrorKind`, which would collapse EPERM into EACCES and drop EIO/EMFILE
+/// entirely.
+#[cfg(unix)]
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    let raw = err.raw_os_error()?;
+    let name = match raw {
+        libc::EACCES => "EACCES",
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EIO => "EIO",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        libc::ELOOP => "ELOOP",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EBADF => "EBADF",
+        libc::EINVAL => "EINVAL",
+        _ => return None, // unknown errno ⇒ omit code, keep the message
+    };
+    Some(name.to_string())
+}
+
+/// Non-unix fallback: `raw_os_error()` is a Win32 code there, not an errno;
+/// map the coarse kinds Node's libuv also names. (The resolve fallbacks'
+/// primary target is unix; parity of the fine-grained codes is a unix
+/// concern.)
+#[cfg(not(unix))]
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => Some("EACCES".to_string()),
+        std::io::ErrorKind::NotFound => Some("ENOENT".to_string()),
+        _ => None,
+    }
+}
+
 fn resolve_home() -> Option<PathBuf> {
     std::env::var("FRESHELL_HOME")
         .ok()
         .or_else(|| std::env::var("HOME").ok())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// The `homeDir` wire field for `POST /api/sessions/resolve`. Node sends
+/// `os.homedir()` (`sessions-router.ts:306-314`) — the USER's home, which on
+/// Windows is `USERPROFILE`-backed and on POSIX is HOME (set and non-empty)
+/// else the passwd-entry home. Resolved via the SAME
+/// `session_directory::provider_home()` helper the session index sources use
+/// (it implements exactly those platform semantics). Do NOT reuse
+/// `resolve_home()`: it prefers `FRESHELL_HOME`, a config/storage root that
+/// can differ from the real home, and the dialog would prefill a cwd-less
+/// resume into the wrong directory.
+fn resolve_wire_home_dir() -> Option<Arc<String>> {
+    session_directory::provider_home().map(|h| Arc::new(h.to_string_lossy().into_owned()))
+}
+
+/// The production claude exact-id fallback body (`crate::resolve::ClaudeLocator`):
+/// the CHECKED locator over Node's authoritative two layouts (direct +
+/// `<parent>/subagents/<id>.jsonl`) with the CHECKED bounded cwd reader —
+/// read errors REPORT as `Err(ProviderFailure)` carrying the symbolic errno
+/// (Node preserves `cause.code` verbatim). Node's locator lowercases the id
+/// before scanning and returns the lowercased id — mirrored here.
+///
+/// Root resolution is Node-parity (`server/claude-home.ts:4-7` +
+/// `providers/claude.ts:524-535`): `CLAUDE_HOME` (non-empty) else
+/// `<home>/.claude`, joined with `projects` — the SAME
+/// `session_directory::provider_home()` root the session index uses (Node
+/// `os.homedir()` platform semantics: USERPROFILE on Windows, where Tauri
+/// deliberately leaves HOME unset; on POSIX HOME when set and non-empty,
+/// else the passwd-entry home — USERPROFILE is never consulted there).
+/// Note CLAUDE_HOME alone suffices even when no home resolves (Node's
+/// `getClaudeHome()` honors it directly); no root ⇒ `Ok(None)`, a miss.
+/// Deliberately NOT `claude_home_candidates()`: its extra
+/// CLAUDE_CONFIG_DIR/bare-CLAUDE_HOME roots would expose transcripts from
+/// roots Node never searches.
+fn resolve_claude_exact_id_fallback(
+    session_id: &str,
+) -> Result<
+    Option<freshell_sessions::resume_resolve::ClaudeTranscriptHit>,
+    freshell_sessions::resume_resolve::ProviderFailure,
+> {
+    let lowered = session_id.to_ascii_lowercase();
+    let claude_home = match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
+        Some(v) => Some(std::path::PathBuf::from(v)),
+        None => session_directory::provider_home().map(|h| h.join(".claude")),
+    };
+    let roots: Vec<std::path::PathBuf> = match claude_home {
+        Some(h) => vec![h.join("projects")],
+        None => return Ok(None),
+    };
+    match freshell_freshagent::locate_transcript_checked(&roots, &lowered) {
+        Ok(Some(path)) => match freshell_freshagent::transcript_cwd_checked(&path) {
+            Ok(cwd) => Ok(Some(
+                freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    cwd,
+                    session_id: lowered,
+                },
+            )),
+            Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                code: errno_code(&e),
+                message: format!("Claude transcript read failed: {e}"),
+            }),
+        },
+        Ok(None) => Ok(None),
+        Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+            code: errno_code(&e),
+            message: format!("Claude transcript scan failed: {e}"),
+        }),
+    }
 }
 
 /// P1.8 tombstone-deletion gate (V10.md): `true` ONLY when a DIRECT
@@ -1682,6 +1886,11 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
 /// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
 /// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
+/// `featureFlags.sessionResolve` is the unconditional literal both servers
+/// declare now that the hardened resolve response surface
+/// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
+/// landed — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
+/// Tasks 2-6 (SYNC-06).
 fn build_platform_payload(
     available_clis: serde_json::Value,
     env: &dyn freshell_platform::Env,
@@ -1691,7 +1900,7 @@ fn build_platform_payload(
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env) },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env), "sessionResolve": true },
     })
 }
 
@@ -1980,6 +2189,7 @@ mod sessions_sweep_tests {
             provider: "claude".to_string(),
             project_path: "/tmp".to_string(),
             title: None,
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at,
@@ -2189,6 +2399,231 @@ mod tests {
     use super::*;
     use freshell_platform::MapEnv;
 
+    /// Save-and-restore guard for one env var (tests below mutate real
+    /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them
+    /// crate-wide). Restores on drop, panic included.
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
+
+        fn set(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frs-main-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    // -- Node `os.homedir()` platform parity for the resolve wiring
+    // (reviewer findings, iterations 2 + 3): production Tauri inherits the
+    // desktop environment WITHOUT setting `HOME` on native Windows, where
+    // Node's `os.homedir()` reads USERPROFILE (HOME is never consulted); on
+    // POSIX it reads HOME when set and non-empty, else the effective user's
+    // passwd-entry home — USERPROFILE is never consulted there. Every home
+    // consumer on the resolve path (the exact-id claude fallback, the
+    // `homeDir` wire field) routes through
+    // `session_directory::provider_home()`, which implements exactly those
+    // platform semantics.
+
+    #[cfg(unix)]
+    #[test]
+    fn wire_home_dir_unix_treats_empty_home_as_unset_using_passwd_entry() {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture-wire");
+        let resolved = resolve_wire_home_dir().map(|h| h.as_str().to_string());
+        assert_ne!(
+            resolved.as_deref(),
+            Some("/Users/win-fixture-wire"),
+            "POSIX must NEVER consult USERPROFILE (Node os.homedir() reads it on Windows only)"
+        );
+        assert_eq!(
+            resolved,
+            Some(
+                crate::session_directory::passwd_entry_home()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "an EMPTY HOME must fall back to the passwd-entry home (Node os.homedir() POSIX parity)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wire_home_dir_windows_uses_userprofile_never_home() {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "C:\\never-consulted");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "C:\\Users\\win-fixture-wire");
+        assert_eq!(
+            resolve_wire_home_dir().map(|h| h.as_str().to_string()),
+            Some("C:\\Users\\win-fixture-wire".to_string()),
+            "Windows must read USERPROFILE and never consult HOME (Node os.homedir() parity)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_exact_id_fallback_finds_transcript_under_home() {
+        // The exact-id fallback itself — not just `provider_home()` — must
+        // find the transcript under `<home>/.claude/projects`, or a
+        // cwd-less/subagent transcript omitted from the index produces a
+        // healthy-looking ready-empty where Node (os.homedir()) finds it.
+        const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = env_test_temp_dir("claude-fallback");
+        let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+
+        let project = home.join(".claude").join("projects").join("-repo-alpha");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/alpha\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure")
+            .expect("fallback must FIND the transcript under HOME/.claude");
+        assert_eq!(hit.session_id, SESSION_ID.to_ascii_lowercase());
+        assert_eq!(hit.cwd.as_deref(), Some("/repo/alpha"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_exact_id_fallback_unix_never_reads_userprofile() {
+        // Node's `os.homedir()` on POSIX never consults USERPROFILE: with
+        // HOME unset, the fallback root is the passwd-entry home — a
+        // transcript living ONLY under `USERPROFILE/.claude` must NOT be
+        // surfaced (the pre-fix HOME||USERPROFILE approximation found it).
+        const SESSION_ID: &str = "0C7B39D1-52E4-4F0F-9E7C-4E2B7A11D9AA";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = env_test_temp_dir("claude-fallback-userprofile");
+        let _home = EnvVarGuard::unset("HOME");
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", profile.to_str().unwrap());
+
+        let project = profile.join(".claude").join("projects").join("-repo-beta");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/beta\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure");
+        assert!(
+            hit.is_none(),
+            "POSIX must resolve the passwd-entry home, never USERPROFILE/.claude"
+        );
+
+        std::fs::remove_dir_all(&profile).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_exact_id_fallback_finds_transcript_in_a_userprofile_only_environment() {
+        // The documented Tauri environment: USERPROFILE = the real user home
+        // containing `.claude/projects/...` (Node's `os.homedir()` is
+        // USERPROFILE-backed on Windows). The exact-id fallback itself —
+        // not just `provider_home()` — must find the transcript there.
+        const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = env_test_temp_dir("claude-fallback");
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
+
+        let project = home.join(".claude").join("projects").join("-repo-alpha");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/alpha\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure")
+            .expect("fallback must FIND the transcript under USERPROFILE/.claude");
+        assert_eq!(hit.session_id, SESSION_ID.to_ascii_lowercase());
+        assert_eq!(hit.cwd.as_deref(), Some("/repo/alpha"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -- Task 6 (resolve parity): errno-name derivation for provider errors.
+    // Node preserves the ORIGINAL `cause.code` VERBATIM
+    // (`ClaudeTranscriptLocatorError`, `claude-transcript-locator.ts:19-27`):
+    // EPERM stays EPERM — a kind-based mapping would collapse it into EACCES
+    // (both are `ErrorKind::PermissionDenied`) and drop EIO entirely.
+
+    #[cfg(unix)]
+    #[test]
+    fn errno_code_preserves_the_raw_errno_name_verbatim() {
+        use std::io;
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EPERM)).as_deref(),
+            Some("EPERM")
+        );
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EACCES)).as_deref(),
+            Some("EACCES")
+        );
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EIO)).as_deref(),
+            Some("EIO")
+        );
+        // Synthetic error without a raw errno: omit the code, keep the message.
+        assert_eq!(
+            errno_code(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no raw errno"
+            )),
+            None
+        );
+    }
+
     // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
     // (V10.md). Deletion is the destructive branch, so every uncertain path
     // must answer `false` (present => defer); only a readable tree with NO
@@ -2303,13 +2738,17 @@ mod tests {
 
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
-        // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled }`,
-        // camelCase, no extra fields — mirrored 1:1 in the Rust payload.
+        // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
+        // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
+        // Rust payload. `sessionResolve` is TRUE again: the hardened resolve
+        // response surface (degraded/providerErrors/unsearchedProviders/
+        // homeDir, warming default) landed via the hardened plan Tasks 2-6
+        // (SYNC-06), so the flag is now genuinely earned.
         let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
         );
     }
 
@@ -2319,7 +2758,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
         );
     }
 

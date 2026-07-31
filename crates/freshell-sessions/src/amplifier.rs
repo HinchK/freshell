@@ -85,15 +85,56 @@ impl AmplifierSource {
 
 impl SessionSource for AmplifierSource {
     fn discover(&self) -> Vec<FileStat> {
-        let projects_dir = self.amplifier_home.join("projects");
-        let mut stats = Vec::new();
-        walk_metadata_files(&projects_dir, &projects_dir, &mut stats);
-        stats
+        discover_amplifier_metadata(&self.amplifier_home).unwrap_or_default()
     }
 
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
         parse_amplifier_file(path)
     }
+
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("amplifier")
+    }
+
+    /// Root-listing failure propagation: an unlistable
+    /// `<amplifier_home>/projects` (EACCES/EIO — not a merely-absent one) is
+    /// a scan failure, never a silent empty listing. SINGLE-PASS: the same
+    /// `read_dir` handle that fails here is the one the traversal consumes
+    /// (no disposable preflight, no TOCTOU window), and root iterator-entry
+    /// errors propagate too. Nested-directory errors stay tolerant.
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        discover_amplifier_metadata(&self.amplifier_home)
+    }
+}
+
+/// Stat every qualifying `metadata.json` under `<amplifier_home>/projects`.
+///
+/// SINGLE-PASS root traversal: the ONE `read_dir` opened by
+/// [`crate::directory_index::open_root_dir`] is the one iterated, and
+/// per-entry iterator errors propagate (`?`) — a root that fails to open OR
+/// fails mid-iteration is an `Err` (recorded as a scan failure by the sweep),
+/// never a silent `Ok(empty)`. A MISSING root is a genuine empty. NESTED
+/// directories stay tolerant via [`walk_metadata_files`].
+fn discover_amplifier_metadata(amplifier_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
+    let projects_dir = amplifier_home.join("projects");
+    let Some(entries) = crate::directory_index::open_root_dir(&projects_dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        paths.push(entry?.path());
+    }
+    paths.sort(); // determinism (readdir order is filesystem-dependent)
+    let mut stats = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            walk_metadata_files(&projects_dir, &path, &mut stats);
+        }
+        // A top-level `metadata.json` directly in `projects/` can never have
+        // a `sessions` path segment in its relative path, so it is excluded
+        // by construction — same as the recursive walk's filter.
+    }
+    Ok(stats)
 }
 
 /// Recursively find every `metadata.json` under `dir` (never
@@ -218,6 +259,10 @@ pub fn parse_amplifier_metadata(content: &str) -> ParsedSessionMeta {
             .map(str::to_string),
         created_at,
         last_activity_at,
+        // Node: `titleSource: name ? 'provider-generated' : undefined`
+        // (`providers/amplifier.ts:93`) — the amplifier `name` IS
+        // provider-generated whenever present.
+        title_provider_generated: title.is_some(),
         title,
         summary,
         is_subagent: Some(is_subagent),
@@ -303,6 +348,7 @@ fn indexed_from_meta(
         // is not currently ported for any provider).
         project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
         title: meta.title.clone(),
+        title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
         last_activity_at,

@@ -19,7 +19,7 @@
 //! { "version": 1, "sessions": { "<provider>": { "<sessionId>": { "sessionType": "...", "sessionTypeSource": "explicit" } } } }
 //! ```
 //!
-//! `get_all()`/`get()` are provided for future read-surfaces (test-only until the session-indexer read path is ported) (the sidebar directory listing
+//! `get_all()` is a production read (resolve endpoint's sessionType overlay, SYNC-06); `get()` remains test-gated until a production caller lands (the sidebar directory listing
 //! embeds `sessionType` inline via `codingCliIndexer` server-side in the reference; this
 //! port's `crates/freshell-sessions` directory index is a SEPARATE crate this module does
 //! not reach into — wiring metadata into the directory listing is out of THIS module's
@@ -27,7 +27,6 @@
 //! `GET /api/session-metadata` route either (confirmed by exhaustive grep of
 //! `server/sessions-router.ts` and `server/index.ts` — only the `POST` exists).
 
-#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,8 +132,9 @@ impl SessionMetadataStore {
     /// `getAll()` (`session-metadata-store.ts:113-122`): flattened `provider:sessionId` →
     /// entry map.
     ///
-    /// Test-only today — see `get` above.
-    #[cfg(test)]
+    /// Production read (SYNC-06): the resolve endpoint overlays match
+    /// `sessionType` from this store, mirroring Node's
+    /// `session-indexer.ts:1159-1161` overlay. Keyed `"{provider}:{session_id}"`.
     pub async fn get_all(&self) -> HashMap<String, Value> {
         let mut guard = self.inner.lock().await;
         let data = Self::load_locked(&mut guard, &self.path).await;

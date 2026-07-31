@@ -22,9 +22,20 @@ pub mod indexer;
 pub mod meta;
 pub mod opencode_locator;
 pub mod parse;
+pub mod resume_input;
+pub mod resume_resolve;
 pub mod search;
 pub mod text;
 pub mod time;
+
+/// Serializes tests (crate-wide) that mutate the process-global
+/// `HOME`/`USERPROFILE`/`FRESHELL_HOME` env vars: cargo runs tests in
+/// parallel THREADS within one process, so two tests racing to mutate the
+/// SAME vars would otherwise flake (one test's assertion observing the
+/// OTHER test's in-flight env state). Shared by `directory_index`'s
+/// persist-path test and `parse::opencode`'s `home_dir()` tests.
+#[cfg(test)]
+pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
 pub use parse::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
