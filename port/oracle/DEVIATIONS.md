@@ -746,13 +746,13 @@ which prevents PARKING such panes in the dead-sessions dialog, is untouched).
 Additive protocol field: optional `notice` on `terminal.created`.
 
 **Reconciliation note (2026-07-30, rebased onto 39010cb57):** codex managed
-launch (DEV-0006 S5.e) is now DEFAULT ON — every codex create/resume plans a
-sidecar app-server + remote proxy. The spawn-door gate runs BEFORE
-managed-launch planning at all three doors (WS create: gate → plan; headless
-respawn: gate → plan → uncancellable permit; REST: gate in
-`spawn_terminal_pane` before `settle_gated_create`'s plan-then-permit), so a
-definitively-absent codex id never consumes a sidecar planning slot; the
-fresh spawn it falls back to plans managed launch normally. Pinned by
+sidecar app-server + remote proxy. For codex restore-class creates the gate runs OFF-permit
+inside `prepare_launch`, BEFORE `plan_codex_managed_launch` — gate ⇒ plan (off-permit) ⇒ permit ⇒ spawn — so a
+definitively-absent codex id never consumes a sidecar planning slot. All other modes (WS
+create, headless respawn, REST) keep the on-permit gate in `handle_create` (post-ladder,
+post-D7); the gate outcome is carried via `PreparedLaunch.resume_gate` so notice emission
+and D8 stale-ref lease release stay single-sited. For the fresh spawn it falls back to,
+all modes plan managed launch normally. Pinned by
 `managed_default_stale_codex_id_is_gated_before_planning` in
 `freshell-ws/tests/resume_validation_gate.rs`. The REST door additionally
 threads `claude_fresh_prealloc` through `RestResumeOutcome` so a gate-minted
