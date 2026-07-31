@@ -58,6 +58,24 @@ impl SessionExistenceProbe for StubProbe {
     }
 }
 
+/// Answers Absent-but-previously-observed for EVERY (provider, id) query —
+/// including ids minted server-side that the test cannot know in advance.
+/// `ever_observed → true` is load-bearing: it defeats the claude zero-turn
+/// carve-out (Absent + never-observed → Proceed, resume_gate.rs:100-104),
+/// so ANY gate consult on a server-allocated id — claude included —
+/// evaluates to SpawnFresh (resume_gate.rs:119), fires the notice, and
+/// fails the assertions below.
+struct AbsentButObservedProbe;
+
+impl SessionExistenceProbe for AbsentButObservedProbe {
+    fn exists(&self, _provider: &str, _session_id: &str) -> SessionExistence {
+        SessionExistence::Absent
+    }
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        true
+    }
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -823,4 +841,66 @@ async fn managed_default_stale_codex_id_is_gated_before_planning() {
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
     std::env::remove_var("CODEX_HOME");
     let _ = std::fs::remove_file(&capture_path);
+}
+
+fn fresh_create(request_id: &str, mode: &str) -> serde_json::Value {
+    // Same envelope as a restore create, minus every resume carrier — this
+    // is the shape that triggers the server prealloc arms.
+    let mut v = restore_create_with_session_ref(request_id, mode, "unused");
+    let obj = v.as_object_mut().expect("create frame is an object");
+    obj.remove("restore");
+    obj.remove("sessionRef");
+    obj.remove("resumeSessionId");
+    v
+}
+
+/// A fresh claude create mints a SERVER-allocated session id (prealloc).
+/// That id is by definition absent on disk — and must NEVER be gated:
+/// no notice, plain successful create. Probe answers Absent-but-observed
+/// for everything, so any gate consult on the minted id evaluates to
+/// SpawnFresh (the claude zero-turn carve-out does NOT apply), fires the
+/// notice, and fails this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_allocated_fresh_claude_id_is_never_gated() {
+    let (url, registry, _ledger, _state) =
+        spawn_server_with_probe(Arc::new(AbsentButObservedProbe), false).await;
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(&mut ws, &fresh_create("req-prealloc-claude", "claude")).await;
+    let frame = next_created_or_error(&mut ws, "req-prealloc-claude").await;
+
+    assert_eq!(
+        frame["type"], "terminal.created",
+        "fresh claude create must succeed, got {frame}"
+    );
+    assert!(
+        notice_of(&frame).is_none(),
+        "server-allocated claude prealloc id must never trip the gate notice"
+    );
+
+    registry.kill_all();
+}
+
+/// The amplifier sibling (THE TRAP: claude_fresh_prealloc == false here, yet
+/// the id is still server-minted): a fresh amplifier create must never gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_allocated_fresh_amplifier_id_is_never_gated() {
+    let (url, registry, _ledger, _state) =
+        spawn_server_with_probe(Arc::new(AbsentButObservedProbe), false).await;
+    let _amp_home = common::isolate_amplifier_home();
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(&mut ws, &fresh_create("req-prealloc-amp", "amplifier")).await;
+    let frame = next_created_or_error(&mut ws, "req-prealloc-amp").await;
+
+    assert_eq!(
+        frame["type"], "terminal.created",
+        "fresh amplifier create must succeed, got {frame}"
+    );
+    assert!(
+        notice_of(&frame).is_none(),
+        "server-minted amplifier id must never trip the gate notice"
+    );
+
+    registry.kill_all();
 }
