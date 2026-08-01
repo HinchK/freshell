@@ -25,6 +25,8 @@ import type { LoopbackServerEndpoint } from './local-port.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
+  CodexApprovalRequestedEvent,
+  CodexApprovalResolvedEvent,
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
   SessionBindingReason,
@@ -607,6 +609,8 @@ export type TerminalRecord = {
     | 'onCandidate'
     | 'onTurnStarted'
     | 'onTurnCompleted'
+    | 'onApprovalRequested'
+    | 'onApprovalResolved'
     | 'onRepairTrigger'
     | 'onFsChanged'
     | 'watchPath'
@@ -1275,6 +1279,21 @@ export function buildSpawnSpec(
   return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
 }
 
+/**
+ * `params.turn?.status ?? params.status` -- the codex turn/completed status.
+ * Mirror of `freshell_codex::protocol::turn_status` and adapter.ts:922-923;
+ * handles both the small-frame nested form and the large-frame flattened form.
+ */
+function codexTurnStatus(params: Record<string, unknown>): string | undefined {
+  const turn = params.turn
+  if (turn && typeof turn === 'object') {
+    const nested = (turn as Record<string, unknown>).status
+    if (typeof nested === 'string') return nested
+  }
+  const status = params.status
+  return typeof status === 'string' ? status : undefined
+}
+
 export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
   private bindingAuthority = new SessionBindingAuthority()
@@ -1490,6 +1509,12 @@ export class TerminalRegistry extends EventEmitter {
     record: TerminalRecord,
     event: { exitCode: number; signal?: number },
   ): void {
+    // Requested closes (kill()/kill_all, shutdownGracefully's direct SIGTERMs)
+    // mark codexRecoveryFinalClose BEFORE exit dispatch — capture it at ENTRY,
+    // before markCodexRecoveryFinalClose below marks EVERY finishing record
+    // and would erase the signal (audit A7: a blanket `true` would ring death
+    // bells on server shutdown).
+    const requestedClose = record.codexRecoveryFinalClose === true
     this.clearCodexPendingCleanExitFinalizer(record)
     this.markCodexRecoveryFinalClose(record)
     this.clearCodexInputGate(record)
@@ -1512,6 +1537,9 @@ export class TerminalRegistry extends EventEmitter {
     this.emit('terminal.exit', {
       terminalId: record.terminalId,
       exitCode: event.exitCode,
+      // Internal payload only (NOT the client wire frame above): true when no
+      // requested close asked for this exit — the death-bell discriminator.
+      spontaneous: !requestedClose,
       ...(recoverableForRestore ? { recoverableForRestore: true } : {}),
     })
     this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
@@ -1921,6 +1949,8 @@ export class TerminalRegistry extends EventEmitter {
       if (!isCurrentSidecar()) return
       this.emit('codex.turn.started', {
         terminalId: record.terminalId,
+        threadId: event.threadId,
+        ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
         at: Date.now(),
       } satisfies CodexTurnStartedEvent)
       void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
@@ -1931,8 +1961,12 @@ export class TerminalRegistry extends EventEmitter {
 
     const turnCompletedUnsubscribe = sidecar.onTurnCompleted?.((event) => {
       if (!isCurrentSidecar()) return
+      const status = codexTurnStatus(event.params)
       this.emit('codex.turn.completed', {
         terminalId: record.terminalId,
+        threadId: event.threadId,
+        ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+        ...(status !== undefined ? { status } : {}),
         at: Date.now(),
       } satisfies CodexTurnCompletedEvent)
       void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {
@@ -1940,6 +1974,27 @@ export class TerminalRegistry extends EventEmitter {
       })
     })
     if (turnCompletedUnsubscribe) unsubscribers.push(turnCompletedUnsubscribe)
+
+    const approvalRequestedUnsubscribe = sidecar.onApprovalRequested?.((event) => {
+      if (!isCurrentSidecar()) return
+      this.emit('codex.approval.requested', {
+        terminalId: record.terminalId,
+        ...(event.threadId !== undefined ? { threadId: event.threadId } : {}),
+        requestId: event.requestId,
+        at: Date.now(),
+      } satisfies CodexApprovalRequestedEvent)
+    })
+    if (approvalRequestedUnsubscribe) unsubscribers.push(approvalRequestedUnsubscribe)
+
+    const approvalResolvedUnsubscribe = sidecar.onApprovalResolved?.((event) => {
+      if (!isCurrentSidecar()) return
+      this.emit('codex.approval.resolved', {
+        terminalId: record.terminalId,
+        requestId: event.requestId,
+        at: Date.now(),
+      } satisfies CodexApprovalResolvedEvent)
+    })
+    if (approvalResolvedUnsubscribe) unsubscribers.push(approvalResolvedUnsubscribe)
 
     const repairUnsubscribe = sidecar.onRepairTrigger?.((event) => {
       if (!isCurrentSidecar()) return
@@ -4070,6 +4125,8 @@ export class TerminalRegistry extends EventEmitter {
     this.emit('terminal.exit', {
       terminalId,
       exitCode: term.exitCode,
+      // kill() is always a requested close — never a death bell.
+      spontaneous: false,
       ...(options.recoverableForRestore ? { recoverableForRestore: true } : {}),
     })
     this.forgetCodexDurabilityStoreRecord(term, 'user_final_close')

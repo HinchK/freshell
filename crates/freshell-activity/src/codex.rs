@@ -88,6 +88,9 @@ pub struct CodexTaskEvents {
     pub latest_task_started_at: Option<i64>,
     pub latest_task_completed_at: Option<i64>,
     pub latest_turn_aborted_at: Option<i64>,
+    /// Reason string paired with `latest_turn_aborted_at` (e.g. "interrupted").
+    /// None on legacy rollout lines that carry no reason.
+    pub latest_turn_aborted_reason: Option<String>,
 }
 
 impl CodexTaskEvents {
@@ -140,6 +143,18 @@ struct TerminalActivity {
     /// S5.a third lane: server-clock receipt time of the newest proxy
     /// TurnStarted -- the proxy lane's turn key for Busy/Unknown clears.
     last_proxy_started_at: Option<i64>,
+    /// Proxy lane (kata codex-turn-thread-scope): the turn id of the bound
+    /// thread's in-flight proxy turn, set on TurnStarted, cleared on rebind
+    /// AND at every accepted terminal-status completion. A TurnCompleted
+    /// carrying a DIFFERENT turn id is a stale echo of an already-closed
+    /// turn and is a no-op by construction. `None` falls back to phase
+    /// semantics (older protocols omit turnId).
+    current_proxy_turn_id: Option<String>,
+    /// Outstanding server→client approval request ids (managed proxy lane).
+    pending_approvals: std::collections::HashSet<String>,
+    /// True when the approval pause demoted a working phase; the resolve
+    /// restores Busy. False when the approval arrived while already idle.
+    resume_busy_after_approval: bool,
     last_observed_at: i64,
     last_emitted_turn_key: Option<i64>,
     parser_state: ParserState,
@@ -221,6 +236,13 @@ impl CodexActivityTracker {
         self.ledger.list_latest_completions()
     }
 
+    #[cfg(test)]
+    fn current_proxy_turn_id_for(&self, terminal_id: &str) -> Option<String> {
+        self.states
+            .get(terminal_id)
+            .and_then(|s| s.current_proxy_turn_id.clone())
+    }
+
     /// Track a codex terminal from create time (deviation 1 above —
     /// `bindTerminal` with the session identity the create carried, if any).
     pub fn track_terminal(
@@ -234,6 +256,15 @@ impl CodexActivityTracker {
                 if existing.session_id.as_deref() != Some(session_id) {
                     let previous = existing.to_record();
                     existing.session_id = Some(session_id.to_string());
+                    // Design decision #7 (kata codex-turn-thread-scope): a
+                    // rebind moves the pane to a DIFFERENT thread -- the old
+                    // thread's in-flight turn id and start anchor must not
+                    // survive (see bind_session).
+                    existing.current_proxy_turn_id = None;
+                    existing.last_proxy_started_at = None;
+                    // Task 7: nor may the old thread's approval pause state.
+                    existing.pending_approvals.clear();
+                    existing.resume_busy_after_approval = false;
                     let next = existing.to_record();
                     return changed(Some(&previous), next);
                 }
@@ -257,6 +288,9 @@ impl CodexActivityTracker {
             swallow_next_proxy_complete: false,
             swallow_next_reconcile_clear: false,
             last_proxy_started_at: None,
+            current_proxy_turn_id: None,
+            pending_approvals: std::collections::HashSet::new(),
+            resume_busy_after_approval: false,
             last_observed_at: at,
             last_emitted_turn_key: None,
             parser_state: ParserState::new(),
@@ -284,6 +318,17 @@ impl CodexActivityTracker {
         }
         let previous = state.to_record();
         state.session_id = Some(session_id.to_string());
+        // Design decision #7 (kata codex-turn-thread-scope): a rebind moves
+        // the pane to a DIFFERENT thread (fork/resume, delivered by the async
+        // disk fork-watch lane -- codex_proxy_route.rs:88-91). The old
+        // thread's in-flight turn id and start anchor must not survive, or
+        // the new thread's first turn/completed is misclassified as a stale
+        // echo / collides on last_emitted_turn_key.
+        state.current_proxy_turn_id = None;
+        state.last_proxy_started_at = None;
+        // Task 7: nor may the old thread's approval pause state.
+        state.pending_approvals.clear();
+        state.resume_busy_after_approval = false;
         let next = state.to_record();
         changed(Some(&previous), next)
     }
@@ -312,6 +357,23 @@ impl CodexActivityTracker {
             events.latest_task_completed_at,
             events.latest_turn_aborted_at,
         );
+        // The newest terminating event decides the clear's shape: an abort
+        // (Esc-interrupt / `turn_aborted`) still ends the turn, but only a
+        // HUMAN-attributed abort (reason `interrupted`/`replaced`, or a
+        // reason-less legacy line) stays silent -- the human is present.
+        // Any OTHER present reason is codex stopping on its own, which DOES
+        // record (rings terminal.idle). Ties go to task_complete: a real
+        // completion at the same instant still rings.
+        let clear_is_abort = match (
+            events.latest_task_completed_at,
+            events.latest_turn_aborted_at,
+        ) {
+            (Some(completed), Some(aborted)) => aborted > completed,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let record =
+            !clear_is_abort || !abort_reason_is_human(events.latest_turn_aborted_reason.as_deref());
 
         // Promote on a NEW unresolved start.
         if let Some(started_at) = events.latest_task_started_at {
@@ -331,12 +393,22 @@ impl CodexActivityTracker {
                     .map(|cleared| started_at > cleared)
                     .unwrap_or(true)
             {
-                state.phase = CodexPhase::Busy;
-                state.force_read_logged = false;
-                state.next_force_read_at = None;
-                state.accepted_start_at = Some(started_at);
-                state.updated_at = at;
-                state.last_observed_at = at;
+                if state.pending_approvals.is_empty() {
+                    state.phase = CodexPhase::Busy;
+                    state.force_read_logged = false;
+                    state.next_force_read_at = None;
+                    state.accepted_start_at = Some(started_at);
+                    state.updated_at = at;
+                    state.last_observed_at = at;
+                } else {
+                    // Lane-interference guard (decision 8 / audit A9): the
+                    // turn's own task_started folding in MID-PAUSE would flip
+                    // the phase Busy, feed the gate, and silently cancel the
+                    // armed approval bell. Fold the anchors as usual but
+                    // defer the Busy promotion to the approval resolve.
+                    state.accepted_start_at = Some(started_at);
+                    state.resume_busy_after_approval = true;
+                }
             }
         }
 
@@ -363,6 +435,7 @@ impl CodexActivityTracker {
                         at,
                         &mut self.ledger,
                         &mut completions,
+                        record,
                     );
                     // CE1: swallow the PTY BEL echo of this reconciled turn end
                     // (armed regardless of whether the fold arrived as one
@@ -376,7 +449,13 @@ impl CodexActivityTracker {
                         .map(|accepted| cleared_at >= accepted)
                         .unwrap_or(false)
                 {
-                    transition_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                    transition_after_turn_clear(
+                        state,
+                        at,
+                        &mut self.ledger,
+                        &mut completions,
+                        record,
+                    );
                     state.swallow_next_bel = true;
                     // S5.a: and the proxy echo of the same physical turn.
                     state.swallow_next_proxy_complete = true;
@@ -520,14 +599,31 @@ impl CodexActivityTracker {
 
     /// S5.a: proxy lane TurnStarted (third clock domain -- server-clock `at`).
     /// Promotes Idle/Unknown/Pending to Busy, edge-triggered; never completes.
-    pub fn note_proxy_turn_started(&mut self, terminal_id: &str, at: i64) -> Vec<CodexEffect> {
+    /// Thread-scoped (kata codex-turn-thread-scope): the shared app-server
+    /// connection relays turn events for EVERY thread on it (sub-agent,
+    /// review, fork threads -- spike scenario D). Only the bound thread's
+    /// turns may drive this terminal; before a thread binds we stay
+    /// conservative and ignore the proxy lane entirely (the Rust identity
+    /// gate holds turn/start until adoption binds, so the window is
+    /// structurally empty on the managed path -- design decision #2).
+    pub fn note_proxy_turn_started(
+        &mut self,
+        terminal_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        at: i64,
+    ) -> Vec<CodexEffect> {
         let Some(state) = self.states.get_mut(terminal_id) else {
             return Vec::new();
         };
+        if state.session_id.as_deref() != Some(thread_id) {
+            return Vec::new();
+        }
         let previous = state.to_record();
         // Design invariant: a NEW proxy turn is beginning -- a stale directed
         // swallow must not eat THIS turn's completion.
         state.swallow_next_proxy_complete = false;
+        state.current_proxy_turn_id = turn_id.map(str::to_string);
         state.last_proxy_started_at = Some(at);
         state.last_observed_at = at;
         if matches!(
@@ -543,19 +639,74 @@ impl CodexActivityTracker {
     /// S5.a: proxy lane TurnCompleted. Real turn ends transition to Idle and
     /// record exactly one completion; echoes of turns another lane already
     /// ended are swallowed one-shot (CE1 generalized).
-    pub fn note_proxy_turn_completed(&mut self, terminal_id: &str, at: i64) -> Vec<CodexEffect> {
+    ///
+    /// Guard order (kata codex-turn-thread-scope):
+    /// 1. thread scope -- foreign threads (sub-agents etc.) are ignored
+    ///    BEFORE any state is touched (they must not consume swallows);
+    /// 2. `inProgress` -- not a turn end at all (protocol.rs:111);
+    /// 3. turn-id -- a completion for a different turn than the in-flight
+    ///    one is a stale echo, no-op by construction;
+    /// 4. directed proxy swallow (cross-lane dedupe, unchanged);
+    /// 5. status -- `completed | failed | absent` record a bell-worthy completion; `interrupted` clears silently.
+    pub fn note_proxy_turn_completed(
+        &mut self,
+        terminal_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        status: Option<&str>,
+        at: i64,
+    ) -> Vec<CodexEffect> {
         let Some(state) = self.states.get_mut(terminal_id) else {
             return Vec::new();
         };
+        if state.session_id.as_deref() != Some(thread_id) {
+            return Vec::new();
+        }
+        if status == Some("inProgress") {
+            return Vec::new();
+        }
+        if let (Some(current), Some(completed)) = (state.current_proxy_turn_id.as_deref(), turn_id)
+        {
+            if current != completed {
+                return Vec::new();
+            }
+        }
+        // Node parity (codex-activity-tracker.ts onTurnCompleted): once the
+        // stale-id guard passes, this completion IS the in-flight turn's
+        // terminal event -- retire the id unconditionally, even when the
+        // effect below is swallowed or lands in the Idle arm. A surviving id
+        // could wrongly drop a later real completion whose turn/started was
+        // missed (proxy reconnect / fork windows).
+        state.current_proxy_turn_id = None;
         if state.swallow_next_proxy_complete {
             state.swallow_next_proxy_complete = false;
             return Vec::new();
         }
+        // Task 7: an accepted terminal-status completion retires the turn's
+        // approval pause state ONCE, BEFORE the phase match -- a turn that
+        // completes during an approval pause routes through the Idle arm
+        // (the request itself demoted the phase, and the Idle arm never
+        // records or resumes), so a late resolve of the stale approval must
+        // not flip the pane Busy again.
+        state.pending_approvals.clear();
+        state.resume_busy_after_approval = false;
+        // Attention-bell policy: completed AND failed are non-human stopping causes
+        // and record a completion (=> gate arms => terminal.idle). `interrupted`
+        // (and only it) is human-requested and stays a silent claim. If a queued
+        // submit exists the shared transition machinery re-arms instead of ringing —
+        // the queued message auto-submits and work continues.
+        let record = matches!(status, None | Some("completed") | Some("failed"));
         let previous = state.to_record();
         let mut completions: Vec<(Option<String>, i64, i64)> = Vec::new();
         match state.phase {
             CodexPhase::Pending => {
-                transition_pending_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                transition_pending_after_turn_clear(
+                    state,
+                    at,
+                    &mut self.ledger,
+                    &mut completions,
+                    record,
+                );
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
             }
@@ -563,19 +714,132 @@ impl CodexActivityTracker {
                 let turn_key = state.last_proxy_started_at.or(state.pending_submit_at);
                 state.phase = CodexPhase::Idle;
                 state.updated_at = at;
-                record_completion_if_idle(
-                    state,
-                    turn_key.or(Some(at)),
-                    at,
-                    &mut self.ledger,
-                    &mut completions,
-                );
+                if record {
+                    record_completion_if_idle(
+                        state,
+                        turn_key.or(Some(at)),
+                        at,
+                        &mut self.ledger,
+                        &mut completions,
+                    );
+                } else {
+                    claim_turn_key_if_idle(state, turn_key.or(Some(at)));
+                }
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
             }
-            CodexPhase::Idle => {}
+            CodexPhase::Idle => {
+                // Mid-pause turn end / stale echo (silent claim): an approval
+                // pause demoted the phase, so the pause's turn/completed lands
+                // here -- no completion, no boundary (the approval bell
+                // already covers this attention event). But the anchors this
+                // turn planted (accepted via the mid-pause reconcile fold,
+                // pending via a pause keystroke) would otherwise survive and
+                // let the codex TUI's turn-complete BEL -- or the rollout's
+                // clear echo -- re-mint the same physical turn as a spurious
+                // TurnComplete (a second terminal.idle for one episode).
+                // Claim the turn key exactly like the Busy arm, retire the
+                // anchors, and arm both cross-lane swallows. Clearing
+                // accepted_start_at is safe for reconcile_rollout: its clear
+                // guard requires Busy|Unknown and `.map(..).unwrap_or(false)`
+                // on the anchor, and its promotion guard falls back to the
+                // is_new edge-trigger.
+                let turn_key = state.last_proxy_started_at.or(state.pending_submit_at);
+                state.accepted_start_at = None;
+                state.pending_submit_at = None;
+                claim_turn_key_if_idle(state, turn_key.or(Some(at)));
+                state.swallow_next_bel = true;
+                state.swallow_next_reconcile_clear = true;
+            }
         }
         self.effects_after_transition(terminal_id, previous, completions)
+    }
+
+    /// Approval-request pause (managed lane). Thread-scoped like turn events;
+    /// requests without a threadId are accepted (the proxy is per-terminal).
+    /// Public phase maps to the EXISTING not-busy value — no new wire phase.
+    /// Queued input never suppresses approval bells: still blocked on a human.
+    pub fn note_approval_requested(
+        &mut self,
+        terminal_id: &str,
+        thread_id: Option<&str>,
+        request_id: &str,
+        at: i64,
+    ) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if let (Some(thread), Some(bound)) = (thread_id, state.session_id.as_deref()) {
+            if thread != bound {
+                return Vec::new();
+            }
+        }
+        // Hardening: only a NEWLY inserted request id arms the gate. A
+        // duplicate request frame (proxy retry / reconnect replay) for an id
+        // already pending must not re-arm -- one boundary per approval pause.
+        let newly_inserted = state.pending_approvals.insert(request_id.to_string());
+        let previous = state.to_record();
+        if matches!(
+            state.phase,
+            CodexPhase::Busy | CodexPhase::Pending | CodexPhase::Unknown
+        ) {
+            state.resume_busy_after_approval = true;
+            state.phase = CodexPhase::Idle;
+        }
+        state.updated_at = at;
+        let next = state.to_record();
+        let mut effects = changed(Some(&previous), next);
+        if newly_inserted {
+            effects.push(TrackerEffect::AttentionBoundary {
+                terminal_id: terminal_id.to_string(),
+                at,
+            });
+        }
+        effects
+    }
+
+    /// The approval response passed back through the proxy: the turn resumes.
+    /// Cancels a pending bell within the grace (gate sees Busy); un-greens the
+    /// pane. Stale/unknown request ids are no-ops.
+    pub fn note_approval_resolved(
+        &mut self,
+        terminal_id: &str,
+        request_id: &str,
+        at: i64,
+    ) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if !state.pending_approvals.remove(request_id) {
+            return Vec::new();
+        }
+        if !state.pending_approvals.is_empty() || !state.resume_busy_after_approval {
+            return Vec::new();
+        }
+        state.resume_busy_after_approval = false;
+        let previous = state.to_record();
+        state.phase = CodexPhase::Busy;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        // Audit A9 hazard 2: a mid-pause Enter (the human answering the
+        // approval prompt in the TUI) planted PTY pending-submit state --
+        // normalize it so the NEXT turn clear is not misread as a queued
+        // re-arm of the pause keystroke.
+        state.pending_submit_at = None;
+        state.pending_freshness_at = None;
+        state.pending_until = None;
+        let next = state.to_record();
+        changed(Some(&previous), next)
+    }
+
+    /// Death-bell engagement extension (decision 3): a pane blocked on an
+    /// approval whose process dies spontaneously must ring. Read by the hub's
+    /// Exit arm alongside IdleGate::is_engaged, BEFORE any teardown.
+    pub fn has_pending_approvals(&self, terminal_id: &str) -> bool {
+        self.states
+            .get(terminal_id)
+            .map(|s| !s.pending_approvals.is_empty())
+            .unwrap_or(false)
     }
 
     /// Shared effect-assembly tail (extracted, S5.a): convert a transition's
@@ -721,6 +985,13 @@ fn has_pending_output_liveness(state: &TerminalActivity, at: i64) -> bool {
     }
 }
 
+/// Human-attributed abort reasons stay silent. A MISSING reason is treated
+/// as human/uncertain (legacy rollouts omit it; the real-world corpus shows
+/// 'interrupted' is the only observed value; uncertainty never rings).
+fn abort_reason_is_human(reason: Option<&str>) -> bool {
+    matches!(reason, None | Some("interrupted") | Some("replaced"))
+}
+
 fn has_queued_submit(state: &TerminalActivity) -> bool {
     match state.queued_submit_at {
         Some(queued) => state
@@ -741,13 +1012,13 @@ fn consume_turn_complete_signal(
 ) -> bool {
     if state.phase == CodexPhase::Pending {
         if state.pending_submit_at.is_some() {
-            transition_pending_after_turn_clear(state, at, ledger, completions);
+            transition_pending_after_turn_clear(state, at, ledger, completions, true);
             return true;
         }
         return false;
     }
     if state.accepted_start_at.is_some() {
-        transition_after_turn_clear(state, at, ledger, completions);
+        transition_after_turn_clear(state, at, ledger, completions, true);
         return true;
     }
     false
@@ -758,6 +1029,7 @@ fn transition_pending_after_turn_clear(
     at: i64,
     ledger: &mut TurnCompletionLedger,
     completions: &mut Vec<(Option<String>, i64, i64)>,
+    record: bool,
 ) {
     let turn_key = state.pending_submit_at;
     let queued = has_queued_submit(state);
@@ -780,7 +1052,11 @@ fn transition_pending_after_turn_clear(
         state.pending_until = None;
         state.queued_submit_at = None;
     }
-    record_completion_if_idle(state, turn_key, at, ledger, completions);
+    if record {
+        record_completion_if_idle(state, turn_key, at, ledger, completions);
+    } else {
+        claim_turn_key_if_idle(state, turn_key);
+    }
 }
 
 fn transition_after_turn_clear(
@@ -788,6 +1064,7 @@ fn transition_after_turn_clear(
     at: i64,
     ledger: &mut TurnCompletionLedger,
     completions: &mut Vec<(Option<String>, i64, i64)>,
+    record: bool,
 ) {
     let turn_key = state.accepted_start_at;
     let queued = has_queued_submit(state);
@@ -807,7 +1084,11 @@ fn transition_after_turn_clear(
         state.queued_submit_at = None;
         state.pending_until = None;
     }
-    record_completion_if_idle(state, turn_key, at, ledger, completions);
+    if record {
+        record_completion_if_idle(state, turn_key, at, ledger, completions);
+    } else {
+        claim_turn_key_if_idle(state, turn_key);
+    }
 }
 
 /// `recordCompletionIfIdle`: record only when a real turn-end transition
@@ -830,6 +1111,23 @@ fn record_completion_if_idle(
     state.last_emitted_turn_key = Some(turn_key);
     let seq = ledger.record_turn_completion(&state.terminal_id, at);
     completions.push((state.session_id.clone(), at, seq));
+}
+
+/// Abort-shaped clears (`turn_aborted` in the rollout lane; status
+/// `interrupted`/`failed` on the proxy lane, Task 2): claim the turn key
+/// exactly like `record_completion_if_idle` does, but WITHOUT recording a
+/// ledger completion -- the pane returns to idle silently (terminal.idle is
+/// never emitted after a HUMAN-REQUESTED stop; it IS emitted for failed turns,
+/// non-human abort reasons (forward-compatible — none emitted at codex <=
+/// 0.147), spontaneous death while engaged, and approval pauses;
+/// shared/ws-protocol.ts terminal.idle doc) and a later echo of the same
+/// physical turn cannot mint a completion.
+fn claim_turn_key_if_idle(state: &mut TerminalActivity, turn_key: Option<i64>) {
+    let Some(turn_key) = turn_key else { return };
+    if state.phase != CodexPhase::Idle {
+        return;
+    }
+    state.last_emitted_turn_key = Some(turn_key);
 }
 
 #[cfg(test)]
@@ -1069,6 +1367,14 @@ mod tests {
             ..Default::default()
         }
     }
+    fn aborted(at: i64, reason: Option<&str>) -> CodexTaskEvents {
+        CodexTaskEvents {
+            latest_task_started_at: Some(at - 1_000),
+            latest_task_completed_at: None,
+            latest_turn_aborted_at: Some(at),
+            latest_turn_aborted_reason: reason.map(str::to_string),
+        }
+    }
 
     #[test]
     fn reconcile_seeds_busy_for_an_unresolved_rollout() {
@@ -1089,6 +1395,7 @@ mod tests {
             latest_task_started_at: Some(100),
             latest_task_completed_at: Some(150),
             latest_turn_aborted_at: None,
+            latest_turn_aborted_reason: None,
         };
         let effects = tracker.reconcile_rollout("t1", &events, 200);
         assert!(effects.is_empty());
@@ -1111,11 +1418,86 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_turn_aborted_also_clears_and_completes() {
+    fn reconcile_turn_aborted_clears_without_completing() {
+        // SEMANTIC CHANGE (kata: codex-turn-thread-scope). This test replaces
+        // `reconcile_turn_aborted_also_clears_and_completes`, which pinned the
+        // old buggy behavior. terminal.idle is never emitted after a
+        // HUMAN-REQUESTED stop; it IS emitted for failed turns, non-human
+        // abort reasons (forward-compatible — none emitted at codex <= 0.147),
+        // spontaneous death while engaged, and approval pauses
+        // (shared/ws-protocol.ts terminal.idle doc) -- an Esc-interrupt
+        // (`turn_aborted`) must return the pane to idle WITHOUT recording a
+        // bell-worthy completion.
+        // REFINED (attention-bell plan, Task 3): this fixture carries NO
+        // abort reason, which stays silent (uncertainty never rings). Aborts
+        // with a non-human reason DO record -- see the `reconcile_abort_*`
+        // tests below.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.reconcile_rollout("t1", &started(100), 200);
         let events = CodexTaskEvents {
+            latest_turn_aborted_at: Some(300),
+            ..Default::default()
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 400);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert!(
+            completions(&effects).is_empty(),
+            "turn_aborted must not ring the bell"
+        );
+    }
+
+    /// Human-requested abort (Esc) — silent, unchanged behavior.
+    #[test]
+    fn reconcile_abort_with_interrupted_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, Some("interrupted")), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// 'replaced' = human submitted new input — silent.
+    #[test]
+    fn reconcile_abort_with_replaced_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, Some("replaced")), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// Missing reason = legacy rollout line / uncertainty — no heuristic bells.
+    #[test]
+    fn reconcile_abort_without_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, None), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// Any OTHER present reason is not human-attributed — it records (rings).
+    #[test]
+    fn reconcile_abort_with_unknown_reason_records_a_completion() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects =
+            tracker.reconcile_rollout("t1", &aborted(5_000, Some("token_budget_exceeded")), 5_000);
+        assert_eq!(completions(&effects).len(), 1);
+    }
+
+    #[test]
+    fn reconcile_task_complete_at_or_after_an_abort_still_completes() {
+        // Tie-break rule: abort suppresses the chime only when it is STRICTLY
+        // the newest terminating event. A real task_complete at the same
+        // instant (or newer) still rings.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let events = CodexTaskEvents {
+            latest_task_completed_at: Some(300),
             latest_turn_aborted_at: Some(300),
             ..Default::default()
         };
@@ -1394,7 +1776,7 @@ mod tests {
     fn proxy_turn_started_promotes_idle_to_busy() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        let effects = tracker.note_proxy_turn_started("t", 2_000);
+        let effects = tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_000);
         assert!(effects
             .iter()
             .any(|e| matches!(e, TrackerEffect::Changed { .. })));
@@ -1408,8 +1790,14 @@ mod tests {
     fn proxy_turn_completes_exactly_once_per_turn() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_proxy_turn_started("t", 2_000);
-        let first = tracker.note_proxy_turn_completed("t", 3_000);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_000);
+        let first = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("completed"),
+            3_000,
+        );
         assert_eq!(
             first
                 .iter()
@@ -1418,7 +1806,13 @@ mod tests {
             1
         );
         // Same physical turn reported again (proxy echo / duplicate) -> no double.
-        let again = tracker.note_proxy_turn_completed("t", 3_001);
+        let again = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("completed"),
+            3_001,
+        );
         assert!(!again
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1431,7 +1825,8 @@ mod tests {
         // A pending PTY turn…
         tracker.note_input("t", "\r", 2_000);
         // …cleared by the PROXY lane (the authoritative turn end)…
-        let cleared = tracker.note_proxy_turn_completed("t", 3_000);
+        let cleared =
+            tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 3_000);
         assert!(cleared
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1457,7 +1852,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
         // …then the proxy echo of the same physical turn is swallowed one-shot.
-        let echo = tracker.note_proxy_turn_completed("t", 3_050);
+        let echo = tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 3_050);
         assert!(!echo
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1468,10 +1863,10 @@ mod tests {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
         tracker.note_input("t", "\r", 2_000);
-        tracker.note_proxy_turn_completed("t", 3_000); // arms bel + reconcile swallows
+        tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 3_000); // arms bel + reconcile swallows
         tracker.note_input("t", "\r", 4_000); // fresh pending turn: disarm
                                               // A REAL turn end for the NEW turn must complete, not be swallowed.
-        let done = tracker.note_proxy_turn_completed("t", 5_000);
+        let done = tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 5_000);
         assert!(done
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1490,8 +1885,14 @@ mod tests {
         tracker.reconcile_rollout("t", &events, 3_000);
         // …but turn 2 STARTS on the proxy lane before any proxy echo of turn 1
         // arrived: the stale swallow must be disarmed, not eat turn 2's end.
-        tracker.note_proxy_turn_started("t", 4_000);
-        let done = tracker.note_proxy_turn_completed("t", 5_000);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-2"), 4_000);
+        let done = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-2"),
+            Some("completed"),
+            5_000,
+        );
         assert!(done
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
@@ -1524,9 +1925,533 @@ mod tests {
         // The proxy echo of the SAME physical turn lands next. Without the
         // BEL-clear arming it hits phase == Pending and PREMATURELY completes
         // queued turn 2 (ledger A11) — it must be swallowed instead.
-        let echo = tracker.note_proxy_turn_completed("t", 3_050);
+        let echo = tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 3_050);
         assert!(!echo
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+    }
+
+    // ---- Thread scoping (kata: codex-turn-thread-scope) ----
+
+    #[test]
+    fn subagent_thread_turn_completed_mid_parent_turn_is_ignored() {
+        // Spike scenario D (/tmp/codex-spike/spike-d.log): on a shared
+        // app-server connection a sub-agent child thread emits turn/completed
+        // (turn.status=completed) while the parent turn is still in progress.
+        // That event must not flip Busy->Idle, must not record a completion,
+        // and must not arm swallow flags that would eat the parent's real
+        // completion.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("thread-parent"), 0);
+        tracker.note_proxy_turn_started("t", "thread-parent", Some("turn-parent"), 1_000);
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+
+        let child = tracker.note_proxy_turn_completed(
+            "t",
+            "thread-child",
+            Some("turn-child"),
+            Some("completed"),
+            2_000,
+        );
+        assert!(
+            child.is_empty(),
+            "foreign-thread completion must be a no-op"
+        );
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+
+        // The parent's REAL completion still rings exactly once.
+        let parent = tracker.note_proxy_turn_completed(
+            "t",
+            "thread-parent",
+            Some("turn-parent"),
+            Some("completed"),
+            3_000,
+        );
+        assert_eq!(phases(&parent), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&parent), vec![1]);
+    }
+
+    #[test]
+    fn foreign_thread_turn_started_does_not_promote_busy() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("thread-parent"), 0);
+        let effects = tracker.note_proxy_turn_started("t", "thread-child", Some("turn-c"), 1_000);
+        assert!(effects.is_empty());
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Idle);
+    }
+
+    #[test]
+    fn unbound_terminal_ignores_proxy_turn_events() {
+        // Unbound window policy (documented in the plan): before a thread
+        // binds, the proxy lane is silent -- no busy promotion, no completion.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", None, 0);
+        assert!(tracker
+            .note_proxy_turn_started("t", "thread-x", Some("turn-1"), 1_000)
+            .is_empty());
+        assert!(tracker
+            .note_proxy_turn_completed("t", "thread-x", Some("turn-1"), Some("completed"), 2_000)
+            .is_empty());
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Idle);
+    }
+
+    #[test]
+    fn rebind_clears_stale_in_flight_proxy_turn_state() {
+        // Design decision #7 (load-bearing ledger A9, falsified without this):
+        // fork/resume rebinds arrive from the async disk fork-watch lane with
+        // NO ordering guarantee vs proxy turn events. The child thread's first
+        // turn/started can land BEFORE the rebind (the thread guard rightly
+        // drops it); if the parent's stale current_proxy_turn_id survived the
+        // rebind, the child's first turn/completed would be misclassified as
+        // a stale echo -- stuck busy until reconcile.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("thread-a"), 0);
+        tracker.note_proxy_turn_started("t", "thread-a", Some("turn-a1"), 1_000);
+        // Child turn starts pre-rebind: dropped by the thread guard.
+        tracker.note_proxy_turn_started("t", "thread-b", Some("turn-b1"), 1_200);
+        // Disk fork-watch lane rebinds the pane to the child thread.
+        tracker.bind_session("t", "thread-b");
+        let effects = tracker.note_proxy_turn_completed(
+            "t",
+            "thread-b",
+            Some("turn-b1"),
+            Some("completed"),
+            2_000,
+        );
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
+    }
+
+    // ---- Status guard ----
+
+    #[test]
+    fn interrupted_status_clears_busy_without_completion() {
+        // Spike scenario B: turn/interrupt yields turn/completed with
+        // turn.status=interrupted. The pane returns to non-busy, no bell.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("interrupted"),
+            2_000,
+        );
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert!(completions(&effects).is_empty());
+    }
+
+    /// SEMANTIC CHANGE (attention-bell plan 2026-08-01): a failed turn is a
+    /// non-human stopping cause — it records a completion so the IdleGate rings.
+    /// Failed takes EXACTLY the completed path, so queue suppression + grace
+    /// apply naturally. (Previously pinned as clears-without-completion.)
+    #[test]
+    fn failed_status_records_a_completion() {
+        // Mirror the setup of `absent_status_still_completes_for_the_bound_thread`
+        // (codex.rs:1843): track, bind thread, proxy turn started, then complete.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+        let effects =
+            tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("failed"), 5_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(
+            completions(&effects).len(),
+            1,
+            "failed must mint a completion"
+        );
+    }
+
+    /// Failed must be indistinguishable from completed in effect shape — that is
+    /// what makes queued-submit suppression and the 2s grace apply for free.
+    #[test]
+    fn failed_with_queued_submit_behaves_exactly_like_completed_with_queued_submit() {
+        let run = |status: &str| {
+            let mut tracker = CodexActivityTracker::new();
+            tracker.track_terminal("t", Some("sess"), 0);
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+            // Queue a submit while busy (mirror the input used by
+            // `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`, codex.rs:1039).
+            tracker.note_input("t", "do the next thing\r", 3_000);
+            let effects =
+                tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some(status), 5_000);
+            (phases(&effects), completions(&effects).len())
+        };
+        assert_eq!(run("failed"), run("completed"));
+    }
+
+    #[test]
+    fn in_progress_status_is_a_no_op() {
+        // protocol.rs:111 -- turn/completed fires for ALL statuses;
+        // `inProgress` is not a turn end and must not clear busy.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("inProgress"),
+            2_000,
+        );
+        assert!(effects.is_empty());
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+    }
+
+    #[test]
+    fn absent_status_still_completes_for_the_bound_thread() {
+        // Compatibility: older protocol forms omit status. Treat as a
+        // positive completion so panes never hang busy.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+        let effects = tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), None, 2_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
+    }
+
+    #[test]
+    fn bel_echo_after_an_interrupted_clear_does_not_ring() {
+        // The interrupt-shaped clear must arm the BEL swallow like a normal
+        // proxy clear does -- the aborted turn's PTY BEL echo stays silent.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+        tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("interrupted"), 2_000);
+        let echo = tracker.note_output("t", "\u{7}", 2_100);
+        assert!(completions(&echo).is_empty());
+    }
+
+    // ---- Turn-id dedupe ----
+
+    #[test]
+    fn stale_completion_for_a_previous_turn_id_is_ignored() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-2"), 2_000);
+        // A late completion echo for an OLDER turn id arrives while turn-2
+        // is running: no-op by construction.
+        let stale = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("completed"),
+            2_100,
+        );
+        assert!(stale.is_empty());
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+        // turn-2's real completion still rings.
+        let real = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-2"),
+            Some("completed"),
+            3_000,
+        );
+        assert_eq!(completions(&real), vec![1]);
+    }
+
+    #[test]
+    fn completion_without_turn_ids_falls_back_to_phase_semantics() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 0);
+        tracker.note_proxy_turn_started("t", "sess", None, 1_000);
+        let effects =
+            tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 2_000);
+        assert_eq!(completions(&effects), vec![1]);
+    }
+
+    /// Deferred minor from the thread-scope plan: the in-flight proxy turn id
+    /// must not survive the turn it belongs to. A NEW turn id arriving after a
+    /// completed one must not be rejected by the stale-turn-id guard.
+    #[test]
+    fn accepted_completion_clears_the_in_flight_proxy_turn_id() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_000,
+        );
+        // The in-flight proxy turn id must be cleared after the accepted completion.
+        assert_eq!(tracker.current_proxy_turn_id_for("t1"), None);
+        // With the id cleared, a follow-up turn with a new id starts cleanly and
+        // its completion is NOT swallowed by the turn-id-mismatch guard.
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-2"), 4_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-2"),
+            Some("completed"),
+            6_000,
+        );
+        assert_eq!(completions(&effects).len(), 1);
+    }
+
+    // ---- Approval pauses (attention bell, Task 7) ----
+
+    /// Approval pause: internal waiting state, public phase flips to the
+    /// EXISTING not-busy value, and the gate boundary arms (no completion).
+    #[test]
+    fn approval_request_pauses_busy_to_idle_and_arms_a_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(
+            completions(&effects).len(),
+            0,
+            "an approval pause is not a turn end"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, TrackerEffect::AttentionBoundary { at: 3_000, .. })),
+            "the gate boundary must arm"
+        );
+    }
+
+    #[test]
+    fn approval_resolved_returns_to_busy() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Busy], "the turn resumes");
+    }
+
+    #[test]
+    fn approval_resolved_with_no_prior_busy_stays_idle() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000); // pane was idle
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(
+            phases(&effects),
+            Vec::<CodexPhase>::new(),
+            "nothing to resume"
+        );
+    }
+
+    #[test]
+    fn foreign_thread_approval_request_is_ignored() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", Some("subagent-thread"), "41", 3_000);
+        assert!(
+            effects.is_empty(),
+            "a sub-agent approval must not ring the parent pane"
+        );
+    }
+
+    #[test]
+    fn approval_request_without_thread_id_is_accepted() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", None, "41", 3_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+    }
+
+    #[test]
+    fn queued_submit_does_not_block_the_approval_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_input("t1", "queued message\r", 2_500); // still blocked on the human
+        let effects = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })));
+    }
+
+    #[test]
+    fn turn_completion_clears_pending_approvals() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            5_000,
+        );
+        // A late response to the stale approval must not flip the pane busy.
+        let effects = tracker.note_approval_resolved("t1", "41", 6_000);
+        assert!(effects.is_empty());
+    }
+
+    /// A turn that ends WHILE the approval pause holds the phase at Idle must
+    /// end silently (the approval bell already covers the attention event) --
+    /// AND its surviving anchors must not let the codex TUI's turn-complete
+    /// BEL echo re-mint the same physical turn as a spurious TurnComplete
+    /// (which would ring a second terminal.idle for one episode).
+    #[test]
+    fn mid_pause_turn_end_silences_the_bel_echo_and_clears_anchors() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        // The turn's own task_started folds mid-pause (audit A9 branch): the
+        // accepted anchor lands without flipping Busy.
+        tracker.reconcile_rollout("t1", &started(3_500), 3_500);
+        // The turn completes while the approval is still pending: the Idle
+        // arm claims silently -- no completion.
+        let done = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            5_000,
+        );
+        assert!(
+            completions(&done).is_empty(),
+            "a mid-pause turn end must not record a completion"
+        );
+        // The TUI's turn-complete BEL echo of that same physical turn.
+        let echo = tracker.note_output("t1", "\u{7}", 5_100);
+        assert!(
+            completions(&echo).is_empty(),
+            "the BEL echo of a mid-pause turn end must not re-mint the turn"
+        );
+        let state = tracker.states.get("t1").expect("state");
+        assert_eq!(state.accepted_start_at, None, "accepted anchor retired");
+        assert_eq!(state.pending_submit_at, None, "pending anchor retired");
+    }
+
+    /// Node parity: the in-flight proxy turn id is retired unconditionally
+    /// once the stale-id guard passes -- including swallowed echoes and the
+    /// Idle arm. A surviving id could wrongly drop a later real completion
+    /// whose turn/started was missed (proxy reconnect / fork windows).
+    #[test]
+    fn swallowed_and_idle_arm_proxy_echoes_retire_the_in_flight_turn_id() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        // The rollout lane ends the turn (fold the start, then its clear).
+        tracker.reconcile_rollout("t1", &started(2_500), 2_600);
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(2_500),
+            latest_task_completed_at: Some(3_000),
+            latest_turn_aborted_at: None,
+            latest_turn_aborted_reason: None,
+        };
+        tracker.reconcile_rollout("t1", &events, 3_100);
+        // First proxy echo of the same physical turn: swallowed one-shot.
+        let first = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_200,
+        );
+        assert!(completions(&first).is_empty(), "swallowed echo is silent");
+        // Second echo lands in the Idle arm: still silent.
+        let second = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_300,
+        );
+        assert!(completions(&second).is_empty(), "idle-arm echo is silent");
+        // The id of the closed turn must not survive either path.
+        assert_eq!(tracker.current_proxy_turn_id_for("t1"), None);
+    }
+
+    /// Hardening: a duplicate request frame for an id ALREADY pending must
+    /// not push a second AttentionBoundary (re-arming the gate would re-ring
+    /// the same approval pause).
+    #[test]
+    fn duplicate_approval_request_does_not_rearm_the_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let first = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })));
+        let dup = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_500);
+        assert!(
+            !dup.iter()
+                .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })),
+            "a duplicate approval request frame must not re-arm the gate"
+        );
+    }
+
+    /// Audit A9: the FIRST rollout fold of the turn's own task_started passes
+    /// the reconcile edge-trigger (codex.rs:352-368) — landing mid-pause it
+    /// would flip phase Busy, feed the gate, and silently cancel the armed
+    /// approval bell. Mid-pause promotions must fold anchors but defer the
+    /// phase flip to the resolve.
+    #[test]
+    fn reconcile_task_started_during_pending_approval_does_not_flip_busy() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        // Reuse Task 3's `started(at)` CodexTaskEvents helper.
+        let effects = tracker.reconcile_rollout("t1", &started(3_500), 3_500);
+        assert_eq!(
+            phases(&effects),
+            Vec::<CodexPhase>::new(),
+            "no Busy upsert mid-pause"
+        );
+        // The deferred promotion resumes at resolve.
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Busy]);
+    }
+
+    /// Audit A9 hazard 2: a mid-pause Enter (the human answering the approval
+    /// in the TUI) plants PTY pending-submit state; resolve must normalize it
+    /// so the NEXT turn clear is not misclassified as a queued re-arm (which
+    /// would suppress a legitimate later bell).
+    #[test]
+    fn approval_resolve_normalizes_pending_submit_input_state() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        tracker.note_input("t1", "\r", 3_500); // answering the approval prompt
+        tracker.note_approval_resolved("t1", "41", 4_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            6_000,
+        );
+        assert_eq!(
+            phases(&effects),
+            vec![CodexPhase::Idle],
+            "no Pending re-arm from the pause keystroke"
+        );
+        assert_eq!(
+            completions(&effects).len(),
+            1,
+            "the completion bell must not be swallowed"
+        );
+    }
+
+    /// Decision 3 / audit A10: a pane blocked on an approval counts as engaged
+    /// for the death bell.
+    #[test]
+    fn has_pending_approvals_tracks_the_pending_set() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        assert!(!tracker.has_pending_approvals("t1"));
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(tracker.has_pending_approvals("t1"));
+        tracker.note_approval_resolved("t1", "41", 4_000);
+        assert!(!tracker.has_pending_approvals("t1"));
     }
 }

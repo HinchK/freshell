@@ -8,6 +8,8 @@ import {
 } from '../../shared/turn-complete-signal.js'
 import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 import type {
+  CodexApprovalRequestedEvent,
+  CodexApprovalResolvedEvent,
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
   SessionBindingReason,
@@ -45,6 +47,23 @@ export type CodexTerminalActivity = CodexActivityRecord & {
   lastSeenSessionLastActivityAt?: number
   lastObservedAt: number
   lastEmittedTurnKey?: number
+  /**
+   * kata codex-turn-thread-scope: the bound thread's in-flight app-server
+   * turn id (set on turn/started). A turn/completed carrying a DIFFERENT
+   * turn id is a stale echo of an already-closed turn -- no-op by
+   * construction. Absent ids fall back to phase semantics.
+   */
+  currentTurnId?: string
+  /**
+   * Outstanding server->client approval request ids (managed proxy lane,
+   * Task 12 / Rust codex.rs pending_approvals).
+   */
+  pendingApprovals: Set<string>
+  /**
+   * True when the approval pause demoted a working phase; the resolve
+   * restores 'busy'. False when the approval arrived while already idle.
+   */
+  resumeBusyAfterApproval: boolean
   parserState: TurnCompleteSignalParserState
 }
 
@@ -58,6 +77,15 @@ export type CodexTurnCompleteEvent = {
 export type CodexActivityChange = {
   upsert: CodexActivityRecord[]
   remove: string[]
+  /** Subset of `remove` caused by a spontaneous PTY death (death-bell input). */
+  spontaneousExitRemovals?: string[]
+  /**
+   * Subset of `remove` whose pending-approval set was non-empty at removal
+   * time (read BEFORE deletion). A pane blocked on an approval whose process
+   * dies spontaneously counts as engaged for the death bell (decision 3 --
+   * Node mirror of Rust has_pending_approvals).
+   */
+  approvalPendingRemovals?: string[]
 }
 
 function maxDefined(...values: Array<number | undefined>): number | undefined {
@@ -74,6 +102,13 @@ function latestClearAt(session?: CodingCliSession): number | undefined {
     session?.codexTaskEvents?.latestTaskCompletedAt,
     session?.codexTaskEvents?.latestTurnAbortedAt,
   )
+}
+
+// Mirrors Rust abort_reason_is_human: missing reason = legacy/uncertainty ->
+// silent; 'interrupted'/'replaced' = human-requested -> silent; anything else
+// is not human-attributed and records (rings).
+function abortReasonIsHuman(reason: string | undefined): boolean {
+  return reason === undefined || reason === 'interrupted' || reason === 'replaced'
 }
 
 function isUnresolvedSession(session?: CodingCliSession): boolean {
@@ -148,6 +183,11 @@ export class CodexActivityTracker extends EventEmitter {
       lastSeenTurnAbortedAt: input.session?.codexTaskEvents?.latestTurnAbortedAt,
       lastSeenSessionLastActivityAt: input.session?.lastActivityAt,
       lastClearedAt: latestClearAt(input.session),
+      // A rebind moves the pane to a different thread: the old thread's
+      // approval pause state must not survive (fresh state ⇒ inherently
+      // cleared -- Task 12 mirror of Rust bind_session).
+      pendingApprovals: new Set(),
+      resumeBusyAfterApproval: false,
       parserState: createTurnCompleteSignalParserState(),
     }
 
@@ -166,9 +206,9 @@ export class CodexActivityTracker extends EventEmitter {
     this.removeState(input.terminalId)
   }
 
-  noteExit(input: { terminalId: string; at: number }): void {
+  noteExit(input: { terminalId: string; at: number; spontaneous?: boolean }): void {
     void input.at
-    this.removeState(input.terminalId)
+    this.removeState(input.terminalId, { spontaneousExit: input.spontaneous === true })
   }
 
   noteInput(input: { terminalId: string; data: string; at: number }): void {
@@ -238,8 +278,16 @@ export class CodexActivityTracker extends EventEmitter {
   onTurnStarted(input: CodexTurnStartedEvent): void {
     const state = this.states.get(input.terminalId)
     if (!state) return
+    // Thread scope guard (kata codex-turn-thread-scope, spike scenario D):
+    // the shared app-server connection relays turn events for EVERY thread
+    // (sub-agents, review threads, forks). Only the bound thread's turns
+    // drive this terminal. A codex terminal enters the tracker only at bind
+    // time, so the unbound window is inherently silent (parity with the
+    // Rust tracker's unbound => ignore).
+    if (state.sessionId === undefined || state.sessionId !== input.threadId) return
 
     const previous = this.toRecord(state)
+    state.currentTurnId = input.turnId
     state.lastSeenTaskStartedAt = maxDefined(state.lastSeenTaskStartedAt, input.at)
     this.promoteBusy(state, input.at, input.at)
     this.commitState(state, previous)
@@ -248,18 +296,116 @@ export class CodexActivityTracker extends EventEmitter {
   onTurnCompleted(input: CodexTurnCompletedEvent): void {
     const state = this.states.get(input.terminalId)
     if (!state) return
+    // Guard order mirrors the Rust tracker (crates/freshell-activity/src/
+    // codex.rs::note_proxy_turn_completed): thread scope -> inProgress ->
+    // stale turn id -> status.
+    if (state.sessionId === undefined || state.sessionId !== input.threadId) return
+    // turn/completed fires for ALL statuses; inProgress is not a turn end.
+    if (input.status === 'inProgress') return
+    if (input.turnId !== undefined && state.currentTurnId !== undefined && input.turnId !== state.currentTurnId) {
+      return
+    }
+    // Task 12: an accepted terminal-status completion retires the turn's
+    // approval pause state ONCE, BEFORE the phase transitions -- a turn that
+    // completes during an approval pause routes through the idle path (the
+    // request itself demoted the phase), so a late resolve of the stale
+    // approval must not flip the pane busy again.
+    state.pendingApprovals.clear()
+    state.resumeBusyAfterApproval = false
+    // Attention-bell policy: completed AND failed record (ring); interrupted is
+    // the human-requested silent clear. Mirrors Rust codex.rs record predicate.
+    const record = input.status === undefined || input.status === 'completed' || input.status === 'failed'
 
+    state.currentTurnId = undefined
     const previous = this.toRecord(state)
-    state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    if (input.status === undefined || input.status === 'completed') {
+      state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    }
     if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
-      this.transitionPendingAfterTurnClear(state, input.at)
-    } else if (state.acceptedStartAt !== undefined) {
-      this.transitionAfterTurnClear(state, input.at)
+      this.transitionPendingAfterTurnClear(state, input.at, record)
+    } else if (state.phase === 'idle') {
+      // Mid-pause turn end / stale echo (mirror of the Rust Idle arm,
+      // crates/freshell-activity/src/codex.rs note_proxy_turn_completed):
+      // an approval pause demoted the phase, so the pause's turn/completed
+      // lands here -- no completion, no event (the approval bell already
+      // covers this attention event). But the anchors this turn planted
+      // (acceptedStartAt via onTurnStarted's promoteBusy or a mid-pause
+      // reconcile fold; pendingSubmitAt via a pause keystroke; a latent
+      // anchor on association bindings) would otherwise survive and let a
+      // later PTY BEL echo re-mint the same physical turn via
+      // consumeTurnCompleteSignal. Claim the turn key with the same
+      // derivation the busy/pending paths use and retire the anchors.
+      const turnKey = state.acceptedStartAt ?? state.pendingSubmitAt
+      state.acceptedStartAt = undefined
+      state.pendingSubmitAt = undefined
+      state.latentAcceptedStartAt = undefined
+      this.claimTurnKeyIfIdle(state, turnKey)
+    } else if ((state.phase === 'busy' || state.phase === 'unknown') && state.acceptedStartAt !== undefined) {
+      this.transitionAfterTurnClear(state, input.at, record)
     } else if (state.latentAcceptedStartAt !== undefined) {
       this.transitionAfterLatentTurnClear(state, input.at)
     }
     this.commitState(state, previous)
     this.flushCompletions()
+  }
+
+  /**
+   * Approval-request pause (managed proxy lane, Task 12 -- Node mirror of
+   * Rust note_approval_requested). Thread-scoped like turn events; requests
+   * without a threadId are accepted (the proxy is per-terminal). The public
+   * phase maps to the EXISTING not-busy value -- no new wire phase. Queued
+   * input never suppresses approval bells: still blocked on a human.
+   */
+  onApprovalRequested(input: CodexApprovalRequestedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+    if (input.threadId !== undefined && state.sessionId !== undefined && input.threadId !== state.sessionId) {
+      return
+    }
+    // Hardening (mirror of Rust note_approval_requested): only a NEWLY
+    // inserted request id arms the gate. A duplicate request frame (proxy
+    // retry / reconnect replay) for an id already pending must not re-arm --
+    // one boundary per approval pause.
+    const newlyInserted = !state.pendingApprovals.has(input.requestId)
+    state.pendingApprovals.add(input.requestId)
+    const previous = this.toRecord(state)
+    if (state.phase === 'busy' || state.phase === 'pending' || state.phase === 'unknown') {
+      state.resumeBusyAfterApproval = true
+      state.phase = 'idle'
+    }
+    state.updatedAt = input.at
+    this.commitState(state, previous)
+    // Arms the truly-idle gate WITHOUT minting a turn completion or a
+    // terminal.turn.complete frame -- an approval pause is not a turn end.
+    // Emitted AFTER the 'changed' demotion so the gate sees not-busy first.
+    if (newlyInserted) {
+      this.emit('attention.boundary', { terminalId: input.terminalId, at: input.at })
+    }
+  }
+
+  /**
+   * The approval response passed back through the proxy: the turn resumes.
+   * Cancels a pending bell within the grace (gate sees busy); un-greens the
+   * pane. Stale/unknown request ids are no-ops.
+   */
+  onApprovalResolved(input: CodexApprovalResolvedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+    if (!state.pendingApprovals.delete(input.requestId)) return
+    if (state.pendingApprovals.size > 0 || !state.resumeBusyAfterApproval) return
+    state.resumeBusyAfterApproval = false
+    const previous = this.toRecord(state)
+    state.phase = 'busy'
+    state.updatedAt = input.at
+    state.lastObservedAt = input.at
+    // Audit A9 hazard 2: a mid-pause Enter (the human answering the approval
+    // prompt in the TUI) planted PTY pending-submit state -- normalize it so
+    // the next turn clear is not misread as a queued re-arm of the pause
+    // keystroke (which would suppress a legitimate later bell).
+    state.pendingSubmitAt = undefined
+    state.pendingFreshnessAt = undefined
+    state.pendingUntil = undefined
+    this.commitState(state, previous)
   }
 
   reconcileProjects(projects: ProjectGroup[], at: number): void {
@@ -275,6 +421,18 @@ export class CodexActivityTracker extends EventEmitter {
       const nextCompletedAt = session.codexTaskEvents?.latestTaskCompletedAt
       const nextTurnAbortedAt = session.codexTaskEvents?.latestTurnAbortedAt
       const clearedAt = maxDefined(nextCompletedAt, nextTurnAbortedAt)
+      // The newest terminating event decides the clear's shape: an abort
+      // (Esc-interrupt / turn_aborted) still ends the turn but must not ring
+      // (shared/ws-protocol.ts terminal.idle: "never emitted after
+      // crash/interrupt/exit"). Ties go to task_complete: a real completion
+      // at the same instant still rings. Mirror of the Rust tracker's
+      // clear_is_abort (crates/freshell-activity/src/codex.rs).
+      const clearIsAbort = nextTurnAbortedAt !== undefined
+        && (nextCompletedAt === undefined || nextTurnAbortedAt > nextCompletedAt)
+      // Abort-shaped clears stay silent only when human-attributed (or the
+      // legacy reason-less form); a present non-human reason records (rings).
+      const nextTurnAbortedReason = session.codexTaskEvents?.latestTurnAbortedReason
+      const record = !clearIsAbort || !abortReasonIsHuman(nextTurnAbortedReason)
       state.lastSeenSessionLastActivityAt = maxDefined(state.lastSeenSessionLastActivityAt, session.lastActivityAt)
 
       if (nextStartedAt !== undefined) {
@@ -291,7 +449,17 @@ export class CodexActivityTracker extends EventEmitter {
             || (state.bindingReason === 'resume' && state.phase === 'idle')
           )
         ) {
-          this.promoteBusy(state, nextStartedAt, at)
+          if (state.pendingApprovals.size === 0) {
+            this.promoteBusy(state, nextStartedAt, at)
+          } else {
+            // Lane-interference guard (decision 8 / audit A9): the turn's own
+            // task_started folding in MID-PAUSE would flip the phase busy,
+            // feed the gate, and silently cancel the armed approval bell.
+            // Fold the anchor as usual but defer the busy promotion to the
+            // approval resolve.
+            state.acceptedStartAt = nextStartedAt
+            state.resumeBusyAfterApproval = true
+          }
         } else if (
           isNewStart
           && state.bindingReason === 'association'
@@ -330,7 +498,7 @@ export class CodexActivityTracker extends EventEmitter {
         && state.pendingSubmitAt !== undefined
         && clearedAt >= state.pendingSubmitAt
       ) {
-        this.transitionPendingAfterTurnClear(state, at)
+        this.transitionPendingAfterTurnClear(state, at, record)
       }
 
       if (
@@ -339,7 +507,7 @@ export class CodexActivityTracker extends EventEmitter {
         && clearedAt >= state.acceptedStartAt
         && (state.phase === 'busy' || state.phase === 'unknown')
       ) {
-        this.transitionAfterTurnClear(state, at)
+        this.transitionAfterTurnClear(state, at, record)
       }
 
       this.commitState(state, previous)
@@ -369,7 +537,7 @@ export class CodexActivityTracker extends EventEmitter {
     state.lastObservedAt = at
   }
 
-  private transitionAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+  private transitionAfterTurnClear(state: CodexTerminalActivity, at: number, record = true): void {
     const turnKey = state.acceptedStartAt
     const hasQueuedSubmit = this.hasQueuedSubmit(state)
     state.lastClearedAt = at
@@ -390,7 +558,11 @@ export class CodexActivityTracker extends EventEmitter {
       state.queuedSubmitAt = undefined
       state.pendingUntil = undefined
     }
-    this.recordCompletionIfIdle(state, turnKey, at)
+    if (record) {
+      this.recordCompletionIfIdle(state, turnKey, at)
+    } else {
+      this.claimTurnKeyIfIdle(state, turnKey)
+    }
   }
 
   private transitionAfterLatentTurnClear(state: CodexTerminalActivity, at: number): void {
@@ -409,7 +581,7 @@ export class CodexActivityTracker extends EventEmitter {
     state.lastObservedAt = at
   }
 
-  private transitionPendingAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+  private transitionPendingAfterTurnClear(state: CodexTerminalActivity, at: number, record = true): void {
     const turnKey = state.pendingSubmitAt
     state.latentAcceptedStartAt = undefined
     state.lastClearedAt = at
@@ -428,7 +600,11 @@ export class CodexActivityTracker extends EventEmitter {
       state.pendingUntil = undefined
       state.queuedSubmitAt = undefined
     }
-    this.recordCompletionIfIdle(state, turnKey, at)
+    if (record) {
+      this.recordCompletionIfIdle(state, turnKey, at)
+    } else {
+      this.claimTurnKeyIfIdle(state, turnKey)
+    }
   }
 
   /**
@@ -449,6 +625,20 @@ export class CodexActivityTracker extends EventEmitter {
       ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       at,
     }))
+  }
+
+  /**
+   * Abort-shaped clears (turn_aborted / status interrupted|failed): claim
+   * the turn key exactly like recordCompletionIfIdle does, but WITHOUT
+   * recording, so a later echo of the same physical turn (BEL, JSONL
+   * reconcile, app-server duplicate -- all share this key space) cannot
+   * mint a completion. shared/ws-protocol.ts terminal.idle: "Never emitted
+   * after crash/interrupt/exit".
+   */
+  private claimTurnKeyIfIdle(state: CodexTerminalActivity, turnKey: number | undefined): void {
+    if (turnKey === undefined) return
+    if (state.phase !== 'idle') return
+    state.lastEmittedTurnKey = turnKey
   }
 
   private flushCompletions(): void {
@@ -488,10 +678,20 @@ export class CodexActivityTracker extends EventEmitter {
 
     if (input.reason === 'resume') {
       if (state.phase === 'idle') {
-        state.phase = 'busy'
-        state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
-        state.latentAcceptedStartAt = undefined
-        state.updatedAt = input.at
+        if (state.pendingApprovals.size > 0) {
+          // Lane-interference guard (decision 8 / audit A9): a resume
+          // re-announce landing during a pending approval must not promote
+          // idle -> busy (it would silently cancel the armed approval bell).
+          // Fold the anchor; the resolve restores busy.
+          state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
+          state.latentAcceptedStartAt = undefined
+          state.resumeBusyAfterApproval = true
+        } else {
+          state.phase = 'busy'
+          state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
+          state.latentAcceptedStartAt = undefined
+          state.updatedAt = input.at
+        }
       } else if (state.phase === 'pending') {
         state.latentAcceptedStartAt = maxDefined(state.latentAcceptedStartAt, startedAt)
       } else {
@@ -579,11 +779,19 @@ export class CodexActivityTracker extends EventEmitter {
     this.emit('changed', { upsert: [next], remove: [] } satisfies CodexActivityChange)
   }
 
-  private removeState(terminalId: string): void {
+  private removeState(terminalId: string, opts?: { spontaneousExit?: boolean }): void {
     const existing = this.states.get(terminalId)
     if (!existing) return
+    // Death-bell engagement (decision 3): read BEFORE deleting the state -- a
+    // pane blocked on an approval when it dies must still ring.
+    const approvalPending = existing.pendingApprovals.size > 0
     this.states.delete(terminalId)
-    this.emit('changed', { upsert: [], remove: [terminalId] } satisfies CodexActivityChange)
+    this.emit('changed', {
+      upsert: [],
+      remove: [terminalId],
+      ...(opts?.spontaneousExit ? { spontaneousExitRemovals: [terminalId] } : {}),
+      ...(approvalPending ? { approvalPendingRemovals: [terminalId] } : {}),
+    } satisfies CodexActivityChange)
   }
 
   private toRecord(state: CodexTerminalActivity): CodexActivityRecord {
