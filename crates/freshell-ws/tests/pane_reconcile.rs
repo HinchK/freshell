@@ -762,17 +762,22 @@ async fn idle_reaped_terminal_mid_reconcile_converges_to_respawn_not_attach() {
     let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Present]);
     let server = spawn_server_with_probe(std::sync::Arc::new(probe), |_| {}).await;
 
-    // A detached claude terminal whose meaningful-activity clock is 20 minutes
+    // A detached shell terminal whose meaningful-activity clock is 20 minutes
     // stale — eligible for the sweep (registry default autoKillIdleMinutes=15).
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis() as i64;
+    // ITEM-3: agent modes now get a 24 h idle hard cap (not the configured
+    // threshold), so the reap side of this seam is driven with a plain
+    // shell terminal; the
+    // pane still re-presents as claude (verdict logic only consults disk
+    // truth + liveness — the reaped row is gone either way).
     headless(
         &server,
         "T-reaped",
         Some("cr-reaped"),
-        "claude",
+        "shell",
         now_ms - 20 * 60_000,
     );
     assert!(
@@ -813,4 +818,36 @@ async fn idle_reaped_terminal_mid_reconcile_converges_to_respawn_not_attach() {
         "a reaped-mid-reconcile terminal must yield a clean respawn, got: {v}"
     );
     assert_eq!(v["sessionRef"]["sessionId"], "sess-reaped");
+}
+
+/// ITEM-3 regression pin: the idle sweep must NOT reap a detached
+/// agent-mode terminal that is stale past the configured threshold but
+/// within the 24 h agent hard cap — agent CLIs are legitimately PTY-silent
+/// during long LLM calls and long tool runs (`terminal.killed by="idle"`
+/// forensics). Past the cap they ARE reaped (ledger A14 backstop).
+#[tokio::test]
+async fn idle_sweep_spares_detached_agent_terminals() {
+    let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Present]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |_| {}).await;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    // 20 minutes stale vs the 15-minute default — reap-eligible by clock.
+    headless(
+        &server,
+        "T-amp-busy",
+        Some("cr-amp-busy"),
+        "amplifier",
+        now_ms - 20 * 60_000,
+    );
+
+    let killed = server.registry.enforce_idle_kills();
+
+    assert!(
+        killed.is_empty(),
+        "a running agent-mode terminal must be spared, got {killed:?}"
+    );
+    assert!(server.registry.is_live("T-amp-busy"));
 }

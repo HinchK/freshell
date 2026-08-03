@@ -16,6 +16,12 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 # Timestamp serialization for amplifier stub metadata (ISO-8601 RFC-3339).
 chrono = { workspace = true }
+# ITEM-1 bundle stamping (`bundle_config.rs`): read amplifier's settings.yaml
+# `bundle.active` when pre-writing session stubs. saphyr is the maintained
+# pure-Rust YAML 1.2 successor to the archived serde_yaml (release 2026-07;
+# yaml-rust2's successor project). default-features off: we only need
+# untyped `Yaml` access to one nested string key, no serde.
+saphyr = { version = "0.0.11", default-features = false }
 # chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
 notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
