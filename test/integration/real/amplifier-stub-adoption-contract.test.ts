@@ -91,7 +91,8 @@ function isolatedAmplifierEnv(home: string): NodeJS.ProcessEnv {
   }
 }
 
-// The exact stub shape the Rust broker writes (plan Global Constraints).
+// The exact stub shape the Rust broker writes (amplifier_stub.rs:193-198 +
+// the ITEM-1 bundle stamp) — keep hand-mirrored with the Rust json! literal.
 // `home` is the sandbox $HOME — the CLI hardcodes `$HOME/.amplifier` for
 // session storage (validated), hence the '.amplifier' segment here.
 async function writeStub(home: string, resolvedCwd: string, sessionId: string): Promise<string> {
@@ -102,6 +103,10 @@ async function writeStub(home: string, resolvedCwd: string, sessionId: string): 
     created: new Date().toISOString(),
     working_dir: resolvedCwd,
     freshell_terminal_id: 'contract-test-terminal',
+    // ITEM-1: the Rust broker stamps the user's `bundle.active` (bare name)
+    // when it resolves; this mirror models the stamped (common) variant.
+    // When nothing resolves, the broker omits the key entirely.
+    bundle: 'foundation',
   }))
   await fs.writeFile(path.join(dir, 'transcript.jsonl'), '')
   await fs.writeFile(path.join(dir, 'events.jsonl'), '')
@@ -229,6 +234,10 @@ describe('amplifier stub-adoption contract (real CLI)', () => {
       const meta = JSON.parse(await fs.readFile(path.join(dir, 'metadata.json'), 'utf8'))
       expect(meta.session_id).toBe(sessionId)
       expect(meta.freshell_terminal_id).toBe('contract-test-terminal')
+      // ITEM-1: zero-turn adoption must leave the stamped bundle intact —
+      // this is the key the CLI's resume path will trust. (Zero-turn only:
+      // after a real first turn the CLI rewrites it as 'bundle:foundation'.)
+      expect(meta.bundle).toBe('foundation')
       // Zero-turn adoption must not mark the session used (GC contract).
       expect(meta.turn_count).toBeUndefined()
     } finally {
