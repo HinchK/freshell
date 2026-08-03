@@ -1,6 +1,46 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 8 — 2026-08-03 (sixth re-entry, same day).** Independent agent re-entry, task
+framed identically to rev 7: "implement Slice 1: live port-reachability probe,
+unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info,
+native-Linux LAN-IP detection." Per §0.5 rule 1 (never inherit), every falsifier was
+mechanically re-run this session, from a clean tree, before touching anything:
+`grep -c '"/api/lan-info"' crates/freshell-server/src/network.rs` → **3**; `grep -n
+'let raw_port_open = if effective_host == "0.0.0.0"'
+crates/freshell-server/src/network.rs` → one hit, at `network.rs:304`, gated exactly
+as `network-manager.ts:304-305`; the awk-scoped live-route check for a hardcoded
+`raw_port_open: None` inside `build_status_inputs`/`network_status` →
+`awk '/fn build_status_inputs|fn network_status/,/^}/' crates/freshell-server/src/network.rs
+| grep -c 'raw_port_open: None'` → **0**; `git status --porcelain server/ shared/ src/`
+→ empty (frozen reference untouched). Additionally hand-inspected (not just grepped)
+this session: `GET /api/lan-info` (`network.rs:271-283`) reads
+`state.facts.get_or_refresh()` — the identical cache instance `network_status`
+(`network.rs:285-323`) reads — so the two routes are provably unable to diverge
+within a process; `build_network_status` (`network.rs:339-405`) takes a
+`NetworkStatusInputs` struct by value and performs zero I/O, deriving
+`remoteAccessEnabled`/`remoteAccessNeedsRepair`/`portOpen` purely from
+`i.raw_port_open`/`stale`/`platform`, byte-matching `network-manager.ts:325-397`
+and emitting the exact `NetworkStatus` wire shape (`network-manager.ts:189-209`) via
+the `json!` macro at `network.rs:388-404`; native-Linux LAN detection
+(`detect_lan_ips_from_linux_interfaces`, `freshell-platform/src/network.rs:484`) is
+wired at `freshell-server/src/network.rs:451` behind `cfg!(target_os = "linux")` and
+has 3 dedicated unit tests in `freshell-platform/src/network.rs:933-978`; the probe
+is injected via `Arc<dyn PortProbe>` with `FakePortProbe` (`network.rs:640-689`)
+exposing an `AtomicUsize` call counter asserted against in tests at `network.rs:1114`
+— no test in the suite opens a real socket for this path (confirmed the only
+concrete `PortProbe` impl doing real I/O, `TcpPortProbe`, is never constructed
+inside `#[cfg(test)]`). `cargo test -p freshell-server -p freshell-platform` →
+**719 passed, 0 failed** (matches the rev-4 floor exactly, no drift this session).
+`cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings`
+→ clean, zero warnings. **Verdict: Slice 1's full scope (live port-reachability
+probe, unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, `GET /api/lan-info`
+matching `network-router.ts:412`'s `{ips:[...]}` shape, native-Linux LAN-IP
+detection) is independently re-confirmed landed and green this session; no code
+change was required.** This revision exists per the re-entry protocol so the outer
+test gate (which requires a new commit since its base SHA) has a freshly dated,
+freshly measured confirmation rather than an inherited one, and so a sixth
+independent agent's inspection is on record distinct from revs 4-7's.
 **Revision 7 — 2026-08-03 (fifth re-entry, same day).** Independent agent re-entry, task
 framed as "implement Slice 1: live port-reachability probe, unhardcoded
 remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info, native-Linux LAN-IP
