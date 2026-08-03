@@ -839,9 +839,14 @@ impl TerminalRegistry {
     /// live-child signal (the Running→Exited flip's only natural trigger is
     /// the PTY reader's EOF; a descendant holding the slave fd wedges it —
     /// ledger A14), and this sweep is the only cleanup for wedged rows.
-    /// CLOSED list: unknown / future modes stay reapable (legacy behavior).
+    /// CLOSED list mirroring the shipped agent-CLI extensions (`category:
+    /// "cli"`, picker group `"agents"` under `extensions/`): unknown /
+    /// future modes stay reapable (legacy behavior) until added here.
     fn is_agent_mode(mode: &str) -> bool {
-        matches!(mode, "claude" | "codex" | "opencode" | "amplifier")
+        matches!(
+            mode,
+            "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi"
+        )
     }
 
     /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`]).
@@ -3938,7 +3943,7 @@ mod tests {
         // the 24 h hard cap they must be spared (999 min << 24 h).
         let reg = TerminalRegistry::new();
         reg.set_auto_kill_idle_minutes(5);
-        for mode in ["claude", "codex", "opencode", "amplifier"] {
+        for mode in ["claude", "codex", "opencode", "amplifier", "gemini", "kimi"] {
             let id = format!("T-{mode}");
             reg.register_headless(HeadlessTerminal {
                 terminal_id: id.clone(),
@@ -3958,7 +3963,7 @@ mod tests {
             killed.is_empty(),
             "agent-mode terminals with a live child must never be idle-reaped, got {killed:?}"
         );
-        assert_eq!(reg.inventory().len(), 4);
+        assert_eq!(reg.inventory().len(), 6);
     }
 
     #[test]

@@ -968,7 +968,7 @@ git commit -m "feat(installers): optional systemd user unit for the rust server;
 **Files:**
 - Modify: `crates/freshell-terminal/src/registry.rs` — the `enforce_idle_kills` filter closure (lines 859-874) + its doc comment (lines 833-846), a new private helper, and new tests in `mod tests`
 
-Context (settled by investigation): a terminal is idle-killed iff running + detached + `last_meaningful_activity_at` older than `autoKillIdleMinutes` (default 15). The meaningful-activity clock is fed ONLY by user input and non-noise PTY output — there is no child-process probe. So an agent that is mid-work but PTY-quiet (long LLM call, long tool run) or emitting only spinner repaints (deliberately classified as noise, DEV-0009) is killed. `s.mode` (`"shell" | "claude" | "codex" | "opencode" | "amplifier"`) is in scope in the filter closure. CORRECTION (ledger A14, validated): `status == Running` is NOT a loss-proof live-child signal — the Running→Exited flip has exactly one natural trigger (the PTY reader thread's EOF), and a descendant holding the slave fd wedges it forever (empirically reproduced); this sweep is also the ONLY cleanup for such wedged rows. So a full exemption is ruled out. The minimal change consistent with the design: agent modes get a large idle HARD CAP (24 h) instead of the configured threshold — busy-but-quiet agents (minutes-to-hours silent) are spared, wedged/abandoned rows still get cleaned. Unknown/future modes keep legacy reaping.
+Context (settled by investigation): a terminal is idle-killed iff running + detached + `last_meaningful_activity_at` older than `autoKillIdleMinutes` (default 15). The meaningful-activity clock is fed ONLY by user input and non-noise PTY output — there is no child-process probe. So an agent that is mid-work but PTY-quiet (long LLM call, long tool run) or emitting only spinner repaints (deliberately classified as noise, DEV-0009) is killed. `s.mode` (`"shell" | "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi"` — one string per shipped extension under `extensions/`, plus `"shell"`) is in scope in the filter closure. CORRECTION (ledger A14, validated): `status == Running` is NOT a loss-proof live-child signal — the Running→Exited flip has exactly one natural trigger (the PTY reader thread's EOF), and a descendant holding the slave fd wedges it forever (empirically reproduced); this sweep is also the ONLY cleanup for such wedged rows. So a full exemption is ruled out. The minimal change consistent with the design: agent modes get a large idle HARD CAP (24 h) instead of the configured threshold — busy-but-quiet agents (minutes-to-hours silent) are spared, wedged/abandoned rows still get cleaned. Unknown/future modes keep legacy reaping.
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
@@ -989,7 +989,7 @@ In `crates/freshell-terminal/src/registry.rs`, `#[cfg(test)] mod tests`, immedia
         // the 24 h hard cap they must be spared (999 min << 24 h).
         let reg = TerminalRegistry::new();
         reg.set_auto_kill_idle_minutes(5);
-        for mode in ["claude", "codex", "opencode", "amplifier"] {
+        for mode in ["claude", "codex", "opencode", "amplifier", "gemini", "kimi"] {
             let id = format!("T-{mode}");
             reg.register_headless(HeadlessTerminal {
                 terminal_id: id.clone(),
@@ -1083,7 +1083,7 @@ In `registry.rs`, add a private helper directly ABOVE `pub fn enforce_idle_kills
     /// ledger A14), and this sweep is the only cleanup for wedged rows.
     /// CLOSED list: unknown / future modes stay reapable (legacy behavior).
     fn is_agent_mode(mode: &str) -> bool {
-        matches!(mode, "claude" | "codex" | "opencode" | "amplifier")
+        matches!(mode, "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi")
     }
 
     /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`]).
