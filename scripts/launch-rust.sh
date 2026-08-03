@@ -15,6 +15,16 @@
 #                                          #   this port first, then start
 #   scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
 #
+# DETACHMENT: the server is started in its own session (setsid, stdin from
+# /dev/null). Closing the shell/console that ran this script does NOT stop
+# the server or its child terminals. Stop it with:
+#   scripts/launch-rust.sh --stop [--port N]
+# CAVEAT (WSL2): when the LAST console/interop handle into the distro
+# closes, Windows shuts the whole WSL VM down (documented behavior) — no
+# launcher-side detachment survives that. For unattended operation use the
+# systemd user unit (recommended; restores the server at next distro boot):
+# see installers/systemd/freshell-rust.service.
+#
 # SAFETY (per AGENTS.md):
 #   * Restarting the LIVE self-hosted server (port 3002) requires explicit user
 #     approval ("APPROVED"). This script will never kill a process it did not
@@ -157,7 +167,22 @@ fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 echo "Starting freshell-server on port $PORT..."
-PORT="$PORT" nohup "$BINARY" >> "$LOG_FILE" 2>&1 &
+# Detach into a NEW SESSION (setsid): the server gets its own session +
+# process group and no controlling terminal, so the death of the launching
+# shell (or its WSL2 relay) can no longer deliver the SIGHUP/SIGTERM
+# cascades that killed the server and every child agent PTY at once
+# (shutdown_forensics events in ~/.freshell/logs/rust-server.jsonl).
+# nohup was useless here: the server installs its own SIGHUP handler, which
+# replaces nohup's inherited SIG_IGN (docs/plans/2026-07-26-rust-wsl-crash-
+# hardening.md A13/V5). stdin comes from /dev/null so no tty fd ties us to
+# the console. setsid exec's WITHOUT forking here (a background job in a
+# non-interactive script is not a process-group leader), so $! below is the
+# server's real pid. Verified by experiment (ledger A11) — but ONLY under
+# these conditions: never enable job control (set -m) in this script and
+# never wrap this script in an outer setsid/setpgid; either would make
+# setsid a process-group leader and flip it into its FORK branch, leaving
+# $! pointing at a short-lived intermediate.
+PORT="$PORT" setsid "$BINARY" < /dev/null >> "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 
@@ -166,6 +191,11 @@ for _ in $(seq 1 60); do
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
     echo ""
     echo "freshell-server is ready! (pid $SERVER_PID, port $PORT)"
+    if ! is_our_server_pid "$SERVER_PID"; then
+      echo "WARNING: $PID_FILE may be stale — setsid forked unexpectedly;" >&2
+      echo "         --stop/--restart may not find the server. Inspect with:" >&2
+      echo "         ps -eo pid,sid,args | grep freshell-server" >&2
+    fi
     # The listening line includes the commit the binary was built from.
     grep -m1 "freshell-server listening" "$LOG_FILE" | tail -1 || true
     echo "  URL: http://localhost:$PORT/?token=$AUTH_TOKEN_VALUE"

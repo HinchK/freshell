@@ -105,7 +105,14 @@ pub struct EnsuredSession {
 /// `working_dir` (canonical cwd), custom `freshell_terminal_id` (best-effort
 /// durable-linkage bonus — validation observed a real turn's save REWRITE
 /// metadata.json and add `*.backup` files, so the field may not survive use;
-/// Freshell's own registry stays primary and nothing keys off it), NO `bundle`; plus empty `transcript.jsonl` and empty
+/// Freshell's own registry stays primary and nothing keys off it), plus a
+/// best-effort `bundle` (bare name from the user's merged settings
+/// `bundle.active` — see [`crate::bundle_config::resolve_active_bundle`];
+/// stamped because the CLI's resume path never consults settings and would
+/// otherwise run its hardcoded default bundle (`anchors`) and persist a
+/// self-perpetuating `"bundle": "unknown"`; the CLI normalizes a bare stamp
+/// to `bundle:<name>` on its first save; omitted entirely when nothing
+/// resolves safely); plus empty `transcript.jsonl` and empty
 /// `events.jsonl` (the latter so the activity hub's create-time resolver
 /// attach finds a file — see the module design note).
 pub fn ensure_session(
@@ -190,12 +197,29 @@ pub fn ensure_session(
         .join("sessions")
         .join(session_id);
     std::fs::create_dir_all(&dir)?;
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "session_id": session_id,
         "created": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "working_dir": resolved.to_string_lossy(),
         "freshell_terminal_id": terminal_id,
     });
+    // ITEM-1: stamp the user's active bundle (bare name, e.g. "foundation";
+    // the CLI accepts bare on read and normalizes it to "bundle:<name>" on
+    // its first save — never assume the literal survives a real turn).
+    // The CLI's `resume` path never consults settings `bundle.active`; an
+    // unstamped stub silently runs the CLI's hardcoded default bundle
+    // (`anchors`) and then persists a self-perpetuating "bundle": "unknown".
+    // Best-effort by
+    // design: `resolve_active_bundle` collapses every surprise to `None`
+    // (HARD SAFETY RULE — a wrong stamp is trusted forever, a missing one
+    // is healed), so stub creation can never fail or slow down here.
+    // `amplifier_home` doubles as the global settings root: callers pass
+    // `resolve_amplifier_home()` = `$HOME/.amplifier` in production (with
+    // the FRESHELL_AMPLIFIER_HOME test override), which is exactly where
+    // the CLI reads its global settings.yaml.
+    if let Some(bundle) = crate::bundle_config::resolve_active_bundle(amplifier_home, &resolved) {
+        metadata["bundle"] = serde_json::Value::String(bundle);
+    }
     // The three stub-file writes below can fail partway through (ENOSPC,
     // permissions, ...) after create_dir_all already succeeded. On that
     // path, best-effort roll back the directory rather than leaving a
@@ -526,6 +550,14 @@ mod tests {
         let cwd_dir = home.join("workdir");
         std::fs::create_dir_all(&cwd_dir).unwrap();
         let canonical = std::fs::canonicalize(&cwd_dir).unwrap();
+        // ITEM-1: a configured global bundle must be stamped into the stub.
+        std::fs::write(
+            home.join("settings.yaml"),
+            "bundle:
+  active: foundation
+",
+        )
+        .unwrap();
 
         let ensured = ensure_session(
             &home,
@@ -554,8 +586,11 @@ mod tests {
         assert_eq!(meta["freshell_terminal_id"], "term-1");
         // ISO-8601 with tz — must parse through the crate's own parser.
         assert!(crate::time::parse_timestamp_ms(&meta["created"]).is_some());
-        // Omit `bundle` so the user's default bundle resolves.
-        assert!(meta.get("bundle").is_none());
+        // ITEM-1: stamp the user's configured bundle (bare name). The CLI's
+        // resume path never consults settings.yaml — an unstamped stub runs
+        // the CLI's hardcoded default bundle and then persists a
+        // self-perpetuating "bundle": "unknown".
+        assert_eq!(meta["bundle"], "foundation");
         // No turn_count on a fresh stub (the GC "unused" signature).
         assert!(meta.get("turn_count").is_none());
         // Empty transcript + empty events (events.jsonl is load-bearing for
@@ -901,6 +936,59 @@ mod tests {
                 sessions_checked: 1
             }
         );
+    }
+
+    #[test]
+    fn ensure_session_omits_bundle_when_no_settings_resolve() {
+        // No settings file at any layer -> no stamp. Amplifier's own
+        // default-bundle resolution heals a missing key; only a WRONG key
+        // is unrecoverable (HARD SAFETY RULE).
+        let home = unique_temp_home("no-bundle");
+        let cwd_dir = home.join("workdir");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+
+        let ensured = ensure_session(
+            &home,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            cwd_dir.to_str().unwrap(),
+            "term-nb",
+        )
+        .unwrap();
+        assert!(ensured.created);
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ensured.session_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.get("bundle").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_session_still_creates_stub_when_settings_are_garbage() {
+        // Surprise settings must degrade to omission — NEVER fail or delay
+        // stub creation.
+        let home = unique_temp_home("garbage-bundle");
+        let cwd_dir = home.join("workdir");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        std::fs::write(home.join("settings.yaml"), "bundle: [unclosed").unwrap();
+
+        let ensured = ensure_session(
+            &home,
+            "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+            cwd_dir.to_str().unwrap(),
+            "term-gb",
+        )
+        .unwrap();
+        assert!(
+            ensured.created,
+            "stub creation must never fail because settings were unreadable"
+        );
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ensured.session_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.get("bundle").is_none());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
