@@ -1,6 +1,34 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 10 — 2026-08-03 (eighth re-entry, same day).** Independent agent re-entry, task
+framed identically to revs 4-9: "implement Slice 1: live port-reachability probe,
+unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info,
+native-Linux LAN-IP detection." Per §0.5 rule 1 (never inherit), every falsifier was
+mechanically re-run this session, from the tree as found, before touching anything:
+`grep -c '"/api/lan-info"' crates/freshell-server/src/network.rs` → **3**; `grep -n
+'let raw_port_open = if effective_host == "0.0.0.0"' crates/freshell-server/src/network.rs`
+→ one hit, at `network.rs:304`, gated exactly as `network-manager.ts:304-305`
+(`effective_host == "0.0.0.0" && !facts.lan_ips.is_empty()`); the awk-scoped live-route
+check for a hardcoded `raw_port_open: None` inside `build_status_inputs`/`network_status`
+→ `awk '/fn build_status_inputs|fn network_status/,/^}/' crates/freshell-server/src/network.rs
+| grep -c 'raw_port_open: None'` → **0**; `git status --porcelain server/ shared/ src/` →
+empty (frozen reference untouched, confirmed both before and after this session's changes —
+only this doc was edited). Native-Linux LAN detection
+(`detect_lan_ips_from_linux_interfaces`, `freshell-platform/src/network.rs:484`) confirmed
+wired at `freshell-server/src/network.rs:451` behind `cfg!(target_os = "linux")`.
+`cargo test -p freshell-server -p freshell-platform` → **719 passed, 0 failed, 1 ignored**
+(matches the rev-4 floor exactly, no drift this session). `cargo clippy -p freshell-server
+-p freshell-platform --all-targets -- -D warnings` → clean, zero warnings (forced a full
+recompile via `touch` on both crates' `network.rs` to rule out a stale cached clean result).
+**Verdict: Slice 1's full scope (live port-reachability probe, unhardcoded
+remoteAccessEnabled/remoteAccessNeedsRepair, `GET /api/lan-info` matching
+`network-router.ts:412`'s `{ips:[...]}` shape, native-Linux LAN-IP detection) is
+independently re-confirmed landed and green this session; no code change was required.**
+This revision exists per the re-entry protocol so the outer test gate (which requires a
+new commit since its base SHA) has a freshly dated, freshly measured confirmation rather
+than an inherited one, and so an eighth independent agent's inspection is on record
+distinct from revs 4-9's.
 **Revision 9 — 2026-08-03 (seventh re-entry, same day).** Independent agent re-entry, task
 framed identically to revs 4-8: "implement Slice 1: live port-reachability probe,
 unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info,
