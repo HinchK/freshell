@@ -472,6 +472,73 @@ pub fn detect_lan_ips_from_windows_interfaces(runner: &dyn CommandRunner) -> Vec
     rank_lan_ip_candidates(&parse_powershell_ip_prefix_lines(&out.stdout))
 }
 
+/// `detectLanIpsFromInterfaces` (`bootstrap.ts:151-153`, `os.networkInterfaces()`)
+/// for a NATIVE LINUX host (not WSL2, not Windows) \u2014 the NET-10 gap that used to
+/// be an unwired `Vec::new()` at `network.rs:243-249`. READ-ONLY `ip -o -4 addr
+/// show`, parsed into `(address, netmask)` candidates (dropping the loopback `lo`
+/// interface and any `scope host` address \u2014 the `internal: true` equivalent
+/// `collectLanIpCandidates` skips), netmask converted from the CIDR prefix via
+/// [`prefix_len_to_netmask`], and ranked with [`rank_lan_ip_candidates`] \u2014 i.e.
+/// byte-identical ranking to the reference's real-netmask `os.networkInterfaces()`
+/// path (unlike the WSL ipconfig.exe branch, which assumes `/24`).
+pub fn detect_lan_ips_from_linux_interfaces(runner: &dyn CommandRunner) -> Vec<String> {
+    let out = runner.run("ip", &["-o", "-4", "addr", "show"]);
+    if !out.ok() {
+        return Vec::new();
+    }
+    rank_lan_ip_candidates(&parse_ip_addr_show_lines(&out.stdout))
+}
+
+/// Parse `ip -o -4 addr show` (one logical record per line) into `(address,
+/// netmask)` candidates. Observed shape (live-captured, this host, 2026-08-02):
+///
+/// ```text
+/// 2: eth0    inet 172.30.149.249/20 brd 172.30.159.255 scope global eth0\       valid_lft forever preferred_lft forever
+/// ```
+///
+/// i.e. `<idx>: <ifname> inet <addr>/<prefix> [brd <addr>] scope <scope> <ifname>\ \u2026`.
+/// Drops the loopback interface (`ifname == "lo"`) and any `scope host` address
+/// (a non-`lo` host-scoped address is the same \"not a real LAN IP\" case the
+/// reference's `internal: true` skip encodes). Malformed/short lines are ignored
+/// (tolerant, matching every other parser in this module).
+fn parse_ip_addr_show_lines(output: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // fields[0] = "<idx>:", fields[1] = ifname, fields[2] = "inet", fields[3] = "<addr>/<prefix>".
+        if fields.len() < 4 || fields[2] != "inet" {
+            continue;
+        }
+        let ifname = fields[1];
+        if ifname == "lo" {
+            continue;
+        }
+        let scope = fields
+            .iter()
+            .position(|f| *f == "scope")
+            .and_then(|i| fields.get(i + 1))
+            .copied();
+        if scope == Some("host") {
+            continue;
+        }
+        let Some((ip, prefix)) = fields[3].split_once('/') else {
+            continue;
+        };
+        let octets: Vec<&str> = ip.split('.').collect();
+        if octets.len() != 4 || !octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+            continue;
+        }
+        let Ok(prefix) = prefix.parse::<u32>() else {
+            continue;
+        };
+        if prefix > 32 {
+            continue;
+        }
+        out.push((ip.to_string(), prefix_len_to_netmask(prefix)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +884,94 @@ Ethernet adapter vEthernet (WSL):\r\n\
             ),
         );
         assert_eq!(detect_lan_ips_via_ipconfig(&runner), vec!["192.168.1.50"]);
+    }
+
+    // ---- NET-10: native-Linux LAN detection (`ip -o -4 addr show`) --------
+
+    /// This host's REAL, live-captured `ip -o -4 addr show` output
+    /// (2026-08-02): an `eth0` (WSL2 NAT-facing) address, a `bossbench0`
+    /// bridge, and nine Docker `br-*` bridge networks \u2014 plus a synthetic
+    /// `docker0 172.17.0.1` line appended (this host happens to run no
+    /// `docker0` interface today) so the golden test can also pin the
+    /// Docker-bridge-deprioritization rule the checklist calls out.
+    const LIVE_IP_ADDR_SHOW: &str = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
+1: lo    inet 10.255.255.254/32 brd 10.255.255.254 scope global lo\\       valid_lft forever preferred_lft forever\n\
+2: eth0    inet 172.30.149.249/20 brd 172.30.159.255 scope global eth0\\       valid_lft forever preferred_lft forever\n\
+3: bossbench0    inet 172.29.0.1/16 scope global bossbench0\\       valid_lft forever preferred_lft forever\n\
+5: br-c26837bac951    inet 172.26.0.1/16 brd 172.26.255.255 scope global br-c26837bac951\\       valid_lft forever preferred_lft forever\n\
+6: br-ec1097d989e7    inet 172.22.0.1/16 brd 172.22.255.255 scope global br-ec1097d989e7\\       valid_lft forever preferred_lft forever\n\
+7: br-3543a9ee0bd4    inet 172.25.0.1/16 brd 172.25.255.255 scope global br-3543a9ee0bd4\\       valid_lft forever preferred_lft forever\n\
+8: br-4b8e6702d964    inet 172.19.0.1/16 brd 172.19.255.255 scope global br-4b8e6702d964\\       valid_lft forever preferred_lft forever\n\
+9: br-7045a3f47d75    inet 172.24.0.1/16 brd 172.24.255.255 scope global br-7045a3f47d75\\       valid_lft forever preferred_lft forever\n\
+10: br-9f77142390c0    inet 172.20.0.1/16 brd 172.20.255.255 scope global br-9f77142390c0\\       valid_lft forever preferred_lft forever\n\
+11: br-e701b8038718    inet 172.23.0.1/16 brd 172.23.255.255 scope global br-e701b8038718\\       valid_lft forever preferred_lft forever\n\
+12: br-88f9f0211270    inet 172.21.0.1/16 brd 172.21.255.255 scope global br-88f9f0211270\\       valid_lft forever preferred_lft forever\n\
+13: br-8ab59ac84d99    inet 172.18.0.1/16 brd 172.18.255.255 scope global br-8ab59ac84d99\\       valid_lft forever preferred_lft forever\n\
+14: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n";
+
+    #[test]
+    fn parse_ip_addr_show_lines_drops_loopback_and_host_scope() {
+        let candidates = parse_ip_addr_show_lines(LIVE_IP_ADDR_SHOW);
+        // Loopback (`lo`) never appears, regardless of scope.
+        assert!(!candidates.iter().any(|(ip, _)| ip == "127.0.0.1"));
+        assert!(!candidates.iter().any(|(ip, _)| ip == "10.255.255.254"));
+        // Every real interface's address IS present, with its real netmask.
+        assert!(candidates
+            .iter()
+            .any(|(ip, mask)| ip == "172.30.149.249" && mask == "255.255.240.0"));
+        assert!(candidates
+            .iter()
+            .any(|(ip, mask)| ip == "172.29.0.1" && mask == "255.255.0.0"));
+        assert!(candidates.iter().any(|(ip, _)| ip == "172.17.0.1"));
+        // 11 real interfaces (eth0, bossbench0, 9x br-*) + the synthetic
+        // docker0 line = 12 candidates.
+        assert_eq!(candidates.len(), 12);
+    }
+
+    #[test]
+    fn detect_lan_ips_from_linux_interfaces_ranks_docker_bridge_low_and_excludes_loopback() {
+        let runner = FakeCommandRunner::new().on(
+            "ip",
+            &["-o", "-4", "addr", "show"],
+            CommandOutput::success(LIVE_IP_ADDR_SHOW),
+        );
+        let ranked = detect_lan_ips_from_linux_interfaces(&runner);
+
+        // Loopback is never a candidate at all.
+        assert!(!ranked.contains(&"127.0.0.1".to_string()));
+        assert!(!ranked.contains(&"10.255.255.254".to_string()));
+
+        // The Docker bridge (172.17.0.1) scores 0 \u2014 lowest of all `172.16-31.x`
+        // candidates present here (which all score 80) \u2014 so it must rank LAST.
+        assert_eq!(ranked.last().map(String::as_str), Some("172.17.0.1"));
+
+        // Every other real (non-docker0) interface address is present.
+        assert!(ranked.contains(&"172.30.149.249".to_string()));
+        assert!(ranked.contains(&"172.29.0.1".to_string()));
+        assert!(ranked.contains(&"172.26.0.1".to_string()));
+        assert_eq!(ranked.len(), 12);
+    }
+
+    #[test]
+    fn detect_lan_ips_from_linux_interfaces_empty_on_command_failure() {
+        let runner = FakeCommandRunner::new().with_default(CommandOutput::spawn_failure("no ip"));
+        assert_eq!(detect_lan_ips_from_linux_interfaces(&runner), Vec::<String>::new());
+    }
+
+    #[test]
+    fn detect_lan_ips_from_linux_interfaces_prefers_192_168_over_docker_and_bridges() {
+        // A realistic home-LAN host: 192.168.1.50/24 on eth0, plus a docker0
+        // bridge \u2014 the LAN address must rank first.
+        let out = "\
+2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0\\       valid_lft forever preferred_lft forever\n\
+3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n";
+        let runner =
+            FakeCommandRunner::new().on("ip", &["-o", "-4", "addr", "show"], CommandOutput::success(out));
+        assert_eq!(
+            detect_lan_ips_from_linux_interfaces(&runner),
+            vec!["192.168.1.50", "172.17.0.1"]
+        );
     }
 
     // ---- READ-ONLY live verification (skips off-WSL) ----------------------

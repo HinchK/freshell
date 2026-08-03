@@ -899,10 +899,11 @@ async fn main() -> ExitCode {
     // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
     let network_state = network::NetworkState {
         auth_token: Arc::clone(&auth_token),
-        settings: Arc::clone(&settings),
-        effective_host: Arc::new(bind_host.clone()),
+        settings: settings_store.clone(),
+        bind: Arc::new(network::BindState::new(bind_host.clone())),
         port,
-        facts: Arc::new(tokio::sync::OnceCell::new()),
+        facts: Arc::new(network::NetworkFactsCache::new()),
+        probe: Arc::new(network::TcpPortProbe::default()),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
