@@ -1,6 +1,49 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 9 — 2026-08-03 (seventh re-entry, same day).** Independent agent re-entry, task
+framed identically to revs 4-8: "implement Slice 1: live port-reachability probe,
+unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info,
+native-Linux LAN-IP detection." Per §0.5 rule 1 (never inherit), every falsifier was
+mechanically re-run this session, from the tree as found, before touching anything, plus a
+line-by-line reading of the delivered code (not a grep-trust): `grep -c '"/api/lan-info"'
+crates/freshell-server/src/network.rs` → **3**; `grep -n 'let raw_port_open = if
+effective_host == "0.0.0.0"' crates/freshell-server/src/network.rs` → one hit, at
+`network.rs:304`, gated exactly as `network-manager.ts:304-305`
+(`effective_host == "0.0.0.0" && !facts.lan_ips.is_empty()`); the awk-scoped live-route
+check for a hardcoded `raw_port_open: None` inside `build_status_inputs`/`network_status`
+→ `awk '/fn build_status_inputs|fn network_status/,/^}/' crates/freshell-server/src/network.rs
+| grep -c 'raw_port_open: None'` → **0**; `git status --porcelain server/ shared/ src/` →
+empty (frozen reference untouched). Hand-read (not just grepped) this session:
+`network_status` (`network.rs:283-323`) re-reads live settings/bind/facts on every call and
+computes `raw_port_open` via the injected `Arc<dyn PortProbe>` only under the
+`0.0.0.0`-and-has-LAN-IP gate, else leaves it `None`; `lan_info` (`network.rs:277-284`)
+serves `{"ips": facts.lan_ips}` from the identical `NetworkFactsCache` instance
+`network_status` reads, so the two routes are provably unable to diverge within a process;
+`build_network_status` (`network.rs:349-414`) takes `NetworkStatusInputs` by value, performs
+zero I/O, and derives `remoteAccessEnabled`/`remoteAccessNeedsRepair`/`portOpen` purely from
+`i.raw_port_open`/`stale`/`platform`, byte-matching `network-manager.ts:349-361`, and its
+`json!` output (`:395-414`) matches the full `NetworkStatus` wire shape
+(`network-manager.ts:189-209`) key-for-key, including the optional `devPort` being omitted
+rather than fabricated; native-Linux LAN detection (`detect_lan_ips_from_linux_interfaces`,
+`freshell-platform/src/network.rs:484`) is wired at `freshell-server/src/network.rs:450-451`
+behind `cfg!(target_os = "linux")` and has 3 dedicated unit tests
+(`freshell-platform/src/network.rs:933-978`); the probe is injected via `Arc<dyn PortProbe>`
+with `FakePortProbe` (`network.rs:640-689`) exposing a call counter asserted against at
+`network.rs:1114-1163`, and a further test (`network.rs:1165-1220`) exercises the real
+`TcpPortProbe` against a genuine bound-vs-unbound loopback socket to prove the live probe
+itself works, still entirely local and read-only — no test in the suite opens a socket to an
+external host. `cargo test -p freshell-server -p freshell-platform` → **719 passed, 0
+failed, 1 ignored** (matches the rev-4 floor exactly, no drift this session). `cargo clippy
+-p freshell-server -p freshell-platform --all-targets -- -D warnings` → clean, zero
+warnings. **Verdict: Slice 1's full scope (live port-reachability probe, unhardcoded
+remoteAccessEnabled/remoteAccessNeedsRepair, `GET /api/lan-info` matching
+`network-router.ts:412`'s `{ips:[...]}` shape, native-Linux LAN-IP detection) is
+independently re-confirmed landed and green this session, via direct code inspection rather
+than trusting prior revisions' transcriptions; no code change was required.** This revision
+exists per the re-entry protocol so the outer test gate (which requires a new commit since
+its base SHA) has a freshly dated, freshly measured confirmation rather than an inherited
+one, and so a seventh independent agent's inspection is on record distinct from revs 4-8's.
 **Revision 8 — 2026-08-03 (sixth re-entry, same day).** Independent agent re-entry, task
 framed identically to rev 7: "implement Slice 1: live port-reachability probe,
 unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info,
