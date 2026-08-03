@@ -843,6 +843,21 @@ Type=simple
 WorkingDirectory=%h/code/freshell
 ExecStart=%h/code/freshell/target/release/freshell-server
 Environment=PORT=3002
+# AUTH_TOKEN: the server reads it from WorkingDirectory/.env itself
+# (main.rs:76-87). Alternatively make it explicit to systemd:
+# EnvironmentFile=%h/code/freshell/.env
+# REQUIRED EDIT: the claude sidecar resolves bare `node` via PATH
+# (crates/freshell-freshagent/src/claude.rs:1372), and systemd user units
+# get a minimal PATH that lacks nvm/fnm installs. Either extend PATH to a
+# dir containing `node`, or point FRESHELL_CLAUDE_NODE at the binary:
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Environment=FRESHELL_CLAUDE_NODE=%h/.nvm/versions/node/v22.14.0/bin/node
+# SINGLE lifecycle owner: when this unit is installed, systemd owns
+# start/stop/restart on this port -- use `systemctl --user stop/restart
+# freshell-rust`, NEVER scripts/launch-rust.sh on the same port (its
+# pid-file stop and this Restart= policy would fight each other).
+# Restart=on-failure does not resist a deliberate `systemctl --user stop`
+# or a clean SIGTERM exit (exit 0).
 Restart=on-failure
 RestartSec=2
 # Give the graceful-shutdown path (WS close 4009 + PTY teardown) time to run.
