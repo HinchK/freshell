@@ -956,7 +956,10 @@ Ethernet adapter vEthernet (WSL):\r\n\
     #[test]
     fn detect_lan_ips_from_linux_interfaces_empty_on_command_failure() {
         let runner = FakeCommandRunner::new().with_default(CommandOutput::spawn_failure("no ip"));
-        assert_eq!(detect_lan_ips_from_linux_interfaces(&runner), Vec::<String>::new());
+        assert_eq!(
+            detect_lan_ips_from_linux_interfaces(&runner),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -966,8 +969,11 @@ Ethernet adapter vEthernet (WSL):\r\n\
         let out = "\
 2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0\\       valid_lft forever preferred_lft forever\n\
 3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n";
-        let runner =
-            FakeCommandRunner::new().on("ip", &["-o", "-4", "addr", "show"], CommandOutput::success(out));
+        let runner = FakeCommandRunner::new().on(
+            "ip",
+            &["-o", "-4", "addr", "show"],
+            CommandOutput::success(out),
+        );
         assert_eq!(
             detect_lan_ips_from_linux_interfaces(&runner),
             vec!["192.168.1.50", "172.17.0.1"]

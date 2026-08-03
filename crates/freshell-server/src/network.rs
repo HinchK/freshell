@@ -302,7 +302,12 @@ async fn network_status(State(state): State<NetworkState>, headers: HeaderMap) -
     // not a deferral.
     let remote_access_ports: Vec<u16> = vec![state.port];
     let raw_port_open = if effective_host == "0.0.0.0" && !facts.lan_ips.is_empty() {
-        probe_remote_access_ports(state.probe.as_ref(), &facts.lan_ips[0], &remote_access_ports).await
+        probe_remote_access_ports(
+            state.probe.as_ref(),
+            &facts.lan_ips[0],
+            &remote_access_ports,
+        )
+        .await
     } else {
         None
     };
