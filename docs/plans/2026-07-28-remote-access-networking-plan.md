@@ -1,6 +1,31 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 6 — 2026-08-03 (fourth re-entry, same day).** Independent agent re-entry to
+"implement Slice 1"; mechanically re-ran every falsifier before touching anything, per
+§0.5 rule 1 (never inherit). Findings, each freshly measured this session:
+`grep -c '"/api/lan-info"' crates/freshell-server/src/network.rs` → **3**; `grep -c 'let
+raw_port_open = if effective_host == "0.0.0.0"' crates/freshell-server/src/network.rs` →
+**1**; the awk-scoped live-route check for a hardcoded `raw_port_open: None` → **0**;
+`remoteAccessEnabled`/`remoteAccessNeedsRepair` in `build_network_status`
+(`network.rs:372-384`) are computed from `raw_port_open`/`port_open`, not hardcoded;
+`GET /api/lan-info` returns `{"ips": [...]}` from the same `NetworkFactsCache` the status
+route uses (`network.rs:268,278-284`); native-Linux LAN-IP detection
+(`detect_lan_ips_from_linux_interfaces`, `freshell-platform/src/network.rs:484`) is wired
+at `freshell-server/src/network.rs:451`; `build_network_status` remains a pure function of
+`NetworkStatusInputs` with no I/O (`network.rs:349-415`), unit-tested at `:518-1000+`; the
+probe itself is injected via `Arc<dyn PortProbe>` with a `FakePortProbe` for tests
+(`network.rs:73-114,640-710`) — never a real socket in the test suite.
+`git status --porcelain server/ shared/ src/` → empty (frozen reference untouched, and
+this revision touches only this doc). `cargo test -p freshell-server -p freshell-platform`
+→ **719 passed, 0 failed** (unchanged from the rev-4/rev-5 recorded floor). `cargo clippy
+-p freshell-server -p freshell-platform --all-targets -- -D warnings` → clean, zero
+warnings. **Verdict: Slice 1's full scope (live probe, unhardcoded
+remoteAccessEnabled/remoteAccessNeedsRepair, `GET /api/lan-info`, native-Linux LAN-IP
+detection) is confirmed already landed and green; no code change was required this
+session.** This revision exists solely so the re-entry protocol (§0.5) has a freshly
+dated, freshly measured confirmation rather than an inherited one, and so the outer test
+gate (which requires a new commit since its base SHA) has one.
 **Revision 5 — 2026-08-03 (third re-entry, same day).** Re-ran Slice 1's own falsifier
 mechanically (not by trusting rev 4's transcription): `grep -c '"/api/lan-info"'
 crates/freshell-server/src/network.rs` → **3**; `grep -c 'let raw_port_open = if
