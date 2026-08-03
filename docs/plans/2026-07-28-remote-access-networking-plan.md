@@ -1,6 +1,20 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 5 — 2026-08-03 (third re-entry, same day).** Re-ran Slice 1's own falsifier
+mechanically (not by trusting rev 4's transcription): `grep -c '"/api/lan-info"'
+crates/freshell-server/src/network.rs` → **3**; `grep -c 'let raw_port_open = if
+effective_host == "0.0.0.0"' crates/freshell-server/src/network.rs` → **1**; the
+`awk`-scoped live-route check for a hardcoded `raw_port_open: None` → **0** (the three hits
+of that literal are confirmed still confined to `#[cfg(test)]` fixtures for the pure
+`build_network_status` builder). `cargo test -p freshell-server -p freshell-platform` →
+**719 passed, 0 failed** (unchanged from rev 4's recorded floor — no drift this session).
+`cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings` and
+`cargo clippy --workspace --all-targets -- -D warnings` → both clean, zero warnings.
+`git status --porcelain server/ shared/ src/` → empty (frozen reference untouched).
+**Verdict: Slice 1 remains fully landed, its falsifier remains green, and no regression was
+found.** No code change was needed this session; this revision exists so the next re-entry
+inherits a freshly-measured "green" rather than an inherited one (per §0.0's own rule).
 **Revision 4 — 2026-08-03 (later same day).** Second re-entry. Rev 3 correctly recorded that
 Slice 1 landed; this revision re-runs *every* falsifier and re-measures *every* live fact,
 and finds **three of rev 3's own recorded facts have already gone stale or were wrong** —
