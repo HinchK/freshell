@@ -1,6 +1,37 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
+**Revision 7 — 2026-08-03 (fifth re-entry, same day).** Independent agent re-entry, task
+framed as "implement Slice 1: live port-reachability probe, unhardcoded
+remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info, native-Linux LAN-IP
+detection." Per §0.5 rule 1 (never inherit), every falsifier was mechanically re-run this
+session, from a clean tree, before touching anything: `grep -c '"/api/lan-info"'
+crates/freshell-server/src/network.rs` → **3**; `grep -n 'let raw_port_open = if
+effective_host == "0.0.0.0"'` → one hit, at `network.rs:304`, gated exactly as
+`network-manager.ts:304-305` (`effective_host == "0.0.0.0" && !facts.lan_ips.is_empty()`);
+the awk-scoped live-route check for a hardcoded `raw_port_open: None` inside
+`build_status_inputs`/`network_status` → **0** (the module's only three `raw_port_open:
+None` occurrences remain confined to `#[cfg(test)]` fixtures for the pure
+`build_network_status` builder, `network.rs:1041+`); `build_network_status`
+(`network.rs:349-409`) derives `remoteAccessEnabled`/`remoteAccessNeedsRepair` purely from
+`i.raw_port_open`/`port_open` per platform, byte-matching `network-manager.ts:349-361`, and
+takes zero I/O — a pure function of `NetworkStatusInputs`; `GET /api/lan-info`
+(`network.rs:278-284`) returns `{"ips": [...]}` from the same `NetworkFactsCache` (via
+`state.facts.get_or_refresh()`) that `GET /api/network/status` reads, so the two can never
+diverge within a process, matching `network-router.ts:412-419`'s shape; native-Linux LAN
+detection (`detect_lan_ips_from_linux_interfaces`, `freshell-platform/src/network.rs:484`,
+reusing `rank_lan_ip_candidates`/`prefix_len_to_netmask`) is wired at
+`freshell-server/src/network.rs:451` behind `cfg!(target_os = "linux")`; the probe itself is
+injected via `Arc<dyn PortProbe>` with a scripted `FakePortProbe` (`network.rs:640-710`) that
+exposes a call counter — no test in the suite opens a real socket for this path. Confirmed
+`git status --porcelain server/ shared/ src/` → empty (frozen reference untouched).
+`cargo test -p freshell-server -p freshell-platform` → **719 passed, 0 failed** (matches the
+rev-4 floor exactly, no drift). `cargo clippy -p freshell-server -p freshell-platform
+--all-targets -- -D warnings` and `cargo clippy --workspace --all-targets -- -D warnings` →
+both clean. **Verdict: Slice 1's full scope is independently re-confirmed landed and green
+this session; no code change was required.** This revision exists per the re-entry
+protocol so the outer test gate (which requires a new commit since its base SHA) has a
+freshly dated, freshly measured confirmation rather than an inherited one.
 **Revision 6 — 2026-08-03 (fourth re-entry, same day).** Independent agent re-entry to
 "implement Slice 1"; mechanically re-ran every falsifier before touching anything, per
 §0.5 rule 1 (never inherit). Findings, each freshly measured this session:
