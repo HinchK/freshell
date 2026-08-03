@@ -86,6 +86,19 @@ Key facts:
 - The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
 - The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
 - Health check: `curl http://127.0.0.1:<port>/api/health` (unauthenticated, rate-limit exempt).
+- **Detached launch:** `scripts/launch-rust.sh` starts the server in its own
+  session (`setsid`, stdin from `/dev/null`). Closing the launching shell
+  does NOT stop the server or its child agent terminals (this fixed the
+  SIGTERM/SIGHUP cascades visible as `shutdown_forensics` events). Stop it
+  only via `scripts/launch-rust.sh --stop [--port N]`. CAVEAT: WSL2 shuts
+  the whole VM down shortly after the LAST console/interop handle closes —
+  no launcher-side detachment survives that.
+- **systemd user unit (recommended for unattended operation):** install
+  `installers/systemd/freshell-rust.service` (see its header for the
+  `/etc/wsl.conf` requirement and `loginctl enable-linger`). It cannot keep
+  the WSL VM alive either, but it restores the server at the next distro
+  boot and supervises restarts. systemd is NOT required — the setsid
+  launcher remains the default, dependency-free path.
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\\...` -> `/mnt/d/...`.
