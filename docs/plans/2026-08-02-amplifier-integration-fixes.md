@@ -22,7 +22,7 @@ Copied from the spec — every task's requirements implicitly include these:
 - **CLI ground truth (validated 2026-08-03; assumption ledger: `.the-usual-logs/amplifier-integration-fixes/load-bearing-ledger.md` beside this worktree):** the authoritative CLI source is the INSTALLED `amplifier_app_cli` 0.1.1 (uv tool venv, `microsoft/amplifier-app-cli@1873aa9`, `~/.local/share/uv/tools/amplifier/lib/python3.13/site-packages/`) — `/home/dan/code/amplifier` contains no CLI source and must not be cited as evidence. Verified: resume's hardcoded default bundle is `anchors`; the CLI deep-merges settings and silently SKIPS malformed layers (our poison-to-omission is deliberately more conservative, always in the safe/omission direction).
 - **Resolution semantics (must mirror Amplifier's merged settings precedence, later wins):** (1) `~/.amplifier/settings.yaml`, (2) `<resolved working dir>/.amplifier/settings.yaml`, (3) `<resolved working dir>/.amplifier/settings.local.yaml` — where `<resolved working dir>` is the stub's canonical working dir (`resolved` in `ensure_session`), NOT the server process cwd. Key path: `bundle.active`.
 - **HARD SAFETY RULE (adversarial review):** stamp ONLY when the value is a plain non-empty YAML string scalar; on ANY surprise — an existing-but-unreadable file, unparseable YAML, non-string value, empty string — OMIT the bundle key entirely and never fail or delay stub creation. A missing stamp is healed by Amplifier's default; a WRONG stamp is trusted silently (refined by ledger A6: a wrong-but-loadable stamp is trusted forever, while a stamp naming an unloadable bundle makes `resume` exit 1 — loud and recoverable via `--force-bundle` or a metadata edit). Both failure directions still favor omission — asymmetric risk, bias hard toward omission. Multi-document settings files are also a surprise (the CLI's own parser errors on them; ledger A10).
-- **Item 4 live-session safety (REDESIGNED per ledger A15 — live validation showed the spec's two guards miss real live sessions: interactive CLI processes carry no session id in argv, and live sessions go events-silent for 24–70+ minutes):** layered model — (0) `--apply` REFUSES to run while ANY `amplifier` process is visible in a fresh `ps -eo args=` snapshot, or when ps itself fails (deliberately over-broad: a false positive only delays the heal; dry-run is unaffected); (1) per session, skip if a running process matches `amplifier.*<session_id>` OR the session dir's `events.jsonl` mtime is within the last 10 minutes (kept as defense in depth); (2) re-read the file immediately before writing and skip if its bytes changed since the eligibility read; (3) fidelity verify (ledger A16): if re-serializing the ORIGINAL parse does not byte-identically reproduce the original file, skip as `skipped-unfaithful` (JSON.stringify re-emits integral floats like `5.0` as `5` and `\uXXXX` escapes literally). Atomic writes (temp file + rename), preserve all other metadata keys and formatting. `--dry-run` is the default; `--apply` writes. **Run `--dry-run` only; NEVER run `--apply`** (the user runs apply themselves). Summary must print scanned / eligible / skipped-live / skipped-unresolved / skipped-unfaithful / updated counts.
+- **Item 4 live-session safety (REDESIGNED per ledger A15 — live validation showed the spec's two guards miss real live sessions: interactive CLI processes carry no session id in argv, and live sessions go events-silent for 24–70+ minutes):** layered model — (0) `--apply` REFUSES to run while ANY `amplifier` process is visible in a fresh `ps -eo args=` snapshot — excluding the backfill's own process tree, ignored by filtering out ps lines containing the script filename `amplifier-backfill-bundle` (present in every node/npx/tsx wrapper's argv), without which the gate would refuse unconditionally — or when ps itself fails (deliberately over-broad: a false positive only delays the heal; dry-run is unaffected); (1) per session, skip if a running process matches `amplifier.*<session_id>` OR the session dir's `events.jsonl` mtime is within the last 10 minutes (kept as defense in depth); (2) re-read the file immediately before writing and skip if its bytes changed since the eligibility read; (3) fidelity verify (ledger A16): if re-serializing the ORIGINAL parse does not byte-identically reproduce the original file, skip as `skipped-unfaithful` (JSON.stringify re-emits integral floats like `5.0` as `5` and `\uXXXX` escapes literally). Atomic writes (temp file + rename), preserve all other metadata keys and formatting. `--dry-run` is the default; `--apply` writes. **Run `--dry-run` only; NEVER run `--apply`** (the user runs apply themselves). Summary must print scanned / eligible / skipped-live / skipped-unresolved / skipped-unfaithful / updated counts.
 - **Item 2 (scoped by ledger A13):** `setsid` (detach from launching session) is the first-class mechanism and experimentally defeats the shell-death HUP/TERM cascades. It does NOT survive WSL2's documented VM teardown after the last console/interop handle closes — nothing launcher-side can. The systemd user unit stays ADDITIONAL (never the only path; document the WSL2 systemd requirement) but is RECOMMENDED for unattended operation (with `loginctl enable-linger`): its realistic value is supervised restarts + resurrection at next distro boot, not uninterrupted survival.
 - **Item 3:** minimal change consistent with the reaper's existing design. (Investigation is settled: the reaper at `crates/freshell-terminal/src/registry.rs:847-892` has NO child-liveness or mode exemption — only running/detached/threshold checks — and `crates/freshell-ws/tests/pane_reconcile.rs:759` proves agent-mode terminals are reaped today. The bug is real; behavior change is warranted, not speculative.)
 - **Repo rules (AGENTS.md):** Red-Green-Refactor TDD; NEVER restart or stop the live self-hosted Rust server on port 3002 (manual verification uses port **3499**); no broad `pkill`; broad test runs go through the coordinator — use only the scoped commands given in each task; NodeNext ESM: relative TS imports carry `.js` extensions; every new Cargo dependency carries a justifying comment; no PR creation without explicit user approval.
@@ -1065,7 +1065,7 @@ In `crates/freshell-terminal/src/registry.rs`, `#[cfg(test)] mod tests`, immedia
 - [ ] **Step 2: Run them to verify red**
 
 Run: `cargo test -p freshell-terminal enforce_idle_kills`
-Expected: `enforce_idle_kills_spares_agent_mode_terminals_past_threshold` and `enforce_idle_kills_mixed_sweep_reaps_only_the_shell` FAIL (agent terminals are currently killed at the configured threshold); `enforce_idle_kills_reaps_agent_terminals_past_the_hard_cap` already passes (it pins the backstop, guarding against a future full exemption); the six existing `enforce_idle_kills_*` tests pass.
+Expected: `enforce_idle_kills_spares_agent_mode_terminals_past_threshold` and `enforce_idle_kills_mixed_sweep_reaps_only_the_shell` FAIL (agent terminals are currently killed at the configured threshold); `enforce_idle_kills_reaps_agent_terminals_past_the_hard_cap` already passes (it pins the backstop, guarding against a future full exemption); the nine existing `enforce_idle_kills_*` tests pass. Total for the filtered run: 12 tests, 10 passed, 2 failed. (Verified against the worktree: `cargo test -p freshell-terminal enforce_idle_kills -- --list` reports exactly 9 existing tests before this task.)
 
 - [ ] **Step 3: Implement the hard cap**
 
@@ -1113,7 +1113,7 @@ And extend the `enforce_idle_kills` doc comment (after the sentence ending "...e
 - [ ] **Step 4: Run the reaper tests to verify green**
 
 Run: `cargo test -p freshell-terminal enforce_idle_kills`
-Expected: **all 9 pass** (6 existing + 3 new; the existing ones all use `insert_headless`, which seeds `mode: "shell"`, so they are unaffected).
+Expected: **all 12 pass** (9 existing + 3 new; the existing ones all use `insert_headless`, which seeds `mode: "shell"`, so they are unaffected).
 
 - [ ] **Step 5: Run the whole crate**
 
@@ -1353,9 +1353,24 @@ describe('detectIndent', () => {
 })
 
 describe('applyBlockedByLiveAmplifier', () => {
-  it('blocks on any amplifier process and passes otherwise', () => {
+  it('blocks on any amplifier process, ignoring its own process tree', () => {
     expect(applyBlockedByLiveAmplifier('python3 /home/u/.local/bin/amplifier\n')).toBe(true)
     expect(applyBlockedByLiveAmplifier('bash\nnvim notes.md\n')).toBe(false)
+    // Self-exclusion: the gate must not trip on the backfill's own
+    // node/npx/tsx process tree (its argv contains the script filename).
+    expect(
+      applyBlockedByLiveAmplifier(
+        'node /repo/node_modules/.bin/tsx scripts/amplifier-backfill-bundle.ts --apply\n' +
+          'npm exec tsx scripts/amplifier-backfill-bundle.ts --apply\n',
+      ),
+    ).toBe(false)
+    // ...but a real amplifier process alongside it still blocks.
+    expect(
+      applyBlockedByLiveAmplifier(
+        'node /repo/node_modules/.bin/tsx scripts/amplifier-backfill-bundle.ts --apply\n' +
+          'python3 /home/u/.local/bin/amplifier\n',
+      ),
+    ).toBe(true)
   })
 })
 
@@ -1590,7 +1605,9 @@ Create `scripts/amplifier-backfill-bundle.ts`:
  * Safety (layered — the spec's original two guards were empirically shown
  * to miss live sessions: interactive CLI processes carry no session id in
  * argv, and live sessions go events-silent for 24-70+ minutes; ledger A15):
- *  - --apply REFUSES to run while ANY amplifier process is visible in ps,
+ *  - --apply REFUSES to run while ANY amplifier process is visible in ps
+ *    (excluding this script's own process tree — its argv contains the
+ *    script filename, which would otherwise trip the gate on itself),
  *    or when ps itself fails (deliberately over-broad: a false positive
  *    only delays the heal; dry-run is unaffected);
  *  - only sessions with "freshell_terminal_id" (freshell-created) AND
@@ -1679,9 +1696,18 @@ export function detectIndent(raw: string): string | number {
 /** --apply gate (ledger A15): ANY visible amplifier process blocks apply.
  *  Interactive/pipeline-hosted CLI sessions carry no session id in argv, so
  *  per-session matching cannot see them — refuse wholesale instead.
- *  Over-broad by design: a false positive only postpones the heal. */
+ *  Over-broad by design: a false positive only postpones the heal.
+ *  SELF-EXCLUSION: the backfill's own process tree (node/npx/tsx running
+ *  this script, and any shell wrapper quoting its invocation) has
+ *  "amplifier" in argv via the script filename, so a whole-snapshot
+ *  `/amplifier/` test would refuse unconditionally. ps lines mentioning
+ *  the script filename are therefore ignored; every wrapper's argv
+ *  (node, npx, tsx, sh -c) contains that filename. */
 export function applyBlockedByLiveAmplifier(psOutput: string): boolean {
-  return /amplifier/.test(psOutput)
+  return psOutput
+    .split('\n')
+    .filter((line) => !line.includes('amplifier-backfill-bundle'))
+    .some((line) => /amplifier/.test(line))
 }
 
 /** A session is live if an amplifier process references its id, or its
