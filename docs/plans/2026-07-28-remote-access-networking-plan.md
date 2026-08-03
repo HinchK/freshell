@@ -1,9 +1,12 @@
 # Remote-access networking on the Rust Freshell server — implementation plan
 
 **Date:** 2026-07-28
-**Revision 3 — 2026-08-03.** Re-entry after Slice 1 **genuinely landed**. Rev 2 replanned
-after a run that produced zero code; this revision replans after a run that produced *real*
-code, and corrects the things that measurement — not assertion — shows are still wrong.
+**Revision 4 — 2026-08-03 (later same day).** Second re-entry. Rev 3 correctly recorded that
+Slice 1 landed; this revision re-runs *every* falsifier and re-measures *every* live fact,
+and finds **three of rev 3's own recorded facts have already gone stale or were wrong** —
+including one (a hardcoded pid) that would have made the harness dangerous. Rev 3 preached
+"re-measure, never inherit" and then inherited. Rev 4 fixes that, and removes the remaining
+places where a fact can rot (§0.0.4).
 **Worktree:** `/home/dan/code/freshell/.worktrees/remote-access-networking`
 **Branch:** `feat/remote-access-networking` (PR target `main`). The main checkout
 `/home/dan/code/freshell` is shared with other agents and **must not be touched**.
@@ -19,11 +22,31 @@ map, not the goal: prioritize working behavior over checkbox parity.
 
 ---
 
-## 0.0 Re-entry preamble — measured state of the branch (2026-08-03)
+## 0.0 Re-entry preamble — measured state of the branch (2026-08-03, rev 4)
 
-Rev 2 was written after a run that reported `success` at every stage and produced **no
-code**. That is no longer the situation. **Slice 1 is real.** Verified this session by
-inspection, not by trusting the commit message:
+### 0.0.0 What rev 4 re-measured, and what it falsified
+
+Every falsifier in rev 3 was executed this session before a word was changed. **Rev 3's
+structural conclusions all hold; three of its recorded facts do not.**
+
+| Rev-3 claim | Re-measured (rev 4) | Verdict |
+|---|---|---|
+| Live server is **pid 64553** on port 3001 | pid is **2766121** (`ps -fp` → cwd `/home/dan/code/freshell`, `0.0.0.0:3001`) | **STALE — and dangerous** (§0.0.4) |
+| Test baseline **718 passed** | **719 passed, 0 failed** | **STALE** (drifted +1) |
+| Slice 0 falsifiers fail (NET08-A/B/C open) | `build_port_forwarding_script(wsl_ip: &str` = 1, `Ipv4Addr` = 0, `c.token == t` = 2, `timing_safe_compare` = 0 | **Confirmed still open** |
+| Slice 1 corrected falsifier passes | `"/api/lan-info"` = 3, live-probe line = 1 | **Confirmed** |
+| Slice 2/3 routes absent | `configure`/`disable-remote-access`/`configure-firewall` = 0; `socket2` in Cargo.toml = 0 | **Confirmed** |
+| Harness absent | `ls scripts/verify-remote-access.sh` → no such file | **Confirmed** |
+| Frozen reference untouched | `git status --porcelain server/ shared/ src/` → empty | **Confirmed** |
+| Tier (a) 200 / (b) `STATUS 200` / (c) 200 | **all three re-measured green today**, eth0 still `172.30.149.249` | **Confirmed** |
+| `SO_REUSEPORT` experiment table | **all four re-run this session**, identical results (§0.0.5) | **Confirmed** |
+
+The two stale numbers are individually minor. **The pattern is not**, and §0.0.4 treats it
+as the finding it is.
+
+### 0.0.1 Slice 1 is real (retained from rev 3, re-verified)
+
+Verified by inspection, not by trusting the commit message:
 
 | Claim from the Slice 1 commit (`5ab35e316`) | How I checked it | Result |
 |---|---|---|
@@ -33,14 +56,13 @@ inspection, not by trusting the commit message:
 | `BindState` has a writer for Slice 2 | `network.rs:178-190` | `RwLock<String>` + `get()`; **`set()` exists and is already tested** (`:974` `status_reflects_a_bind_change_via_bind_state`) |
 | `NetworkFactsCache::invalidate()` exists | `network.rs:258` | Real, tested at `:1015` |
 | Native-Linux LAN detection (NET-10 gap) | `freshell-platform/src/network.rs:484` | `detect_lan_ips_from_linux_interfaces` real, wired at `freshell-server/src/network.rs:446`, 3 tests |
-| Test suite green | `cargo test -p freshell-server -p freshell-platform` | **718 passed, 0 failed** |
+| Test suite green | `cargo test -p freshell-server -p freshell-platform` | **719 passed, 0 failed** (rev 3 said 718) |
 | Frozen reference untouched | `git status --porcelain server/ shared/ src/` | **empty** |
 
-So Slice 1's substance is delivered. **Three things are nevertheless wrong, and this
-revision exists to fix them.** Each was found by running the plan's own falsifiers rather
-than reading its claims.
+So Slice 1's substance is delivered. The corrections below are retained from rev 3 (still
+accurate and still load-bearing), followed by rev 4's new findings (§0.0.4–§0.0.6).
 
-### 0.0.1 Correction 1 — Slice 0 (NET08-A/B/C) did **not** land, and the plan's structure is why
+### 0.0.2 Correction 1 — Slice 0 (NET08-A/B/C) did **not** land, and the plan's structure is why
 
 Rev 2 said Slice 0 was "folded into Slice 1's commit". It was not folded in; it was lost.
 Measured:
@@ -61,7 +83,7 @@ tested (`:724`), so NET08-C is a two-line change that simply was not made.
 `lan-info`, `raw_port_open`, and `cargo test`. Nothing in it could fail if Slice 0 were
 skipped. A slice folded into another slice's commit inherits that commit's falsifier — and
 therefore has *no* falsifier of its own. **Rev 3 therefore promotes Slice 0 to a
-first-class slice with its own commit and its own falsifier** (§Slice 0). Generalized rule,
+first-class unit with its own commit and its own falsifier** (now §Slice 3-PRE, §0.0.6). Generalized rule,
 added to the anti-fabrication contract: *every work item carries a falsifier that fails if
 that item alone is skipped.* A falsifier that cannot distinguish "done" from "silently
 dropped" is not a falsifier.
@@ -71,7 +93,7 @@ is the thing that wires it. Landing Slice 3 on an unfixed `&str` interpolation w
 promote a latent finding into a live command-injection sink. Slice 0 is a **hard blocker**
 for Slice 3.
 
-### 0.0.2 Correction 2 — Slice 1's own falsifier was mis-specified (it "passes" by not being run, and fails if run)
+### 0.0.3 Correction 2 — Slice 1's own falsifier was mis-specified (it "passes" by not being run, and fails if run)
 
 Rev 2's Slice 1 falsifier asserts:
 
@@ -99,21 +121,108 @@ grep -c 'raw_port_open: None' crates/freshell-server/src/network.rs   # may be >
 Lesson folded into §0.5: a falsifier must be *decidable without interpretation*. If a
 grep needs a human explanation to pass, replace the grep.
 
-### 0.0.3 Correction 3 — tier (c) is materially better than rev 2 assumed; re-measure, never inherit
+### 0.0.4 Correction 3 (rev 4, NEW) — the plan recorded a **pid**, and a recorded pid is a loaded gun
+
+Rev 3 §0.1.7 recorded *"the live server is pid 64553 on port 3001"* and rev 3's harness
+Phase 0.3 said: *"if `--port 3001` and **pid 64553** (or any pid not started by this script)
+holds it → abort"*. Measured today:
+
+```
+$ ss -ltnp | grep :3001
+LISTEN 0 128 0.0.0.0:3001 users:(("freshell-server",pid=2766121,fd=11))
+$ ps -fp 2766121   # cwd /home/dan/code/freshell, started 08:57
+```
+
+**The pid changed** (the live server was restarted between sessions — expected; pids are the
+most volatile fact in the whole document). Rev 3's harness text names a *specific stale
+integer* in a safety check. Two failure modes follow, and the second is severe:
+
+1. Benign: 64553 no longer matches, the generic "any pid not started by this script" clause
+   still fires, harness aborts correctly.
+2. **Severe:** pid numbers are recycled by the kernel. A future 64553 could be *any* process
+   — including one the harness would then reason about as "the known live server".
+
+Either way the recorded integer adds **zero** safety over the generic clause and adds a
+falsehood. **Rev 4 deletes every pid from this plan and from the harness spec.** The safety
+rule is restated in a form that cannot rot:
+
+> **Ownership rule (pid-free).** The harness kills **only** pids it started and recorded in
+> its own `$TMP/server.pid`, and only after verifying `/proc/<pid>/cwd` **and** cmdline
+> match *this worktree's* `freshell-server`. Any port it wants that is already listening is
+> an abort — the harness never inspects *which* pid holds it in order to decide whether
+> killing is acceptable, because the answer is always **no**.
+
+This is strictly stronger than rev 3's version and has no expiry date.
+
+**Generalized (added to §0.5):** a plan may record *structural* facts (a file:line anchor, a
+type signature, a schema shape) but must **never** record a *volatile runtime identifier*
+(pid, ephemeral port, session id, container id) as the basis for a safety decision. Volatile
+facts are re-measured at use time or not used. Rev 4 audited the whole document for this
+class: pids (removed), the eth0 IP (already re-resolved every run — correct), the test count
+(now stated as a *drift-tolerant* check, §0.0.5), and the portproxy table (already re-read
+every run — correct).
+
+### 0.0.5 Correction 4 (rev 4, NEW) — the test baseline is drift-tolerant, not an equality assertion
+
+Rev 3 pinned "718 passed"; today it is **719**. Nothing regressed — a test was added (`c79d18d67`
+"assert real call counts for the injected port probe" post-dates the number rev 3 recorded).
+
+A hardcoded total is a **fragile falsifier**: it fails on legitimate additions and, worse,
+tempts an implementer to "fix" the plan by editing the number, which trains exactly the
+paper-over reflex §0.0.3 exists to prevent. The load-bearing property was never the total —
+it is **zero failures, and the count never goes *down***.
+
+```bash
+# Drift-tolerant baseline check (replaces "must equal 718"):
+cargo test -p freshell-server -p freshell-platform 2>&1 \
+  | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'
+# PASS iff failed == 0 AND passed >= 719 (the rev-4 measured floor, which each slice raises).
+```
+
+Each slice records the floor it *raises the count to* in its own commit message. A drop is a
+deleted test and is a red flag; a rise is normal.
+
+### 0.0.6 Correction 5 (rev 4, NEW) — "three slices" is a naming problem, and the fix is to renumber
+
+The task specifies **exactly three implementation slices** plus a harness spec. Rev 3 has
+Slices **0, 1, 2, 3** — four numbered units — and defends this as "Slice 1 is already done,
+so three *remain*". That reading is defensible but relies on a coincidence, and if Slice 1
+had *not* landed, rev 3's structure would have violated the constraint outright.
+
+Rev 4 resolves it without losing rev 3's genuine insight (§0.0.2: NET08-A/B/C needs its own
+commit and its own falsifier). The NET08 hardening is **not a peer of the feature slices** —
+it is a security **precondition** of Slice 3 that touches no route and delivers no endpoint.
+So rev 4 renames it **Slice 3-PRE** and nests it inside Slice 3 as its **mandatory first
+commit**, with its own falsifier, retaining every property §0.0.2 demanded:
+
+- it lands as its **own commit** (not folded into another's);
+- it has its **own falsifier** that fails if it alone is skipped;
+- it **blocks** the rest of Slice 3 (now structurally, since it is Slice 3's step 1).
+
+The plan therefore presents **exactly three implementation slices** (1 status+lan-info,
+2 mutations, 3 firewall+Windows-behind-fakes) plus the harness spec, matching the task
+contract, while the anti-fabrication guarantee is *unchanged*. Nothing about the work
+changes — only the numbering, and the fact that Slice 3 can no longer be started without
+first landing 3-PRE.
+
+### 0.0.7 Correction 6 (rev 3, retained) — tier (c) is materially better than rev 2 assumed; re-measure, never inherit
 
 Rev 2 (2026-08-02) measured tier (c) as `000` on port 3412 and concluded tier (c) is
-"degradation-first by default". **Re-measured 2026-08-03, both external vantages are
-live and green:**
+"degradation-first by default". **Re-measured again in rev 4 (2026-08-03, second session) —
+all three vantages independently re-run, all green:**
 
-| Tier | Command (read-only) | Result 2026-08-03 |
-|---|---|---|
-| (a) | `curl http://127.0.0.1:3001/api/health` | **200** |
-| (b) | `powershell.exe Invoke-WebRequest http://172.30.149.249:3001/api/health` | **`STATUS 200`** |
-| (c) | `ssh shapiroserver2 curl http://192.168.3.50:3001/api/health` | **200** |
+| Tier | Command (read-only) | Rev-3 result | **Rev-4 re-measured** |
+|---|---|---|---|
+| (a) | `curl http://127.0.0.1:3001/api/health` | 200 | **200** |
+| (b) | `powershell.exe Invoke-WebRequest http://172.30.149.249:3001/api/health` | `STATUS 200` | **`STATUS 200`** |
+| (c) | `ssh shapiroserver2 curl http://192.168.3.50:3001/api/health` | 200 | **200** |
 
-`ip -4 addr show eth0` → `172.30.149.249` (unchanged since 2026-08-02, so the portproxy
-connect-address still matches — the tier-(c) precondition holds *today* and must still be
-re-checked at every harness start, because a WSL restart reassigns it).
+`ip -4 addr show eth0` → `172.30.149.249`, unchanged across all three sessions — so the
+portproxy connect-address still matches and the tier-(c) precondition holds *today*. It is
+**still re-checked at every harness start**, because a WSL restart reassigns it. Note the
+contrast with §0.0.4: the eth0 IP is *also* volatile, but the plan never made a safety
+decision on a remembered copy of it — it re-resolves. That is the pattern the pid violated.
 
 Rev 2's `000` was **not** evidence that tier (c) is broken; it was evidence that tier (c) is
 **port-scoped to 3001**, which rev 2 itself correctly diagnosed (`FreshellLANAccess` is
@@ -147,16 +256,20 @@ commands — STATUS reads only; mutation exists solely as golden-string builders
 6. Isolated `HOME` for every test server; reap every process started, ownership-verified
    (`/proc/<pid>/cwd` + cmdline) — never a broad pattern kill (`AGENTS.md` Process Safety).
 7. **Never restart or kill the live self-hosted server** without the user's explicit
-   "APPROVED". **Re-verified 2026-08-03: the live server is pid 64553 on port 3001**, cwd
-   `/home/dan/code/freshell`, `0.0.0.0:3001`, `/api/health` → 200. Port **3002 is empty**
-   (`000`), so the AGENTS.md note naming 3002 remains stale. **The harness must refuse to
-   bind 3001 and must refuse to kill any pid it did not itself start.**
+   "APPROVED". Re-verified rev 4 (2026-08-03): a `freshell-server` from the **main checkout**
+   (`/home/dan/code/freshell`) is listening on `0.0.0.0:3001`, `/api/health` → 200; port
+   **3002 is empty** (`000`), so the AGENTS.md note naming 3002 remains stale.
+   **No pid is recorded here on purpose (§0.0.4)** — pids are recycled and go stale between
+   sessions, and rev 3's hardcoded one already did. The operative rule is pid-free:
+   **the harness kills only pids it started and recorded itself (ownership-verified via
+   `/proc/<pid>/cwd` + cmdline); any already-listening target port is an unconditional
+   abort, regardless of which pid holds it.**
 8. All work happens in the dedicated worktree on `feat/remote-access-networking`. Every
    slice is committed durably before the next begins.
 
-### 0.2 Vantage ladder — RE-MEASURED live 2026-08-03 (this session)
+### 0.2 Vantage ladder — RE-MEASURED live 2026-08-03 (rev 4 session, independently of rev 3)
 
-| Tier | Vantage | Verified 2026-08-03 |
+| Tier | Vantage | Verified 2026-08-03 (rev 4 re-run) |
 |---|---|---|
 | (a) | WSL loopback `curl http://127.0.0.1:$PORT/` | **200** |
 | (b) | Windows host: `powershell.exe Invoke-WebRequest http://<eth0 IP>:$PORT/` | **`STATUS 200`** with `WSL_IP=172.30.149.249` |
@@ -211,7 +324,7 @@ That asymmetry is the whole story, and it explains rev 2's `000` on 3412: the po
 ### 0.4 Port-defect ledger — status after Slice 1
 
 Rev 2 identified four defects in the Rust code. **All four are now fixed and tested**
-(verified by inspection this session, §0.0):
+(re-verified by inspection in rev 4, §0.0.1):
 
 | # | Defect | Rev-2 status | Rev-3 measured status |
 |---|---|---|---|
@@ -224,89 +337,42 @@ These were port defects (the Rust side wrong relative to the reference), **not**
 no DEVIATIONS.md entry. Defect 2 being fixed *with a working `set()`* is what makes Slice 2
 tractable: the rebind path has a live handle to write.
 
-**Still open (moved into Slice 0):** NET08-A (`wsl_ip: &str`), NET08-B (newline smuggling,
-sub-case of A), NET08-C (`==` token compare at `elevated.rs:170`, `:194`).
+**Still open (now Slice 3-PRE, §0.0.6):** NET08-A (`wsl_ip: &str`, re-measured present
+today), NET08-B (newline smuggling, sub-case of A), NET08-C (`==` token compare at
+`elevated.rs:170`, `:194`, re-measured present today).
 
 ### 0.5 Anti-fabrication contract (applies to every slice)
 
-Each slice's "Definition of done" ends with a **falsifier**. Rev 3 strengthens this in two
-ways, both learned from §0.0:
+Each slice's "Definition of done" ends with a **falsifier**. Rev 3 added two rules; rev 4
+adds two more, each learned from a *measured* failure of the preceding revision:
 
 1. **Every work item gets its own commit and its own falsifier.** No item may be "folded
    into" another's commit. A falsifier must fail if *its own item alone* is skipped
-   (§0.0.1).
+   (§0.0.2). Slice 3-PRE keeps this property while living inside Slice 3 (§0.0.6).
 2. **Falsifiers must be decidable without interpretation.** If a grep's verdict needs a
-   prose gloss to be read as passing, the grep is wrong — fix the falsifier (§0.0.2).
+   prose gloss to be read as passing, the grep is wrong — fix the falsifier (§0.0.3).
+3. **(rev 4) Never record a volatile runtime identifier as the basis for a safety
+   decision.** Pids, ephemeral ports, session/container ids are re-measured at use time or
+   not used at all. Structural facts (file:line, type signatures, schema shapes) may be
+   recorded. Rev 3 recorded a pid; it was stale within a day (§0.0.4).
+4. **(rev 4) Falsifiers must be drift-tolerant where the underlying quantity legitimately
+   moves.** Assert the invariant (`failed == 0`, count never decreases), not a snapshot
+   equality that a legitimate change breaks and that invites editing the plan to match
+   (§0.0.5).
 
 ```bash
 # The global falsifier — run before claiming ANY slice complete.
 git log --oneline feat/remote-access-networking
 git diff --stat HEAD~1                            # non-empty for a code slice
 git status --porcelain server/ shared/ src/       # must be EMPTY
-cargo test -p freshell-server -p freshell-platform
+# Drift-tolerant suite check (failed==0 AND passed never drops below the floor):
+cargo test -p freshell-server -p freshell-platform 2>&1 \
+  | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'
 ```
 
----
-
-## Slice 0 — NET08-A/B/C hardening (own commit; hard blocker for Slice 3)
-
-**Promoted from a rev-2 sub-section to a first-class slice** because folding it into
-Slice 1 is exactly how it got lost (§0.0.1). The prior run's audit
-(`docs/plans/2026-07-28-net08-security-audit.md:495-497`, recommendation `:520-524`) says
-fix these *before* wiring callers. Slice 3 is the wiring. This lands first.
-
-### Files to touch
-
-| File | Change |
-|---|---|
-| `crates/freshell-platform/src/port_forward.rs` | `wsl_ip: &str` → `std::net::Ipv4Addr` at `:281`, `:327`, `:416`, and the two `wsl_ip: String` plan fields at `:64`, `:67` |
-| `crates/freshell-platform/src/elevated.rs` | Constant-time token compare at `:170` and `:194` |
-
-### Design
-
-| Finding | Location | Fix |
-|---|---|---|
-| **NET08-A** (MEDIUM → HIGH once wired) | `port_forward.rs:327` `build_port_forwarding_script(wsl_ip: &str, …)` interpolates into `netsh … connectaddress={wsl_ip}` | `&str` → `std::net::Ipv4Addr`. Injection becomes **structurally impossible**, not filtered. Callers parse at the boundary and reject unparseable input before a script exists. |
-| **NET08-B** (LOW, sub-case of A) | same | An `Ipv4Addr` cannot contain `\n`; newline smuggling dies with the type change. |
-| **NET08-C** (LOW) | `elevated.rs:170` `c.token == t`; `elevated.rs:194` `c.token == t` | Route through `freshell_platform::network::timing_safe_compare` (`network.rs:212`, already the auth-token primitive, already tested at `:724`). |
-
-`get_wsl_ip` (`port_forward.rs:549`) returns `Option<String>` today; it becomes
-`Option<Ipv4Addr>` by parsing at the read boundary — the single place untrusted
-`ipconfig.exe`/`ip` output enters. Unparseable output → `None` → no plan, no script. The
-existing tests at `:900-916` assert string equality and are updated to `Ipv4Addr`, not
-deleted.
-
-### Acceptance criteria
-
-1. `build_port_forwarding_script` takes `Ipv4Addr`; the audit's PoC inputs
-   (`"1.2.3.4; calc"`, `"1.2.3.4\nnetsh …"`) **fail to compile** as arguments — a
-   `#[test]` documents this with a `compile_fail` doctest or an explicit comment plus a
-   parse-rejection test (`"1.2.3.4; calc".parse::<Ipv4Addr>().is_err()`).
-2. Golden test pins the script output **byte-identical** for a valid `Ipv4Addr` — this
-   change is security-only and must not alter a single emitted character.
-3. `get_wsl_ip` returns `None` for malformed output; a test feeds injection-shaped output
-   and asserts `None`.
-4. Token-compare tests still pass; a new test asserts `timing_safe_compare` is the function
-   on the path (e.g. equal-length mismatching tokens still reject; the `==` is gone).
-
-### Definition of done + falsifier
-
-Decidable, and **fails if Slice 0 alone is skipped**:
-
-```bash
-# NET08-A/B: the &str signature must be GONE, the Ipv4Addr signature PRESENT.
-grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs   # must be 0
-grep -c 'wsl_ip: Ipv4Addr\|wsl_ip: std::net::Ipv4Addr' crates/freshell-platform/src/port_forward.rs   # must be >0
-# NET08-C: no raw token equality left in elevated.rs.
-grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs                                      # must be 0
-grep -c 'timing_safe_compare' crates/freshell-platform/src/elevated.rs                                # must be >0
-cargo test -p freshell-server -p freshell-platform
-```
-
-### NET evidence
-
-- **NET-08** (command injection structurally impossible; token compare constant-time) — primary.
-- Prerequisite for **NET-04/05/07** wiring in Slice 3.
+**Measured floor as of rev 4: `passed=719, failed=0`.** Each slice raises the floor and
+records the new one in its commit message.
 
 ---
 
@@ -359,7 +425,7 @@ missing read endpoint. **No mutation anywhere in this slice.**
 7. No privileged/mutating process spawned (`FakeCommandRunner` assertion).
 8. Full `NetworkStatus` shape unchanged.
 
-### Definition of done + falsifier — **CORRECTED** (§0.0.2)
+### Definition of done + falsifier — **CORRECTED** (§0.0.3)
 
 Rev 2's `grep -n 'raw_port_open: None' … # must NOT hit` was wrong: it hits at `:518`,
 `:581`, `:614`, all legitimate `#[cfg(test)]` fixtures for the pure builder. Decidable
@@ -369,7 +435,8 @@ replacement:
 grep -c '"/api/lan-info"' crates/freshell-server/src/network.rs      # must be >0
 # The LIVE status path must COMPUTE the probe, not hardcode None:
 grep -c 'let raw_port_open = if effective_host == "0.0.0.0"' crates/freshell-server/src/network.rs  # must be 1
-cargo test -p freshell-server -p freshell-platform                   # 718 passed, 0 failed
+cargo test -p freshell-server -p freshell-platform 2>&1 | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'   # drift-tolerant (§0.0.5); measured 719/0 in rev 4
 ```
 
 ### NET evidence
@@ -427,14 +494,19 @@ verified verbatim this session). That is an objectively defective shape (self-as
 invariant violation + total loss of service), so per the user directive we **fix it in the
 port** and ledger the deviation rather than replicating it bug-for-bug.
 
-**Verified experimentally on this kernel (prior session; re-confirm as a Slice 2 test):**
+**Verified experimentally on this kernel — all four re-run independently in rev 4
+(2026-08-03), identical results both times; still re-confirmed as a Slice 2 test:**
 
-| Experiment | Result |
-|---|---|
-| Bind `127.0.0.1:P`, then `0.0.0.0:P`, neither with `SO_REUSEPORT` | `EADDRINUSE` (98) |
-| Both with `SO_REUSEPORT` | **both bind OK** |
-| Loopback connection with both alive | delivered to the **more-specific `127.0.0.1`** listener |
-| Non-`SO_REUSEPORT` squatter on `0.0.0.0:P`, then our `SO_REUSEPORT` bind | `EADDRINUSE` (98) — a foreign squatter still correctly blocks us |
+| Experiment | Result (rev 3) | **Re-run (rev 4)** |
+|---|---|---|
+| Bind `127.0.0.1:P`, then `0.0.0.0:P`, neither with `SO_REUSEPORT` | `EADDRINUSE` (98) | **`EADDRINUSE` (98)** |
+| Both with `SO_REUSEPORT` | both bind OK | **both bind OK** |
+| Loopback connection with both alive | delivered to the more-specific `127.0.0.1` | **delivered to `127.0.0.1` (specific)** |
+| Non-`SO_REUSEPORT` squatter on `0.0.0.0:P`, then our `SO_REUSEPORT` bind | `EADDRINUSE` (98) | **`EADDRINUSE` (98)** — a foreign squatter still correctly blocks us |
+
+The fourth row is the one the whole deviation rests on: `SO_REUSEPORT` does **not** let us
+silently steal a port from an unrelated process, so the squatter case (Acceptance 4) still
+fails closed exactly as NET-02 requires.
 
 So: **bind the new listener first (that IS the proof), then persist, then drain the old.**
 Rollback becomes "drop the new socket" — a no-op that cannot fail. No window with zero
@@ -549,7 +621,8 @@ deterministically with zero `netsh` queries.
 grep -c '"/api/network/configure"' crates/freshell-server/src/network.rs              # must be >0
 grep -c '"/api/network/disable-remote-access"' crates/freshell-server/src/network.rs  # must be >0
 grep -c 'socket2' crates/freshell-server/Cargo.toml                                   # must be >0
-cargo test -p freshell-server -p freshell-platform
+cargo test -p freshell-server -p freshell-platform 2>&1 | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'
 ```
 
 ### NET evidence
@@ -570,10 +643,90 @@ protocol, plus WSL2 portproxy planning — with **every** OS mutation behind the
 `CommandRunner`, and the real-runner path for Windows mutation **structurally unreachable
 on this host**.
 
-**Blocked on Slice 0.** Wiring these callers on an unfixed `wsl_ip: &str` would promote
-NET08-A from latent to live (§0.0.1). Do not start Slice 3 until Slice 0's falsifier passes.
+Slice 3 lands as **two commits, strictly ordered**: **3-PRE** (security hardening, below)
+then **3-MAIN** (the route + machinery). 3-PRE has its own falsifier and may not be folded
+into 3-MAIN's commit (§0.0.2, §0.0.6).
 
-### Files to touch
+---
+
+### Slice 3-PRE — NET08-A/B/C hardening (mandatory FIRST commit of Slice 3)
+
+Formerly "Slice 0" in rev 3; renumbered in rev 4 (§0.0.6) so the plan presents exactly three
+implementation slices, **with every anti-fabrication property retained**: its own commit,
+its own falsifier, and a hard block on the rest of Slice 3.
+
+**Why it must precede 3-MAIN.** 3-MAIN is precisely the code that wires callers into
+`build_port_forwarding_script`. Landing it on an unfixed `wsl_ip: &str` would promote
+NET08-A from a latent finding to a **live command-injection sink** — the prior audit
+(`docs/plans/2026-07-28-net08-security-audit.md:495-497`, recommendation `:520-524`) is
+explicit that these are cheap now and an incident later. **Re-measured in rev 4: all three
+findings are still open** (`wsl_ip: &str` present, `Ipv4Addr` absent, `c.token == t` ×2,
+`timing_safe_compare` absent from `elevated.rs`).
+
+#### Files to touch
+
+| File | Change |
+|---|---|
+| `crates/freshell-platform/src/port_forward.rs` | `wsl_ip: &str` → `std::net::Ipv4Addr` at `:281`, `:327`, `:416`, and the two `wsl_ip: String` plan fields at `:64`, `:67` |
+| `crates/freshell-platform/src/elevated.rs` | Constant-time token compare at `:170` and `:194` |
+
+#### Design
+
+| Finding | Location | Fix |
+|---|---|---|
+| **NET08-A** (MEDIUM → HIGH once wired) | `port_forward.rs:327` `build_port_forwarding_script(wsl_ip: &str, …)` interpolates into `netsh … connectaddress={wsl_ip}` | `&str` → `std::net::Ipv4Addr`. Injection becomes **structurally impossible**, not filtered. Callers parse at the boundary and reject unparseable input before a script exists. |
+| **NET08-B** (LOW, sub-case of A) | same | An `Ipv4Addr` cannot contain `\n`; newline smuggling dies with the type change. |
+| **NET08-C** (LOW) | `elevated.rs:170` `c.token == t`; `elevated.rs:194` `c.token == t` | Route through `freshell_platform::network::timing_safe_compare` (`network.rs:212`, already the auth-token primitive, already tested at `:724`). |
+
+`get_wsl_ip` (`port_forward.rs:549`) returns `Option<String>` today; it becomes
+`Option<Ipv4Addr>` by parsing at the read boundary — the single place untrusted
+`ipconfig.exe`/`ip` output enters. Unparseable output → `None` → no plan, no script. The
+existing tests at `:900-916` assert string equality and are updated to `Ipv4Addr`, not
+deleted.
+
+#### Acceptance criteria
+
+1. `build_port_forwarding_script` takes `Ipv4Addr`; the audit's PoC inputs
+   (`"1.2.3.4; calc"`, `"1.2.3.4\nnetsh …"`) **fail to compile** as arguments — a
+   `#[test]` documents this with a `compile_fail` doctest or an explicit comment plus a
+   parse-rejection test (`"1.2.3.4; calc".parse::<Ipv4Addr>().is_err()`).
+2. Golden test pins the script output **byte-identical** for a valid `Ipv4Addr` — this
+   change is security-only and must not alter a single emitted character.
+3. `get_wsl_ip` returns `None` for malformed output; a test feeds injection-shaped output
+   and asserts `None`.
+4. Token-compare tests still pass; a new test asserts `timing_safe_compare` is the function
+   on the path (e.g. equal-length mismatching tokens still reject; the `==` is gone).
+
+#### Definition of done + falsifier (3-PRE's OWN — fails if 3-PRE alone is skipped)
+
+```bash
+# NET08-A/B: the &str signature must be GONE, the Ipv4Addr signature PRESENT.
+grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs   # must be 0 (measured 1 today)
+grep -c 'wsl_ip: Ipv4Addr\|wsl_ip: std::net::Ipv4Addr' crates/freshell-platform/src/port_forward.rs   # must be >0 (measured 0 today)
+# NET08-C: no raw token equality left in elevated.rs.
+grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs                                      # must be 0 (measured 2 today)
+grep -c 'timing_safe_compare' crates/freshell-platform/src/elevated.rs                                # must be >0 (measured 0 today)
+# Drift-tolerant suite check (§0.0.5):
+cargo test -p freshell-server -p freshell-platform 2>&1 | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'
+```
+
+**Ordering gate:** 3-MAIN may not begin until this block's four greps read `0 / >0 / 0 />0`.
+The measured-today values are recorded beside each so the falsifier demonstrably
+distinguishes "done" from "silently dropped".
+
+#### NET evidence
+
+- **NET-08** (command injection structurally impossible; token compare constant-time) — primary.
+- Prerequisite for **NET-04/05/07** wiring in 3-MAIN.
+
+---
+
+### Slice 3-MAIN — the route + Windows machinery
+
+**Blocked on 3-PRE.** Do not start until 3-PRE's falsifier passes.
+
+#### Files to touch
 
 | File | Change |
 |---|---|
@@ -583,7 +736,7 @@ NET08-A from latent to live (§0.0.1). Do not start Slice 3 until Slice 0's fals
 | `crates/freshell-platform/src/firewall.rs` | Managed-port staleness read (`get_existing_managed_windows_firewall_ports`, `:313`) feeding `stale` |
 | new small module | Managed-Windows-ports persistence (`network-manager.ts:111-137`), fake-backed |
 
-### TS reference anchors
+#### TS reference anchors
 
 - `server/network-router.ts:617-758` — the route.
 - Confirmation machinery: `issueConfirmation` `:218-228`; `matchesConfirmation` `:230-235`;
@@ -604,7 +757,7 @@ NET08-A from latent to live (§0.0.1). Do not start Slice 3 until Slice 0's fals
   the 409 body **must** carry `method:'in-progress'`); `NetworkSettings.tsx:238-268` (result
   dispatch), `:332-353` (confirm → re-POST with `{confirmElevation:true, confirmationToken}`).
 
-### Behavior on this host
+#### Behavior on this host
 
 `resolveRepairAction` on WSL2 with remote access requested and `portOpen !== true` returns a
 **confirmable** `wsl2-repair`. Our route:
@@ -615,7 +768,7 @@ NET08-A from latent to live (§0.0.1). Do not start Slice 3 until Slice 0's fals
 3. No/mismatched token → 200 `{method:'confirmation-required', title, body, confirmLabel,
    confirmationToken}` — a fresh UUID bound to the action. **No OS call.**
 4. Matching token → acquire lock (lose the race → 409) → **re-resolve against fresh facts**
-   → consume the token (single-use, constant-time compare per Slice 0/NET08-C) → dispatch
+   → consume the token (single-use, constant-time compare per Slice 3-PRE/NET08-C) → dispatch
    the script through the injected runner.
 5. On this Linux host the injected runner for the Windows/elevated path is **not** the real
    `StdCommandRunner` — see structural unreachability below.
@@ -650,7 +803,7 @@ consumed (no replay), and the next status read is authoritative.
 **NET-05 (WSL2 portproxy planning).** Plan builders exist (`port_forward.rs:416`, `:473`)
 with the script normalizer (`:264`). Slice 3 wires the **read-only** inputs — `get_wsl_ip`
 (`:549`), `get_existing_port_proxy_rules` (`:565`), `get_existing_firewall_ports` (`:578`) —
-with `wsl_ip` now an `Ipv4Addr` (Slice 0), and asserts the produced script byte-for-byte
+with `wsl_ip` now an `Ipv4Addr` (Slice 3-PRE), and asserts the produced script byte-for-byte
 against goldens. The script is **returned/logged, never executed**. A golden test pins the
 plan produced from *this host's real, captured* `netsh interface portproxy show all` output
 (**14 rules**, including `0.0.0.0:3001 -> 172.30.149.249:3001` and `0.0.0.0:3412 ->
@@ -666,7 +819,7 @@ parameter (`network.rs:357` `let port_open = if stale { Some(false) } else { i.r
 sentinel rule name are **never** in any delete command (the checklist's "unrelated sentinel
 rule survives", NET-04/NET-06).
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. First POST (no token) → 200 `confirmation-required` with a fresh UUID;
    `FakeCommandRunner` call count **0**.
@@ -690,17 +843,21 @@ rule survives", NET-04/NET-06).
    `netsh … add|delete|set`, no `Start-Process -Verb RunAs`, and no `ufw`/`iptables` ever
    reached a real runner; plus the compile-time unreachability test.
 
-### Definition of done + falsifier
+#### Definition of done + falsifier
 
 ```bash
 grep -c '"/api/network/configure-firewall"' crates/freshell-server/src/network.rs   # must be >0
-cargo test -p freshell-server -p freshell-platform
+# 3-PRE must ALREADY be green before 3-MAIN can be claimed (ordering gate):
+grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs  # must be 0
+grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs                                     # must be 0
+cargo test -p freshell-server -p freshell-platform 2>&1 | grep -E '^test result:' \
+  | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed="p" failed="f; exit (f>0 || p<719)}'
 # Read-only host-state identity check (must match the pre-slice capture byte-for-byte):
 /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile \
   -Command "netsh interface portproxy show all"
 ```
 
-### NET evidence
+#### NET evidence
 
 - **NET-04** — implemented + golden-tested; **live effects HOST-BLOCKED (deferred-with-evidence)**.
 - **NET-05** — planner implemented + golden-tested against real captured host output; **live effects HOST-BLOCKED**.
@@ -751,20 +908,25 @@ human summary on stdout.
 1. `set -euo pipefail`; `trap cleanup EXIT INT TERM`.
 2. Assert `target/release/freshell-server` exists and is newer than the crate sources (else
    `cargo build --release -p freshell-server`).
-3. **Refuse to touch the live server.** Hard error if the requested port is currently
-   listening at all. Specifically: if `--port 3001` and pid 64553 (or any pid not started by
-   this script) holds it → abort naming the pid and its cwd. Never kill a pid this script
-   did not start; ownership-verify via `/proc/<pid>/cwd` + cmdline before any kill.
+3. **Refuse to touch the live server — pid-free rule (§0.0.4).** Hard error if the requested
+   port is currently listening **at all**, whoever holds it. The script reports the holder's
+   pid and cwd *in the abort message* (diagnostics), but **never** uses a pid to decide that
+   killing is acceptable — the answer for any pid it did not start is always no. It kills
+   only pids it started and recorded in its own `$TMP/server.pid`, ownership-verified via
+   `/proc/<pid>/cwd` + cmdline immediately before the kill.
+   > Rev 3 hardcoded a specific live-server pid here; it was already stale one day later
+   > (and pid numbers are recycled). No pid is written into this spec.
 4. `WSL_IP="$(ip -4 addr show eth0 | grep -oP 'inet \K[\d.]+')"` — **re-resolved every run**,
    never read from a file. Empty ⇒ tier (b) unavailable ⇒ **hard fail** (tier (b) is REQUIRED).
-   (Measured `172.30.149.249` on 2026-08-02 and 2026-08-03; a WSL restart reassigns it,
-   which is exactly why it is re-resolved.)
+   (Measured `172.30.149.249` on 2026-08-02 and twice on 2026-08-03 — stable so far, which
+   is *not* a reason to trust it: a WSL restart reassigns it, which is exactly why it is
+   re-resolved every run rather than recorded, cf. §0.0.4.)
 5. Tier (b) liveness: `powershell.exe -NoProfile -Command "echo ok"` must succeed.
 6. **Tier (c) gating** (all read-only, per §0.3):
    - **Unconditional sanity control:** `ssh -o BatchMode=yes -o ConnectTimeout=8
      shapiroserver2 "curl -s -o /dev/null -w '%{http_code}' --max-time 6
-     http://192.168.3.50:3001/api/health"` → record the code (**measured 200 on both
-     2026-08-02 and 2026-08-03**). Proves the LAN vantage is alive without binding anything,
+     http://192.168.3.50:3001/api/health"` → record the code (**measured 200 on 2026-08-02
+     and on both 2026-08-03 sessions — three independent measurements**). Proves the LAN vantage is alive without binding anything,
      so a tier-(c) degradation is provably "not permitted here", not "vantage broken". A
      non-200 is recorded as `tier_c_vantage: unavailable` (a note, not a failure).
    - If `--tier-c` was **not** passed, or the port ≠ 3001: **DEGRADE tier (c)** with reason
@@ -866,7 +1028,7 @@ unchanged, listener set unchanged, `ss` output unchanged):
 | 15 | **Positive control:** one valid `configure` still succeeds after the whole matrix | 200 |
 
 Cases 5/6/14 are additionally proved *structurally* by the Rust unit tests (`host` is an
-enum; `wsl_ip` is an `Ipv4Addr` after Slice 0; `FakeCommandRunner::call_count() == 0`) — the
+enum; `wsl_ip` is an `Ipv4Addr` after Slice 3-PRE; `FakeCommandRunner::call_count() == 0`) — the
 harness proves the black-box contract, the unit tests prove nothing reached a runner. Both
 are required; neither substitutes for the other.
 
@@ -876,7 +1038,9 @@ be absent.
 ### Phase 7 — cleanup & exit
 
 1. Kill only the recorded pid, **after** verifying `/proc/<pid>/cwd` + cmdline match this
-   worktree's `freshell-server` (never a pattern kill). **Never touch pid 64553 / port 3001.**
+   worktree's `freshell-server` (never a pattern kill). **Never touch any process the script
+   did not start, and never touch port 3001's holder** (§0.0.4 — stated by port and by
+   ownership, never by a remembered pid).
 2. Assert no listener remains on `$PORT` (`ss -ltn`).
 3. Remove the temp home unless `--keep-home`.
 4. **Safety self-proof:** re-run the read-only `netsh interface portproxy show all` **and**
@@ -920,7 +1084,7 @@ adjudicates, never the implementer):
 3. **No mass 4009 on rebind.** The reference force-closes every WS connection because it
    must close the listener first. With overlapping listeners we let old connections drain.
    Ledger as an intentional UX improvement.
-4. **NET08-A/B/C hardening** (`Ipv4Addr` typing + constant-time token compare, Slice 0).
+4. **NET08-A/B/C hardening** (`Ipv4Addr` typing + constant-time token compare, Slice 3-PRE).
    Strictly a security improvement over the reference's string interpolation; ledger for
    completeness.
 
@@ -935,29 +1099,32 @@ it. Keep it faithful; note it as *reviewed and deliberately kept*. Slice 1's
 
 ## Sequencing & definition of done
 
-Slices are strictly ordered:
+**Three implementation slices** (§0.0.6), strictly ordered, plus the harness:
 
-- **Slice 0** (NET08-A/B/C) is a **hard blocker for Slice 3** — the audit is explicit that
-  this is cheap now and an incident later, and Slice 3 is what makes it reachable.
-  Independent of Slice 2, so it may land in parallel with or before it, but it **must** land
-  as its own commit with its own falsifier (§0.0.1).
-- **Slice 1** is **done** (`5ab35e316`); its live-state reshape was the hard prerequisite for
-  Slice 2, and it delivered `BindState::set()` + `NetworkFactsCache::invalidate()`, which
-  Slice 2 consumes.
-- **Slice 2** depends on Slice 1. Its action-resolution ladder is reused by Slice 3.
-- **Slice 3** depends on Slice 0 **and** Slice 2.
+- **Slice 1** — status truthfulness + `GET /api/lan-info`. **DONE** (`5ab35e316`). Its
+  live-state reshape was the hard prerequisite for Slice 2, and it delivered
+  `BindState::set()` + `NetworkFactsCache::invalidate()`, which Slice 2 consumes.
+- **Slice 2** — mutation endpoints. Depends on Slice 1. Its action-resolution ladder is
+  reused by Slice 3.
+- **Slice 3** — firewall endpoint + Windows machinery, landing as **two ordered commits**:
+  - **3-PRE** (NET08-A/B/C hardening) — the audit is explicit that this is cheap now and an
+    incident later, and 3-MAIN is what makes it reachable. Independent of Slice 2 (so it may
+    land in parallel with or before it), but it **must** land as its own commit with its own
+    falsifier (§0.0.2) and **must** precede 3-MAIN.
+  - **3-MAIN** — the route + machinery. Depends on 3-PRE **and** Slice 2.
 
 Each slice is Red-Green-Refactor with unit + integration coverage, **and is committed before
 the next begins** (`AGENTS.md` Development Philosophy).
 
 **Done** =
 
-1. Slices 0, 2, 3 committed on `feat/remote-access-networking` (Slice 1 already is), each
-   with a non-empty code diff and its **own** falsifier's output in its **own** commit
-   message;
+1. Slice 2, Slice 3-PRE, and Slice 3-MAIN committed on `feat/remote-access-networking`
+   (Slice 1 already is) — **three separate commits**, each with a non-empty code diff and
+   its **own** falsifier's output in its **own** commit message;
 2. `git status --porcelain server/ shared/ src/` **empty** (frozen reference respected);
-3. `cargo test -p freshell-server -p freshell-platform` green (baseline after Slice 1:
-   **718 passed, 0 failed**);
+3. `cargo test -p freshell-server -p freshell-platform` green, checked **drift-tolerantly**
+   (§0.0.5): `failed == 0` and `passed` never below the floor (**rev-4 measured floor: 719**,
+   raised by each slice and recorded in its commit message);
 4. `test -x scripts/verify-remote-access.sh` **and** the script exits 0 with tiers (a)+(b)
    passing (tier (c) passing or explicitly degraded-with-reason);
 5. `report.json` shows `host_state_unchanged: true`;
