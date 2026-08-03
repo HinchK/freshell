@@ -628,22 +628,27 @@ mod tests {
     /// A scripted, READ-ONLY [`PortProbe`] for tests: returns a fixed,
     /// pre-programmed `Option<bool>` for every call and counts how many times
     /// it was invoked (so a test can assert the probe was/wasn't consulted at
-    /// all — e.g. the loopback-bind gate).
+    /// all — e.g. the loopback-bind gate). The counter lives behind an
+    /// `Arc<AtomicUsize>` a test can clone *before* the probe is erased into
+    /// `Arc<dyn PortProbe>`, so call-count assertions work even after the
+    /// concrete type is gone (unlike a plain `Arc::strong_count` proxy check).
     struct FakePortProbe {
         result: Option<bool>,
-        calls: std::sync::atomic::AtomicUsize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakePortProbe {
         fn new(result: Option<bool>) -> Self {
             Self {
                 result,
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
-        fn call_count(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        /// A cloneable handle to this probe's call counter, usable after the
+        /// probe itself has been moved into `Arc<dyn PortProbe>`.
+        fn call_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            Arc::clone(&self.calls)
         }
     }
 
@@ -678,6 +683,27 @@ mod tests {
             facts: Arc::new(NetworkFactsCache::new()),
             probe: Arc::new(FakePortProbe::new(probe_result)),
         }
+    }
+
+    /// Like [`test_state`], but also returns a cloneable handle to the
+    /// injected [`FakePortProbe`]'s call counter, so a test can assert how
+    /// many times the live route actually invoked the probe (not just that
+    /// the router/state were dropped).
+    fn test_state_with_probe_counter(
+        bind_host: &str,
+        probe_result: Option<bool>,
+    ) -> (NetworkState, Arc<std::sync::atomic::AtomicUsize>) {
+        let probe = FakePortProbe::new(probe_result);
+        let counter = probe.call_counter();
+        let state = NetworkState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: test_settings_store(),
+            bind: Arc::new(BindState::new(bind_host.to_string())),
+            port: 51234,
+            facts: Arc::new(NetworkFactsCache::new()),
+            probe: Arc::new(probe),
+        };
+        (state, counter)
     }
 
     async fn body_json(resp: Response) -> Value {
@@ -831,15 +857,13 @@ mod tests {
         use axum::http::Request;
         use tower::util::ServiceExt;
 
-        let state = test_state("127.0.0.1", Some(true));
+        let (state, probe_calls) = test_state_with_probe_counter("127.0.0.1", Some(true));
         seed_facts(
             &state,
             vec!["192.168.1.50".to_string()],
             linux_none_inactive(),
         )
         .await;
-        // Grab a handle to the fake probe to assert it was never called.
-        let probe_arc = Arc::clone(&state.probe);
 
         let resp = router(state)
             .oneshot(
@@ -860,15 +884,53 @@ mod tests {
             .unwrap()
             .starts_with("http://localhost:"));
 
-        // The probe trait is object-safe; downcast is not available, so this
-        // assertion instead lives in the dedicated unit test below
-        // (`probe_remote_access_ports_is_never_called_off_the_gate`) which
-        // calls the gate condition directly. Here we just confirm the router
-        // (and the `NetworkState` clone it consumed) has been fully dropped
-        // by the time `oneshot` resolves, leaving `probe_arc` as the sole
-        // remaining strong reference \u2014 a sanity check that this test's own
-        // setup didn't leak an extra clone.
-        assert_eq!(Arc::strong_count(&probe_arc), 1);
+        // The load-bearing assertion: the injected probe (standing in for a
+        // real socket connect) must have been invoked ZERO times on a
+        // loopback bind, proving the live route's own gate
+        // (`effective_host == "0.0.0.0" && !lan_ips.is_empty()`) — not just
+        // the pure `build_network_status` builder in isolation — actually
+        // skips the probe.
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "loopback bind must never consult the port-reachability probe"
+        );
+    }
+
+    /// The mirror of the test above: on a `0.0.0.0` bind with a LAN IP
+    /// present, the live route's gate is OPEN and the injected probe must be
+    /// invoked exactly once per remote-access port (one port here) — proving
+    /// the gate is wired both ways, not just closed on loopback.
+    #[tokio::test]
+    async fn zero_zero_zero_zero_bind_with_lan_ip_invokes_the_probe_exactly_once() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let (state, probe_calls) = test_state_with_probe_counter("0.0.0.0", Some(true));
+        seed_facts(
+            &state,
+            vec!["192.168.1.50".to_string()],
+            linux_none_inactive(),
+        )
+        .await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/network/status")
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "0.0.0.0 bind with a LAN IP must consult the probe exactly once per port"
+        );
     }
 
     /// Acceptance 4 (the negative-truth test): `0.0.0.0` bind but the port is
@@ -1045,10 +1107,11 @@ mod tests {
     #[tokio::test]
     async fn probe_remote_access_ports_only_runs_through_the_gate() {
         let probe = FakePortProbe::new(Some(true));
+        let counter = probe.call_counter();
         // Gate open: one LAN IP, one port -> exactly one call.
         let result = probe_remote_access_ports(&probe, "192.168.1.50", &[51234]).await;
         assert_eq!(result, Some(true));
-        assert_eq!(probe.call_count(), 1);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Aggregation semantics (`network-manager.ts:304-323`): any `Some(false)`
