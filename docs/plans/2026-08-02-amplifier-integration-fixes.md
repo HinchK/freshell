@@ -7,7 +7,7 @@
 
 **Goal:** Fix freshell's Amplifier integration: stamp the user's active bundle into new session stubs, detach the Rust server from the login shell, stop the idle reaper from killing busy-but-quiet agent terminals, and ship a one-time backfill script that heals existing sessions.
 
-**Architecture:** Four independent fixes on one branch. (1) A new best-effort YAML settings resolver in `freshell-sessions` feeds a `bundle` key into the stub `metadata.json` written by `ensure_session`. (2) `scripts/launch-rust.sh` gains `setsid` detachment plus an optional systemd user unit. (3) The `freshell-terminal` idle reaper gains a closed-list agent-mode exemption. (4) A standalone `tsx` script backfills `bundle` into existing freshell-created sessions with hard live-session safety rails.
+**Architecture:** Four independent fixes on one branch. (1) A new best-effort YAML settings resolver in `freshell-sessions` feeds a `bundle` key into the stub `metadata.json` written by `ensure_session`. (2) `scripts/launch-rust.sh` gains `setsid` detachment plus an optional systemd user unit. (3) The `freshell-terminal` idle reaper gains a closed-list agent-mode 24 h idle hard cap in place of the configured threshold. (4) A standalone `tsx` script backfills `bundle` into existing freshell-created sessions with hard live-session safety rails.
 
 **Tech Stack:** Rust (cargo workspace: `freshell-sessions`, `freshell-terminal`, `freshell-ws`, `freshell-server`), `saphyr` 0.0.11 (new YAML dep — `serde_yaml` is archived; `saphyr` is the actively maintained pure-Rust successor, last release 2026-07), bash (`scripts/launch-rust.sh`), systemd user unit, TypeScript via `tsx` + the `yaml` npm package, Vitest 3.
 
@@ -18,11 +18,12 @@
 Copied from the spec — every task's requirements implicitly include these:
 
 - **Worktree root (all work happens here):** `/home/dan/code/freshell/.worktrees/amplifier-integration-fixes` — branch `fix/amplifier-integration-fixes`. All commands below assume this as cwd unless stated.
-- **Bundle stamp value:** bare name (e.g. `"foundation"`), **NOT** `"bundle:"`-prefixed. Stamp the string verbatim (trimmed) from settings.
+- **Bundle stamp value:** bare name (e.g. `"foundation"`), **NOT** `"bundle:"`-prefixed. Stamp the string verbatim (trimmed) from settings. Validated nuance (ledger A5): the CLI *accepts* both bare and prefixed forms on read (`session_store.py:60-71`) but *persists* `bundle:<name>`-prefixed on its first save — so a bare stamp is correct and safe, but no test may assert the stamped literal survives a real turn; zero-turn adoption leaves it verbatim.
+- **CLI ground truth (validated 2026-08-03; assumption ledger: `.the-usual-logs/amplifier-integration-fixes/load-bearing-ledger.md` beside this worktree):** the authoritative CLI source is the INSTALLED `amplifier_app_cli` 0.1.1 (uv tool venv, `microsoft/amplifier-app-cli@1873aa9`, `~/.local/share/uv/tools/amplifier/lib/python3.13/site-packages/`) — `/home/dan/code/amplifier` contains no CLI source and must not be cited as evidence. Verified: resume's hardcoded default bundle is `anchors`; the CLI deep-merges settings and silently SKIPS malformed layers (our poison-to-omission is deliberately more conservative, always in the safe/omission direction).
 - **Resolution semantics (must mirror Amplifier's merged settings precedence, later wins):** (1) `~/.amplifier/settings.yaml`, (2) `<resolved working dir>/.amplifier/settings.yaml`, (3) `<resolved working dir>/.amplifier/settings.local.yaml` — where `<resolved working dir>` is the stub's canonical working dir (`resolved` in `ensure_session`), NOT the server process cwd. Key path: `bundle.active`.
-- **HARD SAFETY RULE (adversarial review):** stamp ONLY when the value is a plain non-empty YAML string scalar; on ANY surprise — an existing-but-unreadable file, unparseable YAML, non-string value, empty string — OMIT the bundle key entirely and never fail or delay stub creation. A missing stamp is healed by Amplifier's default; a WRONG stamp is trusted forever — asymmetric risk, bias hard toward omission.
-- **Item 4 live-session safety:** skip a session if a running process matches `amplifier.*<session_id>` (ps check) OR the session dir's `events.jsonl` mtime is within the last 10 minutes. Atomic writes (temp file + rename), preserve all other metadata keys and formatting. `--dry-run` is the default; `--apply` writes. **Run `--dry-run` only; NEVER run `--apply`** (the user runs apply themselves). Summary must print scanned / eligible / skipped-live / updated counts.
-- **Item 2:** `setsid` (detach from launching session) is the first-class mechanism; the systemd user unit is ADDITIONAL and optional (document that WSL2 systemd requirement — do not make systemd the only path).
+- **HARD SAFETY RULE (adversarial review):** stamp ONLY when the value is a plain non-empty YAML string scalar; on ANY surprise — an existing-but-unreadable file, unparseable YAML, non-string value, empty string — OMIT the bundle key entirely and never fail or delay stub creation. A missing stamp is healed by Amplifier's default; a WRONG stamp is trusted silently (refined by ledger A6: a wrong-but-loadable stamp is trusted forever, while a stamp naming an unloadable bundle makes `resume` exit 1 — loud and recoverable via `--force-bundle` or a metadata edit). Both failure directions still favor omission — asymmetric risk, bias hard toward omission. Multi-document settings files are also a surprise (the CLI's own parser errors on them; ledger A10).
+- **Item 4 live-session safety (REDESIGNED per ledger A15 — live validation showed the spec's two guards miss real live sessions: interactive CLI processes carry no session id in argv, and live sessions go events-silent for 24–70+ minutes):** layered model — (0) `--apply` REFUSES to run while ANY `amplifier` process is visible in a fresh `ps -eo args=` snapshot, or when ps itself fails (deliberately over-broad: a false positive only delays the heal; dry-run is unaffected); (1) per session, skip if a running process matches `amplifier.*<session_id>` OR the session dir's `events.jsonl` mtime is within the last 10 minutes (kept as defense in depth); (2) re-read the file immediately before writing and skip if its bytes changed since the eligibility read; (3) fidelity verify (ledger A16): if re-serializing the ORIGINAL parse does not byte-identically reproduce the original file, skip as `skipped-unfaithful` (JSON.stringify re-emits integral floats like `5.0` as `5` and `\uXXXX` escapes literally). Atomic writes (temp file + rename), preserve all other metadata keys and formatting. `--dry-run` is the default; `--apply` writes. **Run `--dry-run` only; NEVER run `--apply`** (the user runs apply themselves). Summary must print scanned / eligible / skipped-live / skipped-unresolved / skipped-unfaithful / updated counts.
+- **Item 2 (scoped by ledger A13):** `setsid` (detach from launching session) is the first-class mechanism and experimentally defeats the shell-death HUP/TERM cascades. It does NOT survive WSL2's documented VM teardown after the last console/interop handle closes — nothing launcher-side can. The systemd user unit stays ADDITIONAL (never the only path; document the WSL2 systemd requirement) but is RECOMMENDED for unattended operation (with `loginctl enable-linger`): its realistic value is supervised restarts + resurrection at next distro boot, not uninterrupted survival.
 - **Item 3:** minimal change consistent with the reaper's existing design. (Investigation is settled: the reaper at `crates/freshell-terminal/src/registry.rs:847-892` has NO child-liveness or mode exemption — only running/detached/threshold checks — and `crates/freshell-ws/tests/pane_reconcile.rs:759` proves agent-mode terminals are reaped today. The bug is real; behavior change is warranted, not speculative.)
 - **Repo rules (AGENTS.md):** Red-Green-Refactor TDD; NEVER restart or stop the live self-hosted Rust server on port 3002 (manual verification uses port **3499**); no broad `pkill`; broad test runs go through the coordinator — use only the scoped commands given in each task; NodeNext ESM: relative TS imports carry `.js` extensions; every new Cargo dependency carries a justifying comment; no PR creation without explicit user approval.
 - **Docs:** README.md is the only end-user markdown doc — this plan and code/unit-file comments are working docs. Server lifecycle behavior changes are documented in `AGENTS.md` §"Rust Server (Self-Hosted Production)" (the repo's server-lifecycle home) and in script/unit-file headers, not new markdown files.
@@ -50,7 +51,7 @@ installers/systemd/
   freshell-rust.service           CREATE  optional systemd user unit (Task 6)
 AGENTS.md                         MODIFY  document detach behavior + systemd option (Task 6)
 crates/freshell-terminal/
-  src/registry.rs                 MODIFY  agent-mode idle-reap exemption + unit tests (Task 7)
+  src/registry.rs                 MODIFY  agent-mode idle-reap 24h hard cap + unit tests (Task 7)
 test/unit/scripts/
   amplifier-backfill-bundle.test.ts  CREATE  backfill unit tests (Task 9)
 package.json                      MODIFY  add `yaml` devDependency (Task 9)
@@ -103,6 +104,12 @@ Create `crates/freshell-sessions/src/bundle_config.rs` with the doc header, a st
 //!   1. `<amplifier_home>/settings.yaml`                 (global, ~/.amplifier)
 //!   2. `<working_dir>/.amplifier/settings.yaml`         (project)
 //!   3. `<working_dir>/.amplifier/settings.local.yaml`   (project-local)
+//!
+//! Known, deliberate divergences from the CLI (ledger A1/A10): the CLI
+//! deep-merges layers and silently SKIPS malformed ones; we treat any
+//! malformed layer — and any multi-document file, which the CLI's own
+//! parser also rejects — as a Surprise poisoning the whole resolution.
+//! Both divergences only ever push toward omission (the safe direction).
 //!
 //! HARD SAFETY RULE (adversarial review): return a value ONLY when it is a
 //! plain non-empty YAML string scalar. On ANY surprise — an existing but
@@ -292,13 +299,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
+
+    #[test]
+    fn multi_document_settings_poison_the_whole_resolution() {
+        // The CLI's own parser errors on multi-document settings files (and
+        // silently skips the layer); taking the first document could stamp
+        // a value the CLI would never resolve. Surprise -> omit (ledger A10).
+        let home = unique_temp_dir("multidoc-home");
+        let cwd = unique_temp_dir("multidoc-cwd");
+        write(
+            &home.join("settings.yaml"),
+            "bundle:\n  active: foundation\n---\nbundle:\n  active: other\n",
+        );
+
+        assert_eq!(resolve_active_bundle(&home, &cwd), None);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn duplicate_active_keys_use_the_last_value() {
+        // saphyr resolves duplicate mapping keys last-wins (verified against
+        // the pinned crate); the TS twin passes `uniqueKeys: false` to match
+        // (ledger A10) — keep both matrices pinned to this behavior.
+        let home = unique_temp_dir("dupkey-home");
+        let cwd = unique_temp_dir("dupkey-cwd");
+        write(
+            &home.join("settings.yaml"),
+            "bundle:\n  active: one\n  active: two\n",
+        );
+
+        assert_eq!(resolve_active_bundle(&home, &cwd), Some("two".to_string()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 }
 ```
 
 - [ ] **Step 3: Run tests to verify the red state**
 
 Run: `cargo test -p freshell-sessions bundle_config`
-Expected: compiles; **4 FAIL** (`resolves_from_global_settings_only`, `project_settings_override_global`, `local_settings_override_project_and_global`, `layer_without_the_key_does_not_clear_an_earlier_winner` — the stub returns `None`), 5 pass.
+Expected: compiles; **5 FAIL** (`resolves_from_global_settings_only`, `project_settings_override_global`, `local_settings_override_project_and_global`, `layer_without_the_key_does_not_clear_an_earlier_winner`, `duplicate_active_keys_use_the_last_value` — the stub returns `None`), 6 pass.
 
 - [ ] **Step 4: Implement the resolver**
 
@@ -332,6 +373,12 @@ fn read_layer(path: &Path) -> Layer {
         Ok(docs) => docs,
         Err(_) => return Layer::Surprise,
     };
+    if docs.len() > 1 {
+        // Multi-document settings: the CLI's own parser errors on these (and
+        // silently skips the layer). Taking the first doc could stamp a value
+        // the CLI would never resolve — Surprise (ledger A10).
+        return Layer::Surprise;
+    }
     let Some(doc) = docs.first() else {
         return Layer::NoKey; // empty file — nothing to contribute
     };
@@ -376,7 +423,7 @@ pub fn resolve_active_bundle(amplifier_home: &Path, working_dir: &Path) -> Optio
 - [ ] **Step 5: Run tests to verify green**
 
 Run: `cargo test -p freshell-sessions bundle_config`
-Expected: **9 passed, 0 failed**.
+Expected: **11 passed, 0 failed**.
 
 - [ ] **Step 6: Format and commit**
 
@@ -450,10 +497,13 @@ to:
         "working_dir": resolved.to_string_lossy(),
         "freshell_terminal_id": terminal_id,
     });
-    // ITEM-1: stamp the user's active bundle (bare name, e.g. "foundation").
+    // ITEM-1: stamp the user's active bundle (bare name, e.g. "foundation";
+    // the CLI accepts bare on read and normalizes it to "bundle:<name>" on
+    // its first save — never assume the literal survives a real turn).
     // The CLI's `resume` path never consults settings `bundle.active`; an
-    // unstamped stub silently runs the CLI's hardcoded default bundle and
-    // then persists a self-perpetuating "bundle": "unknown". Best-effort by
+    // unstamped stub silently runs the CLI's hardcoded default bundle
+    // (`anchors`) and then persists a self-perpetuating "bundle": "unknown".
+    // Best-effort by
     // design: `resolve_active_bundle` collapses every surprise to `None`
     // (HARD SAFETY RULE — a wrong stamp is trusted forever, a missing one
     // is healed), so stub creation can never fail or slow down here.
@@ -480,8 +530,9 @@ In the doc comment at `amplifier_stub.rs:103-110`, replace the stub-shape senten
 /// best-effort `bundle` (bare name from the user's merged settings
 /// `bundle.active` — see [`crate::bundle_config::resolve_active_bundle`];
 /// stamped because the CLI's resume path never consults settings and would
-/// otherwise run its hardcoded default bundle and persist a
-/// self-perpetuating `"bundle": "unknown"`; omitted entirely when nothing
+/// otherwise run its hardcoded default bundle (`anchors`) and persist a
+/// self-perpetuating `"bundle": "unknown"`; the CLI normalizes a bare stamp
+/// to `bundle:<name>` on its first save; omitted entirely when nothing
 /// resolves safely); plus empty `transcript.jsonl` and empty
 /// `events.jsonl` (the latter so the activity hub's create-time resolver
 /// attach finds a file — see the module design note).
@@ -676,7 +727,8 @@ In the first test (`adopts a broker-shaped pre-created stub under the cwd slug`)
 
 ```ts
       // ITEM-1: zero-turn adoption must leave the stamped bundle intact —
-      // this is the key the CLI's resume path will trust.
+      // this is the key the CLI's resume path will trust. (Zero-turn only:
+      // after a real first turn the CLI rewrites it as 'bundle:foundation'.)
       expect(meta.bundle).toBe('foundation')
 ```
 
@@ -726,7 +778,11 @@ with:
 # hardening.md A13/V5). stdin comes from /dev/null so no tty fd ties us to
 # the console. setsid exec's WITHOUT forking here (a background job in a
 # non-interactive script is not a process-group leader), so $! below is the
-# server's real pid.
+# server's real pid. Verified by experiment (ledger A11) — but ONLY under
+# these conditions: never enable job control (set -m) in this script and
+# never wrap this script in an outer setsid/setpgid; either would make
+# setsid a process-group leader and flip it into its FORK branch, leaving
+# $! pointing at a short-lived intermediate.
 PORT="$PORT" setsid "$BINARY" < /dev/null >> "$LOG_FILE" 2>&1 &
 ```
 
@@ -752,8 +808,11 @@ In the header comment block (after the `--stop` usage line, line 16), add:
 # /dev/null). Closing the shell/console that ran this script does NOT stop
 # the server or its child terminals. Stop it with:
 #   scripts/launch-rust.sh --stop [--port N]
-# Optional alternative for WSL2 with systemd enabled: see
-# installers/systemd/freshell-rust.service.
+# CAVEAT (WSL2): when the LAST console/interop handle into the distro
+# closes, Windows shuts the whole WSL VM down (documented behavior) — no
+# launcher-side detachment survives that. For unattended operation use the
+# systemd user unit (recommended; restores the server at next distro boot):
+# see installers/systemd/freshell-rust.service.
 ```
 
 - [ ] **Step 4: Verify detachment on a scratch port (NEVER port 3002)**
@@ -810,7 +869,10 @@ Create `installers/systemd/freshell-rust.service`:
 # Optional systemd USER unit for the self-hosted Rust freshell-server.
 #
 # This is an ALTERNATIVE to scripts/launch-rust.sh (which detaches via
-# setsid and needs no systemd). Use this if you want supervised restarts.
+# setsid and needs no systemd). RECOMMENDED for unattended operation:
+# WSL2 shuts the whole VM down after the last console closes, which kills
+# a setsid-detached server too — this unit (with linger) restores the
+# server at the next distro boot and supervises restarts meanwhile.
 #
 # WSL2 REQUIREMENT: systemd must be enabled — /etc/wsl.conf:
 #   [boot]
@@ -878,14 +940,18 @@ At the end of the "Rust Server (Self-Hosted Production)" section (after its last
 
 ```markdown
 - **Detached launch:** `scripts/launch-rust.sh` starts the server in its own
-  session (`setsid`, stdin from `/dev/null`). Closing the launching shell or
-  WSL2 console does NOT stop the server or its child agent terminals (this
-  fixed the SIGTERM/SIGHUP cascades visible as `shutdown_forensics` events).
-  Stop it only via `scripts/launch-rust.sh --stop [--port N]`.
-- **Optional systemd (WSL2 with systemd enabled):** install the user unit
+  session (`setsid`, stdin from `/dev/null`). Closing the launching shell
+  does NOT stop the server or its child agent terminals (this fixed the
+  SIGTERM/SIGHUP cascades visible as `shutdown_forensics` events). Stop it
+  only via `scripts/launch-rust.sh --stop [--port N]`. CAVEAT: WSL2 shuts
+  the whole VM down shortly after the LAST console/interop handle closes —
+  no launcher-side detachment survives that.
+- **systemd user unit (recommended for unattended operation):** install
   `installers/systemd/freshell-rust.service` (see its header for the
-  `/etc/wsl.conf` requirement and `loginctl enable-linger`). systemd is NOT
-  required — the setsid launcher is the default, dependency-free path.
+  `/etc/wsl.conf` requirement and `loginctl enable-linger`). It cannot keep
+  the WSL VM alive either, but it restores the server at the next distro
+  boot and supervises restarts. systemd is NOT required — the setsid
+  launcher remains the default, dependency-free path.
 ```
 
 - [ ] **Step 4: Commit**
@@ -897,16 +963,16 @@ git commit -m "feat(installers): optional systemd user unit for the rust server;
 
 ---
 
-### Task 7: Exempt agent-mode terminals from the idle reaper (registry)
+### Task 7: Hard-cap agent-mode terminals in the idle reaper (registry)
 
 **Files:**
 - Modify: `crates/freshell-terminal/src/registry.rs` — the `enforce_idle_kills` filter closure (lines 859-874) + its doc comment (lines 833-846), a new private helper, and new tests in `mod tests`
 
-Context (settled by investigation): a terminal is idle-killed iff running + detached + `last_meaningful_activity_at` older than `autoKillIdleMinutes` (default 15). The meaningful-activity clock is fed ONLY by user input and non-noise PTY output — there is no child-process probe. So an agent that is mid-work but PTY-quiet (long LLM call, long tool run) or emitting only spinner repaints (deliberately classified as noise, DEV-0009) is killed. `s.mode` (`"shell" | "claude" | "codex" | "opencode" | "amplifier"`) is in scope in the filter closure; `status == Running` already encodes "the child is alive" (the row flips to Exited when the PTY child exits). The minimal change consistent with the design: a closed-list agent-mode exemption while Running. Unknown/future modes keep legacy reaping.
+Context (settled by investigation): a terminal is idle-killed iff running + detached + `last_meaningful_activity_at` older than `autoKillIdleMinutes` (default 15). The meaningful-activity clock is fed ONLY by user input and non-noise PTY output — there is no child-process probe. So an agent that is mid-work but PTY-quiet (long LLM call, long tool run) or emitting only spinner repaints (deliberately classified as noise, DEV-0009) is killed. `s.mode` (`"shell" | "claude" | "codex" | "opencode" | "amplifier"`) is in scope in the filter closure. CORRECTION (ledger A14, validated): `status == Running` is NOT a loss-proof live-child signal — the Running→Exited flip has exactly one natural trigger (the PTY reader thread's EOF), and a descendant holding the slave fd wedges it forever (empirically reproduced); this sweep is also the ONLY cleanup for such wedged rows. So a full exemption is ruled out. The minimal change consistent with the design: agent modes get a large idle HARD CAP (24 h) instead of the configured threshold — busy-but-quiet agents (minutes-to-hours silent) are spared, wedged/abandoned rows still get cleaned. Unknown/future modes keep legacy reaping.
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: `enforce_idle_kills` never returns agent-mode terminals; new private `fn is_agent_mode(mode: &str) -> bool` on `TerminalRegistry`. Task 8's integration tests rely on this behavior.
+- Produces: `enforce_idle_kills` spares agent-mode terminals until a 24-hour hard cap (`AGENT_IDLE_HARD_CAP_MS`) instead of the configured threshold; new private `fn is_agent_mode(mode: &str) -> bool` on `TerminalRegistry`. Task 8's integration tests rely on this behavior.
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -918,9 +984,9 @@ In `crates/freshell-terminal/src/registry.rs`, `#[cfg(test)] mod tests`, immedia
         // ITEM-3 (`terminal.killed by="idle"` forensics): agent CLIs are
         // legitimately PTY-silent far beyond any idle threshold while
         // mid-work (long LLM calls, long tool runs), and their spinner
-        // repaints are deliberately noise-classified (DEV-0009). While the
-        // child is alive (status == Running), PTY silence is NOT evidence
-        // of idleness for these modes — never reap them.
+        // repaints are deliberately noise-classified (DEV-0009). PTY
+        // silence is NOT evidence of idleness for these modes — within
+        // the 24 h hard cap they must be spared (999 min << 24 h).
         let reg = TerminalRegistry::new();
         reg.set_auto_kill_idle_minutes(5);
         for mode in ["claude", "codex", "opencode", "amplifier"] {
@@ -948,7 +1014,7 @@ In `crates/freshell-terminal/src/registry.rs`, `#[cfg(test)] mod tests`, immedia
 
     #[test]
     fn enforce_idle_kills_mixed_sweep_reaps_only_the_shell() {
-        // The exemption is a CLOSED list: plain shells (and unknown future
+        // The hard cap applies to a CLOSED list: plain shells (and future
         // modes) keep the legacy reap behavior — the sweep still does its
         // resource-cleanup job.
         let reg = TerminalRegistry::new();
@@ -970,50 +1036,84 @@ In `crates/freshell-terminal/src/registry.rs`, `#[cfg(test)] mod tests`, immedia
         assert_eq!(killed, vec!["T-shell".to_string()]);
         assert_eq!(reg.inventory().len(), 1);
     }
+
+    #[test]
+    fn enforce_idle_kills_reaps_agent_terminals_past_the_hard_cap() {
+        // ITEM-3 counterweight (ledger A14): Running is NOT a loss-proof
+        // live-child signal (a descendant holding the PTY slave fd wedges
+        // exit detection), and this sweep is the only cleanup for wedged
+        // rows — so agents are capped, not fully exempt.
+        let reg = TerminalRegistry::new();
+        reg.set_auto_kill_idle_minutes(5);
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-amp-wedged".to_string(),
+            stream_id: "S-amp-wedged".to_string(),
+            mode: "amplifier".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        // 25 hours stale — past the 24-hour agent hard cap.
+        reg.backdate_last_activity("T-amp-wedged", now_ms() - 25 * 60 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T-amp-wedged".to_string()]);
+    }
 ```
 
 - [ ] **Step 2: Run them to verify red**
 
 Run: `cargo test -p freshell-terminal enforce_idle_kills`
-Expected: the two NEW tests FAIL (agent terminals are currently killed); the six existing `enforce_idle_kills_*` tests pass.
+Expected: `enforce_idle_kills_spares_agent_mode_terminals_past_threshold` and `enforce_idle_kills_mixed_sweep_reaps_only_the_shell` FAIL (agent terminals are currently killed at the configured threshold); `enforce_idle_kills_reaps_agent_terminals_past_the_hard_cap` already passes (it pins the backstop, guarding against a future full exemption); the six existing `enforce_idle_kills_*` tests pass.
 
-- [ ] **Step 3: Implement the exemption**
+- [ ] **Step 3: Implement the hard cap**
 
 In `registry.rs`, add a private helper directly ABOVE `pub fn enforce_idle_kills` (line 847):
 
 ```rust
-    /// ITEM-3: agent-CLI terminals (long-running assistant sessions) are
-    /// exempt from the idle-kill sweep while their child is alive
-    /// (`status == Running` — the row flips to Exited when the PTY child
-    /// dies, so Running IS the live-child signal). An agent mid-work can be
-    /// PTY-silent far longer than any reasonable idle threshold (long LLM
-    /// calls, long tool runs), and `terminal.killed by="idle"` forensics
-    /// showed busy amplifier sessions being reaped. CLOSED list: unknown /
-    /// future modes stay reapable (legacy resource-cleanup behavior).
+    /// ITEM-3: agent-CLI terminals (long-running assistant sessions) get a
+    /// 24-hour idle HARD CAP instead of the configured threshold. An agent
+    /// mid-work can be PTY-silent far longer than any reasonable idle
+    /// threshold (long LLM calls, long tool runs), and `terminal.killed
+    /// by="idle"` forensics showed busy amplifier sessions being reaped.
+    /// NOT a full exemption: `status == Running` is not a loss-proof
+    /// live-child signal (the Running→Exited flip's only natural trigger is
+    /// the PTY reader's EOF; a descendant holding the slave fd wedges it —
+    /// ledger A14), and this sweep is the only cleanup for wedged rows.
+    /// CLOSED list: unknown / future modes stay reapable (legacy behavior).
     fn is_agent_mode(mode: &str) -> bool {
         matches!(mode, "claude" | "codex" | "opencode" | "amplifier")
     }
+
+    /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`]).
+    const AGENT_IDLE_HARD_CAP_MS: i64 = 24 * 60 * 60 * 1000;
 ```
 
-In the filter closure, after the subscribers check (lines 864-866), insert:
+In the filter closure, after the subscribers check (lines 864-866), insert (adapt `idle_ms` to the closure's existing local — the closure already computes the row's now-minus-`last_meaningful_activity_at` idle age for its threshold comparison; reuse that same quantity, do not recompute it differently):
 
 ```rust
-                    if Self::is_agent_mode(&s.mode) {
-                        return None; // ITEM-3: live agent session — never idle-reap
+                    if Self::is_agent_mode(&s.mode) && idle_ms < Self::AGENT_IDLE_HARD_CAP_MS {
+                        // ITEM-3: agent session within the hard cap — spare.
+                        return None;
                     }
 ```
+
+(Agent rows past the cap fall through to the normal reap arm.)
 
 And extend the `enforce_idle_kills` doc comment (after the sentence ending "...exempts the terminal regardless of idle time." at lines 838-839) with:
 
 ```rust
-    /// Agent-mode terminals (see [`Self::is_agent_mode`]) are exempt while
-    /// running — PTY silence is not idleness for an agent mid-work (ITEM-3).
+    /// Agent-mode terminals (see [`Self::is_agent_mode`]) use a 24-hour
+    /// hard cap instead of the configured threshold — PTY silence is not
+    /// idleness for an agent mid-work, but the sweep stays their cleanup
+    /// backstop for wedged exit detection (ITEM-3, ledger A14).
 ```
 
 - [ ] **Step 4: Run the reaper tests to verify green**
 
 Run: `cargo test -p freshell-terminal enforce_idle_kills`
-Expected: **all 8 pass** (6 existing + 2 new; the existing ones all use `insert_headless`, which seeds `mode: "shell"`, so they are unaffected).
+Expected: **all 9 pass** (6 existing + 3 new; the existing ones all use `insert_headless`, which seeds `mode: "shell"`, so they are unaffected).
 
 - [ ] **Step 5: Run the whole crate**
 
@@ -1025,7 +1125,7 @@ Expected: all pass. If the reconcile-section test using the in-crate `headless` 
 ```bash
 cargo fmt -p freshell-terminal
 git add crates/freshell-terminal/src/registry.rs
-git commit -m "fix(terminal): exempt live agent-mode terminals from the idle reaper"
+git commit -m "fix(terminal): hard-cap agent-mode idle reaping at 24h (spare busy-quiet agents, keep the cleanup backstop)"
 ```
 
 ---
@@ -1036,7 +1136,7 @@ git commit -m "fix(terminal): exempt live agent-mode terminals from the idle rea
 - Modify: `crates/freshell-ws/tests/pane_reconcile.rs:750-816` (the existing idle-reap reconcile test) + one new test in the same file
 
 **Interfaces:**
-- Consumes: Task 7's exemption; the file-local helper `fn headless(server: &Server, id: &str, key: Option<&str>, mode: &str, created_at: i64)` (`pane_reconcile.rs:272-283`).
+- Consumes: Task 7's hard cap; the file-local helper `fn headless(server: &Server, id: &str, key: Option<&str>, mode: &str, created_at: i64)` (`pane_reconcile.rs:272-283`).
 - Produces: integration pins for both sides of the new policy.
 
 - [ ] **Step 1: Re-point the existing reconcile test at a reapable mode**
@@ -1056,8 +1156,9 @@ git commit -m "fix(terminal): exempt live agent-mode terminals from the idle rea
 to:
 
 ```rust
-    // ITEM-3: agent modes are now exempt from the idle sweep, so the
-    // reap side of this seam is driven with a plain shell terminal; the
+    // ITEM-3: agent modes now get a 24 h idle hard cap (not the configured
+    // threshold), so the reap side of this seam is driven with a plain
+    // shell terminal; the
     // pane still re-presents as claude (verdict logic only consults disk
     // truth + liveness — the reaped row is gone either way).
     headless(
@@ -1077,9 +1178,10 @@ Append to `pane_reconcile.rs` (after line 816):
 
 ```rust
 /// ITEM-3 regression pin: the idle sweep must NOT reap a detached
-/// agent-mode terminal, however stale its meaningful-activity clock is —
-/// agent CLIs are legitimately PTY-silent during long LLM calls and long
-/// tool runs (`terminal.killed by="idle"` forensics).
+/// agent-mode terminal that is stale past the configured threshold but
+/// within the 24 h agent hard cap — agent CLIs are legitimately PTY-silent
+/// during long LLM calls and long tool runs (`terminal.killed by="idle"`
+/// forensics). Past the cap they ARE reaped (ledger A14 backstop).
 #[tokio::test]
 async fn idle_sweep_spares_detached_agent_terminals() {
     let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Present]);
@@ -1117,7 +1219,7 @@ Expected: all pass, including the re-pointed reconcile test (respawn verdict unc
 
 ```bash
 git add crates/freshell-ws/tests/pane_reconcile.rs
-git commit -m "test(ws): pin idle-reaper agent exemption and re-point reap-reconcile seam at shell mode"
+git commit -m "test(ws): pin idle-reaper agent hard cap and re-point reap-reconcile seam at shell mode"
 ```
 
 ---
@@ -1131,7 +1233,7 @@ git commit -m "test(ws): pin idle-reaper agent exemption and re-point reap-recon
 
 **Interfaces:**
 - Consumes: the resolution semantics of Task 1 (deliberately duplicated — no shared runtime with Rust; keep test matrices mirrored).
-- Produces: exports `resolveActiveBundle(globalDir: string, workingDir: string | undefined): Promise<string | null>`, `detectIndent(raw: string): string | number`, `sessionLooksLive(sessionId: string, sessionDir: string, psOutput: string, nowMs: number): Promise<boolean>`, `backfillSession(metaPath: string, opts: { globalDir: string; apply: boolean; psOutput: string; nowMs: number }): Promise<SessionOutcome>`, `type SessionOutcome`, and `main(argv?: string[]): Promise<void>`. Task 10 runs `main` via `npx tsx` in dry-run mode.
+- Produces: exports `resolveActiveBundle(globalDir: string, workingDir: string | undefined): Promise<string | null>`, `detectIndent(raw: string): string | number`, `applyBlockedByLiveAmplifier(psOutput: string): boolean`, `sessionLooksLive(sessionId: string, sessionDir: string, psOutput: string, nowMs: number): Promise<boolean>`, `backfillSession(metaPath: string, opts: { globalDir: string; apply: boolean; psOutput: string; nowMs: number }): Promise<SessionOutcome>`, `type SessionOutcome`, and `main(argv?: string[]): Promise<void>`. Task 10 runs `main` via `npx tsx` in dry-run mode.
 
 - [ ] **Step 1: Add the yaml devDependency**
 
@@ -1151,6 +1253,7 @@ import path from 'node:path'
 import {
   resolveActiveBundle,
   detectIndent,
+  applyBlockedByLiveAmplifier,
   sessionLooksLive,
   backfillSession,
 } from '../../../scripts/amplifier-backfill-bundle.js'
@@ -1218,6 +1321,21 @@ describe('resolveActiveBundle (mirror of Rust bundle_config semantics)', () => {
     expect(await resolveActiveBundle(globalDir, workDir)).toBe('foundation')
   })
 
+  it('multi-document settings poison the whole resolution (mirrors Rust)', async () => {
+    const { globalDir, workDir } = dirs()
+    await write(
+      path.join(globalDir, 'settings.yaml'),
+      'bundle:\n  active: foundation\n---\nbundle:\n  active: other\n',
+    )
+    expect(await resolveActiveBundle(globalDir, workDir)).toBeNull()
+  })
+
+  it('duplicate active keys resolve last-wins (mirrors Rust/saphyr)', async () => {
+    const { globalDir, workDir } = dirs()
+    await write(path.join(globalDir, 'settings.yaml'), 'bundle:\n  active: one\n  active: two\n')
+    expect(await resolveActiveBundle(globalDir, workDir)).toBe('two')
+  })
+
   it('falls back to global-only when workingDir is undefined', async () => {
     const { globalDir } = dirs()
     await write(path.join(globalDir, 'settings.yaml'), 'bundle:\n  active: foundation\n')
@@ -1231,6 +1349,13 @@ describe('detectIndent', () => {
     expect(detectIndent('{\n    "a": 1\n}')).toBe(4)
     expect(detectIndent('{\n\t"a": 1\n}')).toBe('\t')
     expect(detectIndent('{"a":1}')).toBe(0)
+  })
+})
+
+describe('applyBlockedByLiveAmplifier', () => {
+  it('blocks on any amplifier process and passes otherwise', () => {
+    expect(applyBlockedByLiveAmplifier('python3 /home/u/.local/bin/amplifier\n')).toBe(true)
+    expect(applyBlockedByLiveAmplifier('bash\nnvim notes.md\n')).toBe(false)
   })
 })
 
@@ -1406,6 +1531,31 @@ describe('backfillSession', () => {
     ).toBe('would-update')
     expect(await fs.readFile(metaPath, 'utf8')).toBe(raw) // untouched
   })
+
+  it('skips files whose bytes cannot be reproduced faithfully', async () => {
+    // ledger A16: JSON.stringify re-emits 5.0 as 5 — never touch such files.
+    const { globalDir, workDir } = dirs()
+    await write(path.join(globalDir, 'settings.yaml'), 'bundle:\n  active: foundation\n')
+    const { metaPath } = sessionFixture({
+      session_id: 'x',
+      working_dir: workDir,
+      freshell_terminal_id: 'term-x',
+    })
+    const raw =
+      '{\n  "session_id": "x",\n  "working_dir": ' +
+      JSON.stringify(workDir) +
+      ',\n  "freshell_terminal_id": "term-x",\n  "default_launch_wait": 5.0\n}\n'
+    await write(metaPath, raw)
+    expect(
+      await backfillSession(metaPath, {
+        globalDir,
+        apply: true,
+        psOutput: '',
+        nowMs: Date.now() + 11 * 60_000,
+      }),
+    ).toBe('skipped-unfaithful')
+    expect(await fs.readFile(metaPath, 'utf8')).toBe(raw) // untouched
+  })
 })
 ```
 
@@ -1426,8 +1576,10 @@ Create `scripts/amplifier-backfill-bundle.ts`:
  *
  * Why: freshell pre-writes session stubs without a bundle key and launches
  * panes via `amplifier resume <uuid>`; the CLI's resume path never consults
- * settings.yaml `bundle.active`, so those sessions silently run the wrong
- * bundle forever. New stubs are stamped at creation
+ * settings.yaml `bundle.active`, so those sessions silently run the CLI's
+ * hardcoded default bundle (`anchors`) forever. Healing stamps the user's
+ * configured bundle — resumed healed sessions intentionally switch from
+ * that default to the configured bundle. New stubs are stamped at creation
  * (crates/freshell-sessions/src/bundle_config.rs — keep semantics + test
  * matrices mirrored with this file's resolveActiveBundle); this script
  * heals the existing corpus once.
@@ -1435,16 +1587,29 @@ Create `scripts/amplifier-backfill-bundle.ts`:
  * Run with: npx tsx scripts/amplifier-backfill-bundle.ts            # dry run (default)
  *           npx tsx scripts/amplifier-backfill-bundle.ts --apply    # write changes
  *
- * Safety:
+ * Safety (layered — the spec's original two guards were empirically shown
+ * to miss live sessions: interactive CLI processes carry no session id in
+ * argv, and live sessions go events-silent for 24-70+ minutes; ledger A15):
+ *  - --apply REFUSES to run while ANY amplifier process is visible in ps,
+ *    or when ps itself fails (deliberately over-broad: a false positive
+ *    only delays the heal; dry-run is unaffected);
  *  - only sessions with "freshell_terminal_id" (freshell-created) AND
  *    bundle missing-or-"unknown" are touched;
  *  - SKIPS possibly-live sessions: a running `amplifier ... <session_id>`
- *    process, or events.jsonl modified within the last 10 minutes;
+ *    process, or events.jsonl modified within the last 10 minutes
+ *    (defense in depth);
+ *  - re-reads the file immediately before writing and skips if its bytes
+ *    changed since the eligibility read;
+ *  - fidelity verify (ledger A16): if re-serializing the ORIGINAL parse
+ *    does not reproduce the original bytes, skip as skipped-unfaithful
+ *    (JSON.stringify re-emits 5.0 as 5 and \uXXXX escapes literally);
  *  - resolution mirrors Amplifier's merged-settings precedence (later
  *    wins): ~/.amplifier/settings.yaml, <working_dir>/.amplifier/
  *    settings.yaml, <working_dir>/.amplifier/settings.local.yaml — a
  *    session is stamped ONLY with a plain non-empty string; ANY surprise
- *    (garbage YAML in an existing file, non-string, empty) skips it;
+ *    (garbage YAML in an existing file, multi-document file, non-string,
+ *    empty) skips it; duplicate keys resolve last-wins ({uniqueKeys:
+ *    false}) to match the Rust twin and the CLI's own parser;
  *  - atomic write (temp file + rename), preserving key order + indentation.
  */
 
@@ -1461,6 +1626,7 @@ export type SessionOutcome =
   | 'ineligible'
   | 'skipped-live'
   | 'skipped-unresolved'
+  | 'skipped-unfaithful'
   | 'updated'
   | 'would-update'
 
@@ -1485,7 +1651,10 @@ export async function resolveActiveBundle(
     }
     let doc: unknown
     try {
-      doc = YAML.parse(raw)
+      // uniqueKeys:false — duplicate keys resolve last-wins, matching both
+      // the Rust twin (saphyr) and the CLI's own parser (ledger A10).
+      // Multi-document files still throw here — Surprise in both twins.
+      doc = YAML.parse(raw, { uniqueKeys: false })
     } catch {
       return null // unparseable YAML — surprise, omit (poisons the whole resolution)
     }
@@ -1505,6 +1674,14 @@ export function detectIndent(raw: string): string | number {
   if (/\n\t"/.test(raw)) return '\t'
   const m = raw.match(/\n( +)"/)
   return m ? m[1].length : 0
+}
+
+/** --apply gate (ledger A15): ANY visible amplifier process blocks apply.
+ *  Interactive/pipeline-hosted CLI sessions carry no session id in argv, so
+ *  per-session matching cannot see them — refuse wholesale instead.
+ *  Over-broad by design: a false positive only postpones the heal. */
+export function applyBlockedByLiveAmplifier(psOutput: string): boolean {
+  return /amplifier/.test(psOutput)
 }
 
 /** A session is live if an amplifier process references its id, or its
@@ -1556,9 +1733,23 @@ export async function backfillSession(
   const bundle = await resolveActiveBundle(opts.globalDir, workingDir)
   if (bundle === null) return 'skipped-unresolved'
 
+  // Fidelity verify (ledger A16): only touch files whose exact bytes we can
+  // reproduce — re-serializing the ORIGINAL parse must equal the original
+  // raw (JSON.stringify re-emits 5.0 as 5 and \uXXXX escapes literally).
+  const indent = detectIndent(raw)
+  const trailer = raw.endsWith('\n') ? '\n' : ''
+  if (JSON.stringify(JSON.parse(raw), null, indent) + trailer !== raw) {
+    return 'skipped-unfaithful'
+  }
+
   meta.bundle = bundle // JS objects keep insertion order — an existing "unknown" keeps its slot
-  const out = JSON.stringify(meta, null, detectIndent(raw)) + (raw.endsWith('\n') ? '\n' : '')
+  const out = JSON.stringify(meta, null, indent) + trailer
   if (!opts.apply) return 'would-update'
+  // Last-moment race check (ledger A15): re-read and compare — if the CLI
+  // (or anything else) wrote the file since our eligibility read, treat it
+  // as live and leave it alone.
+  const recheck = await fs.readFile(metaPath, 'utf8').catch(() => null)
+  if (recheck !== raw) return 'skipped-live'
   const tmp = path.join(sessionDir, `.metadata.json.backfill-${process.pid}.tmp`)
   await fs.writeFile(tmp, out)
   await fs.rename(tmp, metaPath) // atomic on the same filesystem
@@ -1579,14 +1770,33 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const projectsDir = path.join(globalDir, 'projects')
 
   let psOutput = ''
+  let psFailed = false
   try {
     psOutput = (await execFileP('ps', ['-eo', 'args='])).stdout
   } catch {
+    psFailed = true
     console.error('WARNING: ps failed; process-based live detection disabled for this run.')
+  }
+  // ledger A15: per-session process matching cannot see interactive CLI
+  // sessions (no session id in argv) — refuse to APPLY while any amplifier
+  // process exists (or when we cannot even check). Dry-run proceeds.
+  if (apply && (psFailed || applyBlockedByLiveAmplifier(psOutput))) {
+    console.error(
+      'REFUSING --apply: amplifier process(es) visible in ps (or ps failed).' +
+        ' Close all amplifier sessions, then re-run. Dry-run works anytime.',
+    )
+    process.exit(2)
   }
   const nowMs = Date.now()
 
-  const counts = { scanned: 0, eligible: 0, skippedLive: 0, skippedUnresolved: 0, updated: 0 }
+  const counts = {
+    scanned: 0,
+    eligible: 0,
+    skippedLive: 0,
+    skippedUnresolved: 0,
+    skippedUnfaithful: 0,
+    updated: 0,
+  }
   let projects: string[] = []
   try {
     projects = await fs.readdir(projectsDir)
@@ -1614,6 +1824,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       counts.eligible += 1
       if (outcome === 'skipped-live') counts.skippedLive += 1
       else if (outcome === 'skipped-unresolved') counts.skippedUnresolved += 1
+      else if (outcome === 'skipped-unfaithful') counts.skippedUnfaithful += 1
       else {
         counts.updated += 1
         console.log(`${apply ? 'updated' : 'would update'}: ${metaPath}`)
@@ -1624,7 +1835,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(
     `${apply ? 'APPLY' : 'DRY RUN'} summary: scanned=${counts.scanned}` +
       ` eligible=${counts.eligible} skipped-live=${counts.skippedLive}` +
-      ` skipped-unresolved=${counts.skippedUnresolved} updated=${counts.updated}`,
+      ` skipped-unresolved=${counts.skippedUnresolved}` +
+      ` skipped-unfaithful=${counts.skippedUnfaithful} updated=${counts.updated}`,
   )
 }
 
@@ -1639,7 +1851,7 @@ if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '
 - [ ] **Step 5: Run the unit tests to verify green**
 
 Run: `npm run test:vitest -- run test/unit/scripts/amplifier-backfill-bundle.test.ts --config config/vitest/vitest.config.ts`
-Expected: **all pass** (7 resolve tests, 1 indent, 2 liveness, 5 backfill).
+Expected: **all pass** (9 resolve tests, 1 indent, 1 apply-gate, 2 liveness, 6 backfill).
 
 - [ ] **Step 6: Commit**
 
@@ -1662,8 +1874,8 @@ git commit -m "feat(scripts): one-time amplifier bundle backfill (dry-run defaul
 
 Run: `npx tsx scripts/amplifier-backfill-bundle.ts | tee /tmp/amplifier-backfill-dry-run.txt`
 Expected: a list of `would update: ...` lines (possibly empty) followed by exactly one summary line of the form:
-`DRY RUN summary: scanned=N eligible=N skipped-live=N skipped-unresolved=N updated=N`
-(`updated` counts would-updates in dry-run mode). **NEVER pass `--apply`** — the user runs apply themselves.
+`DRY RUN summary: scanned=N eligible=N skipped-live=N skipped-unresolved=N skipped-unfaithful=N updated=N`
+(`updated` counts would-updates in dry-run mode). Magnitude check against the 2026-08-03 corpus census (ledger A4/A7/A16): scanned ≈ 12,500, eligible ≈ 39 (37 `"unknown"` + 2 missing-key stubs), skipped-unfaithful expected 0 among eligible files — a wildly different eligible count means the predicate regressed; stop and investigate. The dry run works fine while amplifier sessions are live (the refuse-gate applies to `--apply` only). **NEVER pass `--apply`** — the user runs apply themselves.
 
 - [ ] **Step 2: Confirm read-only behavior and record the output**
 
@@ -1692,7 +1904,7 @@ Expected: all pass. If any reconcile-section test fails because it relied on idl
 
 ```bash
 git add crates/freshell-terminal/src/registry.rs
-git commit -m "test(terminal): align reconcile-section fixtures with agent idle-reap exemption"
+git commit -m "test(terminal): align reconcile-section fixtures with agent idle-reap hard cap"
 ```
 
 ---
@@ -1751,14 +1963,14 @@ git add -A && git commit -m "chore: verification sweep fix-ups" # only if Steps 
 ## Self-Review (performed while writing this plan)
 
 **1. Spec coverage.**
-- ITEM 1: resolver (Task 1), stamping + doc comment + unit contract flip (Task 2), ws integration flip (Task 3), TS contract mirror (Task 4), resolution unit tests global/project/local/missing/garbage/non-string (Task 1 Step 2), YAML crate selection with maintenance rationale (Task 1 Step 1), GC/adoption verified untouched (Task 2 Step 6). Covered.
-- ITEM 2: investigation findings inlined (launch path = `scripts/launch-rust.sh:160`; nohup defeated by the server's SIGHUP handler); setsid first-class (Task 5); optional systemd user unit with WSL2 requirement documented, not the only path (Task 6); lifecycle documented where the repo documents it (AGENTS.md + script header). Covered.
-- ITEM 3: investigation settled (bug confirmed with file:line evidence — reproduced in Task 7's context block, so the spec's "document instead of change" branch does not apply); minimal mode-exemption consistent with existing design precedents (`mode != "shell"` gate at registry.rs:1299, `mode == "amplifier"` case at registry.rs:933); unit + integration tests in both directions (Tasks 7, 8, 11). Covered.
-- ITEM 4: script matches every spec clause — scan path, eligibility (freshell_terminal_id + bundle missing/unknown), per-session working_dir resolution with global fallback, skip-if-unresolved, ps + 10-minute-mtime live guards, atomic write preserving keys/formatting, --dry-run default/--apply, summary counts; dry-run executed and captured (Task 10); --apply never run. Covered.
+- ITEM 1: resolver (Task 1), stamping + doc comment + unit contract flip (Task 2), ws integration flip (Task 3), TS contract mirror (Task 4), resolution unit tests global/project/local/missing/garbage/non-string/multi-doc/dup-keys (Task 1 Step 2), YAML crate selection with maintenance rationale and both parsers' edge behavior empirically verified against the pinned versions (Task 1 Step 1, ledger A9/A10), GC/adoption verified untouched (Task 2 Step 6). Covered.
+- ITEM 2: investigation findings inlined (launch path = `scripts/launch-rust.sh:160`; nohup defeated by the server's SIGHUP handler); setsid first-class and experiment-verified against the shell-death cascades (Task 5, ledger A11/A13); the WSL2 VM-teardown limit documented and the systemd user unit promoted to recommended-for-unattended while remaining optional, never the only path (Task 6, ledger A13); lifecycle documented where the repo documents it (AGENTS.md + script header). Covered.
+- ITEM 3: investigation settled (bug confirmed with file:line evidence — reproduced in Task 7's context block, so the spec's "document instead of change" branch does not apply); the remedy is a 24 h agent hard cap rather than an unconditional exemption because load-bearing validation (ledger A14) proved `Running` is not a loss-proof live-child signal and this sweep is the only cleanup for wedged rows; consistent with existing design precedents (`mode != "shell"` gate at registry.rs:1299, `mode == "amplifier"` case at registry.rs:933); unit + integration tests in both directions, including the past-cap backstop pin (Tasks 7, 8, 11). Covered.
+- ITEM 4: script matches every spec clause, with the live-session safety model REDESIGNED per ledger A15 (live validation proved the spec's two guards miss real live sessions): apply-gate on any visible amplifier process, per-session ps+mtime guards retained as defense in depth, pre-rename re-read-compare, and the ledger-A16 fidelity verify (`skipped-unfaithful`). Scan path, eligibility (freshell_terminal_id + bundle missing/unknown), per-session working_dir resolution with global fallback, skip-if-unresolved, atomic write preserving keys/formatting, --dry-run default/--apply, summary counts (now incl. skipped-unfaithful); dry-run executed and captured with corpus-census magnitude checks (Task 10); --apply never run. Covered.
 - Deliverables: all on branch `fix/amplifier-integration-fixes`, tests per repo conventions (cargo scoped + vitest scoped via the coordinator passthrough), dry-run output captured. No UNRESOLVED COVERAGE GAPS.
 
 **1b. No silent deferrals.** The only test doubles are: headless terminals (the registry's designed test seam — the production reap policy itself is what's exercised), and the skip-gated real-CLI contract (the stamping outcome observable in production is proven for real on this branch by Task 3's real-server WS test writing a real stub to disk; the real-CLI adoption run additionally exists for the user's opt-in environment). Task 5's detachment is proven against the real binary on a real port (sid/tty evidence), not simulated. No stub stands in for required behavior without a real-outcome test on this branch.
 
 **2. Placeholder scan.** No TBDs/TODOs. Two bounded contingencies remain deliberately: the saphyr accessor-name check (Task 1 Step 4 — names the exact doc source and the panic trap to avoid) and dist/client-missing at launch verification (Task 5 Step 4 — two exact recovery commands). Task 11 is explicitly conditional with an exact trigger. These are instructions, not deferrals.
 
-**3. Type consistency.** `resolve_active_bundle(&Path, &Path) -> Option<String>` is defined in Task 1 and consumed with the same signature in Task 2. TS exports in Task 9's script match the Task 9 test imports one-to-one (`resolveActiveBundle`, `detectIndent`, `sessionLooksLive`, `backfillSession`, `SessionOutcome`, `main`). `is_agent_mode` is defined and called as `Self::is_agent_mode` within the same impl. The ws `headless(&Server, id, Option<&str>, mode, created_at)` signature matches the verified file-local helper at `pane_reconcile.rs:272-283`. Fixture calls (`insert_headless`, `backdate_last_activity`, `register_headless(HeadlessTerminal{..})`, `TerminalRegistry::new()`, `set_auto_kill_idle_minutes`, `inventory()`) match the verified existing test code verbatim.
+**3. Type consistency.** `resolve_active_bundle(&Path, &Path) -> Option<String>` is defined in Task 1 and consumed with the same signature in Task 2. TS exports in Task 9's script match the Task 9 test imports one-to-one (`resolveActiveBundle`, `detectIndent`, `applyBlockedByLiveAmplifier`, `sessionLooksLive`, `backfillSession`, `SessionOutcome`, `main`). `is_agent_mode` is defined and called as `Self::is_agent_mode` within the same impl. The ws `headless(&Server, id, Option<&str>, mode, created_at)` signature matches the verified file-local helper at `pane_reconcile.rs:272-283`. Fixture calls (`insert_headless`, `backdate_last_activity`, `register_headless(HeadlessTerminal{..})`, `TerminalRegistry::new()`, `set_auto_kill_idle_minutes`, `inventory()`) match the verified existing test code verbatim.
