@@ -52,10 +52,17 @@ api() { # api METHOD PATH [BODY] [--noauth]  -> echoes "HTTP_CODE\n BODY"
     "${auth[@]}" -H 'content-type: application/json' \
     ${body:+--data "$body"} "http://127.0.0.1:$PORT$path"
 }
-tier_b() { # returns "200" (reachable => 0.0.0.0-bound) or "REFUSED"
-  powershell.exe -NoProfile -Command \
-    "try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 6 http://$WSL_IP:$PORT/api/health).StatusCode } catch { 'REFUSED' }" \
-    2>/dev/null | tr -d '\r'
+tier_b() { # "200" (reachable => 0.0.0.0-bound) | "REFUSED" (actively refused)
+  # | "TIMEOUT" | "ERROR". Refined per Task 5.2 review: the old blanket
+  # catch => 'REFUSED' conflated timeout/DNS/any exception with
+  # connection-refused. Callers pass ONLY on the exact expected value, so
+  # TIMEOUT/ERROR fail closed instead of masquerading as a verified
+  # retraction. Refused is detected by walking the exception chain for a
+  # SocketException with SocketErrorCode ConnectionRefused
+  # (locale-independent), with a message match as fallback.
+  local ps
+  ps="try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 6 http://$WSL_IP:$PORT/api/health).StatusCode } catch { \$e = \$_.Exception; \$refused = \$false; \$msgs = ''; while (\$e) { \$msgs += ' ' + \$e.Message; if (\$e -is [System.Net.Sockets.SocketException] -and \$e.SocketErrorCode -eq 'ConnectionRefused') { \$refused = \$true }; \$e = \$e.InnerException }; if (\$refused -or \$msgs -match 'actively refused|connection refused') { 'REFUSED' } elseif (\$msgs -match 'timed out|timeout') { 'TIMEOUT' } else { 'ERROR' } }"
+  powershell.exe -NoProfile -Command "$ps" 2>/dev/null | tr -d '\r'
 }
 tier_c_probe() { # LAN vantage via lanIps[0]; meaningful only at :3001 (the portproxy chain is 3001-scoped)
   powershell.exe -NoProfile -Command \
@@ -94,12 +101,19 @@ phase0_preflight() {
   "settings": { "network": { "host": "127.0.0.1", "configured": true } },
   "sessionOverrides": { "SENTINEL_SESSION": { "keep": "me" } },
   "terminalOverrides": { "SENTINEL_TERM": { "keep": "me" } },
-  "serverSecrets": { "SENTINEL_SECRET": "do-not-touch" },
+  "serverSecrets": { "SENTINEL_SECRET": "do-not-touch",
+                     "codexDisplayIdSecret": "constant-sentinel-secret-value" },
   "completedMigrations": ["m-001"],
   "recentDirectories": ["/tmp/a"],
   "projectColors": { "/tmp/a": "#123456" },
   "someUnknownFutureKey": { "arbitrary": [1, 2, 3] } }
 JSON
+  # codexDisplayIdSecret is seeded so serverSecrets survives byte-for-byte:
+  # boot MINTS one when absent (upstream parity, config-store.ts:443-452;
+  # settings_store.rs:1295-1311 reuses a seeded value verbatim). Without the
+  # seed, Phase 5's NET-09 diff flags a boot-time write that is NOT a network
+  # mutation. Same approach as the in-crate NET-09 test
+  # (net09_config_preservation.rs:80). Caught live by this harness (RED run).
   # configured:true is deliberate: without it a WSL boot defaults to 0.0.0.0
   # (VALIDATED, ledger A-04/A-05). Boot must honor the persisted loopback intent
   # (Tasks 0.3 + 2.2b). NEVER set FRESHELL_BIND_HOST anywhere in this harness -
@@ -250,15 +264,80 @@ phase4_retract() {
   echo "phase4 retract: tier_a=$tier_a tier_b=$tb listeners=$nlisten bound=$bound"
 }
 
+# Phase 5 - RESTART / NET-09 byte-preservation: ownership-verified SIGTERM of
+# the owned server, then a per-key sha256 diff of config.json (NET-09: after
+# the Phase 3/4 mutations, settings.network reflects the chosen state and
+# EVERY other top-level key is byte-identical to the Phase-0 original), then
+# a restart on the same isolated HOME with the SAME env as Phase 1 - in
+# particular FRESHELL_DISABLE_WSL_PORT_FORWARD=1 and still no
+# FRESHELL_BIND_HOST (a bare restart silently changes lanes - reports/V5.md).
+# Post-restart, status must show the persisted state (host=="127.0.0.1") and
+# tier (b) must be REFUSED. Live proof of Tasks 0.3 + 2.2b (ledger A-04).
+phase5_restart() {
+  local k now orig net09 code tb tier_a cmdline cwd pid3001 i
+  # -- ownership verification BEFORE any signal (never blind, never :3001) --
+  pid3001="$(ss -ltnp "( sport = :3001 )" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+  if [ -n "$pid3001" ] && [ "$SERVER_PID" = "$pid3001" ]; then
+    fail_required "phase5: SERVER_PID=$SERVER_PID holds :3001 - refusing to signal"; return 0
+  fi
+  cmdline="$(tr '\0' ' ' < "/proc/$SERVER_PID/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    "$REPO_ROOT/target/release/freshell-server"*) : ;;
+    *) fail_required "phase5: /proc/$SERVER_PID/cmdline ('$cmdline') is not our spawned binary - refusing to signal"; return 0 ;;
+  esac
+  cwd="$(readlink "/proc/$SERVER_PID/cwd" 2>/dev/null || true)"
+  if [ "$cwd" != "$PWD" ]; then
+    fail_required "phase5: /proc/$SERVER_PID/cwd ('$cwd') != harness cwd ('$PWD') - refusing to signal"; return 0
+  fi
+  # -- SIGTERM + bounded wait (10s); NEVER escalates to SIGKILL --
+  kill -TERM "$SERVER_PID" 2>/dev/null || { fail_required "phase5: SIGTERM failed (pid $SERVER_PID already gone?)"; return 0; }
+  for i in $(seq 1 50); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    fail_required "phase5: server $SERVER_PID still alive 10s after SIGTERM (not escalating to SIGKILL)"; return 0
+  fi
+  wait "$SERVER_PID" 2>/dev/null || true  # reap our own child
+  if ss -ltn "( sport = :$PORT )" | grep -q ":$PORT "; then
+    fail_required "phase5: :$PORT still has a listener after server exit"
+  else PASS=$((PASS+1)); log "PASS: phase5: :$PORT released after SIGTERM"; fi
+  # -- NET-09 diff: settings.network reflects the chosen (retracted) state --
+  check "phase5: persisted settings.network == {host:127.0.0.1, configured:true}" \
+    jq -e '.settings.network.host=="127.0.0.1" and .settings.network.configured==true' \
+    "$HOME_DIR/.freshell/config.json"
+  # -- NET-09 diff: every other top-level key byte-identical (sha vs Phase 0) --
+  net09=intact
+  for k in sessionOverrides terminalOverrides serverSecrets completedMigrations recentDirectories projectColors someUnknownFutureKey; do
+    now="$(jq -c ".$k" "$HOME_DIR/.freshell/config.json" | sha256sum | cut -d' ' -f1)"
+    eval "orig=\$SHA_$k"
+    [ "$now" = "$orig" ] || { fail_required "top-level key $k changed across mutation"; net09=VIOLATED; }
+  done
+  # -- restart on the same isolated HOME with the SAME env as Phase 1, by
+  # calling phase1_boot itself (env identical by construction:
+  # FRESHELL_DISABLE_WSL_PORT_FORWARD=1, no FRESHELL_BIND_HOST). It also
+  # re-runs the health wait + loopback-bind assertion: a restart that came up
+  # on 0.0.0.0 dies there with FATAL (that would falsify Tasks 0.3/2.2b). --
+  phase1_boot
+  code="$(api GET /api/network/status)" || code=ERR
+  check "phase5: post-restart status -> 200" [ "$code" = "200" ]
+  check "phase5: post-restart host==127.0.0.1 && configured==true (persisted state honored)" \
+    jq -e '.host=="127.0.0.1" and .configured==true' "$REPORT_DIR/resp.json"
+  tier_a="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/health" || true)"
+  check "phase5: post-restart tier (a) loopback -> 200" [ "$tier_a" = "200" ]
+  tb="$(tier_b)"
+  if [ "$tb" != "REFUSED" ]; then sleep 2; tb="$(tier_b)"; fi
+  check "phase5: post-restart tier (b) connection REFUSED [REQUIRED]" [ "$tb" = "REFUSED" ]
+  echo "phase5 restart: sigterm=ok net09=$net09 new_pid=$SERVER_PID tier_a=$tier_a tier_b=$tb"
+}
+
 main() {
   phase0_preflight
   phase1_boot
   phase2_endpoint_surface
   phase3_expose
   phase4_retract
-  # Phases 5-7 appended in Tasks 5.3-5.5
+  phase5_restart
+  # Phases 6-7 appended in Tasks 5.4-5.5
   if [ "${#DEGRADATIONS[@]}" -gt 0 ]; then printf 'DEGRADED: %s\n' "${DEGRADATIONS[@]}"; fi
-  echo "phases 0-4: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL (port=$PORT wsl_ip=$WSL_IP)"
+  echo "phases 0-5: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL (port=$PORT wsl_ip=$WSL_IP)"
   [ "$REQUIRED_FAIL" = 0 ] || exit 1
 }
 main "$@"
