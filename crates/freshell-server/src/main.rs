@@ -905,6 +905,11 @@ async fn main() -> ExitCode {
     // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
     let rebind =
         crate::net_bind::RebindController::new(port, crate::net_bind::reuse_port_enabled());
+    let managed_ports_store = Arc::new(managed_ports::ManagedPortsStore::windows(
+        home.clone(),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        port,
+    ));
     let network_state = network::NetworkState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -922,12 +927,14 @@ async fn main() -> ExitCode {
         gate: Arc::new(tokio::sync::Mutex::new(
             freshell_platform::elevated::ConfirmationGate::new(),
         )),
-        managed_ports: Arc::new(managed_ports::ManagedPortsStore::windows(
-            home.clone(),
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            port,
-        )),
+        managed_ports: Arc::clone(&managed_ports_store),
         elevated_dispatch: Arc::new(network::LiveElevatedDispatch),
+        // Task 3.5: the live post-`Started` verification seam (the TS
+        // `verifySuccess` spawn-callback step) — READ-ONLY recomputes.
+        elevation_verifier: Arc::new(network::LiveElevationVerifier {
+            port,
+            managed_ports: managed_ports_store,
+        }),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list

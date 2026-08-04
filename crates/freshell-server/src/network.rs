@@ -206,6 +206,11 @@ pub struct NetworkState {
     /// every elevated mutation leaves the server. Production wires
     /// [`LiveElevatedDispatch`]; router tests inject `FakeElevatedDispatch`.
     pub elevated_dispatch: std::sync::Arc<dyn ElevatedDispatch>,
+    /// The Send + Sync post-`Started` verification seam (Task 3.5) — the TS
+    /// spawn-callback `verifySuccess` step (`network-router.ts:184-198`,
+    /// `:380-410`). Production wires [`LiveElevationVerifier`]; router tests
+    /// inject `FakeElevationVerifier` (defaults to `Verified`).
+    pub elevation_verifier: std::sync::Arc<dyn ElevationVerifier>,
 }
 
 impl NetworkState {
@@ -810,6 +815,172 @@ impl ElevatedDispatch for LiveElevatedDispatch {
     }
 }
 
+/// The verifier's classification of a post-`Started` recompute — the port of
+/// the TS `verifySuccess` callbacks (`network-router.ts:380-410`). In the
+/// reference the recompute either throws the lane's
+/// `"<lane> verification failed"` error (the plan is still `ready`), throws
+/// the recompute's own error (`plan.status === 'error'`), or returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationOutcome {
+    /// The recomputed lane plan found no remaining work — success confirmed.
+    Verified,
+    /// The recomputed plan is still `Ready`: the elevated script did not do
+    /// its job (`network-router.ts:388-390,401-403,407-409`).
+    StillReady,
+    /// The recompute itself failed (`throw new Error(plan.message)`,
+    /// `network-router.ts:385-387,398-400`).
+    Error(String),
+}
+
+/// The Send + Sync post-`Started` verification seam — the port of the TS
+/// spawn-callback `verifySuccess` step (`network-router.ts:184-198`).
+///
+/// Exists for the same reason as [`ElevatedDispatch`]: the live recompute
+/// runs `StdCommandRunner` subprocesses directly and is not injectable from
+/// router tests, and axum state must be `Send + Sync + 'static`. Blocking;
+/// handlers call it inside `tokio::task::spawn_blocking` (clone the `Arc`
+/// in). Only the lanes that carry a `verifySuccess` in the reference consult
+/// it — wsl2-repair, wsl2-disable, windows-disable; windows-repair has none
+/// (`network-router.ts:719-727`) and never reaches this seam.
+pub trait ElevationVerifier: Send + Sync {
+    /// Re-run the lane's verifier plan and classify what it found.
+    fn verify(&self, action: ConfirmationAction) -> VerificationOutcome;
+}
+
+/// Production verifier: recomputes the lane's plan through the same live
+/// READ-ONLY helpers the TS verifiers use (`verifyWslRepairSuccess`,
+/// `verifyWslDisableSuccess`, `verifyWindowsDisableSuccess`,
+/// `network-router.ts:380-410`). Reads only; never mutates.
+pub struct LiveElevationVerifier {
+    /// `getRemoteAccessPorts() = [port]` (no devMode in this port).
+    pub port: u16,
+    /// The same instance-scoped store [`NetworkState`] carries.
+    pub managed_ports: std::sync::Arc<crate::managed_ports::ManagedPortsStore>,
+}
+
+impl ElevationVerifier for LiveElevationVerifier {
+    fn verify(&self, action: ConfirmationAction) -> VerificationOutcome {
+        let required = vec![self.port];
+        match action {
+            // No `verifySuccess` in the reference for windows-repair
+            // (`network-router.ts:719-727`); unreachable through the router,
+            // which skips the verify step for this lane entirely.
+            ConfirmationAction::WindowsRepair => VerificationOutcome::Verified,
+            // `verifyWslRepairSuccess` (`network-router.ts:380-391`): the
+            // same recompute as [`compute_wsl_plan_live`], classified.
+            ConfirmationAction::Wsl2Repair => {
+                if !is_wsl2_proc_live() || is_wsl_port_forwarding_disabled_by_env(&RealEnv) {
+                    return VerificationOutcome::Verified; // NotWsl2/Disabled: no throw
+                }
+                let runner = StdCommandRunner::default();
+                let Some(wsl_ip) = get_wsl_ip(&runner) else {
+                    return VerificationOutcome::Error(
+                        "Failed to detect WSL2 IP address".to_string(),
+                    );
+                };
+                let (Some(rules), Some(firewall_ports)) = (
+                    get_existing_port_proxy_rules(&runner),
+                    get_existing_firewall_ports(&runner),
+                ) else {
+                    return VerificationOutcome::Error(
+                        "Failed to query existing Windows remote access rules".to_string(),
+                    );
+                };
+                match build_wsl_port_forwarding_plan(
+                    &required,
+                    &required,
+                    wsl_ip,
+                    &rules,
+                    &firewall_ports,
+                    &self.managed_ports.read_wsl(),
+                ) {
+                    WslPortForwardingPlan::Error(message) => VerificationOutcome::Error(message),
+                    WslPortForwardingPlan::Ready { .. } => VerificationOutcome::StillReady,
+                    _ => VerificationOutcome::Verified,
+                }
+            }
+            // `verifyWslDisableSuccess` (`network-router.ts:393-404`): the
+            // same recompute as [`compute_wsl_teardown_plan_live`].
+            ConfirmationAction::Wsl2Disable => {
+                if !is_wsl2_proc_live() || is_wsl_port_forwarding_disabled_by_env(&RealEnv) {
+                    return VerificationOutcome::Verified;
+                }
+                let runner = StdCommandRunner::default();
+                let (Some(rules), Some(firewall_ports)) = (
+                    get_existing_port_proxy_rules(&runner),
+                    get_existing_firewall_ports(&runner),
+                ) else {
+                    return VerificationOutcome::Error(
+                        "Failed to query existing Windows remote access rules".to_string(),
+                    );
+                };
+                match build_wsl_port_forwarding_teardown_plan(
+                    &required,
+                    &required,
+                    &rules,
+                    &firewall_ports,
+                    &self.managed_ports.read_wsl(),
+                ) {
+                    WslPortForwardingTeardownPlan::Error(message) => {
+                        VerificationOutcome::Error(message)
+                    }
+                    WslPortForwardingTeardownPlan::Ready { .. } => VerificationOutcome::StillReady,
+                    _ => VerificationOutcome::Verified,
+                }
+            }
+            // `verifyWindowsDisableSuccess` (`network-router.ts:406-410`):
+            // any managed Windows rule still standing fails verification.
+            ConfirmationAction::WindowsDisable => {
+                let mut known = required;
+                known.extend(self.managed_ports.read_windows());
+                let runner = StdCommandRunner::default();
+                if get_existing_managed_windows_firewall_ports(&runner, &known).is_empty() {
+                    VerificationOutcome::Verified
+                } else {
+                    VerificationOutcome::StillReady
+                }
+            }
+        }
+    }
+}
+
+/// The injected router-test verifier: records calls, then returns the
+/// programmed outcome (defaults to `Verified` so every pre-existing
+/// happy-path test keeps its shipped behavior).
+#[cfg(test)]
+pub struct FakeElevationVerifier {
+    outcome: std::sync::Mutex<VerificationOutcome>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FakeElevationVerifier {
+    #[allow(clippy::new_without_default)] // test-only helper; Default adds nothing
+    pub fn new() -> Self {
+        Self {
+            outcome: std::sync::Mutex::new(VerificationOutcome::Verified),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Program the outcome every subsequent verify classifies as.
+    pub fn program(&self, outcome: VerificationOutcome) {
+        *self.outcome.lock().unwrap() = outcome;
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl ElevationVerifier for FakeElevationVerifier {
+    fn verify(&self, _action: ConfirmationAction) -> VerificationOutcome {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcome.lock().unwrap().clone()
+    }
+}
+
 /// The injected router-test dispatch: records argv, optionally holds (keeps
 /// the gate observably in-flight for Task 3.5's parallel-409 test), then
 /// returns the programmed outcome. All interior state is Mutex-guarded — the
@@ -1169,6 +1340,38 @@ async fn dispatch_elevated(
         .unwrap_or(ElevationOutcome::PartialFailure)
 }
 
+/// Run the lane's `verifySuccess` port on the blocking pool after a
+/// `Started` dispatch (the TS spawn-callback verify step,
+/// `network-router.ts:184-198`). `Ok(())` = verified; `Err(downgraded)` =
+/// the recompute still found work (`VerificationFailed`) or itself failed
+/// (`PartialFailure`). windows-repair carries no `verifySuccess` in the
+/// reference (`network-router.ts:719-727`) and short-circuits to verified
+/// without consulting the seam.
+async fn verify_elevated(
+    state: &NetworkState,
+    action: ConfirmationAction,
+) -> Result<(), ElevationOutcome> {
+    if action == ConfirmationAction::WindowsRepair {
+        return Ok(());
+    }
+    let verifier = Arc::clone(&state.elevation_verifier);
+    let outcome = tokio::task::spawn_blocking(move || verifier.verify(action))
+        .await
+        .unwrap_or_else(|_| VerificationOutcome::Error("verification task failed".to_string()));
+    match outcome {
+        VerificationOutcome::Verified => Ok(()),
+        VerificationOutcome::StillReady => Err(ElevationOutcome::VerificationFailed),
+        VerificationOutcome::Error(message) => {
+            tracing::error!(
+                error = %message,
+                action = action.as_str(),
+                "elevation verification recompute failed"
+            );
+            Err(ElevationOutcome::PartialFailure)
+        }
+    }
+}
+
 /// The repair lanes' failed-to-start 500 messages (`network-router.ts:743-752`).
 fn repair_failed_to_start(action: ConfirmationAction) -> &'static str {
     match action {
@@ -1408,6 +1611,26 @@ async fn configure_firewall_confirmed_locked(
             .into_response();
     }
 
+    // Port of the spawn-callback verify step (`network-router.ts:184-198`):
+    // in the reference the 200 `{method,status:"started"}` has ALREADY been
+    // sent when `verifySuccess` runs, so its result gates ONLY the success
+    // persistence (`onSuccess`) — never the wire response. A downgrade
+    // (VerificationFailed / PartialFailure) skips the persist, releases the
+    // lock, and still answers started (NET-07).
+    if let Err(downgraded) = verify_elevated(state, action).await {
+        tracing::error!(
+            outcome = ?downgraded,
+            action = action.as_str(),
+            "elevated firewall configuration failed verification"
+        );
+        state.gate.lock().await.release_repair_lock();
+        return (
+            axum::http::StatusCode::OK,
+            Json(json!({ "method": action.response_method(), "status": "started" })),
+        )
+            .into_response();
+    }
+
     // Started: persist the lane's managed ports under the mutation lock
     // (A-08); a persist failure is logged, not fatal (the TS onSuccess catch,
     // `network-router.ts:134-139`).
@@ -1488,6 +1711,24 @@ async fn disable_confirmed_locked(state: &NetworkState, token: Option<&str>) -> 
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": disable_failed_to_start(action) })),
+        )
+            .into_response();
+    }
+
+    // The spawn-callback verify step (`network-router.ts:184-198`): a
+    // downgrade skips the applied disabled state (`onSuccess`), releases the
+    // lock, and still answers the started body the reference had already
+    // sent by verify time (NET-07).
+    if let Err(downgraded) = verify_elevated(state, action).await {
+        tracing::error!(
+            outcome = ?downgraded,
+            action = action.as_str(),
+            "elevated remote access teardown failed verification"
+        );
+        state.gate.lock().await.release_repair_lock();
+        return (
+            axum::http::StatusCode::OK,
+            Json(json!({ "method": action.response_method(), "status": "started" })),
         )
             .into_response();
     }
@@ -2005,7 +2246,11 @@ mod tests {
     /// FIRST (without it the ladder yields `method:"none"`, never a
     /// confirmable `windows-repair`). The managed-ports store is file-backed
     /// on a throwaway home; the `FakeElevatedDispatch` defaults to `Started`.
-    fn confirmable_test_state() -> (NetworkState, Arc<FakeElevatedDispatch>) {
+    fn confirmable_test_state() -> (
+        NetworkState,
+        Arc<FakeElevatedDispatch>,
+        Arc<FakeElevationVerifier>,
+    ) {
         let home = test_home_dir();
         // Persist the settings BEFORE the store loads (sync seeding: the
         // helper is a plain fn, so it cannot await `settings.patch`).
@@ -2015,6 +2260,7 @@ mod tests {
         )
         .unwrap();
         let fake = Arc::new(FakeElevatedDispatch::new());
+        let verifier = Arc::new(FakeElevationVerifier::new());
         let state = NetworkState {
             auth_token: Arc::new("tok".to_string()),
             settings: crate::settings_store::SettingsStore::load(
@@ -2038,6 +2284,7 @@ mod tests {
                 51234,
             )),
             elevated_dispatch: Arc::clone(&fake) as Arc<dyn ElevatedDispatch>,
+            elevation_verifier: Arc::clone(&verifier) as Arc<dyn ElevationVerifier>,
         };
         // Seed the Windows-active facts synchronously (uncontended try_write).
         *state.facts.inner.try_write().unwrap() = Some(LiveNetworkFacts {
@@ -2048,15 +2295,25 @@ mod tests {
             lan_ips: vec!["192.168.1.50".to_string()],
             hostname: "test-host".to_string(),
         });
-        (state, fake)
+        (state, fake, verifier)
     }
 
     /// Windows-active facts + closed port => `resolve_repair_action` yields a
-    /// confirmable `windows-repair`. (The brief's prose sketches a tuple
-    /// return, but its mandated tests bind the state directly — the verbatim
-    /// tests win; the fake handle is available via `confirmable_test_state`.)
-    fn test_state_firewall_confirmable() -> NetworkState {
-        confirmable_test_state().0
+    /// confirmable `windows-repair`. Returns the state + the dispatch fake
+    /// (the shape Task 3.5's mandated tests destructure).
+    fn test_state_firewall_confirmable() -> (NetworkState, Arc<FakeElevatedDispatch>) {
+        let (state, fake, _verifier) = confirmable_test_state();
+        (state, fake)
+    }
+
+    /// Same, plus the injected verifier handle (Task 3.5's lane-scope pin:
+    /// windows-repair must never consult the verifier).
+    fn test_state_firewall_confirmable_with_verifier() -> (
+        NetworkState,
+        Arc<FakeElevatedDispatch>,
+        Arc<FakeElevationVerifier>,
+    ) {
+        confirmable_test_state()
     }
 
     /// Same seeding (the closed firewall port keeps `windows-repair`
@@ -2064,9 +2321,21 @@ mod tests {
     /// resolvable on this state), plus ONE persisted managed Windows port so
     /// the disable ladder yields a confirmable `windows-disable`.
     fn test_state_disable_confirmable() -> (NetworkState, Arc<FakeElevatedDispatch>) {
-        let (state, fake) = confirmable_test_state();
-        state.managed_ports.persist_windows(&[state.port]).unwrap();
+        let (state, fake, _verifier) = test_state_disable_confirmable_with_verifier();
         (state, fake)
+    }
+
+    /// Same seeding as [`test_state_disable_confirmable`], plus the injected
+    /// verifier handle (Task 3.5's downgrade tests — windows-disable is the
+    /// one verifier-carrying lane reachable from router tests).
+    fn test_state_disable_confirmable_with_verifier() -> (
+        NetworkState,
+        Arc<FakeElevatedDispatch>,
+        Arc<FakeElevationVerifier>,
+    ) {
+        let (state, fake, verifier) = confirmable_test_state();
+        state.managed_ports.persist_windows(&[state.port]).unwrap();
+        (state, fake, verifier)
     }
 
     fn test_state(bind_host: &str, probe_result: Option<bool>) -> NetworkState {
@@ -2091,6 +2360,7 @@ mod tests {
                 51234,
             )),
             elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
+            elevation_verifier: Arc::new(FakeElevationVerifier::new()),
         }
     }
 
@@ -2124,6 +2394,7 @@ mod tests {
                 51234,
             )),
             elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
+            elevation_verifier: Arc::new(FakeElevationVerifier::new()),
         };
         (state, counter)
     }
@@ -2182,6 +2453,7 @@ mod tests {
                 probed_port,
             )),
             elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
+            elevation_verifier: Arc::new(FakeElevationVerifier::new()),
         }
     }
 
@@ -2717,7 +2989,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::util::ServiceExt;
-        let state = test_state_firewall_confirmable(); // seeds windows-active facts + closed port => confirmable
+        let (state, _fake) = test_state_firewall_confirmable(); // seeds windows-active facts + closed port => confirmable
         let resp = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -2741,7 +3013,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::util::ServiceExt;
-        let state = test_state_firewall_confirmable();
+        let (state, _fake) = test_state_firewall_confirmable();
         {
             state.gate.lock().await.try_acquire_repair_lock();
         } // simulate in-flight
@@ -2768,7 +3040,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::util::ServiceExt;
-        let state = test_state_firewall_confirmable();
+        let (state, _fake) = test_state_firewall_confirmable();
         // no token => 401
         let r = router(state.clone())
             .oneshot(
@@ -2930,6 +3202,494 @@ mod tests {
             "0.0.0.0",
             "settings untouched"
         );
+    }
+
+    // ---- Task 3.5 (NET-07): elevation outcome matrix — denial / timeout /
+    // ---- partial / verification-failure, entirely behind the fakes ---------
+
+    /// POST an (optionally confirmed) firewall-protocol request body.
+    async fn post_network(state: &NetworkState, uri: &str, body: String) -> Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Issue-phase POST: returns the freshly issued confirmation token.
+    async fn issue_token(state: &NetworkState, uri: &str) -> String {
+        let resp = post_network(state, uri, "{}".to_string()).await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        body["confirmationToken"].as_str().unwrap().to_string()
+    }
+
+    fn confirm_body(token: &str) -> String {
+        format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#)
+    }
+
+    /// `GET /api/network/status` as JSON.
+    async fn get_status_json(state: &NetworkState) -> Value {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        body_json(
+            router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/network/status")
+                        .header("x-auth-token", "tok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Pins all four failed-to-start 500 bodies TS-verbatim
+    /// (`network-router.ts:598-604,743-752`). The WSL lanes are unreachable
+    /// from router tests on this host (facts pin `platform = Windows`), so
+    /// the two WSL strings are pinned here at the unit level.
+    #[test]
+    fn failed_to_start_bodies_are_ts_verbatim() {
+        assert_eq!(
+            repair_failed_to_start(ConfirmationAction::Wsl2Repair),
+            "WSL2 port forwarding failed to start"
+        );
+        assert_eq!(
+            repair_failed_to_start(ConfirmationAction::WindowsRepair),
+            "Windows firewall configuration failed to start"
+        );
+        assert_eq!(
+            disable_failed_to_start(ConfirmationAction::Wsl2Disable),
+            "WSL2 remote access teardown failed to start"
+        );
+        assert_eq!(
+            disable_failed_to_start(ConfirmationAction::WindowsDisable),
+            "Windows remote access teardown failed to start"
+        );
+    }
+
+    /// NET-07 (a)-(d) for a Denied classification on the windows-repair
+    /// lane. Attempt-2 ruling 1: the confirmed POST answers the shipped,
+    /// TS-verbatim 500 `{"error":"Windows firewall configuration failed to
+    /// start"}` (`network-router.ts:743-752`) — not the brief's sketched 200.
+    #[tokio::test]
+    async fn elevation_denial_releases_lock_and_persists_no_success() {
+        let (state, fake) = test_state_firewall_confirmable();
+        fake.program(ElevationOutcome::Denied);
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 500);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body,
+            json!({ "error": "Windows firewall configuration failed to start" })
+        );
+        assert_ne!(
+            body["status"], "started",
+            "a denial must not report success"
+        );
+        assert_eq!(fake.call_count(), 1);
+        // (a) lock released, (b) configuring == false, (c) no success persisted.
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+        assert_eq!(
+            get_status_json(&state).await["firewall"]["configuring"],
+            false
+        );
+        assert!(
+            state.managed_ports.read_windows().is_empty(),
+            "a denial must not persist managed ports"
+        );
+        let s = state.settings.get().await;
+        assert_eq!(
+            serde_json::to_value(&s.network).unwrap()["host"],
+            "0.0.0.0",
+            "settings untouched"
+        );
+        // (d) a later run with a good fake succeeds end-to-end.
+        fake.program(ElevationOutcome::Started);
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["status"], "started");
+        assert_eq!(
+            fake.call_count(),
+            2,
+            "the denied run must not poison later runs"
+        );
+        assert_eq!(state.managed_ports.read_windows(), vec![state.port]);
+    }
+
+    /// NET-07 (a)-(d) for a TimedOut classification. DEVIATION (recorded in
+    /// the task report): the reference produces timeouts asynchronously in
+    /// the spawn callback, after its 200 was sent — unreachable in this sync
+    /// port — so the variant's handler behavior is pinned by programming the
+    /// dispatch seam directly (attempt-2 ruling 2, fallback clause).
+    #[tokio::test]
+    async fn elevation_timeout_releases_lock_and_persists_no_success() {
+        let (state, fake) = test_state_firewall_confirmable();
+        fake.program(ElevationOutcome::TimedOut);
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 500);
+        assert_eq!(
+            body_json(resp).await,
+            json!({ "error": "Windows firewall configuration failed to start" })
+        );
+        assert_eq!(fake.call_count(), 1);
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+        assert_eq!(
+            get_status_json(&state).await["firewall"]["configuring"],
+            false
+        );
+        assert!(state.managed_ports.read_windows().is_empty());
+        // (d) a later run with a good fake succeeds end-to-end.
+        fake.program(ElevationOutcome::Started);
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["status"], "started");
+        assert_eq!(fake.call_count(), 2);
+    }
+
+    /// NET-07 (a)-(d) for a Denied classification on the windows-disable
+    /// lane — pins the disable lane's TS-verbatim 500 body
+    /// (`network-router.ts:598-604`) and that NOTHING of the disabled state
+    /// is applied.
+    #[tokio::test]
+    async fn disable_denial_releases_lock_and_leaves_state_enabled() {
+        let (state, fake) = test_state_disable_confirmable();
+        fake.program(ElevationOutcome::Denied);
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 500);
+        assert_eq!(
+            body_json(resp).await,
+            json!({ "error": "Windows remote access teardown failed to start" })
+        );
+        assert_eq!(fake.call_count(), 1);
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+        assert_eq!(
+            get_status_json(&state).await["firewall"]["configuring"],
+            false
+        );
+        // No success persisted: settings/bind untouched, managed ports intact.
+        let s = state.settings.get().await;
+        assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "0.0.0.0");
+        assert_eq!(state.bind.get().await, "0.0.0.0");
+        assert_eq!(state.managed_ports.read_windows(), vec![state.port]);
+        // (d) a later good run applies the disabled state end-to-end.
+        fake.program(ElevationOutcome::Started);
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["status"], "started");
+        assert_eq!(fake.call_count(), 2);
+        assert_eq!(state.bind.get().await, "127.0.0.1");
+        assert!(state.managed_ports.read_windows().is_empty());
+    }
+
+    /// NET-07 (a)-(d) for the VerificationFailed downgrade: dispatch
+    /// classifies Started, but the re-run verifier plan still finds work
+    /// (`verifyWindowsDisableSuccess`, `network-router.ts:406-410`). TS
+    /// timing: `verifySuccess` runs in the spawn callback AFTER the 200
+    /// `{method,status:"started"}` was sent (`network-router.ts:184-198`),
+    /// so the downgrade gates ONLY the success persistence — the wire
+    /// response stays `started`.
+    #[tokio::test]
+    async fn verification_failure_skips_persistence_releases_lock_and_answers_started() {
+        let (state, fake, verifier) = test_state_disable_confirmable_with_verifier();
+        verifier.program(VerificationOutcome::StillReady);
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "windows-elevated");
+        assert_eq!(body["status"], "started");
+        assert_eq!(fake.call_count(), 1);
+        assert_eq!(
+            verifier.call_count(),
+            1,
+            "the windows-disable lane must consult its verifier"
+        );
+        // (a) lock released, (b) configuring false, (c) NO success persisted:
+        // the disabled state must NOT be applied on a failed verification.
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+        assert_eq!(
+            get_status_json(&state).await["firewall"]["configuring"],
+            false
+        );
+        let s = state.settings.get().await;
+        assert_eq!(
+            serde_json::to_value(&s.network).unwrap()["host"],
+            "0.0.0.0",
+            "settings untouched"
+        );
+        assert_eq!(state.bind.get().await, "0.0.0.0", "listener untouched");
+        assert_eq!(
+            state.managed_ports.read_windows(),
+            vec![state.port],
+            "managed ports NOT cleared"
+        );
+        // (d) a later verified run applies the disabled state end-to-end.
+        verifier.program(VerificationOutcome::Verified);
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["status"], "started");
+        assert_eq!(fake.call_count(), 2);
+        assert_eq!(state.bind.get().await, "127.0.0.1");
+        assert!(state.managed_ports.read_windows().is_empty());
+    }
+
+    /// NET-07 (a)-(d) for the PartialFailure downgrade: the verifier's
+    /// recompute itself errors (`plan.status === 'error'` ⇒ `throw new
+    /// Error(plan.message)`, `network-router.ts:385-387,398-400`). DEVIATION
+    /// (recorded in the task report): TS produces this flavor only on the
+    /// WSL lanes, unreachable from router tests (facts pin Windows); the
+    /// seam realizes the same downgrade machinery on the windows-disable
+    /// lane.
+    #[tokio::test]
+    async fn partial_failure_skips_persistence_releases_lock_and_answers_started() {
+        let (state, fake, verifier) = test_state_disable_confirmable_with_verifier();
+        verifier.program(VerificationOutcome::Error(
+            "Failed to query existing Windows remote access rules".to_string(),
+        ));
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["status"], "started");
+        assert_eq!(fake.call_count(), 1);
+        assert_eq!(verifier.call_count(), 1);
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+        assert_eq!(
+            get_status_json(&state).await["firewall"]["configuring"],
+            false
+        );
+        let s = state.settings.get().await;
+        assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "0.0.0.0");
+        assert_eq!(state.bind.get().await, "0.0.0.0");
+        assert_eq!(state.managed_ports.read_windows(), vec![state.port]);
+        // (d) a later verified run applies the disabled state end-to-end.
+        verifier.program(VerificationOutcome::Verified);
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(fake.call_count(), 2);
+        assert_eq!(state.bind.get().await, "127.0.0.1");
+        assert!(state.managed_ports.read_windows().is_empty());
+    }
+
+    /// Lane-scope pin: windows-repair carries NO `verifySuccess` in the
+    /// reference (`network-router.ts:719-727`) — even a verifier programmed
+    /// to fail is never consulted, and the Started persist proceeds.
+    #[tokio::test]
+    async fn windows_repair_lane_has_no_verifier() {
+        let (state, fake, verifier) = test_state_firewall_confirmable_with_verifier();
+        verifier.program(VerificationOutcome::StillReady);
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "windows-elevated");
+        assert_eq!(body["status"], "started");
+        assert_eq!(fake.call_count(), 1);
+        assert_eq!(
+            verifier.call_count(),
+            0,
+            "windows-repair must not consult the verifier"
+        );
+        assert_eq!(
+            state.managed_ports.read_windows(),
+            vec![state.port],
+            "the Started persist proceeds"
+        );
+        assert!(!state.gate.lock().await.is_repair_in_flight());
+    }
+
+    #[tokio::test]
+    async fn no_real_os_mutation_command_reaches_a_runner() {
+        // Mutation argv is observable ONLY at the injected FakeElevatedDispatch
+        // seam; combined with on_non_windows_the_live_runner_is_unsupported_and_never_spawns
+        // (Task 3.1) this proves zero real OS mutation on this host.
+        let (state, fake) = test_state_disable_confirmable();
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/disable-remote-access",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let recorded = fake.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one elevated dispatch, at the fake seam"
+        );
+        let joined = recorded[0].join(" ");
+        assert!(
+            joined.contains("portproxy") || joined.contains("advfirewall"),
+            "the elevated mutation plan must be visible at the seam: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_token_is_single_use() {
+        let (state, fake) = test_state_firewall_confirmable(); // fake programmed Started
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(fake.call_count(), 1);
+        // REPLAY the consumed token: the gate no longer holds it, so this must
+        // RE-ISSUE (fresh token, facts still resolve windows-repair) and NEVER
+        // dispatch a second time.
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        assert_ne!(body["confirmationToken"].as_str().unwrap(), token);
+        assert_eq!(fake.call_count(), 1, "a replayed token must not dispatch");
+    }
+
+    #[tokio::test]
+    async fn wrong_action_token_reissues_and_never_executes() {
+        // A token issued for windows-disable, presented (confirmed) to
+        // configure-firewall — which freshly resolves windows-repair — is
+        // bound to the WRONG action: re-issue bound to the new action, zero
+        // dispatches.
+        let (state, fake) = test_state_disable_confirmable(); // both lanes resolvable
+        let token = issue_token(&state, "/api/network/disable-remote-access").await;
+        let resp = post_network(
+            &state,
+            "/api/network/configure-firewall",
+            confirm_body(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        assert_ne!(body["confirmationToken"].as_str().unwrap(), token);
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "a wrong-action token must never execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_confirmed_posts_one_wins_one_409() {
+        // Live-unreachable on this host (ledger A-06), so this Rust test is
+        // the ONLY 409-lock race proof - do not delete it.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let (state, fake) = test_state_firewall_confirmable();
+        fake.hold_before_return(std::time::Duration::from_millis(200)); // keeps the gate in-flight while the loser lands
+        let token = issue_token(&state, "/api/network/configure-firewall").await;
+        let confirm = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/network/configure-firewall")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(confirm_body(&token)))
+                .unwrap()
+        };
+        let (a, b) = tokio::join!(
+            router(state.clone()).oneshot(confirm()),
+            router(state.clone()).oneshot(confirm())
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let codes = [a.status().as_u16(), b.status().as_u16()];
+        assert!(
+            codes.contains(&200) && codes.contains(&409),
+            "exactly one wins: {codes:?}"
+        );
+        let loser = if a.status() == 409 { a } else { b };
+        let body = body_json(loser).await;
+        assert_eq!(body["error"], "Firewall configuration already in progress");
+        assert_eq!(body["method"], "in-progress");
+        assert_eq!(fake.call_count(), 1, "exactly one dispatch");
     }
 
     /// Slice 2 (Task 2.2): `broadcast_settings_updated` emits the exact frame
