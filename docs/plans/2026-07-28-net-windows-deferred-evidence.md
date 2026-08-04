@@ -52,3 +52,47 @@ _File: `crates/freshell-server/src/network.rs`_
 - **Sandbox prevents live mutation**: The fake elevation runner and test harness ensure no real OS mutation occurs.
 - **Parity checklist remains honest**: These features cannot be exercised end-to-end on this host; they remain deferred but marked HOST-BLOCKED with full evidence.
 - **Future execution path clear**: When deployed to Windows (or with elevated test VM), all tested code paths execute without modification.
+
+---
+
+## 2026-08-04 addendum: live native-Windows validation session (DANDESKTOP)
+
+A supervised live session upgraded the evidence for the deferred items. The Windows
+binary was cross-compiled from this branch (commit 9257c3b) via the worktree-local
+`x86_64-pc-windows-gnu` target and run natively on the Windows host.
+
+### Newly live-proven (was fake-tested only)
+
+- Native Windows boot: `freshell-server.exe` serves on Windows (PS-launched, port 3003).
+- `POST /api/network/configure {host: 0.0.0.0}` -> true LAN reachability from a
+  separate physical machine (shapiroserver2 -> 192.168.3.50:3003 = HTTP 200).
+- `POST /api/network/disable-remote-access` -> LAN refused (000), loopback survives,
+  host=127.0.0.1. Full expose/retract cycle on native Windows.
+- The no-op decision lane: with the firewall port already open, `configure-firewall`
+  correctly returns `{"method":"none","message":"No configuration changes required"}`
+  and never requests elevation.
+
+### NET-04/07 live-fire remains deferred — with a now-documented environmental reason
+
+Three successive attempts to reach `remoteAccessNeedsRepair=true` (the only state that
+fires the elevated netsh + UAC path) were defeated by the host's firewall posture:
+
+1. Pre-existing program-scoped allow rules for the exe -> port open -> no repair needed.
+2. All freshell rules removed (elevated cleanup, verified) -> on next server launch the
+   allow rule was silently re-created on bind -> port open again.
+3. Fresh never-seen exe name (`freshell-uac.exe`), zero pre-existing rules -> LAN
+   reachable immediately after bind; two program-scoped allow rules appeared with no
+   user prompt.
+
+Effective policy at time of test: `netsh advfirewall show privateprofile` ->
+`State ON, Firewall Policy BlockInbound,AllowOutbound` — yet binds silently mint
+program allow rules. On such a host the firewall never leaves a freshell port closed,
+so the repair path is structurally unreachable without contrived state (an explicit
+block rule, which would convert the repair into a VerificationFailed outcome rather
+than a clean create).
+
+**Conclusion:** live-fire validation of NET-04 (elevated rule creation) and NET-07
+(real UAC approve/deny) requires a host whose firewall does NOT auto-allow the binary —
+i.e. the disposable Windows VM / CI runner already tracked as HARNESS-09. The fake-based
+test matrix plus the above live evidence remains the honest ceiling on this developer
+machine.
