@@ -81,6 +81,16 @@ sha2 = "0.10"
 # time-based), which is simpler than fighting either for this shape.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# NET-02 transactional rebind (`net_bind.rs`): socket2 builds the
+# SO_REUSEADDR+SO_REUSEPORT listener (`set_reuse_port` is gated behind the
+# `all` feature -- socket2 ships no default features, and a dependency's
+# dev-dependencies do NOT unify features into this crate's build);
+# hyper/hyper-util/tower drive the controller-owned accept loop
+# (`serve_connection_with_upgrades` keeps WebSockets working across rebinds).
+socket2 = { version = "0.6", features = ["all"] }
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
+tower = { version = "0.5", features = ["util"] }
 # The from-the-first-byte redaction scrub (DIAG-03): matches `"...token...":"…"`
 # and `"cookie":"…"` JSON fields (and a raw `Cookie:`/`Set-Cookie:` header
 # fragment, belt-and-braces) regardless of which call site produced them.

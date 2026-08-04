@@ -26,6 +26,7 @@ mod files;
 mod identity_sink;
 mod instance_id;
 mod logging;
+mod net_bind;
 mod network;
 mod proxy;
 mod rate_limit;
