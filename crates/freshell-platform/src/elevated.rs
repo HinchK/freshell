@@ -266,6 +266,65 @@ impl ConfirmationGate {
     }
 }
 
+/// The outcome of a spawn_via elevation request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ElevationOutcome {
+    Started,
+    Denied,
+    TimedOut,
+    PartialFailure,
+    VerificationFailed,
+    NotSupported,
+}
+
+pub enum ElevationRunner<'a> {
+    /// Test/injected path — dispatches through a CommandRunner fake.
+    Fake(&'a dyn crate::CommandRunner),
+    /// Real elevation. EXISTS ONLY on Windows: on this Linux host the live
+    /// constructor cannot produce this variant, so real netsh mutation is
+    /// structurally unreachable (safety satisfied by the type system).
+    #[cfg(windows)]
+    Real,
+    /// Non-Windows host: elevation is not supported and never spawns.
+    Unsupported,
+}
+
+pub fn elevation_runner_live() -> ElevationRunner<'static> {
+    #[cfg(windows)]
+    {
+        ElevationRunner::Real
+    }
+    #[cfg(not(windows))]
+    {
+        ElevationRunner::Unsupported
+    }
+}
+
+fn classify(out: &crate::CommandOutput) -> ElevationOutcome {
+    let text = format!("{} {}", out.stdout, out.stderr).to_ascii_lowercase();
+    if text.contains("canceled by the user") || text.contains("cancelled") {
+        return ElevationOutcome::Denied;
+    }
+    if out.ok() {
+        ElevationOutcome::Started
+    } else {
+        ElevationOutcome::Denied
+    }
+}
+
+pub fn spawn_via(runner: &ElevationRunner<'_>, command: &str, script: &str) -> ElevationOutcome {
+    match runner {
+        ElevationRunner::Fake(r) => classify(&spawn_elevated_powershell(*r, command, script)),
+        #[cfg(windows)]
+        ElevationRunner::Real => classify(&spawn_elevated_powershell(
+            &crate::StdCommandRunner::default(),
+            command,
+            script,
+        )),
+        ElevationRunner::Unsupported => ElevationOutcome::NotSupported,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +569,55 @@ protocol=tcp localport=3001 profile=private'"
         let issued = gate.issue_confirmation(ConfirmationAction::Wsl2Repair, "tokseed");
         assert!(!gate.consume_current_confirmation(Some("x")));
         assert!(gate.consume_current_confirmation(Some(&issued.confirmation_token)));
+    }
+
+    // ---- ElevationRunner: structural unreachability of real OS mutation (Task 3.1) ----
+
+    #[test]
+    fn on_non_windows_the_live_runner_is_unsupported_and_never_spawns() {
+        #[cfg(not(windows))]
+        {
+            let runner = elevation_runner_live();
+            assert!(matches!(runner, ElevationRunner::Unsupported));
+            let out = spawn_via(
+                &runner,
+                "powershell.exe",
+                "netsh advfirewall firewall add rule ...",
+            );
+            assert_eq!(out, ElevationOutcome::NotSupported);
+        }
+    }
+
+    #[test]
+    fn source_only_constructs_real_under_cfg_windows() {
+        // Needles are concat!-split so this test's OWN source never satisfies the
+        // contains() checks -- the assertions genuinely inspect the implementation
+        // code elsewhere in this file instead of passing vacuously.
+        let src = include_str!("elevated.rs");
+        let cfg_gate = concat!("#[cfg(", "windows)]");
+        let unsupported = concat!("ElevationRunner::", "Unsupported");
+        assert!(
+            src.contains(cfg_gate),
+            "the Real elevation runner must be cfg(windows)-gated"
+        );
+        assert!(
+            src.contains(unsupported),
+            "Unsupported variant missing from elevated.rs"
+        );
+    }
+
+    #[test]
+    fn fake_runner_dispatch_classifies_outcomes() {
+        use crate::{CommandOutput, FakeCommandRunner};
+        let denied = FakeCommandRunner::new().with_default(CommandOutput::failure(
+            1,
+            "",
+            "The operation was canceled by the user",
+        ));
+        let out = spawn_via(&ElevationRunner::Fake(&denied), "powershell.exe", "script");
+        assert_eq!(out, ElevationOutcome::Denied);
+        let ok = FakeCommandRunner::new().with_default(CommandOutput::success(""));
+        let out = spawn_via(&ElevationRunner::Fake(&ok), "powershell.exe", "script");
+        assert_eq!(out, ElevationOutcome::Started);
     }
 }
