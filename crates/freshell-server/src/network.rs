@@ -287,6 +287,10 @@ pub fn router(state: NetworkState) -> Router {
         .route("/api/network/status", get(network_status))
         .route("/api/lan-info", get(lan_info))
         .route("/api/network/configure", post(configure))
+        .route(
+            "/api/network/disable-remote-access",
+            post(disable_remote_access),
+        )
         .with_state(state)
 }
 
@@ -461,6 +465,189 @@ async fn configure(
     response
 }
 
+/// The `POST /api/network/disable-remote-access` (and, in Slice 3, the
+/// `configure-firewall` confirmed-dispatch) request body: STRICT (unknown keys
+/// rejected, matching the zod `.strict()` schema, `network-router.ts`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ConfirmFirewallRequest {
+    pub confirm_elevation: Option<bool>,
+    pub confirmation_token: Option<String>,
+}
+
+impl ConfirmFirewallRequest {
+    // `Err` IS the ready-to-send 400 (the zod-shaped `invalid_request` body);
+    // boxing a cold validation-failure response buys nothing at this rate.
+    #[allow(clippy::result_large_err)]
+    fn validate(&self) -> Result<(), Response> {
+        if matches!(self.confirm_elevation, Some(false)) {
+            return Err(invalid_request(json!([{
+                "code": "invalid_literal", "path": ["confirmElevation"], "message": "Expected true"
+            }])));
+        }
+        if matches!(self.confirmation_token.as_deref(), Some("")) {
+            return Err(invalid_request(json!([{
+                "code": "too_small", "path": ["confirmationToken"],
+                "message": "String must contain at least 1 character(s)"
+            }])));
+        }
+        Ok(())
+    }
+}
+
+/// The two `method:"none"` outcome messages of `disable-remote-access` — the
+/// control signal the frozen client switches on (`network-router.ts:40-48`),
+/// modeled as an enum discriminant so the EXACT constants live in one place.
+enum DisableNone {
+    NotEnabled,
+    Disabled,
+}
+
+impl DisableNone {
+    fn message(&self) -> &'static str {
+        match self {
+            DisableNone::NotEnabled => "Remote access is not enabled",
+            DisableNone::Disabled => "Remote access disabled",
+        }
+    }
+}
+
+/// The `remoteAccessRequested` derivation shared by [`build_network_status`]
+/// (the Slice-1 status read) and [`disable_remote_access`] (Task 2.4): ONE
+/// `is_remote_access_enabled` call site with identical inputs
+/// (settings-declared intent + live effective host + firewall platform), so
+/// the status read and the disable decision can never diverge.
+fn compute_remote_access_requested(
+    configured: bool,
+    network_host: &str,
+    effective_host: &str,
+    platform: FirewallPlatform,
+) -> bool {
+    let network = NetworkIntent {
+        configured,
+        host: network_host.to_string(),
+    };
+    is_remote_access_enabled(Some(&network), effective_host, platform)
+}
+
+/// `POST /api/network/disable-remote-access` (`network-router.ts:448-615` and
+/// `applyRemoteAccessDisabledState` `:119-132`) — the Linux-live retract
+/// (NET-06): rebind to loopback, persist `{host:"127.0.0.1",configured:true}`,
+/// then broadcast. The success response is emitted AFTER `serve_on`'s drain
+/// barrier (verified teardown). Windows/WSL2-needing-elevation lanes return a
+/// TEMPORARY placeholder confirmation body WITHOUT elevating (replaced
+/// wholesale by Task 3.3's gate-issued protocol).
+async fn disable_remote_access(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let raw = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let req: ConfirmFirewallRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return invalid_request(json!([{
+                "code": "unrecognized_keys", "path": [], "message": e.to_string()
+            }]));
+        }
+    };
+    if let Err(resp) = req.validate() {
+        return resp;
+    }
+
+    // (Slice 3 inserts the 409 in-flight lock pre-check here.)
+
+    // A-08: serialize all network mutations — held through persist + bind.set.
+    let _mutation_guard = state.net_mutation.lock().await;
+
+    let facts = state.facts.get_or_refresh().await;
+    let platform = facts.firewall.platform;
+    let settings = state.settings.get().await;
+    // `requested` uses the exact is_remote_access_enabled inputs Slice 1 uses
+    // in build_status_value — shared via compute_remote_access_requested.
+    let requested = compute_remote_access_requested(
+        settings.network.configured,
+        network_host_str(&settings.network.host),
+        &state.bind.get().await,
+        platform,
+    );
+
+    let wsl_forwarding_disabled = is_wsl_port_forwarding_disabled_by_env(&RealEnv);
+    let is_live_linux_lane = platform != FirewallPlatform::Windows
+        && (platform != FirewallPlatform::Wsl2 || wsl_forwarding_disabled);
+
+    if is_live_linux_lane {
+        if requested {
+            // VALIDATED (ledger A-09, reports/V1.md): a foreign non-reuseport
+            // squatter on the port makes this bind fail (EADDRINUSE) — never
+            // claim a retract that did not happen.
+            if state
+                .rebind
+                .serve_on(std::net::IpAddr::from([127, 0, 0, 1]))
+                .await
+                .is_err()
+            {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to disable remote access" })),
+                )
+                    .into_response();
+            }
+            let merged = match state
+                .settings
+                .patch(&json!({"network":{"host":"127.0.0.1","configured":true}}))
+                .await
+            {
+                Ok(m) => m,
+                Err((s, b)) => {
+                    // Persist failed AFTER the loopback swap. FAIL-SAFE: never
+                    // roll back toward exposure on an error path — keep the
+                    // loopback listener, make status truthful, surface the
+                    // error (deviation from the TS revert-persist; Task 6.1 #9).
+                    state.bind.set("127.0.0.1").await;
+                    state.facts.invalidate().await;
+                    return (s, Json(b)).into_response();
+                }
+            };
+            state.facts.invalidate().await;
+            state.bind.set("127.0.0.1").await;
+            let resp = (
+                axum::http::StatusCode::OK,
+                Json(json!({"method":"none","message":DisableNone::Disabled.message()})),
+            )
+                .into_response();
+            state.broadcast_settings_updated(&merged);
+            return resp;
+        }
+        return (
+            axum::http::StatusCode::OK,
+            Json(json!({"method":"none","message":DisableNone::NotEnabled.message()})),
+        )
+            .into_response();
+    }
+
+    // Windows or WSL2-needing-elevation: TEMPORARY Slice-2 placeholder. The
+    // token below is throwaway (NOT stored in any gate) and MUST NOT survive
+    // Slice 3: Task 3.3 REPLACES this whole block with the gate-issued,
+    // action-bound confirmation + confirmed-dispatch flow (windows-disable /
+    // wsl2-disable lanes). Only the live elevated side effect stays
+    // HOST-BLOCKED (Task 3.6).
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "method":"confirmation-required",
+            "title":"Administrator approval required",
+            "body":"To complete this, you will need to accept the Windows administrator prompt on the next screen.",
+            "confirmLabel":"Continue",
+            "confirmationToken": uuid::Uuid::new_v4().to_string()
+        })),
+    )
+        .into_response()
+}
+
 /// The inputs to the pure [`build_network_status`] (everything the live edge
 /// resolves), so the derivation is deterministic + unit-testable.
 pub struct NetworkStatusInputs<'a> {
@@ -483,12 +670,8 @@ pub fn build_network_status(i: NetworkStatusInputs) -> Value {
     let platform = i.firewall.platform;
     let remote_access_ports: Vec<u16> = vec![i.port]; // getRemoteAccessPorts (no devMode)
 
-    let network = NetworkIntent {
-        configured: i.configured,
-        host: i.network_host.to_string(),
-    };
     let remote_access_requested =
-        is_remote_access_enabled(Some(&network), i.effective_host, platform);
+        compute_remote_access_requested(i.configured, i.network_host, i.effective_host, platform);
 
     // Windows managed-port staleness read is deferred (read-only, Windows-only) → false.
     let stale = false;
@@ -1293,6 +1476,181 @@ mod tests {
         }
         drop(squatter);
         Ok(())
+    }
+
+    // ---- Slice 2 (Task 2.4): POST /api/network/disable-remote-access -------
+
+    #[tokio::test]
+    async fn disable_from_exposed_linux_rebinds_to_loopback_and_persists() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("0.0.0.0", Some(true));
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        let _ = state
+            .settings
+            .patch(&serde_json::json!({"network":{"host":"0.0.0.0","configured":true}}))
+            .await
+            .unwrap();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "none");
+        assert_eq!(body["message"], "Remote access disabled");
+        let s = state.settings.get().await;
+        assert_eq!(
+            serde_json::to_value(&s.network).unwrap()["host"],
+            "127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_rejects_unknown_keys_strictly() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("127.0.0.1", None);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"unknownKey":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn disable_requires_auth() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("127.0.0.1", None);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn concurrent_configure_and_disable_serialize_to_a_consistent_end_state() {
+        // Falsifier for the A-08 mutation lock: without net_mutation held across
+        // bind.get() -> bind.set(), interleavings persist a host that contradicts
+        // the live bind (concrete counterexample schedules in reports/V5.md).
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("0.0.0.0", Some(true));
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        let cfg = router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/network/configure")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                .unwrap(),
+        );
+        let dis = router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/network/disable-remote-access")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        );
+        let (r1, r2) = tokio::join!(cfg, dis);
+        assert_eq!(r1.unwrap().status(), 200);
+        assert_eq!(r2.unwrap().status(), 200);
+        // Whichever order the lock imposed, persisted host must equal the live bind.
+        let persisted =
+            serde_json::to_value(&state.settings.get().await.network).unwrap()["host"].clone();
+        let live = state.bind.get().await;
+        assert_eq!(
+            persisted,
+            serde_json::json!(live),
+            "persisted host desynced from live bind (A-08)"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_keeps_loopback_and_reports_error_when_persist_fails() {
+        // FAIL-SAFE counterpart of Task 2.3's rollback test (Task 6.1 #9): when the
+        // persist fails AFTER the loopback swap, disable must NOT roll back toward
+        // exposure -- loopback listener kept, BindState truthful, error surfaced.
+        // Same read-only-.freshell persist-failure injection and test_state_with_home
+        // helper as Task 2.3.
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::os::unix::fs::PermissionsExt;
+        use tower::util::ServiceExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".freshell")).unwrap();
+        let state = test_state_with_home("0.0.0.0", Some(true), home.path());
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        let _ = state
+            .settings
+            .patch(&serde_json::json!({"network":{"host":"0.0.0.0","configured":true}}))
+            .await
+            .unwrap();
+        let mut perms = std::fs::metadata(home.path().join(".freshell"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(home.path().join(".freshell"), perms).unwrap();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Restore write perms up front so the tempdir cleans up on every path
+        // (same hygiene as Task 2.3's rollback_scenario_once).
+        let mut perms = std::fs::metadata(home.path().join(".freshell"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(home.path().join(".freshell"), perms).unwrap();
+        assert!(
+            resp.status().is_server_error(),
+            "persist failure must surface"
+        );
+        // Truthful + fail-safe: BindState reports the loopback reality; only the
+        // persisted file is stale (and the client got an error saying so).
+        assert_eq!(state.bind.get().await, "127.0.0.1");
+        // Release the real loopback listener this scenario's serve_on bound.
+        state.rebind.shutdown_all().await;
     }
 
     /// Slice 2 (Task 2.2): `broadcast_settings_updated` emits the exact frame
