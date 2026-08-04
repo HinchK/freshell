@@ -419,6 +419,99 @@ pub fn convert_windows_path_to_wsl_path(
     None
 }
 
+// ===========================================================================
+// §1.5 Windows display split/join — `path.win32.dirname/basename/join` as
+// used by the files endpoints (`files-router.ts:194-211`). The files REST
+// surface splits/joins the flavor-preserving DISPLAY path with win32
+// semantics while doing filesystem access on the converted native path.
+// ===========================================================================
+
+/// `path.win32.dirname` + `path.win32.basename` in one step, for the
+/// completion split (`files-router.ts:194-202`): resolve `input` to a
+/// normalized absolute Windows display path, then split it into
+/// `(parent display path, leaf)`.
+///
+/// Matches Node's win32 semantics for every shape `win32_resolve` produces,
+/// with one deliberate share-root deviation (below):
+/// - `C:\\Users\\dan`     -> (`C:\\Users`, `dan`)
+/// - `C:\\Us`            -> (`C:\\`, `Us`)   (parent keeps the root backslash)
+/// - `C:\\`              -> (`C:\\`, ``)     (drive root is its own parent)
+/// - `\\\\srv\\share\\dir`  -> (`\\\\srv\\share\\`, `dir`) (share root keeps `\\`)
+/// - `\\\\srv\\share`      -> (`\\\\srv\\share\\`, ``)
+///
+/// Deviation (oracle-verified, Node v22): for a share ROOT itself, Node's
+/// `win32.basename` returns the share name (`basename(\"\\\\srv\\share\\\") ==
+/// \"share\"`, `\"Ubuntu\"` for `\\\\wsl.localhost\\Ubuntu\\`) while `win32.dirname`
+/// is the root itself. We return an EMPTY leaf instead, so callers list
+/// rather than filter at a root. The corner is unreachable through the files
+/// endpoints (addressable share roots stat as directories and skip the
+/// split; unaddressable ones early-return first), so endpoint behavior is
+/// Node-identical either way.
+///
+/// Returns `None` when the input is not absolutely resolvable (drive-relative
+/// `C:foo`, rooted `\\foo`, plain relative) — the same deterministic-core
+/// boundary as [`win32_resolve`].
+pub fn split_windows_display_path(input: &str) -> Option<(String, String)> {
+    let normalized = win32_resolve(input)?;
+    let root_len = windows_display_root_len(&normalized)?;
+    if normalized.len() <= root_len {
+        return Some((normalized, String::new()));
+    }
+    let tail = &normalized[root_len..];
+    // `win32_resolve` output never has doubled separators, so `tail` never
+    // starts with `\\` and every found index splits parent/leaf cleanly.
+    Some(match tail.rfind('\\') {
+        Some(idx) => (
+            normalized[..root_len + idx].to_string(),
+            tail[idx + 1..].to_string(),
+        ),
+        None => (normalized[..root_len].to_string(), tail.to_string()),
+    })
+}
+
+/// `path.win32.join(parent, name)` for the one shape the files endpoints
+/// need (`files-router.ts:211`): append a single directory-entry name to an
+/// absolute Windows display path. Roots (`C:\\`, `\\\\srv\\share\\`) already end
+/// with the separator; deeper parents need one inserted. Never doubles a
+/// separator, never re-cases anything.
+///
+/// Oracle-verified equal to Node's `win32.join` for all well-behaved dirent
+/// names (dots, spaces, embedded `\\` mid-name). For pathological Linux names
+/// that BEGIN with `\\` or contain `\\.`/`\\..` segments, Node's join would
+/// collapse/normalize where this concatenates verbatim — such names are
+/// unrepresentable in a windows-flavor display path in BOTH servers, so the
+/// divergence is cosmetic (`read_dir` never yields `.`/`..`).
+pub fn join_windows_display_path(parent: &str, name: &str) -> String {
+    if parent.ends_with('\\') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}\\{name}")
+    }
+}
+
+/// Byte length of the device root of a `win32_resolve`-normalized path:
+/// `C:\…` -> 3; `\\server\share\…` -> the share root INCLUDING its trailing
+/// backslash. `None` for unrecognized shapes (defensive — `win32_resolve`
+/// output always matches one of the two).
+fn windows_display_root_len(normalized: &str) -> Option<usize> {
+    let b = normalized.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+        return Some(3);
+    }
+    if let Some(rest) = normalized.strip_prefix("\\\\") {
+        // `\\server\share\…`: skip the server component, then the share
+        // component, and include the backslash that closes the share root.
+        let server_end = rest.find('\\')?; // index within `rest`
+        let after_server = 2 + server_end + 1; // index just past `\\server\`
+        let root_end = match normalized[after_server..].find('\\') {
+            Some(i) => after_server + i + 1, // include the trailing `\`
+            None => normalized.len(),        // bare `\\server\share` (lenient)
+        };
+        return Some(root_end);
+    }
+    None
+}
+
 /// `^([a-zA-Z]):(?:\\(.*))?$` on a backslash-normalized path. `rest` is the
 /// group after the `\` (empty string for a bare root like `C:\`).
 fn match_drive_backslash(s: &str) -> Option<(char, Option<&str>)> {
