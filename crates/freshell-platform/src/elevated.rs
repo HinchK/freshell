@@ -12,6 +12,7 @@
 //! [`CommandRunner`], which in tests is always a [`crate::FakeCommandRunner`].
 //! **No elevated command is ever run against a live host.**
 
+use crate::network::timing_safe_compare;
 use crate::CommandRunner;
 
 /// `ELEVATED_POWERSHELL_TIMEOUT_MS` (`elevated-powershell.ts:3`).
@@ -167,7 +168,7 @@ impl ConfirmationGate {
     /// `matchesConfirmation` (`network-router.ts:230-235`).
     pub fn matches_confirmation(&self, token: Option<&str>, action: ConfirmationAction) -> bool {
         match (&self.current, token) {
-            (Some(c), Some(t)) => c.token == t && c.action == action,
+            (Some(c), Some(t)) => timing_safe_compare(&c.token, t) && c.action == action,
             _ => false,
         }
     }
@@ -191,7 +192,7 @@ impl ConfirmationGate {
     /// token matches the current confirmation (regardless of action).
     pub fn consume_current_confirmation(&mut self, token: Option<&str>) -> bool {
         match (&self.current, token) {
-            (Some(c), Some(t)) if c.token == t => {
+            (Some(c), Some(t)) if timing_safe_compare(&c.token, t) => {
                 self.current = None;
                 true
             }
@@ -468,5 +469,46 @@ protocol=tcp localport=3001 profile=private'"
         assert!(!gate.consume_current_confirmation(Some("nope")));
         assert!(gate.consume_current_confirmation(Some("T")));
         assert!(!gate.consume_current_confirmation(Some("T"))); // already cleared
+    }
+
+    #[test]
+    fn matches_confirmation_uses_constant_time_compare_not_equality() {
+        // Falsifier for NET-08-C: this test fails only if `==` is still used,
+        // because it asserts the source no longer contains the equality compare.
+        // Both needles are concat!-split so this test's OWN source never contains
+        // them intact -- otherwise the negative assert would fail forever and the
+        // positive assert would pass vacuously.
+        let src = include_str!("elevated.rs");
+        let banned = concat!("c.token ", "== t");
+        let required = concat!("timing_safe", "_compare");
+        assert!(
+            !src.contains(banned),
+            "raw == token compare still present; NET-08-C not applied"
+        );
+        assert!(
+            src.contains(required),
+            "constant-time compare not wired into the confirmation gate"
+        );
+    }
+
+    #[test]
+    fn matches_confirmation_rejects_equal_length_mismatched_token() {
+        let mut gate = ConfirmationGate::new();
+        let issued = gate.issue_confirmation(ConfirmationAction::WindowsRepair, "aaaaaaaa");
+        // Same length, different content -> must NOT match.
+        assert!(!gate.matches_confirmation(Some("bbbbbbbb"), ConfirmationAction::WindowsRepair));
+        // The genuinely-issued token still matches.
+        assert!(gate.matches_confirmation(
+            Some(&issued.confirmation_token),
+            ConfirmationAction::WindowsRepair
+        ));
+    }
+
+    #[test]
+    fn consume_current_confirmation_rejects_differing_length_token() {
+        let mut gate = ConfirmationGate::new();
+        let issued = gate.issue_confirmation(ConfirmationAction::Wsl2Repair, "tokseed");
+        assert!(!gate.consume_current_confirmation(Some("x")));
+        assert!(gate.consume_current_confirmation(Some(&issued.confirmation_token)));
     }
 }
