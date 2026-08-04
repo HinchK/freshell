@@ -20,10 +20,13 @@
 //! only `netsh … show` / `ufw status`; LAN detection runs only `ipconfig.exe` /
 //! a read-only PowerShell object query / `ip -o -4 addr show`; the port
 //! reachability probe ([`TcpPortProbe`]) is a plain `TcpStream::connect` (no
-//! bytes written, dropped immediately). The **mutating** network paths
-//! (`configure` / `configure-firewall` / `disable-remote-access`, i.e.
-//! `netsh add/delete` + elevated PowerShell) are NOT wired here — they remain
-//! golden-string builders in `freshell-platform`, never executed. The
+//! bytes written, dropped immediately). The **mutating** network paths are
+//! wired transactionally (`configure` / `disable-remote-access`, Slice 2) and
+//! behind the two-phase confirmation gate (`configure-firewall` + the
+//! confirmed disable lanes, Slice 3); every elevated mutation leaves through
+//! the [`ElevatedDispatch`] seam, whose live runner is `Unsupported` off
+//! Windows — on this host the elevated scripts stay golden strings, never
+//! executed (NET-10: the `terminal` command is data for the client). The
 //! firewall/LAN/hostname facts are computed lazily (on first request) and
 //! cached for the process life, mirroring the original's `getFirewallInfo` /
 //! `ensureLanIps` memoization (so boot stays fast and repeat reads are
@@ -53,10 +56,16 @@ use axum::{
     Json, Router,
 };
 use freshell_platform::detect::{host_os_live, is_wsl2_proc_live};
+use freshell_platform::elevated::{ConfirmationAction, ConfirmationResponse, ElevationOutcome};
+use freshell_platform::firewall::build_windows_firewall_delete_commands;
 use freshell_platform::network::{
     access_url, detect_lan_ips_from_linux_interfaces, is_remote_access_enabled, NetworkIntent,
 };
-use freshell_platform::port_forward::is_wsl_port_forwarding_disabled_by_env;
+use freshell_platform::port_forward::{
+    build_wsl_port_forwarding_plan, build_wsl_port_forwarding_teardown_plan,
+    get_existing_firewall_ports, get_existing_port_proxy_rules, get_wsl_ip,
+    is_wsl_port_forwarding_disabled_by_env, WslPortForwardingPlan, WslPortForwardingTeardownPlan,
+};
 use freshell_platform::{
     detect_firewall, firewall_commands, FirewallInfo, FirewallPlatform, RealEnv, StdCommandRunner,
 };
@@ -182,6 +191,16 @@ pub struct NetworkState {
     /// (ledger A-08, reports/V5.md): without it, concurrent mutations can
     /// persist a host that contradicts the live listener.
     pub net_mutation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Confirmation/elevation state machine (one outstanding action-bound token,
+    /// in-progress lock). Shared by configure-firewall AND disable-remote-access.
+    pub gate: std::sync::Arc<tokio::sync::Mutex<freshell_platform::elevated::ConfirmationGate>>,
+    /// Instance-scoped managed-ports persistence (Task 3.2). Consumed by the
+    /// confirmed disable lanes and the Started-persist of configure-firewall.
+    pub managed_ports: std::sync::Arc<crate::managed_ports::ManagedPortsStore>,
+    /// The Send + Sync elevated-dispatch seam — the one boundary through which
+    /// every elevated mutation leaves the server. Production wires
+    /// [`LiveElevatedDispatch`]; router tests inject `FakeElevatedDispatch`.
+    pub elevated_dispatch: std::sync::Arc<dyn ElevatedDispatch>,
 }
 
 impl NetworkState {
@@ -291,6 +310,7 @@ pub fn router(state: NetworkState) -> Router {
             "/api/network/disable-remote-access",
             post(disable_remote_access),
         )
+        .route("/api/network/configure-firewall", post(configure_firewall))
         .with_state(state)
 }
 
@@ -534,9 +554,11 @@ fn compute_remote_access_requested(
 /// `applyRemoteAccessDisabledState` `:119-132`) — the Linux-live retract
 /// (NET-06): rebind to loopback, persist `{host:"127.0.0.1",configured:true}`,
 /// then broadcast. The success response is emitted AFTER `serve_on`'s drain
-/// barrier (verified teardown). Windows/WSL2-needing-elevation lanes return a
-/// TEMPORARY placeholder confirmation body WITHOUT elevating (replaced
-/// wholesale by Task 3.3's gate-issued protocol).
+/// barrier (verified teardown). Windows/WSL2-needing-elevation lanes run the
+/// gate-issued, action-bound confirmation protocol (Task 3.3): issue →
+/// confirmed re-POST → in-flight lock → TOCTOU re-resolve → single-use
+/// consume → elevated dispatch through the [`ElevatedDispatch`] seam →
+/// applied disabled state (NET-04/06 wire).
 async fn disable_remote_access(
     State(state): State<NetworkState>,
     headers: HeaderMap,
@@ -558,7 +580,11 @@ async fn disable_remote_access(
         return resp;
     }
 
-    // (Slice 3 inserts the 409 in-flight lock pre-check here.)
+    // Task 3.3: a confirmed repair/teardown already in flight → 409, checked
+    // before any I/O (`network-router.ts:462-467`).
+    if state.gate.lock().await.is_repair_in_flight() {
+        return firewall_in_progress_409();
+    }
 
     // A-08: serialize all network mutations — held through persist + bind.set.
     let _mutation_guard = state.net_mutation.lock().await;
@@ -629,23 +655,790 @@ async fn disable_remote_access(
             .into_response();
     }
 
-    // Windows or WSL2-needing-elevation: TEMPORARY Slice-2 placeholder. The
-    // token below is throwaway (NOT stored in any gate) and MUST NOT survive
-    // Slice 3: Task 3.3 REPLACES this whole block with the gate-issued,
-    // action-bound confirmation + confirmed-dispatch flow (windows-disable /
-    // wsl2-disable lanes). Only the live elevated side effect stays
-    // HOST-BLOCKED (Task 3.6).
+    // Windows / WSL2-needing-elevation: the gate-issued, action-bound
+    // confirmation protocol (`network-router.ts:448-615`), replacing the
+    // Slice-2 placeholder. The A-08 guard is released here: the ladder
+    // re-resolves fresh state itself, and `apply_remote_access_disabled_state`
+    // re-acquires the guard around its own persist/bind section.
+    drop(_mutation_guard);
+
+    let confirm = matches!(req.confirm_elevation, Some(true));
+    let token = req.confirmation_token.as_deref();
+
+    let action = match resolve_disable_action(&state).await {
+        DisableAction::Error(message) => {
+            if confirm {
+                state.gate.lock().await.consume_current_confirmation(token);
+            }
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        DisableAction::None(kind) => {
+            // The success message means the disable is applied HERE
+            // (`network-router.ts:485-489`): loopback rebind + persist +
+            // clear the platform lane's managed ports.
+            if matches!(kind, DisableNone::Disabled) {
+                if let Err(resp) = apply_remote_access_disabled_state(&state, platform).await {
+                    if confirm {
+                        state.gate.lock().await.consume_current_confirmation(token);
+                    }
+                    return resp;
+                }
+            }
+            if confirm {
+                state.gate.lock().await.consume_current_confirmation(token);
+            }
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({ "method": "none", "message": kind.message() })),
+            )
+                .into_response();
+        }
+        DisableAction::Confirmable { action, .. } => action,
+    };
+
+    // Phase 1: no/mismatched token → issue a fresh, GATE-stored, action-bound
+    // token (`network-router.ts:495-497`) — never Slice 2's throwaway.
+    // Phase 2 entry: take the in-flight lock (lose the race → 409).
+    {
+        let mut gate = state.gate.lock().await;
+        if !confirm || !gate.matches_confirmation(token, action) {
+            let issued = gate.issue_confirmation(action, &uuid::Uuid::new_v4().to_string());
+            return (axum::http::StatusCode::OK, Json(confirmation_body(&issued))).into_response();
+        }
+        if !gate.try_acquire_repair_lock() {
+            return firewall_in_progress_409();
+        }
+    }
+    // In-flight lock HELD from here — every path in the locked flow releases it.
+    disable_confirmed_locked(&state, token).await
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3 (Task 3.3): POST /api/network/configure-firewall + the confirmed
+// disable lanes — the two-phase confirmation protocol + in-flight 409 lock.
+// ---------------------------------------------------------------------------
+
+/// `NO_CONFIGURATION_CHANGES_REQUIRED.message` (`network-router.ts:34-38`).
+const NO_CONFIGURATION_CHANGES_REQUIRED: &str = "No configuration changes required";
+/// The no-firewall `method:"none"` message (`network-router.ts:298,313`).
+const NO_FIREWALL_DETECTED: &str = "No firewall detected";
+
+/// The one boundary where an elevated mutation leaves the server.
+///
+/// `argv[0]` is the PowerShell binary to elevate through
+/// ([`ConfirmationAction::powershell_command`]), `argv[1]` the script.
+/// Blocking; handlers call it inside `tokio::task::spawn_blocking` (clone the
+/// `Arc` in). This seam — not `ElevationRunner::Fake(&dyn CommandRunner)` —
+/// exists because axum state must be `Send + Sync + 'static`:
+/// `CommandRunner` has no `Send + Sync` supertraits and `FakeCommandRunner`
+/// holds a `RefCell` (`!Sync`), so neither can live in [`NetworkState`].
+pub trait ElevatedDispatch: Send + Sync {
+    /// Runs Task 3.1's `spawn_via` with the given elevated argv and returns
+    /// the classified outcome.
+    fn dispatch(&self, argv: &[String]) -> ElevationOutcome;
+}
+
+/// Production dispatch: Task 3.1's `spawn_via(elevation_runner_live(), ..)`.
+/// Off Windows the live runner is `Unsupported`, so no real OS mutation can
+/// occur (the live elevated effect stays HOST-BLOCKED, Task 3.6).
+pub struct LiveElevatedDispatch;
+
+impl ElevatedDispatch for LiveElevatedDispatch {
+    fn dispatch(&self, argv: &[String]) -> ElevationOutcome {
+        let command = argv.first().map(String::as_str).unwrap_or("powershell.exe");
+        let script = argv.get(1).map(String::as_str).unwrap_or("");
+        freshell_platform::elevated::spawn_via(
+            &freshell_platform::elevated::elevation_runner_live(),
+            command,
+            script,
+        )
+    }
+}
+
+/// The injected router-test dispatch: records argv, optionally holds (keeps
+/// the gate observably in-flight for Task 3.5's parallel-409 test), then
+/// returns the programmed outcome. All interior state is Mutex-guarded — the
+/// type is `Send + Sync` by construction.
+#[cfg(test)]
+pub struct FakeElevatedDispatch {
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+    outcome: std::sync::Mutex<ElevationOutcome>,
+    hold: std::sync::Mutex<Option<std::time::Duration>>,
+}
+
+#[cfg(test)]
+impl FakeElevatedDispatch {
+    /// Rule-less default: classifies every dispatch as `Started`.
+    #[allow(clippy::new_without_default)] // test-only helper; Default adds nothing
+    pub fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outcome: std::sync::Mutex::new(ElevationOutcome::Started),
+            hold: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Program the outcome every subsequent dispatch classifies as.
+    /// (Consumed by Task 3.5's failure-outcome tests.)
+    #[allow(dead_code)]
+    pub fn program(&self, outcome: ElevationOutcome) {
+        *self.outcome.lock().unwrap() = outcome;
+    }
+
+    /// Sleep this long inside dispatch before returning, keeping the gate
+    /// observably in-flight. (Consumed by Task 3.5's parallel-409 test.)
+    #[allow(dead_code)]
+    pub fn hold_before_return(&self, hold: std::time::Duration) {
+        *self.hold.lock().unwrap() = Some(hold);
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    /// The recorded elevated argvs, in dispatch order.
+    /// (Consumed by Task 3.5's script-content assertions.)
+    #[allow(dead_code)]
+    pub fn recorded(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl ElevatedDispatch for FakeElevatedDispatch {
+    fn dispatch(&self, argv: &[String]) -> ElevationOutcome {
+        self.calls.lock().unwrap().push(argv.to_vec());
+        let hold = *self.hold.lock().unwrap();
+        if let Some(hold) = hold {
+            std::thread::sleep(hold);
+        }
+        // `ElevationOutcome` is deliberately not `Clone` in the platform
+        // crate; duplicate the fieldless variant by match.
+        match *self.outcome.lock().unwrap() {
+            ElevationOutcome::Started => ElevationOutcome::Started,
+            ElevationOutcome::Denied => ElevationOutcome::Denied,
+            ElevationOutcome::TimedOut => ElevationOutcome::TimedOut,
+            ElevationOutcome::PartialFailure => ElevationOutcome::PartialFailure,
+            ElevationOutcome::VerificationFailed => ElevationOutcome::VerificationFailed,
+            ElevationOutcome::NotSupported => ElevationOutcome::NotSupported,
+        }
+    }
+}
+
+/// The 409 lock response (`network-router.ts:462-467,624-629`): the `method`
+/// field is load-bearing — the frozen client reads `details.method` and
+/// switches on `"in-progress"`.
+fn firewall_in_progress_409() -> Response {
     (
-        axum::http::StatusCode::OK,
+        axum::http::StatusCode::CONFLICT,
         Json(json!({
-            "method":"confirmation-required",
-            "title":"Administrator approval required",
-            "body":"To complete this, you will need to accept the Windows administrator prompt on the next screen.",
-            "confirmLabel":"Continue",
-            "confirmationToken": uuid::Uuid::new_v4().to_string()
+            "error": "Firewall configuration already in progress",
+            "method": "in-progress"
         })),
     )
         .into_response()
+}
+
+/// The `confirmation-required` wire body (`WINDOWS_ELEVATION_CONFIRMATION` +
+/// the issued token, `network-router.ts:28-33,218-228`).
+fn confirmation_body(issued: &ConfirmationResponse) -> Value {
+    json!({
+        "method": issued.method,
+        "title": issued.title,
+        "body": issued.body,
+        "confirmLabel": issued.confirm_label,
+        "confirmationToken": issued.confirmation_token,
+    })
+}
+
+/// `resolveRepairAction`'s resolution (`network-router.ts:264-320`).
+enum RepairAction {
+    /// Plan computation failed → 500 `{"error": message}`.
+    Error(String),
+    /// Nothing to do → 200 `{"method":"none","message"}`.
+    None(&'static str),
+    /// linux/macos suggested commands → 200 `{"method":"terminal","command"}`.
+    /// The client opens a terminal tab; the SERVER NEVER RUNS IT (NET-10).
+    Terminal(String),
+    /// windows-repair / wsl2-repair: confirmable elevated script.
+    Confirmable {
+        action: ConfirmationAction,
+        script: String,
+    },
+}
+
+/// `resolveRemoteAccessDisableAction`'s resolution
+/// (`network-router.ts:322-378`). A SEPARATE enum from [`RepairAction`]
+/// (D19): the reference's unreachable `terminal`-on-disable arm is
+/// unrepresentable here.
+enum DisableAction {
+    Error(String),
+    None(DisableNone),
+    Confirmable {
+        action: ConfirmationAction,
+        script: String,
+    },
+}
+
+/// `remoteAccessRequested ? REMOTE_ACCESS_DISABLED_SUCCESS :
+/// REMOTE_ACCESS_DISABLED` (`network-router.ts:330-334,368-372`).
+fn disable_none_for(requested: bool) -> DisableNone {
+    if requested {
+        DisableNone::Disabled
+    } else {
+        DisableNone::NotEnabled
+    }
+}
+
+/// Port of `resolveRepairAction` (`network-router.ts:264-320`), resolving from
+/// FRESH status + settings — the same live derivation `GET
+/// /api/network/status` serves ([`build_status_value`]: ONE derivation path,
+/// never two).
+async fn resolve_repair_action(state: &NetworkState) -> RepairAction {
+    let status = build_status_value(state).await;
+    let settings = state.settings.get().await;
+    let facts = state.facts.get_or_refresh().await;
+    let platform = facts.firewall.platform;
+
+    let requested = compute_remote_access_requested(
+        settings.network.configured,
+        network_host_str(&settings.network.host),
+        status["host"].as_str().unwrap_or(""),
+        platform,
+    );
+    if !requested {
+        return RepairAction::None(DisableNone::NotEnabled.message());
+    }
+
+    let port_open = status["firewall"]["portOpen"] == json!(true);
+    let commands: Vec<String> = status["firewall"]["commands"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if platform == FirewallPlatform::Wsl2 {
+        if port_open {
+            return RepairAction::None(NO_CONFIGURATION_CHANGES_REQUIRED);
+        }
+        return match compute_wsl_plan_live(state).await {
+            WslPortForwardingPlan::Error(message) => RepairAction::Error(message),
+            WslPortForwardingPlan::Noop { .. }
+            | WslPortForwardingPlan::NotWsl2
+            | WslPortForwardingPlan::Disabled => {
+                RepairAction::None(NO_CONFIGURATION_CHANGES_REQUIRED)
+            }
+            WslPortForwardingPlan::Ready { script, .. } => RepairAction::Confirmable {
+                action: ConfirmationAction::Wsl2Repair,
+                script,
+            },
+        };
+    }
+
+    if platform == FirewallPlatform::Windows {
+        if commands.is_empty() {
+            return RepairAction::None(NO_FIREWALL_DETECTED);
+        }
+        if port_open {
+            return RepairAction::None(NO_CONFIGURATION_CHANGES_REQUIRED);
+        }
+        return RepairAction::Confirmable {
+            action: ConfirmationAction::WindowsRepair,
+            script: commands.join("; "),
+        };
+    }
+
+    if commands.is_empty() {
+        return RepairAction::None(NO_FIREWALL_DETECTED);
+    }
+    RepairAction::Terminal(commands.join(" && "))
+}
+
+/// Port of `resolveRemoteAccessDisableAction` (`network-router.ts:322-378`).
+async fn resolve_disable_action(state: &NetworkState) -> DisableAction {
+    let settings = state.settings.get().await;
+    let facts = state.facts.get_or_refresh().await;
+    let platform = facts.firewall.platform;
+    let requested = compute_remote_access_requested(
+        settings.network.configured,
+        network_host_str(&settings.network.host),
+        &state.bind.get().await,
+        platform,
+    );
+
+    if platform == FirewallPlatform::Windows {
+        let managed = state.managed_ports.read_windows();
+        if managed.is_empty() {
+            return DisableAction::None(disable_none_for(requested));
+        }
+        return DisableAction::Confirmable {
+            action: ConfirmationAction::WindowsDisable,
+            script: build_windows_firewall_delete_commands(&managed).join("; "),
+        };
+    }
+
+    if platform != FirewallPlatform::Wsl2 {
+        return DisableAction::None(disable_none_for(requested));
+    }
+
+    match compute_wsl_teardown_plan_live(state).await {
+        WslPortForwardingTeardownPlan::Error(message) => DisableAction::Error(message),
+        WslPortForwardingTeardownPlan::NotWsl2 | WslPortForwardingTeardownPlan::Disabled => {
+            DisableAction::None(DisableNone::NotEnabled)
+        }
+        WslPortForwardingTeardownPlan::Noop => DisableAction::None(disable_none_for(requested)),
+        WslPortForwardingTeardownPlan::Ready { script } => DisableAction::Confirmable {
+            action: ConfirmationAction::Wsl2Disable,
+            script,
+        },
+    }
+}
+
+/// Port of `computeWslPortForwardingPlanAsync` (`wsl-port-forward.ts:503-543`):
+/// gate on WSL2 + the env kill-switch, then compose the READ-ONLY live reads
+/// (`ip`/`hostname` for the WSL IP, `netsh … show` for rules/firewall ports,
+/// the managed-ports store) into the pure plan builder. Subprocess reads run
+/// on the blocking pool. `requiredPorts = getRemoteAccessPorts() = [port]`;
+/// `knownOwnedPorts = getRelevantPorts() = [port]` (no devMode in this port).
+async fn compute_wsl_plan_live(state: &NetworkState) -> WslPortForwardingPlan {
+    let required = vec![state.port];
+    let managed = state.managed_ports.read_wsl();
+    tokio::task::spawn_blocking(move || {
+        if !is_wsl2_proc_live() {
+            return WslPortForwardingPlan::NotWsl2;
+        }
+        if is_wsl_port_forwarding_disabled_by_env(&RealEnv) {
+            return WslPortForwardingPlan::Disabled;
+        }
+        let runner = StdCommandRunner::default();
+        let Some(wsl_ip) = get_wsl_ip(&runner) else {
+            return WslPortForwardingPlan::Error("Failed to detect WSL2 IP address".to_string());
+        };
+        let (Some(rules), Some(firewall_ports)) = (
+            get_existing_port_proxy_rules(&runner),
+            get_existing_firewall_ports(&runner),
+        ) else {
+            return WslPortForwardingPlan::Error(
+                "Failed to query existing Windows remote access rules".to_string(),
+            );
+        };
+        build_wsl_port_forwarding_plan(
+            &required,
+            &required,
+            wsl_ip,
+            &rules,
+            &firewall_ports,
+            &managed,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        WslPortForwardingPlan::Error(
+            "Failed to query existing Windows remote access rules".to_string(),
+        )
+    })
+}
+
+/// Port of `computeWslPortForwardingTeardownPlanAsync`
+/// (`wsl-port-forward.ts:545-576`); same composition as
+/// [`compute_wsl_plan_live`], minus the WSL-IP read the teardown plan does
+/// not need.
+async fn compute_wsl_teardown_plan_live(state: &NetworkState) -> WslPortForwardingTeardownPlan {
+    let required = vec![state.port];
+    let managed = state.managed_ports.read_wsl();
+    tokio::task::spawn_blocking(move || {
+        if !is_wsl2_proc_live() {
+            return WslPortForwardingTeardownPlan::NotWsl2;
+        }
+        if is_wsl_port_forwarding_disabled_by_env(&RealEnv) {
+            return WslPortForwardingTeardownPlan::Disabled;
+        }
+        let runner = StdCommandRunner::default();
+        let (Some(rules), Some(firewall_ports)) = (
+            get_existing_port_proxy_rules(&runner),
+            get_existing_firewall_ports(&runner),
+        ) else {
+            return WslPortForwardingTeardownPlan::Error(
+                "Failed to query existing Windows remote access rules".to_string(),
+            );
+        };
+        build_wsl_port_forwarding_teardown_plan(
+            &required,
+            &required,
+            &rules,
+            &firewall_ports,
+            &managed,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        WslPortForwardingTeardownPlan::Error(
+            "Failed to query existing Windows remote access rules".to_string(),
+        )
+    })
+}
+
+/// Dispatch a confirmed elevated action through the [`ElevatedDispatch`] seam
+/// on the blocking pool. `argv = [powershell command, script]`.
+async fn dispatch_elevated(
+    state: &NetworkState,
+    action: ConfirmationAction,
+    script: &str,
+) -> ElevationOutcome {
+    let dispatch = Arc::clone(&state.elevated_dispatch);
+    let argv = vec![action.powershell_command().to_string(), script.to_string()];
+    tokio::task::spawn_blocking(move || dispatch.dispatch(&argv))
+        .await
+        .unwrap_or(ElevationOutcome::PartialFailure)
+}
+
+/// The repair lanes' failed-to-start 500 messages (`network-router.ts:743-752`).
+fn repair_failed_to_start(action: ConfirmationAction) -> &'static str {
+    match action {
+        ConfirmationAction::Wsl2Repair => "WSL2 port forwarding failed to start",
+        _ => "Windows firewall configuration failed to start",
+    }
+}
+
+/// The disable lanes' failed-to-start 500 messages (`network-router.ts:598-604`).
+fn disable_failed_to_start(action: ConfirmationAction) -> &'static str {
+    match action {
+        ConfirmationAction::Wsl2Disable => "WSL2 remote access teardown failed to start",
+        _ => "Windows remote access teardown failed to start",
+    }
+}
+
+/// Port of `applyRemoteAccessDisabledState` (`network-router.ts:119-132`) with
+/// the truthful-bind deviation (#6): really rebind the listener to loopback,
+/// persist `{host:"127.0.0.1",configured:true}`, refresh the live state,
+/// broadcast `settings.updated` (only when the settings actually changed),
+/// then clear the platform lane's managed ports (clear errors logged, not
+/// fatal — the TS swallows them too). Persist-failure handling is identical
+/// to Task 2.4's fail-safe: never roll back toward exposure on an error path.
+// `Err` IS the ready-to-send failure response, same rationale as
+// `ConfirmFirewallRequest::validate`.
+#[allow(clippy::result_large_err)]
+async fn apply_remote_access_disabled_state(
+    state: &NetworkState,
+    platform: FirewallPlatform,
+) -> Result<(), Response> {
+    // A-08: serialize the live-bind read → persist → bind.set section.
+    let _mutation_guard = state.net_mutation.lock().await;
+    let before = state.settings.get().await;
+    if state
+        .rebind
+        .serve_on(std::net::IpAddr::from([127, 0, 0, 1]))
+        .await
+        .is_err()
+    {
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Failed to disable remote access" })),
+        )
+            .into_response());
+    }
+    let merged = match state
+        .settings
+        .patch(&json!({"network":{"host":"127.0.0.1","configured":true}}))
+        .await
+    {
+        Ok(m) => m,
+        Err((s, b)) => {
+            // FAIL-SAFE (Task 2.4 / deviation #9): keep the loopback
+            // listener, make status truthful, surface the error.
+            state.bind.set("127.0.0.1").await;
+            state.facts.invalidate().await;
+            return Err((s, Json(b)).into_response());
+        }
+    };
+    state.facts.invalidate().await;
+    state.bind.set("127.0.0.1").await;
+    if merged.network != before.network {
+        state.broadcast_settings_updated(&merged);
+    }
+    // Clear the lane's managed ports (logged, not fatal).
+    let cleared = match platform {
+        FirewallPlatform::Windows => state.managed_ports.clear_windows(),
+        FirewallPlatform::Wsl2 => state.managed_ports.clear_wsl(),
+        _ => Ok(()),
+    };
+    if let Err(err) = cleared {
+        tracing::error!(error = %err, "Failed to clear managed remote access ports");
+    }
+    Ok(())
+}
+
+/// `POST /api/network/configure-firewall` (`network-router.ts:617-758`): the
+/// two-phase confirmation protocol. The first confirmable POST issues a fresh
+/// gate-stored token WITHOUT any OS call; a confirmed re-POST takes the
+/// in-flight lock, RE-RESOLVES the action under it (TOCTOU), consumes the
+/// single-use token and dispatches through the [`ElevatedDispatch`] seam.
+async fn configure_firewall(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let raw = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let req: ConfirmFirewallRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return invalid_request(json!([{
+                "code": "unrecognized_keys", "path": [], "message": e.to_string()
+            }]));
+        }
+    };
+    if let Err(resp) = req.validate() {
+        return resp;
+    }
+
+    // 409 pre-check FIRST, before any I/O (`network-router.ts:624-629`).
+    if state.gate.lock().await.is_repair_in_flight() {
+        return firewall_in_progress_409();
+    }
+
+    let confirm = matches!(req.confirm_elevation, Some(true));
+    let token = req.confirmation_token.as_deref();
+
+    let action = match resolve_repair_action(&state).await {
+        RepairAction::Error(message) => {
+            if confirm {
+                state.gate.lock().await.consume_current_confirmation(token);
+            }
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        RepairAction::None(message) => {
+            if confirm {
+                state.gate.lock().await.consume_current_confirmation(token);
+            }
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({ "method": "none", "message": message })),
+            )
+                .into_response();
+        }
+        RepairAction::Terminal(command) => {
+            if confirm {
+                state.gate.lock().await.consume_current_confirmation(token);
+            }
+            // NET-10: the client opens a terminal tab with this command; the
+            // SERVER NEVER RUNS IT.
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({ "method": "terminal", "command": command })),
+            )
+                .into_response();
+        }
+        RepairAction::Confirmable { action, .. } => action,
+    };
+
+    {
+        let mut gate = state.gate.lock().await;
+        // Second in-flight check after the (slow) resolution
+        // (`network-router.ts:653-658`).
+        if gate.is_repair_in_flight() {
+            return firewall_in_progress_409();
+        }
+        // Phase 1: no/mismatched token → issue a fresh UUID bound to the
+        // action; NO OS call.
+        if !confirm || !gate.matches_confirmation(token, action) {
+            let issued = gate.issue_confirmation(action, &uuid::Uuid::new_v4().to_string());
+            return (axum::http::StatusCode::OK, Json(confirmation_body(&issued))).into_response();
+        }
+        // Phase 2: take the in-flight lock (lose the race → 409).
+        if !gate.try_acquire_repair_lock() {
+            return firewall_in_progress_409();
+        }
+    }
+    // In-flight lock HELD — every path in the locked flow releases it.
+    configure_firewall_confirmed_locked(&state, token).await
+}
+
+/// The under-lock tail of [`configure_firewall`]
+/// (`network-router.ts:672-756`): TOCTOU re-resolve, single-use token
+/// consumption, elevated dispatch, Started persist. The in-flight lock is
+/// HELD on entry and released on EVERY path (NET-07: failure outcomes release
+/// the lock and persist nothing; `configuring` stays `false` in status).
+async fn configure_firewall_confirmed_locked(
+    state: &NetworkState,
+    token: Option<&str>,
+) -> Response {
+    let (action, script) = match resolve_repair_action(state).await {
+        RepairAction::Error(message) => {
+            let mut gate = state.gate.lock().await;
+            gate.consume_current_confirmation(token);
+            gate.release_repair_lock();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        RepairAction::None(message) => {
+            let mut gate = state.gate.lock().await;
+            gate.consume_current_confirmation(token);
+            gate.release_repair_lock();
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({ "method": "none", "message": message })),
+            )
+                .into_response();
+        }
+        RepairAction::Terminal(command) => {
+            let mut gate = state.gate.lock().await;
+            gate.consume_current_confirmation(token);
+            gate.release_repair_lock();
+            return (
+                axum::http::StatusCode::OK,
+                Json(json!({ "method": "terminal", "command": command })),
+            )
+                .into_response();
+        }
+        RepairAction::Confirmable { action, script } => {
+            let mut gate = state.gate.lock().await;
+            // Single-use consume against the FRESH action (constant-time via
+            // Slice 0). A changed action ⇒ release + re-issue (200, never 4xx).
+            if !gate.consume_confirmation(token, action) {
+                gate.release_repair_lock();
+                let issued = gate.issue_confirmation(action, &uuid::Uuid::new_v4().to_string());
+                return (axum::http::StatusCode::OK, Json(confirmation_body(&issued)))
+                    .into_response();
+            }
+            (action, script)
+        }
+    };
+
+    let outcome = dispatch_elevated(state, action, &script).await;
+    if outcome != ElevationOutcome::Started {
+        // Failure outcome (Denied/TimedOut/PartialFailure/VerificationFailed/
+        // NotSupported): release the lock, persist NOTHING (NET-07).
+        tracing::error!(
+            outcome = ?outcome,
+            action = action.as_str(),
+            "elevated firewall configuration did not start"
+        );
+        state.gate.lock().await.release_repair_lock();
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": repair_failed_to_start(action) })),
+        )
+            .into_response();
+    }
+
+    // Started: persist the lane's managed ports under the mutation lock
+    // (A-08); a persist failure is logged, not fatal (the TS onSuccess catch,
+    // `network-router.ts:134-139`).
+    {
+        let _mutation_guard = state.net_mutation.lock().await;
+        let persisted = match action {
+            ConfirmationAction::Wsl2Repair => state.managed_ports.persist_wsl(&[state.port]),
+            _ => state.managed_ports.persist_windows(&[state.port]),
+        };
+        if let Err(err) = persisted {
+            tracing::error!(error = %err, "Failed to persist managed remote access ports");
+        }
+    }
+    state.gate.lock().await.release_repair_lock();
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({ "method": action.response_method(), "status": "started" })),
+    )
+        .into_response()
+}
+
+/// The under-lock tail of the confirmed disable lanes
+/// (`network-router.ts:507-612`): TOCTOU re-resolve, single-use token
+/// consumption, elevated teardown dispatch, then the applied disabled state.
+/// The in-flight lock is HELD on entry and released on EVERY path (NET-07).
+async fn disable_confirmed_locked(state: &NetworkState, token: Option<&str>) -> Response {
+    let (action, script) = match resolve_disable_action(state).await {
+        DisableAction::Error(message) => {
+            let mut gate = state.gate.lock().await;
+            gate.consume_current_confirmation(token);
+            gate.release_repair_lock();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        DisableAction::None(kind) => {
+            state.gate.lock().await.consume_current_confirmation(token);
+            let applied = if matches!(kind, DisableNone::Disabled) {
+                let platform = state.facts.get_or_refresh().await.firewall.platform;
+                apply_remote_access_disabled_state(state, platform).await
+            } else {
+                Ok(())
+            };
+            state.gate.lock().await.release_repair_lock();
+            return match applied {
+                Err(resp) => resp,
+                Ok(()) => (
+                    axum::http::StatusCode::OK,
+                    Json(json!({ "method": "none", "message": kind.message() })),
+                )
+                    .into_response(),
+            };
+        }
+        DisableAction::Confirmable { action, script } => {
+            let mut gate = state.gate.lock().await;
+            if !gate.consume_confirmation(token, action) {
+                // Action changed while unlocked ⇒ release + re-issue a fresh
+                // token with 200 (never 4xx).
+                gate.release_repair_lock();
+                let issued = gate.issue_confirmation(action, &uuid::Uuid::new_v4().to_string());
+                return (axum::http::StatusCode::OK, Json(confirmation_body(&issued)))
+                    .into_response();
+            }
+            (action, script)
+        }
+    };
+
+    let outcome = dispatch_elevated(state, action, &script).await;
+    if outcome != ElevationOutcome::Started {
+        tracing::error!(
+            outcome = ?outcome,
+            action = action.as_str(),
+            "elevated remote access teardown did not start"
+        );
+        state.gate.lock().await.release_repair_lock();
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": disable_failed_to_start(action) })),
+        )
+            .into_response();
+    }
+
+    // Started: apply the disabled state (loopback rebind + persist +
+    // broadcast + clear the lane's managed ports), then release the lock and
+    // answer `{method,status:"started"}` (`network-router.ts:588-590`).
+    let lane_platform = match action {
+        ConfirmationAction::Wsl2Disable => FirewallPlatform::Wsl2,
+        _ => FirewallPlatform::Windows,
+    };
+    let applied = apply_remote_access_disabled_state(state, lane_platform).await;
+    state.gate.lock().await.release_repair_lock();
+    match applied {
+        Err(resp) => resp,
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({ "method": action.response_method(), "status": "started" })),
+        )
+            .into_response(),
+    }
 }
 
 /// The inputs to the pure [`build_network_status`] (everything the live edge
@@ -1031,14 +1824,94 @@ mod tests {
         }
     }
 
-    fn test_settings_store() -> crate::settings_store::SettingsStore {
+    /// A throwaway per-test home dir with `.freshell/` created. Deliberately
+    /// NOT a `TempDir` guard: the dir must outlive the returned state (the
+    /// managed-ports store and settings store keep reading it), same pattern
+    /// as the pre-existing `test_settings_store`.
+    fn test_home_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "frs-network-test-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        dir
+    }
+
+    fn test_settings_store() -> crate::settings_store::SettingsStore {
+        let dir = test_home_dir();
         crate::settings_store::SettingsStore::load(Some(&dir), vec!["claude".into()])
+    }
+
+    /// The shared confirmable seeding for the Task 3.3 protocol tests:
+    /// Windows-active facts + a CLOSED port (probe `Some(false)`) AND bind +
+    /// persisted settings at `0.0.0.0`/`configured:true` — the
+    /// `isRemoteAccessEnabled` precondition `resolve_repair_action` checks
+    /// FIRST (without it the ladder yields `method:"none"`, never a
+    /// confirmable `windows-repair`). The managed-ports store is file-backed
+    /// on a throwaway home; the `FakeElevatedDispatch` defaults to `Started`.
+    fn confirmable_test_state() -> (NetworkState, Arc<FakeElevatedDispatch>) {
+        let home = test_home_dir();
+        // Persist the settings BEFORE the store loads (sync seeding: the
+        // helper is a plain fn, so it cannot await `settings.patch`).
+        std::fs::write(
+            home.join(".freshell").join("config.json"),
+            r#"{"settings":{"network":{"host":"0.0.0.0","configured":true}}}"#,
+        )
+        .unwrap();
+        let fake = Arc::new(FakeElevatedDispatch::new());
+        let state = NetworkState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(
+                Some(&home),
+                vec!["claude".into()],
+            ),
+            bind: Arc::new(BindState::new("0.0.0.0")),
+            port: 51234,
+            facts: Arc::new(NetworkFactsCache::new()),
+            probe: Arc::new(FakePortProbe::new(Some(false))), // closed port
+            broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            // port 0: never served in unit tests (no app injected either).
+            rebind: crate::net_bind::RebindController::new(0, true),
+            net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            gate: Arc::new(tokio::sync::Mutex::new(
+                freshell_platform::elevated::ConfirmationGate::new(),
+            )),
+            managed_ports: Arc::new(crate::managed_ports::ManagedPortsStore::windows(
+                Some(home),
+                "/proj/test".into(),
+                51234,
+            )),
+            elevated_dispatch: Arc::clone(&fake) as Arc<dyn ElevatedDispatch>,
+        };
+        // Seed the Windows-active facts synchronously (uncontended try_write).
+        *state.facts.inner.try_write().unwrap() = Some(LiveNetworkFacts {
+            firewall: FirewallInfo {
+                platform: FirewallPlatform::Windows,
+                active: true,
+            },
+            lan_ips: vec!["192.168.1.50".to_string()],
+            hostname: "test-host".to_string(),
+        });
+        (state, fake)
+    }
+
+    /// Windows-active facts + closed port => `resolve_repair_action` yields a
+    /// confirmable `windows-repair`. (The brief's prose sketches a tuple
+    /// return, but its mandated tests bind the state directly — the verbatim
+    /// tests win; the fake handle is available via `confirmable_test_state`.)
+    fn test_state_firewall_confirmable() -> NetworkState {
+        confirmable_test_state().0
+    }
+
+    /// Same seeding (the closed firewall port keeps `windows-repair`
+    /// resolvable too — Task 3.5's wrong-action test needs both lanes
+    /// resolvable on this state), plus ONE persisted managed Windows port so
+    /// the disable ladder yields a confirmable `windows-disable`.
+    fn test_state_disable_confirmable() -> (NetworkState, Arc<FakeElevatedDispatch>) {
+        let (state, fake) = confirmable_test_state();
+        state.managed_ports.persist_windows(&[state.port]).unwrap();
+        (state, fake)
     }
 
     fn test_state(bind_host: &str, probe_result: Option<bool>) -> NetworkState {
@@ -1053,6 +1926,16 @@ mod tests {
             // port 0: never served in unit tests (no app injected either).
             rebind: crate::net_bind::RebindController::new(0, true),
             net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            gate: Arc::new(tokio::sync::Mutex::new(
+                freshell_platform::elevated::ConfirmationGate::new(),
+            )),
+            // In-memory managed ports (None home): reads empty, persists no-op.
+            managed_ports: Arc::new(crate::managed_ports::ManagedPortsStore::windows(
+                None,
+                "/proj/test".into(),
+                51234,
+            )),
+            elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
         }
     }
 
@@ -1077,6 +1960,15 @@ mod tests {
             // port 0: never served in unit tests (no app injected either).
             rebind: crate::net_bind::RebindController::new(0, true),
             net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            gate: Arc::new(tokio::sync::Mutex::new(
+                freshell_platform::elevated::ConfirmationGate::new(),
+            )),
+            managed_ports: Arc::new(crate::managed_ports::ManagedPortsStore::windows(
+                None,
+                "/proj/test".into(),
+                51234,
+            )),
+            elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
         };
         (state, counter)
     }
@@ -1126,6 +2018,15 @@ mod tests {
             broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
             rebind: crate::net_bind::RebindController::new(probed_port, true),
             net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            gate: Arc::new(tokio::sync::Mutex::new(
+                freshell_platform::elevated::ConfirmationGate::new(),
+            )),
+            managed_ports: Arc::new(crate::managed_ports::ManagedPortsStore::windows(
+                Some(home.to_path_buf()),
+                "/proj/test".into(),
+                probed_port,
+            )),
+            elevated_dispatch: Arc::new(FakeElevatedDispatch::new()),
         }
     }
 
@@ -1651,6 +2552,229 @@ mod tests {
         assert_eq!(state.bind.get().await, "127.0.0.1");
         // Release the real loopback listener this scenario's serve_on bound.
         state.rebind.shutdown_all().await;
+    }
+
+    // ---- Slice 3 (Task 3.3): POST /api/network/configure-firewall + the ----
+    // ---- confirmed disable lanes (confirmation protocol + 409 lock) --------
+
+    #[tokio::test]
+    async fn configure_firewall_first_post_issues_confirmation_without_running_anything() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state_firewall_confirmable(); // seeds windows-active facts + closed port => confirmable
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure-firewall")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        assert!(!body["confirmationToken"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_firewall_409_when_repair_in_flight() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state_firewall_confirmable();
+        {
+            state.gate.lock().await.try_acquire_repair_lock();
+        } // simulate in-flight
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure-firewall")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "in-progress");
+        assert_eq!(body["error"], "Firewall configuration already in progress");
+    }
+
+    #[tokio::test]
+    async fn configure_firewall_requires_auth_and_strict_body() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state_firewall_confirmable();
+        // no token => 401
+        let r = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure-firewall")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // unknown key => 400
+        let r = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure-firewall")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"nope":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        // confirmElevation:false => 400
+        let r = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure-firewall")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirmElevation":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn disable_windows_lane_issues_confirmation_with_exact_contract_body() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let (state, _fake) = test_state_disable_confirmable();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        assert_eq!(body["title"], "Administrator approval required");
+        assert_eq!(
+            body["body"],
+            "To complete this, you will need to accept the Windows administrator prompt on the next screen."
+        );
+        assert_eq!(body["confirmLabel"], "Continue");
+        assert!(!body["confirmationToken"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disable_confirmed_repost_dispatches_and_applies_disabled_state() {
+        // THE protocol proof that the token is GATE-stored: with Task 2.4's
+        // throwaway uuid a confirmed re-POST would loop on confirmation-required
+        // forever and this test could never observe a dispatch.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let (state, fake) = test_state_disable_confirmable(); // fake classifies Started
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let token = body_json(resp).await["confirmationToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "windows-elevated");
+        assert_eq!(body["status"], "started");
+        assert_eq!(fake.call_count(), 1, "exactly one elevated dispatch");
+        let s = state.settings.get().await;
+        assert_eq!(
+            serde_json::to_value(&s.network).unwrap()["host"],
+            "127.0.0.1"
+        );
+        assert_eq!(state.bind.get().await, "127.0.0.1");
+        assert!(
+            state.managed_ports.read_windows().is_empty(),
+            "managed ports cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_stale_token_reissues_fresh_confirmation_and_never_dispatches() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let (state, fake) = test_state_disable_confirmable();
+        let bogus = uuid::Uuid::new_v4().to_string();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/disable-remote-access")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"confirmElevation":true,"confirmationToken":"{bogus}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["method"], "confirmation-required");
+        assert_ne!(body["confirmationToken"].as_str().unwrap(), bogus);
+        assert_eq!(fake.call_count(), 0, "no dispatch on a mismatched token");
+        let s = state.settings.get().await;
+        assert_eq!(
+            serde_json::to_value(&s.network).unwrap()["host"],
+            "0.0.0.0",
+            "settings untouched"
+        );
     }
 
     /// Slice 2 (Task 2.2): `broadcast_settings_updated` emits the exact frame

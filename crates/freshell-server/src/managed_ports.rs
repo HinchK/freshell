@@ -15,13 +15,15 @@ pub struct ManagedPortsStore {
 }
 
 impl ManagedPortsStore {
-    /// Create a Windows managed ports store. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Create a Windows managed ports store.
     pub fn windows(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self {
         Self { home, cwd, port }
     }
 
-    /// Create a WSL managed ports store. (Consumed by Task 3.3)
+    /// Create a WSL managed ports store. (Identical fields to
+    /// [`Self::windows`]; retained from Task 3.2's contract -- Task 3.3
+    /// shares one `windows`-constructed store for both lanes, so this
+    /// constructor has no consumer yet.)
     #[allow(dead_code)]
     pub fn wsl(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self {
         Self { home, cwd, port }
@@ -132,37 +134,32 @@ impl ManagedPortsStore {
         }
     }
 
-    /// Read Windows managed ports. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Read Windows managed ports.
     pub fn read_windows(&self) -> Vec<u16> {
         self.read_from_dir(self.windows_dir())
     }
 
-    /// Persist Windows managed ports. (Consumed by Task 3.3)
+    /// Persist Windows managed ports.
     pub fn persist_windows(&self, ports: &[u16]) -> io::Result<()> {
         self.persist_to_dir(self.windows_dir(), ports)
     }
 
-    /// Clear Windows managed ports. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Clear Windows managed ports.
     pub fn clear_windows(&self) -> io::Result<()> {
         self.persist_windows(&[])
     }
 
-    /// Read WSL managed ports. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Read WSL managed ports.
     pub fn read_wsl(&self) -> Vec<u16> {
         self.read_from_dir(self.wsl_dir())
     }
 
-    /// Persist WSL managed ports. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Persist WSL managed ports.
     pub fn persist_wsl(&self, ports: &[u16]) -> io::Result<()> {
         self.persist_to_dir(self.wsl_dir(), ports)
     }
 
-    /// Clear WSL managed ports. (Consumed by Task 3.3)
-    #[allow(dead_code)]
+    /// Clear WSL managed ports.
     pub fn clear_wsl(&self) -> io::Result<()> {
         self.persist_wsl(&[])
     }

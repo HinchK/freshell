@@ -915,6 +915,19 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
         rebind: Arc::clone(&rebind),
         net_mutation: Arc::new(tokio::sync::Mutex::new(())),
+        // Task 3.3: the confirmation/elevation gate + the instance-scoped
+        // managed-ports store (keyed by the real home/cwd/port) + the live
+        // elevated-dispatch seam (Unsupported off Windows -- no real OS
+        // mutation can occur on a non-Windows host).
+        gate: Arc::new(tokio::sync::Mutex::new(
+            freshell_platform::elevated::ConfirmationGate::new(),
+        )),
+        managed_ports: Arc::new(managed_ports::ManagedPortsStore::windows(
+            home.clone(),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            port,
+        )),
+        elevated_dispatch: Arc::new(network::LiveElevatedDispatch),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
