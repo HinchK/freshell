@@ -130,7 +130,7 @@ New and modified files, by responsibility. Line numbers are from the current tre
 | `crates/freshell-server/src/network.rs` | Two POST routes (`configure`, `disable-remote-access`); `configure-firewall` route; wire `broadcast_tx`, `RebindController`, `Arc<Mutex<ConfirmationGate>>`, managed-ports store into `NetworkState`; shared action-resolution ladder | 2, 3 |
 | `crates/freshell-server/src/managed_ports.rs` | **NEW.** Instance-scoped Windows/WSL managed-remote-access-ports persistence (fake-backed, honours `FRESHELL_HOME`, atomic) | 3 |
 | `crates/freshell-server/src/main.rs` | Restructure serving so the boot listener is spawned via `RebindController`; boot bind honors persisted `settings.network`; inject `broadcast_tx`, controller, gate, managed-ports store into `NetworkState` | 2, 3 |
-| `crates/freshell-server/Cargo.toml` | Add `socket2 = "0.6"` | 2 |
+| `crates/freshell-server/Cargo.toml` | Add `socket2 = { version = "0.6", features = ["all"] }` | 2 |
 | `crates/freshell-server/tests/net09_config_preservation.rs` | **NEW.** Black-box binary test: byte-preservation of unmanaged config across a network mutation + restart | 2 |
 | `scripts/verify-remote-access.sh` | **NEW.** End-to-end live verification harness (7 phases, 3-tier ladder, NET-08 matrix, read-only host-state identity self-proof, `report.json`) | Harness |
 | `docs/plans/2026-07-28-net-windows-deferred-evidence.md` | **NEW.** HOST-BLOCKED evidence record for NET-04/05/07 | 3 |
@@ -182,14 +182,19 @@ Add to `crates/freshell-platform/src/elevated.rs` inside `#[cfg(test)] mod tests
 fn matches_confirmation_uses_constant_time_compare_not_equality() {
     // Falsifier for NET-08-C: this test fails only if `==` is still used,
     // because it asserts the source no longer contains the equality compare.
+    // Both needles are concat!-split so this test's OWN source never contains
+    // them intact -- otherwise the negative assert would fail forever and the
+    // positive assert would pass vacuously.
     let src = include_str!("elevated.rs");
+    let banned = concat!("c.token ", "== t");
+    let required = concat!("timing_safe", "_compare");
     assert!(
-        !src.contains("c.token == t"),
+        !src.contains(banned),
         "raw == token compare still present; NET-08-C not applied"
     );
     assert!(
-        src.contains("timing_safe_compare"),
-        "timing_safe_compare not wired into the confirmation gate"
+        src.contains(required),
+        "constant-time compare not wired into the confirmation gate"
     );
 }
 
@@ -229,14 +234,16 @@ use crate::network::timing_safe_compare;
 Replace the equality compare at `elevated.rs:170` (inside `matches_confirmation`):
 
 ```rust
-// before:  (Some(c), Some(t)) => c.token == t && c.action == action,
+// before: this arm compared the tokens with the `==` operator (do NOT
+// reproduce the old expression anywhere in this file, even in a comment --
+// the Step 5 grep falsifier requires zero matches)
 (Some(c), Some(t)) => timing_safe_compare(&c.token, t) && c.action == action,
 ```
 
 Replace the equality guard at `elevated.rs:194` (inside `consume_current_confirmation`):
 
 ```rust
-// before:  (Some(c), Some(t)) if c.token == t => {
+// before: this guard compared the tokens with the `==` operator
 (Some(c), Some(t)) if timing_safe_compare(&c.token, t) => {
 ```
 
@@ -514,7 +521,7 @@ plus NET-01/03/08.
 
 **Files:**
 - Create: `crates/freshell-server/src/net_bind.rs`
-- Modify: `crates/freshell-server/Cargo.toml` (add `socket2 = "0.6"`)
+- Modify: `crates/freshell-server/Cargo.toml` (add `socket2 = { version = "0.6", features = ["all"] }`)
 - Modify: `crates/freshell-server/src/main.rs` (add `mod net_bind;` near the other `mod` declarations)
 - Test: `crates/freshell-server/src/net_bind.rs` `#[cfg(test)] mod tests`
 
@@ -531,15 +538,20 @@ plus NET-01/03/08.
 Edit `crates/freshell-server/Cargo.toml`, in `[dependencies]`:
 
 ```toml
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
 tower = { version = "0.5", features = ["util"] }
 ```
 
-All four already resolve in `Cargo.lock` (socket2 0.6.4 via `freshell-ws`;
-hyper/hyper-util/tower via axum). `tower` may already sit in
-`[dev-dependencies]` — having it in both sections is legal; leave the dev line.
+All four VERSIONS already resolve in `Cargo.lock` (socket2 0.6.4 via
+`freshell-ws`'s dev-dependencies; hyper/hyper-util/tower via axum), but
+`features = ["all"]` on socket2 is REQUIRED here: `Socket::set_reuse_port`
+is gated behind the `all` feature, socket2 ships no default features, and a
+dependency's dev-dependencies do NOT unify features into this crate's build.
+Without it, `bind_reusable` fails to compile (`no method named
+set_reuse_port`). `tower` may already sit in `[dev-dependencies]` — having
+it in both sections is legal; leave the dev line.
 
 Run: `cargo build -p freshell-server 2>&1 | tail -5`.
 
@@ -1716,9 +1728,14 @@ fn on_non_windows_the_live_runner_is_unsupported_and_never_spawns() {
 
 #[test]
 fn source_only_constructs_real_under_cfg_windows() {
+    // Needles are concat!-split so this test's OWN source never satisfies the
+    // contains() checks -- the assertions genuinely inspect the implementation
+    // code elsewhere in this file instead of passing vacuously.
     let src = include_str!("elevated.rs");
-    assert!(src.contains("#[cfg(windows)]"), "ElevationRunner::Real must be cfg(windows)-gated");
-    assert!(src.contains("ElevationRunner::Unsupported"));
+    let cfg_gate = concat!("#[cfg(", "windows)]");
+    let unsupported = concat!("ElevationRunner::", "Unsupported");
+    assert!(src.contains(cfg_gate), "the Real elevation runner must be cfg(windows)-gated");
+    assert!(src.contains(unsupported), "Unsupported variant missing from elevated.rs");
 }
 
 #[test]
@@ -2411,7 +2428,10 @@ tier_b() { # returns "200" (reachable => 0.0.0.0-bound) or "REFUSED"
   (`configured, host, remoteAccessEnabled, remoteAccessRequested,
   remoteAccessNeedsRepair, port, lanIps, machineHostname, firewall{platform,
   active, portOpen, commands, configuring}, rebinding, devMode, accessUrl`), and
-  content-type `application/json; charset=utf-8`.
+  content-type exactly `application/json` — no charset parameter: axum's
+  `Json` responder emits none, and the repo's own Slice-1 test pins this
+  (`assert_eq!(content_type, "application/json")`,
+  `crates/freshell-server/src/network.rs:791`).
 - **Phase 3 — expose:** `api POST /api/network/configure '{"host":"0.0.0.0","configured":true}'`
   → 200; status `host=="0.0.0.0"`, `configured==true`, `rebindScheduled==false`;
   `firewall.portOpen==null` and `remoteAccessEnabled==false` — VALIDATED truth at
