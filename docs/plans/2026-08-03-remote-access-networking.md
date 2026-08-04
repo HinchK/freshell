@@ -1145,7 +1145,7 @@ Commit message: `feat(net): boot bind honors persisted settings.network (restart
 2. Parse body into the enum-typed request. Failure → **400 `{"error":"Invalid request","details":[...]}`**. `host` accepts ONLY `"127.0.0.1"`/`"0.0.0.0"` (decoded into a Rust enum — the NET-08 arbitrary-host defense made structural). Schema is NON-strict (unknown keys ignored, matching `NetworkConfigureSchema`).
 3. Acquire `state.net_mutation.lock().await` and hold the guard through step 6 (A-08 serialization — the TS serialized rebinds via its `pendingRebindConfig` queue; we serialize via one mutex). Then compute `host_changed` from the LIVE bind (`BindState::get()`). **DEVIATION (ledgered, Task 6.1 #7):** the TS forces `host_changed=false` on wsl2 (`network-manager.ts:412-413`) because its WSL exposure rides Windows portproxy and the listener always stays on 0.0.0.0. Our port binds truthfully on every platform, and the tier-b bind-address truth test plus the NET-06 disable (which really rebinds to loopback on this WSL2 host) require the symmetric re-expose to really rebind too — so wsl2 rebinds like every other platform.
 4. If `host_changed`: `rebind.serve_on(new_ip)` — binds+proves the new listener FIRST. On `Err` → **500 `{"error":"Failed to configure network"}`, nothing persisted, old listener untouched**.
-5. Persist `{network:{host, configured}}` via `settings.patch(...)` (NET-09 rides the store; no new writer). On patch error propagate `(status, body)`.
+5. Persist `{network:{host, configured}}` via `settings.patch(...)` (NET-09 rides the store; no new writer). On patch error: if the listener was already swapped (`host_changed`), ROLL IT BACK with `rebind.serve_on(old_ip)` BEFORE propagating `(status, body)` — persisted state must never outrun reality (NET-02); the frozen TS has the mirror-image revert (`network-manager.ts:474-505`). If the rollback bind itself fails, keep status truthful anyway (`bind.set(new_host)`) and log a CATASTROPHIC error. Either way `facts.invalidate()` before returning the error.
 6. `facts.invalidate()`, `bind.set(new_host)`.
 7. Build settled status, respond `{...status, "rebindScheduled": false}`.
 8. AFTER responding, broadcast `settings.updated` with the full merged tree.
@@ -1216,12 +1216,56 @@ async fn configure_requires_auth() {
         .await.unwrap();
     assert_eq!(resp.status(), 401);
 }
+
+#[tokio::test]
+async fn configure_rolls_back_the_listener_when_persist_fails() {
+    // NET-02 falsifier (Task 6.1 #9): a persist failure AFTER a successful swap
+    // must roll the LISTENER back so reality keeps matching the (unchanged)
+    // persisted config and BindState. Detector: a 127.0.0.1-bound listener
+    // rejects connects to 127.0.0.2; a 0.0.0.0-bound one accepts them.
+    // Persist failure is forced through the store's own error path: a
+    // file-backed settings store under a HOME whose .freshell dir is read-only.
+    // FIRST read settings_store.rs and confirm persist errors propagate out of
+    // SettingsStore::patch as Err((status, body)); if they are swallowed today,
+    // make them propagate in this task (load-bearing for NET-02/NET-09).
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".freshell")).unwrap();
+    let state = test_state_with_home("127.0.0.1", Some(true), home.path());
+    seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+    let port = serve_real_test_app_on_loopback(&state).await;
+    let mut perms = std::fs::metadata(home.path().join(".freshell")).unwrap().permissions();
+    perms.set_mode(0o555); // read-only dir => the atomic tmp+rename persist fails
+    std::fs::set_permissions(home.path().join(".freshell"), perms).unwrap();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#)).unwrap())
+        .await.unwrap();
+    assert!(resp.status().is_server_error(), "persist failure must surface");
+    // Rollback proof: the wildcard listener must be GONE (127.0.0.2 refused),
+    // loopback still serves, and neither BindState nor settings claim 0.0.0.0.
+    assert!(tokio::net::TcpStream::connect(("127.0.0.2", port)).await.is_err(),
+        "listener left on 0.0.0.0 after failed persist (no rollback)");
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+    assert_eq!(state.bind.get().await, "127.0.0.1");
+    let s = state.settings.get().await;
+    assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "127.0.0.1");
+}
 ```
 
 These unit tests exercise persistence + validation + wire shape without a live
 listener: `test_state`'s controller has no app injected, so `serve_on` returns
 `Ok(())` immediately (the seam added in Task 2.1). Real bind-address truth is
-proven by the harness at tier b (Task 5.2).
+proven by the harness at tier b (Task 5.2). The EXCEPTION is the rollback test,
+which needs a real listener and a file-backed store. Add two small test helpers
+next to `test_state`: `test_state_with_home(host, configured, home)` — identical
+to `test_state` but its settings store persists under `home` — and
+`async fn serve_real_test_app_on_loopback(&state) -> u16` — constructs the
+state's `RebindController` on an ephemeral free port, injects the same hello
+`Router` Task 2.1's tests use (`set_app`), calls `serve_on(127.0.0.1)`, and
+returns the port.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1304,7 +1348,29 @@ async fn configure(
     let patch = json!({ "network": { "host": new_host, "configured": req.configured } });
     let merged = match state.settings.patch(&patch).await {
         Ok(m) => m,
-        Err((status, body)) => return (status, Json(body)).into_response(),
+        Err((status, body)) => {
+            // Persist failed AFTER the live swap: roll the LISTENER back so
+            // reality re-matches the (unchanged) persisted config + BindState
+            // (NET-02 "persisted state never outruns reality"; the frozen TS
+            // revert is network-manager.ts:474-505).
+            if host_changed {
+                let old_ip: std::net::IpAddr = live_host
+                    .parse()
+                    .expect("BindState only ever holds enum-validated IP literals");
+                if state.rebind.serve_on(old_ip).await.is_err() {
+                    // Rollback bind failed: the live listener stays on new_host.
+                    // Keep status TRUTHFUL anyway and log loudly; the persisted
+                    // file is stale until the next successful mutation.
+                    state.bind.set(new_host.clone()).await;
+                    tracing::error!(
+                        "CATASTROPHIC: persist failed and rollback rebind failed; \
+                         live listener on {new_host} contradicts persisted config"
+                    );
+                }
+                state.facts.invalidate().await;
+            }
+            return (status, Json(body)).into_response();
+        }
     };
     state.facts.invalidate().await;
     if host_changed {
@@ -1327,7 +1393,7 @@ probe/facts logic).
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server network::tests 2>&1 | tail -20`
-Expected: the three new `configure_*` tests PASS; all Slice-1 route tests still PASS.
+Expected: the four new `configure_*` tests PASS (rollback test included); all Slice-1 route tests still PASS.
 
 - [ ] **Step 5: Falsifier + commit**
 
@@ -1352,13 +1418,13 @@ Commit message: `feat(net): POST /api/network/configure with transactional rebin
 - Consumes: same as Task 2.3, plus `is_remote_access_enabled` (freshell-platform network), `is_wsl_port_forwarding_disabled_by_env`.
 - Produces: route `POST /api/network/disable-remote-access`; a `#[derive(Deserialize)] #[serde(rename_all="camelCase", deny_unknown_fields)] pub(crate) struct ConfirmFirewallRequest { confirm_elevation: Option<bool>, confirmation_token: Option<String> }` (strict; `confirm_elevation != Some(false)`; `confirmation_token` non-empty when present).
 
-**Behavior (matches `network-router.ts:448-615` + `applyRemoteAccessDisabledState` `:119-132`, Linux lane; Windows/WSL2 elevation is HOST-BLOCKED here and returns the confirmation data without elevating — full flow in Slice 3):**
+**Behavior (matches `network-router.ts:448-615` + `applyRemoteAccessDisabledState` `:119-132`, Linux lane; Windows/WSL2 lanes return placeholder confirmation data here WITHOUT elevating — the full gate-issued protocol lands in Task 3.3, which REPLACES that placeholder; only the live elevated side effect is HOST-BLOCKED):**
 
 1. Auth → 401.
 2. Strict-parse → 400 on unknown key / `confirmElevation:false` / empty `confirmationToken`.
 3. (409 in-flight lock pre-check added in Task 3.3 when the gate is wired.)
 4. Acquire `state.net_mutation.lock().await` (held through the rebind + persist — A-08), then resolve the disable action from the live platform:
-   - **Native Linux / macOS (this host's non-WSL path):** `{method:"none", message:...}`; when remote access WAS requested, apply the disabled state (rebind to `127.0.0.1` + persist `{host:"127.0.0.1",configured:true}` + broadcast). This IS the live retract (NET-06).
+   - **Native Linux / macOS (this host's non-WSL path):** `{method:"none", message:...}`; when remote access WAS requested, apply the disabled state (rebind to `127.0.0.1` + persist `{host:"127.0.0.1",configured:true}` + broadcast). This IS the live retract (NET-06). If the persist fails AFTER the loopback swap: FAIL-SAFE — never re-expose on an error path; keep the loopback listener, `bind.set("127.0.0.1")` so status reports reality, `facts.invalidate()`, and propagate the error (ledgered deviation, Task 6.1 #9).
    - **WSL2 with `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`:** same Linux path (deterministic, zero `netsh`). Otherwise return the `confirmation-required` body WITHOUT elevating (HOST-BLOCKED). Never elevate here.
 5. Message strings are the control signal — EXACT constants (`network-router.ts:40-48`), modeled as an enum discriminant, not a free string:
    - `"Remote access is not enabled"` / `"Remote access disabled"`.
@@ -1430,6 +1496,33 @@ async fn concurrent_configure_and_disable_serialize_to_a_consistent_end_state() 
     let live = state.bind.get().await;
     assert_eq!(persisted, serde_json::json!(live),
         "persisted host desynced from live bind (A-08)");
+}
+
+#[tokio::test]
+async fn disable_keeps_loopback_and_reports_error_when_persist_fails() {
+    // FAIL-SAFE counterpart of Task 2.3's rollback test (Task 6.1 #9): when the
+    // persist fails AFTER the loopback swap, disable must NOT roll back toward
+    // exposure — loopback listener kept, BindState truthful, error surfaced.
+    // Same read-only-.freshell persist-failure injection and test_state_with_home
+    // helper as Task 2.3.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".freshell")).unwrap();
+    let state = test_state_with_home("0.0.0.0", Some(true), home.path());
+    seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+    let _ = state.settings.patch(&serde_json::json!({"network":{"host":"0.0.0.0","configured":true}})).await.unwrap();
+    let mut perms = std::fs::metadata(home.path().join(".freshell")).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(home.path().join(".freshell"), perms).unwrap();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    assert!(resp.status().is_server_error(), "persist failure must surface");
+    // Truthful + fail-safe: BindState reports the loopback reality; only the
+    // persisted file is stale (and the client got an error saying so).
+    assert_eq!(state.bind.get().await, "127.0.0.1");
 }
 ```
 
@@ -1518,7 +1611,15 @@ async fn disable_remote_access(
             let merged = match state.settings
                 .patch(&json!({"network":{"host":"127.0.0.1","configured":true}})).await {
                 Ok(m) => m,
-                Err((s,b)) => return (s, Json(b)).into_response(),
+                Err((s, b)) => {
+                    // Persist failed AFTER the loopback swap. FAIL-SAFE: never
+                    // roll back toward exposure on an error path — keep the
+                    // loopback listener, make status truthful, surface the
+                    // error (deviation from the TS revert-persist; Task 6.1 #9).
+                    state.bind.set("127.0.0.1").await;
+                    state.facts.invalidate().await;
+                    return (s, Json(b)).into_response();
+                }
             };
             state.facts.invalidate().await;
             state.bind.set("127.0.0.1").await;
@@ -1531,7 +1632,12 @@ async fn disable_remote_access(
             Json(json!({"method":"none","message":DisableNone::NotEnabled.message()}))).into_response();
     }
 
-    // Windows or WSL2-needing-elevation: HOST-BLOCKED (Slice 3 wires the gate here).
+    // Windows or WSL2-needing-elevation: TEMPORARY Slice-2 placeholder. The
+    // token below is throwaway (NOT stored in any gate) and MUST NOT survive
+    // Slice 3: Task 3.3 REPLACES this whole block with the gate-issued,
+    // action-bound confirmation + confirmed-dispatch flow (windows-disable /
+    // wsl2-disable lanes). Only the live elevated side effect stays
+    // HOST-BLOCKED (Task 3.6).
     (axum::http::StatusCode::OK, Json(json!({
         "method":"confirmation-required",
         "title":"Administrator approval required",
@@ -1549,7 +1655,7 @@ never diverge.
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server network::tests 2>&1 | tail -20`
-Expected: the three new `disable_*` tests PASS; all prior tests PASS.
+Expected: the four new `disable_*` tests PASS (persist-failure fail-safe included); all prior tests PASS.
 
 - [ ] **Step 5: Falsifier + commit**
 
@@ -1914,16 +2020,16 @@ git commit  # paste falsifier output
 
 Commit message: `feat(net): instance-scoped managed-ports persistence (fixes D15/D16)`
 
-## Task 3.3: `POST /api/network/configure-firewall` — confirmation protocol + 409 lock
+## Task 3.3: `POST /api/network/configure-firewall` + confirmed disable lanes — confirmation protocol + 409 lock
 
 **Files:**
-- Modify: `crates/freshell-server/src/network.rs` — add `Arc<tokio::sync::Mutex<ConfirmationGate>>` to `NetworkState`; add the route + handler + the SHARED action-resolution ladder; wire the disable 409 pre-check placeholder from Task 2.4
-- Modify: `crates/freshell-server/src/main.rs:900-907` (construct the gate)
+- Modify: `crates/freshell-server/src/network.rs` — add `Arc<tokio::sync::Mutex<ConfirmationGate>>` + `managed_ports` to `NetworkState`; add the route + handler + the SHARED action-resolution ladder; REPLACE Task 2.4's disable placeholder (409 pre-check + throwaway-token block) with the full gate-issued disable flow
+- Modify: `crates/freshell-server/src/main.rs:900-907` (construct the gate + the managed-ports store — read Task 3.2's constructor signature; use the real home, cwd and port)
 - Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests`
 
 **Interfaces:**
 - Consumes: `freshell_platform::elevated::{ConfirmationGate, ConfirmationAction, ElevationDecision, elevation_runner_live, spawn_via, ElevationOutcome}`, `ManagedPortsStore`, `port_forward` planners (Ipv4Addr), `firewall::firewall_commands`.
-- Produces: `NetworkState.gate: Arc<tokio::sync::Mutex<ConfirmationGate>>`; route `POST /api/network/configure-firewall`; handler `configure_firewall`; separate `RepairAction` and `DisableAction` enums (fixes D19 — the unreachable `terminal`-on-disable state is unrepresentable).
+- Produces: `NetworkState.gate: Arc<tokio::sync::Mutex<ConfirmationGate>>`; `NetworkState.managed_ports: Arc<ManagedPortsStore>` (the File Structure table's promised wiring); route `POST /api/network/configure-firewall`; handler `configure_firewall`; the full confirmed disable protocol (`windows-disable`/`wsl2-disable` lanes, replacing the Task-2.4 placeholder); separate `RepairAction` and `DisableAction` enums (fixes D19 — the unreachable `terminal`-on-disable state is unrepresentable).
 
 **Behavior (matches `network-router.ts:617-758` + the confirmation protocol `:89-262`; `src/lib/firewall-configure.ts:3-14` is the authoritative client union):**
 
@@ -1937,6 +2043,10 @@ Commit message: `feat(net): instance-scoped managed-ports persistence (fixes D15
 4. Confirmable + no/mismatched token → **200 `confirmation-required`** with a fresh UUID bound to the action; NO OS call (`gate.issue_confirmation(action, &uuid)`).
 5. Confirmable + matching token → `gate.try_acquire_repair_lock()` (lose → 409) → RE-RESOLVE the action under the lock (TOCTOU guard `:672-700`); fresh action differs ⇒ release + re-issue a new token; else `gate.consume_confirmation(token, action)` (single-use, constant-time via Slice 0) → dispatch via `spawn_via(&runner, command, script)` where `runner = elevation_runner_live()` in production (Unsupported off Windows) or an injected `Fake` in tests → on `Started` persist managed ports + respond `{method, status:"started"}`; on failure outcomes release the lock, `configuring=false`, NO persisted success (NET-07).
 6. Broadcast `settings.updated` only when settings actually changed.
+7. **Confirmed disable lanes (REPLACES the Task-2.4 placeholder; matches `network-router.ts:448-615`):** `resolve_disable_action` ports `resolveRemoteAccessDisableAction` (`:322-378`). Plain `{method:"none",message}` outcomes stay exactly as Task 2.4 built them. Confirmable **`windows-disable`** = managed Windows ports non-empty; script = `build_windows_firewall_delete_commands(managed_ports).join("; ")`; response method `"windows-elevated"`. Confirmable **`wsl2-disable`** = teardown plan `ready`; script = the teardown plan's script; response method `"wsl2"`.
+   - Confirmable + no/mismatched token → **200 `confirmation-required`** (same body shape as step 4) via `gate.issue_confirmation(action, &uuid)` — gate-stored and action-bound, never Task 2.4's throwaway.
+   - Confirmable + matching token → `gate.try_acquire_repair_lock()` (lose → the step-2 409) → RE-RESOLVE the disable action under the lock (TOCTOU, `:507-512`); action changed ⇒ release + re-issue a fresh token with **200** (never 4xx); else `gate.consume_confirmation(token, action)` → dispatch via `spawn_via(&runner, ...)` exactly as step 5 (fake-backed in tests; `elevation_runner_live()` is `Unsupported` off Windows — the live elevated effect stays HOST-BLOCKED, Task 3.6).
+   - On `Started`: apply the disabled state (port of `applyRemoteAccessDisabledState` `:119-132` + truthful-bind deviation #6): `rebind.serve_on(127.0.0.1)` + persist `{host:"127.0.0.1","configured":true}` (persist-failure handling identical to Task 2.4's fail-safe) + `bind.set("127.0.0.1")` + `facts.invalidate()` + broadcast; then clear the lane's managed ports via `state.managed_ports` (clear errors logged, not fatal — the TS swallows them too). Respond **200 `{"method":"windows-elevated"|"wsl2","status":"started"}`** (`:588-590`). Failure outcomes release the lock and persist nothing (NET-07), mirroring step 5.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1989,11 +2099,82 @@ async fn configure_firewall_requires_auth_and_strict_body() {
         .body(Body::from(r#"{"confirmElevation":false}"#)).unwrap()).await.unwrap();
     assert_eq!(r.status(), 400);
 }
+
+#[tokio::test]
+async fn disable_windows_lane_issues_confirmation_with_exact_contract_body() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, _fake) = test_state_disable_confirmable();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "confirmation-required");
+    assert_eq!(body["title"], "Administrator approval required");
+    assert_eq!(body["body"], "To complete this, you will need to accept the Windows administrator prompt on the next screen.");
+    assert_eq!(body["confirmLabel"], "Continue");
+    assert!(body["confirmationToken"].as_str().unwrap().len() > 0);
+}
+
+#[tokio::test]
+async fn disable_confirmed_repost_dispatches_and_applies_disabled_state() {
+    // THE protocol proof that the token is GATE-stored: with Task 2.4's
+    // throwaway uuid a confirmed re-POST would loop on confirmation-required
+    // forever and this test could never observe a dispatch.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_disable_confirmable(); // fake classifies Started
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "windows-elevated");
+    assert_eq!(body["status"], "started");
+    assert_eq!(fake.call_count(), 1, "exactly one elevated dispatch");
+    let s = state.settings.get().await;
+    assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "127.0.0.1");
+    assert_eq!(state.bind.get().await, "127.0.0.1");
+    assert!(state.managed_ports.read_windows().is_empty(), "managed ports cleared");
+}
+
+#[tokio::test]
+async fn disable_stale_token_reissues_fresh_confirmation_and_never_dispatches() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_disable_confirmable();
+    let bogus = uuid::Uuid::new_v4().to_string();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{bogus}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "confirmation-required");
+    assert_ne!(body["confirmationToken"].as_str().unwrap(), bogus);
+    assert_eq!(fake.call_count(), 0, "no dispatch on a mismatched token");
+    let s = state.settings.get().await;
+    assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "0.0.0.0", "settings untouched");
+}
 ```
 
 Add `fn test_state_firewall_confirmable()` seeding `NetworkFactsCache` with
 Windows-active facts + closed port (so the ladder yields a confirmable
-`windows-repair`) and constructing the new `gate` field.
+`windows-repair`) and constructing the new `gate` + `managed_ports` fields.
+Add `fn test_state_disable_confirmable() -> (NetworkState, /* fake handle */)`:
+Windows-active facts, bind AND persisted settings at `0.0.0.0`/`configured:true`
+(the enabled precondition the resolver checks first), a `managed_ports` store on
+a tempdir home with ONE persisted port (so the ladder yields a confirmable
+`windows-disable`), and the Task-3.3 runner seam wired to a `FakeCommandRunner`
+whose rule classifies the elevated dispatch as `Started`; return the fake so
+tests can assert `call_count()`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2007,16 +2188,23 @@ Expected: compile/404 — field + route absent.
     /// Confirmation/elevation state machine (one outstanding action-bound token,
     /// in-progress lock). Shared by configure-firewall AND disable-remote-access.
     pub gate: std::sync::Arc<tokio::sync::Mutex<freshell_platform::elevated::ConfirmationGate>>,
+    /// Instance-scoped managed-ports persistence (Task 3.2). Consumed by the
+    /// confirmed disable lanes and the step-5 Started persist.
+    pub managed_ports: std::sync::Arc<crate::managed_ports::ManagedPortsStore>,
 ```
 `main.rs:900-907`: `gate: Arc::new(tokio::sync::Mutex::new(freshell_platform::elevated::ConfirmationGate::new())),`
-and the `test_state` helpers construct it too.
+plus `managed_ports: Arc::new(/* Task 3.2 constructor: real home, cwd, port */)`,
+and the `test_state` helpers construct both too.
 
 Register `.route("/api/network/configure-firewall", post(configure_firewall))`.
-Implement `configure_firewall` per the 6-step behavior. Extract resolution into
+Implement `configure_firewall` per behavior steps 1-6. Extract resolution into
 `async fn resolve_repair_action(state) -> RepairAction` and
 `async fn resolve_disable_action(state) -> DisableAction` (SEPARATE enums — fixes
-D19). Wire the disable handler's 409 pre-check (`gate.is_repair_in_flight()`)
-into the Task-2.4 placeholder. Use `uuid::Uuid::new_v4().to_string()` for tokens.
+D19). REWRITE `disable_remote_access`'s non-Linux tail per behavior step 7: wire
+the 409 pre-check (`gate.is_repair_in_flight()`), DELETE the Slice-2
+throwaway-token block, and implement issue → re-resolve-under-lock → consume →
+dispatch → apply-disabled-state through the same gate + runner seam as
+`configure_firewall`. Use `uuid::Uuid::new_v4().to_string()` for tokens.
 Dispatch via a small `fn elevation_runner_for(state) -> ElevationRunner` returning
 `elevation_runner_live()` in production and a test-injected `Fake` under
 `#[cfg(test)]` (or expose a gate/dispatch helper the tests call directly). Persist
@@ -2028,7 +2216,7 @@ Tasks 2.3/2.4 (A-08).
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server network::tests 2>&1 | tail -30`
-Expected: new `configure_firewall_*` tests PASS; all prior tests PASS.
+Expected: new `configure_firewall_*` AND `disable_*` protocol tests PASS; all prior tests PASS.
 
 - [ ] **Step 5: Falsifier + commit**
 
@@ -2042,7 +2230,7 @@ git add crates/freshell-server/src/network.rs crates/freshell-server/src/main.rs
 git commit  # paste falsifier output
 ```
 
-Commit message: `feat(net): POST /api/network/configure-firewall — confirmation protocol + 409 lock (NET-04 wire)`
+Commit message: `feat(net): configure-firewall + confirmed disable lanes — confirmation protocol + 409 lock (NET-04/06 wire)`
 
 ## Task 3.4: Wire `stale` managed-Windows-ports + WSL2 plan assembly behind fakes (NET-04/05)
 
@@ -2215,7 +2403,7 @@ Create the file documenting, per requirement:
   - `crates/freshell-platform/src/elevated.rs`: `elevated_args_golden_no_quotes`, `on_non_windows_the_live_runner_is_unsupported_and_never_spawns`, `fake_runner_dispatch_classifies_outcomes`, `source_only_constructs_real_under_cfg_windows`.
   - `crates/freshell-platform/src/firewall.rs`: the add/delete/repair goldens + `delete_commands_never_touch_unrelated_or_freshelllanaccess_rules`.
   - `crates/freshell-platform/src/port_forward.rs`: the WSL script goldens + `plan_sees_preexisting_3001_rule_as_satisfied_and_emits_no_add_for_it`.
-  - `crates/freshell-server/src/network.rs`: `configure_firewall_*`, `elevation_denial_releases_lock_and_persists_no_success`, `no_real_os_mutation_command_reaches_a_runner`.
+  - `crates/freshell-server/src/network.rs`: `configure_firewall_*`, `disable_windows_lane_issues_confirmation_with_exact_contract_body`, `disable_confirmed_repost_dispatches_and_applies_disabled_state`, `disable_stale_token_reissues_fresh_confirmation_and_never_dispatches`, `elevation_denial_releases_lock_and_persists_no_success`, `no_real_os_mutation_command_reaches_a_runner`.
 - A statement that these boxes stay UNCHECKED in the parity checklist; the live
   effect is unexecuted BY DESIGN.
 
@@ -2341,8 +2529,10 @@ JSON
   for k in sessionOverrides terminalOverrides serverSecrets completedMigrations recentDirectories projectColors someUnknownFutureKey; do
     eval "SHA_$k=\"$(jq -c ".$k" "$HOME_DIR/.freshell/config.json" | sha256sum | cut -d' ' -f1)\""
   done
-  # read-only host network state for the Phase-7 identity diff
+  # read-only host network state for the Phase-7 identity diff — BOTH halves:
+  # the portproxy table AND the FreshellLANAccess firewall rule (Phase 7 diffs each)
   HOST_STATE_BEFORE="$(powershell.exe -NoProfile -Command 'netsh interface portproxy show all' 2>/dev/null || true)"
+  FIREWALL_STATE_BEFORE="$(powershell.exe -NoProfile -Command 'netsh advfirewall firewall show rule name=FreshellLANAccess' 2>/dev/null || true)"
 }
 
 phase1_boot() {
@@ -2595,9 +2785,11 @@ cleanup() {
 
 Phase 7 proper:
 - Assert no listener remains on `$PORT` (`ss -ltn | grep -q ":$PORT " && fail_required "listener leaked"`).
-- **Safety self-proof:** re-run read-only `netsh interface portproxy show all` and
-  `netsh advfirewall firewall show rule name=FreshellLANAccess`, diff against the
-  Phase-0 capture — MUST be identical → `host_state_unchanged`.
+- **Safety self-proof:** re-run BOTH read-only captures — `netsh interface portproxy show all`
+  and `netsh advfirewall firewall show rule name=FreshellLANAccess` — and diff each
+  against its own Phase-0 baseline (`HOST_STATE_BEFORE` and `FIREWALL_STATE_BEFORE`,
+  both captured in Task 5.1's `phase0_preflight`). Both MUST be identical →
+  `HOST_STATE_UNCHANGED=1`; any difference → `HOST_STATE_UNCHANGED=0` + `fail_required`.
 - **Tier-c gating:** unconditional read-only sanity control
   `ssh -o BatchMode=yes -o ConnectTimeout=8 shapiroserver2 "curl -s -o /dev/null -w '%{http_code}' --max-time 6 http://192.168.3.50:3001/api/health"`
   (record; non-200 → `tier_c_vantage: unavailable`, a NOTE not a failure). When not
@@ -2703,6 +2895,17 @@ leaving an unreachable `terminal`-on-disable state representable.
    `0.0.0.0` → `HOST` → `127.0.0.1`; unconfigured WSL keeps the wildcard
    default. pinning_test: `wsl_with_configured_host_outranks_wsl_default` +
    `wsl_unconfigured_keeps_wildcard_default` + harness Phase 5.
+9. **Fail-safe persist-failure handling on the mutation endpoints** —
+   objective_defect: `server/network-manager.ts:501-503` swallows a failed
+   revert-persist after a rebind rollback (listener and config silently diverge;
+   the client is never told), and the TS disable path has no revert at all.
+   port_behavior: `configure` rolls the LISTENER back when the persist fails
+   after a successful swap (reality re-matches the unchanged config; if the
+   rollback bind itself fails, `bind` stays truthful and a CATASTROPHIC error is
+   logged); `disable-remote-access` NEVER re-exposes on an error path — it keeps
+   the loopback listener, sets `bind` truthfully, and surfaces the error.
+   pinning_test: `configure_rolls_back_the_listener_when_persist_fails` +
+   `disable_keeps_loopback_and_reports_error_when_persist_fails`.
 
 - [ ] **Step 2: Commit**
 
@@ -2762,11 +2965,11 @@ NET-04/05/07 are recorded HOST-BLOCKED and left unchecked in the parity checklis
 | Requirement | Covering task(s) | Observable production outcome (no stub) |
 |---|---|---|
 | NET-01 complete live status | Slice 1 (landed) + Task 3.4 (`stale` unhardcoded) | `GET /api/network/status` returns full `NetworkStatus`; harness Phase 2 asserts every key |
-| NET-02 transactional rebind | 0.3, 2.1, 2.2b, 2.3 | `configure` binds+proves the new listener before persist (and `serve_on` returns only after the old socket is provably closed); boot honors persisted host across restart (platform precedence fixed in 0.3); harness Phase 3 tier-b 200; squatter + 100-swap unit tests prove rollback and drain |
+| NET-02 transactional rebind | 0.3, 2.1, 2.2b, 2.3 | `configure` binds+proves the new listener before persist (and `serve_on` returns only after the old socket is provably closed); boot honors persisted host across restart (platform precedence fixed in 0.3); harness Phase 3 tier-b 200; squatter + 100-swap unit tests prove rollback and drain; persist-failure listener rollback pinned by `configure_rolls_back_the_listener_when_persist_fails` |
 | NET-03 share URL, token never logged | Slice 1 (`accessUrl`) + harness Phase 6 token-scan | harness greps `server.log` for the token → absent |
 | NET-04 Windows firewall configure/repair | 3.1, 3.3, 3.4, 3.5 | golden strings + fake-backed behavior + compile-time unreachability; **HOST-BLOCKED live effect, evidenced 3.6** |
 | NET-05 WSL2 forwarding | 3.4 | golden plan from real captured portproxy; **HOST-BLOCKED live effect, evidenced 3.6** |
-| NET-06 safe disable | 2.4 | `disable-remote-access` live retract on Linux; harness Phase 4 tier-b REFUSED, tier-a still 200 |
+| NET-06 safe disable | 2.4, 3.3 | `disable-remote-access` live retract on Linux (+ fail-safe persist-failure path); gate-issued confirmed windows/wsl2 disable lanes fake-backed in 3.3; harness Phase 4 tier-b REFUSED, tier-a still 200 |
 | NET-07 elevation faults | 3.1, 3.5 | four outcome tests: lock released, `configuring=false`, no false persist; **HOST-BLOCKED live effect, evidenced 3.6** |
 | NET-08 secure every mutation | 2.3, 2.4, 3.3, 3.5 + harness Phase 6 | live negative matrix (auth/schema/host-enum/injection/degraded-token cases, each zero-side-effect-checked) + structural Rust tests (enum host, Ipv4Addr, call_count 0, token replay/wrong-action/parallel-409 — live-unreachable on this host, ledger A-06) |
 | NET-09 lossless writes | 2.3, 2.4, 2.5 | mutations go through `settings.patch`; black-box + harness Phase 5 per-key sha preservation |
@@ -2798,9 +3001,9 @@ concrete instruction, not a placeholder.
 
 - `RebindController` methods (`new`, `set_app`, `has_app`, `serve_on`,
   `shutdown_all`) are named identically across Tasks 2.1–2.4.
-- `NetworkState` new fields (`broadcast_tx`, `rebind`, `net_mutation`, `gate`)
-  are introduced in 2.2 / 3.3 and every later `test_state` update and handler
-  references the same names. `net_mutation` (the A-08 serialization lock) is
+- `NetworkState` new fields (`broadcast_tx`, `rebind`, `net_mutation`, `gate`,
+  `managed_ports`) are introduced in 2.2 / 3.3 and every later `test_state`
+  update and handler references the same names. `net_mutation` (the A-08 serialization lock) is
   acquired in 2.3 / 2.4 / 3.3 with the same held-through-persist contract;
   `LiveListener` is internal to `net_bind.rs`.
 - `ConfirmFirewallRequest` (strict) is defined in 2.4 and reused in 3.3.
