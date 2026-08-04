@@ -139,6 +139,7 @@ async fn candidate_dirs(State(state): State<FilesState>, headers: HeaderMap) -> 
 /// Windows-flavor inputs (e.g. `C:\`) resolve through the WSL drive mount when
 /// running in WSL (path-utils.ts isReachableDirectory parity); on non-WSL hosts
 /// they are unaddressable and report valid:false.
+/// With allowedFilePaths configured, targets outside the roots are rejected 403 like every other files endpoint (Node applies validatePath to this route — files-router.ts:232; closing a formerly-unexplained Rust parity gap).
 async fn validate_dir(
     State(state): State<FilesState>,
     headers: HeaderMap,
@@ -159,6 +160,13 @@ async fn validate_dir(
     }
 
     let resolved = resolve_user_path(trimmed);
+    let settings = state.settings.get().await;
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
+        return forbidden();
+    }
     let is_dir = resolved
         .fs_path
         .as_deref()
@@ -189,11 +197,18 @@ async fn read_file(
     let Some(path) = q.path.filter(|p| !p.is_empty()) else {
         return bad_request("path query parameter required");
     };
-    let resolved = normalize_user_path(&path);
+    let resolved = resolve_user_path(&path);
     let settings = state.settings.get().await;
-    if !is_path_allowed(&resolved, settings.allowed_file_paths.as_deref()) {
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
         return forbidden();
     }
+    // Node's toFilesystemPath fallthrough (`path-utils.ts:208-215`): an
+    // unaddressable input keeps its literal display string as the fs path,
+    // so the stat below fails naturally on non-WSL hosts.
+    let resolved = resolved.fs_path.unwrap_or(resolved.display);
     match std::fs::metadata(&resolved) {
         Ok(meta) if meta.is_dir() => bad_request("Cannot read directory"),
         Ok(meta) => match std::fs::read(&resolved) {
@@ -228,11 +243,16 @@ async fn stat_file(
     let Some(path) = q.path.filter(|p| !p.is_empty()) else {
         return bad_request("path query parameter required");
     };
-    let resolved = normalize_user_path(&path);
+    let resolved = resolve_user_path(&path);
     let settings = state.settings.get().await;
-    if !is_path_allowed(&resolved, settings.allowed_file_paths.as_deref()) {
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
         return forbidden();
     }
+    // Node's toFilesystemPath fallthrough — see read_file above.
+    let resolved = resolved.fs_path.unwrap_or(resolved.display);
     match std::fs::metadata(&resolved) {
         Ok(meta) if meta.is_dir() => {
             Json(json!({ "exists": false, "size": null, "modifiedAt": null })).into_response()
@@ -271,11 +291,16 @@ async fn write_file(
     let Some(content) = body.get("content").and_then(Value::as_str) else {
         return bad_request("content is required");
     };
-    let resolved = normalize_user_path(path);
+    let resolved = resolve_user_path(path);
     let settings = state.settings.get().await;
-    if !is_path_allowed(&resolved, settings.allowed_file_paths.as_deref()) {
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
         return forbidden();
     }
+    // Node's toFilesystemPath fallthrough — see read_file above.
+    let resolved = resolved.fs_path.unwrap_or(resolved.display);
     if let Some(parent) = Path::new(&resolved).parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             return internal_error(&err.to_string());
@@ -624,7 +649,7 @@ fn mtime_iso(meta: &std::fs::Metadata) -> String {
 
 /// Port of `isPathAllowed` (`path-utils.ts`): a target is allowed iff there are no
 /// configured roots, or it equals / is nested under one (at a directory boundary).
-/// POSIX comparison (the oracle host); the Windows case-fold flavor is deferred.
+/// Roots resolve through resolve_user_path — the same conversion as targets (Node converts both sides, path-utils.ts:313/319). Case-folding stays absent: Node lowercases only when process.platform === 'win32', which this Linux-host port never is.
 pub(crate) fn is_path_allowed(target: &str, allowed_roots: Option<&[String]>) -> bool {
     let roots = match allowed_roots {
         Some(roots) if !roots.is_empty() => roots,
@@ -632,7 +657,16 @@ pub(crate) fn is_path_allowed(target: &str, allowed_roots: Option<&[String]>) ->
     };
     let target_norm = normalize_user_path(target);
     for root in roots {
-        let root_norm = normalize_user_path(root);
+        // Node parity: isPathAllowed converts BOTH sides through
+        // resolvePathForSandboxComparison (path-utils.ts:313/319), so a
+        // Windows-flavor root like `C:\Users` matches WSL-converted targets
+        // (pinned by Node's test/unit/server/path-utils.test.ts:236-252).
+        // resolve_user_path's non-Windows branch IS normalize_user_path, so
+        // POSIX/~ roots compare byte-identically to before (including the
+        // repo_icon.rs call sites). On a non-WSL host a Windows-flavor root
+        // stays literal — fail-closed, same stance as unaddressable targets.
+        let root_resolved = resolve_user_path(root);
+        let root_norm = root_resolved.sandbox_target();
         if target_norm == root_norm || target_norm.starts_with(&format!("{root_norm}/")) {
             return true;
         }
@@ -1167,6 +1201,158 @@ mod tests {
         assert!(!is_path_allowed(
             resolve_user_path("D:\\proj").sandbox_target(),
             Some(&roots)
+        ));
+    }
+
+    // ---- read/stat/write (R-WIN4: sandbox + fs access via the converted path) ----
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn read_stat_write_follow_windows_conversion_on_wsl() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        // stat: the fixture file C:\Users\notes.txt exists via the mount.
+        let resp = stat_file(
+            State(test_state()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some("C:\\Users\\notes.txt".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["exists"], true);
+        // read: content comes back through the converted path.
+        let resp = read_file(
+            State(test_state()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some("C:\\Users\\notes.txt".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["content"], "x");
+        // write: lands under the mount, not as a literal backslash-named entry.
+        let resp = write_file(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\Users\\dan\\note2.txt", "content": "hi" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            std::fs::read_to_string(fixture.mount("c").join("Users/dan/note2.txt")).unwrap(),
+            "hi"
+        );
+        assert!(!std::path::Path::new("C:\\Users\\dan\\note2.txt").exists());
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn stat_windows_path_off_wsl_reports_not_exists() {
+        let _guard = env_lock();
+        let _env = non_wsl_env();
+        // Node parity: the literal `C:\…` string is handed to fs and the stat
+        // fails naturally -> { exists: false } with HTTP 200.
+        let resp = stat_file(
+            State(test_state()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some("C:\\Users\\notes.txt".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["exists"], false);
+    }
+
+    // ---- validate_dir sandbox (closes the Node-parity gap: files-router.ts:232
+    // applies validatePath to validate-dir; 403 pinned by Node's
+    // test/unit/server/files-router.test.ts:451-460) ----
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_denies_path_outside_allowed_roots() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let state = test_state();
+        // Configure a sandbox root via the store's public patch API (persist
+        // no-ops for home: None stores — settings_store.rs:420-422 — so this
+        // touches no real config file).
+        let root = fixture.mount("d").to_string_lossy().into_owned();
+        state
+            .settings
+            .patch(&json!({ "allowedFilePaths": [root] }))
+            .await
+            .unwrap();
+        // A windows path converting OUTSIDE the allowed root is denied…
+        let resp = validate_dir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\Users\\dan" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // …while one INSIDE it (converted native path under the root) validates.
+        let resp = validate_dir(
+            State(state),
+            auth_headers(),
+            Json(json!({ "path": "D:\\proj" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true);
+    }
+
+    // ---- allowlist ROOTS convert through the same seam (R-WIN4 root side:
+    // Node's isPathAllowed applies resolvePathForSandboxComparison to BOTH
+    // sides, path-utils.ts:313/319; pinned by Node's
+    // test/unit/server/path-utils.test.ts:236-252) ----
+
+    #[test]
+    fn windows_flavor_allowlist_roots_convert_like_node() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let mount_c = fixture.mount("c").to_string_lossy().into_owned();
+        // Drive-root allowlist entry `C:\` matches the mount root and
+        // anything under it (Node test lines 245-247).
+        let drive_root = vec!["C:\\".to_string()];
+        assert!(is_path_allowed(&mount_c, Some(&drive_root)));
+        assert!(is_path_allowed(
+            resolve_user_path("C:\\Users\\alice\\project").sandbox_target(),
+            Some(&drive_root)
+        ));
+        // Deeper Windows-flavor root matches converted targets under it and
+        // rejects other drives (Node test lines 249-251).
+        let users_root = vec!["C:\\Users".to_string()];
+        assert!(is_path_allowed(
+            resolve_user_path("C:\\Users\\alice\\project").sandbox_target(),
+            Some(&users_root)
+        ));
+        assert!(!is_path_allowed(
+            resolve_user_path("D:\\Users\\alice\\project").sandbox_target(),
+            Some(&users_root)
+        ));
+        // POSIX roots keep byte-identical semantics (regression guard).
+        let posix_root = vec![mount_c.clone()];
+        assert!(is_path_allowed(
+            &format!("{mount_c}/Users"),
+            Some(&posix_root)
         ));
     }
 
