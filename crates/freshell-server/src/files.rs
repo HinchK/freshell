@@ -413,6 +413,7 @@ async fn complete(
 /// therefore never pre-checks existence \u2014 it always attempts the create and
 /// reports `existed` purely from what `create_dir_all` tells it (i.e. never true
 /// on success), matching the original's observable behavior exactly.
+/// Windows-flavor inputs convert through the WSL mount before create_dir_all; inputs with no native address on this host are rejected with 400 instead of creating a literal backslash-named directory.
 async fn mkdir(
     State(state): State<FilesState>,
     headers: HeaderMap,
@@ -429,19 +430,30 @@ async fn mkdir(
     else {
         return bad_request("path is required");
     };
-    let resolved = normalize_user_path(path);
+    let resolved = resolve_user_path(path);
     let settings = state.settings.get().await;
-    if !is_path_allowed(&resolved, settings.allowed_file_paths.as_deref()) {
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
         return forbidden();
     }
-    match std::fs::create_dir_all(&resolved) {
-        Ok(()) => Json(json!({ "created": true, "existed": false, "resolvedPath": resolved }))
-            .into_response(),
+    let Some(fs_path) = resolved.fs_path else {
+        // Never create a literal `C:\…` entry under the server cwd — the
+        // deliberate divergence from Node's non-WSL fallthrough hazard
+        // (`files-router.ts:262` + `path-utils.ts:208-215`).
+        return bad_request("path cannot be resolved to a directory on this host");
+    };
+    match std::fs::create_dir_all(&fs_path) {
+        Ok(()) => {
+            Json(json!({ "created": true, "existed": false, "resolvedPath": resolved.display }))
+                .into_response()
+        }
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => forbidden_msg("Permission denied"),
             _ => {
                 // A path component that exists but is not a directory \u2192 409.
-                if Path::new(&resolved).exists() {
+                if Path::new(&fs_path).exists() {
                     (
                         StatusCode::CONFLICT,
                         Json(json!({ "error": "Path exists but is not a directory" })),
@@ -1156,6 +1168,84 @@ mod tests {
             resolve_user_path("D:\\proj").sandbox_target(),
             Some(&roots)
         ));
+    }
+
+    // ---- mkdir (R-WIN5: convert windows-flavor input; reject unaddressable) ----
+
+    async fn mkdir_resp(path: &str) -> Response {
+        mkdir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": path })),
+        )
+        .await
+        .into_response()
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mkdir_windows_path_creates_under_mount() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let resp = mkdir_resp("C:\\Users\\dan\\newproj").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["created"], true);
+        assert_eq!(v["existed"], false);
+        // resolvedPath is the flavor-preserving DISPLAY path (Node parity).
+        assert_eq!(v["resolvedPath"], "C:\\Users\\dan\\newproj");
+        // The directory was created under the mount…
+        assert!(fixture.mount("c").join("Users/dan/newproj").is_dir());
+        // …and NOT as a literal backslash-named entry under the server cwd.
+        assert!(!std::path::Path::new("C:\\Users\\dan\\newproj").exists());
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mkdir_rejects_unaddressable_windows_input_off_wsl() {
+        let _guard = env_lock();
+        let _env = non_wsl_env();
+        let resp = mkdir_resp("C:\\").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert!(v["error"].as_str().unwrap().contains("cannot be resolved"));
+        // The hazard this fix removes (old files.rs:387-393): no literal
+        // `C:\` directory materializes under the process cwd.
+        assert!(!std::path::Path::new("C:\\").exists());
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mkdir_rejects_unresolvable_windows_forms_even_on_wsl() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // Bare drive / rooted inputs are Windows flavor but have no absolute
+        // native address, even on WSL. (`C:foo` is `native` flavor in both
+        // servers — see resolve_user_path_windows_unresolvable_forms — so it
+        // keeps today's behavior and is not asserted here.)
+        for input in ["C:", "\\rooted"] {
+            let resp = mkdir_resp(input).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{input:?}");
+        }
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mkdir_posix_regression_unchanged() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = format!("{}/fresh-sub", tmp.path().display());
+        let resp = mkdir_resp(&target).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["created"], true);
+        assert_eq!(v["existed"], false);
+        assert_eq!(v["resolvedPath"], target);
+        assert!(std::path::Path::new(&target).is_dir());
     }
 
     #[test]
