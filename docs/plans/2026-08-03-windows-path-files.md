@@ -1141,7 +1141,7 @@ Add to `mod tests` in `files.rs`:
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-server files::tests::mkdir_rejects_unaddressable_windows_input_off_wsl -- --exact --nocapture`
-Expected: FAIL — status is `200 OK` (today's mkdir happily `create_dir_all`s the literal string), not `400`. If a literal `C:\` directory gets created in the crate dir by this red run, delete it before proceeding: `rm -rf '/home/dan/code/freshell/.worktrees/windows-path-files/C:\'` (quote exactly).
+Expected: FAIL — status is `200 OK` (today's mkdir happily `create_dir_all`s the literal string), not `400`. Cargo runs test binaries with the working directory set to the package root, so the leftover artifact lands in the crate dir at `crates/freshell-server/C:\` — and Step 4's green run re-checks `assert!(!std::path::Path::new("C:\\").exists())` against that same cwd, so it cannot pass until the artifact is gone. Delete it before proceeding: `rm -rf '/home/dan/code/freshell/.worktrees/windows-path-files/crates/freshell-server/C:\'` (quote exactly), then confirm removal with `test ! -e '/home/dan/code/freshell/.worktrees/windows-path-files/crates/freshell-server/C:\' && echo clean` (expect `clean`).
 
 - [ ] **Step 3: Write the implementation**
 
