@@ -49,7 +49,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use freshell_platform::path::{convert_windows_path_to_wsl_path, win32_resolve};
+use freshell_platform::path::{
+    convert_windows_path_to_wsl_path, join_windows_display_path, split_windows_display_path,
+    win32_resolve,
+};
 use freshell_platform::{
     detect_user_path_flavor, sanitize_user_path_input, RealEnv, UserPathFlavor,
 };
@@ -307,18 +310,41 @@ async fn complete(
 
     // Resolve the completion input against `root` (unless the prefix is absolute).
     let completion_input = resolve_completion_input(&prefix, q.root.as_deref());
-    let normalized = normalize_user_path(&completion_input);
+    let resolved = resolve_user_path(&completion_input);
     let settings = state.settings.get().await;
-    if !is_path_allowed(&normalized, settings.allowed_file_paths.as_deref()) {
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
         return forbidden();
     }
+    let Some(fs_path) = resolved.fs_path.clone() else {
+        // Windows-flavor input this host cannot address (non-WSL host, generic
+        // UNC, drive-relative): Node's readdir would ENOENT -> empty suggestions.
+        return Json(json!({ "suggestions": [] })).into_response();
+    };
+    let windows_flavor = resolved.flavor == UserPathFlavor::Windows;
 
     // If the input is itself a directory, list all its entries; otherwise treat the
-    // basename as a partial and filter the parent's entries by it.
-    let (dir_display, dir_fs, basename) = match std::fs::metadata(&normalized) {
-        Ok(meta) if meta.is_dir() => (normalized.clone(), normalized.clone(), String::new()),
+    // basename as a partial and filter the parent's entries by it. The split is
+    // done on the DISPLAY path with the INPUT's flavor semantics, and the parent
+    // is re-converted for filesystem access (`files-router.ts:187-203`).
+    let (dir_display, dir_fs, basename) = match std::fs::metadata(&fs_path) {
+        Ok(meta) if meta.is_dir() => (resolved.display.clone(), fs_path, String::new()),
+        _ if windows_flavor => {
+            let Some((parent_display, leaf)) = split_windows_display_path(&resolved.display) else {
+                return Json(json!({ "suggestions": [] })).into_response();
+            };
+            // `fs_path` was Some, so this request already established a live
+            // WSL environment — the parent converts under the same regime.
+            let Some(parent_fs) = convert_windows_path_to_wsl_path(&parent_display, &RealEnv, true)
+            else {
+                return Json(json!({ "suggestions": [] })).into_response();
+            };
+            (parent_display, parent_fs, leaf)
+        }
         _ => {
-            let p = Path::new(&normalized);
+            let p = Path::new(&resolved.display);
             let parent = p
                 .parent()
                 .map(|d| d.to_string_lossy().into_owned())
@@ -343,10 +369,16 @@ async fn complete(
                 if dirs_only && !is_dir {
                     return None;
                 }
-                let joined = Path::new(&dir_display)
-                    .join(&name)
-                    .to_string_lossy()
-                    .into_owned();
+                // Suggestion paths are DISPLAY paths in the input's flavor
+                // (`files-router.ts:211` — pathModule.join(dirDisplayPath, name)).
+                let joined = if windows_flavor {
+                    join_windows_display_path(&dir_display, &name)
+                } else {
+                    Path::new(&dir_display)
+                        .join(&name)
+                        .to_string_lossy()
+                        .into_owned()
+                };
                 Some((joined, is_dir))
             })
             .collect(),
@@ -501,6 +533,18 @@ fn trim_trailing_separators(input: &str) -> String {
 pub(crate) struct ResolvedUserPath {
     pub display: String,
     pub fs_path: Option<String>,
+    pub flavor: UserPathFlavor,
+}
+
+impl ResolvedUserPath {
+    /// The string sandbox checks compare — Node's `validatePath` resolves the
+    /// request path through `toFilesystemPath` before `isPathAllowed`
+    /// (`files-router.ts:75-78`), so comparisons use the CONVERTED native path
+    /// when the input is addressable, and fall back to the literal display
+    /// string when it is not (Node's non-WSL fallthrough).
+    pub(crate) fn sandbox_target(&self) -> &str {
+        self.fs_path.as_deref().unwrap_or(&self.display)
+    }
 }
 
 /// Port of `normalizeUserPath` + `toFilesystemPath` composed
@@ -519,11 +563,13 @@ pub(crate) struct ResolvedUserPath {
 ///   the input as unaddressable instead of stat'ing/creating a literal
 ///   backslash-named entry — the mkdir hazard this fix removes.
 pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath {
-    if detect_user_path_flavor(input) != UserPathFlavor::Windows {
+    let flavor = detect_user_path_flavor(input);
+    if flavor != UserPathFlavor::Windows {
         let normalized = normalize_user_path(input);
         return ResolvedUserPath {
             display: normalized.clone(),
             fs_path: Some(normalized),
+            flavor,
         };
     }
     let sanitized = sanitize_user_path_input(input);
@@ -538,6 +584,7 @@ pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath {
         return ResolvedUserPath {
             display: sanitized,
             fs_path: None,
+            flavor: UserPathFlavor::Windows,
         };
     };
     let fs_path = if freshell_platform::detect::is_wsl_env_live() {
@@ -548,7 +595,11 @@ pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath {
     } else {
         None
     };
-    ResolvedUserPath { display, fs_path }
+    ResolvedUserPath {
+        display,
+        fs_path,
+        flavor: UserPathFlavor::Windows,
+    }
 }
 
 /// An mtime as an ISO-8601 / RFC-3339 millis-precision `Z` string, byte-shape
@@ -928,6 +979,183 @@ mod tests {
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["valid"], false);
+    }
+
+    // ---- complete (R-WIN3: suggestions rendered in the INPUT's flavor) ----
+
+    /// Call `complete` and return the suggestion path strings.
+    async fn complete_paths(prefix: &str, root: Option<&str>, dirs: Option<&str>) -> Vec<String> {
+        let resp = complete(
+            State(test_state()),
+            auth_headers(),
+            Query(CompleteQuery {
+                prefix: Some(prefix.to_string()),
+                root: root.map(str::to_string),
+                dirs: dirs.map(str::to_string),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        v["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Intentional: `_guard` is held across every `.await` BY DESIGN — these
+    // tests mutate/read process env and must stay serialized on the
+    // crate-wide HOME_ENV_TEST_LOCK end-to-end.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_windows_drive_root_lists_in_input_flavor() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // C:\ is a directory (the fixture's <root>/c) -> list all children,
+        // display paths joined win32-style in the input's flavor.
+        // Children of <root>/c: Users/ and Windows/ (dirs sort before files;
+        // byte-order alphabetical within).
+        let paths = complete_paths("C:\\", None, None).await;
+        assert_eq!(paths, vec!["C:\\Users", "C:\\Windows"]);
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_windows_partial_leaf_filters_and_preserves_flavor() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // Partial leaf: split parent/leaf on the display path, filter by leaf.
+        let paths = complete_paths("C:\\Us", None, None).await;
+        assert_eq!(paths, vec!["C:\\Users"]);
+        // Leaf matching is case-sensitive (Node files-router parity).
+        let paths = complete_paths("C:\\us", None, None).await;
+        assert!(paths.is_empty());
+        // Drive-letter case flows through from the typed input.
+        let paths = complete_paths("c:\\Us", None, None).await;
+        assert_eq!(paths, vec!["c:\\Users"]);
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_windows_dirs_only_filters_files() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // C:\Users contains dan/ (dir) and notes.txt (file).
+        let all = complete_paths("C:\\Users\\", None, None).await;
+        assert_eq!(all, vec!["C:\\Users\\dan", "C:\\Users\\notes.txt"]);
+        let dirs = complete_paths("C:\\Users\\", None, Some("true")).await;
+        assert_eq!(dirs, vec!["C:\\Users\\dan"]);
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_windows_missing_parent_and_off_wsl_return_empty() {
+        let _guard = env_lock();
+        {
+            let _fixture = WslMountFixture::new();
+            // Parent C:\Nope doesn't exist -> readdir NotFound -> 200 { suggestions: [] }.
+            assert!(complete_paths("C:\\Nope\\x", None, None).await.is_empty());
+        }
+        let _env = non_wsl_env();
+        // Windows input on a non-WSL host is unaddressable -> empty suggestions.
+        assert!(complete_paths("C:\\", None, None).await.is_empty());
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_windows_root_anchoring_composes() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // Relative prefix under a windows-flavor root: resolve_completion_input
+        // joins with `/`, and win32_resolve then normalizes the mixed
+        // separators into a windows display path.
+        let paths = complete_paths("da", Some("C:\\Users"), None).await;
+        assert_eq!(paths, vec!["C:\\Users\\dan"]);
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_wsl_unc_partial_leaf_round_trips() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // WSL-UNC inputs convert to native root-relative paths
+        // (`\\wsl.localhost\Ubuntu\<p>` -> `/<p>`; distro matched
+        // case-insensitively against WSL_DISTRO_NAME, path.rs:384-419) — so a
+        // real tempdir exercises the full composed chain end-to-end:
+        // split on the display path -> reconvert the parent -> join back.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
+        let tmp_unc = tmp
+            .path()
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "\\");
+        let prefix = format!("\\\\wsl.localhost\\Ubuntu\\{tmp_unc}\\su");
+        let paths = complete_paths(&prefix, None, None).await;
+        assert_eq!(
+            paths,
+            vec![format!("\\\\wsl.localhost\\Ubuntu\\{tmp_unc}\\subdir")]
+        );
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_posix_regression_unchanged() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("subzero")).unwrap();
+        let prefix = format!("{}/sub", tmp.path().display());
+        let paths = complete_paths(&prefix, None, None).await;
+        assert_eq!(
+            paths,
+            vec![
+                format!("{}/subdir", tmp.path().display()),
+                format!("{}/subzero", tmp.path().display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_target_uses_converted_native_path() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let mount_c = fixture.mount("c").to_string_lossy().into_owned();
+        // R-WIN4: sandbox comparisons use the CONVERTED native path (Node's
+        // validatePath resolves through toFilesystemPath before isPathAllowed).
+        let r = resolve_user_path("C:\\Users");
+        assert_eq!(r.sandbox_target(), format!("{mount_c}/Users"));
+        // Unaddressable input falls back to its display string. With roots
+        // configured, that literal never matches -> unconditional deny. This
+        // is DELIBERATELY STRICTER than Node, which posix-resolves the
+        // literal against the server cwd first (path-utils.ts:294) and so
+        // ALLOWS it whenever the cwd sits under an allowed root (its /write
+        // can then even create a literal `C:\...` entry there — oracle-
+        // verified). Fail-closed here: we never allow a request Node denies.
+        let r = resolve_user_path("\\\\srv\\share\\x");
+        assert_eq!(r.sandbox_target(), "\\\\srv\\share\\x");
+        // POSIX target is compared as-is.
+        let r = resolve_user_path("/tmp/x");
+        assert_eq!(r.sandbox_target(), "/tmp/x");
+        // And the existing boundary logic operates on those native strings.
+        let roots = vec![mount_c.clone()];
+        assert!(is_path_allowed(
+            resolve_user_path("C:\\Users").sandbox_target(),
+            Some(&roots)
+        ));
+        assert!(!is_path_allowed(
+            resolve_user_path("D:\\proj").sandbox_target(),
+            Some(&roots)
+        ));
     }
 
     #[test]
