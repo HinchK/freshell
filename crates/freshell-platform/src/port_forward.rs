@@ -23,6 +23,7 @@
 //! host, and even those go through the injected [`CommandRunner`].
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use crate::{CommandRunner, Env};
 
@@ -61,10 +62,10 @@ pub enum WslPortForwardingPlan {
     Disabled,
     Error(String),
     Noop {
-        wsl_ip: String,
+        wsl_ip: Ipv4Addr,
     },
     Ready {
-        wsl_ip: String,
+        wsl_ip: Ipv4Addr,
         script_kind: ScriptKind,
         script: String,
     },
@@ -278,15 +279,16 @@ pub fn needs_firewall_update(required_ports: &[u16], existing_ports: &[u16]) -> 
 /// `needsPortForwardingUpdate` (`wsl-port-forward.ts:302-317`): any required
 /// port missing, pointing at the wrong IP, or the wrong connect port.
 pub fn needs_port_forwarding_update(
-    wsl_ip: &str,
+    wsl_ip: Ipv4Addr,
     required_ports: &[u16],
     existing_rules: &BTreeMap<u16, PortProxyRule>,
 ) -> bool {
+    let wsl_ip_str = wsl_ip.to_string();
     for &port in required_ports {
         match existing_rules.get(&port) {
             None => return true,
             Some(rule) => {
-                if rule.connect_address != wsl_ip || rule.connect_port != port {
+                if rule.connect_address != wsl_ip_str || rule.connect_port != port {
                     return true;
                 }
             }
@@ -324,7 +326,12 @@ dir=in action=allow protocol=tcp localport={} profile=private",
 ///
 /// Deletes (deduped `cleanup_ports`) then adds (raw `ports`), then the
 /// delete-then-add firewall rule. `cleanup_ports` defaults to `ports`.
-pub fn build_port_forwarding_script(wsl_ip: &str, ports: &[u16], cleanup_ports: &[u16]) -> String {
+pub fn build_port_forwarding_script(
+    wsl_ip: Ipv4Addr,
+    ports: &[u16],
+    cleanup_ports: &[u16],
+) -> String {
+    let wsl_ip = wsl_ip.to_string();
     let mut cmds: Vec<String> = Vec::new();
 
     for port in unique_preserving_order(cleanup_ports.iter().copied()) {
@@ -413,7 +420,7 @@ fn get_stale_managed_port_proxy_ports(
 pub fn build_wsl_port_forwarding_plan(
     required_ports: &[u16],
     known_owned_ports: &[u16],
-    wsl_ip: &str,
+    wsl_ip: Ipv4Addr,
     existing_rules: &BTreeMap<u16, PortProxyRule>,
     existing_firewall_ports: &[u16],
     managed_ports: &[u16],
@@ -440,9 +447,7 @@ pub fn build_wsl_port_forwarding_plan(
         || !stale_firewall_ports.is_empty();
 
     if !ports_need_update && !firewall_needs_update {
-        return WslPortForwardingPlan::Noop {
-            wsl_ip: wsl_ip.to_string(),
-        };
+        return WslPortForwardingPlan::Noop { wsl_ip };
     }
 
     let script_kind = if ports_need_update {
@@ -463,7 +468,7 @@ pub fn build_wsl_port_forwarding_plan(
     };
 
     WslPortForwardingPlan::Ready {
-        wsl_ip: wsl_ip.to_string(),
+        wsl_ip,
         script_kind,
         script: normalize_script_for_elevated_powershell(&script),
     }
@@ -509,7 +514,7 @@ pub fn build_wsl_port_forwarding_teardown_plan(
 // Runner-backed reads (READ-ONLY `show` / `ip` / `hostname`)
 // ---------------------------------------------------------------------------
 
-fn parse_eth0_ip(stdout: &str) -> Option<String> {
+fn parse_eth0_ip(stdout: &str) -> Option<Ipv4Addr> {
     // `/inet\s+([\d.]+)/` — "inet" then >=1 whitespace then a `[\d.]+` run.
     let bytes = stdout.as_bytes();
     let mut search_from = 0;
@@ -527,7 +532,9 @@ fn parse_eth0_ip(stdout: &str) -> Option<String> {
             if i > start {
                 let candidate = &stdout[start..i];
                 if is_ipv4_shape(candidate) {
-                    return Some(candidate.to_string());
+                    if let Ok(ip) = candidate.parse::<Ipv4Addr>() {
+                        return Some(ip);
+                    }
                 }
             }
         }
@@ -536,17 +543,17 @@ fn parse_eth0_ip(stdout: &str) -> Option<String> {
     None
 }
 
-fn parse_hostname_ip(stdout: &str) -> Option<String> {
+fn parse_hostname_ip(stdout: &str) -> Option<Ipv4Addr> {
     // `stdout.trim().split(/\s+/).filter(Boolean)` == `split_whitespace()`.
     stdout
         .split_whitespace()
-        .find(|addr| is_ipv4_shape(addr) && !addr.starts_with("172.17."))
-        .map(|s| s.to_string())
+        .filter(|addr| is_ipv4_shape(addr) && !addr.starts_with("172.17."))
+        .find_map(|s| s.parse::<Ipv4Addr>().ok())
 }
 
 /// `getWslIpAsync` (`wsl-port-forward.ts:141-171`): `ip -4 addr show eth0`, else
 /// `hostname -I` first non-`172.17.*` IPv4. READ-ONLY.
-pub fn get_wsl_ip(runner: &dyn CommandRunner) -> Option<String> {
+pub fn get_wsl_ip(runner: &dyn CommandRunner) -> Option<Ipv4Addr> {
     let ip_out = runner.run("ip", &["-4", "addr", "show", "eth0"]);
     if ip_out.ok() {
         if let Some(ip) = parse_eth0_ip(&ip_out.stdout) {
@@ -622,7 +629,7 @@ protocol=tcp localport=3001 profile=private"
     #[test]
     fn port_forwarding_script_golden_raw_backslash() {
         // Single required port, cleanup defaults to the same port set.
-        let got = build_port_forwarding_script("172.30.149.249", &[3001], &[3001]);
+        let got = build_port_forwarding_script("172.30.149.249".parse().unwrap(), &[3001], &[3001]);
         assert_eq!(
             got,
             "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=3001 2>\\$null; \
@@ -636,7 +643,11 @@ protocol=tcp localport=3001 profile=private"
 
     #[test]
     fn port_forwarding_script_multiport_and_distinct_cleanup() {
-        let got = build_port_forwarding_script("10.0.0.5", &[3001, 3002], &[3001, 3002, 9999]);
+        let got = build_port_forwarding_script(
+            "10.0.0.5".parse().unwrap(),
+            &[3001, 3002],
+            &[3001, 3002, 9999],
+        );
         assert_eq!(
             got,
             "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=3001 2>\\$null; \
@@ -766,7 +777,7 @@ Address         Port        Address         Port\r\n\
         let plan = build_wsl_port_forwarding_plan(
             &[3001],
             &[3001],
-            "172.30.149.249",
+            "172.30.149.249".parse().unwrap(),
             &rules,
             &[3001],
             &[3001],
@@ -774,7 +785,7 @@ Address         Port        Address         Port\r\n\
         assert_eq!(
             plan,
             WslPortForwardingPlan::Noop {
-                wsl_ip: "172.30.149.249".into()
+                wsl_ip: "172.30.149.249".parse().unwrap()
             }
         );
     }
@@ -782,8 +793,14 @@ Address         Port        Address         Port\r\n\
     #[test]
     fn plan_full_when_portproxy_missing() {
         let rules = BTreeMap::new(); // nothing configured yet
-        let plan =
-            build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
+        let plan = build_wsl_port_forwarding_plan(
+            &[3001],
+            &[3001],
+            "172.30.149.249".parse().unwrap(),
+            &rules,
+            &[],
+            &[],
+        );
         match plan {
             WslPortForwardingPlan::Ready {
                 script_kind,
@@ -791,7 +808,7 @@ Address         Port        Address         Port\r\n\
                 wsl_ip,
             } => {
                 assert_eq!(script_kind, ScriptKind::Full);
-                assert_eq!(wsl_ip, "172.30.149.249");
+                assert_eq!(wsl_ip.to_string(), "172.30.149.249");
                 assert!(script.contains("portproxy add"));
                 assert!(script.contains("2>$null")); // normalized for PowerShell
                 assert!(!script.contains("2>\\$null"));
@@ -805,8 +822,14 @@ Address         Port        Address         Port\r\n\
         let mut rules = BTreeMap::new();
         rules.insert(3001, rule("172.30.149.249", 3001));
         // firewall rule has no ports -> needs firewall update, proxy fine.
-        let plan =
-            build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
+        let plan = build_wsl_port_forwarding_plan(
+            &[3001],
+            &[3001],
+            "172.30.149.249".parse().unwrap(),
+            &rules,
+            &[],
+            &[],
+        );
         match plan {
             WslPortForwardingPlan::Ready {
                 script_kind,
@@ -830,7 +853,7 @@ Address         Port        Address         Port\r\n\
         let plan = build_wsl_port_forwarding_plan(
             &[3001],
             &[3001],
-            "172.30.149.249",
+            "172.30.149.249".parse().unwrap(),
             &rules,
             &[3001], // firewall already has 3001
             &[4000], // managed ports include stale 4000
@@ -878,21 +901,27 @@ Address         Port        Address         Port\r\n\
     #[test]
     fn parse_eth0_ip_from_ip_addr() {
         let out = "2: eth0: <BROADCAST> mtu 1500\n    inet 172.30.149.249/20 brd 172.30.159.255 scope global eth0\n";
-        assert_eq!(parse_eth0_ip(out).as_deref(), Some("172.30.149.249"));
+        assert_eq!(
+            parse_eth0_ip(out).map(|ip| ip.to_string()),
+            Some("172.30.149.249".to_string())
+        );
     }
 
     #[test]
     fn parse_eth0_ip_skips_inet6() {
         let out =
             "    inet6 fe80::215:5dff:fe? scope link\n    inet 10.0.0.4/24 scope global eth0\n";
-        assert_eq!(parse_eth0_ip(out).as_deref(), Some("10.0.0.4"));
+        assert_eq!(
+            parse_eth0_ip(out).map(|ip| ip.to_string()),
+            Some("10.0.0.4".to_string())
+        );
     }
 
     #[test]
     fn parse_hostname_ip_skips_docker() {
         assert_eq!(
-            parse_hostname_ip("172.17.0.1 192.168.1.50 \n").as_deref(),
-            Some("192.168.1.50")
+            parse_hostname_ip("172.17.0.1 192.168.1.50 \n").map(|ip| ip.to_string()),
+            Some("192.168.1.50".to_string())
         );
     }
 
@@ -903,7 +932,10 @@ Address         Port        Address         Port\r\n\
             &["eth0"],
             CommandOutput::success("    inet 172.30.149.249/20 scope global eth0\n"),
         );
-        assert_eq!(get_wsl_ip(&eth0).as_deref(), Some("172.30.149.249"));
+        assert_eq!(
+            get_wsl_ip(&eth0).map(|ip| ip.to_string()),
+            Some("172.30.149.249".to_string())
+        );
 
         // eth0 fails -> hostname fallback
         let host = FakeCommandRunner::new()
@@ -913,7 +945,10 @@ Address         Port        Address         Port\r\n\
                 &["-I"],
                 CommandOutput::success("172.17.0.1 10.1.2.3\n"),
             );
-        assert_eq!(get_wsl_ip(&host).as_deref(), Some("10.1.2.3"));
+        assert_eq!(
+            get_wsl_ip(&host).map(|ip| ip.to_string()),
+            Some("10.1.2.3".to_string())
+        );
     }
 
     // ---- runner-backed reads via fakes ------------------------------------
@@ -938,6 +973,62 @@ Address         Port        Address         Port\r\n\
         assert_eq!(get_existing_firewall_ports(&runner), None);
     }
 
+    // ---- injection hardening: Ipv4Addr typing ---------------------
+
+    #[test]
+    fn wsl_ip_injection_payloads_cannot_be_typed_as_ipv4() {
+        // Each of these is a command-injection attempt; none is a valid Ipv4Addr.
+        let payloads = [
+            "1.2.3.4; calc",
+            "1.2.3.4\nnetsh interface portproxy add",
+            "1.2.3.4`whoami`",
+            "$(id)",
+            "1.2.3.4 | rm -rf /",
+            "999.1.1.1", // passes a naive digit/dot shape, fails real parse
+            "1.2.3.4.5",
+            "",
+            "0x7f.0.0.1",
+        ];
+        for p in payloads {
+            assert!(
+                p.parse::<Ipv4Addr>().is_err(),
+                "payload unexpectedly parsed as Ipv4Addr: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_wsl_ip_returns_none_for_shape_valid_but_unparseable_output() {
+        // eth0 output whose token passes a digits-and-dots heuristic but is not a
+        // real IPv4 address. Pre-change (String) code would have returned Some("999.1.1.1").
+        let runner = crate::FakeCommandRunner::new().on(
+            "ip",
+            &["addr", "show", "eth0"],
+            crate::CommandOutput::success("    inet 999.1.1.1/24 brd ... scope global eth0"),
+        );
+        assert_eq!(get_wsl_ip(&runner), None);
+    }
+
+    #[test]
+    fn get_wsl_ip_parses_a_real_ipv4() {
+        let runner = crate::FakeCommandRunner::new().on(
+            "ip",
+            &["addr", "show", "eth0"],
+            crate::CommandOutput::success("    inet 172.30.149.249/20 brd ... scope global eth0"),
+        );
+        assert_eq!(get_wsl_ip(&runner), Some(Ipv4Addr::new(172, 30, 149, 249)));
+    }
+
+    #[test]
+    fn port_forwarding_script_bytes_unchanged_under_ipv4_typing() {
+        // Golden lock: the emitted script must be byte-identical to the pre-change
+        // output for a valid IP. (Ipv4Addr::to_string() renders identically.)
+        let script =
+            build_port_forwarding_script(Ipv4Addr::new(172, 30, 149, 249), &[3001], &[3001]);
+        assert!(script.contains("connectaddress=172.30.149.249"));
+        assert!(script.contains("2>\\$null")); // raw backslash-dollar preserved
+    }
+
     // ---- READ-ONLY live verification (skips off-WSL) ----------------------
 
     /// P18 (`LV? = yes`): the real `get_wsl_ip` via [`crate::StdCommandRunner`]
@@ -951,7 +1042,10 @@ Address         Port        Address         Port\r\n\
         let runner = crate::StdCommandRunner::default();
         match get_wsl_ip(&runner) {
             Some(ip) => {
-                assert!(is_ipv4_shape(&ip), "expected IPv4 shape, got {ip:?}");
+                assert!(
+                    is_ipv4_shape(&ip.to_string()),
+                    "expected IPv4 shape, got {ip:?}"
+                );
                 eprintln!("LIVE get_wsl_ip (read-only) -> {ip}");
             }
             None => eprintln!("SKIP-ish: WSL IP not detectable on this host"),
