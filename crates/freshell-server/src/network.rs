@@ -453,6 +453,17 @@ fn network_host_str(host: &NetworkHost) -> &'static str {
     }
 }
 
+/// Boot-time bind config from the persisted settings (NET-02/06 restart
+/// truthfulness): a disable that persisted loopback must survive a restart.
+pub fn boot_bind_config(
+    network: &freshell_protocol::SettingsNetwork,
+) -> freshell_platform::network::BindHostConfig {
+    freshell_platform::network::BindHostConfig::Ok {
+        raw_host: Some(network_host_str(&network.host).to_string()),
+        configured: network.configured,
+    }
+}
+
 /// Compute the live, read-only host facts (blocking — call on `spawn_blocking`).
 fn resolve_live_network_facts() -> LiveNetworkFacts {
     let host_os = host_os_live();
@@ -652,6 +663,41 @@ mod tests {
             token: "t",
         });
         assert_eq!(status["machineHostname"], json!("macbook"));
+    }
+
+    #[test]
+    fn boot_bind_config_passes_persisted_network_intent() {
+        use freshell_platform::network::BindHostConfig;
+        let net = freshell_protocol::SettingsNetwork {
+            configured: true,
+            host: NetworkHost::Loopback,
+        };
+        match boot_bind_config(&net) {
+            BindHostConfig::Ok {
+                raw_host,
+                configured,
+            } => {
+                assert_eq!(raw_host.as_deref(), Some("127.0.0.1"));
+                assert!(configured);
+            }
+            _ => panic!("expected Ok config"),
+        }
+        let unconfigured = freshell_protocol::SettingsNetwork {
+            configured: false,
+            host: NetworkHost::Loopback,
+        };
+        match boot_bind_config(&unconfigured) {
+            BindHostConfig::Ok {
+                raw_host,
+                configured,
+            } => {
+                // unconfigured: still pass the host as a raw hint but configured=false,
+                // so the WSL default / HOST env keep their precedence.
+                assert_eq!(raw_host.as_deref(), Some("127.0.0.1"));
+                assert!(!configured);
+            }
+            _ => panic!("expected Ok config"),
+        }
     }
 
     // ---- Slice 1: live probe wiring + route-level tests --------------------

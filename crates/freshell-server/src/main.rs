@@ -104,7 +104,6 @@ async fn main() -> ExitCode {
     };
 
     let port = resolve_port();
-    let bind_host = resolve_bind_host();
     let home = resolve_home();
 
     // DIAG-01/DIAG-03: structured JSONL logging to
@@ -198,6 +197,11 @@ async fn main() -> ExitCode {
             .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
+    // NET-02/06 restart truthfulness: the BOOT bind honors the persisted
+    // `settings.network` (a disable that persisted loopback must survive a
+    // restart), so the bind host is resolved only now, AFTER the settings
+    // store loads. `FRESHELL_BIND_HOST` still outranks it (platform-side).
+    let bind_host = resolve_bind_host(&settings_store.get().await.network);
     // GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
     // notice, if the primary config needed to fall back at boot. `None` for
     // a healthy config or an ordinary fresh install. Threaded into
@@ -1624,26 +1628,24 @@ fn resolve_allowed_origins() -> Vec<String> {
 }
 
 /// Resolve the bind host, faithfully to `server/get-network-host.ts`:
-/// an explicit `FRESHELL_BIND_HOST` (`0.0.0.0`/`127.0.0.1`) wins; otherwise **on WSL
-/// bind `0.0.0.0`** so the Windows host (browser / the legacy Electron app) can reach
-/// the server across the WSL2 NAT boundary — "not remote access, basic WSL2
-/// functionality" (get-network-host.ts:11-13,40-42); else fall back to `127.0.0.1`.
+/// an explicit `FRESHELL_BIND_HOST` (`0.0.0.0`/`127.0.0.1`) wins; then the
+/// persisted `settings.network` when `configured: true` (NET-02/06 restart
+/// truthfulness — a disable that persisted loopback survives a restart);
+/// otherwise **on WSL bind `0.0.0.0`** so the Windows host (browser / the
+/// legacy Electron app) can reach the server across the WSL2 NAT boundary —
+/// "not remote access, basic WSL2 functionality"
+/// (get-network-host.ts:11-13,40-42); else the config host hint, the `HOST`
+/// env fallback, and finally `127.0.0.1`.
 ///
-/// NOTE: the earlier loopback-only default diverged from the original (it left the
-/// server unreachable from Windows). The oracle never caught it because the harness
-/// always forces `FRESHELL_BIND_HOST=127.0.0.1` for test isolation — which this still
-/// honors, so T0/T1/T2/T3 remain loopback and unaffected.
-fn resolve_bind_host() -> String {
+/// NOTE: the harness always forces `FRESHELL_BIND_HOST=127.0.0.1` for test
+/// isolation — which this still honors (it outranks the persisted config),
+/// so T0/T1/T2/T3 remain loopback and unaffected.
+fn resolve_bind_host(network: &freshell_protocol::settings::SettingsNetwork) -> String {
     let is_wsl = is_wsl_proc(read_proc_version().as_deref());
     freshell_platform::network::resolve_bind_host(
         &freshell_platform::RealEnv,
         is_wsl,
-        // No config-file host override wired here; FRESHELL_BIND_HOST + the WSL
-        // default + the `HOST` env fallback are what the standalone run needs.
-        freshell_platform::network::BindHostConfig::Ok {
-            raw_host: None,
-            configured: false,
-        },
+        network::boot_bind_config(network),
     )
 }
 
