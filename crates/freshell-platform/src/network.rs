@@ -42,14 +42,25 @@ fn is_valid_bind(host: &str) -> bool {
 
 /// `getNetworkHost` (`get-network-host.ts:27-64`).
 ///
-/// Order: `FRESHELL_BIND_HOST` (only `0.0.0.0`/`127.0.0.1`) > **Regime-B WSL ->
-/// `0.0.0.0`** > config `settings.network.host` (with the unconfigured `HOST`
-/// override) > `HOST` env fallback > `127.0.0.1`. `is_wsl` is Regime B
+/// Order: `FRESHELL_BIND_HOST` (only `0.0.0.0`/`127.0.0.1`) > persisted config
+/// (when `configured: true`, valid host) > **Regime-B WSL -> `0.0.0.0`** >
+/// config raw_host hint > `HOST` env fallback > `127.0.0.1`. `is_wsl` is Regime B
 /// (`/proc/version`, the broad `isWSL()`), computed by the caller.
 pub fn resolve_bind_host(env: &dyn Env, is_wsl: bool, config: BindHostConfig) -> String {
     if let Some(o) = env.get("FRESHELL_BIND_HOST") {
         if is_valid_bind(&o) {
             return o;
+        }
+    }
+
+    // Check for persisted configured host before WSL default
+    if let BindHostConfig::Ok {
+        raw_host: Some(h),
+        configured: true,
+    } = &config
+    {
+        if is_valid_bind(h) {
+            return h.clone();
         }
     }
 
@@ -571,6 +582,33 @@ mod tests {
             resolve_bind_host(&MapEnv::new(), true, BindHostConfig::Failed),
             "0.0.0.0"
         );
+    }
+
+    #[test]
+    fn wsl_with_configured_host_outranks_wsl_default() {
+        // env WITHOUT FRESHELL_BIND_HOST / HOST set
+        let host = resolve_bind_host(
+            &MapEnv::new(),
+            true,
+            BindHostConfig::Ok {
+                raw_host: Some("127.0.0.1".into()),
+                configured: true,
+            },
+        );
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn wsl_unconfigured_keeps_wildcard_default() {
+        let host = resolve_bind_host(
+            &MapEnv::new(),
+            true,
+            BindHostConfig::Ok {
+                raw_host: Some("127.0.0.1".into()),
+                configured: false,
+            },
+        );
+        assert_eq!(host, "0.0.0.0");
     }
 
     #[test]
