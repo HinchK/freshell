@@ -20,12 +20,6 @@
 //! the port. On a single-user self-hosted box that is inside the same trust
 //! boundary as the auth token.
 
-// Consumed by Slice 2's later tasks (2.2 wires `serve_on`/`set_app` into
-// main.rs boot; 2.3/2.4 call `serve_on` from the mutation endpoints). Until
-// then only the in-crate tests reach these items, so the binary target's
-// dead-code lint fires; drop this allow when 2.2 lands.
-#![allow(dead_code)]
-
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, OnceLock};
 
@@ -98,6 +92,9 @@ impl RebindController {
         let _ = self.app.set(app); // first (full) app wins
     }
 
+    // Consumed by Task 2.3/2.4's network mutation endpoints (they gate the
+    // rebind path on a fully-built app); until then nothing in the bin reads it.
+    #[allow(dead_code)]
     pub fn has_app(&self) -> bool {
         self.app.get().is_some()
     }
@@ -123,7 +120,17 @@ impl RebindController {
                     biased;
                     _ = shut.notified() => break,
                     res = listener.accept() => {
-                        let Ok((stream, _remote)) = res else { continue };
+                        let (stream, _remote) = match res {
+                            Ok(accepted) => accepted,
+                            Err(err) => {
+                                // A persistent accept failure (e.g. EMFILE)
+                                // must not silently busy-loop: log it and back
+                                // off briefly before retrying.
+                                tracing::warn!(error = %err, "listener accept failed; retrying after backoff");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        };
                         let app = app.clone();
                         tokio::spawn(async move {
                             // axum 0.8 "serve with hyper directly" pattern — if the

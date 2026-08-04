@@ -170,6 +170,37 @@ pub struct NetworkState {
     /// reachability outcome (`Some(true)`/`Some(false)`/`None`) is
     /// deterministic and no real socket is touched.
     pub probe: Arc<dyn PortProbe>,
+    /// The process-wide settings/event broadcast bus (same one `settings_store`
+    /// uses). Network mutations broadcast `settings.updated` after the change.
+    pub broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    /// The transactional rebind controller (Slice 2). Swaps the live listener
+    /// between 127.0.0.1 and 0.0.0.0 without a zero-listener window.
+    // Read by Task 2.3/2.4's mutation endpoints (`state.rebind.serve_on(..)`);
+    // until then main.rs only WRITES the field at construction.
+    #[allow(dead_code)]
+    pub rebind: std::sync::Arc<crate::net_bind::RebindController>,
+    /// Serializes ALL network mutations (configure / disable / firewall persist)
+    /// from before the live-bind read through persist + bind.set — the port of
+    /// the TS rebind queue (network-manager.ts:220-221, :424-436). VALIDATED
+    /// (ledger A-08, reports/V5.md): without it, concurrent mutations can
+    /// persist a host that contradicts the live listener.
+    // Locked by Task 2.3/2.4's mutation endpoints; nothing in the bin reads it yet.
+    #[allow(dead_code)]
+    pub net_mutation: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl NetworkState {
+    /// Emit the exact frame `settings_store::patch_settings` emits on success.
+    // Called by Task 2.3/2.4's mutation endpoints after persist+rebind; until
+    // then only the unit test exercises it, so the bin target sees it as dead.
+    #[allow(dead_code)]
+    pub fn broadcast_settings_updated(&self, settings: &freshell_protocol::ServerSettings) {
+        if let Ok(frame) = serde_json::to_string(
+            &serde_json::json!({ "type": "settings.updated", "settings": settings }),
+        ) {
+            let _ = self.broadcast_tx.send(frame);
+        }
+    }
 }
 
 /// The live, currently-bound host (`"127.0.0.1"` / `"0.0.0.0"`). A thin
@@ -687,6 +718,10 @@ mod tests {
             port: 51234,
             facts: Arc::new(NetworkFactsCache::new()),
             probe: Arc::new(FakePortProbe::new(probe_result)),
+            broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            // port 0: never served in unit tests (no app injected either).
+            rebind: crate::net_bind::RebindController::new(0, true),
+            net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -707,8 +742,28 @@ mod tests {
             port: 51234,
             facts: Arc::new(NetworkFactsCache::new()),
             probe: Arc::new(probe),
+            broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            // port 0: never served in unit tests (no app injected either).
+            rebind: crate::net_bind::RebindController::new(0, true),
+            net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
         (state, counter)
+    }
+
+    /// Slice 2 (Task 2.2): `broadcast_settings_updated` emits the exact frame
+    /// `settings_store::patch_settings` emits on success — `settings.updated`
+    /// with the full settings tree (including `network`) as the payload.
+    #[tokio::test]
+    async fn broadcast_settings_updated_emits_the_settings_updated_frame() {
+        let state = test_state("127.0.0.1", None);
+        let mut rx = state.broadcast_tx.subscribe();
+        let settings = state.settings.get().await;
+        state.broadcast_settings_updated(&settings);
+        let frame = rx.recv().await.expect("a frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "settings.updated");
+        assert!(v["settings"].is_object());
+        assert!(v["settings"].get("network").is_some());
     }
 
     async fn body_json(resp: Response) -> Value {

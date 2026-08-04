@@ -47,7 +47,7 @@ mod tabs_snapshots;
 mod terminals;
 mod updater;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -898,6 +898,8 @@ async fn main() -> ExitCode {
     // The read-only network status surface (`GET /api/network/status`, Follow-up
     // 3.19): the full `NetworkStatus` shape, with firewall/LAN facts detected
     // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
+    let rebind =
+        crate::net_bind::RebindController::new(port, crate::net_bind::reuse_port_enabled());
     let network_state = network::NetworkState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -905,6 +907,9 @@ async fn main() -> ExitCode {
         port,
         facts: Arc::new(network::NetworkFactsCache::new()),
         probe: Arc::new(network::TcpPortProbe::default()),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        rebind: Arc::clone(&rebind),
+        net_mutation: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
@@ -1352,34 +1357,37 @@ async fn main() -> ExitCode {
             logging::request_logging_middleware,
         ));
 
-    let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    let addr = SocketAddr::new(ip, port);
-
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("freshell-server: failed to bind {addr}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // Slice 2 (Task 2.2): the boot listener is served through the
+    // RebindController — the same transactional bind/swap path the network
+    // mutation endpoints (2.3/2.4) use — so there is exactly ONE serving
+    // mechanism to reason about. `serve_on` binds (proof) and starts the
+    // accept loop; a bind failure here is the old bind-error exit path.
+    rebind.set_app(app.clone());
+    let boot_ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    if let Err(err) = rebind.serve_on(boot_ip).await {
+        eprintln!("freshell-server: failed to bind {boot_ip}:{port}: {err}");
+        return ExitCode::FAILURE;
+    }
     // Single startup line (stderr, so it never pollutes any stdout protocol).
     // Provenance-hardening lane: the commit suffix (same `commit` value
     // `GET /api/server-info` reports, `diag.rs::build_commit()`) means an
     // operator tailing boot logs can identify exactly which source commit
     // is running without a separate authenticated request.
     eprintln!(
-        "freshell-server listening on http://{addr} (ws://{addr}/ws) [commit {}]",
+        "freshell-server listening on http://{boot_ip}:{port} (ws://{boot_ip}:{port}/ws) [commit {}]",
         diag::build_commit()
     );
 
-    // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
-    // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(
-            Arc::clone(&shutdown_notify),
-            std::sync::Arc::clone(&shutdown_started),
-        ))
-        .await;
+    // Block until SIGTERM/SIGINT (the same graceful-shutdown trigger the old
+    // `axum::serve(...).with_graceful_shutdown(...)` used), then drain the
+    // live listener so every owned child (PTY terminals, the
+    // Codex/claude/opencode sidecars) is reaped — no orphans.
+    shutdown_signal(
+        Arc::clone(&shutdown_notify),
+        std::sync::Arc::clone(&shutdown_started),
+    )
+    .await;
+    rebind.shutdown_all().await;
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
     // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
@@ -1428,10 +1436,6 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
-    if let Err(err) = serve_result {
-        eprintln!("freshell-server: serve error: {err}");
-        return ExitCode::FAILURE;
-    }
     ExitCode::SUCCESS
 }
 
