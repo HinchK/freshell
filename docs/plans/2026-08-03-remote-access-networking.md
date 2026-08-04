@@ -1,0 +1,2479 @@
+# Remote-Access Networking Completion Implementation Plan
+
+> **For agentic workers:** This plan is executed task-by-task by the
+> workflow's execute stage: a fresh implementer per task, with a spec +
+> quality review after each task. Steps use checkbox (`- [ ]`) syntax
+> for tracking. Every task is self-contained — repeated code is intentional
+> because a fresh implementer sees only their own task.
+
+**Goal:** Finish the Rust Freshell server's remote-access networking surface —
+the two mutation endpoints (`configure`, `disable-remote-access`) with a
+genuinely transactional rebind, the `configure-firewall` endpoint with the full
+confirmation-token protocol and Windows/WSL2 machinery behind injected fakes,
+plus a live verification harness — matching the frozen TypeScript wire contract
+exactly, all committed to `feat/remote-access-networking`.
+
+**Architecture:** Slice 1 (live status + `GET /api/lan-info`) is already landed.
+This plan adds Slice 0 (injection/timing hardening in `freshell-platform`),
+Slice 2 (Linux-live mutation endpoints with a bind-new-before-persist rebind
+using `SO_REUSEPORT`), Slice 3 (`configure-firewall` + Windows/WSL2 elevation
+behind a compile-time-unreachable real runner), and a `scripts/verify-remote-access.sh`
+harness that proves expose/retract against a three-tier vantage ladder. All OS
+mutation flows through an injected `CommandRunner`; on this Linux host the real
+Windows-mutation path is structurally unreachable (a `#[cfg(windows)]`-only enum
+variant), so tests exercise it via `FakeCommandRunner` with byte-exact golden
+strings.
+
+**Tech Stack:** Rust (edition 2021, rust-version 1.96), axum 0.8, tokio,
+`socket2` (SO_REUSEPORT), `serde_json` (preserve_order), `uuid` v4, `tower`
+(`ServiceExt::oneshot` for in-crate route tests), bash + curl + jq +
+`powershell.exe`/`ssh` for the harness.
+
+## Global Constraints
+
+Every task's requirements implicitly include this section. Values are copied
+verbatim from the spec and the exploration.
+
+- **Repo root (worktree):** `/home/dan/code/freshell/.worktrees/remote-access-networking`.
+  All subagents/scripts run with an UNKNOWN working directory — always use
+  absolute paths or `git -C <root>` / path-prefixed access. Never rely on cwd.
+- **Branch:** `feat/remote-access-networking`. All work commits here. Uncommitted
+  work is treated as nonexistent.
+- **FROZEN — never edit:** `server/`, `shared/`, `src/`. They are the behavioral
+  reference and the client contract. `git status --porcelain server/ shared/ src/`
+  MUST stay empty; it is a falsifier in every code slice.
+- **The TypeScript is the behavioral reference; the client is the contract.**
+  Match the wire shapes the client reads exactly (`src/store/networkSlice.ts`,
+  `src/components/settings/NetworkSettings.tsx`, `src/components/NetworkQuickAccess.tsx`,
+  `src/lib/firewall-configure.ts`, `src/lib/share-utils.ts`).
+- **Package scope for all Rust checks:**
+  `cargo test -p freshell-server -p freshell-platform` and
+  `cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings`
+  and `cargo fmt --check`. `freshell-server` is `[[bin]]`-only (no `src/lib.rs`),
+  so route unit tests live IN-crate as `#[cfg(test)] mod tests`; cross-process
+  tests live in `crates/freshell-server/tests/*.rs` and spawn the compiled binary.
+- **Baseline after Slice 1:** `cargo test -p freshell-server -p freshell-platform`
+  is green (~708–718 passed, 0 failed, 1 ignored). Never reduce this; only add.
+- **SAFETY — never execute mutating OS network/firewall commands on this host:**
+  no `netsh ... add/delete/set`, no `netsh interface portproxy add/delete`, no
+  `Start-Process -Verb RunAs`, no `ufw`/`iptables`. Mutation exists ONLY as
+  golden-string builders dispatched through an injected `CommandRunner`, which in
+  every test is a `FakeCommandRunner`. Read-only `netsh ... show all` /
+  `netsh advfirewall firewall show rule` via `powershell.exe` is the ONLY
+  permitted `netsh` use. Rebinding our OWN listener (`127.0.0.1` ↔ `0.0.0.0`) is
+  allowed — our socket, not OS-global state.
+- **PORT 3001 POLICY (critical):** the user's LIVE Freshell instance holds
+  `0.0.0.0:3001` and serves real sessions. DO NOT kill it; DO NOT bind 3001 while
+  it runs. All harness endpoint/expose/retract tests run on an ephemeral high
+  test port using tiers (a)+(b). Tier (c) needs 3001 → gate it behind a flag and
+  degrade-with-documented-reason otherwise. If a brief 3001 takeover seems
+  needed, STOP and surface to the user — do not act.
+- **Vantage ladder** (all three verified live 2026-08-03): (a) WSL loopback
+  `curl http://127.0.0.1:$PORT/`; (b) Windows host
+  `powershell.exe Invoke-WebRequest http://<eth0 IP>:$PORT/` — re-resolve eth0 IP
+  each run via `ip -4 addr show eth0` — HTTP 200 truthfully means 0.0.0.0-bound,
+  connection refused truthfully means loopback-bound, works on ANY port,
+  **REQUIRED / never degradable**; (c) true LAN
+  `ssh shapiroserver2 curl http://192.168.3.50:3001/...`, valid ONLY on port 3001.
+- **Deviations:** where the TS is buggy, fix it and record the deviation in
+  `port/oracle/DEVIATIONS.md` with status `proposed` (Task 6.1). Working behavior
+  over bug-for-bug parity. Do NOT replicate the wsl2
+  `remoteAccessEnabled = rawPortOpen === true` predicate as a bug — it is the
+  client contract (`src/lib/share-utils.ts`); Slice 1 already ports it faithfully.
+- **Commits:** conventional-commit messages, one commit per work item, each with
+  its own falsifier output pasted into the commit body, plus the Amplifier
+  co-author attribution block:
+
+  ```
+  🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+  Co-Authored-By: Claude <noreply@anthropic.com>
+  ```
+- **Anti-fabrication contract:** every work item gets its own commit and its own
+  falsifier that FAILS if that item alone is skipped. Falsifiers must be decidable
+  without prose interpretation (a grep verdict, a passing test, an exit code).
+- **README.md** is the only end-user markdown doc; this plan and the
+  deferred-evidence doc live under `docs/plans/` and are working/agent docs.
+
+---
+
+## UNRESOLVED COVERAGE GAPS
+
+None. NET-04, NET-05, and NET-07 require a disposable **elevated Windows VM** that
+this Linux host is not and that the safety rules forbid simulating; they are
+therefore **HOST-BLOCKED / deferred-with-evidence** — the *production code paths*
+for them are fully implemented and exercised through `FakeCommandRunner` with
+byte-exact golden strings and a compile-time unreachability proof (Tasks 3.1–3.5),
+and the deferral is recorded with evidence in Task 3.6. This is not a stub
+standing in for missing behavior: the behavior is built and tested; only the
+*live elevated side effect* is unexecuted, by design, because executing it
+requires hardware this host lacks. This disposition is the spec's own: it
+explicitly orders these implemented "behind fakes ... structurally unreachable"
+and "documented as deferred-with-evidence". Every other NET requirement
+(NET-01/02/03/06/08/09/10) is evidenced live by the harness (Tasks 5.x). See the
+coverage table in the Self-Review section.
+
+---
+
+## File Structure
+
+New and modified files, by responsibility. Line numbers are from the current tree
+(`13c5c34e8`) and are anchors — resolve by name if they drift.
+
+| File | Responsibility | Slice |
+|---|---|---|
+| `crates/freshell-platform/src/elevated.rs` | Confirmation gate token compare → constant-time; add `ElevationRunner` enum (structural unreachability) + NET-07 outcome variants | 0, 3 |
+| `crates/freshell-platform/src/port_forward.rs` | `wsl_ip: &str` → `std::net::Ipv4Addr` across builders/plans/reads (kills the injection sink) | 0 |
+| `crates/freshell-server/src/net_bind.rs` | **NEW.** `SO_REUSEPORT`/`SO_REUSEADDR` listener factory; `RebindController` (bind-new → prove → persist → drain old); per-listener `Notify` | 2 |
+| `crates/freshell-server/src/network.rs` | Two POST routes (`configure`, `disable-remote-access`); `configure-firewall` route; wire `broadcast_tx`, `RebindController`, `Arc<Mutex<ConfirmationGate>>`, managed-ports store into `NetworkState`; shared action-resolution ladder | 2, 3 |
+| `crates/freshell-server/src/managed_ports.rs` | **NEW.** Instance-scoped Windows/WSL managed-remote-access-ports persistence (fake-backed, honours `FRESHELL_HOME`, atomic) | 3 |
+| `crates/freshell-server/src/main.rs` | Restructure serving so the boot listener is spawned via `RebindController`; boot bind honors persisted `settings.network`; inject `broadcast_tx`, controller, gate, managed-ports store into `NetworkState` | 2, 3 |
+| `crates/freshell-server/Cargo.toml` | Add `socket2 = "0.6"` | 2 |
+| `crates/freshell-server/tests/net09_config_preservation.rs` | **NEW.** Black-box binary test: byte-preservation of unmanaged config across a network mutation + restart | 2 |
+| `scripts/verify-remote-access.sh` | **NEW.** End-to-end live verification harness (7 phases, 3-tier ladder, NET-08 matrix, read-only host-state identity self-proof, `report.json`) | Harness |
+| `docs/plans/2026-07-28-net-windows-deferred-evidence.md` | **NEW.** HOST-BLOCKED evidence record for NET-04/05/07 | 3 |
+| `port/oracle/DEVIATIONS.md` | Append `proposed` deviation entries | 6 |
+
+---
+
+## Task ordering and dependencies
+
+- **Slice 0** (Task 0.1, 0.2) — `freshell-platform` only; independent of Slice 2;
+  a HARD BLOCKER for Slice 3 (wiring callers onto an unfixed `wsl_ip: &str`
+  promotes the injection sink from latent to live). Land first.
+- **Slice 2** (Tasks 2.1–2.5) — depends on Slice 1 (landed).
+- **Slice 3** (Tasks 3.1–3.6) — depends on Slice 0 AND Slice 2.
+- **Harness** (Tasks 5.1–5.5) — depends on Slices 2 and 3 (it curls all five
+  endpoints). Write it last.
+- **Deviations** (Task 6.1) — after the code slices; documents the choices made.
+
+Each slice is Red-Green-Refactor and committed before the next begins.
+
+---
+
+# SLICE 0 — Injection & timing hardening (freshell-platform)
+
+Two files, security-only, no wire change. The prior attempt at
+`.ai/attempt5-slice3-partial.patch` is REFERENCE-ONLY inspiration (it is
+uncommitted and its two `get_wsl_ip_rejects_injection_shaped_*` tests are weak —
+they pass on pre-patch code; strengthen them here so the falsifier truly fails if
+the item is skipped).
+
+## Task 0.1: Constant-time confirmation-token compare
+
+**Files:**
+- Modify: `crates/freshell-platform/src/elevated.rs:168-200` (`matches_confirmation`, `consume_current_confirmation`)
+- Test: `crates/freshell-platform/src/elevated.rs` `#[cfg(test)] mod tests` (starts `:268`)
+
+**Interfaces:**
+- Consumes: `freshell_platform::network::timing_safe_compare` (`crates/freshell-platform/src/network.rs:212`, signature `pub fn timing_safe_compare(a: &str, b: &str) -> bool` or `(&[u8],&[u8])` — verify by reading its definition and matching the call).
+- Produces: unchanged public signatures for `ConfirmationGate::matches_confirmation` and `::consume_current_confirmation`; behavior identical for valid tokens, now constant-time.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/freshell-platform/src/elevated.rs` inside `#[cfg(test)] mod tests`:
+
+```rust
+#[test]
+fn matches_confirmation_uses_constant_time_compare_not_equality() {
+    // Falsifier for NET-08-C: this test fails only if `==` is still used,
+    // because it asserts the source no longer contains the equality compare.
+    let src = include_str!("elevated.rs");
+    assert!(
+        !src.contains("c.token == t"),
+        "raw == token compare still present; NET-08-C not applied"
+    );
+    assert!(
+        src.contains("timing_safe_compare"),
+        "timing_safe_compare not wired into the confirmation gate"
+    );
+}
+
+#[test]
+fn matches_confirmation_rejects_equal_length_mismatched_token() {
+    let mut gate = ConfirmationGate::new();
+    let issued = gate.issue_confirmation(ConfirmationAction::WindowsRepair, "aaaaaaaa");
+    // Same length, different content -> must NOT match.
+    assert!(!gate.matches_confirmation(Some("bbbbbbbb"), ConfirmationAction::WindowsRepair));
+    // The genuinely-issued token still matches.
+    assert!(gate.matches_confirmation(Some(&issued.confirmation_token), ConfirmationAction::WindowsRepair));
+}
+
+#[test]
+fn consume_current_confirmation_rejects_differing_length_token() {
+    let mut gate = ConfirmationGate::new();
+    let issued = gate.issue_confirmation(ConfirmationAction::Wsl2Repair, "tokseed");
+    assert!(!gate.consume_current_confirmation(Some("x")));
+    assert!(gate.consume_current_confirmation(Some(&issued.confirmation_token)));
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test -p freshell-platform elevated:: 2>&1 | tail -30`
+Expected: `matches_confirmation_uses_constant_time_compare_not_equality` FAILS
+(`raw == token compare still present`).
+
+- [ ] **Step 3: Apply the constant-time compare**
+
+At the top of `elevated.rs` add the import (place near the other `use crate::` lines):
+
+```rust
+use crate::network::timing_safe_compare;
+```
+
+Replace the equality compare at `elevated.rs:170` (inside `matches_confirmation`):
+
+```rust
+// before:  (Some(c), Some(t)) => c.token == t && c.action == action,
+(Some(c), Some(t)) => timing_safe_compare(&c.token, t) && c.action == action,
+```
+
+Replace the equality guard at `elevated.rs:194` (inside `consume_current_confirmation`):
+
+```rust
+// before:  (Some(c), Some(t)) if c.token == t => {
+(Some(c), Some(t)) if timing_safe_compare(&c.token, t) => {
+```
+
+If `timing_safe_compare` takes `&[u8]`, call `timing_safe_compare(c.token.as_bytes(), t.as_bytes())` instead — read `crates/freshell-platform/src/network.rs:212` first and match the exact signature.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-platform elevated:: 2>&1 | tail -30`
+Expected: all three new tests PASS; the pre-existing gate tests
+(`phase1_issues_token_and_never_spawns`, `confirm_with_wrong_token_reissues_and_does_not_spawn`, etc.) still PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs        # must be 0
+grep -c 'timing_safe_compare' crates/freshell-platform/src/elevated.rs  # must be >0
+cargo test -p freshell-platform -p freshell-server 2>&1 | tail -5
+cargo clippy -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-platform/src/elevated.rs
+git commit  # message below, paste falsifier output into the body
+```
+
+Commit message: `fix(net): constant-time confirmation-token compare (NET-08-C)`
+
+## Task 0.2: Type `wsl_ip` as `Ipv4Addr` to make command injection unrepresentable
+
+**Files:**
+- Modify: `crates/freshell-platform/src/port_forward.rs` — `WslPortForwardingPlan` fields (`:58-71`), `build_port_forwarding_script` (`:327`), `needs_port_forwarding_update` (`:280`), `build_wsl_port_forwarding_plan` (`:413`), `get_wsl_ip` (`:549`)
+- Test: `crates/freshell-platform/src/port_forward.rs` `#[cfg(test)] mod tests` (starts `:598`)
+- Sweep: any caller in `crates/` that constructs/reads these (compile check catches them)
+
+**Interfaces:**
+- Consumes: `std::net::Ipv4Addr`.
+- Produces:
+  - `WslPortForwardingPlan::Noop { wsl_ip: Ipv4Addr }` and
+    `::Ready { wsl_ip: Ipv4Addr, script_kind: ScriptKind, script: String }`
+  - `pub fn build_port_forwarding_script(wsl_ip: Ipv4Addr, ports: &[u16], cleanup_ports: &[u16]) -> String`
+  - `pub fn needs_port_forwarding_update(wsl_ip: Ipv4Addr, required_ports: &[u16], existing_rules: &BTreeMap<u16, PortProxyRule>) -> bool`
+  - `pub fn build_wsl_port_forwarding_plan(required_ports: &[u16], known_owned_ports: &[u16], wsl_ip: Ipv4Addr, existing_rules: &BTreeMap<u16, PortProxyRule>, existing_firewall_ports: &[u16], managed_ports: &[u16]) -> WslPortForwardingPlan`
+  - `pub fn get_wsl_ip(runner: &dyn CommandRunner) -> Option<Ipv4Addr>`
+  - **Golden script strings are UNCHANGED** (`Ipv4Addr::to_string()` renders `172.30.149.249` identically). This is a security-only change.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/freshell-platform/src/port_forward.rs` inside `#[cfg(test)] mod tests`. The key strengthening over the prior attempt: a payload that *passes* a shape heuristic but *fails* `Ipv4Addr::from_str`, so the test cannot pass on pre-change code.
+
+```rust
+use std::net::Ipv4Addr;
+
+#[test]
+fn wsl_ip_injection_payloads_cannot_be_typed_as_ipv4() {
+    // Each of these is a command-injection attempt; none is a valid Ipv4Addr.
+    let payloads = [
+        "1.2.3.4; calc",
+        "1.2.3.4\nnetsh interface portproxy add",
+        "1.2.3.4`whoami`",
+        "$(id)",
+        "1.2.3.4 | rm -rf /",
+        "999.1.1.1",          // passes a naive digit/dot shape, fails real parse
+        "1.2.3.4.5",
+        "",
+        "0x7f.0.0.1",
+    ];
+    for p in payloads {
+        assert!(
+            p.parse::<Ipv4Addr>().is_err(),
+            "payload unexpectedly parsed as Ipv4Addr: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn get_wsl_ip_returns_none_for_shape_valid_but_unparseable_output() {
+    // eth0 output whose token passes a digits-and-dots heuristic but is not a
+    // real IPv4 address. Pre-change (String) code would have returned Some("999.1.1.1").
+    let runner = crate::FakeCommandRunner::new().on(
+        "ip",
+        &["addr", "show", "eth0"],
+        crate::CommandOutput::success("    inet 999.1.1.1/24 brd ... scope global eth0"),
+    );
+    assert_eq!(get_wsl_ip(&runner), None);
+}
+
+#[test]
+fn get_wsl_ip_parses_a_real_ipv4() {
+    let runner = crate::FakeCommandRunner::new().on(
+        "ip",
+        &["addr", "show", "eth0"],
+        crate::CommandOutput::success("    inet 172.30.149.249/20 brd ... scope global eth0"),
+    );
+    assert_eq!(get_wsl_ip(&runner), Some(Ipv4Addr::new(172, 30, 149, 249)));
+}
+
+#[test]
+fn port_forwarding_script_bytes_unchanged_under_ipv4_typing() {
+    // Golden lock: the emitted script must be byte-identical to the pre-change
+    // output for a valid IP. (Copy the exact expected string from the existing
+    // `port_forwarding_script_golden_raw_backslash` test at :623 before editing.)
+    let script = build_port_forwarding_script(Ipv4Addr::new(172, 30, 149, 249), &[3001], &[3001]);
+    assert!(script.contains("connectaddress=172.30.149.249"));
+    assert!(script.contains("2>\\$null")); // raw backslash-dollar preserved
+}
+```
+
+Before editing, **read the existing golden tests** `port_forwarding_script_golden_raw_backslash` (`:623`) and `port_forwarding_script_multiport_and_distinct_cleanup` (`:638`) and update their call sites to pass `Ipv4Addr` literals (`"172.30.149.249".parse().unwrap()`), keeping the expected strings byte-identical.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-platform port_forward:: 2>&1 | tail -30`
+Expected: compile error (the new tests reference the `Ipv4Addr` signatures that
+don't exist yet), or the existing goldens fail to compile.
+
+- [ ] **Step 3: Apply the type change**
+
+At the top of `port_forward.rs`: `use std::net::Ipv4Addr;`
+
+Change the plan enum (`:58-71`):
+
+```rust
+pub enum WslPortForwardingPlan {
+    NotWsl2,
+    Disabled,
+    Error(String),
+    Noop { wsl_ip: Ipv4Addr },
+    Ready { wsl_ip: Ipv4Addr, script_kind: ScriptKind, script: String },
+}
+```
+
+Change `build_port_forwarding_script` (`:327`) — internally bind `let wsl_ip = wsl_ip.to_string();` at the top so the rest of the body is unchanged:
+
+```rust
+pub fn build_port_forwarding_script(wsl_ip: Ipv4Addr, ports: &[u16], cleanup_ports: &[u16]) -> String {
+    let wsl_ip = wsl_ip.to_string();
+    // ... existing body unchanged (interpolates `connectaddress={wsl_ip}`) ...
+}
+```
+
+Change `needs_port_forwarding_update` (`:280`) similarly (bind `let wsl_ip_str = wsl_ip.to_string();`, compare `rule.connect_address != wsl_ip_str`).
+
+Change `build_wsl_port_forwarding_plan` (`:413`) signature to take `wsl_ip: Ipv4Addr`; drop the `.to_string()` at the `Noop { wsl_ip }` / `Ready { wsl_ip, .. }` construction sites (the field is now `Ipv4Addr`); call `build_port_forwarding_script(wsl_ip, ...)` directly.
+
+Change `get_wsl_ip` (`:549`) to parse at the read boundary:
+
+```rust
+pub fn get_wsl_ip(runner: &dyn CommandRunner) -> Option<Ipv4Addr> {
+    // ... existing eth0-then-hostname extraction yields a &str candidate ...
+    // then, at each return point:
+    candidate.trim().parse::<Ipv4Addr>().ok()
+}
+```
+
+- [ ] **Step 4: Caller sweep — compile the whole scope**
+
+Run: `cargo build -p freshell-platform -p freshell-server 2>&1 | tail -40`
+Fix every call site the compiler flags (e.g. any code reading `plan.wsl_ip` now
+gets an `Ipv4Addr`; if it needs a string, call `.to_string()`). If a caller
+`Serialize`s `WslPortForwardingPlan`, add a test asserting `Ipv4Addr` serializes
+as `"172.30.149.249"` (same wire shape). At `13c5c34e8` there are no
+`freshell-server` callers, but do not assume — let the compiler prove it.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-platform port_forward:: 2>&1 | tail -30`
+Expected: new tests PASS; all pre-existing `port_forward` golden tests PASS
+(strings byte-identical).
+
+- [ ] **Step 6: Falsifier + commit**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs  # must be 0
+grep -Ec 'wsl_ip: Ipv4Addr|wsl_ip: std::net::Ipv4Addr' crates/freshell-platform/src/port_forward.rs  # must be >0
+cargo test -p freshell-platform -p freshell-server 2>&1 | tail -5
+cargo clippy -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-platform/src/port_forward.rs
+git commit  # paste falsifier output into the body
+```
+
+Commit message: `fix(net): type wsl_ip as Ipv4Addr, making command injection unrepresentable (NET-08-A/B)`
+
+---
+
+# SLICE 2 — Mutation endpoints, Linux-live
+
+`POST /api/network/configure` and `POST /api/network/disable-remote-access`
+really expose and really retract, transactionally, through the serialized config
+store. This is the primary evidence for NET-02 (transactional rebind, exceeding
+the reference), NET-06 (safe disable, Linux lane), and NET-09 (lossless writes),
+plus NET-01/03/08.
+
+## Task 2.1: `SO_REUSEPORT` listener factory + `RebindController`
+
+**Files:**
+- Create: `crates/freshell-server/src/net_bind.rs`
+- Modify: `crates/freshell-server/Cargo.toml` (add `socket2 = "0.6"`)
+- Modify: `crates/freshell-server/src/main.rs` (add `mod net_bind;` near the other `mod` declarations)
+- Test: `crates/freshell-server/src/net_bind.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: `socket2`, `tokio::net::TcpListener`, `axum::Router`, `tokio::sync::Notify`.
+- Produces:
+  - `pub fn bind_reusable(addr: std::net::SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpListener>` — a std listener with `SO_REUSEADDR` (+ `SO_REUSEPORT` on unix when `reuse_port`), nonblocking, listening.
+  - `pub fn parse_reuse_port(raw: Option<&str>) -> bool` — `false` iff raw ∈ {`1`,`true`,`yes`} (case-insensitive), else `true`.
+  - `pub fn reuse_port_enabled() -> bool` — reads `FRESHELL_REBIND_NO_REUSEPORT`.
+  - `pub struct RebindController` with `new`, `set_app`, `has_app`, `serve_on`, `shutdown_all` (see body in Step 4).
+
+- [ ] **Step 1: Add the dependency**
+
+Edit `crates/freshell-server/Cargo.toml`, in `[dependencies]`:
+
+```toml
+socket2 = "0.6"
+```
+
+Run: `cargo build -p freshell-server 2>&1 | tail -5` (fetches the crate; already in `Cargo.lock` v0.6.4 via `freshell-ws`).
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `crates/freshell-server/src/net_bind.rs` with only the tests first (module body added in Step 4). Put this at the bottom:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn reuse_port_kill_switch_reads_env() {
+        assert!(parse_reuse_port(None));
+        assert!(!parse_reuse_port(Some("1")));
+        assert!(!parse_reuse_port(Some("TRUE")));
+        assert!(!parse_reuse_port(Some("yes")));
+        assert!(parse_reuse_port(Some("0")));
+        assert!(parse_reuse_port(Some("")));
+    }
+
+    #[test]
+    fn two_reuseport_binds_on_same_addr_both_succeed() {
+        let port = free_port();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let a = bind_reusable(addr, true).expect("first reuseport bind");
+        let b = bind_reusable(addr, true).expect("second reuseport bind must also succeed");
+        drop((a, b));
+    }
+
+    #[test]
+    fn foreign_squatter_blocks_our_bind() {
+        let port = free_port();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let squatter = std::net::TcpListener::bind(addr).expect("squatter binds");
+        let result = bind_reusable(addr, true);
+        assert!(result.is_err(), "reuseport bind must still fail against a foreign non-reuseport squatter");
+        drop(squatter);
+    }
+
+    #[tokio::test]
+    async fn serve_on_proves_bind_before_swapping_and_serves_traffic() {
+        use axum::{routing::get, Router};
+        let port = free_port();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let ctl = RebindController::new(port, true);
+        ctl.set_app(app);
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.expect("initial serve");
+        let body = reqwest::get(format!("http://127.0.0.1:{port}/ping")).await.unwrap().text().await.unwrap();
+        assert_eq!(body, "pong");
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await.expect("rebind serve");
+        let body2 = reqwest::get(format!("http://127.0.0.1:{port}/ping")).await.unwrap().text().await.unwrap();
+        assert_eq!(body2, "pong");
+        ctl.shutdown_all().await;
+    }
+}
+```
+
+`reqwest` is already a `freshell-server` dev-dependency. If unavailable in unit tests, add it under `[dev-dependencies]`.
+
+- [ ] **Step 3: Run to verify failure**
+
+Run: `cargo test -p freshell-server net_bind:: 2>&1 | tail -20`
+Expected: compile failure (module body absent).
+
+- [ ] **Step 4: Implement the module body**
+
+Prepend, above the `#[cfg(test)]` block in `crates/freshell-server/src/net_bind.rs`:
+
+```rust
+//! Listener binding for the transactional rebind (NET-02).
+//!
+//! We create every listener (boot AND rebind) with SO_REUSEADDR + SO_REUSEPORT
+//! so a new listener can be *proven to bind* before we persist the config and
+//! drain the old one. Rollback is dropping the new socket — an infallible no-op.
+//! There is never a zero-listener window and persisted state never outruns
+//! reality. The `FRESHELL_REBIND_NO_REUSEPORT=1` escape hatch disables
+//! SO_REUSEPORT (falls back to a best-effort bind a foreign squatter can block).
+//!
+//! Trade-off: SO_REUSEPORT lets another process of the same effective UID bind
+//! the port. On a single-user self-hosted box that is inside the same trust
+//! boundary as the auth token.
+
+use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
+use std::sync::{Arc, OnceLock};
+
+use axum::Router;
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::sync::{Mutex, Notify};
+
+pub fn parse_reuse_port(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        None => true,
+    }
+}
+
+pub fn reuse_port_enabled() -> bool {
+    parse_reuse_port(std::env::var("FRESHELL_REBIND_NO_REUSEPORT").ok().as_deref())
+}
+
+pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdTcpListener> {
+    let domain = match addr.ip() {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: StdTcpListener = socket.into();
+    std_listener.set_nonblocking(true)?;
+    Ok(std_listener)
+}
+
+pub struct RebindController {
+    port: u16,
+    reuse_port: bool,
+    app: OnceLock<Router>,
+    current: Mutex<Option<Arc<Notify>>>,
+}
+
+impl RebindController {
+    pub fn new(port: u16, reuse_port: bool) -> Arc<Self> {
+        Arc::new(Self { port, reuse_port, app: OnceLock::new(), current: Mutex::new(None) })
+    }
+
+    pub fn set_app(&self, app: Router) {
+        let _ = self.app.set(app); // first (full) app wins
+    }
+
+    pub fn has_app(&self) -> bool {
+        self.app.get().is_some()
+    }
+
+    /// Bind `host:port` (proof), spawn a serve task, then drain the old listener.
+    /// On bind failure the previous listener is left untouched (no swap). When no
+    /// app has been injected (unit tests) this is an Ok no-op so validation and
+    /// persistence can be tested without a real socket.
+    pub async fn serve_on(&self, host: IpAddr) -> std::io::Result<()> {
+        let Some(app) = self.app.get().cloned() else { return Ok(()); };
+        let addr = SocketAddr::new(host, self.port);
+        let std_listener = bind_reusable(addr, self.reuse_port)?; // PROOF: must succeed
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let notify = Arc::new(Notify::new());
+        let shutdown = notify.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await;
+        });
+        let mut cur = self.current.lock().await;
+        if let Some(old) = cur.replace(notify) {
+            old.notify_waiters();
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_all(&self) {
+        if let Some(cur) = self.current.lock().await.as_ref() {
+            cur.notify_waiters();
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-server net_bind:: 2>&1 | tail -20`
+Expected: all `net_bind` tests PASS.
+
+- [ ] **Step 6: Falsifier + commit**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+grep -c 'socket2' crates/freshell-server/Cargo.toml                    # must be >0
+grep -c 'pub struct RebindController' crates/freshell-server/src/net_bind.rs  # must be >0
+cargo test -p freshell-server net_bind:: 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/Cargo.toml crates/freshell-server/src/net_bind.rs crates/freshell-server/src/main.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): SO_REUSEPORT listener factory + transactional RebindController (NET-02)`
+
+## Task 2.2: Wire `broadcast_tx` + `RebindController` into `NetworkState`; serve the boot listener through the controller
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs:146-173` (`NetworkState` fields)
+- Modify: `crates/freshell-server/src/main.rs:900-907` (construction), `:1354-1381` (serving)
+- Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: `net_bind::RebindController`, the process `broadcast_tx` (built at `main.rs:212`).
+- Produces: `NetworkState` gains `pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>` and `pub rebind: Arc<crate::net_bind::RebindController>`, plus `pub fn broadcast_settings_updated(&self, settings: &ServerSettings)`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[tokio::test]
+async fn broadcast_settings_updated_emits_the_settings_updated_frame() {
+    let state = test_state("127.0.0.1", None); // updated helper returns a state with a live broadcast_tx
+    let mut rx = state.broadcast_tx.subscribe();
+    let settings = state.settings.get().await;
+    state.broadcast_settings_updated(&settings);
+    let frame = rx.recv().await.expect("a frame");
+    let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(v["type"], "settings.updated");
+    assert!(v["settings"].is_object());
+    assert!(v["settings"].get("network").is_some());
+}
+```
+
+Update the `test_state` / `test_state_with_probe_counter` helpers (`network.rs:682`, `:697`) to construct the two new fields:
+
+```rust
+let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+let rebind = crate::net_bind::RebindController::new(0, true); // port 0: never served in unit tests
+NetworkState {
+    auth_token,
+    settings,
+    bind: Arc::new(BindState::new(bind_host)),
+    port,
+    facts: Arc::new(NetworkFactsCache::new()),
+    probe: Arc::new(FakePortProbe::new(probe_result)),
+    broadcast_tx,
+    rebind,
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests::broadcast 2>&1 | tail -20`
+Expected: compile error (fields don't exist).
+
+- [ ] **Step 3: Add the fields + helper**
+
+Edit `NetworkState` (`network.rs:146-173`), adding after `probe`:
+
+```rust
+    /// The process-wide settings/event broadcast bus (same one `settings_store`
+    /// uses). Network mutations broadcast `settings.updated` after the change.
+    pub broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    /// The transactional rebind controller (Slice 2). Swaps the live listener
+    /// between 127.0.0.1 and 0.0.0.0 without a zero-listener window.
+    pub rebind: std::sync::Arc<crate::net_bind::RebindController>,
+```
+
+Add the helper method (match the `ServerSettings` path already used in `settings_store.rs`):
+
+```rust
+impl NetworkState {
+    /// Emit the exact frame `settings_store::patch_settings` emits on success.
+    pub fn broadcast_settings_updated(&self, settings: &crate::settings::ServerSettings) {
+        if let Ok(frame) =
+            serde_json::to_string(&serde_json::json!({ "type": "settings.updated", "settings": settings }))
+        {
+            let _ = self.broadcast_tx.send(frame);
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Wire construction in main.rs**
+
+At `main.rs:900-907`, build the controller and extend the `NetworkState { ... }`:
+
+```rust
+let rebind = crate::net_bind::RebindController::new(port, crate::net_bind::reuse_port_enabled());
+let network_state = network::NetworkState {
+    auth_token: Arc::clone(&auth_token),
+    settings: settings_store.clone(),
+    bind: Arc::new(network::BindState::new(bind_host.clone())),
+    port,
+    facts: Arc::new(network::NetworkFactsCache::new()),
+    probe: Arc::new(network::TcpPortProbe::default()),
+    broadcast_tx: Arc::clone(&broadcast_tx),
+    rebind: Arc::clone(&rebind),
+};
+```
+
+At the serving site (`main.rs:1354-1381`), REPLACE the single `TcpListener::bind` +
+`axum::serve(...).await` with controller-driven serving. After `app` is fully
+built (`.merge(...)` + global `.layer(...)`):
+
+```rust
+rebind.set_app(app.clone());
+let boot_ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
+if let Err(err) = rebind.serve_on(boot_ip).await {
+    eprintln!("freshell-server: failed to bind {boot_ip}:{port}: {err}");
+    return ExitCode::FAILURE;
+}
+eprintln!(
+    "freshell-server listening on http://{boot_ip}:{port} (ws://{boot_ip}:{port}/ws) [commit {}]",
+    diag::build_commit()
+);
+shutdown_signal(Arc::clone(&shutdown_notify), std::sync::Arc::clone(&shutdown_started)).await;
+rebind.shutdown_all().await;
+// ... existing teardown (registry.kill_all(), *_state.shutdown(), etc.) unchanged ...
+```
+
+`shutdown_signal` is now `.await`ed directly to block `main`, then triggers the
+listener drain. Preserve the existing post-serve teardown block (`main.rs:1401-1419`).
+
+- [ ] **Step 5: Run tests + full build to verify it passes**
+
+Run:
+```
+cargo test -p freshell-server network::tests::broadcast 2>&1 | tail -10
+cargo build -p freshell-server 2>&1 | tail -10
+```
+Expected: broadcast test PASS; whole binary compiles. Fix any leftover references
+to the old `serve_result` variable.
+
+- [ ] **Step 6: Manual smoke (boot still serves)**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+cargo build --release -p freshell-server 2>&1 | tail -3
+P=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+HOME=$(mktemp -d) FRESHELL_HOME=$HOME AUTH_TOKEN=verify-smoke-token-abcdef PORT=$P \
+  ./target/release/freshell-server &
+SRV=$!; sleep 3
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:$P/api/health   # expect 200
+kill $SRV
+```
+Expected: `200`.
+
+- [ ] **Step 7: Falsifier + commit**
+
+```bash
+grep -c 'rebind.serve_on' crates/freshell-server/src/main.rs           # must be >0
+grep -c 'pub rebind:' crates/freshell-server/src/network.rs            # must be >0
+grep -c 'broadcast_settings_updated' crates/freshell-server/src/network.rs  # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs crates/freshell-server/src/main.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): wire broadcast_tx + RebindController into NetworkState; serve boot listener via controller`
+
+## Task 2.2b: Boot bind honors persisted `settings.network` (restart truthfulness)
+
+**Files:**
+- Modify: `crates/freshell-server/src/main.rs:1631-1643` (`resolve_bind_host`) and its call site (`main.rs:105-106`)
+- Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests` (pure-helper test) + harness Phase 5 (live proof)
+
+**Interfaces:**
+- Consumes: `freshell_platform::network::{resolve_bind_host, BindHostConfig}`, `SettingsStore::get()`, `SettingsNetwork`/`NetworkHost` (`crates/freshell-protocol/src/settings.rs:112-115`, `:30-35`), `network_host_str` (`network.rs:418`).
+- Produces: `pub fn boot_bind_config(network: &SettingsNetwork) -> freshell_platform::network::BindHostConfig` (in `network.rs`, pure and testable), and `main.rs` passes it instead of the hardcoded `BindHostConfig::Ok { raw_host: None, configured: false }`.
+
+**Why:** today `resolve_bind_host()` deliberately ignores `settings.network`
+(`main.rs:1638-1641`), so after a disable persists `{host:"127.0.0.1",configured:true}`,
+a restart on WSL would re-bind 0.0.0.0 (the WSL default) — re-exposing a server
+the user retracted, and failing harness Phase 5 (tier-b must stay REFUSED across
+restart). Precedence stays: explicit `FRESHELL_BIND_HOST` → persisted config
+(when `configured`) → WSL default `0.0.0.0` → `HOST` env → `127.0.0.1` — the
+platform `resolve_bind_host` already implements this given a real `BindHostConfig`.
+
+- [ ] **Step 1: Write the failing test**
+
+In `network.rs` tests:
+
+```rust
+#[test]
+fn boot_bind_config_passes_persisted_network_intent() {
+    use freshell_platform::network::BindHostConfig;
+    let net = crate::settings::SettingsNetwork {
+        configured: true,
+        host: crate::settings::NetworkHost::Loopback,
+    };
+    match boot_bind_config(&net) {
+        BindHostConfig::Ok { raw_host, configured } => {
+            assert_eq!(raw_host.as_deref(), Some("127.0.0.1"));
+            assert!(configured);
+        }
+        _ => panic!("expected Ok config"),
+    }
+    let unconfigured = crate::settings::SettingsNetwork {
+        configured: false,
+        host: crate::settings::NetworkHost::Loopback,
+    };
+    match boot_bind_config(&unconfigured) {
+        BindHostConfig::Ok { raw_host, configured } => {
+            // unconfigured: still pass the host as a raw hint but configured=false,
+            // so the WSL default / HOST env keep their precedence.
+            assert_eq!(raw_host.as_deref(), Some("127.0.0.1"));
+            assert!(!configured);
+        }
+        _ => panic!("expected Ok config"),
+    }
+}
+```
+
+(Match the exact `SettingsNetwork`/`NetworkHost` paths used elsewhere in
+`network.rs`; adjust the `BindHostConfig` variant fields to the real enum at
+`crates/freshell-platform/src/network.rs:22` — read it first.)
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests::boot_bind_config 2>&1 | tail -10`
+Expected: compile error — helper absent.
+
+- [ ] **Step 3: Implement the helper + wire it into main**
+
+In `network.rs`:
+
+```rust
+/// Boot-time bind config from the persisted settings (NET-02/06 restart
+/// truthfulness): a disable that persisted loopback must survive a restart.
+pub fn boot_bind_config(
+    network: &crate::settings::SettingsNetwork,
+) -> freshell_platform::network::BindHostConfig {
+    freshell_platform::network::BindHostConfig::Ok {
+        raw_host: Some(network_host_str(&network.host).to_string()),
+        configured: network.configured,
+    }
+}
+```
+
+In `main.rs`, the bind host must now be resolved AFTER the settings store loads.
+Move the `let bind_host = resolve_bind_host();` call (currently `main.rs:105-106`)
+to after `settings_store` is constructed, and change `resolve_bind_host`
+(`main.rs:1631-1643`) to take the persisted network settings:
+
+```rust
+fn resolve_bind_host(network: &freshell_protocol::settings::SettingsNetwork) -> String {
+    let is_wsl = is_wsl_proc(read_proc_version().as_deref());
+    freshell_platform::network::resolve_bind_host(
+        &freshell_platform::RealEnv,
+        is_wsl,
+        network::boot_bind_config(network),
+    )
+}
+```
+
+Call site: `let bind_host = resolve_bind_host(&settings_store.get().await.network);`
+(match the async context main already has). Keep the env precedence intact — the
+platform function already orders `FRESHELL_BIND_HOST` above the config.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5`
+Expected: green (the platform `resolve_bind_host` precedence tests already exist
+and still pass; the new helper test passes). Harness Phase 5 (Task 5.3) is the
+live proof: after disable + restart, tier (b) stays REFUSED.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c 'raw_host: None' crates/freshell-server/src/main.rs        # must be 0
+grep -c 'boot_bind_config' crates/freshell-server/src/network.rs   # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs crates/freshell-server/src/main.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): boot bind honors persisted settings.network (restart truthfulness)`
+
+## Task 2.3: `POST /api/network/configure` — transactional expose/rebind
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs` — add `use axum::routing::post;`, add route to `router()` (`:265-270`), add `configure` handler + `NetworkConfigureRequest`
+- Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: `NetworkState.rebind`, `.settings` (`patch`), `.bind` (`get`/`set`), `.facts` (`invalidate`), `.broadcast_settings_updated`, `build_network_status`, `is_authed`/`unauthorized`.
+- Produces: route `POST /api/network/configure`; handler `async fn configure(State<NetworkState>, HeaderMap, Option<Json<Value>>) -> Response`; a reusable `async fn build_status_value(state: &NetworkState) -> Value`; a `fn invalid_request(details: Value) -> Response`.
+
+**Behavior (ordered — matches `network-router.ts:431-446` + `network-manager.ts:400-439`, with the NET-02 transactional fix):**
+
+1. Auth → 401 `{"error":"Unauthorized"}`.
+2. Parse body into the enum-typed request. Failure → **400 `{"error":"Invalid request","details":[...]}`**. `host` accepts ONLY `"127.0.0.1"`/`"0.0.0.0"` (decoded into a Rust enum — the NET-08 arbitrary-host defense made structural). Schema is NON-strict (unknown keys ignored, matching `NetworkConfigureSchema`).
+3. Compute `host_changed` from the LIVE bind (`BindState::get()`). **DEVIATION (ledgered, Task 6.1 #7):** the TS forces `host_changed=false` on wsl2 (`network-manager.ts:412-413`) because its WSL exposure rides Windows portproxy and the listener always stays on 0.0.0.0. Our port binds truthfully on every platform, and the tier-b bind-address truth test plus the NET-06 disable (which really rebinds to loopback on this WSL2 host) require the symmetric re-expose to really rebind too — so wsl2 rebinds like every other platform.
+4. If `host_changed`: `rebind.serve_on(new_ip)` — binds+proves the new listener FIRST. On `Err` → **500 `{"error":"Failed to configure network"}`, nothing persisted, old listener untouched**.
+5. Persist `{network:{host, configured}}` via `settings.patch(...)` (NET-09 rides the store; no new writer). On patch error propagate `(status, body)`.
+6. `facts.invalidate()`, `bind.set(new_host)`.
+7. Build settled status, respond `{...status, "rebindScheduled": false}`.
+8. AFTER responding, broadcast `settings.updated` with the full merged tree.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn configure_to_all_interfaces_persists_and_reports_settled_host() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+    let state = test_state("127.0.0.1", Some(true));
+    seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/network/configure")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["host"], "0.0.0.0");
+    assert_eq!(body["configured"], true);
+    assert_eq!(body["rebindScheduled"], false);
+    let s = state.settings.get().await;
+    assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "0.0.0.0");
+}
+
+#[tokio::test]
+async fn configure_rejects_arbitrary_host_with_400() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+    let state = test_state("127.0.0.1", None);
+    for bad in [r#"{"host":"10.0.0.1","configured":true}"#,
+                r#"{"host":"0.0.0.0; rm -rf /","configured":true}"#,
+                r#"{"host":"$(id)","configured":true}"#,
+                r#"{"configured":true}"#,
+                r#"{"host":"0.0.0.0","configured":"yes"}"#] {
+        let resp = router(state.clone())
+            .oneshot(Request::builder().method("POST").uri("/api/network/configure")
+                .header("x-auth-token","tok").header("content-type","application/json")
+                .body(Body::from(bad)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), 400, "payload {bad} must be rejected");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "Invalid request");
+        assert!(body["details"].is_array());
+    }
+}
+
+#[tokio::test]
+async fn configure_requires_auth() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+    let state = test_state("127.0.0.1", None);
+    let resp = router(state)
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure")
+            .header("content-type","application/json")
+            .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#)).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+```
+
+These unit tests exercise persistence + validation + wire shape without a live
+listener: `test_state`'s controller has no app injected, so `serve_on` returns
+`Ok(())` immediately (the seam added in Task 2.1). Real bind-address truth is
+proven by the harness at tier b (Task 5.2).
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests::configure 2>&1 | tail -20`
+Expected: 404/compile — route/handler absent.
+
+- [ ] **Step 3: Implement the route + handler**
+
+Add `use axum::routing::post;`. Register the route:
+
+```rust
+pub fn router(state: NetworkState) -> Router {
+    Router::new()
+        .route("/api/network/status", get(network_status))
+        .route("/api/lan-info", get(lan_info))
+        .route("/api/network/configure", post(configure))
+        .with_state(state)
+}
+```
+
+Add the typed request + a zod-shaped 400 helper:
+
+```rust
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkConfigureRequest {
+    host: crate::settings::NetworkHost, // enum: only "127.0.0.1" | "0.0.0.0" deserialize
+    configured: bool,
+}
+
+fn invalid_request(details: serde_json::Value) -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "Invalid request", "details": details })),
+    )
+        .into_response()
+}
+```
+
+Handler:
+
+```rust
+async fn configure(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let raw = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let req: NetworkConfigureRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return invalid_request(json!([{
+                "code": "invalid_type", "path": [], "message": e.to_string()
+            }]));
+        }
+    };
+    let new_host = network_host_str(&req.host).to_string(); // "127.0.0.1" | "0.0.0.0"
+    let live_host = state.bind.get().await;
+    // DEVIATION (Task 6.1 #7): no wsl2 exception — our bind is truthful on every
+    // platform, so wsl2 rebinds for real (the TS kept its listener on 0.0.0.0 and
+    // used portproxy for exposure; network-manager.ts:412-413).
+    let host_changed = live_host != new_host;
+
+    if host_changed {
+        let new_ip: std::net::IpAddr = new_host.parse().expect("enum guarantees a valid IP literal");
+        if state.rebind.serve_on(new_ip).await.is_err() {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to configure network" })),
+            ).into_response();
+        }
+    }
+
+    // Persist AFTER the new listener is proven (NET-02).
+    let patch = json!({ "network": { "host": new_host, "configured": req.configured } });
+    let merged = match state.settings.patch(&patch).await {
+        Ok(m) => m,
+        Err((status, body)) => return (status, Json(body)).into_response(),
+    };
+    state.facts.invalidate().await;
+    if host_changed {
+        state.bind.set(new_host.clone()).await;
+    }
+
+    let mut out = build_status_value(&state).await;
+    out["rebindScheduled"] = json!(false);
+    let response = (axum::http::StatusCode::OK, Json(out)).into_response();
+    state.broadcast_settings_updated(&merged);
+    response
+}
+```
+
+Refactor the status-building block currently inline in `network_status`
+(`network.rs:286-329`) into `async fn build_status_value(state: &NetworkState) -> Value`
+and call it from BOTH `network_status` and `configure` (DRY — do not duplicate the
+probe/facts logic).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-server network::tests 2>&1 | tail -20`
+Expected: the three new `configure_*` tests PASS; all Slice-1 route tests still PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c '"/api/network/configure"' crates/freshell-server/src/network.rs   # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): POST /api/network/configure with transactional rebind (NET-02/09)`
+
+## Task 2.4: `POST /api/network/disable-remote-access` — Linux-live retract
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs` — add route + `disable_remote_access` handler + strict `ConfirmFirewallRequest` (shared with Slice 3) + a `DisableNone` enum
+- Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: same as Task 2.3, plus `is_remote_access_enabled` (freshell-platform network), `is_wsl_port_forwarding_disabled_by_env`.
+- Produces: route `POST /api/network/disable-remote-access`; a `#[derive(Deserialize)] #[serde(rename_all="camelCase", deny_unknown_fields)] pub(crate) struct ConfirmFirewallRequest { confirm_elevation: Option<bool>, confirmation_token: Option<String> }` (strict; `confirm_elevation != Some(false)`; `confirmation_token` non-empty when present).
+
+**Behavior (matches `network-router.ts:448-615` + `applyRemoteAccessDisabledState` `:119-132`, Linux lane; Windows/WSL2 elevation is HOST-BLOCKED here and returns the confirmation data without elevating — full flow in Slice 3):**
+
+1. Auth → 401.
+2. Strict-parse → 400 on unknown key / `confirmElevation:false` / empty `confirmationToken`.
+3. (409 in-flight lock pre-check added in Task 3.3 when the gate is wired.)
+4. Resolve the disable action from the live platform:
+   - **Native Linux / macOS (this host's non-WSL path):** `{method:"none", message:...}`; when remote access WAS requested, apply the disabled state (rebind to `127.0.0.1` + persist `{host:"127.0.0.1",configured:true}` + broadcast). This IS the live retract (NET-06).
+   - **WSL2 with `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`:** same Linux path (deterministic, zero `netsh`). Otherwise return the `confirmation-required` body WITHOUT elevating (HOST-BLOCKED). Never elevate here.
+5. Message strings are the control signal — EXACT constants (`network-router.ts:40-48`), modeled as an enum discriminant, not a free string:
+   - `"Remote access is not enabled"` / `"Remote access disabled"`.
+6. The success response is emitted AFTER the drain (verified teardown, NET-06).
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn disable_from_exposed_linux_rebinds_to_loopback_and_persists() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state("0.0.0.0", Some(true));
+    seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+    let _ = state.settings.patch(&serde_json::json!({"network":{"host":"0.0.0.0","configured":true}})).await.unwrap();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "none");
+    assert_eq!(body["message"], "Remote access disabled");
+    let s = state.settings.get().await;
+    assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "127.0.0.1");
+}
+
+#[tokio::test]
+async fn disable_rejects_unknown_keys_strictly() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state("127.0.0.1", None);
+    let resp = router(state)
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(r#"{"unknownKey":1}"#)).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn disable_requires_auth() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state("127.0.0.1", None);
+    let resp = router(state)
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests::disable 2>&1 | tail -20`
+Expected: 404/compile — route absent.
+
+- [ ] **Step 3: Implement the strict request type, the enum, the route + handler**
+
+```rust
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ConfirmFirewallRequest {
+    pub confirm_elevation: Option<bool>,
+    pub confirmation_token: Option<String>,
+}
+
+impl ConfirmFirewallRequest {
+    fn validate(&self) -> Result<(), Response> {
+        if matches!(self.confirm_elevation, Some(false)) {
+            return Err(invalid_request(json!([{"code":"invalid_literal","path":["confirmElevation"],"message":"Expected true"}])));
+        }
+        if matches!(self.confirmation_token.as_deref(), Some("")) {
+            return Err(invalid_request(json!([{"code":"too_small","path":["confirmationToken"],"message":"String must contain at least 1 character(s)"}])));
+        }
+        Ok(())
+    }
+}
+
+enum DisableNone { NotEnabled, Disabled }
+impl DisableNone {
+    fn message(&self) -> &'static str {
+        match self { DisableNone::NotEnabled => "Remote access is not enabled",
+                     DisableNone::Disabled => "Remote access disabled" }
+    }
+}
+```
+
+Register `.route("/api/network/disable-remote-access", post(disable_remote_access))` and:
+
+```rust
+async fn disable_remote_access(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let raw = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let req: ConfirmFirewallRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => return invalid_request(json!([{"code":"unrecognized_keys","path":[],"message":e.to_string()}])),
+    };
+    if let Err(resp) = req.validate() { return resp; }
+
+    // (Slice 3 inserts the 409 in-flight lock pre-check here.)
+
+    let facts = state.facts.get_or_refresh().await;
+    let platform = facts.firewall.platform;
+    let settings = state.settings.get().await;
+    // `requested` uses the exact is_remote_access_enabled inputs Slice 1 uses in
+    // build_status_value (read network.rs around :325/:357 and reuse them).
+    let requested = compute_remote_access_requested(&settings, &state.bind.get().await, platform);
+
+    let wsl_forwarding_disabled =
+        freshell_platform::port_forward::is_wsl_port_forwarding_disabled_by_env(&freshell_platform::RealEnv);
+    let is_live_linux_lane = platform != FirewallPlatform::Windows
+        && (platform != FirewallPlatform::Wsl2 || wsl_forwarding_disabled);
+
+    if is_live_linux_lane {
+        if requested {
+            let _ = state.rebind.serve_on(std::net::IpAddr::from([127,0,0,1])).await;
+            let merged = match state.settings
+                .patch(&json!({"network":{"host":"127.0.0.1","configured":true}})).await {
+                Ok(m) => m,
+                Err((s,b)) => return (s, Json(b)).into_response(),
+            };
+            state.facts.invalidate().await;
+            state.bind.set("127.0.0.1").await;
+            let resp = (axum::http::StatusCode::OK,
+                Json(json!({"method":"none","message":DisableNone::Disabled.message()}))).into_response();
+            state.broadcast_settings_updated(&merged);
+            return resp;
+        }
+        return (axum::http::StatusCode::OK,
+            Json(json!({"method":"none","message":DisableNone::NotEnabled.message()}))).into_response();
+    }
+
+    // Windows or WSL2-needing-elevation: HOST-BLOCKED (Slice 3 wires the gate here).
+    (axum::http::StatusCode::OK, Json(json!({
+        "method":"confirmation-required",
+        "title":"Administrator approval required",
+        "body":"To complete this, you will need to accept the Windows administrator prompt on the next screen.",
+        "confirmLabel":"Continue",
+        "confirmationToken": uuid::Uuid::new_v4().to_string()
+    }))).into_response()
+}
+```
+
+Extract `compute_remote_access_requested` from the Slice-1 status code (or inline
+the same `is_remote_access_enabled(...)` call with identical inputs) so the two
+never diverge.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-server network::tests 2>&1 | tail -20`
+Expected: the three new `disable_*` tests PASS; all prior tests PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c '"/api/network/disable-remote-access"' crates/freshell-server/src/network.rs  # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): POST /api/network/disable-remote-access — live Linux retract (NET-06)`
+
+## Task 2.5: NET-09 byte-preservation across a network mutation + restart (black-box)
+
+**Files:**
+- Create: `crates/freshell-server/tests/net09_config_preservation.rs`
+
+**Interfaces:**
+- Consumes: the compiled `freshell-server` binary; harness helpers copied from `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs:37-108` (with an attribution comment, as `sighup_forensics.rs` does): `discover_server_binary`, `allocate_ephemeral_port`, `wait_for_health`.
+- Produces: a `#![cfg(unix)]` black-box test proving unmanaged top-level config keys survive a network mutation and a restart byte-for-byte.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `crates/freshell-server/tests/net09_config_preservation.rs`:
+
+```rust
+#![cfg(unix)]
+//! NET-09: a network mutation must route through the serialized config store and
+//! leave every unrelated top-level document key byte-identical, across restart.
+//! Harness helpers copied from safe11_term22_shutdown_reaping.rs (attribution).
+
+use std::process::Command;
+use std::time::Duration;
+
+const AUTH_TOKEN: &str = "net09-preservation-token-abcdef012345";
+
+// --- copy discover_server_binary / allocate_ephemeral_port / wait_for_health here ---
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    // use the sha2 dev-dep, or shell out to `sha256sum`.
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+#[tokio::test]
+async fn network_mutation_preserves_every_unmanaged_top_level_key() {
+    let home = tempfile::tempdir().unwrap();
+    let seed = serde_json::json!({
+        "version": 1,
+        "settings": { "network": { "host": "127.0.0.1", "configured": false } },
+        "sessionOverrides": { "SENTINEL_SESSION": { "keep": "me" } },
+        "terminalOverrides": { "SENTINEL_TERM": { "keep": "me" } },
+        "serverSecrets": { "SENTINEL_SECRET": "do-not-touch" },
+        "completedMigrations": ["m-001", "m-002"],
+        "recentDirectories": ["/tmp/a", "/tmp/b"],
+        "projectColors": { "/tmp/a": "#123456" },
+        "someUnknownFutureKey": { "arbitrary": [1, 2, 3] }
+    });
+    let cfg_dir = home.path().join(".freshell");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.json"), serde_json::to_vec_pretty(&seed).unwrap()).unwrap();
+
+    let orig: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cfg_dir.join("config.json")).unwrap()).unwrap();
+    let watched = ["sessionOverrides","terminalOverrides","serverSecrets",
+                   "completedMigrations","recentDirectories","projectColors","someUnknownFutureKey"];
+    let before: std::collections::HashMap<_, _> = watched.iter()
+        .map(|k| (*k, sha256_hex(&serde_json::to_vec(&orig[*k]).unwrap()))).collect();
+
+    let port = allocate_ephemeral_port();
+    let bin = discover_server_binary();
+    let mut child = Command::new(&bin)
+        .env("PORT", port.to_string())
+        .env("AUTH_TOKEN", AUTH_TOKEN)
+        .env("FRESHELL_HOME", home.path())
+        .env("HOME", home.path())
+        .env("FRESHELL_DISABLE_WSL_PORT_FORWARD", "1")
+        .spawn().unwrap();
+    assert!(wait_for_health(port, &mut child, Duration::from_secs(20)).await);
+
+    let client = reqwest::Client::new();
+    let resp = client.post(format!("http://127.0.0.1:{port}/api/network/configure"))
+        .header("x-auth-token", AUTH_TOKEN)
+        .json(&serde_json::json!({"host":"0.0.0.0","configured":true}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ownership-verified SIGTERM (check /proc/<pid>/cwd + cmdline before signaling).
+    let pid = child.id();
+    unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    let _ = child.wait();
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cfg_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(after["settings"]["network"]["host"], "0.0.0.0");
+    assert_eq!(after["settings"]["network"]["configured"], true);
+    for k in watched {
+        let now = sha256_hex(&serde_json::to_vec(&after[k]).unwrap());
+        assert_eq!(before[k], now, "top-level key `{k}` was not byte-preserved");
+    }
+}
+```
+
+If `sha2` is not a dev-dep, add it under `[dev-dependencies]` (or shell out to
+`sha256sum`). `libc` is already a unix dev/dep.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server --test net09_config_preservation 2>&1 | tail -30`
+Expected: fails to compile until helpers are copied; then GREEN on top of Task
+2.3 (if it fails, fix the endpoint, not the test).
+
+- [ ] **Step 3: Make it pass** — copy helpers, ensure the binary builds.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p freshell-server --test net09_config_preservation 2>&1 | tail -20`
+Expected: PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+test -f crates/freshell-server/tests/net09_config_preservation.rs && echo present
+cargo test -p freshell-server --test net09_config_preservation 2>&1 | tail -5
+cargo clippy -p freshell-server --tests -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/tests/net09_config_preservation.rs crates/freshell-server/Cargo.toml
+git commit  # paste falsifier output
+```
+
+Commit message: `test(net): NET-09 byte-preservation of unmanaged config across mutation + restart`
+
+---
+
+# SLICE 3 — configure-firewall + Windows/WSL2 machinery behind fakes
+
+Blocked on Slice 0 (do not start until `grep -c 'c\.token == t' elevated.rs` is 0
+and `wsl_ip: &str` is gone). All OS mutation flows through the injected
+`CommandRunner`; the real Windows-mutation runner is a `#[cfg(windows)]`-only enum
+variant, so on this Linux host it is structurally unreachable. NET-04/05/07 are
+HOST-BLOCKED and evidenced by golden/fake tests + a compile-time unreachability
+proof; the endpoint's confirmation-token protocol and 409 lock ARE exercised live
+by the harness (Task 5.4).
+
+## Task 3.1: `ElevationRunner` enum — structural unreachability of real OS mutation
+
+**Files:**
+- Modify: `crates/freshell-platform/src/elevated.rs`
+- Test: `crates/freshell-platform/src/elevated.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Produces:
+  - `pub enum ElevationRunner<'a> { Fake(&'a dyn crate::CommandRunner), #[cfg(windows)] Real, Unsupported }` — the real, process-spawning variant exists ONLY under `#[cfg(windows)]`.
+  - `pub fn elevation_runner_live() -> ElevationRunner<'static>` — `Real` under `#[cfg(windows)]`, `Unsupported` otherwise (cannot construct `Real` off Windows).
+  - `pub fn spawn_via(runner: &ElevationRunner<'_>, command: &str, script: &str) -> ElevationOutcome`.
+  - `pub enum ElevationOutcome { Started, Denied, TimedOut, PartialFailure, VerificationFailed, NotSupported }`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn on_non_windows_the_live_runner_is_unsupported_and_never_spawns() {
+    #[cfg(not(windows))]
+    {
+        let runner = elevation_runner_live();
+        assert!(matches!(runner, ElevationRunner::Unsupported));
+        let out = spawn_via(&runner, "powershell.exe", "netsh advfirewall firewall add rule ...");
+        assert_eq!(out, ElevationOutcome::NotSupported);
+    }
+}
+
+#[test]
+fn source_only_constructs_real_under_cfg_windows() {
+    let src = include_str!("elevated.rs");
+    assert!(src.contains("#[cfg(windows)]"), "ElevationRunner::Real must be cfg(windows)-gated");
+    assert!(src.contains("ElevationRunner::Unsupported"));
+}
+
+#[test]
+fn fake_runner_dispatch_classifies_outcomes() {
+    use crate::{FakeCommandRunner, CommandOutput};
+    let denied = FakeCommandRunner::new().with_default(
+        CommandOutput::failure(1, "", "The operation was canceled by the user"));
+    let out = spawn_via(&ElevationRunner::Fake(&denied), "powershell.exe", "script");
+    assert_eq!(out, ElevationOutcome::Denied);
+    let ok = FakeCommandRunner::new().with_default(CommandOutput::success(""));
+    let out = spawn_via(&ElevationRunner::Fake(&ok), "powershell.exe", "script");
+    assert_eq!(out, ElevationOutcome::Started);
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-platform elevated::tests::on_non_windows 2>&1 | tail -20`
+Expected: compile error — types absent.
+
+- [ ] **Step 3: Implement the enum + dispatcher + classification**
+
+```rust
+#[derive(Debug, PartialEq, Eq)]
+pub enum ElevationOutcome {
+    Started,
+    Denied,
+    TimedOut,
+    PartialFailure,
+    VerificationFailed,
+    NotSupported,
+}
+
+pub enum ElevationRunner<'a> {
+    /// Test/injected path — dispatches through a CommandRunner fake.
+    Fake(&'a dyn crate::CommandRunner),
+    /// Real elevation. EXISTS ONLY on Windows: on this Linux host the live
+    /// constructor cannot produce this variant, so real netsh mutation is
+    /// structurally unreachable (safety satisfied by the type system).
+    #[cfg(windows)]
+    Real,
+    /// Non-Windows host: elevation is not supported and never spawns.
+    Unsupported,
+}
+
+pub fn elevation_runner_live() -> ElevationRunner<'static> {
+    #[cfg(windows)]
+    { ElevationRunner::Real }
+    #[cfg(not(windows))]
+    { ElevationRunner::Unsupported }
+}
+
+fn classify(out: &crate::CommandOutput) -> ElevationOutcome {
+    let text = format!("{} {}", out.stdout, out.stderr).to_ascii_lowercase();
+    if text.contains("canceled by the user") || text.contains("cancelled") {
+        return ElevationOutcome::Denied;
+    }
+    if out.ok() { ElevationOutcome::Started } else { ElevationOutcome::Denied }
+}
+
+pub fn spawn_via(runner: &ElevationRunner<'_>, command: &str, script: &str) -> ElevationOutcome {
+    match runner {
+        ElevationRunner::Fake(r) => classify(&spawn_elevated_powershell(*r, command, script)),
+        #[cfg(windows)]
+        ElevationRunner::Real => {
+            classify(&spawn_elevated_powershell(&crate::StdCommandRunner::default(), command, script))
+        }
+        ElevationRunner::Unsupported => ElevationOutcome::NotSupported,
+    }
+}
+```
+
+(`spawn_elevated_powershell(runner, command, script)` exists at `elevated.rs:37`.
+Timeout/partial/verification-failed outcomes are produced by the caller in Task
+3.3/3.5 by re-running the verifier plan; `classify` distinguishes started vs
+denied.)
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-platform elevated:: 2>&1 | tail -20`
+Expected: all new + existing PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c '#\[cfg(windows)\]' crates/freshell-platform/src/elevated.rs   # must be >0
+grep -c 'ElevationRunner::Unsupported' crates/freshell-platform/src/elevated.rs  # must be >0
+cargo test -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-platform/src/elevated.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): ElevationRunner enum — real OS mutation structurally unreachable off Windows`
+
+## Task 3.2: Managed-remote-access-ports persistence module (instance-scoped, fake-backed)
+
+**Files:**
+- Create: `crates/freshell-server/src/managed_ports.rs`
+- Modify: `crates/freshell-server/src/main.rs` (add `mod managed_ports;`)
+- Test: `crates/freshell-server/src/managed_ports.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Produces (port of `network-manager.ts:66-137` + `wsl-port-forward.ts:59-219`, with D15/D16 fixed — honour `FRESHELL_HOME`, atomic write, instance-scoped by `sha256(cwd::port)`):
+  - `pub struct ManagedPortsStore { home: Option<PathBuf>, cwd: PathBuf, port: u16 }`
+  - `pub fn windows(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self`
+  - `pub fn read_windows(&self) -> Vec<u16>` / `pub fn persist_windows(&self, ports: &[u16]) -> std::io::Result<()>` / `pub fn clear_windows(&self) -> std::io::Result<()>`
+  - equivalent WSL methods keyed the same way.
+  - Normalization: dedupe, keep `[1,65535]`, ascending sort. Empty list ⇒ delete the file.
+  - Path: `<home|~>/.freshell/windows-managed-remote-access-ports/<sha256("{cwd}::{port}")>.json`, content `{"ports":[...]}` pretty (2-space), atomic tmp+rename.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn persist_read_roundtrip_and_normalization() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
+        store.persist_windows(&[3001, 3001, 70000, 8080, 0]).unwrap();
+        assert_eq!(store.read_windows(), vec![3001, 8080]);
+    }
+    #[test]
+    fn empty_list_deletes_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
+        store.persist_windows(&[3001]).unwrap();
+        store.persist_windows(&[]).unwrap();
+        assert!(store.read_windows().is_empty());
+    }
+    #[test]
+    fn two_instances_do_not_clobber_each_other() {
+        let home = tempfile::tempdir().unwrap();
+        let a = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
+        let b = ManagedPortsStore::windows(Some(home.path().into()), "/proj/b".into(), 3001);
+        a.persist_windows(&[3001]).unwrap();
+        b.persist_windows(&[4001]).unwrap();
+        assert_eq!(a.read_windows(), vec![3001]);
+        assert_eq!(b.read_windows(), vec![4001]);
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server managed_ports:: 2>&1 | tail -20`
+Expected: compile error.
+
+- [ ] **Step 3: Implement the module**
+
+Write `ManagedPortsStore` with `sha256` keying (use the crate the server already
+vendors; if none, add `sha2` to `[dependencies]`), atomic tmp+rename
+(`.tmp-<pid>-<nanos>` then `std::fs::rename`), and the normalization rule. The WSL
+methods mirror the Windows ones under a `wsl-managed-remote-access-ports/` subdir
+keyed identically (fixing D15/D16). `None` home ⇒ read returns empty, persist
+returns `Ok(())` (in-memory only), mirroring `settings_store::persist`.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p freshell-server managed_ports:: 2>&1 | tail -20`
+Expected: PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+test -f crates/freshell-server/src/managed_ports.rs && echo present
+cargo test -p freshell-server managed_ports:: 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/managed_ports.rs crates/freshell-server/src/main.rs crates/freshell-server/Cargo.toml
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): instance-scoped managed-ports persistence (fixes D15/D16)`
+
+## Task 3.3: `POST /api/network/configure-firewall` — confirmation protocol + 409 lock
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs` — add `Arc<tokio::sync::Mutex<ConfirmationGate>>` to `NetworkState`; add the route + handler + the SHARED action-resolution ladder; wire the disable 409 pre-check placeholder from Task 2.4
+- Modify: `crates/freshell-server/src/main.rs:900-907` (construct the gate)
+- Test: `crates/freshell-server/src/network.rs` `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Consumes: `freshell_platform::elevated::{ConfirmationGate, ConfirmationAction, ElevationDecision, elevation_runner_live, spawn_via, ElevationOutcome}`, `ManagedPortsStore`, `port_forward` planners (Ipv4Addr), `firewall::firewall_commands`.
+- Produces: `NetworkState.gate: Arc<tokio::sync::Mutex<ConfirmationGate>>`; route `POST /api/network/configure-firewall`; handler `configure_firewall`; separate `RepairAction` and `DisableAction` enums (fixes D19 — the unreachable `terminal`-on-disable state is unrepresentable).
+
+**Behavior (matches `network-router.ts:617-758` + the confirmation protocol `:89-262`; `src/lib/firewall-configure.ts:3-14` is the authoritative client union):**
+
+1. Auth → 401; strict-parse (`ConfirmFirewallRequest`) → 400.
+2. `gate.is_repair_in_flight()` → **409 `{"error":"Firewall configuration already in progress","method":"in-progress"}`** (the `method` field is load-bearing — the client reads `details.method`). Checked FIRST, before I/O.
+3. Resolve the repair action from fresh status+settings (`resolveRepairAction` `:264-320`):
+   - not remote-access-enabled → `{method:"none",message:"Remote access is not enabled"}`
+   - WSL2 portOpen true → `{method:"none",message:"No configuration changes required"}`; else compute the WSL plan → `ready` ⇒ confirmable `wsl2-repair`; `noop|not-wsl2|disabled` ⇒ `No configuration changes required`; `error` ⇒ 500 `{"error":<message>}`.
+   - Windows: no commands ⇒ `{method:"none",message:"No firewall detected"}`; portOpen true ⇒ `No configuration changes required`; else confirmable `windows-repair`.
+   - linux/macos with commands ⇒ `{method:"terminal","command": commands.join(" && ")}` — the client opens a terminal tab; the SERVER NEVER RUNS IT (NET-10).
+4. Confirmable + no/mismatched token → **200 `confirmation-required`** with a fresh UUID bound to the action; NO OS call (`gate.issue_confirmation(action, &uuid)`).
+5. Confirmable + matching token → `gate.try_acquire_repair_lock()` (lose → 409) → RE-RESOLVE the action under the lock (TOCTOU guard `:672-700`); fresh action differs ⇒ release + re-issue a new token; else `gate.consume_confirmation(token, action)` (single-use, constant-time via Slice 0) → dispatch via `spawn_via(&runner, command, script)` where `runner = elevation_runner_live()` in production (Unsupported off Windows) or an injected `Fake` in tests → on `Started` persist managed ports + respond `{method, status:"started"}`; on failure outcomes release the lock, `configuring=false`, NO persisted success (NET-07).
+6. Broadcast `settings.updated` only when settings actually changed.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn configure_firewall_first_post_issues_confirmation_without_running_anything() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state_firewall_confirmable(); // seeds windows-active facts + closed port => confirmable
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "confirmation-required");
+    assert!(body["confirmationToken"].as_str().unwrap().len() > 0);
+}
+
+#[tokio::test]
+async fn configure_firewall_409_when_repair_in_flight() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state_firewall_confirmable();
+    { state.gate.lock().await.try_acquire_repair_lock(); } // simulate in-flight
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), 409);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "in-progress");
+    assert_eq!(body["error"], "Firewall configuration already in progress");
+}
+
+#[tokio::test]
+async fn configure_firewall_requires_auth_and_strict_body() {
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state_firewall_confirmable();
+    // no token => 401
+    let r = router(state.clone()).oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+        .header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 401);
+    // unknown key => 400
+    let r = router(state.clone()).oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+        .header("x-auth-token","tok").header("content-type","application/json")
+        .body(Body::from(r#"{"nope":1}"#)).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 400);
+    // confirmElevation:false => 400
+    let r = router(state).oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+        .header("x-auth-token","tok").header("content-type","application/json")
+        .body(Body::from(r#"{"confirmElevation":false}"#)).unwrap()).await.unwrap();
+    assert_eq!(r.status(), 400);
+}
+```
+
+Add `fn test_state_firewall_confirmable()` seeding `NetworkFactsCache` with
+Windows-active facts + closed port (so the ladder yields a confirmable
+`windows-repair`) and constructing the new `gate` field.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests::configure_firewall 2>&1 | tail -20`
+Expected: compile/404 — field + route absent.
+
+- [ ] **Step 3: Add the gate field, wire main.rs, implement the route + ladders**
+
+`NetworkState` gains:
+```rust
+    /// Confirmation/elevation state machine (one outstanding action-bound token,
+    /// in-progress lock). Shared by configure-firewall AND disable-remote-access.
+    pub gate: std::sync::Arc<tokio::sync::Mutex<freshell_platform::elevated::ConfirmationGate>>,
+```
+`main.rs:900-907`: `gate: Arc::new(tokio::sync::Mutex::new(freshell_platform::elevated::ConfirmationGate::new())),`
+and the `test_state` helpers construct it too.
+
+Register `.route("/api/network/configure-firewall", post(configure_firewall))`.
+Implement `configure_firewall` per the 6-step behavior. Extract resolution into
+`async fn resolve_repair_action(state) -> RepairAction` and
+`async fn resolve_disable_action(state) -> DisableAction` (SEPARATE enums — fixes
+D19). Wire the disable handler's 409 pre-check (`gate.is_repair_in_flight()`)
+into the Task-2.4 placeholder. Use `uuid::Uuid::new_v4().to_string()` for tokens.
+Dispatch via a small `fn elevation_runner_for(state) -> ElevationRunner` returning
+`elevation_runner_live()` in production and a test-injected `Fake` under
+`#[cfg(test)]` (or expose a gate/dispatch helper the tests call directly). Persist
+managed ports on `Started` via `ManagedPortsStore`. Broadcast `settings.updated`
+only on actual settings change.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p freshell-server network::tests 2>&1 | tail -30`
+Expected: new `configure_firewall_*` tests PASS; all prior tests PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c '"/api/network/configure-firewall"' crates/freshell-server/src/network.rs  # must be >0
+grep -c 'pub gate:' crates/freshell-server/src/network.rs                          # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs crates/freshell-server/src/main.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): POST /api/network/configure-firewall — confirmation protocol + 409 lock (NET-04 wire)`
+
+## Task 3.4: Wire `stale` managed-Windows-ports + WSL2 plan assembly behind fakes (NET-04/05)
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs` — feed the `stale` input of `build_network_status` from `get_existing_managed_windows_firewall_ports` over a runner; wire the WSL2 `ready` plan from read-only `get_wsl_ip`/`get_existing_port_proxy_rules`/`get_existing_firewall_ports`
+- Test: `crates/freshell-server/src/network.rs` tests + `crates/freshell-platform` golden tests
+
+**Interfaces:**
+- Consumes: `port_forward::{get_wsl_ip, get_existing_port_proxy_rules, get_existing_firewall_ports, build_wsl_port_forwarding_plan}` (Ipv4Addr), `firewall::{get_existing_managed_windows_firewall_ports, build_windows_firewall_repair_commands, managed_windows_firewall_rule_name}`.
+- Produces: `stale` no longer hardcoded `false`; a golden test pins the WSL plan from THIS host's real captured `netsh interface portproxy show all` (proving no add for the already-satisfied 3001 rule); a golden test proving the real `FreshellLANAccess` rule and an unrelated sentinel are NEVER in a delete command.
+
+- [ ] **Step 1: Write the failing golden tests**
+
+In `crates/freshell-platform/src/port_forward.rs` tests:
+
+```rust
+#[test]
+fn plan_sees_preexisting_3001_rule_as_satisfied_and_emits_no_add_for_it() {
+    let capture = "\
+Listen on ipv4:             Connect to ipv4:
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         3412        172.30.149.249  3412";
+    let rules = parse_port_proxy_rules(capture);
+    let plan = build_wsl_port_forwarding_plan(
+        &[3001], &[3001], "172.30.149.249".parse().unwrap(),
+        &rules, &[3001], &[3001]);
+    assert!(matches!(plan, WslPortForwardingPlan::Noop { .. }),
+        "planner must treat the pre-existing 3001 portproxy+firewall as satisfying");
+}
+```
+
+In `crates/freshell-platform/src/firewall.rs` tests:
+
+```rust
+#[test]
+fn delete_commands_never_touch_unrelated_or_freshelllanaccess_rules() {
+    let cmds = build_windows_firewall_delete_commands(&[3001]);
+    let joined = cmds.join(" ; ");
+    assert!(!joined.contains("FreshellLANAccess"));
+    assert!(!joined.contains("SomeUnrelatedSentinelRule"));
+    assert!(joined.contains(&managed_windows_firewall_rule_name(3001)));
+}
+```
+
+In `network.rs` tests, add a `stale`-wiring test using a `FakeCommandRunner` that
+reports a managed port NOT in the required set ⇒ status `firewall.portOpen`
+becomes `false` and `remoteAccessNeedsRepair` true (Windows branch).
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-platform port_forward::tests::plan_sees 2>&1 | tail -20`
+Expected: RED (or, if the planner is already correct, the `network.rs` `stale`
+wiring test is the RED one that drives the change).
+
+- [ ] **Step 3: Wire `stale` + WSL plan assembly**
+
+In `build_status_value`/`build_network_status`, replace hardcoded
+`let stale = false;` (`network.rs:357`) with a computed value:
+- Windows + firewall active: `stale = get_existing_managed_windows_firewall_ports(runner)` contains any port not in `remote_access_ports`.
+- WSL2 + rawPortOpen true: recompute the WSL plan; `stale` iff `plan` is `Ready`.
+Use a `StdCommandRunner` at the call boundary in production (read-only `netsh ... show`), as `resolve_live_network_facts` does; inject a `FakeCommandRunner` in tests. Keep all mutation OUT — read-only queries only.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p freshell-server -p freshell-platform 2>&1 | tail -10`
+Expected: PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+grep -c 'get_existing_managed_windows_firewall_ports' crates/freshell-server/src/network.rs  # must be >0
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs crates/freshell-platform/src/port_forward.rs crates/freshell-platform/src/firewall.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `feat(net): wire stale managed-ports + WSL2 plan assembly behind read-only fakes (NET-04/05)`
+
+## Task 3.5: NET-07 outcome matrix — denial / timeout / partial / verification-failure golden tests
+
+**Files:**
+- Modify: `crates/freshell-server/src/network.rs` tests (behavioral) + `crates/freshell-platform/src/elevated.rs` tests (classification)
+
+**Interfaces:**
+- Consumes: `ElevationOutcome`, `ConfirmationGate`, `FakeCommandRunner`.
+- Produces: four tests proving each failure outcome (a) releases the lock exactly once, (b) leaves `firewall.configuring == false`, (c) persists NO success, (d) a subsequent success after switching the fake to a good response works; plus a suite-wide assertion that no `netsh ... add|delete|set` and no `Start-Process -Verb RunAs` reached a real runner (`FakeCommandRunner::call_count`) and the compile-time unreachability test from Task 3.1.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn elevation_denial_releases_lock_and_persists_no_success() {
+    // Inject a Fake runner returning "canceled by the user"; drive configure-firewall
+    // through the confirm phase => Denied. Assert: gate not in-flight afterward,
+    // status.firewall.configuring == false, settings.network unchanged, and a later
+    // run with a good Fake succeeds.
+}
+
+#[test]
+fn no_real_os_mutation_command_reaches_a_runner() {
+    // A FakeCommandRunner with no rules records every call; assert its call_count
+    // matches the expected read-only-only count and that no recorded arg contains
+    // "add rule" / "delete rule" / "portproxy add" / "RunAs". Combined with
+    // on_non_windows_the_live_runner_is_unsupported (Task 3.1), this proves zero
+    // real OS mutation on this host.
+}
+```
+
+Model timeout/partial/verification-failure by having `configure_firewall` re-run
+the verifier plan after `Started` and downgrade to `VerificationFailed` /
+`PartialFailure` when the recomputed plan is still `Ready` (port of `verifySuccess`
+`:380-410`). Test each by seeding the post-dispatch fake facts so the verifier
+still finds work.
+
+- [ ] **Step 2: Run to verify failure** → **Step 3: implement the verifier downgrade + settle logic** → **Step 4: run to verify pass.**
+
+Run: `cargo test -p freshell-server network::tests 2>&1 | tail -30` — all PASS.
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-server/src/network.rs crates/freshell-platform/src/elevated.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `test(net): NET-07 elevation outcome matrix (denial/timeout/partial/verification-failure) behind fakes`
+
+## Task 3.6: HOST-BLOCKED evidence record for NET-04/05/07
+
+**Files:**
+- Create: `docs/plans/2026-07-28-net-windows-deferred-evidence.md`
+
+- [ ] **Step 1: Write the evidence doc**
+
+Create the file documenting, per requirement:
+- NET-04 (Windows firewall configure/repair), NET-05 (WSL2 forwarding), NET-07
+  (elevation denial/timeout/partial/verification) are **HOST-BLOCKED**: they
+  require a disposable elevated Windows VM this Linux host is not and the safety
+  rules forbid simulating live.
+- Evidence the CODE is complete and tested — list exact test names + files:
+  - `crates/freshell-platform/src/elevated.rs`: `elevated_args_golden_no_quotes`, `on_non_windows_the_live_runner_is_unsupported_and_never_spawns`, `fake_runner_dispatch_classifies_outcomes`, `source_only_constructs_real_under_cfg_windows`.
+  - `crates/freshell-platform/src/firewall.rs`: the add/delete/repair goldens + `delete_commands_never_touch_unrelated_or_freshelllanaccess_rules`.
+  - `crates/freshell-platform/src/port_forward.rs`: the WSL script goldens + `plan_sees_preexisting_3001_rule_as_satisfied_and_emits_no_add_for_it`.
+  - `crates/freshell-server/src/network.rs`: `configure_firewall_*`, `elevation_denial_releases_lock_and_persists_no_success`, `no_real_os_mutation_command_reaches_a_runner`.
+- A statement that these boxes stay UNCHECKED in the parity checklist; the live
+  effect is unexecuted BY DESIGN.
+
+- [ ] **Step 2: Falsifier + commit**
+
+```bash
+test -f docs/plans/2026-07-28-net-windows-deferred-evidence.md && echo present
+git add docs/plans/2026-07-28-net-windows-deferred-evidence.md
+git commit
+```
+
+Commit message: `docs(net): HOST-BLOCKED deferred-with-evidence record for NET-04/05/07`
+
+---
+
+# HARNESS — scripts/verify-remote-access.sh
+
+One self-contained bash script that boots the built server on an ephemeral test
+port with an isolated HOME, exercises all five endpoints (auth ±), proves
+expose/retract at tiers a+b, runs the NET-08 negative matrix, reaps everything it
+started, and does a read-only host-state identity self-proof. Exits 0 only if all
+required checks pass. **It must fail loudly if absent** (a prior run reported green
+on `No such file or directory`) — the Definition of Done checks
+`test -x scripts/verify-remote-access.sh`.
+
+Style templates: `scripts/deploy-tab-diff.sh` (header + exit-code table +
+read-only safety note + subcommand dispatch) and `scripts/sandbox-test.sh`
+(`set -euo pipefail`, `REPO_ROOT` derivation, usage guard).
+
+## Task 5.1: Harness Phase 0–1 (preflight + boot)
+
+**Files:**
+- Create: `scripts/verify-remote-access.sh` (Phases 0–1 + skeleton)
+
+- [ ] **Step 1: Write the skeleton with a self-test**
+
+Create `scripts/verify-remote-access.sh`:
+
+```bash
+#!/usr/bin/env bash
+# verify-remote-access.sh — live end-to-end verification of the Freshell Rust
+# server's remote-access networking (owning plan:
+# docs/plans/2026-08-03-remote-access-networking.md).
+#
+# Usage:
+#   scripts/verify-remote-access.sh [--port N] [--tier-c] [--keep-home] [--verbose]
+#
+# Default port = an ephemeral free high port (probed, never hardcoded).
+# --tier-c is honored ONLY with --port 3001 and only if nothing listens there.
+#
+# Exit codes:
+#   0  all required checks passed (tier-c may be degraded-with-reason)
+#   1  a required check failed (incl. tier-b failure, or host-state changed)
+#   2  usage error
+#   3  preflight precondition failed (missing binary, missing eth0 IP, etc.)
+#
+# SAFETY: never binds or kills port 3001 / the live server (pid holding 0.0.0.0:3001).
+# Only READ-ONLY `netsh ... show` is used. Never creates/modifies portproxy or
+# firewall rules. Reaps only pids it started, ownership-verified via /proc/<pid>.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT=""; TIER_C=0; KEEP_HOME=0; VERBOSE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --tier-c) TIER_C=1; shift ;;
+    --keep-home) KEEP_HOME=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    *) echo "usage: $0 [--port N] [--tier-c] [--keep-home] [--verbose]"; exit 2 ;;
+  esac
+done
+REPORT_DIR="$(mktemp -d "/tmp/freshell-verify-remote-access-$$-XXXX")"
+SERVER_PID=""; HOME_DIR=""
+declare -a DEGRADATIONS=()
+REQUIRED_FAIL=0
+
+log() { [ "$VERBOSE" = 1 ] && echo "[vra] $*" >&2 || true; }
+fail_required() { echo "REQUIRED FAIL: $*" >&2; REQUIRED_FAIL=1; }
+
+cleanup() { :; }  # replaced in Task 5.5
+trap cleanup EXIT INT TERM
+
+probe_free_port() {
+  python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
+}
+
+phase0_preflight() {
+  [ -n "$PORT" ] || PORT="$(probe_free_port)"
+  # binary present, else build
+  if [ ! -x "$REPO_ROOT/target/release/freshell-server" ]; then
+    ( cd "$REPO_ROOT" && cargo build --release -p freshell-server ) || { echo "FATAL: build failed"; exit 3; }
+  fi
+  # eth0 IP re-resolved EVERY run; empty => tier b unavailable => hard fail
+  WSL_IP="$(ip -4 addr show eth0 | grep -oP 'inet \K[\d.]+' || true)"
+  [ -n "$WSL_IP" ] || { echo "FATAL: no eth0 IPv4 (tier b unavailable)"; exit 3; }
+  powershell.exe -NoProfile -Command "echo ok" >/dev/null 2>&1 || { echo "FATAL: powershell.exe unavailable (tier b)"; exit 3; }
+  # refuse to touch a listening port (esp. the live server / 3001)
+  if ss -ltn "( sport = :$PORT )" | grep -q ":$PORT "; then
+    echo "FATAL: something already listens on :$PORT — refusing"; exit 3
+  fi
+  if [ "$PORT" = "3001" ] && [ "$TIER_C" != 1 ]; then
+    echo "FATAL: refusing to use 3001 without --tier-c"; exit 3
+  fi
+  # isolated HOME with a full-sentinel config.json; sha256 per top-level key
+  HOME_DIR="$(mktemp -d)"; mkdir -p "$HOME_DIR/.freshell"
+  cat > "$HOME_DIR/.freshell/config.json" <<'JSON'
+{ "version": 1,
+  "settings": { "network": { "host": "127.0.0.1", "configured": false } },
+  "sessionOverrides": { "SENTINEL_SESSION": { "keep": "me" } },
+  "terminalOverrides": { "SENTINEL_TERM": { "keep": "me" } },
+  "serverSecrets": { "SENTINEL_SECRET": "do-not-touch" },
+  "completedMigrations": ["m-001"],
+  "recentDirectories": ["/tmp/a"],
+  "projectColors": { "/tmp/a": "#123456" },
+  "someUnknownFutureKey": { "arbitrary": [1, 2, 3] } }
+JSON
+  AUTH_TOKEN="$(openssl rand -hex 32)"  # never echoed/written to the report
+  # per-key sha of the ORIGINAL for the Phase-5 diff (exclude version/settings)
+  for k in sessionOverrides terminalOverrides serverSecrets completedMigrations recentDirectories projectColors someUnknownFutureKey; do
+    eval "SHA_$k=\"$(jq -c ".$k" "$HOME_DIR/.freshell/config.json" | sha256sum | cut -d' ' -f1)\""
+  done
+  # read-only host network state for the Phase-7 identity diff
+  HOST_STATE_BEFORE="$(powershell.exe -NoProfile -Command 'netsh interface portproxy show all' 2>/dev/null || true)"
+}
+
+phase1_boot() {
+  HOME="$HOME_DIR" FRESHELL_HOME="$HOME_DIR" AUTH_TOKEN="$AUTH_TOKEN" PORT="$PORT" \
+    FRESHELL_DISABLE_WSL_PORT_FORWARD=1 \
+    "$REPO_ROOT/target/release/freshell-server" >"$HOME_DIR/server.log" 2>&1 &
+  SERVER_PID=$!
+  echo "$SERVER_PID" > "$REPORT_DIR/server.pid"
+  for _ in $(seq 1 100); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/health" || true)" = "200" ] && return 0
+    sleep 0.2
+  done
+  echo "FATAL: server did not become healthy"; exit 1
+}
+
+main() {
+  phase0_preflight
+  phase1_boot
+  # Phases 2-7 appended in Tasks 5.2-5.5
+  echo "phase0+1 OK (port=$PORT wsl_ip=$WSL_IP)"
+}
+main "$@"
+```
+
+`chmod +x scripts/verify-remote-access.sh`.
+
+- [ ] **Step 2: Run the phase 0–1 smoke (must exit 0, must not touch 3001)**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+cargo build --release -p freshell-server 2>&1 | tail -3
+scripts/verify-remote-access.sh --verbose ; echo "exit=$?"
+ss -ltn | grep ':3001 ' && echo "live 3001 still up (good)"
+```
+Expected: prints `phase0+1 OK (port=<high> wsl_ip=172.30.x.x)`, `exit=0`; live 3001 untouched.
+
+- [ ] **Step 3: Falsifier + commit**
+
+```bash
+test -x scripts/verify-remote-access.sh && echo executable
+grep -c 'FRESHELL_DISABLE_WSL_PORT_FORWARD=1' scripts/verify-remote-access.sh  # must be >0
+grep -c '3001' scripts/verify-remote-access.sh                                 # must be >0
+git add scripts/verify-remote-access.sh
+git commit  # paste smoke output
+```
+
+Commit message: `feat(net): verify-remote-access harness — Phase 0-1 preflight + boot`
+
+## Task 5.2: Harness Phase 2–4 (endpoint surface auth±, expose, retract) with the vantage ladder
+
+**Files:**
+- Modify: `scripts/verify-remote-access.sh`
+
+- [ ] **Step 1: Add Phases 2–4**
+
+Add functions and call them from `main` after `phase1_boot`. Add a curl helper:
+
+```bash
+api() { # api METHOD PATH [BODY] [--noauth]  -> echoes "HTTP_CODE\n BODY"
+  local method="$1" path="$2" body="${3:-}" auth=(-H "x-auth-token: $AUTH_TOKEN")
+  [ "${4:-}" = "--noauth" ] && auth=()
+  curl -s -o "$REPORT_DIR/resp.json" -w '%{http_code}' -X "$method" \
+    "${auth[@]}" -H 'content-type: application/json' \
+    ${body:+--data "$body"} "http://127.0.0.1:$PORT$path"
+}
+tier_b() { # returns "200" (reachable => 0.0.0.0-bound) or "REFUSED"
+  powershell.exe -NoProfile -Command \
+    "try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 6 http://$WSL_IP:$PORT/api/health).StatusCode } catch { 'REFUSED' }" \
+    2>/dev/null | tr -d '\r'
+}
+```
+
+- **Phase 2 — endpoint surface (auth ±):** for each of the five endpoints, one
+  request WITH auth and one WITHOUT. Assert authed → 200 (POSTs need a valid
+  body); unauthed → 401 with `{"error":"Unauthorized"}`. On `GET /api/network/status`
+  assert EVERY `NetworkStatus` key present with correct JSON type via `jq`
+  (`configured, host, remoteAccessEnabled, remoteAccessRequested,
+  remoteAccessNeedsRepair, port, lanIps, machineHostname, firewall{platform,
+  active, portOpen, commands, configuring}, rebinding, devMode, accessUrl`), and
+  content-type `application/json; charset=utf-8`.
+- **Phase 3 — expose:** `api POST /api/network/configure '{"host":"0.0.0.0","configured":true}'`
+  → 200; status `host=="0.0.0.0"`, `firewall.portOpen==true`, `remoteAccessEnabled==true`;
+  tier (a) `curl http://127.0.0.1:$PORT/api/health` → 200; **tier (b) `[ "$(tier_b)" = 200 ]` REQUIRED**;
+  tier (c) 200 or documented degradation.
+- **Phase 4 — retract:** `api POST /api/network/disable-remote-access '{}'` → 200 with
+  `method`; status `host=="127.0.0.1"`, `portOpen==null`, `remoteAccessEnabled==false`;
+  **tier (b) `[ "$(tier_b)" = REFUSED ]` REQUIRED**; tier (a) still 200;
+  `ss -ltn | grep -c ":$PORT "` shows exactly ONE listener, bound `127.0.0.1`.
+
+Each assertion increments a pass/fail counter; a required failure calls
+`fail_required`.
+
+- [ ] **Step 2: Run it**
+
+```bash
+scripts/verify-remote-access.sh --verbose ; echo "exit=$?"
+```
+Expected: Phases 2–4 all PASS; tier (b) 200 when exposed, REFUSED after disable; `exit=0`.
+
+- [ ] **Step 3: Falsifier + commit**
+
+```bash
+grep -c 'Invoke-WebRequest' scripts/verify-remote-access.sh   # tier b present
+scripts/verify-remote-access.sh >/tmp/vra.out 2>&1; echo "exit=$?"; tail -20 /tmp/vra.out
+git add scripts/verify-remote-access.sh
+git commit  # paste output
+```
+
+Commit message: `feat(net): harness Phase 2-4 — endpoint surface + expose/retract at tiers a+b (NET-01/02/06)`
+
+## Task 5.3: Harness Phase 5 (restart / NET-09 byte-preservation)
+
+**Files:**
+- Modify: `scripts/verify-remote-access.sh`
+
+- [ ] **Step 1: Add Phase 5**
+
+- SIGTERM the owned pid (ownership-verified via `/proc/<pid>/cwd` +
+  `/proc/<pid>/cmdline`; bounded wait; never a blind SIGKILL; never pid holding 3001).
+- Diff `config.json`: `settings.network` reflects the chosen state; **every other
+  top-level key byte-identical** — compare each `SHA_<key>` from Phase 0:
+  ```bash
+  for k in sessionOverrides terminalOverrides serverSecrets completedMigrations recentDirectories projectColors someUnknownFutureKey; do
+    now="$(jq -c ".$k" "$HOME_DIR/.freshell/config.json" | sha256sum | cut -d' ' -f1)"
+    eval "orig=\$SHA_$k"
+    [ "$now" = "$orig" ] || fail_required "top-level key $k changed across mutation"
+  done
+  ```
+- Restart the server on the same isolated HOME; assert status shows the persisted
+  state (`host=="127.0.0.1"`); tier (b) REFUSED.
+
+- [ ] **Step 2: Run + Step 3: Falsifier + commit**
+
+```bash
+scripts/verify-remote-access.sh >/tmp/vra.out 2>&1; echo "exit=$?"; grep -i 'phase 5' /tmp/vra.out
+grep -c 'sha256sum' scripts/verify-remote-access.sh   # per-key preservation present
+git add scripts/verify-remote-access.sh
+git commit  # paste output
+```
+
+Commit message: `feat(net): harness Phase 5 — restart + NET-09 byte-preservation`
+
+## Task 5.4: Harness Phase 6 (NET-08 negative matrix, 15 cases)
+
+**Files:**
+- Modify: `scripts/verify-remote-access.sh`
+
+- [ ] **Step 1: Add Phase 6** — each case asserts rejection AND zero side effects
+  (config sha unchanged, `ss` listener set unchanged). Cases:
+
+  1. no token → 401
+  2. wrong token → 401
+  3. `configure {}` / missing `host` / missing `configured` → 400 `Invalid request`
+  4. `configure {"host":"1.2.3.4",...}` → 400
+  5. `configure {"host":"0.0.0.0; rm -rf /",...}` → 400
+  6. `configure` `{"host":"$(id)"}` / backtick / pipe / newline variants → 400
+  7. `configure {"host":"0.0.0.0","configured":"yes"}` → 400
+  8. `disable-remote-access {"unknownKey":1}` (strict) → 400
+  9. `configure-firewall {"confirmElevation":false}` → 400
+  10. `configure-firewall {"confirmationToken":""}` → 400
+  11. token replay (issue → confirm → confirm again) → second is a NEW
+      `confirmation-required`, never a second execution
+  12. wrong-action token across the two endpoints → re-issue, never execute
+  13. two parallel confirmed POSTs → exactly one proceeds, other 409 `method:"in-progress"`
+  14. injection strings in `confirmationToken` → 400/re-issue, never reaches a runner
+  15. positive control — one valid `configure` still succeeds → 200
+
+  Also `grep -F "$AUTH_TOKEN" "$HOME_DIR/server.log"` → MUST be absent (NET-03).
+
+  Cases 5/6/14 are ALSO proved structurally by the Rust unit tests (`host` enum,
+  `wsl_ip: Ipv4Addr`, `FakeCommandRunner::call_count()==0`); the harness proves
+  them live too — both required, neither substitutes for the other.
+
+- [ ] **Step 2: Run + Step 3: Falsifier + commit**
+
+```bash
+scripts/verify-remote-access.sh >/tmp/vra.out 2>&1; echo "exit=$?"; grep -ci 'net-08\|case' /tmp/vra.out
+git add scripts/verify-remote-access.sh
+git commit  # paste output
+```
+
+Commit message: `feat(net): harness Phase 6 — NET-08 negative matrix (15 cases) + token-never-logged`
+
+## Task 5.5: Harness Phase 7 (cleanup, safety self-proof, report.json) + tier-c gating
+
+**Files:**
+- Modify: `scripts/verify-remote-access.sh`
+
+- [ ] **Step 1: Add Phase 7 + the `cleanup` trap + tier-c gating**
+
+Replace the placeholder `cleanup()` with an ownership-verified reaper:
+
+```bash
+cleanup() {
+  if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    # ownership verify before signaling
+    local cwd cmd
+    cwd="$(readlink -f /proc/$SERVER_PID/cwd 2>/dev/null || true)"
+    cmd="$(tr '\0' ' ' < /proc/$SERVER_PID/cmdline 2>/dev/null || true)"
+    if [ "$SERVER_PID" != "64553" ] && echo "$cmd" | grep -q 'freshell-server'; then
+      kill -TERM "$SERVER_PID" 2>/dev/null || true
+      for _ in $(seq 1 25); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.2; done
+    fi
+  fi
+  [ "$KEEP_HOME" = 1 ] || { [ -n "${HOME_DIR:-}" ] && rm -rf "$HOME_DIR"; }
+}
+```
+
+Phase 7 proper:
+- Assert no listener remains on `$PORT` (`ss -ltn | grep -q ":$PORT " && fail_required "listener leaked"`).
+- **Safety self-proof:** re-run read-only `netsh interface portproxy show all` and
+  `netsh advfirewall firewall show rule name=FreshellLANAccess`, diff against the
+  Phase-0 capture — MUST be identical → `host_state_unchanged`.
+- **Tier-c gating:** unconditional read-only sanity control
+  `ssh -o BatchMode=yes -o ConnectTimeout=8 shapiroserver2 "curl -s -o /dev/null -w '%{http_code}' --max-time 6 http://192.168.3.50:3001/api/health"`
+  (record; non-200 → `tier_c_vantage: unavailable`, a NOTE not a failure). When not
+  `--tier-c` or port ≠ 3001, add a `DEGRADATIONS` entry with the exact reason
+  `firewall allow scoped to 3001 only (FreshellLANAccess LocalPort=3001); harness port <N> may not open a new rule (safety rule)`.
+  With `--tier-c` + 3001: additionally require (i) nothing listening on 3001,
+  (ii) a portproxy rule `0.0.0.0 3001 -> <WSL_IP> 3001`, (iii) connect-address ==
+  current `WSL_IP`, else degrade with `portproxy target <old> != current eth0 <new>`.
+- Write `report.json`:
+  ```bash
+  jq -n --arg port "$PORT" --arg wsl "$WSL_IP" \
+     --argjson passed "$([ "$REQUIRED_FAIL" = 0 ] && echo true || echo false)" \
+     --argjson unchanged "$([ "$HOST_STATE_UNCHANGED" = 1 ] && echo true || echo false)" \
+     '{port:($port|tonumber), wsl_ip:$wsl,
+       tiers:{a:{},b:{},c:{status:"'"$TIER_C_STATUS"'",reason:"'"$TIER_C_REASON"'"}},
+       deferred_host_blocked:["NET-04","NET-05","NET-07"],
+       degradations:[], host_state_unchanged:$unchanged, passed:$passed}' \
+     > "$REPORT_DIR/report.json"
+  cat "$REPORT_DIR/report.json"
+  ```
+- Exit 0 only if `REQUIRED_FAIL == 0` AND `HOST_STATE_UNCHANGED == 1`. Tier-c
+  degradation is NOT a failure; tier-b failure IS.
+
+- [ ] **Step 2: Full run**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+scripts/verify-remote-access.sh --verbose ; echo "exit=$?"
+cat /tmp/freshell-verify-remote-access-*/report.json | jq '{passed, host_state_unchanged, tiers}'
+ss -ltn | grep ':3001 ' && echo "live 3001 untouched"
+```
+Expected: `exit=0`, `passed:true`, `host_state_unchanged:true`, tier b pass, tier c
+pass-or-degraded-with-reason; live 3001 untouched.
+
+- [ ] **Step 3: Falsifier + commit**
+
+```bash
+grep -c 'host_state_unchanged' scripts/verify-remote-access.sh   # must be >0
+grep -c 'FreshellLANAccess' scripts/verify-remote-access.sh      # read-only self-proof present
+scripts/verify-remote-access.sh >/tmp/vra.out 2>&1; echo "exit=$?"
+git add scripts/verify-remote-access.sh
+git commit  # paste output + report.json summary
+```
+
+Commit message: `feat(net): harness Phase 7 — cleanup, read-only host-state self-proof, report.json, tier-c gating`
+
+---
+
+# Task 6.1: Record DEVIATIONS (proposed)
+
+**Files:**
+- Modify: `port/oracle/DEVIATIONS.md` (append; the antagonist adjudicates — leave status `proposed`)
+
+- [ ] **Step 1: Append the deviation entries**
+
+Append entries with status `proposed`, each with objective_defect (a TS
+`file:line` citation), port_behavior, and pinning_test (a test name from this
+plan):
+
+1. **Transactional rebind (bind-new-before-persist, `SO_REUSEPORT`)** — defect:
+   `server/network-manager.ts:477-483` (`CATASTROPHIC: ... server has no active
+   listener`) + persistence-before-proof at `:417` vs NET-02. port_behavior: prove
+   new listener first, then persist, then drain; rollback is an infallible socket
+   drop. Escape hatch `FRESHELL_REBIND_NO_REUSEPORT=1`. pinning_test:
+   `net_bind::tests::serve_on_proves_bind_before_swapping_and_serves_traffic` +
+   `foreign_squatter_blocks_our_bind` + harness Phase 3/4.
+2. **Settled-status response to `configure`** — answer settled truth +
+   `rebindScheduled:false` instead of a desired-state preview; contract-legal per
+   `src/store/networkSlice.ts:123-130`. pinning_test:
+   `configure_to_all_interfaces_persists_and_reports_settled_host`.
+3. **No mass 4009 on rebind** — overlapping listeners let old WS connections drain
+   (intentional UX improvement).
+4. **NET-08-A/B/C hardening** (`Ipv4Addr` typing + constant-time compare, Slice 0).
+5. **Action-bound token consumption everywhere** (fixes D1); **instance-scoped,
+   `FRESHELL_HOME`-honouring, atomic WSL managed-ports file** (fixes D15/D16);
+   **separate disable/repair action enums** (fixes D19).
+6. **WSL2 listener rebind is real** — the TS forces `hostChanged=false` on wsl2
+   (`network-manager.ts:412-413`) and keeps the listener on 0.0.0.0, using Windows
+   portproxy for exposure. Our port binds truthfully on every platform: disable
+   really rebinds to loopback (NET-06, provable at tier b) and configure really
+   re-exposes. objective_defect: with truthful loopback binding after a disable,
+   the TS rule would strand the server loopback-bound with no live re-expose path.
+   pinning_test: harness Phase 3/4 tier-b transitions +
+   `disable_from_exposed_linux_rebinds_to_loopback_and_persists`.
+7. **Kept-as-contract (NOT a bug to fix):** wsl2
+   `remoteAccessEnabled = rawPortOpen === true` (`network-manager.ts:349-350`) —
+   depended on by `src/lib/share-utils.ts:17-34`; Slice 1 ports it faithfully.
+   Note as reviewed and deliberately kept.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add port/oracle/DEVIATIONS.md
+git commit
+```
+
+Commit message: `docs(net): file remote-access networking deviations (proposed)`
+
+---
+
+# Definition of Done (final falsifier — run before declaring the plan complete)
+
+- [ ] **Run the global falsifier**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+git log --oneline feat/remote-access-networking | head -25
+git status --porcelain server/ shared/ src/            # MUST be empty
+# Slice 0
+grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs                              # 0
+grep -c 'timing_safe_compare' crates/freshell-platform/src/elevated.rs                        # >0
+grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs  # 0
+# Slice 2
+grep -c '"/api/network/configure"' crates/freshell-server/src/network.rs                      # >0
+grep -c '"/api/network/disable-remote-access"' crates/freshell-server/src/network.rs          # >0
+grep -c 'socket2' crates/freshell-server/Cargo.toml                                           # >0
+# Slice 3
+grep -c '"/api/network/configure-firewall"' crates/freshell-server/src/network.rs             # >0
+grep -c 'ElevationRunner::Unsupported' crates/freshell-platform/src/elevated.rs               # >0
+# Harness + docs
+test -x scripts/verify-remote-access.sh && echo harness-ok
+test -f docs/plans/2026-07-28-net-windows-deferred-evidence.md && echo evidence-ok
+# Tests + lint
+cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5     # all green, >= baseline
+cargo clippy -p freshell-server -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+# Live end-to-end
+scripts/verify-remote-access.sh --verbose ; echo "exit=$?"            # exit 0
+cat /tmp/freshell-verify-remote-access-*/report.json | jq '{passed, host_state_unchanged}'
+```
+
+All greps produce the stated verdicts; `cargo test` is green at ≥ the Slice-1
+baseline; the harness exits 0 with `passed:true` and `host_state_unchanged:true`;
+NET-04/05/07 are recorded HOST-BLOCKED and left unchecked in the parity checklist.
+
+---
+
+## Self-Review
+
+### 1. Spec coverage (each requirement → covering task)
+
+| Requirement | Covering task(s) | Observable production outcome (no stub) |
+|---|---|---|
+| NET-01 complete live status | Slice 1 (landed) + Task 3.4 (`stale` unhardcoded) | `GET /api/network/status` returns full `NetworkStatus`; harness Phase 2 asserts every key |
+| NET-02 transactional rebind | 2.1, 2.2b, 2.3 | `configure` binds+proves the new listener before persist; boot honors persisted host across restart; harness Phase 3 tier-b 200; squatter unit test proves rollback |
+| NET-03 share URL, token never logged | Slice 1 (`accessUrl`) + harness Phase 6 token-scan | harness greps `server.log` for the token → absent |
+| NET-04 Windows firewall configure/repair | 3.1, 3.3, 3.4, 3.5 | golden strings + fake-backed behavior + compile-time unreachability; **HOST-BLOCKED live effect, evidenced 3.6** |
+| NET-05 WSL2 forwarding | 3.4 | golden plan from real captured portproxy; **HOST-BLOCKED live effect, evidenced 3.6** |
+| NET-06 safe disable | 2.4 | `disable-remote-access` live retract on Linux; harness Phase 4 tier-b REFUSED, tier-a still 200 |
+| NET-07 elevation faults | 3.1, 3.5 | four outcome tests: lock released, `configuring=false`, no false persist; **HOST-BLOCKED live effect, evidenced 3.6** |
+| NET-08 secure every mutation | 2.3, 2.4, 3.3 + harness Phase 6 | 15-case live matrix + structural Rust tests (enum host, Ipv4Addr, call_count 0) |
+| NET-09 lossless writes | 2.3, 2.4, 2.5 | mutations go through `settings.patch`; black-box + harness Phase 5 per-key sha preservation |
+| NET-10 native Linux guidance | Slice 1 + 3.3 `terminal` branch | `configure-firewall` returns `{method:"terminal",command}`; server never runs it |
+
+### 1b. No silent deferrals
+
+Every NET requirement has a covering task producing a real, tested outcome. The
+only deferred items — NET-04/05/07 *live elevated side effects* — are HOST-BLOCKED
+(hardware this Linux host lacks; safety rules forbid simulation). Their production
+code paths are fully implemented and exercised via `FakeCommandRunner` golden
+strings, fake-backed behavioral tests, AND a compile-time unreachability proof;
+the deferral is recorded with named test evidence in Task 3.6 and left UNCHECKED
+in the parity checklist. No stub, mock, or synthetic value stands in for a
+required *behavior* — only the live OS mutation is unexecuted, by design. This is
+explicitly the spec's own "deferred-with-evidence" disposition, not a scope
+reduction. No UNRESOLVED COVERAGE GAP remains.
+
+### 2. Placeholder scan
+
+No "TBD/TODO/handle appropriately". Every code step shows code; every test step
+shows the test; every command shows its expected verdict. Where an exact internal
+signature could drift (`timing_safe_compare` arg type, the `ServerSettings`
+import path, the status-building block refactored into `build_status_value`), the
+step names the file:line to read first and the exact contract to preserve —
+concrete instruction, not a placeholder.
+
+### 3. Type consistency
+
+- `RebindController` methods (`new`, `set_app`, `has_app`, `serve_on`,
+  `shutdown_all`) are named identically across Tasks 2.1–2.4.
+- `NetworkState` new fields (`broadcast_tx`, `rebind`, `gate`) are introduced in
+  2.2 / 3.3 and every later `test_state` update and handler references the same
+  names.
+- `ConfirmFirewallRequest` (strict) is defined in 2.4 and reused in 3.3.
+- `invalid_request` / `build_status_value` are introduced in 2.3 and reused by
+  2.4 / 3.3 / 3.4.
+- `ElevationRunner` / `ElevationOutcome` / `spawn_via` / `elevation_runner_live`
+  are defined in 3.1 and consumed in 3.3 / 3.5.
+- `ManagedPortsStore::{windows, read_windows, persist_windows, clear_windows}`
+  defined in 3.2, consumed in 3.3.
+- Wire shapes (`{"error":"Invalid request","details":[...]}`,
+  `{"error":"Unauthorized"}`, `rebindScheduled:false`, the `method` discriminant,
+  the 409 `{"error":...,"method":"in-progress"}`, the two `method:"none"` message
+  strings) are copied verbatim from the frozen TS contract and are consistent
+  across every task that emits them.
+
+No mismatches found.
