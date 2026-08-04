@@ -1060,13 +1060,13 @@ proves the pre-existing gap, and the rust leg proves the improvement.
 - **pinning_test:** `crates/freshell-server/src/network.rs::configure_to_all_interfaces_persists_and_reports_settled_host`.
 - **status:** proposed
 
-### DEV-0013 — No mass 4009 on rebind (overlapping listeners drain old connections safely)
+### DEV-0013 — No mass 4009 on rebind (in-flight connections drain across the listener swap)
 
-- **objective_defect:** *UX improvement / intentional divergence* — overlapping listeners (old + new bound simultaneously via SO_REUSEPORT) allow existing WS connections to drain gracefully instead of abrupt closure.
+- **objective_defect:** *UX improvement / intentional divergence* — the rebind swap retires only the accept loop, never accepted connections, so existing WS/HTTP connections drain gracefully instead of receiving abrupt closure.
 - **original_behavior:** On rebind, old listener is torn down immediately, causing connected clients to receive 4009 (going away) en masse.
-- **port_behavior:** Old listener stays bound during the overlap period, allowing graceful drain of existing connections while new requests route to the new listener.
-- **fingerprint:** harness Phase 3/4 connection stability (old connections not abruptly closed on rebind).
-- **pinning_test:** harness Phase 3/4 (overlapping-listener/drain behavior: old connections drain gracefully via RebindController's kept accept loop; new requests route to new listener).
+- **port_behavior:** The old accept loop is RETIRED at the swap (`Notify::notify_one` permit + awaiting its JoinHandle — a deterministic "old socket closed" barrier); in-flight connections are unaffected because each accepted connection runs in its own detached spawned task, which keeps draining after the swap while new requests route to the new listener. (SO_REUSEPORT overlap exists only for the bind-proof; drain comes from the detached per-connection tasks, not a kept accept loop.)
+- **fingerprint:** net_bind drain pin (live connection held open across a `serve_on` swap completes; new listener serves concurrently).
+- **pinning_test:** `crates/freshell-server/src/net_bind.rs::inflight_connection_survives_rebind_and_drains_to_completion` (holds an in-flight request open across the swap, proves the new listener serves during the drain, then completes the old request — fails if the swap force-closes in-flight connections).
 - **status:** proposed
 
 ### DEV-0014 — NET-08-A/B/C hardening (Ipv4Addr typing, constant-time compare, Slice 0)

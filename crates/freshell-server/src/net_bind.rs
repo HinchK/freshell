@@ -279,4 +279,91 @@ mod tests {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
             .expect("no stuck listeners after 100 swaps");
     }
+
+    /// Pins the DEV-0013 drain property: a connection accepted by the OLD
+    /// listener keeps working across a rebind (drains gracefully in its
+    /// detached per-connection task) while the NEW listener serves new
+    /// requests. Fails if the swap force-closes in-flight connections.
+    ///
+    /// Deterministic sequencing (no sleeps): the gated handler signals entry
+    /// via mpsc BEFORE the swap, and is released via watch only AFTER the
+    /// swap + new-listener probe. Timeouts are failure bounds, not sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inflight_connection_survives_rebind_and_drains_to_completion() {
+        use axum::{routing::get, Router};
+        use std::time::Duration;
+        use tokio::sync::{mpsc, watch};
+        use tokio::time::timeout;
+
+        let port = free_port();
+        let (arrived_tx, mut arrived_rx) = mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = watch::channel(false);
+        let slow = {
+            let arrived_tx = arrived_tx.clone();
+            let release_rx = release_rx.clone();
+            move || {
+                let arrived_tx = arrived_tx.clone();
+                let mut release_rx = release_rx.clone();
+                async move {
+                    let _ = arrived_tx.send(()); // in-flight on the OLD listener
+                    while !*release_rx.borrow_and_update() {
+                        if release_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    "drained"
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/ping", get(|| async { "pong" }));
+        let ctl = RebindController::new(port, true);
+        ctl.set_app(app);
+        let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        ctl.serve_on(localhost).await.expect("initial serve");
+
+        // Start a request that will still be in flight when we swap. Only the
+        // OLD listener exists at this point, so it owns the connection.
+        let old_req =
+            tokio::spawn(
+                async move { reqwest::get(format!("http://127.0.0.1:{port}/slow")).await },
+            );
+        timeout(Duration::from_secs(30), arrived_rx.recv())
+            .await
+            .expect("handler must start before the swap")
+            .expect("arrival signal");
+
+        // Swap. When serve_on returns, the old accept loop has exited and the
+        // old socket is closed (barrier) -- yet the in-flight connection above
+        // must keep draining in its detached task.
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .await
+            .expect("rebind serve");
+
+        // NEW listener serves new connections while the old one still drains.
+        let body = reqwest::get(format!("http://127.0.0.1:{port}/ping"))
+            .await
+            .expect("new listener accepts during drain")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "pong");
+
+        // Release the gate: the request accepted by the retired listener must
+        // complete successfully. A force-close on swap => connection reset /
+        // incomplete body here, failing the test.
+        release_tx.send(true).expect("handler still alive");
+        let resp = timeout(Duration::from_secs(30), old_req)
+            .await
+            .expect("old connection must complete, not hang")
+            .expect("client task")
+            .expect("old connection must not be reset by the swap");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "drained",
+            "in-flight request must drain to completion across the rebind"
+        );
+        ctl.shutdown_all().await;
+    }
 }
