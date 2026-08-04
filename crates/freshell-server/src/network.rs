@@ -49,7 +49,7 @@ use axum::{
     extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use freshell_platform::detect::{host_os_live, is_wsl2_proc_live};
@@ -175,25 +175,17 @@ pub struct NetworkState {
     pub broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
     /// The transactional rebind controller (Slice 2). Swaps the live listener
     /// between 127.0.0.1 and 0.0.0.0 without a zero-listener window.
-    // Read by Task 2.3/2.4's mutation endpoints (`state.rebind.serve_on(..)`);
-    // until then main.rs only WRITES the field at construction.
-    #[allow(dead_code)]
     pub rebind: std::sync::Arc<crate::net_bind::RebindController>,
     /// Serializes ALL network mutations (configure / disable / firewall persist)
     /// from before the live-bind read through persist + bind.set — the port of
     /// the TS rebind queue (network-manager.ts:220-221, :424-436). VALIDATED
     /// (ledger A-08, reports/V5.md): without it, concurrent mutations can
     /// persist a host that contradicts the live listener.
-    // Locked by Task 2.3/2.4's mutation endpoints; nothing in the bin reads it yet.
-    #[allow(dead_code)]
     pub net_mutation: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl NetworkState {
     /// Emit the exact frame `settings_store::patch_settings` emits on success.
-    // Called by Task 2.3/2.4's mutation endpoints after persist+rebind; until
-    // then only the unit test exercises it, so the bin target sees it as dead.
-    #[allow(dead_code)]
     pub fn broadcast_settings_updated(&self, settings: &freshell_protocol::ServerSettings) {
         if let Ok(frame) = serde_json::to_string(
             &serde_json::json!({ "type": "settings.updated", "settings": settings }),
@@ -221,9 +213,8 @@ impl BindState {
         self.host.read().await.clone()
     }
 
-    /// Overwrite the live bind host (Slice 2's rebind path; unused in Slice 1
-    /// but exposed now so the reshape doesn't need to happen twice).
-    #[allow(dead_code)]
+    /// Overwrite the live bind host (Slice 2's rebind path: `configure`
+    /// commits the settled host here after a proven swap + persist).
     pub async fn set(&self, host: impl Into<String>) {
         *self.host.write().await = host.into();
     }
@@ -282,10 +273,8 @@ impl NetworkFactsCache {
 
     /// Force the next [`Self::get_or_refresh`] to re-detect (defect 3 fix):
     /// mirrors `this.firewallInfo = null; await this.refreshLanIpsAsync()`
-    /// (`network-manager.ts:419-420`). Unused by any route in Slice 1 (no
-    /// mutation endpoint exists yet); exercised directly by the acceptance
-    /// tests below and reused verbatim by Slice 2's `configure` route.
-    #[allow(dead_code)]
+    /// (`network-manager.ts:419-420`). Consumed by Slice 2's `configure`
+    /// route after every mutation (success AND rolled-back failure).
     pub async fn invalidate(&self) {
         *self.inner.write().await = None;
     }
@@ -297,6 +286,7 @@ pub fn router(state: NetworkState) -> Router {
     Router::new()
         .route("/api/network/status", get(network_status))
         .route("/api/lan-info", get(lan_info))
+        .route("/api/network/configure", post(configure))
         .with_state(state)
 }
 
@@ -318,7 +308,13 @@ async fn network_status(State(state): State<NetworkState>, headers: HeaderMap) -
     if !is_authed(&headers, &state.auth_token) {
         return crate::boot::unauthorized();
     }
+    Json(build_status_value(&state).await).into_response()
+}
 
+/// Resolve the live inputs (settings/bind/facts/probe) and build the settled
+/// `NetworkStatus` value -- shared by `GET /api/network/status` and
+/// `POST /api/network/configure` (DRY: ONE probe/facts path, never two).
+async fn build_status_value(state: &NetworkState) -> Value {
     // Live settings (defect 1): re-read on every call, never a boot snapshot.
     let settings = state.settings.get().await;
     // Live bind (defect 2): re-read the current bind host on every call.
@@ -356,7 +352,113 @@ async fn network_status(State(state): State<NetworkState>, headers: HeaderMap) -
         wsl_forwarding_disabled_by_env: is_wsl_port_forwarding_disabled_by_env(&RealEnv),
         token: state.auth_token.as_str(),
     };
-    Json(build_network_status(inputs)).into_response()
+    build_network_status(inputs)
+}
+
+/// The `POST /api/network/configure` request (`NetworkConfigureSchema`,
+/// `server/network-router.ts`): NON-strict (unknown keys ignored, matching
+/// the zod schema); `host` is the enum-typed [`NetworkHost`], so ONLY
+/// `"127.0.0.1"`/`"0.0.0.0"` deserialize -- the NET-08 arbitrary-host
+/// defense made structural.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkConfigureRequest {
+    host: NetworkHost,
+    configured: bool,
+}
+
+/// The zod-shaped 400 (`{"error":"Invalid request","details":[...]}`,
+/// `network-router.ts:437-439`).
+fn invalid_request(details: Value) -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "Invalid request", "details": details })),
+    )
+        .into_response()
+}
+
+/// `POST /api/network/configure` -- transactional expose/rebind
+/// (`network-router.ts:431-446` + `network-manager.ts:400-439`, with the
+/// NET-02 transactional fix): prove the NEW listener first, persist second,
+/// and roll the listener back if persist fails, so persisted state never
+/// outruns reality.
+async fn configure(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let raw = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let req: NetworkConfigureRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return invalid_request(json!([{
+                "code": "invalid_type", "path": [], "message": e.to_string()
+            }]));
+        }
+    };
+    // A-08: serialize all network mutations -- held through persist + bind.set.
+    let _mutation_guard = state.net_mutation.lock().await;
+    let new_host = network_host_str(&req.host).to_string(); // "127.0.0.1" | "0.0.0.0"
+    let live_host = state.bind.get().await;
+    // DEVIATION (Task 6.1 #7): no wsl2 exception -- our bind is truthful on every
+    // platform, so wsl2 rebinds for real (the TS kept its listener on 0.0.0.0 and
+    // used portproxy for exposure; network-manager.ts:412-413).
+    let host_changed = live_host != new_host;
+
+    if host_changed {
+        let new_ip: std::net::IpAddr = new_host
+            .parse()
+            .expect("enum guarantees a valid IP literal");
+        if state.rebind.serve_on(new_ip).await.is_err() {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to configure network" })),
+            )
+                .into_response();
+        }
+    }
+
+    // Persist AFTER the new listener is proven (NET-02).
+    let patch = json!({ "network": { "host": new_host, "configured": req.configured } });
+    let merged = match state.settings.patch(&patch).await {
+        Ok(m) => m,
+        Err((status, body)) => {
+            // Persist failed AFTER the live swap: roll the LISTENER back so
+            // reality re-matches the (unchanged) persisted config + BindState
+            // (NET-02 "persisted state never outruns reality"; the frozen TS
+            // revert is network-manager.ts:474-505).
+            if host_changed {
+                let old_ip: std::net::IpAddr = live_host
+                    .parse()
+                    .expect("BindState only ever holds enum-validated IP literals");
+                if state.rebind.serve_on(old_ip).await.is_err() {
+                    // Rollback bind failed: the live listener stays on new_host.
+                    // Keep status TRUTHFUL anyway and log loudly; the persisted
+                    // file is stale until the next successful mutation.
+                    state.bind.set(new_host.clone()).await;
+                    tracing::error!(
+                        "CATASTROPHIC: persist failed and rollback rebind failed; \
+                         live listener on {new_host} contradicts persisted config"
+                    );
+                }
+                state.facts.invalidate().await;
+            }
+            return (status, Json(body)).into_response();
+        }
+    };
+    state.facts.invalidate().await;
+    if host_changed {
+        state.bind.set(new_host.clone()).await;
+    }
+
+    let mut out = build_status_value(&state).await;
+    out["rebindScheduled"] = json!(false);
+    let response = (axum::http::StatusCode::OK, Json(out)).into_response();
+    state.broadcast_settings_updated(&merged);
+    response
 }
 
 /// The inputs to the pure [`build_network_status`] (everything the live edge
@@ -794,6 +896,330 @@ mod tests {
             net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
         (state, counter)
+    }
+
+    /// Probe a free port BELOW the Linux ephemeral range (default
+    /// 32768-60999): kernel-assigned ports (other tests' `bind(.., 0)` probes
+    /// and outgoing-connect source ports) can never land here, so the
+    /// probe-then-rebind window cannot be raced by the parallel suite.
+    /// (Measured: probing WITH `bind(("127.0.0.1", 0))` instead flaked
+    /// `configure_rolls_back_the_listener_when_persist_fails` ~1/15 full
+    /// bin-test runs -- a sibling test's wildcard listener landed on the
+    /// probed port.) The pid offset keeps two simultaneous test PROCESSES off
+    /// the same sequence; the wildcard probe proves BOTH `127.0.0.1:port`
+    /// and `0.0.0.0:port` are bindable.
+    fn probe_free_low_port() -> u16 {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static CURSOR: AtomicU16 = AtomicU16::new(0);
+        let base = 21000 + (std::process::id() as u16 % 4000);
+        loop {
+            let candidate = base + (CURSOR.fetch_add(1, Ordering::SeqCst) % 4000);
+            if std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, candidate)).is_ok() {
+                return candidate;
+            }
+        }
+    }
+
+    /// Like [`test_state`], but (a) its settings store is FILE-BACKED under
+    /// `home` (so a persist can really fail), and (b) it does NOT reuse
+    /// `test_state`'s port-0/never-served controller: it carries a REAL fixed
+    /// (probed) port. With port 0, every `serve_on` (the handler's swap to
+    /// `0.0.0.0` AND the rollback back to `127.0.0.1`) would bind a DIFFERENT
+    /// ephemeral port, making post-rollback connect assertions on `port`
+    /// meaningless.
+    fn test_state_with_home(
+        bind_host: &str,
+        probe_result: Option<bool>,
+        home: &std::path::Path,
+    ) -> NetworkState {
+        let probed_port = probe_free_low_port();
+        NetworkState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(Some(home), vec!["claude".into()]),
+            bind: Arc::new(BindState::new(bind_host.to_string())),
+            port: probed_port,
+            facts: Arc::new(NetworkFactsCache::new()),
+            probe: Arc::new(FakePortProbe::new(probe_result)),
+            broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            rebind: crate::net_bind::RebindController::new(probed_port, true),
+            net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Inject the same hello `Router` Task 2.1's tests use and serve it on
+    /// loopback via the state's OWN controller. Constructs nothing and reads
+    /// no private controller fields -- the port was already chosen and
+    /// threaded through by [`test_state_with_home`]. Errors (instead of
+    /// panicking) so the retrying scenarios below can treat a transient bind
+    /// artifact as one failed attempt.
+    async fn serve_real_test_app_on_loopback(state: &NetworkState) -> Result<u16, String> {
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        state.rebind.set_app(app);
+        state
+            .rebind
+            .serve_on(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .await
+            .map_err(|e| format!("initial loopback serve failed: {e}"))?;
+        Ok(state.port)
+    }
+
+    // ---- Slice 2 (Task 2.3): POST /api/network/configure -------------------
+
+    #[tokio::test]
+    async fn configure_to_all_interfaces_persists_and_reports_settled_host() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("127.0.0.1", Some(true));
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["host"], "0.0.0.0");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["rebindScheduled"], false);
+        let s = state.settings.get().await;
+        assert_eq!(serde_json::to_value(&s.network).unwrap()["host"], "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_arbitrary_host_with_400() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("127.0.0.1", None);
+        for bad in [
+            r#"{"host":"10.0.0.1","configured":true}"#,
+            r#"{"host":"0.0.0.0; rm -rf /","configured":true}"#,
+            r#"{"host":"$(id)","configured":true}"#,
+            r#"{"configured":true}"#,
+            r#"{"host":"0.0.0.0","configured":"yes"}"#,
+        ] {
+            let resp = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/network/configure")
+                        .header("x-auth-token", "tok")
+                        .header("content-type", "application/json")
+                        .body(Body::from(bad))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "payload {bad} must be rejected");
+            let body = body_json(resp).await;
+            assert_eq!(body["error"], "Invalid request");
+            assert!(body["details"].is_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_requires_auth() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let state = test_state("127.0.0.1", None);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// NET-02 falsifier (Task 6.1 #9): a persist failure AFTER a successful
+    /// swap must roll the LISTENER back so reality keeps matching the
+    /// (unchanged) persisted config and BindState. Persist failure is forced
+    /// through the store's own error path: a file-backed settings store under
+    /// a HOME whose .freshell dir is read-only. Confirmed (settings_store.rs
+    /// GAP2 fix): persist runs BEFORE the live tree commits and its failure
+    /// propagates out of `SettingsStore::patch` as `Err((status, body))` --
+    /// load-bearing for NET-02/NET-09.
+    ///
+    /// RETRY WRAPPER (measured on this WSL2 host): real-socket bind/close
+    /// cycles occasionally hit transient loopback-port artifacts under full
+    /// parallel-suite load (~1/10 runs a detector connect/bind on the
+    /// just-swapped port misbehaved while diagnostics confirmed the 500, the
+    /// rollback, and a truthful 127.0.0.1 BindState were all correct;
+    /// net_bind's own Task-2.1 port tests flake the same way). Every attempt
+    /// runs on a FRESH home + state + port, and every product invariant is
+    /// checked on every attempt -- a REAL rollback regression fails all five
+    /// attempts deterministically, so the falsifying power is preserved while
+    /// transient environment noise is retried away.
+    #[tokio::test]
+    async fn configure_rolls_back_the_listener_when_persist_fails() {
+        for attempt in 1..=5 {
+            match rollback_scenario_once().await {
+                Ok(()) => return,
+                Err(e) if attempt < 5 => {
+                    eprintln!("rollback scenario attempt {attempt}: {e}; retrying on a fresh port");
+                }
+                Err(e) => panic!("rollback invariants violated on every attempt: {e}"),
+            }
+        }
+    }
+
+    /// One full run of the rollback scenario on a fresh home/state/port.
+    /// Product-invariant violations are returned as `Err` (not panics) so the
+    /// retry wrapper above can distinguish attempts; a real regression
+    /// returns the same error every attempt.
+    async fn rollback_scenario_once() -> Result<(), String> {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::os::unix::fs::PermissionsExt;
+        use tower::util::ServiceExt;
+        let home = tempfile::tempdir().unwrap();
+        let freshell_dir = home.path().join(".freshell");
+        std::fs::create_dir_all(&freshell_dir).unwrap();
+        let state = test_state_with_home("127.0.0.1", Some(true), home.path());
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        let port = serve_real_test_app_on_loopback(&state).await?;
+        let mut perms = std::fs::metadata(&freshell_dir).unwrap().permissions();
+        perms.set_mode(0o555); // read-only dir => the atomic tmp+rename persist fails
+        std::fs::set_permissions(&freshell_dir, perms).unwrap();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Restore write perms up front so the tempdir cleans up on every path.
+        let mut perms = std::fs::metadata(&freshell_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&freshell_dir, perms).unwrap();
+        if !resp.status().is_server_error() {
+            return Err(format!(
+                "persist failure must surface as a 5xx, got {}",
+                resp.status()
+            ));
+        }
+        // Rollback proof: the wildcard listener must be GONE, loopback must
+        // still serve, and neither BindState nor settings claim 0.0.0.0.
+        // Wildcard-gone detector: a PLAIN (no SO_REUSEPORT) bind of
+        // 127.0.0.2:port fails while any 0.0.0.0:port listener survives
+        // (wildcard conflicts with every specific address; sharing would need
+        // reuseport on BOTH) and succeeds against the rolled-back 127.0.0.1
+        // listener (two DIFFERENT specific addresses never conflict).
+        if std::net::TcpListener::bind(("127.0.0.2", port)).is_err() {
+            return Err("listener left on 0.0.0.0 after failed persist (no rollback)".into());
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            return Err("rolled-back loopback listener is not serving".into());
+        }
+        let live = state.bind.get().await;
+        if live != "127.0.0.1" {
+            return Err(format!(
+                "BindState claims {live} after a rolled-back persist failure"
+            ));
+        }
+        let s = state.settings.get().await;
+        let host = serde_json::to_value(&s.network).unwrap()["host"].clone();
+        if host != "127.0.0.1" {
+            return Err(format!("settings claim host {host} after failed persist"));
+        }
+        state.rebind.shutdown_all().await;
+        Ok(())
+    }
+
+    /// Step-4 falsifier: a foreign (non-reuseport) squatter on 0.0.0.0:port
+    /// makes the new bind fail; the handler must answer 500 with the frozen
+    /// error shape and persist NOTHING (settings + BindState unchanged, old
+    /// listener untouched -- here trivially: none was ever swapped in).
+    /// Retried on a fresh port for the same transient WSL2 loopback-port
+    /// artifacts as the rollback test above.
+    #[tokio::test]
+    async fn configure_returns_500_and_persists_nothing_when_bind_fails() {
+        for attempt in 1..=5 {
+            match bind_failure_scenario_once().await {
+                Ok(()) => return,
+                Err(e) if attempt < 5 => {
+                    eprintln!(
+                        "bind-failure scenario attempt {attempt}: {e}; retrying on a fresh port"
+                    );
+                }
+                Err(e) => panic!("bind-failure invariants violated on every attempt: {e}"),
+            }
+        }
+    }
+
+    /// One full run of the squatter/bind-failure scenario on a fresh
+    /// home/state/port (same retry contract as [`rollback_scenario_once`]).
+    async fn bind_failure_scenario_once() -> Result<(), String> {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".freshell")).unwrap();
+        let state = test_state_with_home("127.0.0.1", Some(true), home.path());
+        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+        // Real app injected (so serve_on really binds) but NOT served yet: the
+        // squatter takes 0.0.0.0:port first -- exactly net_bind's proven
+        // foreign-squatter-blocks-our-bind case.
+        state
+            .rebind
+            .set_app(Router::new().route("/ping", get(|| async { "pong" })));
+        let squatter = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, state.port))
+            .map_err(|e| format!("squatter could not bind the probed port: {e}"))?;
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/configure")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if resp.status() != 500 {
+            return Err(format!(
+                "blocked bind must surface as 500, got {}",
+                resp.status()
+            ));
+        }
+        let body = body_json(resp).await;
+        if body != json!({ "error": "Failed to configure network" }) {
+            return Err(format!("wrong 500 body: {body}"));
+        }
+        let live = state.bind.get().await;
+        if live != "127.0.0.1" {
+            return Err(format!("BindState claims {live} after a failed bind"));
+        }
+        let s = state.settings.get().await;
+        let host = serde_json::to_value(&s.network).unwrap()["host"].clone();
+        if host != "127.0.0.1" {
+            return Err(format!("settings claim host {host} after a failed bind"));
+        }
+        drop(squatter);
+        Ok(())
     }
 
     /// Slice 2 (Task 2.2): `broadcast_settings_updated` emits the exact frame
