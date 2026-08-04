@@ -614,6 +614,7 @@ mod tests {
                     exit_code: Some(0),
                     stdout: "/usr/bin/claude-real".into(),
                     stderr: String::new(),
+                    timed_out: false,
                 },
             )
             .on(
@@ -623,6 +624,7 @@ mod tests {
                     exit_code: Some(1),
                     stdout: String::new(),
                     stderr: String::new(),
+                    timed_out: false,
                 },
             );
         let mut env = HashMap::new();
@@ -648,6 +650,7 @@ mod tests {
                 exit_code: Some(0),
                 stdout: "C:\\claude.exe".into(),
                 stderr: String::new(),
+                timed_out: false,
             },
         );
         let get = |_: &str| None;

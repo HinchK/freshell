@@ -232,6 +232,10 @@ pub struct CommandOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// `true` iff the runner killed the process because its wall-clock timeout
+    /// elapsed ([`StdCommandRunner::timeout`]). Distinguishes a timeout kill
+    /// from the other `exit_code: None` causes (spawn failure, signal kill).
+    pub timed_out: bool,
 }
 
 impl CommandOutput {
@@ -241,6 +245,7 @@ impl CommandOutput {
             exit_code: Some(0),
             stdout: stdout.into(),
             stderr: String::new(),
+            timed_out: false,
         }
     }
 
@@ -250,6 +255,7 @@ impl CommandOutput {
             exit_code: Some(exit_code),
             stdout: stdout.into(),
             stderr: stderr.into(),
+            timed_out: false,
         }
     }
 
@@ -260,6 +266,18 @@ impl CommandOutput {
             exit_code: None,
             stdout: String::new(),
             stderr: stderr.into(),
+            timed_out: false,
+        }
+    }
+
+    /// A run the runner killed on wall-clock timeout: `exit_code` is `None`
+    /// (the process never settled) and [`CommandOutput::timed_out`] is set.
+    pub fn timeout(stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+        Self {
+            exit_code: None,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            timed_out: true,
         }
     }
 
@@ -349,6 +367,7 @@ impl CommandRunner for StdCommandRunner {
         });
 
         let deadline = std::time::Instant::now() + self.timeout;
+        let mut timed_out = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
@@ -356,6 +375,7 @@ impl CommandRunner for StdCommandRunner {
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
+                        timed_out = true;
                         break None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(15));
@@ -371,11 +391,13 @@ impl CommandRunner for StdCommandRunner {
                 exit_code: s.code(),
                 stdout,
                 stderr,
+                timed_out: false,
             },
             None => CommandOutput {
                 exit_code: None,
                 stdout,
                 stderr,
+                timed_out,
             },
         }
     }
@@ -475,6 +497,24 @@ mod inject_tests {
         assert_eq!(env.or_default("SET", "d"), "v");
         assert_eq!(env.or_default("EMPTY", "d"), "d");
         assert_eq!(env.or_default("MISSING", "d"), "d");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn std_runner_flags_timed_out_only_on_wall_clock_kill() {
+        let runner = StdCommandRunner::with_timeout(std::time::Duration::from_millis(50));
+        let out = runner.run("sleep", &["5"]);
+        assert!(out.timed_out, "kill-on-timeout must set timed_out");
+        assert_eq!(out.exit_code, None);
+
+        let ok = StdCommandRunner::default().run("true", &[]);
+        assert!(!ok.timed_out);
+        assert_eq!(ok.exit_code, Some(0));
+
+        // Spawn failure is also `exit_code: None` but NOT a timeout.
+        let missing = runner.run("freshell-definitely-missing-binary", &[]);
+        assert!(!missing.timed_out);
+        assert_eq!(missing.exit_code, None);
     }
 
     #[test]

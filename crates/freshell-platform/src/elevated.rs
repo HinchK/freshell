@@ -45,6 +45,17 @@ pub fn spawn_elevated_powershell(
     runner.run(command, &arg_refs)
 }
 
+/// The [`CommandRunner`] for REAL elevation dispatch: [`crate::StdCommandRunner`]
+/// carrying [`ELEVATED_POWERSHELL_TIMEOUT_MS`] (120s, `elevated-powershell.ts:3`)
+/// instead of the 5s read-only `tryExec` default. `Start-Process -Verb RunAs
+/// -Wait` blocks on the interactive UAC prompt plus the elevated script, so the
+/// short default would kill the outer PowerShell and misreport the outcome.
+pub fn elevated_std_runner() -> crate::StdCommandRunner {
+    crate::StdCommandRunner::with_timeout(std::time::Duration::from_millis(
+        ELEVATED_POWERSHELL_TIMEOUT_MS,
+    ))
+}
+
 /// `ConfirmationAction` (`network-router.ts:50`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationAction {
@@ -301,6 +312,11 @@ pub fn elevation_runner_live() -> ElevationRunner<'static> {
 }
 
 fn classify(out: &crate::CommandOutput) -> ElevationOutcome {
+    // A runner kill on wall-clock timeout is authoritative: the elevated
+    // PowerShell never settled, so the outcome is TimedOut, not Denied.
+    if out.timed_out {
+        return ElevationOutcome::TimedOut;
+    }
     let text = format!("{} {}", out.stdout, out.stderr).to_ascii_lowercase();
     if text.contains("canceled by the user") || text.contains("cancelled") {
         return ElevationOutcome::Denied;
@@ -317,7 +333,7 @@ pub fn spawn_via(runner: &ElevationRunner<'_>, command: &str, script: &str) -> E
         ElevationRunner::Fake(r) => classify(&spawn_elevated_powershell(*r, command, script)),
         #[cfg(windows)]
         ElevationRunner::Real => classify(&spawn_elevated_powershell(
-            &crate::StdCommandRunner::default(),
+            &elevated_std_runner(),
             command,
             script,
         )),
@@ -358,8 +374,36 @@ protocol=tcp localport=3001 profile=private'"
     }
 
     #[test]
-    fn timeout_constant() {
+    fn real_elevation_runner_carries_the_120s_timeout() {
+        // Strictly stronger than the old constant-value-only assertion: the
+        // constant must be 120_000 AND the runner used for real elevation
+        // dispatch must actually carry it (not the 5s read-only default).
         assert_eq!(ELEVATED_POWERSHELL_TIMEOUT_MS, 120_000);
+        let runner = elevated_std_runner();
+        assert_eq!(
+            runner.timeout,
+            std::time::Duration::from_millis(ELEVATED_POWERSHELL_TIMEOUT_MS)
+        );
+        assert_eq!(runner.timeout, std::time::Duration::from_millis(120_000));
+    }
+
+    #[test]
+    fn real_dispatch_wires_the_elevated_runner_not_the_5s_default() {
+        // The `ElevationRunner::Real` arm is cfg(windows)-gated, so on non-Windows
+        // hosts the wiring is pinned by source inspection (repo convention:
+        // needles are concat!-split so this test's OWN source never satisfies
+        // the contains() checks).
+        let src = include_str!("elevated.rs");
+        let banned = concat!("StdCommandRunner::", "default()");
+        let required = concat!("elevated_std", "_runner()");
+        assert!(
+            !src.contains(banned),
+            "Real elevation dispatch must not use the 5s-default StdCommandRunner"
+        );
+        assert!(
+            src.contains(required),
+            "Real elevation dispatch must go through the 120s elevated runner"
+        );
     }
 
     // ---- action metadata ---------------------------------------------------
@@ -619,5 +663,28 @@ protocol=tcp localport=3001 profile=private'"
         let ok = FakeCommandRunner::new().with_default(CommandOutput::success(""));
         let out = spawn_via(&ElevationRunner::Fake(&ok), "powershell.exe", "script");
         assert_eq!(out, ElevationOutcome::Started);
+    }
+
+    #[test]
+    fn timed_out_outcome_classifies_as_timed_out_not_denied() {
+        // A runner kill on wall-clock timeout must surface as TimedOut...
+        let timed_out = FakeCommandRunner::new().with_default(CommandOutput::timeout("", ""));
+        let out = spawn_via(
+            &ElevationRunner::Fake(&timed_out),
+            "powershell.exe",
+            "script",
+        );
+        assert_eq!(out, ElevationOutcome::TimedOut);
+
+        // ...while a plain spawn failure (`exit_code: None`, no timeout flag)
+        // still classifies as Denied, exactly as before.
+        let spawn_fail =
+            FakeCommandRunner::new().with_default(CommandOutput::spawn_failure("boom"));
+        let out = spawn_via(
+            &ElevationRunner::Fake(&spawn_fail),
+            "powershell.exe",
+            "script",
+        );
+        assert_eq!(out, ElevationOutcome::Denied);
     }
 }
