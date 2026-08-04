@@ -328,6 +328,134 @@ phase5_restart() {
   echo "phase5 restart: sigterm=ok net09=$net09 new_pid=$SERVER_PID tier_a=$tier_a tier_b=$tb"
 }
 
+# Phase 6 - NET-08 negative security matrix (15 cases): every case asserts the
+# expected status/body AND zero side effects - config.json byte-identical
+# (full-file sha256) and the `ss` listener set unchanged vs the Phase-6
+# baseline. The token PROTOCOL cases (replay / wrong-action / parallel 409)
+# are Rust-only by VALIDATED necessity (ledger A-06, reports/V5.md: with
+# FRESHELL_DISABLE_WSL_PORT_FORWARD=1 on this host no live lane ever issues a
+# confirmation token) - covered by the Task 3.5 unit tests, NOT here. Cases
+# 5/6/14 are ALSO proved structurally in Rust (`host` enum, `wsl_ip: Ipv4Addr`,
+# FakeCommandRunner::call_count()==0); the harness proves them live too - both
+# required, neither substitutes for the other. Injection-string bodies below
+# are single-quoted so bash/jq NEVER interpret them - they exist to prove the
+# SERVER rejects/neutralizes them.
+config_sha() { sha256sum "$HOME_DIR/.freshell/config.json" | cut -d' ' -f1; }
+listener_set() { { ss -ltn | grep ":$PORT " || true; } | awk '{print $4}' | sort | paste -sd, -; }
+NET08_SHA=""; NET08_LSET=""
+net08_intact() { # CASE-DESC -> zero-side-effect assertion vs the Phase-6 baseline
+  local desc="$1"
+  check "phase6: $desc - config.json byte-identical" [ "$(config_sha)" = "$NET08_SHA" ]
+  check "phase6: $desc - listener set unchanged" [ "$(listener_set)" = "$NET08_LSET" ]
+}
+reject400() { # DESC PATH BODY -> 400 {"error":"Invalid request"} + zero side effects
+  local desc="$1" path="$2" body="$3" code
+  code="$(api POST "$path" "$body")" || code=ERR
+  check "phase6: $desc -> 400" [ "$code" = "400" ]
+  check "phase6: $desc body Invalid request" jq -e '.error=="Invalid request"' "$REPORT_DIR/resp.json"
+  net08_intact "$desc"
+}
+benign200() { # DESC PATH BODY -> 200 method:"none" + zero side effects
+  local desc="$1" path="$2" body="$3" code
+  code="$(api POST "$path" "$body")" || code=ERR
+  check "phase6: $desc -> 200" [ "$code" = "200" ]
+  check "phase6: $desc method none" jq -e '.method=="none"' "$REPORT_DIR/resp.json"
+  net08_intact "$desc"
+}
+
+phase6_net08_matrix() {
+  local code uuid pid_a pid_b c1 c2
+  NET08_SHA="$(config_sha)"; NET08_LSET="$(listener_set)"
+  # case 1: no token -> 401. The body is a REAL expose attempt - auth must stop it.
+  code="$(api POST /api/network/configure '{"host":"0.0.0.0","configured":true}' --noauth)" || code=ERR
+  check "phase6: case1 no token -> 401" [ "$code" = "401" ]
+  check "phase6: case1 body Unauthorized" jq -e '.error=="Unauthorized"' "$REPORT_DIR/resp.json"
+  net08_intact "case1 no-token"
+  # case 2: wrong token -> 401
+  code="$(curl -s -o "$REPORT_DIR/resp.json" -w '%{http_code}' -X POST \
+    -H 'x-auth-token: not-the-real-token' -H 'content-type: application/json' \
+    --data '{"host":"0.0.0.0","configured":true}' \
+    "http://127.0.0.1:$PORT/api/network/configure")" || code=ERR
+  check "phase6: case2 wrong token -> 401" [ "$code" = "401" ]
+  check "phase6: case2 body Unauthorized" jq -e '.error=="Unauthorized"' "$REPORT_DIR/resp.json"
+  net08_intact "case2 wrong-token"
+  # case 3: empty / missing-field configure bodies -> 400 Invalid request
+  reject400 "case3a configure {}"                 /api/network/configure '{}'
+  reject400 "case3b configure missing host"       /api/network/configure '{"configured":true}'
+  reject400 "case3c configure missing configured" /api/network/configure '{"host":"0.0.0.0"}'
+  # case 4: arbitrary host -> 400 (NetworkHost enum: only 127.0.0.1 / 0.0.0.0)
+  reject400 "case4 host 1.2.3.4" /api/network/configure '{"host":"1.2.3.4","configured":true}'
+  # case 5: command-injection host -> 400
+  reject400 "case5 host semicolon-rm" /api/network/configure '{"host":"0.0.0.0; rm -rf /","configured":true}'
+  # case 6: injection variants in host -> 400 each
+  reject400 "case6a host dollar-paren" /api/network/configure '{"host":"$(id)","configured":true}'
+  reject400 "case6b host backtick"     /api/network/configure '{"host":"`id`","configured":true}'
+  reject400 "case6c host pipe"         /api/network/configure '{"host":"0.0.0.0|id","configured":true}'
+  reject400 "case6d host newline"      /api/network/configure '{"host":"0.0.0.0\nid","configured":true}'
+  # case 7: configured wrong type -> 400
+  reject400 "case7 configured string" /api/network/configure '{"host":"0.0.0.0","configured":"yes"}'
+  # case 8: strict schema - unknown key on disable-remote-access -> 400
+  reject400 "case8 disable unknownKey" /api/network/disable-remote-access '{"unknownKey":1}'
+  # case 9: confirmElevation:false -> 400 (zod literal true)
+  reject400 "case9 confirmElevation false" /api/network/configure-firewall '{"confirmElevation":false}'
+  # case 10: empty confirmationToken -> 400 (min length 1)
+  reject400 "case10 empty confirmationToken" /api/network/configure-firewall '{"confirmationToken":""}'
+  # case 11: token-shaped configure-firewall -> benign 200 method:"none".
+  # VALIDATED (ledger A-06): no live lane on this host ever ISSUES a token, so
+  # any presented token is inert; replay/wrong-action/parallel-409 live in Rust.
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  benign200 "case11 fw uuid token" /api/network/configure-firewall "{\"confirmationToken\":\"$uuid\"}"
+  # case 12: same token shape against disable-remote-access -> 200 method:"none"
+  benign200 "case12 disable uuid token" /api/network/disable-remote-access "{\"confirmationToken\":\"$uuid\"}"
+  # case 13: two PARALLEL disable POSTs -> both 200 method:"none"; the
+  # net_mutation lock serializes them (no live 409 expected - Rust-tested).
+  curl -s -o "$REPORT_DIR/par1.json" -w '%{http_code}' -X POST \
+    -H "x-auth-token: $AUTH_TOKEN" -H 'content-type: application/json' --data '{}' \
+    "http://127.0.0.1:$PORT/api/network/disable-remote-access" >"$REPORT_DIR/par1.code" &
+  pid_a=$!
+  curl -s -o "$REPORT_DIR/par2.json" -w '%{http_code}' -X POST \
+    -H "x-auth-token: $AUTH_TOKEN" -H 'content-type: application/json' --data '{}' \
+    "http://127.0.0.1:$PORT/api/network/disable-remote-access" >"$REPORT_DIR/par2.code" &
+  pid_b=$!
+  wait "$pid_a"; wait "$pid_b"
+  c1="$(cat "$REPORT_DIR/par1.code")"; c2="$(cat "$REPORT_DIR/par2.code")"
+  check "phase6: case13 parallel disable A -> 200" [ "$c1" = "200" ]
+  check "phase6: case13 parallel disable B -> 200" [ "$c2" = "200" ]
+  check "phase6: case13 parallel A method none" jq -e '.method=="none"' "$REPORT_DIR/par1.json"
+  check "phase6: case13 parallel B method none" jq -e '.method=="none"' "$REPORT_DIR/par2.json"
+  net08_intact "case13 parallel-disables"
+  # case 14: injection strings in confirmationToken -> 200 method:"none".
+  # Non-empty strings pass shape validation BY DESIGN - the property is
+  # behavioral: zero side effects, nothing reaches a runner.
+  benign200 "case14a fw token dollar-paren" /api/network/configure-firewall '{"confirmationToken":"$(id)"}'
+  benign200 "case14b fw token backtick"     /api/network/configure-firewall '{"confirmationToken":"`id`"}'
+  benign200 "case14c fw token newline"      /api/network/configure-firewall '{"confirmationToken":"a\nb"}'
+  # case 15: POSITIVE CONTROL - a valid configure still succeeds (the negative
+  # results above are rejections, not a dead server) AND the zero-side-effect
+  # detectors demonstrably FIRE on a real mutation (meta-falsifier). Then the
+  # state is restored to the Phase-6 baseline.
+  code="$(api POST /api/network/configure '{"host":"0.0.0.0","configured":true}')" || code=ERR
+  check "phase6: case15 positive-control configure 0.0.0.0 -> 200" [ "$code" = "200" ]
+  check "phase6: case15 response host==0.0.0.0" jq -e '.host=="0.0.0.0"' "$REPORT_DIR/resp.json"
+  check "phase6: case15 detector fires - config sha CHANGED" [ "$(config_sha)" != "$NET08_SHA" ]
+  check "phase6: case15 detector fires - listener set CHANGED" [ "$(listener_set)" != "$NET08_LSET" ]
+  code="$(api POST /api/network/disable-remote-access '{}')" || code=ERR
+  check "phase6: case15 restore disable -> 200" [ "$code" = "200" ]
+  check "phase6: case15 restore method none" jq -e '.method=="none"' "$REPORT_DIR/resp.json"
+  check "phase6: case15 restore - listener set restored" [ "$(listener_set)" = "$NET08_LSET" ]
+  check "phase6: case15 restore - persisted network == loopback/configured" \
+    jq -e '.settings.network.host=="127.0.0.1" and .settings.network.configured==true' \
+    "$HOME_DIR/.freshell/config.json"
+  check "phase6: case15 restore - config sha restored (deterministic serialization)" \
+    [ "$(config_sha)" = "$NET08_SHA" ]
+  # NET-03 token-never-logged: scan the LOG only - the token legitimately
+  # appears in accessUrl response BODIES (reports/V3.md), never in the log.
+  if grep -qF -- "$AUTH_TOKEN" "$HOME_DIR/server.log"; then
+    fail_required "phase6: AUTH_TOKEN found in server.log (NET-03 token-never-logged)"
+  else PASS=$((PASS+1)); log "PASS: phase6: token never logged (NET-03)"; fi
+  echo "phase6 net-08 matrix: 15 cases + token-never-logged done (pass=$PASS fail=$FAIL)"
+}
+
 main() {
   phase0_preflight
   phase1_boot
@@ -335,9 +463,10 @@ main() {
   phase3_expose
   phase4_retract
   phase5_restart
-  # Phases 6-7 appended in Tasks 5.4-5.5
+  phase6_net08_matrix
+  # Phase 7 appended in Task 5.5
   if [ "${#DEGRADATIONS[@]}" -gt 0 ]; then printf 'DEGRADED: %s\n' "${DEGRADATIONS[@]}"; fi
-  echo "phases 0-5: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL (port=$PORT wsl_ip=$WSL_IP)"
+  echo "phases 0-6: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL (port=$PORT wsl_ip=$WSL_IP)"
   [ "$REQUIRED_FAIL" = 0 ] || exit 1
 }
 main "$@"
