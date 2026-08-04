@@ -136,12 +136,14 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // ownership-verified SIGTERM (check /proc/<pid>/cwd + cmdline before signaling).
+    // SIGTERM the first server: the process is an owned child of this test;
+    // the unreaped PID cannot be recycled until we wait() for it.
     let pid = child.id();
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-    let _ = child.wait();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "server should exit gracefully on SIGTERM");
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cfg_dir.join("config.json")).unwrap()).unwrap();
@@ -150,5 +152,47 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
     for k in watched {
         let now = sha256_hex(&serde_json::to_vec(&after[k]).unwrap());
         assert_eq!(before[k], now, "top-level key `{k}` was not byte-preserved");
+    }
+
+    // === RESTART LEG ===
+    // Respawn the server with the same env (same home, same token) but a fresh ephemeral port.
+    // This exercises the boot-load path: the server must read config.json, parse the mutated
+    // state, and preserve all unmanaged top-level keys when it writes the config back on shutdown.
+    let port2 = allocate_ephemeral_port();
+    let mut child2 = Command::new(&bin)
+        .env("PORT", port2.to_string())
+        .env("AUTH_TOKEN", AUTH_TOKEN)
+        .env("FRESHELL_HOME", home.path())
+        .env("HOME", home.path())
+        .env("FRESHELL_DISABLE_WSL_PORT_FORWARD", "1")
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_for_health(port2, &mut child2, Duration::from_secs(20)).await,
+        "respawned server failed to become healthy"
+    );
+
+    // SIGTERM the second server and wait for graceful exit.
+    let pid2 = child2.id();
+    unsafe {
+        libc::kill(pid2 as i32, libc::SIGTERM);
+    }
+    let status2 = child2.wait().unwrap();
+    assert!(
+        status2.success(),
+        "respawned server should exit gracefully on SIGTERM"
+    );
+
+    // Re-read config and verify the mutation persisted and all watched keys are unchanged.
+    let after_restart: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cfg_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(after_restart["settings"]["network"]["host"], "0.0.0.0");
+    assert_eq!(after_restart["settings"]["network"]["configured"], true);
+    for k in watched {
+        let now = sha256_hex(&serde_json::to_vec(&after_restart[k]).unwrap());
+        assert_eq!(
+            before[k], now,
+            "top-level key `{k}` was not byte-preserved across restart"
+        );
     }
 }
