@@ -1259,13 +1259,25 @@ These unit tests exercise persistence + validation + wire shape without a live
 listener: `test_state`'s controller has no app injected, so `serve_on` returns
 `Ok(())` immediately (the seam added in Task 2.1). Real bind-address truth is
 proven by the harness at tier b (Task 5.2). The EXCEPTION is the rollback test,
-which needs a real listener and a file-backed store. Add two small test helpers
-next to `test_state`: `test_state_with_home(host, configured, home)` — identical
-to `test_state` but its settings store persists under `home` — and
-`async fn serve_real_test_app_on_loopback(&state) -> u16` — constructs the
-state's `RebindController` on an ephemeral free port, injects the same hello
-`Router` Task 2.1's tests use (`set_app`), calls `serve_on(127.0.0.1)`, and
-returns the port.
+which needs a real listener on a STABLE port and a file-backed store. Add two
+small test helpers next to `test_state`:
+
+- `test_state_with_home(host, configured, home)` — like `test_state` EXCEPT
+  (a) its settings store is file-backed under `home`, and (b) it does NOT reuse
+  `test_state`'s port-0/never-served controller: it first probes a free
+  ephemeral port (`std::net::TcpListener::bind(("127.0.0.1", 0))`, read
+  `local_addr().port()`, drop the probe listener), then constructs
+  `RebindController::new(probed_port, true)` and sets `NetworkState.port` to
+  the same `probed_port`. The controller must carry a REAL fixed port: with
+  port 0 every `serve_on` (the handler's swap to `0.0.0.0` AND the rollback
+  back to `127.0.0.1`) would bind a DIFFERENT ephemeral port, making the
+  test's post-rollback connect assertions on `port` meaningless. The
+  probe-then-rebind race window is acceptable in a test.
+- `async fn serve_real_test_app_on_loopback(state: &NetworkState) -> u16` —
+  injects the same hello `Router` Task 2.1's tests use (`set_app`), calls
+  `state.rebind.serve_on("127.0.0.1")` (binds the probed port), and returns
+  `state.port`. It constructs NOTHING and reads no private controller fields —
+  the port was already chosen and threaded through by `test_state_with_home`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1951,7 +1963,10 @@ Commit message: `feat(net): ElevationRunner enum — real OS mutation structural
   - `pub fn windows(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self`
   - `pub fn read_windows(&self) -> Vec<u16>` / `pub fn persist_windows(&self, ports: &[u16]) -> std::io::Result<()>` / `pub fn clear_windows(&self) -> std::io::Result<()>`
   - equivalent WSL methods keyed the same way.
-  - Normalization: dedupe, keep `[1,65535]`, ascending sort. Empty list ⇒ delete the file.
+  - Normalization: dedupe, drop `0`, ascending sort. The `&[u16]` API makes
+    the TS `[1,65535]` upper bound unrepresentable by construction (a literal
+    like 70000 is a hard compile error), so only the zero filter remains to
+    enforce. Empty list ⇒ delete the file.
   - Path: `<home|~>/.freshell/windows-managed-remote-access-ports/<sha256("{cwd}::{port}")>.json`, content `{"ports":[...]}` pretty (2-space), atomic tmp+rename.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1964,7 +1979,11 @@ mod tests {
     fn persist_read_roundtrip_and_normalization() {
         let home = tempfile::tempdir().unwrap();
         let store = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
-        store.persist_windows(&[3001, 3001, 70000, 8080, 0]).unwrap();
+        // Unsorted input proves the ascending sort; the duplicate proves
+        // dedupe; 0 proves the drop-zero filter. (A >65535 literal such as
+        // 70000 cannot even compile through `&[u16]` — the type enforces the
+        // upper bound; do NOT try to test it.)
+        store.persist_windows(&[8080, 3001, 3001, 0]).unwrap();
         assert_eq!(store.read_windows(), vec![3001, 8080]);
     }
     #[test]
@@ -2029,7 +2048,10 @@ Commit message: `feat(net): instance-scoped managed-ports persistence (fixes D15
 
 **Interfaces:**
 - Consumes: `freshell_platform::elevated::{ConfirmationGate, ConfirmationAction, ElevationDecision, elevation_runner_live, spawn_via, ElevationOutcome}`, `ManagedPortsStore`, `port_forward` planners (Ipv4Addr), `firewall::firewall_commands`.
-- Produces: `NetworkState.gate: Arc<tokio::sync::Mutex<ConfirmationGate>>`; `NetworkState.managed_ports: Arc<ManagedPortsStore>` (the File Structure table's promised wiring); route `POST /api/network/configure-firewall`; handler `configure_firewall`; the full confirmed disable protocol (`windows-disable`/`wsl2-disable` lanes, replacing the Task-2.4 placeholder); separate `RepairAction` and `DisableAction` enums (fixes D19 — the unreachable `terminal`-on-disable state is unrepresentable).
+- Produces: `NetworkState.gate: Arc<tokio::sync::Mutex<ConfirmationGate>>`; `NetworkState.managed_ports: Arc<ManagedPortsStore>` (the File Structure table's promised wiring); route `POST /api/network/configure-firewall`; handler `configure_firewall`; the full confirmed disable protocol (`windows-disable`/`wsl2-disable` lanes, replacing the Task-2.4 placeholder); separate `RepairAction` and `DisableAction` enums (fixes D19 — the unreachable `terminal`-on-disable state is unrepresentable); the
+`ElevatedDispatch` seam (`NetworkState.elevated_dispatch: Arc<dyn ElevatedDispatch>`,
+Step 3) — the `Send + Sync` boundary through which every elevated mutation
+leaves the server and which router tests replace with `FakeElevatedDispatch`.
 
 **Behavior (matches `network-router.ts:617-758` + the confirmation protocol `:89-262`; `src/lib/firewall-configure.ts:3-14` is the authoritative client union):**
 
@@ -2165,16 +2187,23 @@ async fn disable_stale_token_reissues_fresh_confirmation_and_never_dispatches() 
 }
 ```
 
-Add `fn test_state_firewall_confirmable()` seeding `NetworkFactsCache` with
-Windows-active facts + closed port (so the ladder yields a confirmable
-`windows-repair`) and constructing the new `gate` + `managed_ports` fields.
-Add `fn test_state_disable_confirmable() -> (NetworkState, /* fake handle */)`:
-Windows-active facts, bind AND persisted settings at `0.0.0.0`/`configured:true`
-(the enabled precondition the resolver checks first), a `managed_ports` store on
-a tempdir home with ONE persisted port (so the ladder yields a confirmable
-`windows-disable`), and the Task-3.3 runner seam wired to a `FakeCommandRunner`
-whose rule classifies the elevated dispatch as `Started`; return the fake so
-tests can assert `call_count()`.
+Add `fn test_state_firewall_confirmable() -> (NetworkState, Arc<FakeElevatedDispatch>)`
+seeding `NetworkFactsCache` with Windows-active facts + closed port AND bind +
+persisted settings at `0.0.0.0`/`configured:true` (the `isRemoteAccessEnabled`
+precondition `resolve_repair_action` checks FIRST — without it the ladder
+yields `method:"none"`, never a confirmable `windows-repair`), constructing the
+new `gate` + `managed_ports` fields, and wiring `elevated_dispatch` to a
+`FakeElevatedDispatch` programmed to classify the dispatch as `Started`; return
+the fake handle so tests can assert `call_count()`.
+Add `fn test_state_disable_confirmable() -> (NetworkState, Arc<FakeElevatedDispatch>)`:
+same seeding (keep the closed firewall port so `resolve_repair_action` ALSO
+yields a confirmable `windows-repair` — Task 3.5's wrong-action test needs both
+lanes resolvable on this state), plus a `managed_ports` store on a tempdir home
+with ONE persisted port (so the disable ladder yields a confirmable
+`windows-disable`). `FakeCommandRunner` CANNOT back this seam: it holds a
+`RefCell` (`!Sync`), `CommandRunner` has no `Send + Sync` supertraits, and axum
+state must be `Send + Sync + 'static` — that is exactly why the
+`ElevatedDispatch` trait (Step 3) exists.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2191,10 +2220,15 @@ Expected: compile/404 — field + route absent.
     /// Instance-scoped managed-ports persistence (Task 3.2). Consumed by the
     /// confirmed disable lanes and the step-5 Started persist.
     pub managed_ports: std::sync::Arc<crate::managed_ports::ManagedPortsStore>,
+    /// The Send + Sync elevated-dispatch seam (see below): production wires
+    /// `LiveElevatedDispatch`; router tests inject `FakeElevatedDispatch`.
+    pub elevated_dispatch: std::sync::Arc<dyn ElevatedDispatch>,
 ```
 `main.rs:900-907`: `gate: Arc::new(tokio::sync::Mutex::new(freshell_platform::elevated::ConfirmationGate::new())),`
 plus `managed_ports: Arc::new(/* Task 3.2 constructor: real home, cwd, port */)`,
-and the `test_state` helpers construct both too.
+plus `elevated_dispatch: Arc::new(LiveElevatedDispatch)`, and the `test_state`
+helpers construct all three (plain `test_state` may wire a rule-less
+`FakeElevatedDispatch`).
 
 Register `.route("/api/network/configure-firewall", post(configure_firewall))`.
 Implement `configure_firewall` per behavior steps 1-6. Extract resolution into
@@ -2205,9 +2239,44 @@ the 409 pre-check (`gate.is_repair_in_flight()`), DELETE the Slice-2
 throwaway-token block, and implement issue → re-resolve-under-lock → consume →
 dispatch → apply-disabled-state through the same gate + runner seam as
 `configure_firewall`. Use `uuid::Uuid::new_v4().to_string()` for tokens.
-Dispatch via a small `fn elevation_runner_for(state) -> ElevationRunner` returning
-`elevation_runner_live()` in production and a test-injected `Fake` under
-`#[cfg(test)]` (or expose a gate/dispatch helper the tests call directly). Persist
+Dispatch through the `ElevatedDispatch` seam — NOT through
+`ElevationRunner::Fake(&dyn CommandRunner)` or a `FakeCommandRunner` carried in
+state, neither of which can satisfy axum's `Send + Sync + 'static` state bound
+(`CommandRunner` has no `Send + Sync` supertraits; `FakeCommandRunner` holds a
+`RefCell` ⇒ `!Sync`):
+
+```rust
+/// The one boundary where an elevated mutation leaves the server.
+pub trait ElevatedDispatch: Send + Sync {
+    /// Runs Task 3.1's `spawn_via` with the given elevated argv and returns
+    /// the classified outcome. Blocking; handlers call it inside
+    /// `tokio::task::spawn_blocking` (clone the `Arc` in).
+    fn dispatch(&self, argv: &[String]) -> freshell_platform::elevated::ElevationOutcome;
+}
+
+pub struct LiveElevatedDispatch;
+impl ElevatedDispatch for LiveElevatedDispatch {
+    fn dispatch(&self, argv: &[String]) -> freshell_platform::elevated::ElevationOutcome {
+        // match Task 3.1's exact spawn_via / elevation_runner_live signatures
+        freshell_platform::elevated::spawn_via(
+            freshell_platform::elevated::elevation_runner_live(), argv)
+    }
+}
+
+#[cfg(test)]
+pub struct FakeElevatedDispatch {
+    calls: std::sync::Mutex<Vec<Vec<String>>>,   // recorded argv, recorded()
+    outcome: std::sync::Mutex<freshell_platform::elevated::ElevationOutcome>, // program()
+    hold: std::sync::Mutex<Option<std::time::Duration>>, // hold_before_return()
+}
+// #[cfg(test)] impl: program(outcome), hold_before_return(duration),
+// call_count(), recorded(); dispatch() records the argv, sleeps the optional
+// hold (keeps the gate observably in-flight for the parallel-409 test in
+// Task 3.5), then returns the programmed outcome. All interior state is
+// Mutex-guarded — the type is Send + Sync by construction.
+```
+
+Persist
 managed ports on `Started` via `ManagedPortsStore`. Broadcast `settings.updated`
 only on actual settings change. Hold `state.net_mutation.lock().await` across the
 post-dispatch persist/broadcast section (managed ports + settings), matching
@@ -2320,48 +2389,157 @@ Commit message: `feat(net): wire stale managed-ports + WSL2 plan assembly behind
 - Modify: `crates/freshell-server/src/network.rs` tests (behavioral) + `crates/freshell-platform/src/elevated.rs` tests (classification)
 
 **Interfaces:**
-- Consumes: `ElevationOutcome`, `ConfirmationGate`, `FakeCommandRunner`.
-- Produces: four tests proving each failure outcome (a) releases the lock exactly once, (b) leaves `firewall.configuring == false`, (c) persists NO success, (d) a subsequent success after switching the fake to a good response works; plus the token-protocol trio (single-use replay, wrong-action re-issue, parallel-confirm 409) — Rust-only BY VALIDATED NECESSITY (ledger A-06, reports/V5.md: no live lane on this host ever issues a confirmation token under `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`); plus a suite-wide assertion that no `netsh ... add|delete|set` and no `Start-Process -Verb RunAs` reached a real runner (`FakeCommandRunner::call_count`) and the compile-time unreachability test from Task 3.1.
+- Consumes: `ElevationOutcome`, `ConfirmationGate`, `FakeElevatedDispatch`
+  (Task 3.3's Send + Sync seam double — router-driven tests cannot carry a
+  `FakeCommandRunner` in axum state; `FakeCommandRunner` remains for the
+  `elevated.rs` classification tests only).
+- Produces: four tests proving each failure outcome (a) releases the lock exactly once, (b) leaves `firewall.configuring == false`, (c) persists NO success, (d) a subsequent success after switching the fake to a good response works; plus the token-protocol trio (single-use replay, wrong-action re-issue, parallel-confirm 409) — Rust-only BY VALIDATED NECESSITY (ledger A-06, reports/V5.md: no live lane on this host ever issues a confirmation token under `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`); plus a suite-wide assertion that no `netsh ... add|delete|set` and no `Start-Process -Verb RunAs` reached a real runner (argv recorded only at the injected `FakeElevatedDispatch` seam) and the compile-time unreachability test from Task 3.1.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
 async fn elevation_denial_releases_lock_and_persists_no_success() {
-    // Inject a Fake runner returning "canceled by the user"; drive configure-firewall
-    // through the confirm phase => Denied. Assert: gate not in-flight afterward,
-    // status.firewall.configuring == false, settings.network unchanged, and a later
-    // run with a good Fake succeeds.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_firewall_confirmable();
+    fake.program(ElevationOutcome::Denied); // match Task 3.1's exact variant shape ("canceled by the user" classification)
+    // issue
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    // confirm => the fake classifies Denied
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_ne!(body["status"], "started", "a denial must not report success");
+    assert_eq!(fake.call_count(), 1);
+    // (a) lock released, (b) configuring == false, (c) no success persisted
+    assert!(!state.gate.lock().await.is_repair_in_flight());
+    let status = body_json(router(state.clone())
+        .oneshot(Request::builder().method("GET").uri("/api/network/status")
+            .header("x-auth-token","tok").body(Body::empty()).unwrap()).await.unwrap()).await;
+    assert_eq!(status["firewall"]["configuring"], false);
+    // (d) a later run with a good fake succeeds end-to-end
+    fake.program(ElevationOutcome::Started);
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(fake.call_count(), 2, "the denied run must not poison later runs");
 }
 
-#[test]
-fn no_real_os_mutation_command_reaches_a_runner() {
-    // A FakeCommandRunner with no rules records every call; assert its call_count
-    // matches the expected read-only-only count and that no recorded arg contains
-    // "add rule" / "delete rule" / "portproxy add" / "RunAs". Combined with
-    // on_non_windows_the_live_runner_is_unsupported (Task 3.1), this proves zero
-    // real OS mutation on this host.
+#[tokio::test]
+async fn no_real_os_mutation_command_reaches_a_runner() {
+    // Mutation argv is observable ONLY at the injected FakeElevatedDispatch
+    // seam; combined with on_non_windows_the_live_runner_is_unsupported_and_never_spawns
+    // (Task 3.1) this proves zero real OS mutation on this host.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_disable_confirmable();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let recorded = fake.recorded();
+    assert_eq!(recorded.len(), 1, "exactly one elevated dispatch, at the fake seam");
+    let joined = recorded[0].join(" ");
+    assert!(joined.contains("portproxy") || joined.contains("advfirewall"),
+        "the elevated mutation plan must be visible at the seam: {joined}");
 }
 
 #[tokio::test]
 async fn confirmation_token_is_single_use() {
-    // Issue -> confirm (Started via a good Fake) -> REPLAY the same token: the
-    // second POST must yield a NEW confirmation-required (fresh token), never a
-    // second dispatch (FakeCommandRunner::call_count unchanged).
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_firewall_confirmable(); // fake programmed Started
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let confirm = |t: &str| Request::builder().method("POST").uri("/api/network/configure-firewall")
+        .header("x-auth-token","tok").header("content-type","application/json")
+        .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{t}"}}"#))).unwrap();
+    let resp = router(state.clone()).oneshot(confirm(&token)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(fake.call_count(), 1);
+    // REPLAY the consumed token: the gate no longer holds it, so this must
+    // RE-ISSUE (fresh token, facts still resolve windows-repair) and NEVER
+    // dispatch a second time.
+    let resp = router(state.clone()).oneshot(confirm(&token)).await.unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "confirmation-required");
+    assert_ne!(body["confirmationToken"].as_str().unwrap(), token);
+    assert_eq!(fake.call_count(), 1, "a replayed token must not dispatch");
 }
 
 #[tokio::test]
 async fn wrong_action_token_reissues_and_never_executes() {
-    // A token issued for one action presented where the freshly-resolved action
-    // differs => re-issue (fresh token bound to the new action), zero runner calls.
+    // A token issued for windows-disable, presented (confirmed) to
+    // configure-firewall — which freshly resolves windows-repair — is bound to
+    // the WRONG action: re-issue bound to the new action, zero dispatches.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_disable_confirmable(); // both lanes resolvable
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap())
+        .await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["method"], "confirmation-required");
+    assert_ne!(body["confirmationToken"].as_str().unwrap(), token);
+    assert_eq!(fake.call_count(), 0, "a wrong-action token must never execute");
 }
 
 #[tokio::test]
 async fn parallel_confirmed_posts_one_wins_one_409() {
-    // Two simultaneous confirmed POSTs (tokio::join!): exactly one dispatches;
-    // the other gets 409 {"error":"Firewall configuration already in progress",
-    // "method":"in-progress"}. Live-unreachable on this host (ledger A-06), so
-    // this Rust test is the ONLY 409-lock race proof - do not delete it.
+    // Live-unreachable on this host (ledger A-06), so this Rust test is the
+    // ONLY 409-lock race proof - do not delete it.
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let (state, fake) = test_state_firewall_confirmable();
+    fake.hold_before_return(std::time::Duration::from_millis(200)); // keeps the gate in-flight while the loser lands
+    let resp = router(state.clone())
+        .oneshot(Request::builder().method("POST").uri("/api/network/configure-firewall")
+            .header("x-auth-token","tok").header("content-type","application/json")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+    let token = body_json(resp).await["confirmationToken"].as_str().unwrap().to_string();
+    let confirm = || Request::builder().method("POST").uri("/api/network/configure-firewall")
+        .header("x-auth-token","tok").header("content-type","application/json")
+        .body(Body::from(format!(r#"{{"confirmElevation":true,"confirmationToken":"{token}"}}"#))).unwrap();
+    let (a, b) = tokio::join!(router(state.clone()).oneshot(confirm()),
+                              router(state.clone()).oneshot(confirm()));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let codes = [a.status().as_u16(), b.status().as_u16()];
+    assert!(codes.contains(&200) && codes.contains(&409), "exactly one wins: {codes:?}");
+    let loser = if a.status() == 409 { a } else { b };
+    let body = body_json(loser).await;
+    assert_eq!(body["error"], "Firewall configuration already in progress");
+    assert_eq!(body["method"], "in-progress");
+    assert_eq!(fake.call_count(), 1, "exactly one dispatch");
 }
 ```
 
@@ -2371,7 +2549,25 @@ the verifier plan after `Started` and downgrade to `VerificationFailed` /
 `:380-410`). Test each by seeding the post-dispatch fake facts so the verifier
 still finds work.
 
-- [ ] **Step 2: Run to verify failure** → **Step 3: implement the verifier downgrade + settle logic** → **Step 4: run to verify pass.**
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-server network::tests 2>&1 | tail -30`
+Expected: FAILURE — first as a compile error (`program` / `hold_before_return` /
+`recorded` and the verifier-downgrade path do not exist yet); once it compiles,
+`elevation_denial_releases_lock_and_persists_no_success` keeps failing until
+Step 3 lands. The token-protocol trio pins gate semantics Task 3.3 already
+implemented — those three MAY already pass, which is acceptable for pinning
+tests (A-06); what is NOT acceptable is a test that passes with an empty body.
+If ALL five pass before Step 3, STOP and diagnose before proceeding.
+
+- [ ] **Step 3: Implement the verifier downgrade + settle logic**
+
+Add the missing `FakeElevatedDispatch` knobs (`program`, `hold_before_return`,
+`recorded`) if Task 3.3 did not already ship them; implement the post-`Started`
+verifier re-run and downgrade per the intro above (port of `verifySuccess`
+`:380-410`).
+
+- [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p freshell-server network::tests 2>&1 | tail -30` — all PASS.
 
@@ -3010,7 +3206,10 @@ concrete instruction, not a placeholder.
 - `invalid_request` / `build_status_value` are introduced in 2.3 and reused by
   2.4 / 3.3 / 3.4.
 - `ElevationRunner` / `ElevationOutcome` / `spawn_via` / `elevation_runner_live`
-  are defined in 3.1 and consumed in 3.3 / 3.5.
+  are defined in 3.1 and consumed in 3.3 / 3.5 through the `ElevatedDispatch`
+  seam defined in 3.3 (`LiveElevatedDispatch` in production,
+  `FakeElevatedDispatch` — `program` / `hold_before_return` / `call_count` /
+  `recorded` — in router tests; names identical across 3.3 / 3.5).
 - `ManagedPortsStore::{windows, read_windows, persist_windows, clear_windows}`
   defined in 3.2, consumed in 3.3.
 - Wire shapes (`{"error":"Invalid request","details":[...]}`,
