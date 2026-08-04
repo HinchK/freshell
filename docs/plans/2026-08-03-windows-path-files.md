@@ -30,7 +30,7 @@
 
 Single subsystem (Rust server file endpoints + one helper pair in its platform crate). One plan.
 
-**Boundary notes** (explicit, so nothing is silently deferred): spec requirement 4 says *any* sandbox check in files.rs must compare the converted native path — `read_file`/`stat_file`/`write_file` also call `is_path_allowed`, so Task 5 routes their sandbox target and filesystem access through the same seam (with Node's exact literal fallthrough for unaddressable inputs; their response shapes contain no paths, so nothing else changes). `validate_dir` today performs no sandbox check at all — load-bearing validation established this gap is NOT deliberate: Node applies `validatePath` to the route (`files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`), and the gap's git history (`bda1c7315` enumerates sandboxed endpoints omitting validate-dir with no reason; `984294fe8` "close all 14 parity divergences" left it unchecked) records no intent. It is an unexplained Node-parity defect, so Task 5 closes it: `validate_dir` gains the same `is_path_allowed(resolved.sandbox_target(), …)` check as every other files.rs endpoint (zero behavior change for the default `allowed_file_paths: None`).
+**Boundary notes** (explicit, so nothing is silently deferred): spec requirement 4 says *any* sandbox check in files.rs must compare the converted native path — `read_file`/`stat_file`/`write_file` also call `is_path_allowed`, so Task 5 routes their sandbox target and filesystem access through the same seam (with Node's exact literal fallthrough for unaddressable inputs; their response shapes contain no paths, so nothing else changes). `validate_dir` today performs no sandbox check at all — load-bearing validation established this gap is NOT deliberate: Node applies `validatePath` to the route (`files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`), and the gap's git history (`bda1c7315` enumerates sandboxed endpoints omitting validate-dir with no reason; `984294fe8` "close all 14 parity divergences" left it unchecked) records no intent. It is an unexplained Node-parity defect, so Task 5 closes it: `validate_dir` gains the same `is_path_allowed(resolved.sandbox_target(), …)` check as every other files.rs endpoint (zero behavior change for the default `allowed_file_paths: None`). Requirement 4 also has a root side: Node's `isPathAllowed` routes BOTH the target and each allowlist root through `resolvePathForSandboxComparison` (`path-utils.ts:313/319`, pinned by `test/unit/server/path-utils.test.ts:236-252` — root `C:\Users` matches target `<mount>/c/users/…` on WSL), so Task 5 also converts allowlist roots through the same seam inside `is_path_allowed`; without it, a WSL user with `allowedFilePaths: ["C:\\Users\\dan"]` would be denied every request Node allows. On a non-WSL host a Windows-flavor root stays literal — fail-closed, the same stance as unaddressable targets. POSIX/`~` roots take the byte-identical `normalize_user_path` path (zero behavior change, including `repo_icon.rs` call sites).
 
 One documented divergence class (validated, deliberate): if a literal backslash-named entry (e.g. a directory named `C:\Users`) already exists under the server cwd — an artifact only the legacy Node hazard could create (`node-reference.md:734/:752`) — Node's validate-dir/complete would report it, while this port's unaddressable early-returns report `valid:false`/empty. Those artifacts are the hazard being removed, not directories to honor; the port stays fail-closed.
 
@@ -1218,13 +1218,13 @@ Co-Authored-By: Amplifier <240428069+microsoft-amplifier@users.noreply.github.co
 ### Task 5: read/stat/write/validate_dir sandbox comparison via the seam; final verification
 
 **Files:**
-- Modify: `crates/freshell-server/src/files.rs` (`read_file` at lines 159–198, `stat_file` at 200–235, `write_file` at 237–277, pre-Task-2 numbering; `validate_dir` as rewritten by Task 2; tests module)
+- Modify: `crates/freshell-server/src/files.rs` (`read_file` at lines 159–198, `stat_file` at 200–235, `write_file` at 237–277, `is_path_allowed` at 489–505, pre-Task-2 numbering; `validate_dir` as rewritten by Task 2; tests module)
 
 **Interfaces:**
 - Consumes: `resolve_user_path`, `ResolvedUserPath::sandbox_target` (Tasks 2–3), existing handler bodies, `SettingsStore::patch` (test only; existing, exercised at `settings_store.rs:2077-2094`; `persist` no-ops when the store was loaded with `home: None`, `settings_store.rs:420-422`).
-- Produces: no new items — spec requirement 4 ("any sandbox checks in files.rs compare the converted native path") now holds for every `is_path_allowed` call site in files.rs, and `validate_dir` gains the check it was missing (validated as an unexplained Node-parity defect — Node applies `validatePath` to the route, `files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`).
+- Produces: no new items — spec requirement 4 ("any sandbox checks in files.rs compare the converted native path") now holds for every `is_path_allowed` call site in files.rs AND for the allowlist roots themselves (`is_path_allowed` resolves each root through the same seam — Node's `isPathAllowed` converts both sides via `resolvePathForSandboxComparison`, `path-utils.ts:313/319`), and `validate_dir` gains the check it was missing (validated as an unexplained Node-parity defect — Node applies `validatePath` to the route, `files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`).
 
-All three read/stat/write handlers share the identical prelude `normalize_user_path` → `settings.get()` → `is_path_allowed(&resolved, …)` and then use `resolved` directly as the filesystem path. The change is the same three-line substitution in each: resolve through the seam, compare `sandbox_target()`, then rebind `resolved` to the native path with Node's exact literal fallthrough (`toFilesystemPath` on a non-WSL host returns the literal `C:\…` string, so a stat of it fails naturally — no new rejection semantics here; the mkdir-style 400 applies to mkdir only, per spec). The remainder of each handler body is untouched. `validate_dir` additionally gains the sandbox prelude it never had (see Step 3, last item).
+All three read/stat/write handlers share the identical prelude `normalize_user_path` → `settings.get()` → `is_path_allowed(&resolved, …)` and then use `resolved` directly as the filesystem path. The change is the same three-line substitution in each: resolve through the seam, compare `sandbox_target()`, then rebind `resolved` to the native path with Node's exact literal fallthrough (`toFilesystemPath` on a non-WSL host returns the literal `C:\…` string, so a stat of it fails naturally — no new rejection semantics here; the mkdir-style 400 applies to mkdir only, per spec). The remainder of each handler body is untouched. `validate_dir` additionally gains the sandbox prelude it never had, and `is_path_allowed` gains root-side conversion (see Step 3, final items): today it normalizes each root with `normalize_user_path` only (tilde + trailing-`/` trim), so a Windows-flavor root like `C:\Users\dan` can never match a converted `/mnt/c/…` target — Node converts both sides (`resolvePathForSandboxComparison` at `path-utils.ts:313/319`, pinned by `test/unit/server/path-utils.test.ts:236-252`). Routing each root through `resolve_user_path(root).sandbox_target()` closes that hole while keeping POSIX/`~` roots byte-identical (the non-Windows branch of `resolve_user_path` IS `normalize_user_path`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1339,12 +1339,52 @@ Add to `mod tests` in `files.rs`:
         let v = body_json(resp).await;
         assert_eq!(v["valid"], true);
     }
+
+    // ---- allowlist ROOTS convert through the same seam (R-WIN4 root side:
+    // Node's isPathAllowed applies resolvePathForSandboxComparison to BOTH
+    // sides, path-utils.ts:313/319; pinned by Node's
+    // test/unit/server/path-utils.test.ts:236-252) ----
+
+    #[test]
+    fn windows_flavor_allowlist_roots_convert_like_node() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let mount_c = fixture.mount("c").to_string_lossy().into_owned();
+        // Drive-root allowlist entry `C:\` matches the mount root and
+        // anything under it (Node test lines 245-247).
+        let drive_root = vec!["C:\\".to_string()];
+        assert!(is_path_allowed(&mount_c, Some(&drive_root)));
+        assert!(is_path_allowed(
+            resolve_user_path("C:\\Users\\alice\\project").sandbox_target(),
+            Some(&drive_root)
+        ));
+        // Deeper Windows-flavor root matches converted targets under it and
+        // rejects other drives (Node test lines 249-251).
+        let users_root = vec!["C:\\Users".to_string()];
+        assert!(is_path_allowed(
+            resolve_user_path("C:\\Users\\alice\\project").sandbox_target(),
+            Some(&users_root)
+        ));
+        assert!(!is_path_allowed(
+            resolve_user_path("D:\\Users\\alice\\project").sandbox_target(),
+            Some(&users_root)
+        ));
+        // POSIX roots keep byte-identical semantics (regression guard).
+        let posix_root = vec![mount_c.clone()];
+        assert!(is_path_allowed(
+            &format!("{mount_c}/Users"),
+            Some(&posix_root)
+        ));
+    }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-server files::tests::read_stat_write_follow_windows_conversion_on_wsl -- --exact --nocapture`
 Expected: FAIL — `v["exists"]` is `false` and read returns 404 (today the literal `C:\Users\notes.txt` string is stat'd and not found). `validate_dir_denies_path_outside_allowed_roots` also fails red (status 200, no sandbox check yet).
+
+Run: `cargo test -p freshell-server files::tests::windows_flavor_allowlist_roots_convert_like_node -- --exact --nocapture`
+Expected: FAIL — today `is_path_allowed` normalizes roots with `normalize_user_path` only, so the root `C:\` stays a literal string and the first assert (`is_path_allowed(&mount_c, …)`) trips.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1431,10 +1471,43 @@ Finally, in `validate_dir` (as rewritten by Task 2), insert the sandbox prelude 
 
 and append one line to `validate_dir`'s doc comment: `/// With allowedFilePaths configured, targets outside the roots are rejected 403 like every other files endpoint (Node applies validatePath to this route — files-router.ts:232; closing a formerly-unexplained Rust parity gap).`
 
+Last, convert the allowlist ROOTS through the same seam. In `is_path_allowed` (lines 489–505 pre-Task-2 numbering), replace the loop body:
+
+```rust
+    for root in roots {
+        let root_norm = normalize_user_path(root);
+        if target_norm == root_norm || target_norm.starts_with(&format!("{root_norm}/")) {
+            return true;
+        }
+    }
+```
+
+with:
+
+```rust
+    for root in roots {
+        // Node parity: isPathAllowed converts BOTH sides through
+        // resolvePathForSandboxComparison (path-utils.ts:313/319), so a
+        // Windows-flavor root like `C:\Users` matches WSL-converted targets
+        // (pinned by Node's test/unit/server/path-utils.test.ts:236-252).
+        // resolve_user_path's non-Windows branch IS normalize_user_path, so
+        // POSIX/~ roots compare byte-identically to before (including the
+        // repo_icon.rs call sites). On a non-WSL host a Windows-flavor root
+        // stays literal — fail-closed, same stance as unaddressable targets.
+        let root_resolved = resolve_user_path(root);
+        let root_norm = root_resolved.sandbox_target();
+        if target_norm == root_norm || target_norm.starts_with(&format!("{root_norm}/")) {
+            return true;
+        }
+    }
+```
+
+(The two-line binding is required: `resolve_user_path(root).sandbox_target()` inline would borrow a temporary that drops at the end of the statement.) Update the function's doc comment third line from `/// POSIX comparison (the oracle host); the Windows case-fold flavor is deferred.` to `/// Roots resolve through resolve_user_path — the same conversion as targets (Node converts both sides, path-utils.ts:313/319). Case-folding stays absent: Node lowercases only when process.platform === 'win32', which this Linux-host port never is.`
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server files::tests`
-Expected: PASS — all module tests including the 3 new ones.
+Expected: PASS — all module tests including the 4 new ones.
 
 - [ ] **Step 5: Full verification sweep**
 
@@ -1454,13 +1527,17 @@ Expected: fmt no diffs; clippy exits 0; both test suites fully green (freshell-s
 ```bash
 git -C /home/dan/code/freshell/.worktrees/windows-path-files add crates/freshell-server/src/files.rs
 git -C /home/dan/code/freshell/.worktrees/windows-path-files commit -m "feat(server): route files sandbox checks through path conversion" -m "Every is_path_allowed call site in files.rs now compares the converted
-native path (Node validatePath parity), and read/stat/write access the
-filesystem through the same conversion with Node's exact literal
-fallthrough for unaddressable inputs. Windows-flavor paths now read/stat/
-write through the WSL mount; POSIX/~ behavior is string-identical.
-validate_dir gains the sandbox check it was missing (Node applies
-validatePath to the route, files-router.ts:232 — the Rust gap was an
-unexplained parity defect, not deliberate).
+native path, and is_path_allowed itself converts each allowlist ROOT
+through the same seam — Node's isPathAllowed converts both sides
+(path-utils.ts:313/319), so Windows-flavor allowedFilePaths entries like
+C:\\Users\\dan now match WSL-converted targets instead of denying
+everything. read/stat/write access the filesystem through the same
+conversion with Node's exact literal fallthrough for unaddressable
+inputs. Windows-flavor paths now read/stat/write through the WSL mount;
+POSIX/~ behavior is string-identical (roots included). validate_dir
+gains the sandbox check it was missing (Node applies validatePath to
+the route, files-router.ts:232 — the Rust gap was an unexplained parity
+defect, not deliberate).
 
 Verified: cargo fmt --all --check clean, clippy -p freshell-platform -p
 freshell-server -D warnings clean, cargo test -p freshell-platform and
@@ -1480,7 +1557,7 @@ Co-Authored-By: Amplifier <240428069+microsoft-amplifier@users.noreply.github.co
 | 1. `validate_dir`: `C:\` / `D:\foo\bar` on WSL → valid:true via mount; non-WSL → invalid | Task 2 (impl + `validate_dir_accepts_windows_drive_on_wsl`, `validate_dir_windows_deep_path_and_missing_dir`, `validate_dir_windows_input_invalid_off_wsl`) |
 | 2. `complete`: `C:\` lists `/mnt/c` but renders `C:\Users`, `C:\Windows`; partial `C:\Us` splits/filters/joins in input flavor; POSIX/`~` unchanged | Task 3 (impl + `complete_windows_*` tests, `complete_wsl_unc_partial_leaf_round_trips` end-to-end UNC composition, `complete_posix_regression_unchanged`); Task 2's `resolve_user_path_posix_and_tilde_unchanged` |
 | 3. `mkdir`: convert windows input; 400-reject unresolvable; no literal `C:\` dir ever created | Task 4 (impl + `mkdir_windows_path_creates_under_mount`, `mkdir_rejects_unaddressable_windows_input_off_wsl`, `mkdir_rejects_unresolvable_windows_forms_even_on_wsl`) |
-| 4. Sandbox checks compare the converted native path | Task 3 (`sandbox_target` + `sandbox_target_uses_converted_native_path`; wired into `complete`), Task 4 (wired into `mkdir`), Task 5 (wired into `read_file`/`stat_file`/`write_file` AND newly into `validate_dir` + `validate_dir_denies_path_outside_allowed_roots` — after Task 5, every files.rs endpoint checks `is_path_allowed` on the converted native path; the validate-dir gap was validated as an unexplained Node-parity defect and is closed, see Boundary notes). |
+| 4. Sandbox checks compare the converted native path | Task 3 (`sandbox_target` + `sandbox_target_uses_converted_native_path`; wired into `complete`), Task 4 (wired into `mkdir`), Task 5 (wired into `read_file`/`stat_file`/`write_file` AND newly into `validate_dir` + `validate_dir_denies_path_outside_allowed_roots` — after Task 5, every files.rs endpoint checks `is_path_allowed` on the converted native path; the validate-dir gap was validated as an unexplained Node-parity defect and is closed, see Boundary notes). Task 5 also converts the allowlist ROOTS inside `is_path_allowed` (`windows_flavor_allowlist_roots_convert_like_node` — Node converts both sides, `path-utils.ts:313/319`, pinned by `path-utils.test.ts:236-252`). |
 | 5. Reuse freshell-platform helpers; add missing ones there with unit tests | Task 1 (split/join helpers + tests); Tasks 2–4 compose only `freshell_platform::path` conversions — no conversion logic in files.rs |
 | Testing: env-based WSL emulation w/ temp mount root; POSIX/~ regressions; no-literal-`C:\` test | Task 2 scaffolding (`WslMountFixture` via `WSL_DISTRO_NAME`/`WSL_WINDOWS_SYS32`); regression tests in Tasks 2–4; Task 4 Step 1 |
 | Repo conventions: fmt/clippy/test per crate, standard checks | Every task's Steps 4–5; Task 4 Step 5 full sweep |
