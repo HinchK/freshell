@@ -951,7 +951,7 @@ mod tests {
     /// no private controller fields -- the port was already chosen and
     /// threaded through by [`test_state_with_home`]. Errors (instead of
     /// panicking) so the retrying scenarios below can treat a transient bind
-    /// artifact as one failed attempt.
+    /// artifact as one environmental ([`ScenarioError::Env`]) failed attempt.
     async fn serve_real_test_app_on_loopback(state: &NetworkState) -> Result<u16, String> {
         let app = Router::new().route("/ping", get(|| async { "pong" }));
         state.rebind.set_app(app);
@@ -1054,34 +1054,57 @@ mod tests {
     /// propagates out of `SettingsStore::patch` as `Err((status, body))` --
     /// load-bearing for NET-02/NET-09.
     ///
+    /// Failure taxonomy for the retried real-socket scenarios below. The
+    /// retry wrappers forgive ONLY `Env`: any `Product` failure panics on
+    /// the spot, so an intermittent product bug on attempt 1 can never be
+    /// forgiven by a pass on attempt 2.
+    enum ScenarioError {
+        /// Environmental: transient WSL2 loopback-port artifacts with a
+        /// DOCUMENTED failure mode (see each construction site). Retried on
+        /// a fresh home/state/port.
+        Env(String),
+        /// Product-invariant violation (response status/body, `BindState`,
+        /// persisted settings -- pure in-memory reads with zero
+        /// environmental exposure). Never retried: fail fast.
+        Product(String),
+    }
+
     /// RETRY WRAPPER (measured on this WSL2 host): real-socket bind/close
     /// cycles occasionally hit transient loopback-port artifacts under full
     /// parallel-suite load (~1/10 runs a detector connect/bind on the
     /// just-swapped port misbehaved while diagnostics confirmed the 500, the
     /// rollback, and a truthful 127.0.0.1 BindState were all correct;
     /// net_bind's own Task-2.1 port tests flake the same way). Every attempt
-    /// runs on a FRESH home + state + port, and every product invariant is
-    /// checked on every attempt -- a REAL rollback regression fails all five
-    /// attempts deterministically, so the falsifying power is preserved while
+    /// runs on a FRESH home + state + port. Only [`ScenarioError::Env`]
+    /// failures are retried; any [`ScenarioError::Product`] violation panics
+    /// immediately, so the falsifying power holds on the FIRST attempt while
     /// transient environment noise is retried away.
     #[tokio::test]
     async fn configure_rolls_back_the_listener_when_persist_fails() {
         for attempt in 1..=5 {
             match rollback_scenario_once().await {
                 Ok(()) => return,
-                Err(e) if attempt < 5 => {
-                    eprintln!("rollback scenario attempt {attempt}: {e}; retrying on a fresh port");
+                Err(ScenarioError::Product(e)) => panic!(
+                    "rollback product invariant violated (attempt {attempt}, fail-fast): {e}"
+                ),
+                Err(ScenarioError::Env(e)) if attempt < 5 => {
+                    eprintln!(
+                        "rollback scenario attempt {attempt} (environmental): {e}; \
+                         retrying on a fresh port"
+                    );
                 }
-                Err(e) => panic!("rollback invariants violated on every attempt: {e}"),
+                Err(ScenarioError::Env(e)) => {
+                    panic!("rollback scenario failed environmentally on all 5 attempts: {e}")
+                }
             }
         }
     }
 
     /// One full run of the rollback scenario on a fresh home/state/port.
-    /// Product-invariant violations are returned as `Err` (not panics) so the
-    /// retry wrapper above can distinguish attempts; a real regression
-    /// returns the same error every attempt.
-    async fn rollback_scenario_once() -> Result<(), String> {
+    /// Failures are classified per [`ScenarioError`]: only documented
+    /// transient socket artifacts come back as `Env`; every in-memory
+    /// product invariant comes back as `Product` and fails the test fast.
+    async fn rollback_scenario_once() -> Result<(), ScenarioError> {
         use axum::body::Body;
         use axum::http::Request;
         use std::os::unix::fs::PermissionsExt;
@@ -1091,7 +1114,9 @@ mod tests {
         std::fs::create_dir_all(&freshell_dir).unwrap();
         let state = test_state_with_home("127.0.0.1", Some(true), home.path());
         seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
-        let port = serve_real_test_app_on_loopback(&state).await?;
+        let port = serve_real_test_app_on_loopback(&state)
+            .await
+            .map_err(ScenarioError::Env)?;
         let mut perms = std::fs::metadata(&freshell_dir).unwrap().permissions();
         perms.set_mode(0o555); // read-only dir => the atomic tmp+rename persist fails
         std::fs::set_permissions(&freshell_dir, perms).unwrap();
@@ -1111,10 +1136,25 @@ mod tests {
         let mut perms = std::fs::metadata(&freshell_dir).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&freshell_dir, perms).unwrap();
-        if !resp.status().is_server_error() {
-            return Err(format!(
-                "persist failure must surface as a 5xx, got {}",
-                resp.status()
+        let status = resp.status();
+        if !status.is_server_error() {
+            return Err(ScenarioError::Product(format!(
+                "persist failure must surface as a 5xx, got {status}"
+            )));
+        }
+        // Vacuous-pass guard (review fix round 1): the handler's bind-failure
+        // arm answers 500 with the frozen body below WITHOUT ever reaching
+        // the persist/rollback path. If the initial serve_on(0.0.0.0) failed
+        // transiently (same WSL2 socket-artifact class as the detector flakes
+        // documented on the retry wrapper), every later invariant would pass
+        // vacuously. Classifying exactly that body as Env (fresh port, next
+        // attempt) means an Ok from this scenario proves the persist-failure
+        // path is the one that ran; a PERSISTENT bind regression still fails
+        // the test by exhausting all five attempts.
+        let body = body_json(resp).await;
+        if body == json!({ "error": "Failed to configure network" }) {
+            return Err(ScenarioError::Env(
+                "handler's initial serve_on(0.0.0.0) failed before the persist path ran".into(),
             ));
         }
         // Rollback proof: the wildcard listener must be GONE, loopback must
@@ -1124,25 +1164,44 @@ mod tests {
         // (wildcard conflicts with every specific address; sharing would need
         // reuseport on BOTH) and succeeds against the rolled-back 127.0.0.1
         // listener (two DIFFERENT specific addresses never conflict).
+        //
+        // Both socket-facing detector checks are Env, NOT Product, because
+        // they have a MEASURED environmental failure mode on this WSL2 host:
+        // pre-hardening (~1/10 full parallel-suite runs) a detector
+        // bind/connect on the just-swapped port misbehaved while diagnostics
+        // confirmed the 500, the rollback, and a truthful 127.0.0.1 BindState
+        // were all correct. A REAL rollback regression fails them
+        // deterministically on every fresh-port attempt and so still fails
+        // the test.
         if std::net::TcpListener::bind(("127.0.0.2", port)).is_err() {
-            return Err("listener left on 0.0.0.0 after failed persist (no rollback)".into());
+            return Err(ScenarioError::Env(
+                "listener left on 0.0.0.0 after failed persist (no rollback), \
+                 or a transient detector-bind artifact"
+                    .into(),
+            ));
         }
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_err()
         {
-            return Err("rolled-back loopback listener is not serving".into());
+            return Err(ScenarioError::Env(
+                "rolled-back loopback listener is not serving, or a transient \
+                 detector-connect artifact"
+                    .into(),
+            ));
         }
         let live = state.bind.get().await;
         if live != "127.0.0.1" {
-            return Err(format!(
+            return Err(ScenarioError::Product(format!(
                 "BindState claims {live} after a rolled-back persist failure"
-            ));
+            )));
         }
         let s = state.settings.get().await;
         let host = serde_json::to_value(&s.network).unwrap()["host"].clone();
         if host != "127.0.0.1" {
-            return Err(format!("settings claim host {host} after failed persist"));
+            return Err(ScenarioError::Product(format!(
+                "settings claim host {host} after failed persist"
+            )));
         }
         state.rebind.shutdown_all().await;
         Ok(())
@@ -1153,25 +1212,33 @@ mod tests {
     /// error shape and persist NOTHING (settings + BindState unchanged, old
     /// listener untouched -- here trivially: none was ever swapped in).
     /// Retried on a fresh port for the same transient WSL2 loopback-port
-    /// artifacts as the rollback test above.
+    /// artifacts as the rollback test above -- but here ONLY the squatter's
+    /// own bind is environmental; every other check is a pure in-memory
+    /// product invariant and fails fast.
     #[tokio::test]
     async fn configure_returns_500_and_persists_nothing_when_bind_fails() {
         for attempt in 1..=5 {
             match bind_failure_scenario_once().await {
                 Ok(()) => return,
-                Err(e) if attempt < 5 => {
+                Err(ScenarioError::Product(e)) => panic!(
+                    "bind-failure product invariant violated (attempt {attempt}, fail-fast): {e}"
+                ),
+                Err(ScenarioError::Env(e)) if attempt < 5 => {
                     eprintln!(
-                        "bind-failure scenario attempt {attempt}: {e}; retrying on a fresh port"
+                        "bind-failure scenario attempt {attempt} (environmental): {e}; \
+                         retrying on a fresh port"
                     );
                 }
-                Err(e) => panic!("bind-failure invariants violated on every attempt: {e}"),
+                Err(ScenarioError::Env(e)) => {
+                    panic!("bind-failure scenario failed environmentally on all 5 attempts: {e}")
+                }
             }
         }
     }
 
     /// One full run of the squatter/bind-failure scenario on a fresh
     /// home/state/port (same retry contract as [`rollback_scenario_once`]).
-    async fn bind_failure_scenario_once() -> Result<(), String> {
+    async fn bind_failure_scenario_once() -> Result<(), ScenarioError> {
         use axum::body::Body;
         use axum::http::Request;
         use tower::util::ServiceExt;
@@ -1186,7 +1253,9 @@ mod tests {
             .rebind
             .set_app(Router::new().route("/ping", get(|| async { "pong" })));
         let squatter = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, state.port))
-            .map_err(|e| format!("squatter could not bind the probed port: {e}"))?;
+            .map_err(|e| {
+            ScenarioError::Env(format!("squatter could not bind the probed port: {e}"))
+        })?;
         let resp = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -1200,23 +1269,27 @@ mod tests {
             .await
             .unwrap();
         if resp.status() != 500 {
-            return Err(format!(
+            return Err(ScenarioError::Product(format!(
                 "blocked bind must surface as 500, got {}",
                 resp.status()
-            ));
+            )));
         }
         let body = body_json(resp).await;
         if body != json!({ "error": "Failed to configure network" }) {
-            return Err(format!("wrong 500 body: {body}"));
+            return Err(ScenarioError::Product(format!("wrong 500 body: {body}")));
         }
         let live = state.bind.get().await;
         if live != "127.0.0.1" {
-            return Err(format!("BindState claims {live} after a failed bind"));
+            return Err(ScenarioError::Product(format!(
+                "BindState claims {live} after a failed bind"
+            )));
         }
         let s = state.settings.get().await;
         let host = serde_json::to_value(&s.network).unwrap()["host"].clone();
         if host != "127.0.0.1" {
-            return Err(format!("settings claim host {host} after a failed bind"));
+            return Err(ScenarioError::Product(format!(
+                "settings claim host {host} after a failed bind"
+            )));
         }
         drop(squatter);
         Ok(())
