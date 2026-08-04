@@ -15,13 +15,13 @@ pub struct ManagedPortsStore {
 }
 
 impl ManagedPortsStore {
-    /// Create a Windows managed ports store.
+    /// Create a Windows managed ports store. (Consumed by Task 3.3)
     #[allow(dead_code)]
     pub fn windows(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self {
         Self { home, cwd, port }
     }
 
-    /// Create a WSL managed ports store.
+    /// Create a WSL managed ports store. (Consumed by Task 3.3)
     #[allow(dead_code)]
     pub fn wsl(home: Option<PathBuf>, cwd: PathBuf, port: u16) -> Self {
         Self { home, cwd, port }
@@ -71,7 +71,7 @@ impl ManagedPortsStore {
                     if let Some(ports_array) = json.get("ports").and_then(|v| v.as_array()) {
                         ports_array
                             .iter()
-                            .filter_map(|v| v.as_u64().map(|u| u as u16))
+                            .filter_map(|v| v.as_u64().and_then(|u| u16::try_from(u).ok()))
                             .collect()
                     } else {
                         Vec::new()
@@ -96,7 +96,11 @@ impl ManagedPortsStore {
 
         // Empty list: delete the file
         if normalized.is_empty() {
-            let _ = fs::remove_file(&file_path);
+            match fs::remove_file(&file_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
             return Ok(());
         }
 
@@ -118,9 +122,14 @@ impl ManagedPortsStore {
         let tmp_path = dir.join(&tmp_name);
 
         fs::write(&tmp_path, json_string)?;
-        fs::rename(&tmp_path, &file_path)?;
-
-        Ok(())
+        match fs::rename(&tmp_path, &file_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Clean up the orphaned temporary file on error
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     /// Read Windows managed ports. (Consumed by Task 3.3)
@@ -182,6 +191,44 @@ mod tests {
         store.persist_windows(&[3001]).unwrap();
         store.persist_windows(&[]).unwrap();
         assert!(store.read_windows().is_empty());
+
+        // Assert the file is actually deleted from disk
+        let key = store.compute_key();
+        let windows_dir = home
+            .path()
+            .join(".freshell")
+            .join("windows-managed-remote-access-ports");
+        let file_path = windows_dir.join(format!("{}.json", key));
+        assert!(!file_path.exists(), "File should be deleted from disk");
+    }
+
+    #[test]
+    fn clear_on_nonexistent_file_returns_ok() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
+        // Clearing when no file exists should succeed
+        assert!(store.clear_windows().is_ok());
+    }
+
+    #[test]
+    fn out_of_range_ports_are_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ManagedPortsStore::windows(Some(home.path().into()), "/proj/a".into(), 3001);
+
+        // Manually write a JSON file with out-of-range port values
+        let windows_dir = home
+            .path()
+            .join(".freshell")
+            .join("windows-managed-remote-access-ports");
+        fs::create_dir_all(&windows_dir).unwrap();
+        let key = store.compute_key();
+        let file_path = windows_dir.join(format!("{}.json", key));
+
+        // Write JSON with out-of-range port (70000 exceeds u16 max of 65535)
+        fs::write(&file_path, r#"{"ports":[70000, 3001]}"#).unwrap();
+
+        // Reading should return only the valid port (3001)
+        assert_eq!(store.read_windows(), vec![3001]);
     }
 
     #[test]
