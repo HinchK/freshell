@@ -928,8 +928,8 @@ mod tests {
 
     // Intentional: `_guard` is held across every `.await` BY DESIGN — the
     // whole test mutates/reads process env and must stay serialized on the
-    // crate-wide HOME_ENV_TEST_LOCK end-to-end (same rationale as codex.rs's
-    // env-lock tests).
+    // crate-wide HOME_ENV_TEST_LOCK end-to-end. Holding the env guard across
+    // .await is the point: it serializes env-mutating tests process-wide.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_accepts_windows_drive_on_wsl() {
