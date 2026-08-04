@@ -1053,7 +1053,7 @@ proves the pre-existing gap, and the rust leg proves the improvement.
 
 ### DEV-0012 — Settled-status response to configure endpoint
 
-- **objective_defect:** *contradicts documented behavior* — `src/store/networkSlice.ts:123-130` specifies `configure` response MUST return settled truth (current state), not desired-state preview; the TS response field `rebindScheduled` should reflect reality post-mutation, not anticipation.
+- **objective_defect:** *contract-legal deliberate choice* — `src/store/networkSlice.ts:123-130` documents that the client reducer accepts both settled truth (current state post-mutation) and desired-state preview (`rebindScheduled:true`); the port chooses to return settled truth (listener already active post-transactional bind), whereas the original returns a preview. Both are contract-legal client behavior; the port's choice to report reality instead of anticipation is an intentional improvement.
 - **original_behavior:** `POST /api/network/configure` returns `rebindScheduled:true` as a preview/plan, not the actual state after the mutation.
 - **port_behavior:** `POST /api/network/configure` returns `{..., rebindScheduled:false}` (the listener is already active; no further rebind scheduled) and other settled fields matching the transactional reality.
 - **fingerprint:** configure response shape (rebindScheduled field value).
@@ -1066,7 +1066,7 @@ proves the pre-existing gap, and the rust leg proves the improvement.
 - **original_behavior:** On rebind, old listener is torn down immediately, causing connected clients to receive 4009 (going away) en masse.
 - **port_behavior:** Old listener stays bound during the overlap period, allowing graceful drain of existing connections while new requests route to the new listener.
 - **fingerprint:** harness Phase 3/4 connection stability (old connections not abruptly closed on rebind).
-- **pinning_test:** harness Phase 3/4 (verified zero 4009 spam during overlapping-listener window).
+- **pinning_test:** harness Phase 3/4 (overlapping-listener/drain behavior: old connections drain gracefully via RebindController's kept accept loop; new requests route to new listener).
 - **status:** proposed
 
 ### DEV-0014 — NET-08-A/B/C hardening (Ipv4Addr typing, constant-time compare, Slice 0)
