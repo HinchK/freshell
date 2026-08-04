@@ -36,8 +36,9 @@
 //!
 //! ## Deferred (documented, loopback-faithful)
 //!
-//! The Windows managed-firewall-port staleness read is deferred: `stale` is a
-//! hardcoded `false` (HOST-BLOCKED — Windows-only, see the plan's Slice 3).
+//! The Windows managed-firewall-port staleness read is WIRED (Task 3.4,
+//! NET-04/05): `stale` is computed from the READ-ONLY managed-rule probe
+//! (Windows) or the recomputed WSL plan (WSL2) — see [`build_status_value`].
 //! `raw_port_open` is now a LIVE probe result (see [`TcpPortProbe`]), gated
 //! exactly as the original gates it: only when `effective_host == "0.0.0.0"`
 //! and `lan_ips` is non-empty (`network-manager.ts:304-305`); otherwise it stays
@@ -57,7 +58,10 @@ use axum::{
 };
 use freshell_platform::detect::{host_os_live, is_wsl2_proc_live};
 use freshell_platform::elevated::{ConfirmationAction, ConfirmationResponse, ElevationOutcome};
-use freshell_platform::firewall::build_windows_firewall_delete_commands;
+use freshell_platform::firewall::{
+    build_windows_firewall_delete_commands, build_windows_firewall_repair_commands,
+    get_existing_managed_windows_firewall_ports,
+};
 use freshell_platform::network::{
     access_url, detect_lan_ips_from_linux_interfaces, is_remote_access_enabled, NetworkIntent,
 };
@@ -67,7 +71,8 @@ use freshell_platform::port_forward::{
     is_wsl_port_forwarding_disabled_by_env, WslPortForwardingPlan, WslPortForwardingTeardownPlan,
 };
 use freshell_platform::{
-    detect_firewall, firewall_commands, FirewallInfo, FirewallPlatform, RealEnv, StdCommandRunner,
+    detect_firewall, firewall_commands, CommandRunner, FirewallInfo, FirewallPlatform, RealEnv,
+    StdCommandRunner,
 };
 use freshell_protocol::NetworkHost;
 use serde_json::{json, Value};
@@ -364,6 +369,50 @@ async fn build_status_value(state: &NetworkState) -> Value {
     };
 
     let network_host = network_host_str(&settings.network.host);
+
+    // `staleManagedWindowsExposure` (`network-manager.ts:326-341`), resolved at
+    // the live edge behind the original's own gate: only when remote access is
+    // requested AND the effective host is `0.0.0.0`. Both branches are
+    // READ-ONLY (`netsh … show` / `ip addr show`); production constructs a
+    // [`StdCommandRunner`] at this boundary (as [`resolve_live_network_facts`]
+    // does), while the derivation stays pure and fake-testable
+    // ([`compute_windows_managed_exposure`] + [`build_network_status`]).
+    let requested = compute_remote_access_requested(
+        settings.network.configured,
+        network_host,
+        &effective_host,
+        facts.firewall.platform,
+    );
+    let (existing_managed_windows_ports, stale_managed_windows_exposure) =
+        if requested && effective_host == "0.0.0.0" {
+            match facts.firewall.platform {
+                // WSL2 + raw-open: the exposure is stale iff the recomputed WSL
+                // plan still has work to do (`network-manager.ts:333-335`).
+                FirewallPlatform::Wsl2 if raw_port_open == Some(true) => {
+                    let plan = compute_wsl_plan_live(state).await;
+                    (
+                        Vec::new(),
+                        matches!(plan, WslPortForwardingPlan::Ready { .. }),
+                    )
+                }
+                // Windows + active firewall: any existing managed rule outside the
+                // required set is stale (`network-manager.ts:336-340`).
+                FirewallPlatform::Windows if facts.firewall.active => {
+                    let required = remote_access_ports.clone();
+                    let persisted = state.managed_ports.read_windows();
+                    tokio::task::spawn_blocking(move || {
+                        let runner = StdCommandRunner::default();
+                        compute_windows_managed_exposure(&runner, &required, &persisted)
+                    })
+                    .await
+                    .unwrap_or((Vec::new(), false))
+                }
+                _ => (Vec::new(), false),
+            }
+        } else {
+            (Vec::new(), false)
+        };
+
     let inputs = NetworkStatusInputs {
         configured: settings.network.configured,
         network_host,
@@ -375,6 +424,8 @@ async fn build_status_value(state: &NetworkState) -> Value {
         raw_port_open,
         wsl_forwarding_disabled_by_env: is_wsl_port_forwarding_disabled_by_env(&RealEnv),
         token: state.auth_token.as_str(),
+        stale_managed_windows_exposure,
+        existing_managed_windows_ports: &existing_managed_windows_ports,
     };
     build_network_status(inputs)
 }
@@ -1001,6 +1052,25 @@ async fn resolve_disable_action(state: &NetworkState) -> DisableAction {
     }
 }
 
+/// The Windows managed-exposure staleness read (`network-manager.ts:336-340`
+/// plus `getManagedWindowsRemoteAccessPorts`, `:544-550`): probe the KNOWN
+/// managed ports (required ∪ persisted store) through the READ-ONLY
+/// `netsh … show rule` existence probe, returning which of them exist and
+/// whether any existing managed port falls outside the required set — i.e.
+/// the managed Windows exposure is STALE. Only ever reads; the repair/delete
+/// commands are built (never run) by [`build_network_status`].
+fn compute_windows_managed_exposure(
+    runner: &dyn CommandRunner,
+    required_ports: &[u16],
+    persisted_managed_ports: &[u16],
+) -> (Vec<u16>, bool) {
+    let mut known: Vec<u16> = required_ports.to_vec();
+    known.extend_from_slice(persisted_managed_ports);
+    let existing = get_existing_managed_windows_firewall_ports(runner, &known);
+    let stale = existing.iter().any(|p| !required_ports.contains(p));
+    (existing, stale)
+}
+
 /// Port of `computeWslPortForwardingPlanAsync` (`wsl-port-forward.ts:503-543`):
 /// gate on WSL2 + the env kill-switch, then compose the READ-ONLY live reads
 /// (`ip`/`hostname` for the WSL IP, `netsh … show` for rules/firewall ports,
@@ -1454,6 +1524,14 @@ pub struct NetworkStatusInputs<'a> {
     pub raw_port_open: Option<bool>,
     pub wsl_forwarding_disabled_by_env: bool,
     pub token: &'a str,
+    /// `staleManagedWindowsExposure` (`network-manager.ts:326-341`), resolved
+    /// by the live edge: Windows → an existing managed rule outside the
+    /// required set; WSL2 → the recomputed WSL plan is `Ready` while the raw
+    /// probe says open.
+    pub stale_managed_windows_exposure: bool,
+    /// `existingManagedWindowsPorts` (`network-manager.ts:327,337`) — feeds
+    /// the Windows repair-command builder when the exposure is stale.
+    pub existing_managed_windows_ports: &'a [u16],
 }
 
 /// Pure port of `getStatus()`'s derivation (`network-manager.ts:325-397`). Every
@@ -1466,14 +1544,25 @@ pub fn build_network_status(i: NetworkStatusInputs) -> Value {
     let remote_access_requested =
         compute_remote_access_requested(i.configured, i.network_host, i.effective_host, platform);
 
-    // Windows managed-port staleness read is deferred (read-only, Windows-only) → false.
-    let stale = false;
+    // `staleManagedWindowsExposure` (`network-manager.ts:326-343`), resolved by
+    // the live edge (Task 3.4): stale exposure forces `portOpen` to false.
+    let stale = i.stale_managed_windows_exposure;
     let port_open = if stale { Some(false) } else { i.raw_port_open };
 
     let commands = if i.firewall.active {
-        // The Windows stale-repair branch is deferred (stale == false), so this is
-        // always the plain suggested-command builder (golden strings; wsl2 → []).
-        firewall_commands(platform, &remote_access_ports)
+        if platform == FirewallPlatform::Windows && stale {
+            // The Windows stale-repair branch (`network-manager.ts:344-348`):
+            // delete stale managed rules, add only what's missing when the
+            // advertised port is RAW-reachable. Built as data, never run here.
+            build_windows_firewall_repair_commands(
+                &remote_access_ports,
+                i.existing_managed_windows_ports,
+                i.raw_port_open == Some(true),
+            )
+        } else {
+            // The plain suggested-command builder (golden strings; wsl2 → []).
+            firewall_commands(platform, &remote_access_ports)
+        }
     } else {
         Vec::new()
     };
@@ -1643,6 +1732,8 @@ mod tests {
             raw_port_open: None,
             wsl_forwarding_disabled_by_env: false,
             token: "tok-abc",
+            stale_managed_windows_exposure: false,
+            existing_managed_windows_ports: &[],
         });
 
         // Full NetworkStatus shape present.
@@ -1706,6 +1797,8 @@ mod tests {
             raw_port_open: None, // probe deferred → unknown
             wsl_forwarding_disabled_by_env: false,
             token: "t",
+            stale_managed_windows_exposure: false,
+            existing_managed_windows_ports: &[],
         });
         assert_eq!(status["host"], json!("0.0.0.0"));
         assert_eq!(status["remoteAccessRequested"], json!(true));
@@ -1721,6 +1814,66 @@ mod tests {
         // portOpen unknown (deferred probe) → null; remoteAccessEnabled false.
         assert_eq!(status["firewall"]["portOpen"], Value::Null);
         assert_eq!(status["remoteAccessEnabled"], json!(false));
+    }
+
+    /// Task 3.4 (NET-04): the `stale` wiring, Windows branch — a READ-ONLY
+    /// managed-rule probe (behind a [`FakeCommandRunner`]) that reports a
+    /// managed port NOT in the required set forces `firewall.portOpen` to
+    /// `false` and `remoteAccessNeedsRepair` to `true`, and switches the
+    /// suggested commands to the repair builder (stale delete, no add for the
+    /// already-present + reachable required port). Never spawns a subprocess.
+    #[test]
+    fn windows_stale_managed_port_forces_port_open_false_and_needs_repair() {
+        use freshell_platform::{CommandOutput, FakeCommandRunner};
+
+        // The fake `netsh … show rule` probe: the required 3001 rule exists
+        // AND a leftover managed 3412 rule (NOT in the required set) exists.
+        let runner = FakeCommandRunner::new()
+            .on(
+                "netsh",
+                &["name=Freshell (port 3001)"],
+                CommandOutput::success("Rule Name: Freshell (port 3001)\r\nOk.\r\n"),
+            )
+            .on(
+                "netsh",
+                &["name=Freshell (port 3412)"],
+                CommandOutput::success("Rule Name: Freshell (port 3412)\r\nOk.\r\n"),
+            );
+        let (existing, stale) = compute_windows_managed_exposure(&runner, &[3001], &[3412]);
+        assert_eq!(existing, vec![3001, 3412]);
+        assert!(
+            stale,
+            "an existing managed port outside the required set must mark the exposure stale"
+        );
+
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::Windows,
+            active: true,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.50".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: Some(true),
+            wsl_forwarding_disabled_by_env: false,
+            token: "tok",
+            stale_managed_windows_exposure: stale,
+            existing_managed_windows_ports: &existing,
+        });
+        // Stale exposure overrides the raw probe: portOpen false, repair needed
+        // (network-manager.ts:343,352-361).
+        assert_eq!(status["firewall"]["portOpen"], json!(false));
+        assert_eq!(status["remoteAccessNeedsRepair"], json!(true));
+        // Commands switch to the REPAIR builder (network-manager.ts:344-348):
+        // delete the stale 3412; NO add for 3001 (present + rawPortOpen true).
+        assert_eq!(
+            status["firewall"]["commands"],
+            json!(["netsh advfirewall firewall delete rule name=\"Freshell (port 3412)\" 2>$null"])
+        );
     }
 
     #[test]
@@ -1739,6 +1892,8 @@ mod tests {
             raw_port_open: None,
             wsl_forwarding_disabled_by_env: false,
             token: "t",
+            stale_managed_windows_exposure: false,
+            existing_managed_windows_ports: &[],
         });
         assert_eq!(status["machineHostname"], json!("macbook"));
     }

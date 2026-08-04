@@ -872,6 +872,33 @@ Address         Port        Address         Port\r\n\
         }
     }
 
+    /// Task 3.4 golden (NET-05): the plan built from THIS host's real captured
+    /// `netsh interface portproxy show all` output treats the pre-existing,
+    /// already-correct 3001 portproxy + firewall rule as SATISFYING — Noop,
+    /// so no `portproxy add` is ever emitted for it.
+    #[test]
+    fn plan_sees_preexisting_3001_rule_as_satisfied_and_emits_no_add_for_it() {
+        let capture = "\
+Listen on ipv4:             Connect to ipv4:
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         3412        172.30.149.249  3412";
+        let rules = parse_port_proxy_rules(capture);
+        let plan = build_wsl_port_forwarding_plan(
+            &[3001],
+            &[3001],
+            "172.30.149.249".parse().unwrap(),
+            &rules,
+            &[3001],
+            &[3001],
+        );
+        assert!(
+            matches!(plan, WslPortForwardingPlan::Noop { .. }),
+            "planner must treat the pre-existing 3001 portproxy+firewall as satisfying"
+        );
+    }
+
     #[test]
     fn teardown_plan_noop_when_nothing_present() {
         let rules = BTreeMap::new();
