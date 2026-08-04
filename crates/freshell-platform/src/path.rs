@@ -433,15 +433,15 @@ pub fn convert_windows_path_to_wsl_path(
 ///
 /// Matches Node's win32 semantics for every shape `win32_resolve` produces,
 /// with one deliberate share-root deviation (below):
-/// - `C:\\Users\\dan`     -> (`C:\\Users`, `dan`)
-/// - `C:\\Us`            -> (`C:\\`, `Us`)   (parent keeps the root backslash)
-/// - `C:\\`              -> (`C:\\`, ``)     (drive root is its own parent)
-/// - `\\\\srv\\share\\dir`  -> (`\\\\srv\\share\\`, `dir`) (share root keeps `\\`)
-/// - `\\\\srv\\share`      -> (`\\\\srv\\share\\`, ``)
+/// - `C:\Users\dan`     -> (`C:\Users`, `dan`)
+/// - `C:\Us`            -> (`C:\`, `Us`)   (parent keeps the root backslash)
+/// - `C:\`              -> (`C:\`, ``)     (drive root is its own parent)
+/// - `\\srv\share\dir`  -> (`\\srv\share\`, `dir`) (share root keeps `\`)
+/// - `\\srv\share`      -> (`\\srv\share\`, ``)
 ///
 /// Deviation (oracle-verified, Node v22): for a share ROOT itself, Node's
-/// `win32.basename` returns the share name (`basename(\"\\\\srv\\share\\\") ==
-/// \"share\"`, `\"Ubuntu\"` for `\\\\wsl.localhost\\Ubuntu\\`) while `win32.dirname`
+/// `win32.basename` returns the share name (`basename("\\srv\share\") ==
+/// "share"`, `"Ubuntu"` for `\\wsl.localhost\Ubuntu\`) while `win32.dirname`
 /// is the root itself. We return an EMPTY leaf instead, so callers list
 /// rather than filter at a root. The corner is unreachable through the files
 /// endpoints (addressable share roots stat as directories and skip the
@@ -449,7 +449,7 @@ pub fn convert_windows_path_to_wsl_path(
 /// Node-identical either way.
 ///
 /// Returns `None` when the input is not absolutely resolvable (drive-relative
-/// `C:foo`, rooted `\\foo`, plain relative) — the same deterministic-core
+/// `C:foo`, rooted `\foo`, plain relative) — the same deterministic-core
 /// boundary as [`win32_resolve`].
 pub fn split_windows_display_path(input: &str) -> Option<(String, String)> {
     let normalized = win32_resolve(input)?;
@@ -459,7 +459,7 @@ pub fn split_windows_display_path(input: &str) -> Option<(String, String)> {
     }
     let tail = &normalized[root_len..];
     // `win32_resolve` output never has doubled separators, so `tail` never
-    // starts with `\\` and every found index splits parent/leaf cleanly.
+    // starts with `\` and every found index splits parent/leaf cleanly.
     Some(match tail.rfind('\\') {
         Some(idx) => (
             normalized[..root_len + idx].to_string(),
@@ -471,13 +471,13 @@ pub fn split_windows_display_path(input: &str) -> Option<(String, String)> {
 
 /// `path.win32.join(parent, name)` for the one shape the files endpoints
 /// need (`files-router.ts:211`): append a single directory-entry name to an
-/// absolute Windows display path. Roots (`C:\\`, `\\\\srv\\share\\`) already end
+/// absolute Windows display path. Roots (`C:\`, `\\srv\share\`) already end
 /// with the separator; deeper parents need one inserted. Never doubles a
 /// separator, never re-cases anything.
 ///
 /// Oracle-verified equal to Node's `win32.join` for all well-behaved dirent
-/// names (dots, spaces, embedded `\\` mid-name). For pathological Linux names
-/// that BEGIN with `\\` or contain `\\.`/`\\..` segments, Node's join would
+/// names (dots, spaces, embedded `\` mid-name). For pathological Linux names
+/// that BEGIN with `\` or contain `\.`/`\..` segments, Node's join would
 /// collapse/normalize where this concatenates verbatim — such names are
 /// unrepresentable in a windows-flavor display path in BOTH servers, so the
 /// divergence is cosmetic (`read_dir` never yields `.`/`..`).
