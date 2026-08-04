@@ -14,7 +14,8 @@ plus a live verification harness — matching the frozen TypeScript wire contrac
 exactly, all committed to `feat/remote-access-networking`.
 
 **Architecture:** Slice 1 (live status + `GET /api/lan-info`) is already landed.
-This plan adds Slice 0 (injection/timing hardening in `freshell-platform`),
+This plan adds Slice 0 (injection/timing hardening + WSL bind-precedence fix
+in `freshell-platform`),
 Slice 2 (Linux-live mutation endpoints with a bind-new-before-persist rebind
 using `SO_REUSEPORT`), Slice 3 (`configure-firewall` + Windows/WSL2 elevation
 behind a compile-time-unreachable real runner), and a `scripts/verify-remote-access.sh`
@@ -124,7 +125,8 @@ New and modified files, by responsibility. Line numbers are from the current tre
 |---|---|---|
 | `crates/freshell-platform/src/elevated.rs` | Confirmation gate token compare → constant-time; add `ElevationRunner` enum (structural unreachability) + NET-07 outcome variants | 0, 3 |
 | `crates/freshell-platform/src/port_forward.rs` | `wsl_ip: &str` → `std::net::Ipv4Addr` across builders/plans/reads (kills the injection sink) | 0 |
-| `crates/freshell-server/src/net_bind.rs` | **NEW.** `SO_REUSEPORT`/`SO_REUSEADDR` listener factory; `RebindController` (bind-new → prove → persist → drain old); per-listener `Notify` | 2 |
+| `crates/freshell-platform/src/network.rs` | `resolve_bind_host`: persisted `configured:true` host outranks the WSL wildcard default (restart truthfulness) | 0 |
+| `crates/freshell-server/src/net_bind.rs` | **NEW.** `SO_REUSEPORT`/`SO_REUSEADDR` listener factory; `RebindController` (bind-new → prove → persist → drain old); own accept loop; `notify_one` + JoinHandle barrier (old socket provably closed before responding) | 2 |
 | `crates/freshell-server/src/network.rs` | Two POST routes (`configure`, `disable-remote-access`); `configure-firewall` route; wire `broadcast_tx`, `RebindController`, `Arc<Mutex<ConfirmationGate>>`, managed-ports store into `NetworkState`; shared action-resolution ladder | 2, 3 |
 | `crates/freshell-server/src/managed_ports.rs` | **NEW.** Instance-scoped Windows/WSL managed-remote-access-ports persistence (fake-backed, honours `FRESHELL_HOME`, atomic) | 3 |
 | `crates/freshell-server/src/main.rs` | Restructure serving so the boot listener is spawned via `RebindController`; boot bind honors persisted `settings.network`; inject `broadcast_tx`, controller, gate, managed-ports store into `NetworkState` | 2, 3 |
@@ -138,9 +140,11 @@ New and modified files, by responsibility. Line numbers are from the current tre
 
 ## Task ordering and dependencies
 
-- **Slice 0** (Task 0.1, 0.2) — `freshell-platform` only; independent of Slice 2;
-  a HARD BLOCKER for Slice 3 (wiring callers onto an unfixed `wsl_ip: &str`
-  promotes the injection sink from latent to live). Land first.
+- **Slice 0** (Tasks 0.1–0.3) — `freshell-platform` only; independent of Slice 2's
+  early tasks; a HARD BLOCKER for Slice 3 (wiring callers onto an unfixed
+  `wsl_ip: &str` promotes the injection sink from latent to live), and Task 0.3
+  is a HARD BLOCKER for Task 2.2b + harness Phase 5 (validated: without it a WSL
+  restart ignores the persisted host — ledger A-04, reports/V2.md). Land first.
 - **Slice 2** (Tasks 2.1–2.5) — depends on Slice 1 (landed).
 - **Slice 3** (Tasks 3.1–3.6) — depends on Slice 0 AND Slice 2.
 - **Harness** (Tasks 5.1–5.5) — depends on Slices 2 and 3 (it curls all five
@@ -151,9 +155,9 @@ Each slice is Red-Green-Refactor and committed before the next begins.
 
 ---
 
-# SLICE 0 — Injection & timing hardening (freshell-platform)
+# SLICE 0 — Injection & timing hardening + bind-precedence fix (freshell-platform)
 
-Two files, security-only, no wire change. The prior attempt at
+Three tasks, `freshell-platform` only, no wire change. The prior attempt at
 `.ai/attempt5-slice3-partial.patch` is REFERENCE-ONLY inspiration (it is
 uncommitted and its two `get_wsl_ip_rejects_injection_shaped_*` tests are weak —
 they pass on pre-patch code; strengthen them here so the falsifier truly fails if
@@ -416,6 +420,86 @@ git commit  # paste falsifier output into the body
 
 Commit message: `fix(net): type wsl_ip as Ipv4Addr, making command injection unrepresentable (NET-08-A/B)`
 
+## Task 0.3: `resolve_bind_host` — persisted `configured` intent outranks the WSL default
+
+**Files:**
+- Modify: `crates/freshell-platform/src/network.rs` — `resolve_bind_host` (~`:49-91`) + its doc comment (`:45-48`)
+- Test: same file's `#[cfg(test)] mod tests`
+
+**Why (VALIDATED — ledger A-04, reports/V2.md):** at HEAD, `network.rs:57-59`
+returns `"0.0.0.0"` for WSL BEFORE consulting the config (confirmed by a live
+run: `is_wsl=true` + `Ok { raw_host: Some("127.0.0.1"), configured: true }` →
+`"0.0.0.0"`). The frozen TS reference does the same (`server/get-network-host.ts:42`),
+so this is a DELIBERATE divergence — record it as deviation entry #8 (Task 6.1):
+after a disable persists `{host:"127.0.0.1",configured:true}`, a WSL restart must
+NOT silently re-expose. Only `configured: true` config outranks the WSL default;
+unconfigured WSL keeps `0.0.0.0` (`scripts/run-rust-server.sh` relies on that).
+The contested precedence cell is unpinned by any existing test, so nothing breaks.
+
+**Interfaces:**
+- Produces: unchanged signature `resolve_bind_host(env, is_wsl, config) -> String`;
+  new precedence: `FRESHELL_BIND_HOST` → persisted config (when `configured: true`,
+  valid host) → WSL default `0.0.0.0` → config raw_host hint → `HOST` → `127.0.0.1`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Read the neighboring tests `wsl_forces_0000` (`:568-574`) and
+`bind_override_invalid_falls_through` (`:559-566`) first and copy their env-fake
+construction style exactly. Then add:
+
+```rust
+#[test]
+fn wsl_with_configured_host_outranks_wsl_default() {
+    // env WITHOUT FRESHELL_BIND_HOST / HOST set
+    let host = resolve_bind_host(&test_env_without_overrides(), true, BindHostConfig::Ok {
+        raw_host: Some("127.0.0.1".into()), configured: true });
+    assert_eq!(host, "127.0.0.1");
+}
+
+#[test]
+fn wsl_unconfigured_keeps_wildcard_default() {
+    let host = resolve_bind_host(&test_env_without_overrides(), true, BindHostConfig::Ok {
+        raw_host: Some("127.0.0.1".into()), configured: false });
+    assert_eq!(host, "0.0.0.0");
+}
+```
+
+(`test_env_without_overrides()` = whatever fake-env helper the existing tests in
+this module use — match it, do not invent a new one.)
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p freshell-platform network:: 2>&1 | tail -20`
+Expected: `wsl_with_configured_host_outranks_wsl_default` FAILS (gets `0.0.0.0`).
+
+- [ ] **Step 3: Apply the precedence change**
+
+In `resolve_bind_host`, BEFORE the `if is_wsl { return "0.0.0.0" ... }` branch,
+return the configured host when the config is `Ok { raw_host: Some(h), configured: true }`
+and `h` passes the function's existing host validation; keep `FRESHELL_BIND_HOST`
+above everything. Update the doc comment (`:45-48`) to the new order.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p freshell-platform network:: 2>&1 | tail -10`
+Expected: both new tests PASS; `wsl_forces_0000` and every other existing
+precedence test still PASS (they exercise `BindHostConfig::Failed` / unconfigured
+paths, which are unchanged).
+
+- [ ] **Step 5: Falsifier + commit**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/remote-access-networking
+grep -c 'wsl_with_configured_host_outranks_wsl_default' crates/freshell-platform/src/network.rs  # must be >0
+cargo test -p freshell-platform 2>&1 | tail -5
+cargo clippy -p freshell-platform --all-targets -- -D warnings 2>&1 | tail -3
+cargo fmt --check
+git add crates/freshell-platform/src/network.rs
+git commit  # paste falsifier output
+```
+
+Commit message: `fix(net): persisted configured host outranks the WSL wildcard default (restart truthfulness)`
+
 ---
 
 # SLICE 2 — Mutation endpoints, Linux-live
@@ -440,7 +524,7 @@ plus NET-01/03/08.
   - `pub fn bind_reusable(addr: std::net::SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpListener>` — a std listener with `SO_REUSEADDR` (+ `SO_REUSEPORT` on unix when `reuse_port`), nonblocking, listening.
   - `pub fn parse_reuse_port(raw: Option<&str>) -> bool` — `false` iff raw ∈ {`1`,`true`,`yes`} (case-insensitive), else `true`.
   - `pub fn reuse_port_enabled() -> bool` — reads `FRESHELL_REBIND_NO_REUSEPORT`.
-  - `pub struct RebindController` with `new`, `set_app`, `has_app`, `serve_on`, `shutdown_all` (see body in Step 4).
+  - `pub struct RebindController` with `new`, `set_app`, `has_app`, `serve_on`, `shutdown_all` (see body in Step 4). `serve_on` returns only after the OLD listener is provably closed (permit-storing `notify_one` + accept-loop `JoinHandle` barrier — VALIDATED design, ledger A-03: the naive `notify_waiters`-and-no-barrier version loses 57–99/100 wakeups and resets 42–50/100 immediate probes); in-flight connections keep draining in their own tasks.
 
 - [ ] **Step 1: Add the dependency**
 
@@ -448,9 +532,16 @@ Edit `crates/freshell-server/Cargo.toml`, in `[dependencies]`:
 
 ```toml
 socket2 = "0.6"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
+tower = { version = "0.5", features = ["util"] }
 ```
 
-Run: `cargo build -p freshell-server 2>&1 | tail -5` (fetches the crate; already in `Cargo.lock` v0.6.4 via `freshell-ws`).
+All four already resolve in `Cargo.lock` (socket2 0.6.4 via `freshell-ws`;
+hyper/hyper-util/tower via axum). `tower` may already sit in
+`[dev-dependencies]` — having it in both sections is legal; leave the dev line.
+
+Run: `cargo build -p freshell-server 2>&1 | tail -5`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -511,10 +602,39 @@ mod tests {
         assert_eq!(body2, "pong");
         ctl.shutdown_all().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hundred_rapid_rebinds_never_lose_a_listener_or_reset_a_probe() {
+        // Falsifier for the validated lost-wakeup/drain race (ledger A-03,
+        // reports/V1.md): with notify_waiters and no barrier, 42-99/100 of
+        // these iterations fail. Do NOT weaken this test.
+        use axum::{routing::get, Router};
+        let port = free_port();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let ctl = RebindController::new(port, true);
+        ctl.set_app(app);
+        let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let wildcard = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        ctl.serve_on(localhost).await.expect("initial serve");
+        for i in 0..100 {
+            let target = if i % 2 == 0 { wildcard } else { localhost };
+            ctl.serve_on(target).await.expect("swap");
+            // serve_on returned => the OLD listener is closed (barrier), so an
+            // immediate probe must hit the new listener, never ConnectionReset.
+            let body = reqwest::get(format!("http://127.0.0.1:{port}/ping"))
+                .await.expect("probe connects").text().await.unwrap();
+            assert_eq!(body, "pong", "swap #{i}");
+        }
+        ctl.shutdown_all().await;
+        // Port fully released: a plain (non-reuseport) bind succeeds only if no
+        // stuck listener remains (the lost-wakeup failure mode).
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("no stuck listeners after 100 swaps");
+    }
 }
 ```
 
-`reqwest` is already a `freshell-server` dev-dependency. If unavailable in unit tests, add it under `[dev-dependencies]`.
+`reqwest` is already a `freshell-server` dependency (in `[dependencies]`, v0.13 — available to unit tests as-is; VALIDATED, reports/V7.md).
 
 - [ ] **Step 3: Run to verify failure**
 
@@ -530,10 +650,19 @@ Prepend, above the `#[cfg(test)]` block in `crates/freshell-server/src/net_bind.
 //!
 //! We create every listener (boot AND rebind) with SO_REUSEADDR + SO_REUSEPORT
 //! so a new listener can be *proven to bind* before we persist the config and
-//! drain the old one. Rollback is dropping the new socket — an infallible no-op.
-//! There is never a zero-listener window and persisted state never outruns
-//! reality. The `FRESHELL_REBIND_NO_REUSEPORT=1` escape hatch disables
+//! retire the old one. Rollback is dropping the new socket — an infallible
+//! no-op. There is never a zero-listener window and persisted state never
+//! outruns reality. The `FRESHELL_REBIND_NO_REUSEPORT=1` escape hatch disables
 //! SO_REUSEPORT (falls back to a best-effort bind a foreign squatter can block).
+//!
+//! Drain design (VALIDATED — ledger A-03 falsified the naive version): the
+//! controller owns its own accept loop per listener. Retiring a listener uses
+//! `Notify::notify_one()` (permit-storing: the wakeup cannot be lost, unlike
+//! `notify_waiters`) and then AWAITS the old accept-loop `JoinHandle`, which
+//! exits only after dropping its listener — a deterministic "old socket
+//! closed" barrier, so callers may respond/probe immediately after `serve_on`
+//! returns. In-flight connections (incl. WebSockets) drain in their own
+//! spawned tasks — no mass 4009 on rebind.
 //!
 //! Trade-off: SO_REUSEPORT lets another process of the same effective UID bind
 //! the port. On a single-user self-hosted box that is inside the same trust
@@ -545,6 +674,7 @@ use std::sync::{Arc, OnceLock};
 use axum::Router;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 pub fn parse_reuse_port(raw: Option<&str>) -> bool {
     match raw {
@@ -577,11 +707,19 @@ pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdT
     Ok(std_listener)
 }
 
+/// One live listener: its shutdown signal + the accept-loop task handle. The
+/// accept loop drops its listener before exiting, so awaiting the handle is a
+/// true "old socket closed" barrier.
+struct LiveListener {
+    shutdown: Arc<Notify>,
+    accept_loop: JoinHandle<()>,
+}
+
 pub struct RebindController {
     port: u16,
     reuse_port: bool,
     app: OnceLock<Router>,
-    current: Mutex<Option<Arc<Notify>>>,
+    current: Mutex<Option<LiveListener>>,
 }
 
 impl RebindController {
@@ -597,32 +735,63 @@ impl RebindController {
         self.app.get().is_some()
     }
 
-    /// Bind `host:port` (proof), spawn a serve task, then drain the old listener.
-    /// On bind failure the previous listener is left untouched (no swap). When no
-    /// app has been injected (unit tests) this is an Ok no-op so validation and
-    /// persistence can be tested without a real socket.
+    /// Bind `host:port` (proof), start our own accept loop, then retire the old
+    /// listener: `notify_one` (permit-storing, cannot be lost) + await its
+    /// JoinHandle (deterministic closed barrier). On bind failure the previous
+    /// listener is left untouched (no swap). When no app has been injected
+    /// (unit tests) this is an Ok no-op so validation and persistence can be
+    /// tested without a real socket.
     pub async fn serve_on(&self, host: IpAddr) -> std::io::Result<()> {
         let Some(app) = self.app.get().cloned() else { return Ok(()); };
         let addr = SocketAddr::new(host, self.port);
         let std_listener = bind_reusable(addr, self.reuse_port)?; // PROOF: must succeed
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let notify = Arc::new(Notify::new());
-        let shutdown = notify.clone();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move { shutdown.notified().await })
-                .await;
+        let shutdown = Arc::new(Notify::new());
+        let shut = Arc::clone(&shutdown);
+        let accept_loop = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shut.notified() => break,
+                    res = listener.accept() => {
+                        let Ok((stream, _remote)) = res else { continue };
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            // axum 0.8 "serve with hyper directly" pattern — if the
+                            // compiler objects to the service shape, mirror the
+                            // vendored axum example `serve-with-hyper` exactly.
+                            // `serve_connection_with_upgrades` keeps WebSockets working.
+                            use tower::ServiceExt as _;
+                            let socket = hyper_util::rt::TokioIo::new(stream);
+                            let hyper_service = hyper::service::service_fn(
+                                move |request: hyper::Request<hyper::body::Incoming>| {
+                                    app.clone().oneshot(request)
+                                },
+                            );
+                            let _ = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection_with_upgrades(socket, hyper_service)
+                            .await;
+                        });
+                    }
+                }
+            }
+            // `listener` is dropped HERE, before the task completes: awaiting
+            // this JoinHandle is a true "old listener closed" barrier.
         });
         let mut cur = self.current.lock().await;
-        if let Some(old) = cur.replace(notify) {
-            old.notify_waiters();
+        if let Some(old) = cur.replace(LiveListener { shutdown, accept_loop }) {
+            old.shutdown.notify_one(); // permit-storing: never lost
+            let _ = old.accept_loop.await; // barrier: old socket provably closed
         }
         Ok(())
     }
 
     pub async fn shutdown_all(&self) {
-        if let Some(cur) = self.current.lock().await.as_ref() {
-            cur.notify_waiters();
+        if let Some(cur) = self.current.lock().await.take() {
+            cur.shutdown.notify_one();
+            let _ = cur.accept_loop.await;
         }
     }
 }
@@ -639,6 +808,8 @@ Expected: all `net_bind` tests PASS.
 cd /home/dan/code/freshell/.worktrees/remote-access-networking
 grep -c 'socket2' crates/freshell-server/Cargo.toml                    # must be >0
 grep -c 'pub struct RebindController' crates/freshell-server/src/net_bind.rs  # must be >0
+grep -c 'notify_one' crates/freshell-server/src/net_bind.rs                    # must be >0 (A-03 fix present)
+grep -c 'notify_waiters' crates/freshell-server/src/net_bind.rs                # must be 0 (lost-wakeup API banned here)
 cargo test -p freshell-server net_bind:: 2>&1 | tail -5
 cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
 cargo fmt --check
@@ -690,6 +861,7 @@ NetworkState {
     probe: Arc::new(FakePortProbe::new(probe_result)),
     broadcast_tx,
     rebind,
+    net_mutation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
 }
 ```
 
@@ -709,6 +881,12 @@ Edit `NetworkState` (`network.rs:146-173`), adding after `probe`:
     /// The transactional rebind controller (Slice 2). Swaps the live listener
     /// between 127.0.0.1 and 0.0.0.0 without a zero-listener window.
     pub rebind: std::sync::Arc<crate::net_bind::RebindController>,
+    /// Serializes ALL network mutations (configure / disable / firewall persist)
+    /// from before the live-bind read through persist + bind.set — the port of
+    /// the TS rebind queue (network-manager.ts:220-221, :424-436). VALIDATED
+    /// (ledger A-08, reports/V5.md): without it, concurrent mutations can
+    /// persist a host that contradicts the live listener.
+    pub net_mutation: std::sync::Arc<tokio::sync::Mutex<()>>,
 ```
 
 Add the helper method (match the `ServerSettings` path already used in `settings_store.rs`):
@@ -741,6 +919,7 @@ let network_state = network::NetworkState {
     probe: Arc::new(network::TcpPortProbe::default()),
     broadcast_tx: Arc::clone(&broadcast_tx),
     rebind: Arc::clone(&rebind),
+    net_mutation: Arc::new(tokio::sync::Mutex::new(())),
 };
 ```
 
@@ -765,7 +944,14 @@ rebind.shutdown_all().await;
 ```
 
 `shutdown_signal` is now `.await`ed directly to block `main`, then triggers the
-listener drain. Preserve the existing post-serve teardown block (`main.rs:1401-1419`).
+listener drain. Preserve the existing post-serve teardown block
+(`main.rs:1401-1429` — it ends at the CodexTerminalLaunchManager shutdown, not
+`:1419`), KEEP the function's final `ExitCode::SUCCESS` return, and delete the
+old `serve_result` error check entirely (bind failure is now the `serve_on` Err
+branch above). The SIGTERM/SIGHUP exit-0 assertions in
+`safe11_term22_shutdown_reaping.rs` / `sighup_forensics.rs` depend on that exit
+code (VALIDATED inventory: ledger A-10, reports/V6.md — 6/6 lifecycle suites
+green at the validated HEAD; no suite pins the old serving shape).
 
 - [ ] **Step 5: Run tests + full build to verify it passes**
 
@@ -797,6 +983,7 @@ Expected: `200`.
 grep -c 'rebind.serve_on' crates/freshell-server/src/main.rs           # must be >0
 grep -c 'pub rebind:' crates/freshell-server/src/network.rs            # must be >0
 grep -c 'broadcast_settings_updated' crates/freshell-server/src/network.rs  # must be >0
+grep -c 'net_mutation' crates/freshell-server/src/network.rs                # must be >0 (A-08 lock present)
 cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5
 cargo clippy -p freshell-server --all-targets -- -D warnings 2>&1 | tail -3
 cargo fmt --check
@@ -804,7 +991,7 @@ git add crates/freshell-server/src/network.rs crates/freshell-server/src/main.rs
 git commit  # paste falsifier output
 ```
 
-Commit message: `feat(net): wire broadcast_tx + RebindController into NetworkState; serve boot listener via controller`
+Commit message: `feat(net): wire broadcast_tx + RebindController + mutation lock into NetworkState; serve boot listener via controller`
 
 ## Task 2.2b: Boot bind honors persisted `settings.network` (restart truthfulness)
 
@@ -820,9 +1007,13 @@ Commit message: `feat(net): wire broadcast_tx + RebindController into NetworkSta
 (`main.rs:1638-1641`), so after a disable persists `{host:"127.0.0.1",configured:true}`,
 a restart on WSL would re-bind 0.0.0.0 (the WSL default) — re-exposing a server
 the user retracted, and failing harness Phase 5 (tier-b must stay REFUSED across
-restart). Precedence stays: explicit `FRESHELL_BIND_HOST` → persisted config
-(when `configured`) → WSL default `0.0.0.0` → `HOST` env → `127.0.0.1` — the
-platform `resolve_bind_host` already implements this given a real `BindHostConfig`.
+restart). **Depends on Task 0.3** — VALIDATED (ledger A-04, reports/V2.md): at
+the pre-plan HEAD the platform function returned the WSL default BEFORE
+consulting config (`network.rs:57-59`), so this task alone could never pass
+Phase 5. With Task 0.3 landed the precedence is: explicit `FRESHELL_BIND_HOST`
+→ persisted config (when `configured: true`) → WSL default `0.0.0.0` → `HOST`
+env → `127.0.0.1`; this task's only job is to feed the REAL persisted config in.
+Also update the `resolve_bind_host` doc comment in `main.rs:1621-1630` to match.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -908,8 +1099,8 @@ platform function already orders `FRESHELL_BIND_HOST` above the config.
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p freshell-server -p freshell-platform 2>&1 | tail -5`
-Expected: green (the platform `resolve_bind_host` precedence tests already exist
-and still pass; the new helper test passes). Harness Phase 5 (Task 5.3) is the
+Expected: green (the platform precedence tests — including Task 0.3's two new
+ones — still pass; the new helper test passes). Harness Phase 5 (Task 5.3) is the
 live proof: after disable + restart, tier (b) stays REFUSED.
 
 - [ ] **Step 5: Falsifier + commit**
@@ -940,7 +1131,7 @@ Commit message: `feat(net): boot bind honors persisted settings.network (restart
 
 1. Auth → 401 `{"error":"Unauthorized"}`.
 2. Parse body into the enum-typed request. Failure → **400 `{"error":"Invalid request","details":[...]}`**. `host` accepts ONLY `"127.0.0.1"`/`"0.0.0.0"` (decoded into a Rust enum — the NET-08 arbitrary-host defense made structural). Schema is NON-strict (unknown keys ignored, matching `NetworkConfigureSchema`).
-3. Compute `host_changed` from the LIVE bind (`BindState::get()`). **DEVIATION (ledgered, Task 6.1 #7):** the TS forces `host_changed=false` on wsl2 (`network-manager.ts:412-413`) because its WSL exposure rides Windows portproxy and the listener always stays on 0.0.0.0. Our port binds truthfully on every platform, and the tier-b bind-address truth test plus the NET-06 disable (which really rebinds to loopback on this WSL2 host) require the symmetric re-expose to really rebind too — so wsl2 rebinds like every other platform.
+3. Acquire `state.net_mutation.lock().await` and hold the guard through step 6 (A-08 serialization — the TS serialized rebinds via its `pendingRebindConfig` queue; we serialize via one mutex). Then compute `host_changed` from the LIVE bind (`BindState::get()`). **DEVIATION (ledgered, Task 6.1 #7):** the TS forces `host_changed=false` on wsl2 (`network-manager.ts:412-413`) because its WSL exposure rides Windows portproxy and the listener always stays on 0.0.0.0. Our port binds truthfully on every platform, and the tier-b bind-address truth test plus the NET-06 disable (which really rebinds to loopback on this WSL2 host) require the symmetric re-expose to really rebind too — so wsl2 rebinds like every other platform.
 4. If `host_changed`: `rebind.serve_on(new_ip)` — binds+proves the new listener FIRST. On `Err` → **500 `{"error":"Failed to configure network"}`, nothing persisted, old listener untouched**.
 5. Persist `{network:{host, configured}}` via `settings.patch(...)` (NET-09 rides the store; no new writer). On patch error propagate `(status, body)`.
 6. `facts.invalidate()`, `bind.set(new_host)`.
@@ -1078,6 +1269,8 @@ async fn configure(
             }]));
         }
     };
+    // A-08: serialize all network mutations — held through persist + bind.set.
+    let _mutation_guard = state.net_mutation.lock().await;
     let new_host = network_host_str(&req.host).to_string(); // "127.0.0.1" | "0.0.0.0"
     let live_host = state.bind.get().await;
     // DEVIATION (Task 6.1 #7): no wsl2 exception — our bind is truthful on every
@@ -1152,7 +1345,7 @@ Commit message: `feat(net): POST /api/network/configure with transactional rebin
 1. Auth → 401.
 2. Strict-parse → 400 on unknown key / `confirmElevation:false` / empty `confirmationToken`.
 3. (409 in-flight lock pre-check added in Task 3.3 when the gate is wired.)
-4. Resolve the disable action from the live platform:
+4. Acquire `state.net_mutation.lock().await` (held through the rebind + persist — A-08), then resolve the disable action from the live platform:
    - **Native Linux / macOS (this host's non-WSL path):** `{method:"none", message:...}`; when remote access WAS requested, apply the disabled state (rebind to `127.0.0.1` + persist `{host:"127.0.0.1",configured:true}` + broadcast). This IS the live retract (NET-06).
    - **WSL2 with `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`:** same Linux path (deterministic, zero `netsh`). Otherwise return the `confirmation-required` body WITHOUT elevating (HOST-BLOCKED). Never elevate here.
 5. Message strings are the control signal — EXACT constants (`network-router.ts:40-48`), modeled as an enum discriminant, not a free string:
@@ -1199,6 +1392,32 @@ async fn disable_requires_auth() {
         .oneshot(Request::builder().method("POST").uri("/api/network/disable-remote-access")
             .header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn concurrent_configure_and_disable_serialize_to_a_consistent_end_state() {
+    // Falsifier for the A-08 mutation lock: without net_mutation held across
+    // bind.get() -> bind.set(), interleavings persist a host that contradicts
+    // the live bind (concrete counterexample schedules in reports/V5.md).
+    use axum::body::Body; use axum::http::Request; use tower::util::ServiceExt;
+    let state = test_state("0.0.0.0", Some(true));
+    seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
+    let cfg = router(state.clone()).oneshot(Request::builder().method("POST")
+        .uri("/api/network/configure").header("x-auth-token","tok")
+        .header("content-type","application/json")
+        .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#)).unwrap());
+    let dis = router(state.clone()).oneshot(Request::builder().method("POST")
+        .uri("/api/network/disable-remote-access").header("x-auth-token","tok")
+        .header("content-type","application/json")
+        .body(Body::from("{}")).unwrap());
+    let (r1, r2) = tokio::join!(cfg, dis);
+    assert_eq!(r1.unwrap().status(), 200);
+    assert_eq!(r2.unwrap().status(), 200);
+    // Whichever order the lock imposed, persisted host must equal the live bind.
+    let persisted = serde_json::to_value(&state.settings.get().await.network).unwrap()["host"].clone();
+    let live = state.bind.get().await;
+    assert_eq!(persisted, serde_json::json!(live),
+        "persisted host desynced from live bind (A-08)");
 }
 ```
 
@@ -1258,6 +1477,9 @@ async fn disable_remote_access(
 
     // (Slice 3 inserts the 409 in-flight lock pre-check here.)
 
+    // A-08: serialize all network mutations — held through persist + bind.set.
+    let _mutation_guard = state.net_mutation.lock().await;
+
     let facts = state.facts.get_or_refresh().await;
     let platform = facts.firewall.platform;
     let settings = state.settings.get().await;
@@ -1272,7 +1494,15 @@ async fn disable_remote_access(
 
     if is_live_linux_lane {
         if requested {
-            let _ = state.rebind.serve_on(std::net::IpAddr::from([127,0,0,1])).await;
+            // VALIDATED (ledger A-09, reports/V1.md): a foreign non-reuseport
+            // squatter on the port makes this bind fail (EADDRINUSE) — never
+            // claim a retract that did not happen.
+            if state.rebind.serve_on(std::net::IpAddr::from([127, 0, 0, 1])).await.is_err() {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to disable remote access" })),
+                ).into_response();
+            }
             let merged = match state.settings
                 .patch(&json!({"network":{"host":"127.0.0.1","configured":true}})).await {
                 Ok(m) => m,
@@ -1415,8 +1645,9 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
 }
 ```
 
-If `sha2` is not a dev-dep, add it under `[dev-dependencies]` (or shell out to
-`sha256sum`). `libc` is already a unix dev/dep.
+`sha2` 0.10 is already a `freshell-server` dependency (usable from tests).
+`libc` is already present under `[target.'cfg(unix)'.dependencies]` (VALIDATED,
+reports/V7.md).
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1641,8 +1872,8 @@ Expected: compile error.
 
 - [ ] **Step 3: Implement the module**
 
-Write `ManagedPortsStore` with `sha256` keying (use the crate the server already
-vendors; if none, add `sha2` to `[dependencies]`), atomic tmp+rename
+Write `ManagedPortsStore` with `sha256` keying (use the `sha2` 0.10 crate
+already in `[dependencies]` — VALIDATED, reports/V7.md), atomic tmp+rename
 (`.tmp-<pid>-<nanos>` then `std::fs::rename`), and the normalization rule. The WSL
 methods mirror the Windows ones under a `wsl-managed-remote-access-ports/` subdir
 keyed identically (fixing D15/D16). `None` home ⇒ read returns empty, persist
@@ -1773,7 +2004,9 @@ Dispatch via a small `fn elevation_runner_for(state) -> ElevationRunner` returni
 `elevation_runner_live()` in production and a test-injected `Fake` under
 `#[cfg(test)]` (or expose a gate/dispatch helper the tests call directly). Persist
 managed ports on `Started` via `ManagedPortsStore`. Broadcast `settings.updated`
-only on actual settings change.
+only on actual settings change. Hold `state.net_mutation.lock().await` across the
+post-dispatch persist/broadcast section (managed ports + settings), matching
+Tasks 2.3/2.4 (A-08).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1852,7 +2085,8 @@ wiring test is the RED one that drives the change).
 - [ ] **Step 3: Wire `stale` + WSL plan assembly**
 
 In `build_status_value`/`build_network_status`, replace hardcoded
-`let stale = false;` (`network.rs:357`) with a computed value:
+`let stale = false;` (`network.rs:361`, inside the pure `build_network_status`)
+with a computed value:
 - Windows + firewall active: `stale = get_existing_managed_windows_firewall_ports(runner)` contains any port not in `remote_access_ports`.
 - WSL2 + rawPortOpen true: recompute the WSL plan; `stale` iff `plan` is `Ready`.
 Use a `StdCommandRunner` at the call boundary in production (read-only `netsh ... show`), as `resolve_live_network_facts` does; inject a `FakeCommandRunner` in tests. Keep all mutation OUT — read-only queries only.
@@ -1882,7 +2116,7 @@ Commit message: `feat(net): wire stale managed-ports + WSL2 plan assembly behind
 
 **Interfaces:**
 - Consumes: `ElevationOutcome`, `ConfirmationGate`, `FakeCommandRunner`.
-- Produces: four tests proving each failure outcome (a) releases the lock exactly once, (b) leaves `firewall.configuring == false`, (c) persists NO success, (d) a subsequent success after switching the fake to a good response works; plus a suite-wide assertion that no `netsh ... add|delete|set` and no `Start-Process -Verb RunAs` reached a real runner (`FakeCommandRunner::call_count`) and the compile-time unreachability test from Task 3.1.
+- Produces: four tests proving each failure outcome (a) releases the lock exactly once, (b) leaves `firewall.configuring == false`, (c) persists NO success, (d) a subsequent success after switching the fake to a good response works; plus the token-protocol trio (single-use replay, wrong-action re-issue, parallel-confirm 409) — Rust-only BY VALIDATED NECESSITY (ledger A-06, reports/V5.md: no live lane on this host ever issues a confirmation token under `FRESHELL_DISABLE_WSL_PORT_FORWARD=1`); plus a suite-wide assertion that no `netsh ... add|delete|set` and no `Start-Process -Verb RunAs` reached a real runner (`FakeCommandRunner::call_count`) and the compile-time unreachability test from Task 3.1.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1902,6 +2136,27 @@ fn no_real_os_mutation_command_reaches_a_runner() {
     // "add rule" / "delete rule" / "portproxy add" / "RunAs". Combined with
     // on_non_windows_the_live_runner_is_unsupported (Task 3.1), this proves zero
     // real OS mutation on this host.
+}
+
+#[tokio::test]
+async fn confirmation_token_is_single_use() {
+    // Issue -> confirm (Started via a good Fake) -> REPLAY the same token: the
+    // second POST must yield a NEW confirmation-required (fresh token), never a
+    // second dispatch (FakeCommandRunner::call_count unchanged).
+}
+
+#[tokio::test]
+async fn wrong_action_token_reissues_and_never_executes() {
+    // A token issued for one action presented where the freshly-resolved action
+    // differs => re-issue (fresh token bound to the new action), zero runner calls.
+}
+
+#[tokio::test]
+async fn parallel_confirmed_posts_one_wins_one_409() {
+    // Two simultaneous confirmed POSTs (tokio::join!): exactly one dispatches;
+    // the other gets 409 {"error":"Firewall configuration already in progress",
+    // "method":"in-progress"}. Live-unreachable on this host (ledger A-06), so
+    // this Rust test is the ONLY 409-lock race proof - do not delete it.
 }
 ```
 
@@ -2051,7 +2306,7 @@ phase0_preflight() {
   HOME_DIR="$(mktemp -d)"; mkdir -p "$HOME_DIR/.freshell"
   cat > "$HOME_DIR/.freshell/config.json" <<'JSON'
 { "version": 1,
-  "settings": { "network": { "host": "127.0.0.1", "configured": false } },
+  "settings": { "network": { "host": "127.0.0.1", "configured": true } },
   "sessionOverrides": { "SENTINEL_SESSION": { "keep": "me" } },
   "terminalOverrides": { "SENTINEL_TERM": { "keep": "me" } },
   "serverSecrets": { "SENTINEL_SECRET": "do-not-touch" },
@@ -2060,6 +2315,10 @@ phase0_preflight() {
   "projectColors": { "/tmp/a": "#123456" },
   "someUnknownFutureKey": { "arbitrary": [1, 2, 3] } }
 JSON
+  # configured:true is deliberate: without it a WSL boot defaults to 0.0.0.0
+  # (VALIDATED, ledger A-04/A-05). Boot must honor the persisted loopback intent
+  # (Tasks 0.3 + 2.2b). NEVER set FRESHELL_BIND_HOST anywhere in this harness -
+  # it outranks config and would mask exactly what Phase 5 exists to prove.
   AUTH_TOKEN="$(openssl rand -hex 32)"  # never echoed/written to the report
   # per-key sha of the ORIGINAL for the Phase-5 diff (exclude version/settings)
   for k in sessionOverrides terminalOverrides serverSecrets completedMigrations recentDirectories projectColors someUnknownFutureKey; do
@@ -2076,7 +2335,12 @@ phase1_boot() {
   SERVER_PID=$!
   echo "$SERVER_PID" > "$REPORT_DIR/server.pid"
   for _ in $(seq 1 100); do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/health" || true)" = "200" ] && return 0
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/health" || true)" = "200" ]; then
+      # Boot must honor the seeded configured loopback (Tasks 0.3 + 2.2b).
+      ss -ltn | grep ":$PORT " | grep -q '127.0.0.1' \
+        || { echo "FATAL: boot bound non-loopback despite configured:true"; exit 1; }
+      return 0
+    fi
     sleep 0.2
   done
   echo "FATAL: server did not become healthy"; exit 1
@@ -2142,19 +2406,30 @@ tier_b() { # returns "200" (reachable => 0.0.0.0-bound) or "REFUSED"
 - **Phase 2 — endpoint surface (auth ±):** for each of the five endpoints, one
   request WITH auth and one WITHOUT. Assert authed → 200 (POSTs need a valid
   body); unauthed → 401 with `{"error":"Unauthorized"}`. On `GET /api/network/status`
-  assert EVERY `NetworkStatus` key present with correct JSON type via `jq`
+  assert EVERY `NetworkStatus` key present with correct JSON type via `jq` —
+  `firewall.portOpen` is nullable: presence, not non-null, is the assertion
   (`configured, host, remoteAccessEnabled, remoteAccessRequested,
   remoteAccessNeedsRepair, port, lanIps, machineHostname, firewall{platform,
   active, portOpen, commands, configuring}, rebinding, devMode, accessUrl`), and
   content-type `application/json; charset=utf-8`.
 - **Phase 3 — expose:** `api POST /api/network/configure '{"host":"0.0.0.0","configured":true}'`
-  → 200; status `host=="0.0.0.0"`, `firewall.portOpen==true`, `remoteAccessEnabled==true`;
-  tier (a) `curl http://127.0.0.1:$PORT/api/health` → 200; **tier (b) `[ "$(tier_b)" = 200 ]` REQUIRED**;
-  tier (c) 200 or documented degradation.
+  → 200; status `host=="0.0.0.0"`, `configured==true`, `rebindScheduled==false`;
+  `firewall.portOpen==null` and `remoteAccessEnabled==false` — VALIDATED truth at
+  non-3001 ports on this host (ledger A-05, reports/V3.md: the wsl2 probe targets
+  `lanIps[0]`, the Windows LAN IP, reachable only through the 3001-scoped
+  portproxy, so the probe times out ⇒ `null`; wsl2 `remoteAccessEnabled` requires
+  `portOpen==true`). Exposure ground truth is the vantage ladder, NOT those two
+  fields: tier (a) `curl http://127.0.0.1:$PORT/api/health` → 200;
+  **tier (b) `[ "$(tier_b)" = 200 ]` REQUIRED**; tier (c) 200 or documented
+  degradation. Budget ~3s per status call on wildcard binds (uncached probe
+  measured ~2.0–2.2s live).
 - **Phase 4 — retract:** `api POST /api/network/disable-remote-access '{}'` → 200 with
   `method`; status `host=="127.0.0.1"`, `portOpen==null`, `remoteAccessEnabled==false`;
   **tier (b) `[ "$(tier_b)" = REFUSED ]` REQUIRED**; tier (a) still 200;
   `ss -ltn | grep -c ":$PORT "` shows exactly ONE listener, bound `127.0.0.1`.
+  The disable response is emitted only after the old listener is provably closed
+  (Task 2.1 barrier), so these checks may run immediately; still retry tier (b)
+  once after 2s before failing (powershell.exe flakiness, not drain).
 
 Each assertion increments a pass/fail counter; a required failure calls
 `fail_required`.
@@ -2195,8 +2470,11 @@ Commit message: `feat(net): harness Phase 2-4 — endpoint surface + expose/retr
     [ "$now" = "$orig" ] || fail_required "top-level key $k changed across mutation"
   done
   ```
-- Restart the server on the same isolated HOME; assert status shows the persisted
-  state (`host=="127.0.0.1"`); tier (b) REFUSED.
+- Restart the server on the same isolated HOME **with the same env as Phase 1 —
+  in particular `FRESHELL_DISABLE_WSL_PORT_FORWARD=1` and still no
+  `FRESHELL_BIND_HOST`** (a bare restart silently changes lanes — reports/V5.md);
+  assert status shows the persisted state (`host=="127.0.0.1"`); tier (b) REFUSED.
+  This is the live proof of Tasks 0.3 + 2.2b (ledger A-04).
 
 - [ ] **Step 2: Run + Step 3: Falsifier + commit**
 
@@ -2227,18 +2505,35 @@ Commit message: `feat(net): harness Phase 5 — restart + NET-09 byte-preservati
   8. `disable-remote-access {"unknownKey":1}` (strict) → 400
   9. `configure-firewall {"confirmElevation":false}` → 400
   10. `configure-firewall {"confirmationToken":""}` → 400
-  11. token replay (issue → confirm → confirm again) → second is a NEW
-      `confirmation-required`, never a second execution
-  12. wrong-action token across the two endpoints → re-issue, never execute
-  13. two parallel confirmed POSTs → exactly one proceeds, other 409 `method:"in-progress"`
-  14. injection strings in `confirmationToken` → 400/re-issue, never reaches a runner
+  11. token-shaped request to `configure-firewall` (`{"confirmationToken":"<uuid>"}`)
+      → 200 `method:"none"` and ZERO side effects (config sha unchanged, listener
+      set unchanged). VALIDATED (ledger A-06, reports/V5.md): with
+      `FRESHELL_DISABLE_WSL_PORT_FORWARD=1` on this host, NO live lane ever
+      issues a confirmation token, so token replay / wrong-action / parallel-409
+      are structurally unreachable live — they are covered by the Rust tests in
+      Task 3.5 (`confirmation_token_is_single_use`,
+      `wrong_action_token_reissues_and_never_executes`,
+      `parallel_confirmed_posts_one_wins_one_409`) instead.
+  12. same token-shaped request against `disable-remote-access` → 200
+      `method:"none"`, zero side effects.
+  13. two parallel `disable-remote-access` POSTs → both 200 `method:"none"`,
+      config sha afterwards unchanged and consistent (the net_mutation lock
+      serializes them; no live 409 is expected — the 409 race is Rust-tested).
+  14. injection strings in `confirmationToken` (`$(id)`, backtick, newline
+      variants) → 200 `method:"none"` (non-empty strings pass shape validation
+      BY DESIGN — the real property is behavioral): zero side effects, nothing
+      reaches a runner, config sha + `ss` listener set unchanged.
   15. positive control — one valid `configure` still succeeds → 200
 
-  Also `grep -F "$AUTH_TOKEN" "$HOME_DIR/server.log"` → MUST be absent (NET-03).
+  Also `grep -F "$AUTH_TOKEN" "$HOME_DIR/server.log"` → MUST be absent (NET-03;
+  scan the LOG only — the token legitimately appears in `accessUrl` response
+  bodies, reports/V3.md).
 
   Cases 5/6/14 are ALSO proved structurally by the Rust unit tests (`host` enum,
   `wsl_ip: Ipv4Addr`, `FakeCommandRunner::call_count()==0`); the harness proves
-  them live too — both required, neither substitutes for the other.
+  them live too — both required, neither substitutes for the other. The token
+  PROTOCOL cases (replay / wrong-action / parallel 409) are Rust-only by
+  validated necessity, not by preference.
 
 - [ ] **Step 2: Run + Step 3: Falsifier + commit**
 
@@ -2248,7 +2543,7 @@ git add scripts/verify-remote-access.sh
 git commit  # paste output
 ```
 
-Commit message: `feat(net): harness Phase 6 — NET-08 negative matrix (15 cases) + token-never-logged`
+Commit message: `feat(net): harness Phase 6 — NET-08 negative matrix (live cases + degraded token variants) + token-never-logged`
 
 ## Task 5.5: Harness Phase 7 (cleanup, safety self-proof, report.json) + tier-c gating
 
@@ -2266,7 +2561,10 @@ cleanup() {
     local cwd cmd
     cwd="$(readlink -f /proc/$SERVER_PID/cwd 2>/dev/null || true)"
     cmd="$(tr '\0' ' ' < /proc/$SERVER_PID/cmdline 2>/dev/null || true)"
-    if [ "$SERVER_PID" != "64553" ] && echo "$cmd" | grep -q 'freshell-server'; then
+    # Never signal a pid we don't own: cmdline must be our server AND the pid
+    # must NOT hold :3001 (the user's live instance). No hardcoded pids.
+    if echo "$cmd" | grep -q 'freshell-server' \
+       && ! ss -ltnp 2>/dev/null | grep ":3001 " | grep -q "pid=$SERVER_PID,"; then
       kill -TERM "$SERVER_PID" 2>/dev/null || true
       for _ in $(seq 1 25); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.2; done
     fi
@@ -2337,7 +2635,15 @@ Commit message: `feat(net): harness Phase 7 — cleanup, read-only host-state se
 
 Append entries with status `proposed`, each with objective_defect (a TS
 `file:line` citation), port_behavior, and pinning_test (a test name from this
-plan):
+plan). `port/oracle/DEVIATIONS.md` uses the `DEV-NNNN` / `EDEV-NN` ID scheme —
+append new `DEV-NNNN` entries continuing the existing sequence (VALIDATED,
+reports/V7.md: the file contains no "D1/D15/D16/D19" IDs). Those D-numbers are
+plan-internal defect labels, defined ONLY here — do not grep for them:
+**D1** = the TS consumes a confirmation token without binding it to the action
+that issued it; **D15** = the TS WSL managed-ports file ignores `FRESHELL_HOME`
+and is not instance-scoped; **D16** = the TS managed-ports writes are
+non-atomic; **D19** = the TS models repair and disable actions as one type,
+leaving an unreachable `terminal`-on-disable state representable.
 
 1. **Transactional rebind (bind-new-before-persist, `SO_REUSEPORT`)** — defect:
    `server/network-manager.ts:477-483` (`CATASTROPHIC: ... server has no active
@@ -2368,6 +2674,15 @@ plan):
    `remoteAccessEnabled = rawPortOpen === true` (`network-manager.ts:349-350`) —
    depended on by `src/lib/share-utils.ts:17-34`; Slice 1 ports it faithfully.
    Note as reviewed and deliberately kept.
+8. **Persisted `configured` host outranks the WSL wildcard default** (Task 0.3) —
+   objective_defect: `server/get-network-host.ts:42` returns `0.0.0.0` for WSL
+   before consulting the persisted config, so a disable that persisted loopback
+   is silently re-exposed on the next boot (contradicts NET-02/NET-06 restart
+   truthfulness; validated live in reports/V2.md). port_behavior: precedence is
+   `FRESHELL_BIND_HOST` → persisted config when `configured:true` → WSL default
+   `0.0.0.0` → `HOST` → `127.0.0.1`; unconfigured WSL keeps the wildcard
+   default. pinning_test: `wsl_with_configured_host_outranks_wsl_default` +
+   `wsl_unconfigured_keeps_wildcard_default` + harness Phase 5.
 
 - [ ] **Step 2: Commit**
 
@@ -2392,10 +2707,13 @@ git status --porcelain server/ shared/ src/            # MUST be empty
 grep -c 'c\.token == t' crates/freshell-platform/src/elevated.rs                              # 0
 grep -c 'timing_safe_compare' crates/freshell-platform/src/elevated.rs                        # >0
 grep -c 'fn build_port_forwarding_script(wsl_ip: &str' crates/freshell-platform/src/port_forward.rs  # 0
+grep -c 'wsl_with_configured_host_outranks_wsl_default' crates/freshell-platform/src/network.rs      # >0
 # Slice 2
 grep -c '"/api/network/configure"' crates/freshell-server/src/network.rs                      # >0
 grep -c '"/api/network/disable-remote-access"' crates/freshell-server/src/network.rs          # >0
 grep -c 'socket2' crates/freshell-server/Cargo.toml                                           # >0
+grep -c 'net_mutation' crates/freshell-server/src/network.rs                                  # >0
+grep -c 'notify_one' crates/freshell-server/src/net_bind.rs                                   # >0
 # Slice 3
 grep -c '"/api/network/configure-firewall"' crates/freshell-server/src/network.rs             # >0
 grep -c 'ElevationRunner::Unsupported' crates/freshell-platform/src/elevated.rs               # >0
@@ -2424,13 +2742,13 @@ NET-04/05/07 are recorded HOST-BLOCKED and left unchecked in the parity checklis
 | Requirement | Covering task(s) | Observable production outcome (no stub) |
 |---|---|---|
 | NET-01 complete live status | Slice 1 (landed) + Task 3.4 (`stale` unhardcoded) | `GET /api/network/status` returns full `NetworkStatus`; harness Phase 2 asserts every key |
-| NET-02 transactional rebind | 2.1, 2.2b, 2.3 | `configure` binds+proves the new listener before persist; boot honors persisted host across restart; harness Phase 3 tier-b 200; squatter unit test proves rollback |
+| NET-02 transactional rebind | 0.3, 2.1, 2.2b, 2.3 | `configure` binds+proves the new listener before persist (and `serve_on` returns only after the old socket is provably closed); boot honors persisted host across restart (platform precedence fixed in 0.3); harness Phase 3 tier-b 200; squatter + 100-swap unit tests prove rollback and drain |
 | NET-03 share URL, token never logged | Slice 1 (`accessUrl`) + harness Phase 6 token-scan | harness greps `server.log` for the token → absent |
 | NET-04 Windows firewall configure/repair | 3.1, 3.3, 3.4, 3.5 | golden strings + fake-backed behavior + compile-time unreachability; **HOST-BLOCKED live effect, evidenced 3.6** |
 | NET-05 WSL2 forwarding | 3.4 | golden plan from real captured portproxy; **HOST-BLOCKED live effect, evidenced 3.6** |
 | NET-06 safe disable | 2.4 | `disable-remote-access` live retract on Linux; harness Phase 4 tier-b REFUSED, tier-a still 200 |
 | NET-07 elevation faults | 3.1, 3.5 | four outcome tests: lock released, `configuring=false`, no false persist; **HOST-BLOCKED live effect, evidenced 3.6** |
-| NET-08 secure every mutation | 2.3, 2.4, 3.3 + harness Phase 6 | 15-case live matrix + structural Rust tests (enum host, Ipv4Addr, call_count 0) |
+| NET-08 secure every mutation | 2.3, 2.4, 3.3, 3.5 + harness Phase 6 | live negative matrix (auth/schema/host-enum/injection/degraded-token cases, each zero-side-effect-checked) + structural Rust tests (enum host, Ipv4Addr, call_count 0, token replay/wrong-action/parallel-409 — live-unreachable on this host, ledger A-06) |
 | NET-09 lossless writes | 2.3, 2.4, 2.5 | mutations go through `settings.patch`; black-box + harness Phase 5 per-key sha preservation |
 | NET-10 native Linux guidance | Slice 1 + 3.3 `terminal` branch | `configure-firewall` returns `{method:"terminal",command}`; server never runs it |
 
@@ -2460,9 +2778,11 @@ concrete instruction, not a placeholder.
 
 - `RebindController` methods (`new`, `set_app`, `has_app`, `serve_on`,
   `shutdown_all`) are named identically across Tasks 2.1–2.4.
-- `NetworkState` new fields (`broadcast_tx`, `rebind`, `gate`) are introduced in
-  2.2 / 3.3 and every later `test_state` update and handler references the same
-  names.
+- `NetworkState` new fields (`broadcast_tx`, `rebind`, `net_mutation`, `gate`)
+  are introduced in 2.2 / 3.3 and every later `test_state` update and handler
+  references the same names. `net_mutation` (the A-08 serialization lock) is
+  acquired in 2.3 / 2.4 / 3.3 with the same held-through-persist contract;
+  `LiveListener` is internal to `net_bind.rs`.
 - `ConfirmFirewallRequest` (strict) is defined in 2.4 and reused in 3.3.
 - `invalid_request` / `build_status_value` are introduced in 2.3 and reused by
   2.4 / 3.3 / 3.4.
