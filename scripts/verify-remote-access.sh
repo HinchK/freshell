@@ -70,7 +70,22 @@ tier_c_probe() { # LAN vantage via lanIps[0]; meaningful only at :3001 (the port
     2>/dev/null | tr -d '\r'
 }
 
-cleanup() { :; }  # replaced in Task 5.5
+cleanup() {
+  if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    # ownership verify before signaling
+    local cwd cmd
+    cwd="$(readlink -f /proc/$SERVER_PID/cwd 2>/dev/null || true)"
+    cmd="$(tr '\0' ' ' < /proc/$SERVER_PID/cmdline 2>/dev/null || true)"
+    # Never signal a pid we don't own: cmdline must be our server AND the pid
+    # must NOT hold :3001 (the user's live instance). No hardcoded pids.
+    if echo "$cmd" | grep -q 'freshell-server' \
+       && ! ss -ltnp 2>/dev/null | grep ":3001 " | grep -q "pid=$SERVER_PID,"; then
+      kill -TERM "$SERVER_PID" 2>/dev/null || true
+      for _ in $(seq 1 25); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.2; done
+    fi
+  fi
+  [ "$KEEP_HOME" = 1 ] || { [ -n "${HOME_DIR:-}" ] && rm -rf "$HOME_DIR"; }
+}
 trap cleanup EXIT INT TERM
 
 probe_free_port() {
@@ -236,6 +251,7 @@ phase3_expose() {
     DEGRADATIONS+=("tier-c: skipped - PORT=$PORT != 3001 (the portproxy chain is 3001-scoped; rerun --port 3001 --tier-c when 3001 is free)")
     tier_c_result=skipped
   fi
+  TIER_C_PROBE="$tier_c_result"  # consumed by Phase 7's tier-c gating
   echo "phase3 expose: tier_a=$tier_a tier_b=$tb tier_c=$tier_c_result"
 }
 
@@ -456,6 +472,82 @@ phase6_net08_matrix() {
   echo "phase6 net-08 matrix: 15 cases + token-never-logged done (pass=$PASS fail=$FAIL)"
 }
 
+# Phase 7 - teardown + no-leak assertion + READ-ONLY host-state identity
+# self-proof + tier-c gating + report.json. The self-proof re-runs BOTH
+# Phase-0 read-only captures (portproxy table, FreshellLANAccess firewall
+# rule) and requires byte-identity: this harness never runs a mutating netsh,
+# so ANY diff is a safety violation => HOST_STATE_UNCHANGED=0 + required fail.
+phase7_teardown_selfproof_report() {
+  local host_after fw_after vantage pp_target
+  # -- teardown NOW via the same ownership-verified reaper the EXIT trap uses
+  # (idempotent: the trap re-run finds the pid gone), then prove no leak --
+  cleanup
+  if ss -ltn | grep -q ":$PORT "; then
+    fail_required "phase7: listener leaked on :$PORT after cleanup"
+  else PASS=$((PASS+1)); log "PASS: phase7: no listener leaked on :$PORT"; fi
+  # -- safety self-proof: re-run BOTH read-only captures, diff vs Phase 0 --
+  host_after="$(powershell.exe -NoProfile -Command 'netsh interface portproxy show all' 2>/dev/null || true)"
+  fw_after="$(powershell.exe -NoProfile -Command 'netsh advfirewall firewall show rule name=FreshellLANAccess' 2>/dev/null || true)"
+  HOST_STATE_UNCHANGED=1
+  printf '%s\n' "$HOST_STATE_BEFORE"     > "$REPORT_DIR/portproxy.before"
+  printf '%s\n' "$host_after"            > "$REPORT_DIR/portproxy.after"
+  printf '%s\n' "$FIREWALL_STATE_BEFORE" > "$REPORT_DIR/firewall.before"
+  printf '%s\n' "$fw_after"              > "$REPORT_DIR/firewall.after"
+  if ! diff -u "$REPORT_DIR/portproxy.before" "$REPORT_DIR/portproxy.after" > "$REPORT_DIR/portproxy.diff"; then
+    HOST_STATE_UNCHANGED=0
+    fail_required "phase7: host portproxy table CHANGED across run (diff follows)"
+    cat "$REPORT_DIR/portproxy.diff" >&2
+  fi
+  if ! diff -u "$REPORT_DIR/firewall.before" "$REPORT_DIR/firewall.after" > "$REPORT_DIR/firewall.diff"; then
+    HOST_STATE_UNCHANGED=0
+    fail_required "phase7: FreshellLANAccess firewall rule CHANGED across run (diff follows)"
+    cat "$REPORT_DIR/firewall.diff" >&2
+  fi
+  if [ "$HOST_STATE_UNCHANGED" = 1 ]; then
+    PASS=$((PASS+1)); log "PASS: phase7: host state identical (portproxy + FreshellLANAccess rule)"
+  fi
+  # -- tier-c gating --
+  # Unconditional READ-ONLY sanity control from the LAN vantage: curl the
+  # USER'S LIVE :3001 health endpoint over ssh. Non-200 / no ssh => the LAN
+  # vantage is unavailable today - recorded as a NOTE, never a failure.
+  vantage="$(ssh -o BatchMode=yes -o ConnectTimeout=8 shapiroserver2 \
+    "curl -s -o /dev/null -w '%{http_code}' --max-time 6 http://192.168.3.50:3001/api/health" \
+    2>/dev/null | tr -d '\r' || true)"
+  echo "phase7: tier-c vantage control (ssh shapiroserver2 -> live :3001): '${vantage:-}'"
+  if [ "$vantage" != "200" ]; then
+    echo "NOTE: tier_c_vantage: unavailable (control returned '${vantage:-}'; not a failure)"
+  fi
+  if [ "$TIER_C" = 1 ] && [ "$PORT" = "3001" ]; then
+    TIER_C_STATUS=pass; TIER_C_REASON=""
+    pp_target="$(printf '%s\n' "$host_after" | tr -d '\r' | awk '$1=="0.0.0.0" && $2=="3001" {print $3; exit}')"
+    if [ "${TIER_C_PROBE:-}" != "200" ]; then
+      TIER_C_STATUS=degraded; TIER_C_REASON="phase3 tier-c probe did not return 200 (got '${TIER_C_PROBE:-unset}')"
+    elif ss -ltn "( sport = :3001 )" | grep -q ":3001 "; then
+      TIER_C_STATUS=degraded; TIER_C_REASON="something still listening on :3001 post-cleanup"
+    elif [ -z "$pp_target" ]; then
+      TIER_C_STATUS=degraded; TIER_C_REASON="no portproxy rule 0.0.0.0 3001 -> $WSL_IP 3001"
+    elif [ "$pp_target" != "$WSL_IP" ]; then
+      TIER_C_STATUS=degraded; TIER_C_REASON="portproxy target $pp_target != current eth0 $WSL_IP"
+    fi
+    if [ "$TIER_C_STATUS" = "degraded" ]; then DEGRADATIONS+=("tier-c: $TIER_C_REASON"); fi
+  else
+    TIER_C_STATUS=degraded
+    TIER_C_REASON="firewall allow scoped to 3001 only (FreshellLANAccess LocalPort=3001); harness port $PORT may not open a new rule (safety rule)"
+    DEGRADATIONS+=("$TIER_C_REASON")
+  fi
+  # -- report.json (tier-c fields via --arg; degradations = the REAL array) --
+  jq -n --arg port "$PORT" --arg wsl "$WSL_IP" \
+     --arg tcs "$TIER_C_STATUS" --arg tcr "$TIER_C_REASON" \
+     --argjson passed "$([ "$REQUIRED_FAIL" = 0 ] && echo true || echo false)" \
+     --argjson unchanged "$([ "$HOST_STATE_UNCHANGED" = 1 ] && echo true || echo false)" \
+     '{port:($port|tonumber), wsl_ip:$wsl,
+       tiers:{a:{},b:{},c:{status:$tcs,reason:$tcr}},
+       deferred_host_blocked:["NET-04","NET-05","NET-07"],
+       degradations:$ARGS.positional, host_state_unchanged:$unchanged, passed:$passed}' \
+     --args "${DEGRADATIONS[@]}" > "$REPORT_DIR/report.json"
+  cat "$REPORT_DIR/report.json"
+}
+
 main() {
   phase0_preflight
   phase1_boot
@@ -464,9 +556,11 @@ main() {
   phase4_retract
   phase5_restart
   phase6_net08_matrix
-  # Phase 7 appended in Task 5.5
+  phase7_teardown_selfproof_report
   if [ "${#DEGRADATIONS[@]}" -gt 0 ]; then printf 'DEGRADED: %s\n' "${DEGRADATIONS[@]}"; fi
-  echo "phases 0-6: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL (port=$PORT wsl_ip=$WSL_IP)"
-  [ "$REQUIRED_FAIL" = 0 ] || exit 1
+  echo "phases 0-7: pass=$PASS fail=$FAIL required_fail=$REQUIRED_FAIL host_state_unchanged=$HOST_STATE_UNCHANGED (port=$PORT wsl_ip=$WSL_IP report=$REPORT_DIR/report.json)"
+  # Exit 0 ONLY if no required failure AND the host-state self-proof held.
+  # Tier-c degradation is NOT a failure; a tier-b failure IS (REQUIRED above).
+  if [ "$REQUIRED_FAIL" = 0 ] && [ "$HOST_STATE_UNCHANGED" = 1 ]; then exit 0; else exit 1; fi
 }
 main "$@"
