@@ -21,7 +21,7 @@
 - Commit convention: Conventional Commits with crate scope, lowercase imperative subject (e.g. `feat(server): …`), one focused commit per task. Committer identity MUST be `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`. Append the Amplifier trailers and record the verification run in the body (see commit steps).
 - Rust tests are not CI-gated; local green is the only evidence. Run the listed cargo commands and record results in each commit body.
 - `cargo clippy --workspace` may fail locally if GTK/WebKit libs for `freshell-tauri` are absent; scope clippy with `-p freshell-platform -p freshell-server` as the commands below do.
-- Tests that mutate real process env (`std::env::set_var`) MUST serialize via a `static ENV_LOCK: Mutex<()>` (repo pattern: `crates/freshell-ws/src/terminal.rs:5064`) and restore prior values via RAII.
+- Tests that mutate real process env (`std::env::set_var`) MUST serialize via the existing crate-wide test lock `crate::session_directory::HOME_ENV_TEST_LOCK` (`crates/freshell-server/src/session_directory.rs:463-464`, file-scope `#[cfg(test)] pub(crate) static Mutex<()>`) and restore prior values via RAII. Do NOT mint a files-local lock: freshell-server is a bin-only crate (all module tests share ONE bin test binary), and 11 existing tests (`session_directory.rs:1336-1516`, `main.rs:2460-2571`) already mutate `HOME`/`FRESHELL_HOME`/`USERPROFILE` under that lock — a second mutex would not serialize against them. Acquire poison-tolerantly: `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)` (pattern: `main.rs:2460`). Bare `set_var` compiles fine here: workspace edition is 2021 (root `Cargo.toml:27`).
 - Tests assume a Linux host (`host_os_live() == HostOs::Linux`); this matches the repo's dev/CI environment (WSL2) and the existing test suite's assumptions.
 
 ---
@@ -30,7 +30,9 @@
 
 Single subsystem (Rust server file endpoints + one helper pair in its platform crate). One plan.
 
-**Boundary notes** (explicit, so nothing is silently deferred): spec requirement 4 says *any* sandbox check in files.rs must compare the converted native path — `read_file`/`stat_file`/`write_file` also call `is_path_allowed`, so Task 5 routes their sandbox target and filesystem access through the same seam (with Node's exact literal fallthrough for unaddressable inputs; their response shapes contain no paths, so nothing else changes). `validate_dir` today performs no sandbox check at all (a pre-existing deliberate difference from Node's middleware) — with no check present, requirement 4 imposes nothing there; that difference is preserved, not widened.
+**Boundary notes** (explicit, so nothing is silently deferred): spec requirement 4 says *any* sandbox check in files.rs must compare the converted native path — `read_file`/`stat_file`/`write_file` also call `is_path_allowed`, so Task 5 routes their sandbox target and filesystem access through the same seam (with Node's exact literal fallthrough for unaddressable inputs; their response shapes contain no paths, so nothing else changes). `validate_dir` today performs no sandbox check at all — load-bearing validation established this gap is NOT deliberate: Node applies `validatePath` to the route (`files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`), and the gap's git history (`bda1c7315` enumerates sandboxed endpoints omitting validate-dir with no reason; `984294fe8` "close all 14 parity divergences" left it unchecked) records no intent. It is an unexplained Node-parity defect, so Task 5 closes it: `validate_dir` gains the same `is_path_allowed(resolved.sandbox_target(), …)` check as every other files.rs endpoint (zero behavior change for the default `allowed_file_paths: None`).
+
+One documented divergence class (validated, deliberate): if a literal backslash-named entry (e.g. a directory named `C:\Users`) already exists under the server cwd — an artifact only the legacy Node hazard could create (`node-reference.md:734/:752`) — Node's validate-dir/complete would report it, while this port's unaddressable early-returns report `valid:false`/empty. Those artifacts are the hazard being removed, not directories to honor; the port stays fail-closed.
 
 ## File Structure
 
@@ -38,7 +40,7 @@ Single subsystem (Rust server file endpoints + one helper pair in its platform c
 |---|---|
 | `crates/freshell-platform/src/path.rs` (modify) | Add two pub display helpers: `split_windows_display_path` (win32 dirname/basename for absolute display paths) and `join_windows_display_path` (win32 join of a directory-entry name). Pure, deterministic, no env/IO. All conversion logic stays here — files.rs never reimplements it. |
 | `crates/freshell-platform/tests/path_tests.rs` (modify) | Table-driven tests for the two new helpers, in the file's existing style. |
-| `crates/freshell-server/src/files.rs` (modify) | Add `ResolvedUserPath` + `resolve_user_path` (flavor-aware display/native resolution seam, composing freshell-platform helpers). Rewrite the bodies of `validate_dir` (lines 132–157), `complete` (lines 282–355), `mkdir` (lines 371–411) to use it; re-point the `read_file` (159–198) / `stat_file` (200–235) / `write_file` (237–277) sandbox target + fs path through the same seam. Add test scaffolding (ENV_LOCK, EnvGuard, WslMountFixture, handler-call helpers) + new tests to the inline `#[cfg(test)] mod tests` (currently lines 575–704). |
+| `crates/freshell-server/src/files.rs` (modify) | Add `ResolvedUserPath` + `resolve_user_path` (flavor-aware display/native resolution seam, composing freshell-platform helpers). Rewrite the bodies of `validate_dir` (lines 132–157), `complete` (lines 282–355), `mkdir` (lines 371–411) to use it; re-point the `read_file` (159–198) / `stat_file` (200–235) / `write_file` (237–277) sandbox target + fs path through the same seam. Add test scaffolding (ENV_LOCK alias of the crate-wide `HOME_ENV_TEST_LOCK` + poison-tolerant `env_lock()`, EnvGuard, WslMountFixture, handler-call helpers) + new tests to the inline `#[cfg(test)] mod tests` (currently lines 575–704). |
 
 Key pre-existing building blocks (verified signatures — do not re-derive):
 
@@ -103,6 +105,8 @@ fn split_windows_display_path_matrix() {
         ("C:\\Users\\", Some(("C:\\", "Users"))),
         // UNC: share root keeps its trailing backslash (win32.dirname semantics)
         ("\\\\srv\\share\\dir", Some(("\\\\srv\\share\\", "dir"))),
+        // deliberate deviation: Node win32.basename would give "share" here —
+        // we return an empty leaf (endpoint-unreachable corner; see helper docs)
         ("\\\\srv\\share", Some(("\\\\srv\\share\\", ""))),
         // cwd-dependent inputs are not absolutely resolvable -> None
         ("C:foo", None),
@@ -163,12 +167,22 @@ Append to `crates/freshell-platform/src/path.rs`, directly after `convert_window
 /// normalized absolute Windows display path, then split it into
 /// `(parent display path, leaf)`.
 ///
-/// Matches Node's win32 semantics for every shape `win32_resolve` produces:
+/// Matches Node's win32 semantics for every shape `win32_resolve` produces,
+/// with one deliberate share-root deviation (below):
 /// - `C:\Users\dan`     -> (`C:\Users`, `dan`)
 /// - `C:\Us`            -> (`C:\`, `Us`)   (parent keeps the root backslash)
 /// - `C:\`              -> (`C:\`, ``)     (drive root is its own parent)
 /// - `\\srv\share\dir`  -> (`\\srv\share\`, `dir`) (share root keeps `\`)
 /// - `\\srv\share`      -> (`\\srv\share\`, ``)
+///
+/// Deviation (oracle-verified, Node v22): for a share ROOT itself, Node's
+/// `win32.basename` returns the share name (`basename("\\srv\share\") ==
+/// "share"`, `"Ubuntu"` for `\\wsl.localhost\Ubuntu\`) while `win32.dirname`
+/// is the root itself. We return an EMPTY leaf instead, so callers list
+/// rather than filter at a root. The corner is unreachable through the files
+/// endpoints (addressable share roots stat as directories and skip the
+/// split; unaddressable ones early-return first), so endpoint behavior is
+/// Node-identical either way.
 ///
 /// Returns `None` when the input is not absolutely resolvable (drive-relative
 /// `C:foo`, rooted `\foo`, plain relative) — the same deterministic-core
@@ -196,6 +210,13 @@ pub fn split_windows_display_path(input: &str) -> Option<(String, String)> {
 /// absolute Windows display path. Roots (`C:\`, `\\srv\share\`) already end
 /// with the separator; deeper parents need one inserted. Never doubles a
 /// separator, never re-cases anything.
+///
+/// Oracle-verified equal to Node's `win32.join` for all well-behaved dirent
+/// names (dots, spaces, embedded `\` mid-name). For pathological Linux names
+/// that BEGIN with `\` or contain `\.`/`\..` segments, Node's join would
+/// collapse/normalize where this concatenates verbatim — such names are
+/// unrepresentable in a windows-flavor display path in BOTH servers, so the
+/// divergence is cosmetic (`read_dir` never yields `.`/`..`).
 pub fn join_windows_display_path(parent: &str, name: &str) -> String {
     if parent.ends_with('\\') {
         format!("{parent}{name}")
@@ -267,17 +288,26 @@ Co-Authored-By: Amplifier <240428069+microsoft-amplifier@users.noreply.github.co
 - Produces (Tasks 3–4 rely on these exact items):
   - `pub(crate) struct ResolvedUserPath { pub display: String, pub fs_path: Option<String> }` (Task 3 adds a `flavor` field)
   - `pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath`
-  - Test scaffolding inside `mod tests`: `static ENV_LOCK: Mutex<()>`, `struct EnvGuard` with `fn set(pairs: &[(&'static str, Option<&str>)]) -> EnvGuard`, `struct WslMountFixture` with `fn new() -> WslMountFixture` and `fn mount(&self, drive: &str) -> std::path::PathBuf`, `fn test_state() -> FilesState`, `fn auth_headers() -> HeaderMap`, `async fn body_json(resp: Response) -> Value`.
+  - Test scaffolding inside `mod tests`: `ENV_LOCK` (alias of the crate-wide `crate::session_directory::HOME_ENV_TEST_LOCK`) + poison-tolerant `fn env_lock() -> MutexGuard<'static, ()>`, `struct EnvGuard` with `fn set(pairs: &[(&'static str, Option<&str>)]) -> EnvGuard`, `struct WslMountFixture` with `fn new() -> WslMountFixture` and `fn mount(&self, drive: &str) -> std::path::PathBuf`, `fn test_state() -> FilesState`, `fn auth_headers() -> HeaderMap`, `async fn body_json(resp: Response) -> Value`.
 
 - [ ] **Step 1: Write the failing tests**
 
 In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod tests` block (after `use super::*;`), add the scaffolding and tests:
 
 ```rust
-    // `std::env::set_var` mutates whole-process state; serialize every
-    // env-touching test in this binary (same hand-rolled pattern as
-    // `crates/freshell-ws/src/terminal.rs:5064`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `std::env::set_var` mutates whole-process state, and this bin test
+    // binary ALREADY serializes env-mutating tests (session_directory.rs
+    // provider_home tests, main.rs resolve-wiring tests) on the crate-wide
+    // `HOME_ENV_TEST_LOCK` (session_directory.rs:463-464). Reuse THAT lock —
+    // a files-local mutex would not serialize against those 11 tests.
+    use crate::session_directory::HOME_ENV_TEST_LOCK as ENV_LOCK;
+
+    /// Poison-tolerant acquisition (same pattern as `main.rs:2460`).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// RAII: set/remove a group of env vars, restoring prior values on drop.
     struct EnvGuard {
@@ -386,7 +416,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[test]
     fn resolve_user_path_windows_drive_on_wsl_maps_to_mount() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let fixture = WslMountFixture::new();
         let mount_c = fixture.mount("c").to_string_lossy().into_owned();
 
@@ -407,7 +437,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[test]
     fn resolve_user_path_windows_off_wsl_is_unaddressable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = non_wsl_env();
         let r = resolve_user_path("C:\\Users");
         assert_eq!(r.display, "C:\\Users");
@@ -416,7 +446,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[test]
     fn resolve_user_path_windows_unresolvable_forms_are_unaddressable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // Bare drive, rooted, and generic (non-WSL) UNC inputs have no native
         // address even on WSL. (NOTE: drive-relative `C:foo` is NOT Windows
@@ -431,7 +461,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[test]
     fn resolve_user_path_posix_and_tilde_unchanged() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
         // POSIX: exact normalize_user_path behavior — display == fs path.
         let r = resolve_user_path("/tmp/x///");
@@ -447,7 +477,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[tokio::test]
     async fn validate_dir_accepts_windows_drive_on_wsl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         let resp = validate_dir(
             State(test_state()),
@@ -464,7 +494,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[tokio::test]
     async fn validate_dir_windows_deep_path_and_missing_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // D:\proj exists in the fixture.
         let resp = validate_dir(
@@ -493,7 +523,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[tokio::test]
     async fn validate_dir_windows_input_invalid_off_wsl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = non_wsl_env();
         let resp = validate_dir(
             State(test_state()),
@@ -510,7 +540,7 @@ In `crates/freshell-server/src/files.rs`, inside the existing `#[cfg(test)] mod 
 
     #[tokio::test]
     async fn validate_dir_posix_regression() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_string_lossy().into_owned();
         let resp = validate_dir(
@@ -541,7 +571,7 @@ Also update the two pre-existing env-mutating tests in this module to take the n
 In `expand_tilde_uses_home` (line 599) and `resolve_completion_input_honors_root_and_absolute` (line 631), insert as the first two lines of each test body:
 
 ```rust
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
 ```
 
@@ -605,7 +635,11 @@ pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath {
     let Some(display) = win32_resolve(&sanitized) else {
         // Bare drive (`C:`) / rooted (`\foo`): cwd-dependent inputs the
         // deterministic core refuses. Keep the sanitized input as the
-        // display string; not addressable here.
+        // display string; not addressable here. (Node would cwd-anchor via
+        // path.win32.resolve — e.g. `C:` -> `C:\<server-cwd>` — but oracle
+        // runs show `\foo` resolves to itself on POSIX, so the divergence is
+        // limited to bare-drive forms, where both servers report
+        // valid:false / empty suggestions and nothing is persisted.)
         return ResolvedUserPath {
             display: sanitized,
             fs_path: None,
@@ -716,7 +750,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn complete_windows_drive_root_lists_in_input_flavor() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // C:\ is a directory (the fixture's <root>/c) -> list all children,
         // display paths joined win32-style in the input's flavor.
@@ -728,7 +762,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn complete_windows_partial_leaf_filters_and_preserves_flavor() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // Partial leaf: split parent/leaf on the display path, filter by leaf.
         let paths = complete_paths("C:\\Us", None, None).await;
@@ -743,7 +777,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn complete_windows_dirs_only_filters_files() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // C:\Users contains dan/ (dir) and notes.txt (file).
         let all = complete_paths("C:\\Users\\", None, None).await;
@@ -754,7 +788,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn complete_windows_missing_parent_and_off_wsl_return_empty() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         {
             let _fixture = WslMountFixture::new();
             // Parent C:\Nope doesn't exist -> readdir NotFound -> 200 { suggestions: [] }.
@@ -767,7 +801,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn complete_windows_root_anchoring_composes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // Relative prefix under a windows-flavor root: resolve_completion_input
         // joins with `/`, and win32_resolve then normalizes the mixed
@@ -777,8 +811,32 @@ Add to `mod tests` in `files.rs`:
     }
 
     #[tokio::test]
+    async fn complete_wsl_unc_partial_leaf_round_trips() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // WSL-UNC inputs convert to native root-relative paths
+        // (`\\wsl.localhost\Ubuntu\<p>` -> `/<p>`; distro matched
+        // case-insensitively against WSL_DISTRO_NAME, path.rs:384-419) — so a
+        // real tempdir exercises the full composed chain end-to-end:
+        // split on the display path -> reconvert the parent -> join back.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
+        let tmp_unc = tmp
+            .path()
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "\\");
+        let prefix = format!("\\\\wsl.localhost\\Ubuntu\\{tmp_unc}\\su");
+        let paths = complete_paths(&prefix, None, None).await;
+        assert_eq!(
+            paths,
+            vec![format!("\\\\wsl.localhost\\Ubuntu\\{tmp_unc}\\subdir")]
+        );
+    }
+
+    #[tokio::test]
     async fn complete_posix_regression_unchanged() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
         std::fs::create_dir_all(tmp.path().join("subzero")).unwrap();
@@ -795,16 +853,20 @@ Add to `mod tests` in `files.rs`:
 
     #[test]
     fn sandbox_target_uses_converted_native_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let fixture = WslMountFixture::new();
         let mount_c = fixture.mount("c").to_string_lossy().into_owned();
         // R-WIN4: sandbox comparisons use the CONVERTED native path (Node's
         // validatePath resolves through toFilesystemPath before isPathAllowed).
         let r = resolve_user_path("C:\\Users");
         assert_eq!(r.sandbox_target(), format!("{mount_c}/Users"));
-        // Unaddressable input falls back to its display string (Node's
-        // literal fallthrough) — with roots configured that literal never
-        // matches, so the deny matches Node's 403 behavior.
+        // Unaddressable input falls back to its display string. With roots
+        // configured, that literal never matches -> unconditional deny. This
+        // is DELIBERATELY STRICTER than Node, which posix-resolves the
+        // literal against the server cwd first (path-utils.ts:294) and so
+        // ALLOWS it whenever the cwd sits under an allowed root (its /write
+        // can then even create a literal `C:\...` entry there — oracle-
+        // verified). Fail-closed here: we never allow a request Node denies.
         let r = resolve_user_path("\\\\srv\\share\\x");
         assert_eq!(r.sandbox_target(), "\\\\srv\\share\\x");
         // POSIX target is compared as-is.
@@ -964,7 +1026,7 @@ Note the POSIX/native path through this code is string-identical to the old code
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server files::tests`
-Expected: PASS — all module tests including the 7 new ones.
+Expected: PASS — all module tests including the 8 new ones.
 
 - [ ] **Step 5: Format + lint**
 
@@ -1019,7 +1081,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn mkdir_windows_path_creates_under_mount() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let fixture = WslMountFixture::new();
         let resp = mkdir_resp("C:\\Users\\dan\\newproj").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1036,7 +1098,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn mkdir_rejects_unaddressable_windows_input_off_wsl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = non_wsl_env();
         let resp = mkdir_resp("C:\\").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1049,7 +1111,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn mkdir_rejects_unresolvable_windows_forms_even_on_wsl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _fixture = WslMountFixture::new();
         // Bare drive / rooted inputs are Windows flavor but have no absolute
         // native address, even on WSL. (`C:foo` is `native` flavor in both
@@ -1063,7 +1125,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn mkdir_posix_regression_unchanged() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let target = format!("{}/fresh-sub", tmp.path().display());
         let resp = mkdir_resp(&target).await;
@@ -1153,16 +1215,16 @@ Co-Authored-By: Amplifier <240428069+microsoft-amplifier@users.noreply.github.co
 
 ---
 
-### Task 5: read/stat/write sandbox comparison via the seam; final verification
+### Task 5: read/stat/write/validate_dir sandbox comparison via the seam; final verification
 
 **Files:**
-- Modify: `crates/freshell-server/src/files.rs` (`read_file` at lines 159–198, `stat_file` at 200–235, `write_file` at 237–277, pre-Task-2 numbering; tests module)
+- Modify: `crates/freshell-server/src/files.rs` (`read_file` at lines 159–198, `stat_file` at 200–235, `write_file` at 237–277, pre-Task-2 numbering; `validate_dir` as rewritten by Task 2; tests module)
 
 **Interfaces:**
-- Consumes: `resolve_user_path`, `ResolvedUserPath::sandbox_target` (Tasks 2–3), existing handler bodies.
-- Produces: no new items — spec requirement 4 ("any sandbox checks in files.rs compare the converted native path") now holds for every `is_path_allowed` call site in files.rs.
+- Consumes: `resolve_user_path`, `ResolvedUserPath::sandbox_target` (Tasks 2–3), existing handler bodies, `SettingsStore::patch` (test only; existing, exercised at `settings_store.rs:2077-2094`; `persist` no-ops when the store was loaded with `home: None`, `settings_store.rs:420-422`).
+- Produces: no new items — spec requirement 4 ("any sandbox checks in files.rs compare the converted native path") now holds for every `is_path_allowed` call site in files.rs, and `validate_dir` gains the check it was missing (validated as an unexplained Node-parity defect — Node applies `validatePath` to the route, `files-router.ts:232`, 403 pinned by `test/unit/server/files-router.test.ts:451-460`).
 
-All three handlers share the identical prelude `normalize_user_path` → `settings.get()` → `is_path_allowed(&resolved, …)` and then use `resolved` directly as the filesystem path. The change is the same three-line substitution in each: resolve through the seam, compare `sandbox_target()`, then rebind `resolved` to the native path with Node's exact literal fallthrough (`toFilesystemPath` on a non-WSL host returns the literal `C:\…` string, so a stat of it fails naturally — no new rejection semantics here; the mkdir-style 400 applies to mkdir only, per spec). The remainder of each handler body is untouched.
+All three read/stat/write handlers share the identical prelude `normalize_user_path` → `settings.get()` → `is_path_allowed(&resolved, …)` and then use `resolved` directly as the filesystem path. The change is the same three-line substitution in each: resolve through the seam, compare `sandbox_target()`, then rebind `resolved` to the native path with Node's exact literal fallthrough (`toFilesystemPath` on a non-WSL host returns the literal `C:\…` string, so a stat of it fails naturally — no new rejection semantics here; the mkdir-style 400 applies to mkdir only, per spec). The remainder of each handler body is untouched. `validate_dir` additionally gains the sandbox prelude it never had (see Step 3, last item).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1173,7 +1235,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn read_stat_write_follow_windows_conversion_on_wsl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let fixture = WslMountFixture::new();
         // stat: the fixture file C:\Users\notes.txt exists via the mount.
         let resp = stat_file(
@@ -1220,7 +1282,7 @@ Add to `mod tests` in `files.rs`:
 
     #[tokio::test]
     async fn stat_windows_path_off_wsl_reports_not_exists() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _env = non_wsl_env();
         // Node parity: the literal `C:\…` string is handed to fs and the stat
         // fails naturally -> { exists: false } with HTTP 200.
@@ -1237,12 +1299,52 @@ Add to `mod tests` in `files.rs`:
         let v = body_json(resp).await;
         assert_eq!(v["exists"], false);
     }
+
+    // ---- validate_dir sandbox (closes the Node-parity gap: files-router.ts:232
+    // applies validatePath to validate-dir; 403 pinned by Node's
+    // test/unit/server/files-router.test.ts:451-460) ----
+
+    #[tokio::test]
+    async fn validate_dir_denies_path_outside_allowed_roots() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let state = test_state();
+        // Configure a sandbox root via the store's public patch API (persist
+        // no-ops for home: None stores — settings_store.rs:420-422 — so this
+        // touches no real config file).
+        let root = fixture.mount("d").to_string_lossy().into_owned();
+        state
+            .settings
+            .patch(&json!({ "allowedFilePaths": [root] }))
+            .await
+            .unwrap();
+        // A windows path converting OUTSIDE the allowed root is denied…
+        let resp = validate_dir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\Users\\dan" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // …while one INSIDE it (converted native path under the root) validates.
+        let resp = validate_dir(
+            State(state),
+            auth_headers(),
+            Json(json!({ "path": "D:\\proj" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true);
+    }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-server files::tests::read_stat_write_follow_windows_conversion_on_wsl -- --exact --nocapture`
-Expected: FAIL — `v["exists"]` is `false` and read returns 404 (today the literal `C:\Users\notes.txt` string is stat'd and not found).
+Expected: FAIL — `v["exists"]` is `false` and read returns 404 (today the literal `C:\Users\notes.txt` string is stat'd and not found). `validate_dir_denies_path_outside_allowed_roots` also fails red (status 200, no sandbox check yet).
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1318,10 +1420,21 @@ with:
 
 The rest of each handler already consumes `resolved` as a `String` filesystem path, so nothing else changes.
 
+Finally, in `validate_dir` (as rewritten by Task 2), insert the sandbox prelude directly after `let resolved = resolve_user_path(trimmed);` (before the `is_dir` computation):
+
+```rust
+    let settings = state.settings.get().await;
+    if !is_path_allowed(resolved.sandbox_target(), settings.allowed_file_paths.as_deref()) {
+        return forbidden();
+    }
+```
+
+and append one line to `validate_dir`'s doc comment: `/// With allowedFilePaths configured, targets outside the roots are rejected 403 like every other files endpoint (Node applies validatePath to this route — files-router.ts:232; closing a formerly-unexplained Rust parity gap).`
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server files::tests`
-Expected: PASS — all module tests including the 2 new ones.
+Expected: PASS — all module tests including the 3 new ones.
 
 - [ ] **Step 5: Full verification sweep**
 
@@ -1340,11 +1453,14 @@ Expected: fmt no diffs; clippy exits 0; both test suites fully green (freshell-s
 
 ```bash
 git -C /home/dan/code/freshell/.worktrees/windows-path-files add crates/freshell-server/src/files.rs
-git -C /home/dan/code/freshell/.worktrees/windows-path-files commit -m "feat(server): route files read/stat/write sandbox checks through path conversion" -m "Every is_path_allowed call site in files.rs now compares the converted
+git -C /home/dan/code/freshell/.worktrees/windows-path-files commit -m "feat(server): route files sandbox checks through path conversion" -m "Every is_path_allowed call site in files.rs now compares the converted
 native path (Node validatePath parity), and read/stat/write access the
 filesystem through the same conversion with Node's exact literal
 fallthrough for unaddressable inputs. Windows-flavor paths now read/stat/
 write through the WSL mount; POSIX/~ behavior is string-identical.
+validate_dir gains the sandbox check it was missing (Node applies
+validatePath to the route, files-router.ts:232 — the Rust gap was an
+unexplained parity defect, not deliberate).
 
 Verified: cargo fmt --all --check clean, clippy -p freshell-platform -p
 freshell-server -D warnings clean, cargo test -p freshell-platform and
@@ -1362,9 +1478,9 @@ Co-Authored-By: Amplifier <240428069+microsoft-amplifier@users.noreply.github.co
 | Spec requirement | Covered by |
 |---|---|
 | 1. `validate_dir`: `C:\` / `D:\foo\bar` on WSL → valid:true via mount; non-WSL → invalid | Task 2 (impl + `validate_dir_accepts_windows_drive_on_wsl`, `validate_dir_windows_deep_path_and_missing_dir`, `validate_dir_windows_input_invalid_off_wsl`) |
-| 2. `complete`: `C:\` lists `/mnt/c` but renders `C:\Users`, `C:\Windows`; partial `C:\Us` splits/filters/joins in input flavor; POSIX/`~` unchanged | Task 3 (impl + `complete_windows_*` tests, `complete_posix_regression_unchanged`); Task 2's `resolve_user_path_posix_and_tilde_unchanged` |
+| 2. `complete`: `C:\` lists `/mnt/c` but renders `C:\Users`, `C:\Windows`; partial `C:\Us` splits/filters/joins in input flavor; POSIX/`~` unchanged | Task 3 (impl + `complete_windows_*` tests, `complete_wsl_unc_partial_leaf_round_trips` end-to-end UNC composition, `complete_posix_regression_unchanged`); Task 2's `resolve_user_path_posix_and_tilde_unchanged` |
 | 3. `mkdir`: convert windows input; 400-reject unresolvable; no literal `C:\` dir ever created | Task 4 (impl + `mkdir_windows_path_creates_under_mount`, `mkdir_rejects_unaddressable_windows_input_off_wsl`, `mkdir_rejects_unresolvable_windows_forms_even_on_wsl`) |
-| 4. Sandbox checks compare the converted native path | Task 3 (`sandbox_target` + `sandbox_target_uses_converted_native_path`; wired into `complete`), Task 4 (wired into `mkdir`), Task 5 (wired into `read_file`/`stat_file`/`write_file` — every `is_path_allowed` call site). `validate_dir` has no sandbox check today (pre-existing, preserved). |
+| 4. Sandbox checks compare the converted native path | Task 3 (`sandbox_target` + `sandbox_target_uses_converted_native_path`; wired into `complete`), Task 4 (wired into `mkdir`), Task 5 (wired into `read_file`/`stat_file`/`write_file` AND newly into `validate_dir` + `validate_dir_denies_path_outside_allowed_roots` — after Task 5, every files.rs endpoint checks `is_path_allowed` on the converted native path; the validate-dir gap was validated as an unexplained Node-parity defect and is closed, see Boundary notes). |
 | 5. Reuse freshell-platform helpers; add missing ones there with unit tests | Task 1 (split/join helpers + tests); Tasks 2–4 compose only `freshell_platform::path` conversions — no conversion logic in files.rs |
 | Testing: env-based WSL emulation w/ temp mount root; POSIX/~ regressions; no-literal-`C:\` test | Task 2 scaffolding (`WslMountFixture` via `WSL_DISTRO_NAME`/`WSL_WINDOWS_SYS32`); regression tests in Tasks 2–4; Task 4 Step 1 |
 | Repo conventions: fmt/clippy/test per crate, standard checks | Every task's Steps 4–5; Task 4 Step 5 full sweep |
