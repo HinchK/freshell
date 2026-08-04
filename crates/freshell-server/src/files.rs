@@ -49,6 +49,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use freshell_platform::path::{convert_windows_path_to_wsl_path, win32_resolve};
+use freshell_platform::{
+    detect_user_path_flavor, sanitize_user_path_input, RealEnv, UserPathFlavor,
+};
 use freshell_terminal::TerminalRegistry;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -129,6 +133,9 @@ async fn candidate_dirs(State(state): State<FilesState>, headers: HeaderMap) -> 
 /// Ports `isReachableDirectory`: normalize the user path, `stat` it, and report
 /// whether it resolves to an existing directory. A missing/blank `path` is `400`,
 /// exactly like the original.
+/// Windows-flavor inputs (e.g. `C:\`) resolve through the WSL drive mount when
+/// running in WSL (path-utils.ts isReachableDirectory parity); on non-WSL hosts
+/// they are unaddressable and report valid:false.
 async fn validate_dir(
     State(state): State<FilesState>,
     headers: HeaderMap,
@@ -148,12 +155,18 @@ async fn validate_dir(
             .into_response();
     }
 
-    let normalized_path = normalize_user_path(trimmed);
-    let is_dir = std::fs::metadata(&normalized_path)
-        .map(|meta| meta.is_dir())
+    let resolved = resolve_user_path(trimmed);
+    let is_dir = resolved
+        .fs_path
+        .as_deref()
+        .map(|fs| {
+            std::fs::metadata(fs)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
 
-    Json(json!({ "valid": is_dir, "resolvedPath": normalized_path })).into_response()
+    Json(json!({ "valid": is_dir, "resolvedPath": resolved.display })).into_response()
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -478,6 +491,66 @@ fn trim_trailing_separators(input: &str) -> String {
     }
 }
 
+/// A user path resolved for filesystem access: the flavor-preserving DISPLAY
+/// string (what goes back to the client in `resolvedPath` / suggestion paths)
+/// plus the native path used for actual filesystem operations.
+/// `fs_path: None` means the input names a location this host cannot address
+/// (a Windows path on a non-WSL Linux host, a bare drive `C:`, rooted
+/// `\foo`, or a generic `\\server\share` UNC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedUserPath {
+    pub display: String,
+    pub fs_path: Option<String>,
+}
+
+/// Port of `normalizeUserPath` + `toFilesystemPath` composed
+/// (`path-utils.ts:54-73`, `:208-215`, `:241-245`) for this POSIX-host server.
+///
+/// - Posix/Native flavors (including `~`): EXACTLY the existing
+///   [`normalize_user_path`] behavior — display and fs path are the same
+///   string, so pre-existing callers observe zero change.
+/// - Windows flavor: display = [`win32_resolve`] (Node's `path.win32.resolve`
+///   semantics — separators to `\`, trailing separator stripped, `..`
+///   collapsed, drive-letter case preserved as typed); fs path = the WSL
+///   drive/UNC conversion, gated on the live WSL environment exactly like
+///   Node's `resolveWindowsFlavorPath`. Where Node falls through to the
+///   literal `C:\…` string on non-WSL hosts (and `fs` then treats it as a
+///   relative POSIX name), this returns `fs_path: None` so callers can treat
+///   the input as unaddressable instead of stat'ing/creating a literal
+///   backslash-named entry — the mkdir hazard this fix removes.
+pub(crate) fn resolve_user_path(input: &str) -> ResolvedUserPath {
+    if detect_user_path_flavor(input) != UserPathFlavor::Windows {
+        let normalized = normalize_user_path(input);
+        return ResolvedUserPath {
+            display: normalized.clone(),
+            fs_path: Some(normalized),
+        };
+    }
+    let sanitized = sanitize_user_path_input(input);
+    let Some(display) = win32_resolve(&sanitized) else {
+        // Bare drive (`C:`) / rooted (`\foo`): cwd-dependent inputs the
+        // deterministic core refuses. Keep the sanitized input as the
+        // display string; not addressable here. (Node would cwd-anchor via
+        // path.win32.resolve — e.g. `C:` -> `C:\<server-cwd>` — but oracle
+        // runs show `\foo` resolves to itself on POSIX, so the divergence is
+        // limited to bare-drive forms, where both servers report
+        // valid:false / empty suggestions and nothing is persisted.)
+        return ResolvedUserPath {
+            display: sanitized,
+            fs_path: None,
+        };
+    };
+    let fs_path = if freshell_platform::detect::is_wsl_env_live() {
+        // `convert_windows_path_to_wsl_path`'s drive branch would convert even
+        // off-WSL; the gate above is what makes this match Node's
+        // resolveWindowsFlavorPath (conversion only when isWslEnvironment()).
+        convert_windows_path_to_wsl_path(&display, &RealEnv, true)
+    } else {
+        None
+    };
+    ResolvedUserPath { display, fs_path }
+}
+
 /// An mtime as an ISO-8601 / RFC-3339 millis-precision `Z` string, byte-shape
 /// compatible with JS `stat.mtime.toISOString()`.
 fn mtime_iso(meta: &std::fs::Metadata) -> String {
@@ -576,6 +649,287 @@ fn internal_error(msg: &str) -> Response {
 mod tests {
     use super::*;
 
+    // `std::env::set_var` mutates whole-process state, and this bin test
+    // binary ALREADY serializes env-mutating tests (session_directory.rs
+    // provider_home tests, main.rs resolve-wiring tests) on the crate-wide
+    // `HOME_ENV_TEST_LOCK` (session_directory.rs:463-464). Reuse THAT lock —
+    // a files-local mutex would not serialize against those 11 tests.
+    use crate::session_directory::HOME_ENV_TEST_LOCK as ENV_LOCK;
+
+    /// Poison-tolerant acquisition (same pattern as `main.rs:2460`).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII: set/remove a group of env vars, restoring prior values on drop.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        /// `Some(v)` sets the var; `None` removes it. Prior state is restored
+        /// (set-or-removed) on drop, even on panic.
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let prior = std::env::var_os(key);
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                    (*key, prior)
+                })
+                .collect();
+            EnvGuard { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, prior) in self.saved.drain(..) {
+                match prior {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// A fake WSL drive mount under a tempdir: env says "this is WSL and
+    /// drives are mounted at <root>" (WSL_DISTRO_NAME + WSL_WINDOWS_SYS32,
+    /// the same knobs the freshell-platform tests and the Node plan
+    /// docs/superpowers/plans/2026-06-10-windows-wsl-launch-cwd.md use), and
+    /// real directories exist at <root>/c/{Users/dan,Windows/System32} and
+    /// <root>/d/proj. WSL_WINDOWS_SYS32 must match the strict
+    /// `^(.*)/[a-zA-Z]/Windows/System32$` shape or the mount prefix silently
+    /// falls back to /mnt.
+    struct WslMountFixture {
+        _env: EnvGuard,
+        root: tempfile::TempDir,
+    }
+
+    impl WslMountFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let sys32 = root.path().join("c/Windows/System32");
+            std::fs::create_dir_all(&sys32).unwrap();
+            std::fs::create_dir_all(root.path().join("c/Users/dan")).unwrap();
+            std::fs::write(root.path().join("c/Users/notes.txt"), b"x").unwrap();
+            std::fs::create_dir_all(root.path().join("d/proj")).unwrap();
+            let sys32_str = sys32.to_string_lossy().into_owned();
+            let env = EnvGuard::set(&[
+                ("WSL_DISTRO_NAME", Some("Ubuntu")),
+                ("WSL_INTEROP", None),
+                ("WSLENV", None),
+                ("WSL_WINDOWS_SYS32", Some(sys32_str.as_str())),
+            ]);
+            WslMountFixture { _env: env, root }
+        }
+
+        /// The native directory a `X:\` drive maps to, e.g. `mount("c")`.
+        fn mount(&self, drive: &str) -> std::path::PathBuf {
+            self.root.path().join(drive)
+        }
+    }
+
+    /// Env pinned to a plain (non-WSL) Linux host.
+    fn non_wsl_env() -> EnvGuard {
+        EnvGuard::set(&[
+            ("WSL_DISTRO_NAME", None),
+            ("WSL_INTEROP", None),
+            ("WSLENV", None),
+            ("WSL_WINDOWS_SYS32", None),
+        ])
+    }
+
+    fn test_state() -> FilesState {
+        FilesState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: SettingsStore::load(None, Vec::new()),
+            registry: TerminalRegistry::new(),
+        }
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        headers
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // ---- resolve_user_path (R-WIN1: flavor-aware display/native seam) ----
+
+    #[test]
+    fn resolve_user_path_windows_drive_on_wsl_maps_to_mount() {
+        let _guard = env_lock();
+        let fixture = WslMountFixture::new();
+        let mount_c = fixture.mount("c").to_string_lossy().into_owned();
+
+        let r = resolve_user_path("C:\\");
+        assert_eq!(r.display, "C:\\");
+        assert_eq!(r.fs_path, Some(mount_c.clone()));
+
+        let r = resolve_user_path("C:\\Users\\dan");
+        assert_eq!(r.display, "C:\\Users\\dan");
+        assert_eq!(r.fs_path, Some(format!("{mount_c}/Users/dan")));
+
+        // Forward slashes + trailing separator normalize; drive case preserved
+        // as typed (Node path.win32.resolve semantics).
+        let r = resolve_user_path("c:/Users/");
+        assert_eq!(r.display, "c:\\Users");
+        assert_eq!(r.fs_path, Some(format!("{mount_c}/Users")));
+    }
+
+    #[test]
+    fn resolve_user_path_windows_off_wsl_is_unaddressable() {
+        let _guard = env_lock();
+        let _env = non_wsl_env();
+        let r = resolve_user_path("C:\\Users");
+        assert_eq!(r.display, "C:\\Users");
+        assert_eq!(r.fs_path, None);
+    }
+
+    #[test]
+    fn resolve_user_path_windows_unresolvable_forms_are_unaddressable() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // Bare drive, rooted, and generic (non-WSL) UNC inputs have no native
+        // address even on WSL. (NOTE: drive-relative `C:foo` is NOT Windows
+        // flavor — Node's WINDOWS_DRIVE_PREFIX_RE requires a separator or
+        // end-of-string after the colon, so `C:foo` stays `native` in both
+        // servers and keeps today's literal behavior.)
+        for input in ["C:", "\\rooted", "\\\\srv\\share\\x"] {
+            let r = resolve_user_path(input);
+            assert_eq!(r.fs_path, None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_user_path_posix_and_tilde_unchanged() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        // POSIX: exact normalize_user_path behavior — display == fs path.
+        let r = resolve_user_path("/tmp/x///");
+        assert_eq!(r.display, "/tmp/x");
+        assert_eq!(r.fs_path, Some("/tmp/x".to_string()));
+        // Tilde: native flavor, expanded via HOME.
+        let r = resolve_user_path("~/proj");
+        assert_eq!(r.display, "/home/tester/proj");
+        assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
+    }
+
+    // ---- validate_dir (R-WIN2: Windows input on WSL resolves via the mount) ----
+
+    // Intentional: `_guard` is held across every `.await` BY DESIGN — the
+    // whole test mutates/reads process env and must stay serialized on the
+    // crate-wide HOME_ENV_TEST_LOCK end-to-end (same rationale as codex.rs's
+    // env-lock tests).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_accepts_windows_drive_on_wsl() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["resolvedPath"], "C:\\");
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_windows_deep_path_and_missing_dir() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // D:\proj exists in the fixture.
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "D:\\proj" })),
+        )
+        .await
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["resolvedPath"], "D:\\proj");
+        // C:\Nope does not exist -> valid:false but the display path is still
+        // returned (Node isReachableDirectory semantics).
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\Nope" })),
+        )
+        .await
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], false);
+        assert_eq!(v["resolvedPath"], "C:\\Nope");
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_windows_input_invalid_off_wsl() {
+        let _guard = env_lock();
+        let _env = non_wsl_env();
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "C:\\" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], false);
+        assert_eq!(v["resolvedPath"], "C:\\");
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_posix_regression() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": dir.as_str() })),
+        )
+        .await
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["resolvedPath"], dir);
+        let bogus = format!("{}/freshell-nonexistent-xyz", tmp.path().display());
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": bogus })),
+        )
+        .await
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], false);
+    }
+
     #[test]
     fn add_unique_dedupes_and_trims() {
         let mut dirs = Vec::new();
@@ -598,7 +952,8 @@ mod tests {
 
     #[test]
     fn expand_tilde_uses_home() {
-        std::env::set_var("HOME", "/home/tester");
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
         assert_eq!(expand_tilde("~"), "/home/tester");
         assert_eq!(expand_tilde("~/proj"), "/home/tester/proj");
         assert_eq!(expand_tilde("/abs"), "/abs");
@@ -630,7 +985,8 @@ mod tests {
 
     #[test]
     fn resolve_completion_input_honors_root_and_absolute() {
-        std::env::set_var("HOME", "/home/tester");
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
         // No root \u2192 prefix unchanged.
         assert_eq!(resolve_completion_input("a", None), "a");
         // Absolute prefix ignores root.
