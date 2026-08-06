@@ -520,6 +520,12 @@ async fn main() -> ExitCode {
             events: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneStream::new()),
         },
     ));
+    // #606: the claude deadman's session-JSONL truth source (verify-then-
+    // decide; fakes in tests). Unset would make every deadman verify fail
+    // (crash semantics).
+    activity_hub.set_claude_truth(std::sync::Arc::new(
+        freshell_ws::claude_truth::FsClaudeTruth::from_env(),
+    ));
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
@@ -1369,13 +1375,24 @@ async fn main() -> ExitCode {
         }
     };
     // Single startup line (stderr, so it never pollutes any stdout protocol).
-    // Provenance-hardening lane: the commit suffix (same `commit` value
-    // `GET /api/server-info` reports, `diag.rs::build_commit()`) means an
-    // operator tailing boot logs can identify exactly which source commit
-    // is running without a separate authenticated request.
+    // Provenance-hardening lane (#613): timestamp + pid + commit + dirty
+    // (the same `commit`/`buildDirty` values `GET /api/server-info` reports,
+    // `diag.rs::build_commit()`/`build_dirty_str()`) means an operator
+    // tailing append-mode boot logs can always attribute a line to a run
+    // and its exact source commit without a separate authenticated request.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     eprintln!(
-        "freshell-server listening on http://{addr} (ws://{addr}/ws) [commit {}]",
-        diag::build_commit()
+        "{}",
+        diag::boot_line(
+            &addr.to_string(),
+            diag::build_commit(),
+            diag::build_dirty_str(),
+            std::process::id(),
+            &diag::iso8601_utc(now_secs),
+        )
     );
 
     // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
