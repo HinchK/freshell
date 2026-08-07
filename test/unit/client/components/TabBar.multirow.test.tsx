@@ -51,12 +51,15 @@ function createTab(overrides: Partial<Tab> = {}): Tab {
   }
 }
 
-function createStore(options: { tabs: Tab[]; activeTabId: string | null; multirowTabs?: boolean }) {
-  const localSettings = resolveLocalSettings(
-    options.multirowTabs === undefined
-      ? undefined
-      : { panes: { multirowTabs: options.multirowTabs } },
-  )
+function buildPanesPatch(options: { multirowTabs?: boolean; tabBarRows?: number }) {
+  const panes: { multirowTabs?: boolean; tabBarRows?: number } = {}
+  if (options.multirowTabs !== undefined) panes.multirowTabs = options.multirowTabs
+  if (options.tabBarRows !== undefined) panes.tabBarRows = options.tabBarRows
+  return Object.keys(panes).length > 0 ? { panes } : undefined
+}
+
+function createStore(options: { tabs: Tab[]; activeTabId: string | null; multirowTabs?: boolean; tabBarRows?: number }) {
+  const localSettings = resolveLocalSettings(buildPanesPatch(options))
   const serverSettings = createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
   })
@@ -146,7 +149,7 @@ describe('TabBar multirow tabs', () => {
     expect(rightBtn).toBeInTheDocument()
   })
 
-  it('applies h-auto to the outer wrapper and max-h-32 to the tab strip when multirowTabs is enabled', () => {
+  it('applies h-auto to the outer wrapper and a 3-row max-height to the tab strip when multirowTabs is enabled', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
     const { container } = renderWithStore(<TabBar />, store)
@@ -155,9 +158,25 @@ describe('TabBar multirow tabs', () => {
     expect(wrapper.className).toContain('h-auto')
     expect(wrapper.className).not.toContain('h-12')
 
-    const tabStrip = container.querySelector('.flex-wrap')
-    expect(tabStrip).not.toBeNull()
-    expect(tabStrip!.className).toContain('max-h-32')
+    const strip = screen.getByTestId('tab-strip')
+    // No Tailwind max-h-* class at all (superset of the old fixed-class check):
+    // the max-height contract is the inline rem-based style below.
+    expect(strip.className).not.toContain('max-h-')
+    expect(strip.style.maxHeight).toBe('calc(6.25rem + 1px)')
+  })
+
+  it('derives the strip max-height from panes.tabBarRows', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true, tabBarRows: 5 })
+    renderWithStore(<TabBar />, store)
+    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(10.5rem + 1px)')
+  })
+
+  it('applies no inline max-height in single-row mode', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+    renderWithStore(<TabBar />, store)
+    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('')
   })
 
   it('applies fixed height to the outer wrapper when multirowTabs is disabled', () => {

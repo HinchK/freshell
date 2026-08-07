@@ -29,7 +29,8 @@ test.describe('Multi-row tabs', () => {
     const tabStrip = page.getByTestId('tab-strip')
     await expect(tabStrip).toBeVisible({ timeout: 5_000 })
     await expect(tabStrip).toHaveClass(/flex-wrap/)
-    await expect(tabStrip).toHaveClass(/max-h-32/)
+    // calc(6.25rem + 1px) computes to 101px at the default --ui-scale of 1.
+    await expect(tabStrip).toHaveCSS('max-height', '101px')
   })
 
   test('single-row mode uses overflow-x-auto', async ({ freshellPage: page }) => {

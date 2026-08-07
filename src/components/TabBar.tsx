@@ -43,6 +43,8 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 import type { RepoIconInfo } from '@/components/icons/RepoIcon'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
+import { TAB_BAR_ROWS_DEFAULT } from '@shared/settings'
+import { tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
 
 function escapeSelector(id: string): string {
   if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
@@ -205,6 +207,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
   const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? true)
+  const tabBarRows = useAppSelector((s) => s.settings?.settings?.panes?.tabBarRows ?? TAB_BAR_ROWS_DEFAULT)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   // Compute display title for a single tab
@@ -559,9 +562,10 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
             className={cn(
               "flex items-end gap-0.5 pt-px flex-1 min-w-0",
               multirowTabs
-                ? "flex-wrap max-h-32 overflow-y-auto"
+                ? "flex-wrap overflow-y-auto"
                 : "overflow-x-auto overflow-y-hidden scrollbar-none"
             )}
+            style={multirowTabs ? { maxHeight: tabBarRowsToMaxHeightCss(tabBarRows) } : undefined}
           >
             {tabs.map(renderSortableTab)}
           </div>
