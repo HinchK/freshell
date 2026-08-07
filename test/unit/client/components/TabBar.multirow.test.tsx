@@ -292,6 +292,87 @@ describe('TabBar multirow tabs', () => {
       expect(wrapper.className).toContain('max-w-[200px]')
       expect(wrapper.className).not.toContain('w-[175px]')
     })
+
+    it('locks every tab to the full-row width when tabs wrap to multiple rows', () => {
+      // Fake geometry (jsdom has no layout): a 1000px-wide strip whose content
+      // wraps (scrollHeight 67 > the 2-row threshold at a 16px root).
+      const clientWidthSpy = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(1000)
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      try {
+        const tabs = Array.from({ length: 8 }, (_, i) =>
+          createTab({ id: `tab-${i + 1}`, title: `Tab ${i + 1}` }),
+        )
+        const store = createStore({ tabs, activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        const strip = screen.getByTestId('tab-strip')
+        const wrappers = Array.from(strip.children) as HTMLElement[]
+        expect(wrappers.length).toBe(8)
+        for (const wrapper of wrappers) {
+          // 1000px strip, 2px gap -> 6 tabs per full row -> floor((1000 - 5*2)/6) = 165.
+          expect(wrapper.style.width).toBe('165px')
+          expect(wrapper.className).toContain('shrink-0')
+          expect(wrapper.className).not.toContain('grow')
+          expect(wrapper.className).not.toContain('basis-[150px]')
+          expect(wrapper.className).not.toContain('max-w-[200px]')
+        }
+      } finally {
+        clientWidthSpy.mockRestore()
+        scrollHeightSpy.mockRestore()
+      }
+    })
+
+    it('prefers the fractional rect width so a knife-edge clientWidth round-up cannot overpredict capacity', () => {
+      // Real-Chromium-validated knife edge: a true content width of 909.6px
+      // rounds to clientWidth 910 (capacity 6), but only 5 tabs of >=150px
+      // actually fit per row. The effect must prefer
+      // floor(getBoundingClientRect().width) = 909 (capacity 5), so 6 tabs
+      // wrap and lock to floor((909 - 4*2) / 5) = 180.
+      const clientWidthSpy = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(910)
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      const rect = {
+        width: 909.6, height: 67, top: 0, left: 0, right: 909.6, bottom: 67, x: 0, y: 0,
+        toJSON: () => ({}),
+      } as DOMRect
+      const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(rect)
+      try {
+        const tabs = Array.from({ length: 6 }, (_, i) =>
+          createTab({ id: `tab-${i + 1}`, title: `Tab ${i + 1}` }),
+        )
+        const store = createStore({ tabs, activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        const wrappers = Array.from(screen.getByTestId('tab-strip').children) as HTMLElement[]
+        expect(wrappers.length).toBe(6)
+        for (const wrapper of wrappers) {
+          expect(wrapper.style.width).toBe('180px')
+        }
+      } finally {
+        clientWidthSpy.mockRestore()
+        scrollHeightSpy.mockRestore()
+        rectSpy.mockRestore()
+      }
+    })
+
+    it('keeps stretch-to-fill when all tabs fit on a single multirow row', () => {
+      // 1000px strip fits 6 tabs per row; 3 tabs -> single row -> no width lock.
+      const clientWidthSpy = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(1000)
+      try {
+        const tabs = [
+          createTab({ id: 'tab-1', title: 'Tab 1' }),
+          createTab({ id: 'tab-2', title: 'Tab 2' }),
+          createTab({ id: 'tab-3', title: 'Tab 3' }),
+        ]
+        const store = createStore({ tabs, activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        const wrapper = screen.getByTestId('tab-strip').firstElementChild as HTMLElement
+        expect(wrapper.style.width).toBe('')
+        expect(wrapper.className).toContain('grow')
+        expect(wrapper.className).toContain('basis-[150px]')
+        expect(wrapper.className).toContain('min-w-[150px]')
+        expect(wrapper.className).toContain('max-w-[200px]')
+      } finally {
+        clientWidthSpy.mockRestore()
+      }
+    })
   })
 
   describe('tab bar resize handle', () => {
