@@ -698,6 +698,29 @@ async function main() {
     }
   })
 
+  // Bug-1 (sidebar rail): bindSession's async subagent re-classification
+  // resolved for a (re)bound opencode target — re-sync the metadata service's
+  // copy so server-fabricated live session-directory items track the CURRENT
+  // association in both directions (set on root→child, unset on child→root).
+  // The 'associated' lane above only overwrites meta.sessionId; without this,
+  // the flag would stay create-time-frozen across a TUI session switch.
+  registry.on('terminal.subagent.classified', (payload) => {
+    const event = payload as {
+      terminalId?: string
+      provider?: CodingCliProviderName
+      sessionId?: string
+      isSubagent?: boolean
+    }
+    if (!event.terminalId || !event.provider || !event.sessionId) return
+    const upsert = terminalMetadata.setResumeTargetIsSubagent(
+      event.terminalId,
+      event.provider,
+      event.sessionId,
+      event.isSubagent === true,
+    )
+    if (upsert) broadcastTerminalMetaUpserts([upsert])
+  })
+
   const applyDebugLogging = (enabled: boolean, source: string) => {
     const nextEnabled = !!enabled
     setLogLevel(resolveRuntimeLogLevel(nextEnabled))

@@ -36,6 +36,7 @@ import type {
   TerminalOutputRawEvent,
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
+  TerminalSubagentClassifiedEvent,
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
@@ -4888,6 +4889,19 @@ export class TerminalRegistry extends EventEmitter {
           const current = this.terminals.get(terminalId)
           if (current && current.resumeSessionId === normalized) {
             current.resumeTargetIsSubagent = isSubagent || undefined
+            // Propagate the answer to TerminalMetadataService's copy
+            // (TerminalMeta.resumeTargetIsSubagent): the 'associated'
+            // broadcast lane overwrites meta.sessionId WITHOUT touching the
+            // flag, so server-fabricated live session-directory items would
+            // otherwise carry a stale classification across a rebind.
+            // Emitted only when the registry guard above passed; the
+            // metadata service applies its own sessionId-match guard.
+            this.emit('terminal.subagent.classified', {
+              terminalId,
+              provider,
+              sessionId: normalized,
+              isSubagent,
+            } satisfies TerminalSubagentClassifiedEvent)
           }
         })
         .catch(() => {})

@@ -33,10 +33,14 @@ export type TerminalMeta = {
   // opencode SUBAGENT (child) session — classified by the registry at
   // terminal.create and carried here so server-fabricated live-terminal
   // session-directory items can be hidden under default visibility.
-  // FRESHNESS: the flag is only as fresh as the `sessionId` beside it —
-  // create-time-frozen, and the `??` merge in upsert() never unsets it. If a
-  // future opencode rebind lane updates sessionId on TerminalMeta, the flag
-  // must travel with it (re-classify or clear alongside the new sessionId).
+  // FRESHNESS: the flag tracks the `sessionId` beside it. The LIVE opencode
+  // rebind lane (TUI session switch: opencode-session-controller
+  // promoteAssociation → bindSession → 'associated' → associateSession)
+  // overwrites sessionId here; bindSession's async re-classification then
+  // lands through setResumeTargetIsSubagent() (via the registry's
+  // 'terminal.subagent.classified' event), which sets AND unsets under a
+  // sessionId-match staleness guard. Note upsert()'s `??` merge never
+  // unsets — only setResumeTargetIsSubagent() can clear a stale true.
   resumeTargetIsSubagent?: boolean
   tokenUsage?: TokenSummary
   updatedAt: number
@@ -177,6 +181,42 @@ export class TerminalMetadataService {
     return this.commitIfChanged(next)
   }
 
+  /**
+   * Bug-1 (sidebar rail), opencode rebind re-sync lane: bindSession's
+   * fire-and-forget subagent re-classification resolved for `sessionId`
+   * (registry 'terminal.subagent.classified' event) — land the answer on
+   * this terminal's metadata copy. Both directions: `true` sets the flag
+   * (root→child switch), `false` clears it (child→root switch) — this is
+   * the only lane that can UNSET (upsert()'s `??` merge cannot).
+   *
+   * Staleness guard (spirit of the Rust generation guard,
+   * crates/freshell-ws/src/identity.rs complete_subagent_classification):
+   * the write lands IFF this meta is still associated with the classified
+   * provider+session. associateSession() runs synchronously in the rebind
+   * lane before any classification can resolve, so `sessionId` here always
+   * names the NEWEST target — a slow older classification for a superseded
+   * target mismatches and is dropped.
+   */
+  setResumeTargetIsSubagent(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    isSubagent: boolean,
+  ): TerminalMeta | undefined {
+    const current = this.byTerminalId.get(terminalId)
+    if (!current) return undefined
+    if (current.provider !== provider || current.sessionId !== sessionId) return undefined
+
+    const next: TerminalMeta = {
+      ...current,
+      // Same normalization as the registry record: absent means "not a
+      // subagent target" (the wire field is additive/optional).
+      resumeTargetIsSubagent: isSubagent || undefined,
+    }
+
+    return this.commitIfChanged(next)
+  }
+
   clearSessionAssociation(
     terminalId: string,
     provider: CodingCliProviderName,
@@ -263,7 +303,9 @@ export class TerminalMetadataService {
       cwd: patch.cwd ?? current?.cwd,
       provider: patch.provider ?? current?.provider,
       sessionId: patch.sessionId ?? current?.sessionId,
-      // NOTE: `??` keeps the last known flag — it never UNSETS. See the
+      // NOTE: `??` keeps the last known flag — seeding never UNSETS. The
+      // opencode rebind lane clears a stale true via
+      // setResumeTargetIsSubagent() (explicit false-capable write). See the
       // freshness breadcrumb on TerminalMeta.resumeTargetIsSubagent.
       resumeTargetIsSubagent: patch.resumeTargetIsSubagent ?? current?.resumeTargetIsSubagent,
       branch: current?.branch,
