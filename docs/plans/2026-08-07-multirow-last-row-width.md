@@ -7,7 +7,7 @@
 
 **Goal:** In multirow tab-bar mode with 2+ wrapped rows, lock every tab — including the partial bottom row — to exactly the width the full rows render at, so the last row ends short of the right edge instead of stretching wider.
 
-**Architecture:** Widths in the multirow strip are currently pure CSS (`flex-wrap` + `grow basis-[150px] min-w-[150px] max-w-[200px]`), and CSS flexbox distributes free space *per flex line* — so a sparse last row stretches its tabs wider (up to the 200px cap) than the full rows above. The fix adds a pure width computation to `src/lib/tab-bar-metrics.ts` (compute tabs-per-full-row at the 150px minimum, stretch to fill, cap at 200px, floor to an integer), measures the strip's `clientWidth` inside `TabBar.tsx`'s existing ResizeObserver effect, and applies the resulting width as an inline `style` uniformly to every tab wrapper — but only when the tabs actually wrap to 2+ rows. When all tabs fit on one row (or the width is unmeasured, e.g. jsdom), the helper returns `null` and the existing stretch-to-fill CSS classes remain untouched.
+**Architecture:** Widths in the multirow strip are currently pure CSS (`flex-wrap` + `grow basis-[150px] min-w-[150px] max-w-[200px]`), and CSS flexbox distributes free space *per flex line* — so a sparse last row stretches its tabs wider (up to the 200px cap) than the full rows above. The fix adds a pure width computation to `src/lib/tab-bar-metrics.ts` (compute tabs-per-full-row at the 150px minimum, stretch to fill, cap at 200px, floor to an integer), measures the strip inside `TabBar.tsx`'s existing ResizeObserver effect (conservative width `rectWidth > 0 ? Math.min(node.clientWidth, Math.floor(node.getBoundingClientRect().width)) : node.clientWidth` — see Global Constraints), and applies the resulting width as an inline `style` uniformly to every tab wrapper — but only when the tabs actually wrap to 2+ rows. When all tabs fit on one row (or the width is unmeasured, e.g. jsdom), the helper returns `null` and the existing stretch-to-fill CSS classes remain untouched.
 
 **Tech Stack:** React 18 + Redux Toolkit, Tailwind (arbitrary-value classes), Vitest 3 + @testing-library/react (jsdom), Playwright (chromium) e2e.
 
@@ -17,7 +17,8 @@
 - The inter-tab gap is `gap-0.5` = `TAB_ROW_GAP_REM` = **0.125rem** (2px at the default 16px root) and IS rem-based/scale-aware — width math must take the gap in px as a parameter, computed as `TAB_ROW_GAP_REM * getRootFontSizePx()`.
 - Tailwind JIT cannot generate interpolated classes: a **computed width MUST be an inline `style`**, never `` `w-[${n}px]` ``.
 - `Math.floor` the computed width — rounding up crosses the packing knife-edge and re-wraps a full row's last tab onto the next row (layout oscillation under ResizeObserver).
-- Guard `clientWidth === 0` (jsdom / pre-layout): fall back to today's stretch classes so every existing TabBar unit test stays green.
+- Measurement input (validated in real Chromium during planning — see the assumption ledger in the workflow logs): `Element.clientWidth` rounds to the NEAREST integer, so in a ~0.5px window below each 152px wrap threshold it over-reports row capacity by one; `getBoundingClientRect().width` is fractional (exact) but INCLUDES a classic space-taking vertical scrollbar when the strip scrolls. The effect therefore measures `rectWidth = node.getBoundingClientRect().width` and passes `rectWidth > 0 ? Math.min(node.clientWidth, Math.floor(rectWidth)) : node.clientWidth` — exact without a scrollbar (floor of the true content width, verified 0/42 knife-edge divergences), verified-correct `clientWidth` behavior with one (9/9). Accepted residual: classic scrollbar AND a sub-0.5px round-up width coinciding (~0.33% of the scrolling regime) — the lock harmlessly degrades to today's stretch behavior; no oscillation (verified stable).
+- Guard a `0` measurement (jsdom / pre-layout): the rect is unmeasured (0) so the composition falls back to `clientWidth`, and the helper returns `null` for `<= 0` — today's stretch classes remain, so every existing TabBar unit test stays green.
 - `react-hooks/exhaustive-deps` is **warning-only** in this repo: any new value passed through `renderSortableTab` MUST be hand-added to its `useCallback` dependency array (`src/components/TabBar.tsx:401-418`).
 - `console.error` is fatal in unit tests (`test/setup/dom.ts` throws in afterEach).
 - Red-Green-Refactor TDD is mandatory (AGENTS.md); every behavior change gets unit AND e2e coverage.
@@ -37,6 +38,8 @@
 
 The strip (`src/components/TabBar.tsx:589-601`) is `flex flex-wrap gap-0.5`; each tab wrapper is `grow basis-[150px] min-w-[150px] max-w-[200px]`. CSS Flexbox resolves flexible lengths **per flex line**: each line splits *its own* free space among *its own* items. A line holding `n` tabs renders each at `min(200, (W - (n-1)·gap) / n)` — strictly decreasing in `n`. Full rows hold `N_full = floor((W + gap) / (150 + gap))` tabs; the last row holds fewer, so its tabs come out wider (e.g. W=1000, gap=2: full rows render 165px tabs, a 2-tab last row clamps at 200px — a 35px visible mismatch). Nothing in the code names "last row"; it is emergent layout. The fix therefore computes ONE width from the full rows and pins every tab to it with `flex-grow` removed.
 
+Both the bug and the fix were reproduced in real Chromium 147 during plan validation (1000px strip, 8 tabs: stretched rows render [6 @ 165px, 2 @ 200px]; pinning 165px restores uniformity with the last row ending at x=332), and the packing math was verified exact on a 1205-case width sweep — evidence in `/home/dan/code/freshell/.worktrees/.the-usual-logs/multirow-last-row-width/load-bearing-ledger.md`.
+
 ---
 
 ## File Structure
@@ -45,7 +48,7 @@ The strip (`src/components/TabBar.tsx:589-601`) is `flex flex-wrap gap-0.5`; eac
 |---|---|---|
 | `src/lib/tab-bar-metrics.ts` | Modify (add exports) | Pure, DOM-free width math: `MULTIROW_TAB_MIN_WIDTH_PX`, `MULTIROW_TAB_MAX_WIDTH_PX`, `multirowUniformTabWidthPx()` |
 | `test/unit/client/lib/tab-bar-metrics.test.ts` | Modify (new describe) | Table-driven unit coverage of the width math |
-| `src/components/TabBar.tsx` | Modify (5 focused edits) | Measure `clientWidth` in the existing ResizeObserver effect; thread `uniformWidthPx` to `SortableTab`; apply inline width + `shrink-0` when locked |
+| `src/components/TabBar.tsx` | Modify (5 focused edits) | Measure the strip (conservative `min(clientWidth, floor(rect.width))`) in the existing ResizeObserver effect; thread `uniformWidthPx` to `SortableTab`; apply inline width + `shrink-0` when locked |
 | `test/unit/client/components/TabBar.multirow.test.tsx` | Modify (extend `describe('tab widths')`) | Component-level contract: locked inline width across all wrappers; stretch classes preserved when tabs fit one row |
 | `test/e2e-browser/specs/multirow-tabs.spec.ts` | Modify (new test) | Real-browser proof: with a partial last row, ALL tabs measure the same width and the last row ends short of the right edge |
 
@@ -197,8 +200,10 @@ export const MULTIROW_TAB_MAX_WIDTH_PX = 200
  * row past the container width and drop its last tab onto the next row,
  * oscillating on every ResizeObserver tick.
  *
- * Pure px math — callers pass the strip's clientWidth and the gap in px
- * (TAB_ROW_GAP_REM * root font-size); this function never reads the DOM.
+ * Pure px math — callers pass the strip's measured content width in px (see
+ * TabBar's measurement effect for the exact conservative composition) and the
+ * gap in px (TAB_ROW_GAP_REM * root font-size); this function never reads the
+ * DOM.
  */
 export function multirowUniformTabWidthPx(
   containerWidthPx: number,
@@ -240,16 +245,16 @@ git commit -m "fix(tabs): add multirowUniformTabWidthPx full-row width math"
 ### Task 2: Apply the uniform width in `TabBar.tsx`
 
 **Files:**
-- Modify: `src/components/TabBar.tsx` (import block :46-49; `SortableTab` props interface ~:73; `SortableTab` style/className ~:118-142; measurement effect ~:456-478; `renderSortableTab` pass site ~:361 and its deps array ~:401-418 — line anchors are pre-change positions, verify against the quoted code)
+- Modify: `src/components/TabBar.tsx` (import block :46-49; `SortableTab` props interface ~:73; `SortableTab` style :118-121 and className :135-141; measurement effect ~:456-478; `renderSortableTab` pass site ~:361 and its deps array ~:401-418 — line anchors are pre-change positions, verify against the quoted code)
 - Test: `test/unit/client/components/TabBar.multirow.test.tsx` (extend `describe('tab widths')` at :272-295)
 
 **Interfaces:**
 - Consumes (from Task 1): `multirowUniformTabWidthPx(containerWidthPx: number, tabCount: number, gapPx: number): number | null`, plus existing `TAB_ROW_GAP_REM: number` and `getRootFontSizePx(): number` from `@/lib/tab-bar-metrics`.
 - Produces (the DOM contract Task 3's e2e measures): when multirow tabs wrap to 2+ rows, every direct child `<div>` of `[data-testid="tab-strip"]` carries inline `style.width = '<N>px'` (same integer N for all) and class `shrink-0`, with NO `grow`/`basis-[150px]`/`max-w-[200px]` classes; when all tabs fit one row, the classes remain exactly `grow basis-[150px] min-w-[150px] max-w-[200px]` with no inline width. `SortableTab` gains required prop `uniformWidthPx: number | null`.
 
-- [ ] **Step 1: Write the failing test (plus one pin test for the single-row branch)**
+- [ ] **Step 1: Write the failing tests (plus one pin test for the single-row branch)**
 
-In `test/unit/client/components/TabBar.multirow.test.tsx`, add these two tests inside the existing `describe('tab widths', () => { ... })` block (after the `'sizes tabs between 150px and 200px in multirow mode'` test). They reuse the file's existing `createTab`, `createStore`, `renderWithStore` helpers and the established `vi.spyOn(Element.prototype, ..., 'get')` geometry-faking idiom:
+In `test/unit/client/components/TabBar.multirow.test.tsx`, add these three tests inside the existing `describe('tab widths', () => { ... })` block (after the `'sizes tabs between 150px and 200px in multirow mode'` test). They reuse the file's existing `createTab`, `createStore`, `renderWithStore` helpers and the established `vi.spyOn(Element.prototype, ..., 'get')` geometry-faking idiom:
 
 ```tsx
     it('locks every tab to the full-row width when tabs wrap to multiple rows', () => {
@@ -280,6 +285,37 @@ In `test/unit/client/components/TabBar.multirow.test.tsx`, add these two tests i
       }
     })
 
+    it('prefers the fractional rect width so a knife-edge clientWidth round-up cannot overpredict capacity', () => {
+      // Real-Chromium-validated knife edge: a true content width of 909.6px
+      // rounds to clientWidth 910 (capacity 6), but only 5 tabs of >=150px
+      // actually fit per row. The effect must prefer
+      // floor(getBoundingClientRect().width) = 909 (capacity 5), so 6 tabs
+      // wrap and lock to floor((909 - 4*2) / 5) = 180.
+      const clientWidthSpy = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(910)
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      const rect = {
+        width: 909.6, height: 67, top: 0, left: 0, right: 909.6, bottom: 67, x: 0, y: 0,
+        toJSON: () => ({}),
+      } as DOMRect
+      const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(rect)
+      try {
+        const tabs = Array.from({ length: 6 }, (_, i) =>
+          createTab({ id: `tab-${i + 1}`, title: `Tab ${i + 1}` }),
+        )
+        const store = createStore({ tabs, activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        const wrappers = Array.from(screen.getByTestId('tab-strip').children) as HTMLElement[]
+        expect(wrappers.length).toBe(6)
+        for (const wrapper of wrappers) {
+          expect(wrapper.style.width).toBe('180px')
+        }
+      } finally {
+        clientWidthSpy.mockRestore()
+        scrollHeightSpy.mockRestore()
+        rectSpy.mockRestore()
+      }
+    })
+
     it('keeps stretch-to-fill when all tabs fit on a single multirow row', () => {
       // 1000px strip fits 6 tabs per row; 3 tabs -> single row -> no width lock.
       const clientWidthSpy = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(1000)
@@ -303,14 +339,14 @@ In `test/unit/client/components/TabBar.multirow.test.tsx`, add these two tests i
     })
 ```
 
-- [ ] **Step 2: Run the tests to verify the lock test fails (RED — this reproduces the bug's mechanism)**
+- [ ] **Step 2: Run the tests to verify the lock tests fail (RED — this reproduces the bug's mechanism)**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/multirow-last-row-width
 npm run test:vitest -- run test/unit/client/components/TabBar.multirow.test.tsx -t 'tab widths'
 ```
 
-Expected: **1 failed, 3 passed**. The lock test fails at `expect(wrapper.style.width).toBe('165px')` with `expected '' to be '165px'` — today no width lock exists, every wrapper keeps the per-line stretch classes. The single-row pin test passes already (it guards the branch that must NOT change). The 2 pre-existing width tests pass.
+Expected: **2 failed, 3 passed**. The lock test fails at `expect(wrapper.style.width).toBe('165px')` with `expected '' to be '165px'`, and the knife-edge test fails the same way (`expected '' to be '180px'`) — today no width lock exists, every wrapper keeps the per-line stretch classes. The single-row pin test passes already (it guards the branch that must NOT change). The 2 pre-existing width tests pass.
 
 - [ ] **Step 3: Implement the TabBar wiring (5 focused edits)**
 
@@ -362,7 +398,7 @@ with:
   }
 ```
 
-and replace the wrapper's width classes (currently `TabBar.tsx:134-141`):
+and replace the wrapper's width classes (currently `TabBar.tsx:135-141`):
 
 ```tsx
       // Multirow: pack rows at a 150px minimum, stretch to fill the row, cap at 200px.
@@ -391,6 +427,8 @@ with:
           : "w-[175px] shrink-0"
       )}
 ```
+
+Caution (validated against the installed dnd-kit sources): keep `width` OUT of any CSS `transition` on this wrapper — the style's transition stays `transform`-only as quoted above. dnd-kit re-measures sortable rects mid-drag on a 25ms debounce, and an animating width would let it capture intermediate widths.
 
 **Edit 4 — measurement effect.** Replace the existing multiple-rows detection effect (currently `TabBar.tsx:456-478`):
 
@@ -444,12 +482,22 @@ with:
       const rootFontSizePx = getRootFontSizePx()
       setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(rootFontSizePx))
       // Lock every tab to the full-row width whenever the tabs wrap to 2+ rows.
-      // clientWidth excludes the overflow-y-auto scrollbar; a 0 measurement
-      // (jsdom / pre-layout) makes the helper return null, keeping the CSS
-      // stretch-to-fill classes. Scale changes re-fire the observer (above),
-      // so the rem-based gap term stays fresh.
+      // Conservative width measurement (validated in real Chromium):
+      // - clientWidth excludes a classic vertical scrollbar but ROUNDS TO
+      //   NEAREST, over-reporting row capacity in a ~0.5px window below each
+      //   wrap threshold (which would re-wrap a full row's last tab);
+      // - getBoundingClientRect().width is fractional (exact) but INCLUDES a
+      //   space-taking scrollbar.
+      // min() of the two is exact when the strip has no scrollbar and falls
+      // back to the verified clientWidth behavior when it does. A 0 rect
+      // (jsdom / pre-layout) falls back to clientWidth, and the helper returns
+      // null for <= 0, keeping the CSS stretch-to-fill classes. Scale changes
+      // re-fire the observer (above), so the rem-based gap term stays fresh.
+      const rectWidth = node.getBoundingClientRect().width
+      const stripWidthPx =
+        rectWidth > 0 ? Math.min(node.clientWidth, Math.floor(rectWidth)) : node.clientWidth
       setUniformTabWidthPx(
-        multirowUniformTabWidthPx(node.clientWidth, tabs.length, TAB_ROW_GAP_REM * rootFontSizePx),
+        multirowUniformTabWidthPx(stripWidthPx, tabs.length, TAB_ROW_GAP_REM * rootFontSizePx),
       )
     }
     update()
@@ -459,6 +507,8 @@ with:
     return () => observer.disconnect()
   }, [multirowTabs, tabs.length])
 ```
+
+Note (validated in Chromium): when the mobile breakpoint (767px) swaps the strip's DOM node, the observer on the detached node delivers a final 0×0 entry — the lock resets to `null` (stretch fallback, never a wrong width) until deps change. This is the same pre-existing exposure `hasMultipleRows` has (PR #616); do NOT add extra listeners for it.
 
 **Edit 5 — thread the prop through `renderSortableTab`.** At the pass site (currently `TabBar.tsx:361`), directly below:
 
@@ -480,7 +530,7 @@ Then in `renderSortableTab`'s `useCallback` dependency array (currently `TabBar.
 npm run test:vitest -- run test/unit/client/components/TabBar.multirow.test.tsx
 ```
 
-Expected: **PASS** — `Tests 24 passed (24)` (22 existing + 2 new). Note the two pre-existing width tests pass untouched: the multirow one renders a single tab at jsdom `clientWidth` 0 → helper returns `null` → stretch classes; the single-row-mode one never enters the multirow branch.
+Expected: **PASS** — `Tests 25 passed (25)` (22 existing + 3 new). Note the two pre-existing width tests pass untouched: the multirow one renders a single tab at jsdom geometry 0 (rect 0 → fallback `clientWidth` 0) → helper returns `null` → stretch classes; the single-row-mode one never enters the multirow branch.
 
 - [ ] **Step 5: Run the full tab-bar unit slice and the client typecheck**
 
@@ -524,10 +574,18 @@ git commit -m "fix(tabs): lock last-row multirow tabs to the full-row width"
 > 11 is prime, so the last row is a strict partial row for ANY tabs-per-row the
 > viewport yields — the assertion `lastRowCount < firstRowCount` can never be
 > defeated by an evenly-divisible packing.
+>
+> Accepted coverage caveats (from plan validation): headless Chromium uses
+> overlay (0px) scrollbars, so this spec cannot exercise the classic-scrollbar
+> leg of the measurement (validated separately in a headed run during
+> planning). The 1px width tolerance is calibrated for Chromium — the only
+> engine that gates this spec today (no CI workflow runs Playwright; the
+> config's firefox/webkit projects activate only under `CI=true`). If a CI e2e
+> job is ever added, revisit the tolerance for other engines.
 
 - [ ] **Step 1: Write the e2e test**
 
-Append inside `test.describe('Multi-row tabs', ...)` in `test/e2e-browser/specs/multirow-tabs.spec.ts` (after the `'single-row tabs are fixed at 175px'` test):
+Append inside `test.describe('Multi-row tabs', ...)` in `test/e2e-browser/specs/multirow-tabs.spec.ts` (after the `'single-row tabs are fixed at 175px'` test). Note: `[data-context="tab-add"]` is rendered via the `ContextIds.TabAdd` constant (resolving to `'tab-add'`), not a string literal — grep for `ContextIds.TabAdd` in TabBar.tsx if you need the source; the selector below works at runtime as-is:
 
 ```ts
   test('last-row tabs match the width of the full rows above', async ({ freshellPage: page, harness }) => {
@@ -559,7 +617,8 @@ Append inside `test.describe('Multi-row tabs', ...)` in `test/e2e-browser/specs/
     expect(lastRowCount).toBeLessThan(tabsPerRow[0])
 
     // THE invariant: every tab — full rows AND the partial last row — renders
-    // at the same width (1px tolerance for sub-pixel rounding).
+    // at the same width (1px tolerance for sub-pixel rounding; calibrated for
+    // Chromium, the only engine that gates this spec today).
     const widths = boxes.map((b) => b.width)
     const minWidth = Math.min(...widths)
     const maxWidth = Math.max(...widths)
@@ -635,6 +694,7 @@ git commit -m "test(e2e): cover uniform multirow tab width across wrapped rows"
 | Width computed from full rows: min 150px, fit as many as possible, stretch to fill, 200px cap | Task 1 | Unit: `165` @ W=1000, cap case `200` @ W=450, floor case, min-clamp case, packing invariant loop; Task 3 e2e bounds check [149, 201] |
 | Uniform width applied to ALL tabs; last row ends short of the right edge | Task 2, Task 3 | Task 3 e2e: partial-row precondition (`lastRowCount < firstRowCount`) + equal widths + last-row right edge short of strip edge |
 | Single row in multirow mode keeps stretch-to-fill as-is | Task 1 (`null` return), Task 2 (pin test) | Existing e2e `'multirow tabs render between 150 and 200px wide'` (2 tabs, one row) stays green in Task 3 Step 3 |
+| Knife-edge measurement: a rounding-up `clientWidth` must not overpredict row capacity (validated falsification of the naive input in real Chromium) | Task 2 (conservative `min(clientWidth, floor(rect.width))` in Edit 4 + knife-edge unit test) | Unit: `180px` @ rect 909.6 / clientWidth 910 / 6 tabs; Chromium sweep evidence in the assumption ledger (0/42 divergent with the remedy) |
 | Single-row mode (multirow=false) fixed 175px unchanged | No code change (branch untouched) | Existing unit test `'fixes tabs at 175px in single-row mode'` + existing e2e `'single-row tabs are fixed at 175px'` re-run green in Tasks 2/3 |
 | Unit + e2e coverage of the uniform-width invariant (repo TDD conventions) | Tasks 1–3 | Red-green at unit level (Task 1 Step 2, Task 2 Step 2); e2e invariant test in Task 3 |
 
