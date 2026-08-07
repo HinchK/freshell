@@ -249,10 +249,23 @@ Test 3 — single-row is no longer the default; dispatch it explicitly first:
   })
 ```
 
-- [ ] **Step 9: Run the e2e spec**
+Also make `test/e2e-browser/specs/sidebar.spec.ts` mode-explicit. Its test `'sidebar reopen button stays fixed when overflowing tabs are scrolled'` (~line 29) depends on the OLD single-row default without ever naming it: it creates 18 tabs, locates the strip via `tabBar.locator('.overflow-x-auto').first()` (~line 61), and asserts horizontal scrollability (`scrollWidth > clientWidth`). Under the new multirow default the strip renders `flex-wrap overflow-y-auto` and no `.overflow-x-auto` element exists in the tab bar, so the locator resolves to nothing and the test fails. Insert at the very top of that test's body (before any tabs are created) the same explicit opt-out dispatch used above:
 
-Run: `npx playwright test --config test/e2e-browser/playwright.config.ts multirow-tabs --project=chromium`
-Expected: 3 passed.
+```ts
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { multirowTabs: false } },
+      })
+    })
+```
+
+Do NOT change any of the test's locators or assertions — its intent (reopen button stays fixed while the single-row strip scrolls horizontally) is single-row-specific, so pinning the mode preserves exactly what it proves.
+
+- [ ] **Step 9: Run the e2e specs**
+
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts multirow-tabs sidebar --project=chromium`
+Expected: all pass (3 in `multirow-tabs.spec.ts` plus every test in `sidebar.spec.ts`).
 
 - [ ] **Step 10: Flip the docs mock switch**
 
@@ -275,7 +288,8 @@ to:
 ```bash
 git add shared/settings.ts src/components/TabBar.tsx src/components/settings/PanesSettings.tsx docs/index.html \
   test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts \
-  test/unit/client/components/
+  test/unit/client/components/ \
+  test/e2e-browser/specs/multirow-tabs.spec.ts test/e2e-browser/specs/sidebar.spec.ts
 git commit -m "feat(tabs): default multi-row tab bar to on"
 ```
 
@@ -727,6 +741,16 @@ interface SortableTabProps {
 ```tsx
       multirow={multirowTabs}
 ```
+
+AND add `multirowTabs` to `renderSortableTab`'s `useCallback` dependency array (the one-entry-per-line `}, [ ... ])` list that closes the callback, ~lines 389–405; insert alphabetically):
+
+```ts
+    iconsOnTabs,
+    multirowTabs,
+    repoIconsOnTabs,
+```
+
+Why this is load-bearing: `renderSortableTab` is memoized. Without `multirowTabs` in its deps, a runtime settings toggle re-renders `TabBar` but the callback keeps closing over the old value, so every tab keeps its stale width classes — a real product bug (the Settings toggle stops restyling tabs) AND it makes Step 6's `'single-row tabs are fixed at 175px'` e2e test unachievable (the tab would still measure ~200px). Do not rely on lint to catch this: `react-hooks/exhaustive-deps` is warning-only in this repo's eslint config and `npm run lint` passes with warnings.
 
 (d) In the `<DragOverlay>` block, change the ghost width `className="w-[180px]"` to:
 
@@ -1437,16 +1461,30 @@ git commit -m "test(e2e): tab bar height resize, keyboard steps, and per-browser
 Run: `npm run test:unit && npm run lint && npm run typecheck`
 Expected: PASS / clean. Fix any straggler test that still assumes single-row default, 180px tabs, or `max-h-32` using the explicit-mode patterns from Tasks 1/4/5 (check `test/e2e/*.test.tsx` jsdom app-flow tests in particular).
 
-- [ ] **Step 2: Check settings-related e2e for default assumptions**
+- [ ] **Step 2: Check e2e specs for default assumptions**
 
-Run: `grep -rln "multirowTabs\|multi-row" test/e2e-browser/specs/`
-Expected: `multirow-tabs.spec.ts`, `tab-bar-resize.spec.ts`, and possibly `settings-persistence-split.spec.ts`. Run every match:
+A settings-name grep alone CANNOT find specs that depend on the old single-row default structurally without ever naming the setting (e.g. `sidebar.spec.ts` locates `.overflow-x-auto` — made mode-explicit in Task 1 Step 8). Run both greps:
 
 ```bash
-npx playwright test --config test/e2e-browser/playwright.config.ts multirow-tabs tab-bar-resize settings-persistence-split --project=chromium
+grep -rln "multirowTabs\|multi-row" test/e2e-browser/specs/
+grep -rln "overflow-x-auto\|flex-wrap\|tab-strip" test/e2e-browser/specs/
+```
+
+Expected: first grep — `multirow-tabs.spec.ts`, `sidebar.spec.ts` (after Task 1 Step 8), `tab-bar-resize.spec.ts`, and possibly `settings-persistence-split.spec.ts`; second grep — `multirow-tabs.spec.ts`, `sidebar.spec.ts`, `tab-bar-resize.spec.ts` (its `getByTestId('tab-strip')` locators match `tab-strip`). For any match not already made mode-explicit by earlier tasks, read the spec: if it assumes single-row structure (horizontal scrolling, `overflow-x-auto`, fixed one-row heights), add the explicit `multirowTabs: false` dispatch from Task 1 Step 8 at the top of the affected test — never weaken assertions. Then run every match:
+
+```bash
+npx playwright test --config test/e2e-browser/playwright.config.ts multirow-tabs tab-bar-resize sidebar settings-persistence-split --project=chromium
 ```
 
 Expected: all pass. If `settings-persistence-split.spec.ts` used `multirowTabs: true` as its "non-default local value" sample, switch that sample to `multirowTabs: false` (now the non-default) or `tabBarRows: 5`, keeping the test's intent identical.
+
+Finally, because grep-based discovery is a heuristic, run the FULL e2e-browser suite once as the actual gate for "a fully green tree":
+
+```bash
+npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium
+```
+
+Expected: all pass. Any failure in a spec not touched by this feature is a regression from the default flip: if the failing test verifies single-row-specific behavior, pin it with the explicit `multirowTabs: false` dispatch; if it exposes a genuine product bug, stop and fix the bug — do not update baselines or weaken assertions to get green.
 
 - [ ] **Step 3: Screenshot baselines**
 
