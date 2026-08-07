@@ -131,6 +131,15 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             );
             continue;
         }
+        // Claim guards on the id being adopted (parity with the codex
+        // adoption tail's `codex_identity::codex_claim_refused` and the
+        // opencode SIGNAL lane's `target_session_guards_pass` — this
+        // locator lane previously had neither, so a sole cwd-matching
+        // candidate could silently rebind another pane's (or a fresh
+        // agent's) session onto this terminal).
+        if opencode_claim_refused(state, &located.terminal_id, &located.session_id).await {
+            continue;
+        }
 
         state.identity.upsert(
             &located.terminal_id,
@@ -256,6 +265,61 @@ async fn classify_resume_target_task(
             crate::terminal::broadcast_terminals_changed(&state);
         }
     }
+}
+
+/// Shared misbind guards for the locator adoption lane. `session_id` is the
+/// id being CLAIMED. Mirrors `codex_identity::codex_claim_refused` (the
+/// codex adoption tail's REQUIRED A4 misbind hardening) and the opencode
+/// signal lane's `target_session_guards_pass` semantics:
+/// - retired-INCLUSIVE bound-elsewhere (ledger A8): a session bound to
+///   ANOTHER terminal — live or retired — must never be re-adopted here.
+///   Reachable with two panes in one cwd: pane A's `ses_*` row lands inside
+///   pane B's Enter window before B's own row exists, so B's locator emits
+///   A's id as a clean sole candidate. Same-terminal re-adopt is an
+///   idempotent allow.
+/// - fresh-agent exclusion (the codex B2xB4 twin): the fresh-agent
+///   `opencode serve` inherits the server env and writes the SAME
+///   `<HOME>/.local/share/opencode/opencode.db` this locator row-diffs, so
+///   an agent chat materializing its session in the pane's cwd inside the
+///   window would misbind as a sole candidate. A session the server knows
+///   as a fresh-agent session — live in the fresh_opencode session map, or
+///   recorded by the durable kind:fresh-agent ledger row — must never bind
+///   to a terminal pane.
+async fn opencode_claim_refused(state: &WsState, terminal_id: &str, session_id: &str) -> bool {
+    if let Some(existing) = state
+        .identity
+        .find_by_session_including_retired("opencode", session_id)
+    {
+        if existing != terminal_id {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                session_id = %session_id,
+                "opencode_association_rejected: session_bound_elsewhere"
+            );
+            return true;
+        }
+    }
+    if state.fresh_opencode.has_live_session(session_id).await {
+        tracing::warn!(
+            terminal_id = %terminal_id,
+            session_id = %session_id,
+            "opencode_association_rejected: freshagent_live_session"
+        );
+        return true;
+    }
+    if state
+        .pane_ledger
+        .lookup_by_session("opencode", session_id)
+        .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+    {
+        tracing::warn!(
+            terminal_id = %terminal_id,
+            session_id = %session_id,
+            "opencode_association_rejected: freshagent_ledger_row"
+        );
+        return true;
+    }
+    false
 }
 
 /// Fan `terminal.session.associated` (the sessionRef the client's
@@ -963,6 +1027,217 @@ mod tests {
                 .is_none(),
             "no ledger binding may be written for the rejected candidate"
         );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// One-writer defense, locator lane (mirror of `codex_association.rs`'s
+    /// `located_session_bound_elsewhere_is_rejected`): a session already
+    /// bound to ANOTHER terminal (including a retired binding) must never be
+    /// re-adopted by the drain. Two live panes in one cwd are enough to
+    /// reach this in production: pane A's `ses_*` row lands inside pane B's
+    /// Enter window before B's own row exists, so B's locator emits A's id
+    /// as a clean sole candidate.
+    #[tokio::test]
+    async fn located_session_bound_elsewhere_is_rejected() {
+        const SID: &str = "ses_boundelsewhere0000000000";
+        let home = unique_temp_dir("bound-elsewhere");
+        let (state, _rx) = state_with_locator(home.clone());
+        let db = open_seed_db(&home);
+
+        // The victim's binding, RETIRED — exactly the state the exit path
+        // leaves behind (terminal.rs's exit hook calls identity.retire).
+        // Retired-INCLUSIVE is the point: a dead pane's identity must still
+        // repel adoption by another terminal.
+        state.identity.upsert(
+            "victim",
+            Some("opencode"),
+            Some(SID),
+            Some("/tmp"),
+            now_ms(),
+        );
+        assert!(state.identity.retire("victim"));
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "opencode",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
+
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
+        note_possible_submit(&state, "t1", "\r");
+
+        // The bound-elsewhere session's row appears inside t1's window with
+        // t1's own cwd — a fully resolvable sole candidate, or this test
+        // proves nothing.
+        insert_session(&db, SID, "/tmp", crate::terminal::now_ms(), None, None);
+
+        // Drive drains until the locator EMITS (tick disarms on emission —
+        // armed_count 0 is the positive proof the Located event reached the
+        // drain's guards, not that the locator never resolved).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut emitted = false;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state.opencode_locator.as_ref().unwrap().armed_count() == 0 {
+                emitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(emitted, "the locator must emit a Located event");
+
+        // Guard refused: nothing adopted.
+        assert!(
+            state.identity.get("t1").is_none(),
+            "a session bound to another terminal must never be adopted"
+        );
+        let entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .unwrap();
+        assert!(entry.resume_session_id.is_none());
+        // The victim's binding is untouched.
+        assert_eq!(
+            state
+                .identity
+                .find_by_session_including_retired("opencode", SID)
+                .as_deref(),
+            Some("victim")
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Fresh-agent exclusion, locator lane (mirror of `codex_association.rs`'s
+    /// `located_freshagent_known_thread_is_rejected`): the fresh-agent
+    /// `opencode serve` inherits the server env and writes the SAME
+    /// `<HOME>/.local/share/opencode/opencode.db` the locator row-diffs, so
+    /// an agent chat materializing its `ses_*` row in the pane's cwd inside
+    /// the Enter window is a clean sole candidate. B4's kind:fresh-agent
+    /// ledger row is the exclusion signal: a freshagent-known session must
+    /// never bind to a terminal pane.
+    #[tokio::test]
+    async fn located_freshagent_known_session_is_rejected() {
+        const SID: &str = "ses_freshagentknown00000000";
+        let home = unique_temp_dir("freshagent-known");
+        let ledger_dir = unique_temp_dir("freshagent-known-ledger");
+        let (state, _rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+        let db = open_seed_db(&home);
+
+        // The fresh-agent session's ledger row, exactly what the identity
+        // sink persists at session materialization (durable before answer).
+        state
+            .pane_ledger
+            .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                provider: "opencode",
+                session_id: SID,
+                mode: "freshopencode",
+                cwd: Some("/tmp"),
+                create_request_id: None,
+                model: Some("some-model"),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                supersedes: None,
+                now_ms: now_ms(),
+            })
+            .expect("seed fresh-agent ledger row");
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "opencode",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
+
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
+        note_possible_submit(&state, "t1", "\r");
+
+        // The fresh-agent serve's row appears in the shared DB with the
+        // pane's own cwd — the exact misbind shape.
+        insert_session(&db, SID, "/tmp", crate::terminal::now_ms(), None, None);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut emitted = false;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state.opencode_locator.as_ref().unwrap().armed_count() == 0 {
+                emitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(emitted, "the locator must emit a Located event");
+
+        // Guard refused: the fresh-agent session never binds the terminal.
+        assert!(
+            state.identity.get("t1").is_none(),
+            "a fresh-agent session must never bind to a terminal pane"
+        );
+        let entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .unwrap();
+        assert!(entry.resume_session_id.is_none());
+        // The fresh-agent ledger row is untouched (still fresh-agent kind).
+        let hit = state
+            .pane_ledger
+            .lookup_by_session("opencode", SID)
+            .expect("fresh-agent row survives");
+        assert_eq!(hit.row.pane_kind.as_deref(), Some("fresh-agent"));
 
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
