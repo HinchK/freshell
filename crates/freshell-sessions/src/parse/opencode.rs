@@ -447,6 +447,74 @@ pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, 
     }
 }
 
+/// Classify a session id as SUBAGENT (`parent_id IS NOT NULL`) via a single
+/// indexed row lookup — the classification behind the sidebar rail's
+/// subagent-terminal filtering (never used for association decisions; the
+/// locator's candidate SQL keeps its own `parent_id IS NULL` refusal).
+///
+/// - `Ok(None)`: DB file missing (opencode never ran here) or no matching row;
+/// - `Ok(Some(true))`: row exists with a parent (subagent/child session);
+/// - `Ok(Some(false))`: root row, or a legacy schema without `parent_id`
+///   (every session is a root there);
+/// - `Err`: ANY read failure — callers must treat as "unknown", never
+///   "subagent" (a lock-contention misclassification would hide a real
+///   user session from the rail).
+pub fn session_is_subagent_by_id(
+    data_home: &Path,
+    session_id: &str,
+) -> Result<Option<bool>, OpencodeReadError> {
+    let db_path = data_home.join("opencode.db");
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(500))
+        .map_err(|e| OpencodeReadError(e.to_string()))?;
+
+    // PRAGMA table_info(session) -> hasParentId (same guard as run_opencode_query_inner).
+    let has_parent_id = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(session)")
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let mut found = false;
+        for name in names {
+            if name.map_err(|e| OpencodeReadError(e.to_string()))? == "parent_id" {
+                found = true;
+            }
+        }
+        found
+    };
+
+    if !has_parent_id {
+        return match conn.query_row(
+            "SELECT 1 FROM session WHERE id = ?1",
+            rusqlite::params![session_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(Some(false)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(OpencodeReadError(e.to_string())),
+        };
+    }
+
+    match conn.query_row(
+        "SELECT parent_id FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(parent) => Ok(Some(parent.is_some())),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(OpencodeReadError(e.to_string())),
+    }
+}
+
 /// SHORT busy timeout (`opencode-by-id-query.ts:12`): a locked DB must fail
 /// FAST — the failure surfaces as provider-unavailable, never "not found".
 const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
