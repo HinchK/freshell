@@ -805,7 +805,10 @@ fn build_live_terminal_session_item(
         last_activity_at: identity.updated_at,
         created_at: Some(identity.updated_at),
         cwd: identity.cwd.clone(),
-        is_subagent: false,
+        // Bug-1 (sidebar rail): a live terminal launched at a subagent
+        // session projects the classification; the client's existing
+        // showSubagents filter (sidebarSelectors.ts:656) then hides it.
+        is_subagent: identity.is_subagent.unwrap_or(false),
         is_non_interactive: false,
         is_running: true,
         archived: false,
@@ -942,6 +945,30 @@ mod join_tests {
         assert_eq!(item.running_terminal_id.as_deref(), Some("term-9"));
         assert!(!item.live_terminal_only);
         assert_eq!(item.last_activity_at, 2000);
+    }
+
+    /// Bug-1 (sidebar rail): a live terminal launched at a subagent session
+    /// projects the identity classification onto the synthesized item (and its
+    /// `isSubagent` wire emission); unclassified identities stay non-subagent.
+    #[test]
+    fn live_terminal_item_mirrors_identity_subagent_flag() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert(
+            "term-9",
+            Some("opencode"),
+            Some("sess-77"),
+            Some("/home/dan/project"),
+            2000,
+        );
+        let mut identity = reg.list().into_iter().next().unwrap();
+        identity.is_subagent = Some(true);
+        let item = build_live_terminal_session_item(&identity).expect("item");
+        assert!(item.is_subagent, "identity Some(true) must project");
+        assert_eq!(item.to_value()["isSubagent"], serde_json::json!(true));
+
+        identity.is_subagent = None;
+        let item = build_live_terminal_session_item(&identity).expect("item");
+        assert!(!item.is_subagent, "unclassified stays non-subagent");
     }
 
     /// A codex terminal established at create time with NO session id yet
