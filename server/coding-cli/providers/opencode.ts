@@ -59,6 +59,16 @@ export function defaultOpencodeDataHome(): string {
   return path.join(os.homedir(), '.local', 'share', 'opencode')
 }
 
+/**
+ * The opencode.db path inside an opencode DATA home. With no argument this
+ * is the PRODUCTION default: `$XDG_DATA_HOME/opencode/opencode.db`,
+ * `%LOCALAPPDATA%\opencode\opencode.db`, or `~/.local/share/opencode/opencode.db`
+ * (whatever defaultOpencodeDataHome() resolves).
+ */
+export function resolveOpencodeDatabasePath(dataHome: string = defaultOpencodeDataHome()): string {
+  return path.join(dataHome, 'opencode.db')
+}
+
 function toValidTimestamp(value: unknown): number | undefined {
   // SQLite columns are dynamically typed, so time_updated/time_created can arrive
   // as REAL. Downstream read-model schemas require integer epoch-ms, so floor.
@@ -91,7 +101,7 @@ export class OpencodeProvider implements CodingCliProvider {
 
   /** Public: resolve-fallbacks builds the off-thread by-id lookup from this path. */
   getDatabasePath(): string {
-    return path.join(this.homeDir, 'opencode.db')
+    return resolveOpencodeDatabasePath(this.homeDir)
   }
 
   private getWatchedDatabasePaths(): [string, string] {

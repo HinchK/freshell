@@ -36,6 +36,10 @@ export async function runOpencodeSessionByIdQuery(
     const hasProject = tableNames.has('project')
     const projectSelect = hasProject ? 'p.worktree' : 'NULL'
     const projectJoin = hasProject ? 'LEFT JOIN project p ON p.id = s.project_id' : ''
+    // Schema-guarded parent_id projection (same PRAGMA probe idiom as the
+    // listing query): old schemas keep returning rows, with parentId null.
+    const columns = db.prepare('PRAGMA table_info(session)').all() as Array<{ name?: unknown }>
+    const hasParentId = columns.some((c) => c.name === 'parent_id')
     const row = db.prepare(`
       SELECT
         s.id AS sessionId,
@@ -43,6 +47,7 @@ export async function runOpencodeSessionByIdQuery(
         s.title AS title,
         s.time_created AS createdAt,
         s.time_updated AS lastActivityAt,
+        ${hasParentId ? 's.parent_id' : 'NULL'} AS parentId,
         ${projectSelect} AS projectPath
       FROM session s
       ${projectJoin}
