@@ -9,6 +9,10 @@ interface PaneDividerProps {
   dataContext?: string
   dataTabId?: string
   dataSplitId?: string
+  /** Pixels per keyboard arrow press (default 10). */
+  keyboardStep?: number
+  /** Accessible name; defaults to the generic pane divider label. */
+  ariaLabel?: string
 }
 
 export default function PaneDivider({
@@ -19,6 +23,8 @@ export default function PaneDivider({
   dataContext,
   dataTabId,
   dataSplitId,
+  keyboardStep = 10,
+  ariaLabel,
 }: PaneDividerProps) {
   const [isDragging, setIsDragging] = useState(false)
   const startPosRef = useRef(0)
@@ -94,7 +100,7 @@ export default function PaneDivider({
   }, [isDragging, direction, onResize, onResizeEnd])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
-    const step = 10 // keyboard resize step in pixels
+    const step = keyboardStep
     let handled = false
 
     if (direction === 'horizontal') {
@@ -122,7 +128,7 @@ export default function PaneDivider({
     if (handled) {
       onResizeEnd()
     }
-  }, [direction, onResize, onResizeEnd])
+  }, [direction, onResize, onResizeEnd, keyboardStep])
 
   return (
     // A focusable separator is the ARIA pattern for keyboard-resizable splitters.
@@ -132,7 +138,7 @@ export default function PaneDivider({
       // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
       tabIndex={0}
       aria-orientation={direction === 'horizontal' ? 'vertical' : 'horizontal'}
-      aria-label={`Pane divider (${direction === 'horizontal' ? 'horizontal' : 'vertical'} resize)`}
+      aria-label={ariaLabel ?? `Pane divider (${direction === 'horizontal' ? 'horizontal' : 'vertical'} resize)`}
       onMouseDown={handleMouseDown}
       onTouchStart={handleTouchStart}
       onKeyDown={handleKeyDown}

@@ -563,8 +563,8 @@ describe('shared settings contract', () => {
     })
   })
 
-  it('defaults multirowTabs to false in resolved local settings', () => {
-    expect(resolveLocalSettings(undefined).panes.multirowTabs).toBe(false)
+  it('defaults multirowTabs to true in resolved local settings', () => {
+    expect(resolveLocalSettings(undefined).panes.multirowTabs).toBe(true)
   })
 
   it('accepts multirowTabs boolean in local settings patch', () => {
@@ -628,6 +628,45 @@ describe('shared settings contract', () => {
     it('is rejected by the server patch schema (stays local)', () => {
       const schema = buildServerSettingsPatchSchema()
       expect(schema.safeParse({ panes: { repoIconsOnTabs: true } }).success).toBe(false)
+    })
+  })
+
+  describe('panes.tabBarRows (browser-local)', () => {
+    it('defaults to 3', () => {
+      expect(resolveLocalSettings(undefined).panes.tabBarRows).toBe(3)
+    })
+
+    it('applies a numeric patch', () => {
+      expect(resolveLocalSettings({ panes: { tabBarRows: 5 } }).panes.tabBarRows).toBe(5)
+    })
+
+    it('merges patches preserving other pane keys', () => {
+      const merged = mergeLocalSettings(
+        { panes: { multirowTabs: false } },
+        { panes: { tabBarRows: 6 } },
+      )
+      expect(merged.panes?.multirowTabs).toBe(false)
+      expect(merged.panes?.tabBarRows).toBe(6)
+    })
+
+    it('rounds and clamps tabBarRows in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 4.4 },
+      } as Record<string, unknown>)).toEqual({ panes: { tabBarRows: 4 } })
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 42 },
+      } as Record<string, unknown>)).toEqual({ panes: { tabBarRows: 10 } })
+    })
+
+    it('rejects a non-numeric tabBarRows in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 'lots' },
+      } as Record<string, unknown>)).toEqual(undefined)
+    })
+
+    it('is rejected by the server patch schema (stays local)', () => {
+      const schema = buildServerSettingsPatchSchema()
+      expect(schema.safeParse({ panes: { tabBarRows: 5 } }).success).toBe(false)
     })
   })
 

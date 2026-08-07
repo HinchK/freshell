@@ -63,6 +63,9 @@ const TERMINAL_LINE_HEIGHT_MIN = 1
 const TERMINAL_LINE_HEIGHT_MAX = 1.8
 const PANE_SNAP_THRESHOLD_MIN = 0
 const PANE_SNAP_THRESHOLD_MAX = 8
+export const TAB_BAR_ROWS_MIN = 1
+export const TAB_BAR_ROWS_MAX = 10
+export const TAB_BAR_ROWS_DEFAULT = 3
 const SIDEBAR_WIDTH_MIN = 200
 const SIDEBAR_WIDTH_MAX = 500
 export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif', 'mono'] as const
@@ -79,7 +82,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs', 'tabBarRows'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'worktreeGrouping',
@@ -210,6 +213,7 @@ export type LocalSettings = {
     sessionOpenMode: SessionOpenMode
     multirowTabs: boolean
     repoIconsOnTabs: boolean
+    tabBarRows: number
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -572,6 +576,14 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (typeof patch.panes.repoIconsOnTabs === 'boolean') {
       panes.repoIconsOnTabs = patch.panes.repoIconsOnTabs as boolean
     }
+    const normalizedTabBarRows = normalizeRoundedClampedNumber(
+      patch.panes.tabBarRows,
+      TAB_BAR_ROWS_MIN,
+      TAB_BAR_ROWS_MAX,
+    )
+    if (normalizedTabBarRows !== undefined) {
+      panes.tabBarRows = normalizedTabBarRows
+    }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
     }
@@ -890,8 +902,9 @@ export const defaultLocalSettings: LocalSettings = {
     tabAttentionStyle: 'highlight',
     attentionDismiss: 'click',
     sessionOpenMode: 'tab',
-    multirowTabs: false,
+    multirowTabs: true,
     repoIconsOnTabs: true,
+    tabBarRows: TAB_BAR_ROWS_DEFAULT,
   },
   sidebar: {
     sortMode: 'activity',

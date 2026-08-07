@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
@@ -20,7 +20,11 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({ send: vi.fn() }),
 }))
 
-vi.mock('lucide-react', () => ({
+// Partial mock: TabBar's import chain (TabBarResizeHandle -> @/components/panes)
+// pulls in many icons; keep the real module and override only the ones the
+// original mock stubbed with testids.
+vi.mock('lucide-react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('lucide-react')>()),
   X: ({ className }: { className?: string }) => <svg data-testid="x-icon" className={className} />,
   Plus: ({ className }: { className?: string }) => <svg data-testid="plus-icon" className={className} />,
   Circle: ({ className }: { className?: string }) => <svg data-testid="circle-icon" className={className} />,
@@ -51,10 +55,15 @@ function createTab(overrides: Partial<Tab> = {}): Tab {
   }
 }
 
-function createStore(options: { tabs: Tab[]; activeTabId: string | null; multirowTabs?: boolean }) {
-  const localSettings = resolveLocalSettings(
-    options.multirowTabs ? { panes: { multirowTabs: true } } : undefined,
-  )
+function buildPanesPatch(options: { multirowTabs?: boolean; tabBarRows?: number }) {
+  const panes: { multirowTabs?: boolean; tabBarRows?: number } = {}
+  if (options.multirowTabs !== undefined) panes.multirowTabs = options.multirowTabs
+  if (options.tabBarRows !== undefined) panes.tabBarRows = options.tabBarRows
+  return Object.keys(panes).length > 0 ? { panes } : undefined
+}
+
+function createStore(options: { tabs: Tab[]; activeTabId: string | null; multirowTabs?: boolean; tabBarRows?: number }) {
+  const localSettings = resolveLocalSettings(buildPanesPatch(options))
   const serverSettings = createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
   })
@@ -104,7 +113,7 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap).not.toBeNull()
   })
 
-  it('does not use flex-wrap when multirowTabs is disabled (default)', () => {
+  it('does not use flex-wrap when multirowTabs is disabled (single-row)', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
     const { container } = renderWithStore(<TabBar />, store)
@@ -113,7 +122,7 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap).toBeNull()
   })
 
-  it('uses overflow-x-auto when multirowTabs is disabled (default)', () => {
+  it('uses overflow-x-auto when multirowTabs is disabled (single-row)', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
     const { container } = renderWithStore(<TabBar />, store)
@@ -144,7 +153,7 @@ describe('TabBar multirow tabs', () => {
     expect(rightBtn).toBeInTheDocument()
   })
 
-  it('applies h-auto to the outer wrapper and max-h-32 to the tab strip when multirowTabs is enabled', () => {
+  it('applies h-auto to the outer wrapper and a 3-row max-height to the tab strip when multirowTabs is enabled', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
     const { container } = renderWithStore(<TabBar />, store)
@@ -153,9 +162,25 @@ describe('TabBar multirow tabs', () => {
     expect(wrapper.className).toContain('h-auto')
     expect(wrapper.className).not.toContain('h-12')
 
-    const tabStrip = container.querySelector('.flex-wrap')
-    expect(tabStrip).not.toBeNull()
-    expect(tabStrip!.className).toContain('max-h-32')
+    const strip = screen.getByTestId('tab-strip')
+    // No Tailwind max-h-* class at all (superset of the old fixed-class check):
+    // the max-height contract is the inline rem-based style below.
+    expect(strip.className).not.toContain('max-h-')
+    expect(strip.style.maxHeight).toBe('calc(6.25rem + 1px)')
+  })
+
+  it('derives the strip max-height from panes.tabBarRows', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true, tabBarRows: 5 })
+    renderWithStore(<TabBar />, store)
+    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(10.5rem + 1px)')
+  })
+
+  it('applies no inline max-height in single-row mode', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+    renderWithStore(<TabBar />, store)
+    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('')
   })
 
   it('applies fixed height to the outer wrapper when multirowTabs is disabled', () => {
@@ -221,6 +246,16 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap!.className).not.toContain('overflow-x-hidden')
   })
 
+  it('defaults to multirow mode when no local settings are stored', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const strip = screen.getByTestId('tab-strip')
+    expect(strip.className).toContain('flex-wrap')
+    expect(strip.className).not.toContain('overflow-x-auto')
+  })
+
   it('does not apply h-full to sidebar reopen slot in multirow mode', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
@@ -232,5 +267,76 @@ describe('TabBar multirow tabs', () => {
     const slot = container.querySelector('[data-testid="desktop-sidebar-reopen-slot"]')
     expect(slot).not.toBeNull()
     expect(slot!.className).not.toContain('h-full')
+  })
+
+  describe('tab widths', () => {
+    it('fixes tabs at 175px in single-row mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+      renderWithStore(<TabBar />, store)
+      const wrapper = screen.getByTestId('tab-strip').firstElementChild as HTMLElement
+      expect(wrapper.className).toContain('w-[175px]')
+      expect(wrapper.className).toContain('shrink-0')
+      expect(wrapper.className).not.toContain('grow')
+      expect(wrapper.className).not.toContain('max-w-[200px]')
+    })
+
+    it('sizes tabs between 150px and 200px in multirow mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+      renderWithStore(<TabBar />, store)
+      const wrapper = screen.getByTestId('tab-strip').firstElementChild as HTMLElement
+      expect(wrapper.className).toContain('grow')
+      expect(wrapper.className).toContain('basis-[150px]')
+      expect(wrapper.className).toContain('min-w-[150px]')
+      expect(wrapper.className).toContain('max-w-[200px]')
+      expect(wrapper.className).not.toContain('w-[175px]')
+    })
+  })
+
+  describe('tab bar resize handle', () => {
+    it('does not render in single-row mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+      renderWithStore(<TabBar />, store)
+      expect(screen.queryByTestId('tab-bar-resize-handle')).toBeNull()
+    })
+
+    it('does not render when tabs fit in one row', () => {
+      // jsdom scrollHeight is 0 -> below the multi-row threshold.
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+      renderWithStore(<TabBar />, store)
+      expect(screen.queryByTestId('tab-bar-resize-handle')).toBeNull()
+    })
+
+    it('renders when the strip wraps to multiple rows', () => {
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      try {
+        const tab = createTab({ id: 'tab-1' })
+        const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        expect(screen.getByTestId('tab-bar-resize-handle')).toBeTruthy()
+      } finally {
+        scrollHeightSpy.mockRestore()
+      }
+    })
+
+    it('keyboard-resizing the handle updates the strip max-height via the store', () => {
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      try {
+        const tab = createTab({ id: 'tab-1' })
+        const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(6.25rem + 1px)')
+
+        fireEvent.keyDown(screen.getByRole('separator', { name: 'Resize tab bar height' }), { key: 'ArrowDown' })
+
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(8.375rem + 1px)')
+        expect(store.getState().settings.localSettings.panes.tabBarRows).toBe(4)
+      } finally {
+        scrollHeightSpy.mockRestore()
+      }
+    })
   })
 })

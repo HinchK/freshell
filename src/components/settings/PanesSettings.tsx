@@ -79,7 +79,8 @@ export default function PanesSettings({
 
         <SettingsRow label="Multi-row tabs" description="Show tabs in multiple rows instead of a single scrollable row.">
           <Toggle
-            checked={settings.panes?.multirowTabs ?? false}
+            checked={settings.panes?.multirowTabs ?? true}
+            aria-label="Toggle multi-row tabs"
             onChange={(checked) => {
               applyLocalSetting({ panes: { multirowTabs: checked } })
             }}

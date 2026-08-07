@@ -43,6 +43,10 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 import type { RepoIconInfo } from '@/components/icons/RepoIcon'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
+import { TAB_BAR_ROWS_DEFAULT } from '@shared/settings'
+import { getRootFontSizePx, tabBarMultiRowThresholdPx, tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
+import TabBarResizeHandle from '@/components/TabBarResizeHandle'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 
 function escapeSelector(id: string): string {
   if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
@@ -66,6 +70,7 @@ interface SortableTabProps {
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
+  multirow: boolean
   paneEntries?: Array<{ paneId: string; content: PaneContent; repoCwd?: string }>
   iconsOnTabs?: boolean
   repoIconsOnTabs?: boolean
@@ -89,6 +94,7 @@ function SortableTab({
   isDragging,
   isRenaming,
   renameValue,
+  multirow,
   paneEntries,
   iconsOnTabs,
   repoIconsOnTabs,
@@ -110,7 +116,7 @@ function SortableTab({
   } = useSortable({ id: tab.id })
 
   const style = {
-    transform: DndCSS.Transform.toString(transform),
+    transform: DndCSS.Translate.toString(transform),
     transition: transition || 'transform 150ms ease',
   }
 
@@ -126,9 +132,13 @@ function SortableTab({
       style={style}
       {...attributes}
       {...listeners}
-      // Uniform tab width: 180px when space allows, shrinking equally
-      // (never below 100px) before the strip starts scrolling.
-      className="w-[180px] min-w-[100px] shrink"
+      // Multirow: pack rows at a 150px minimum, stretch to fill the row, cap at 200px.
+      // Single row: fixed 175px at all times; the strip scrolls horizontally.
+      className={cn(
+        multirow
+          ? "grow basis-[150px] min-w-[150px] max-w-[200px]"
+          : "w-[175px] shrink-0"
+      )}
     >
       <TabItem
         tab={tabWithDisplayTitle}
@@ -198,7 +208,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? EMPTY_REPO_ICONS)
   const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
-  const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)
+  const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? true)
+  const tabBarRows = useAppSelector((s) => s.settings?.settings?.panes?.tabBarRows ?? TAB_BAR_ROWS_DEFAULT)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   // Compute display title for a single tab
@@ -347,6 +358,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         isDragging={activeId === tab.id}
         isRenaming={renamingId === tab.id}
         renameValue={renameValue}
+        multirow={multirowTabs}
         paneEntries={getPaneEntries(tab)}
         iconsOnTabs={iconsOnTabs}
         repoIconsOnTabs={repoIconsOnTabs}
@@ -397,6 +409,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     getPaneEntries,
     getTerminalIdsForTab,
     iconsOnTabs,
+    multirowTabs,
     repoIconsOnTabs,
     repoIconInfoByCwd,
     renameValue,
@@ -439,6 +452,34 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     callbackRef(node)
     multirowContainerRef.current = node
   }, [callbackRef])
+
+  // The resize handle only appears when the strip actually wraps to 2+ rows.
+  const [hasMultipleRows, setHasMultipleRows] = useState(false)
+  useEffect(() => {
+    if (!multirowTabs) {
+      setHasMultipleRows(false)
+      return
+    }
+    const node = multirowContainerRef.current
+    if (!node) return
+    const update = () => {
+      // Threshold computed at measure time from the live root font-size: scrollHeight
+      // and threshold scale together under any --ui-scale, including the pre-hydration
+      // window where the CSS fallback (1.25) still governs (child effects run before
+      // App's useTheme effect writes --ui-scale; the scale write resizes the strip,
+      // which re-fires the ResizeObserver and re-measures).
+      setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(getRootFontSizePx()))
+    }
+    update()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(update)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [multirowTabs, tabs.length])
+
+  const handleTabBarRowsChange = useCallback((rows: number) => {
+    dispatch(updateSettingsLocal({ panes: { tabBarRows: rows } }))
+  }, [dispatch])
 
   // Container-scoped scroll for active tab in multirow mode (vertical)
   useEffect(() => {
@@ -551,9 +592,10 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
             className={cn(
               "flex items-end gap-0.5 pt-px flex-1 min-w-0",
               multirowTabs
-                ? "flex-wrap max-h-32 overflow-y-auto"
+                ? "flex-wrap overflow-y-auto"
                 : "overflow-x-auto overflow-y-hidden scrollbar-none"
             )}
+            style={multirowTabs ? { maxHeight: tabBarRowsToMaxHeightCss(tabBarRows) } : undefined}
           >
             {tabs.map(renderSortableTab)}
           </div>
@@ -593,7 +635,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         <DragOverlay>
           {activeTab ? (
             <div
-              className="w-[180px]"
+              className="w-[175px]"
               style={{
                 opacity: 0.9,
                 transform: 'scale(1.02)',
@@ -626,6 +668,9 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           ) : null}
         </DragOverlay>
       </DndContext>
+      {multirowTabs && hasMultipleRows && (
+        <TabBarResizeHandle rows={tabBarRows} onRowsChange={handleTabBarRowsChange} />
+      )}
     </div>
   )
 }
