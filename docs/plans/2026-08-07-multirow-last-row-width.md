@@ -245,7 +245,7 @@ git commit -m "fix(tabs): add multirowUniformTabWidthPx full-row width math"
 ### Task 2: Apply the uniform width in `TabBar.tsx`
 
 **Files:**
-- Modify: `src/components/TabBar.tsx` (import block :46-49; `SortableTab` props interface ~:73; `SortableTab` style :118-121 and className :135-141; measurement effect ~:456-478; `renderSortableTab` pass site ~:361 and its deps array ~:401-418 — line anchors are pre-change positions, verify against the quoted code)
+- Modify: `src/components/TabBar.tsx` (import block :46-49; `SortableTab` props interface ~:73; `SortableTab` style :118-121 and className :135-141; `uniformTabWidthPx` state hoist directly above `renderSortableTab` ~:346; measurement effect ~:456-478; `renderSortableTab` pass site ~:361 and its deps array ~:401-418 — line anchors are pre-change positions, verify against the quoted code)
 - Test: `test/unit/client/components/TabBar.multirow.test.tsx` (extend `describe('tab widths')` at :272-295)
 
 **Interfaces:**
@@ -430,7 +430,16 @@ with:
 
 Caution (validated against the installed dnd-kit sources): keep `width` OUT of any CSS `transition` on this wrapper — the style's transition stays `transform`-only as quoted above. dnd-kit re-measures sortable rects mid-drag on a 25ms debounce, and an animating width would let it capture intermediate widths.
 
-**Edit 4 — measurement effect.** Replace the existing multiple-rows detection effect (currently `TabBar.tsx:456-478`):
+**Edit 4 — width state + measurement effect.** First, declare the width state directly above `renderSortableTab` (between `handleDragEnd`'s closing `)` at `TabBar.tsx:~344` and `const renderSortableTab = useCallback` at `:~346`). It MUST be declared before `renderSortableTab`: Edit 5 adds `uniformTabWidthPx` to that callback's dependency array, and a deps array is evaluated at hook-call time on every render — declaring the state lower in the file (e.g. co-located with `hasMultipleRows` in the effect below) throws a TDZ `ReferenceError: Cannot access 'uniformTabWidthPx' before initialization`. Do not re-colocate it with the measurement effect. Insert:
+
+```tsx
+  // Locked uniform tab width when the tabs wrap to 2+ rows; null = CSS stretch.
+  // Declared here (before renderSortableTab, its first use); measured by the
+  // ResizeObserver effect further down, next to hasMultipleRows.
+  const [uniformTabWidthPx, setUniformTabWidthPx] = useState<number | null>(null)
+```
+
+Then replace the existing multiple-rows detection effect (currently `TabBar.tsx:456-478`):
 
 ```tsx
   // The resize handle only appears when the strip actually wraps to 2+ rows.
@@ -463,8 +472,6 @@ with:
 ```tsx
   // The resize handle only appears when the strip actually wraps to 2+ rows.
   const [hasMultipleRows, setHasMultipleRows] = useState(false)
-  // Locked uniform tab width when the tabs wrap to 2+ rows; null = CSS stretch.
-  const [uniformTabWidthPx, setUniformTabWidthPx] = useState<number | null>(null)
   useEffect(() => {
     if (!multirowTabs) {
       setHasMultipleRows(false)
