@@ -7,7 +7,7 @@
 
 **Goal:** Fix two root-caused sidebar (rail) bugs for OpenCode sessions: (1) live opencode terminals targeting subagent/child sessions no longer clutter the rail as permanent raw-command entries — they are classified as subagents and respect the existing `showSubagents` visibility filter; (2) sessions in OpenCode's catch-all `global` project (`worktree='/'`) display their real directory instead of literal `/`.
 
-**Architecture:** Bug 2 is a mechanical guard in both servers' opencode parsers: treat `'/'` (and empty) worktree as absent so the existing cwd fallback fires. Bug 1 flows a new server-computed classification to the client: at terminal-creation time the server (which knows the resume-target `ses_` id) runs a one-row `SELECT parent_id FROM session WHERE id = ?` against opencode.db and exposes an additive, optional `resumeTargetIsSubagent: true` field on the per-terminal record (`/api/terminals`, `terminal.inventory`); the Rust server additionally marks its server-fabricated live-terminal session-directory item's existing `isSubagent` field. The client's live-terminal manufacture block copies the flag into `SidebarSessionItem.isSubagent`, which the existing `showSubagents` filter (default `false`) already hides. The by-design refusal to *bind* terminals to subagent rows is untouched.
+**Architecture:** Bug 2 is a mechanical guard in both servers' opencode parsers: treat `'/'` (and empty) worktree as absent so the existing cwd fallback fires. Bug 1 flows a new server-computed classification to the client: whenever a terminal acquires (or changes) its resume-target `ses_` id, the server runs a one-row `SELECT parent_id FROM session WHERE id = ?` against opencode.db and exposes an additive, optional `resumeTargetIsSubagent: true` field on the per-terminal record (`/api/terminals`, `terminal.inventory`); the Rust server additionally marks its server-fabricated live-terminal session-directory item's existing `isSubagent` field. Classification runs at every hook point where a resume target is acquired or changes: Node — `terminal.create` plus `bindSession` re-classification; Rust — four hook sites: WS create, auto-resume respawn, the signal rebind lane, and the REST/fresh-agent binder. The client hides BOTH rail-entry variants it can mint from the flag: manufactured `terminal:<id>` rows AND tab/pane-derived fallback rows (the latter via the `runningSessionMap` consult in `pushFallbackItem`) — both feed `SidebarSessionItem.isSubagent`, which the existing `showSubagents` filter (default `false`) already hides. The by-design refusal to *bind* terminals to subagent rows is untouched.
 
 **Tech Stack:** Node/TypeScript server (`server/`, NodeNext ESM, `node:sqlite`), Rust workspace (`crates/`, rusqlite/axum/tokio), React+Redux client (`src/`), Vitest (coordinated), cargo test, Playwright (`test/e2e-browser/`).
 
@@ -50,7 +50,7 @@ Append to `test/unit/server/coding-cli/opencode-provider.sqlite.test.ts` (this f
 ```ts
 describe('global project worktree "/" fallback (Bug 2)', () => {
   it('treats worktree="/" as absent and falls back to the git repo root of cwd', async () => {
-    // Throwaway tmp home — never the user's real opencode data dir (session safety rule).
+    // Throwaway tmp dirs — never the user's real opencode data dir (session safety rule).
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oc-worktree-'))
     const dataDir = path.join(homeDir, '.local', 'share', 'opencode')
     await fsp.mkdir(dataDir, { recursive: true })
@@ -71,7 +71,10 @@ describe('global project worktree "/" fallback (Bug 2)', () => {
       db.close()
     }
 
-    const provider = new OpencodeProvider(homeDir, { queryRunner: inProcessListingRunner })
+    // The ctor arg is the opencode DATA HOME (the directory containing
+    // opencode.db, e.g. ~/.local/share/opencode) — NOT the user home. Same
+    // as this file's existing tests, which pass the mkdtemp data dir directly.
+    const provider = new OpencodeProvider(dataDir, { queryRunner: inProcessListingRunner })
     const sessions = await provider.listSessionsDirect()
 
     expect(sessions).toHaveLength(1)
@@ -374,7 +377,7 @@ git commit -m "fix(opencode): treat global-project worktree '/' as absent in Rus
 **Interfaces:**
 - Consumes: `node:sqlite` `DatabaseSync` (lazy import, same pattern as `opencode-listing-query.ts:38` — the lazy import keeps `vi.mock('node:sqlite')` viable).
 - Produces:
-  - `export function resolveOpencodeDatabasePath(homeDir?: string): string` from `server/coding-cli/providers/opencode.ts` — extract the existing private `getDatabasePath` body (the `XDG_DATA_HOME` branch at `opencode.ts:40-41` plus its platform default) into this exported module-level function taking an optional home override; the provider method delegates to it. Behavior must be byte-identical to today.
+  - `export function resolveOpencodeDatabasePath(dataHome?: string): string` from `server/coding-cli/providers/opencode.ts` — a NEW module-level one-liner `path.join(dataHome, 'opencode.db')` whose `dataHome` parameter defaults to the ALREADY-EXPORTED `defaultOpencodeDataHome()` (`opencode.ts:39-48`, which owns the `XDG_DATA_HOME` branch and the win32/`~/.local/share/opencode` platform defaults). The provider's `getDatabasePath()` (`opencode.ts:80-83`) is PUBLIC (its doc comment cites an external consumer — resolve-fallbacks builds the off-thread by-id lookup from it; do NOT make it private) and is today a one-liner `path.join(this.homeDir, 'opencode.db')` with NO XDG logic — it delegates: `return resolveOpencodeDatabasePath(this.homeDir)`. Behavior must be byte-identical to today. (Note: the `OpencodeProvider` ctor arg `homeDir` is the opencode DATA HOME, defaulting to `defaultOpencodeDataHome()` — `opencode.ts:73-78`.)
   - `export async function isOpencodeSubagentSession(sessionId: string, dbPath?: string): Promise<boolean>` from `server/coding-cli/providers/opencode-subagent-query.ts` — `true` ONLY when the session row exists AND has `parent_id NOT NULL`. Returns `false` for: missing DB file, `node:sqlite` unavailable, missing row, schema without a `parent_id` column, and ANY read error (classification is best-effort; it must never block or fail terminal creation). `dbPath` defaults to `resolveOpencodeDatabasePath()`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -454,12 +457,34 @@ describe('isOpencodeSubagentSession', () => {
 })
 ```
 
+Also add (same file, top level) a default-resolution pin — NO other test exercises the no-args production default, and it is exactly what would have silently broken under the wrong `os.homedir()` model:
+
+```ts
+import { resolveOpencodeDatabasePath } from '../../../../server/coding-cli/providers/opencode'
+
+describe('resolveOpencodeDatabasePath', () => {
+  it('defaults to <XDG_DATA_HOME>/opencode/opencode.db (production default) and joins explicit data homes', async () => {
+    const savedXdg = process.env.XDG_DATA_HOME
+    const xdgTmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oc-xdg-'))
+    process.env.XDG_DATA_HOME = xdgTmp
+    try {
+      expect(resolveOpencodeDatabasePath()).toBe(path.join(xdgTmp, 'opencode', 'opencode.db'))
+      expect(resolveOpencodeDatabasePath('/explicit/data/home')).toBe(path.join('/explicit/data/home', 'opencode.db'))
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = savedXdg
+      await fsp.rm(xdgTmp, { recursive: true, force: true })
+    }
+  })
+})
+```
+
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
 FRESHELL_TEST_SUMMARY="bug1-node-query-red" npm run test:vitest -- run test/unit/server/coding-cli/opencode-subagent-query.test.ts --config config/vitest/vitest.server.config.ts
 ```
-Expected: FAIL — module `opencode-subagent-query` does not exist.
+Expected: FAIL — module `opencode-subagent-query` does not exist, and `resolveOpencodeDatabasePath` is not yet exported from `opencode.ts` (import error).
 
 - [ ] **Step 3: Implement**
 
@@ -512,20 +537,25 @@ export async function isOpencodeSubagentSession(
 }
 ```
 
-In `server/coding-cli/providers/opencode.ts`: extract the body of the provider's private `getDatabasePath()` (the function containing the `process.env.XDG_DATA_HOME` branch at lines ~38-45) into a new exported module-level function, preserving its logic byte-for-byte:
+In `server/coding-cli/providers/opencode.ts`: the provider's `getDatabasePath()` is already PUBLIC (`opencode.ts:80-83`; its doc comment cites an external consumer — resolve-fallbacks builds the off-thread by-id lookup from it — so keep it public) and is a one-liner `path.join(this.homeDir, 'opencode.db')` with NO XDG logic; the XDG branch lives in the already-exported `defaultOpencodeDataHome()` (`opencode.ts:39-48`). Add a new exported module-level function next to `defaultOpencodeDataHome`:
 
 ```ts
-export function resolveOpencodeDatabasePath(homeDir: string = os.homedir()): string {
-  // <verbatim body of the existing getDatabasePath, with `this.homeDir`
-  //  replaced by the `homeDir` parameter>
+/**
+ * The opencode.db path inside an opencode DATA home. With no argument this
+ * is the PRODUCTION default: `$XDG_DATA_HOME/opencode/opencode.db`,
+ * `%LOCALAPPDATA%\opencode\opencode.db`, or `~/.local/share/opencode/opencode.db`
+ * (whatever defaultOpencodeDataHome() resolves).
+ */
+export function resolveOpencodeDatabasePath(dataHome: string = defaultOpencodeDataHome()): string {
+  return path.join(dataHome, 'opencode.db')
 }
 ```
 
-and make the provider method a one-liner: `private getDatabasePath(): string { return resolveOpencodeDatabasePath(this.homeDir) }` (keep the method's existing name/visibility so all call sites are untouched). If `os` is not yet imported in opencode.ts, it already is (`fsp`/`path`/`os` are standard there — add the import if missing).
+and make the provider's public method delegate (behavior byte-identical to today): `getDatabasePath(): string { return resolveOpencodeDatabasePath(this.homeDir) }` — keep the method's existing name, PUBLIC visibility, and doc comment so all call sites are untouched.
 
 - [ ] **Step 4: Run to verify pass**
 
-Same command as Step 2. Expected: PASS (6 tests). Also re-run Task 1's file to prove the extraction didn't regress:
+Same command as Step 2. Expected: PASS (7 tests). Also re-run Task 1's file to prove the delegation didn't regress:
 ```bash
 FRESHELL_TEST_SUMMARY="bug1-node-query-green" npm run test:vitest -- run test/unit/server/coding-cli/opencode-subagent-query.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts test/unit/server/coding-cli/opencode-provider.test.ts --config config/vitest/vitest.server.config.ts
 ```
@@ -547,14 +577,17 @@ git commit -m "feat(opencode): add best-effort subagent (parent_id) classificati
 - Modify: `server/terminal-view/service.ts` (`TerminalListRecord` at 23-36; `buildDirectoryItem` at ~309-325)
 - Modify: `server/terminal-view/types.ts` (`TerminalDirectoryItem` at 6-24)
 - Modify: `server/ws-handler.ts` (the `case 'terminal.create':` handler at ~2039+)
+- Modify: `shared/ws-protocol.ts` (`TerminalInventoryMessage` at ~1108-1125 — additive optional field)
+- Regenerate: `port/contract/ws-server-messages.schema.json` (via `npm run contract:generate` — see Step 7)
 - Test: `test/unit/server/terminal-registry.test.ts` (append)
 - Test: `test/server/terminals-api.test.ts` (append)
 
 **Interfaces:**
 - Consumes: `isOpencodeSubagentSession(sessionId: string, dbPath?: string): Promise<boolean>` from Task 3 (import in ws-handler as `./coding-cli/providers/opencode-subagent-query.js` — note the `.js` extension).
 - Produces:
-  - `TerminalRegistry.create(opts)` accepts a new optional `resumeTargetIsSubagent?: boolean`; `TerminalRecord.resumeTargetIsSubagent?: boolean` (immutable for the record's lifetime — the launch target never changes); `list()` items include `resumeTargetIsSubagent?: boolean`.
-  - Wire: `/api/terminals` items and `terminal.inventory` rows carry `resumeTargetIsSubagent: true` ONLY when true (omitted otherwise — undefined-omitted, matching every optional field on these payloads). `terminal.inventory` gets it for free via the `...rest` spread in `normalizeTerminalInventoryForClient` (`ws-handler.ts:188-209` strips only `resumeSessionId`).
+  - `TerminalRegistry.create(opts)` accepts a new optional `resumeTargetIsSubagent?: boolean`; `TerminalRecord.resumeTargetIsSubagent?: boolean` (recomputed whenever the resume target changes — set at create time and re-derived by `bindSession` when it overwrites `resumeSessionId`, see Step 6); `list()` items include `resumeTargetIsSubagent?: boolean`.
+  - Wire: `/api/terminals` items and `terminal.inventory` rows carry `resumeTargetIsSubagent: true` ONLY when true (omitted otherwise — undefined-omitted, matching every optional field on these payloads). `terminal.inventory` gets it for free via the `...rest` spread in `normalizeTerminalInventoryForClient` (`ws-handler.ts:350-371` strips only `resumeSessionId`).
+  - Protocol: `resumeTargetIsSubagent?: boolean` declared on the terminal-inventory item type in `shared/ws-protocol.ts` (`TerminalInventoryMessage`, ~:1108-1125) — additive + optional, server→client only, NO `WS_PROTOCOL_VERSION` bump (the Global Constraint's `:876-884` precedent) — and the frozen contract `port/contract/ws-server-messages.schema.json` regenerated to admit it (its `terminal.inventory` items carry `additionalProperties: false`, so without this the Node runtime would formally violate its own contract whenever the flag is set). The Rust protocol crate is deliberately unaffected (serde is accept-and-strip crate-wide; the Node/Rust inventory asymmetry stays).
 
 - [ ] **Step 1: Write the failing registry test**
 
@@ -595,12 +628,13 @@ In `server/terminal-registry.ts`:
 1. `TerminalRecord` (type at ~566): add after `resumeSessionId?: string`:
 ```ts
   /**
-   * True when this terminal was LAUNCHED targeting an opencode subagent
-   * (child) session (`parent_id NOT NULL` in opencode.db). Computed once at
-   * create time from the requested resume id — `resumeSessionId` itself is
-   * later overwritten by bindSession with a ROOT-resolved id, so this flag
-   * cannot be derived post-binding. Server→client only; drives the
-   * sidebar's showSubagents visibility filter.
+   * True when this terminal's resume target is an opencode subagent
+   * (child) session (`parent_id NOT NULL` in opencode.db). Computed at
+   * create time from the requested resume id and RECOMPUTED whenever the
+   * resume target changes (bindSession re-classifies when it overwrites
+   * resumeSessionId — root-resolved ids in the happy path, raw child ids
+   * possible in the degraded chain-walk-failure edge). Server→client only;
+   * drives the sidebar's showSubagents visibility filter.
    */
   resumeTargetIsSubagent?: boolean
 ```
@@ -667,8 +701,8 @@ import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subag
 2. Inside `case 'terminal.create': {` (starts at ~2039), locate the single `registry.create(`/`this.registry.create(` call for the requested terminal (`grep -n "registry.create" server/ws-handler.ts` and pick the call inside this case). Immediately BEFORE it, add:
 ```ts
         // Bug-1 (sidebar rail): classify the requested opencode resume target
-        // ONCE, at the only moment the requested id is known (bindSession later
-        // overwrites resumeSessionId with a ROOT-resolved id). Best-effort:
+        // at create time (bindSession later re-classifies whenever it
+        // overwrites resumeSessionId — see Step 6). Best-effort:
         // any failure classifies as "not a subagent".
         const requestedOpencodeTarget = m.mode === 'opencode'
           ? (m.resumeSessionId ?? (m.sessionRef?.provider === 'opencode' ? m.sessionRef.sessionId : undefined))
@@ -680,18 +714,84 @@ import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subag
    (The handler already reads `m.resumeSessionId ?? m.sessionRef.sessionId` at line ~2056, so both fields exist on `m` here. The handler is `async` — the `await` is legal.)
 3. Add `resumeTargetIsSubagent,` to the options object passed to that `registry.create(...)` call.
 
-- [ ] **Step 6: Run the touched suites + typecheck**
+- [ ] **Step 6: Re-classify on bindSession (Node mirror of the Rust rebind fix)**
+
+`bindSession` (`server/terminal-registry.ts:4797`) overwrites `record.resumeSessionId` post-create (`term.resumeSessionId = normalized`, the tracker-driven association write — root-resolved ids in the happy path, raw child ids possible in the degraded chain-walk-failure edge), which can leave the create-time flag stale in BOTH directions (e.g. created targeting a child → user switches the TUI to a root session → the terminal would stay hidden).
+
+First append the failing test to `test/unit/server/terminal-registry.test.ts` (inside the Step 1 describe block):
+
+```ts
+  it('re-classifies resumeTargetIsSubagent when bindSession changes the resume target (both directions)', async () => {
+    const created = registry.create({
+      mode: 'opencode',
+      cwd: '/home/user/project',
+      resumeSessionId: 'ses_child0000000000000000000000',
+      resumeTargetIsSubagent: true,
+    })
+    // Rebind to a ROOT id: the fire-and-forget re-classification must clear
+    // the stale flag (no opencode.db here -> isOpencodeSubagentSession
+    // resolves false, which is exactly the root/unknown answer).
+    const bound = registry.bindSession(created.terminalId, 'opencode', 'ses_root0000000000000000000000', 'association')
+    expect(bound.ok).toBe(true)
+    await vi.waitFor(() => {
+      expect(registry.list().find((t) => t.terminalId === created.terminalId)?.resumeTargetIsSubagent).toBeUndefined()
+    })
+  })
+```
+
+(Adapt the `registry.create(...)` return-value access to the file's existing idiom if `create` returns the record differently, and reuse the file's existing `vi` import. The inverse direction — root→child flips the flag to `true` — is covered end-to-end by classification against a real seeded DB in Task 9; here the DB-less `false` answer pins the clearing behavior, which is the direction the create-time flag can never fix on its own.)
+
+Then implement in `server/terminal-registry.ts` — in `bindSession` (:4797), immediately after `term.resumeSessionId = normalized` (before the `terminal.session.bound` emit), add a fire-and-forget re-classification:
+
+```ts
+    // Bug-1 (sidebar rail): the resume target just changed — re-derive the
+    // subagent classification for the NEW target (both directions: a switch
+    // to a root session must CLEAR a stale true). Fire-and-forget:
+    // classification must never block or fail binding.
+    if (provider === 'opencode') {
+      void isOpencodeSubagentSession(normalized)
+        .then((isSubagent) => {
+          const current = this.terminals.get(terminalId)
+          if (current) current.resumeTargetIsSubagent = isSubagent || undefined
+        })
+        .catch(() => {})
+    }
+```
+
+Add the import at the top of `terminal-registry.ts` (NodeNext ESM — `.js` extension): `import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subagent-query.js'`.
+
+Run the Step 1 command again. Expected: PASS.
+
+- [ ] **Step 7: Declare the field on the frozen WS contract**
+
+The frozen contract `port/contract/ws-server-messages.schema.json` has `additionalProperties: false` on `terminal.inventory` items, so the `...rest`-spread inventory carrying the new field would formally violate the contract (invisible to CI today — the oracle sweeps only create shell terminals — but a latent fidelity gap for any future capture).
+
+1. In `shared/ws-protocol.ts`, add to the terminal-inventory item type (`TerminalInventoryMessage`, ~:1108-1125), alongside its other optional fields:
+```ts
+  /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */
+  resumeTargetIsSubagent?: boolean
+```
+   (Additive + optional, server→client — consistent with the Global Constraint and its `:876-884` precedent; NO `WS_PROTOCOL_VERSION` bump.)
+2. Regenerate the committed schema so it admits the field:
+```bash
+npm run contract:generate
+git diff --stat port/contract/   # expect ws-server-messages.schema.json to gain the optional prop
+```
+   The Rust protocol crate is deliberately unaffected (serde accept-and-strips unknown fields crate-wide; the Node/Rust inventory asymmetry stays).
+
+- [ ] **Step 8: Run the touched suites + typecheck**
 
 ```bash
 npm run typecheck:server
 FRESHELL_TEST_SUMMARY="bug1-node-green" npm run test:vitest -- run test/unit/server/terminal-registry.test.ts test/server/terminals-api.test.ts test/server/ws-handshake-snapshot.test.ts --config config/vitest/vitest.server.config.ts
+npm run test:port
 ```
-Expected: PASS (the handshake-snapshot suite proves the inventory spread didn't regress — its exact-strip assertion only checks `resumeSessionId`).
+Expected: PASS (the handshake-snapshot suite proves the inventory spread didn't regress — its exact-strip assertion only checks `resumeSessionId`; `test:port` proves the regenerated contract is in sync with `shared/ws-protocol.ts`).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add server/terminal-registry.ts server/terminal-view/service.ts server/terminal-view/types.ts server/ws-handler.ts test/unit/server/terminal-registry.test.ts test/server/terminals-api.test.ts
+git add server/terminal-registry.ts server/terminal-view/service.ts server/terminal-view/types.ts server/ws-handler.ts shared/ws-protocol.ts port/contract/ws-server-messages.schema.json test/unit/server/terminal-registry.test.ts test/server/terminals-api.test.ts
 git commit -m "feat(terminals): expose resumeTargetIsSubagent on the Node terminal record and /api/terminals (Bug 1)"
 ```
 
@@ -935,20 +1035,27 @@ git commit -m "feat(opencode): add parent_id subagent classification lookup + lo
 
 ---
 
-### Task 6: Rust — Bug 1b: identity `is_subagent` flag, classified at terminal create/respawn
+### Task 6: Rust — Bug 1b: identity `is_subagent` flag, classified at every resume-target acquisition (create, respawn, signal rebind, REST bind)
 
 **Files:**
 - Modify: `crates/freshell-ws/src/identity.rs` (`TerminalIdentity` struct at ~34-44; upsert preserve semantics; new setter)
 - Modify: `crates/freshell-ws/src/opencode_association.rs` (new `classify_and_mark_resume_target`)
 - Modify: `crates/freshell-ws/src/terminal.rs` (call sites after the create `set_meta` at ~2799-2806 and the auto-resume respawn `set_meta` at ~3498-3507; make `broadcast_terminals_changed` `pub(crate)`)
-- Test: inline `#[cfg(test)]` additions in `identity.rs` and `opencode_association.rs`
+- Modify: `crates/freshell-ws/src/opencode_signal.rs` (hook site #3: `rebind_fanout` at :399-437 and the (0b) retired-rebind branch at ~:508)
+- Modify: `crates/freshell-ws/src/pane_identity_binder.rs` (hook site #4: classifier injected into `LedgerPaneIdentityBinder`; classification after the `:110` upsert in `register_create_identity`)
+- Modify: `crates/freshell-server/src/main.rs` (:313-318 region — wire the classifier into the binder construction)
+- Test: inline `#[cfg(test)]` additions in `identity.rs`, `opencode_association.rs`, `opencode_signal.rs`, and `pane_identity_binder.rs`
 
 **Interfaces:**
 - Consumes: `OpencodeLocator::classify_resume_target(&self, session_id: &str) -> Option<bool>` (Task 5); the locator handle already held by `opencode_association.rs`'s `drain_and_associate`/`maybe_arm` (reuse the exact same field/handle those functions read from `WsState` — grep `locator` in that file); `broadcast_terminals_changed(state: &WsState)` in `terminal.rs` (currently private — widen to `pub(crate)`).
 - Produces:
-  - `TerminalIdentity.is_subagent: Option<bool>` (new field; `None` = unclassified).
-  - `TerminalIdentityRegistry::set_is_subagent(&self, terminal_id: &str, value: Option<bool>)` — sets the flag on an existing entry, or creates a minimal entry (`terminal_id`, `is_subagent`, `updated_at = now`, everything else `None`/`false`) when none exists. `upsert(...)` PRESERVES an existing entry's `is_subagent` (it does not have an `is_subagent` parameter).
-  - `pub(crate) fn classify_and_mark_resume_target(state: &WsState, terminal_id: &str, mode: &str, resume_session_id: Option<&str>)` in `opencode_association.rs` — no-op unless `mode == "opencode"` and a resume id is present; spawns a tokio task that runs the SQLite read via `spawn_blocking` (the `drain_and_associate` precedent at `opencode_association.rs:86-104`), and when the answer is `Some(true)`: `state.identity.set_is_subagent(terminal_id, Some(true))` then `crate::terminal::broadcast_terminals_changed(&state)` so clients refetch `/api/terminals`.
+  - `TerminalIdentity.is_subagent: Option<bool>` (new field; `None` = unclassified). The flag is NOT immutable: it is recomputed at every resume-target acquisition/change — WS create, auto-resume respawn, signal rebind, REST bind.
+  - `TerminalIdentityRegistry::set_is_subagent(&self, terminal_id: &str, value: Option<bool>)` — sets the flag on an existing entry, or creates a minimal entry (`terminal_id`, `is_subagent`, `updated_at = now`, everything else `None`/`false`) when none exists.
+  - `upsert(...)` PRESERVES an existing entry's `is_subagent` (it does not gain an `is_subagent` parameter). IMPORTANT: this preserve contract does NOT exist today — `upsert` is a blind `map.insert` (`identity.rs:73-84`) — so Task 6 CREATES it via a get-mutate-or-insert restructure that must preserve the two pinned behaviors: un-retire-on-reseed (existing test `upsert_over_a_retired_entry_un_retires_it`, `identity.rs:322-331`) and full replacement of provider/session_id/cwd/updated_at (the signal rebinds depend on replacement — `opencode_signal.rs:399-405`, `:508-514`).
+  - `pub(crate) fn classify_and_mark_resume_target(state: &WsState, terminal_id: &str, mode: &str, resume_session_id: Option<&str>)` in `opencode_association.rs` — no-op unless `mode == "opencode"` and a resume id is present; spawns a tokio task that runs the SQLite read via `spawn_blocking` (the `drain_and_associate` precedent at `opencode_association.rs:86-104`), and writes the classified value in BOTH directions — for any `Some(true)`/`Some(false)` answer it calls `state.identity.set_is_subagent(terminal_id, Some(value))` (never only-when-true — rebinds must be able to CLEAR a stale flag when the new target is a root) then `crate::terminal::broadcast_terminals_changed(&state)` so clients refetch `/api/terminals`. `None` (unknown/missing/error) writes nothing. (When the reconcile gate has cleared a definitively-absent id to `None`, no resume id reaches the hook and it simply no-ops — existing behavior, keep.)
+  - `LedgerPaneIdentityBinder` gains an injected classifier at construction (the shared `OpencodeLocator` or an `Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>` closure wrapping Task 5's `classify_resume_target`) — the binder seam has no `WsState` (`pane_identity_binder.rs:14-18`), so it cannot call `classify_and_mark_resume_target`.
+
+**Hook-site completeness (verified by exhaustive enumeration):** with the four hook sites in this task — WS create (`terminal.rs:2908` seed), auto-resume respawn (`respawn_agent_terminal`, seed upsert at `terminal.rs:3562`), signal rebind lane (`opencode_signal.rs:399`/`:508`), and the REST/fresh-agent binder (`pane_identity_binder.rs:111`) — every production identity-seed path carrying an opencode resume target is covered; the only other lane, locator association, fresh-mints ids only and skips resume-bound panes (`opencode_association.rs:127`).
 
 - [ ] **Step 1: Write the failing identity tests**
 
@@ -986,13 +1093,15 @@ In `crates/freshell-ws/src/identity.rs`:
 
 1. Add to `TerminalIdentity` (after `retired: bool`):
 ```rust
-    /// `Some(true)` when this terminal was launched targeting an opencode
+    /// `Some(true)` when this terminal's resume target is an opencode
     /// SUBAGENT (child) session — display classification for the sidebar
-    /// rail (`showSubagents` filter). `None` = unclassified. Never consulted
-    /// by association logic.
+    /// rail (`showSubagents` filter). `None` = unclassified. Recomputed
+    /// whenever the resume target changes (create, respawn, signal rebind,
+    /// REST bind); preserved across plain upserts. Never consulted by
+    /// association logic.
     pub is_subagent: Option<bool>,
 ```
-2. Everywhere `TerminalIdentity` is constructed inside this file (upsert's new-entry branch, etc.): initialize `is_subagent: None` — EXCEPT upsert's update-an-existing-entry path, which must carry the existing value forward unchanged.
+2. Restructure `upsert` (TODAY a blind `map.insert` at `identity.rs:73-84` — the preserve contract does not exist yet; this step CREATES it) into get-mutate-or-insert: when an entry exists, overwrite `provider`/`session_id`/`cwd`/`updated_at`, set `retired = false`, and carry `is_subagent` forward UNCHANGED; when none exists, insert a fresh entry with `is_subagent: None`. Two pinned behaviors must survive the restructure: un-retire-on-reseed (existing test `upsert_over_a_retired_entry_un_retires_it`, `identity.rs:322-331`) and full field replacement (the signal rebinds upsert a NEW session_id over the old one — `opencode_signal.rs:399-405`, `:508-514` — and depend on replacement). Initialize `is_subagent: None` in any other `TerminalIdentity` construction inside this file.
 3. Add the setter to the registry impl:
 ```rust
     /// Set the subagent display classification. Creates a minimal entry when
@@ -1044,12 +1153,19 @@ In `crates/freshell-ws/src/opencode_association.rs`'s existing `#[cfg(test)] mod
         }
         assert!(saw_changed, "expected a terminals.changed ping after classification");
 
-        // Root target -> no flag.
+        // Root target -> classified Some(false), written BOTH directions so a
+        // rebind can CLEAR a stale true (pre-seed true to prove the clear).
+        state.identity.set_is_subagent("t-root", Some(true));
         classify_and_mark_resume_target(&state, "t-root", "opencode", Some("ses_root"));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_ne!(
+        for _ in 0..100 {
+            if state.identity.get("t-root").and_then(|i| i.is_subagent) == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
             state.identity.get("t-root").and_then(|i| i.is_subagent),
-            Some(true)
+            Some(false)
         );
 
         // Non-opencode / no-resume -> no-op.
@@ -1069,15 +1185,17 @@ Expected: FAIL to compile — function does not exist.
 1. In `crates/freshell-ws/src/terminal.rs`: change `fn broadcast_terminals_changed(state: &WsState)` (~3792-3813) to `pub(crate) fn broadcast_terminals_changed(state: &WsState)`.
 2. In `crates/freshell-ws/src/opencode_association.rs`, add:
 ```rust
-/// Bug-1 (sidebar rail): classify a resume-create/respawn target ONCE, at the
-/// moment the requested `ses_` id is known, and mark the terminal identity so
-/// the directory projections (`/api/terminals`, session-directory live items)
-/// can expose it. Display classification only — association keeps refusing
-/// `parent_id` rows via its candidate SQL, untouched.
+/// Bug-1 (sidebar rail): classify a resume target at the moment a `ses_` id
+/// is acquired or CHANGES (WS create, auto-resume respawn, signal rebind),
+/// and mark the terminal identity so the directory projections
+/// (`/api/terminals`, session-directory live items) can expose it. The write
+/// goes BOTH directions (Some(true) AND Some(false)) so a rebind to a root
+/// session clears a stale flag. Display classification only — association
+/// keeps refusing `parent_id` rows via its candidate SQL, untouched.
 ///
 /// Fire-and-forget: the one-row SQLite read runs on the blocking pool (the
 /// drain_and_associate precedent) and any failure classifies as "unknown"
-/// (no flag), so terminal creation is never blocked or failed by this.
+/// (no write), so terminal creation is never blocked or failed by this.
 pub(crate) fn classify_and_mark_resume_target(
     state: &WsState,
     terminal_id: &str,
@@ -1101,8 +1219,11 @@ pub(crate) fn classify_and_mark_resume_target(
                 .await
                 .ok()
                 .flatten();
-        if classified == Some(true) {
-            state.identity.set_is_subagent(&terminal_id, Some(true));
+        if let Some(value) = classified {
+            // BOTH directions: Some(true) flags, Some(false) clears a stale
+            // flag after a rebind to a root session. None (unknown) writes
+            // nothing.
+            state.identity.set_is_subagent(&terminal_id, Some(value));
             // Ping clients to refetch /api/terminals with the new flag. This
             // is a standalone lifecycle ping — NOT inserted between the pinned
             // `terminal.session.associated` -> `terminal.meta.updated` pair
@@ -1127,15 +1248,126 @@ pub(crate) fn classify_and_mark_resume_target(
 ```
 4. Same call immediately after the auto-resume respawn `set_meta` (~3498-3507), with that scope's variable names.
 
-- [ ] **Step 5: Run to verify pass**
+These are hook sites #1 (WS create) and #2 (auto-resume respawn). Steps 5 and 6 add the remaining two production hook sites.
+
+- [ ] **Step 5: Hook site #3 — signal rebind lane (`opencode_signal.rs`)**
+
+Why: the signal rebind lane accepts child ids (ZERO `parent_id` references anywhere in its guard ladder — the only session-id validation is shape, `is_valid_opencode_session_id` at `opencode_signal.rs:70-73`) and writes `identity.upsert` + `set_meta` post-create. Without this hook, a TUI session-switch INTO a child session leaves the terminal visible on the rail (the bug persists), and a switch OUT of a child leaves it wrongly hidden (preserve semantics keep the stale flag).
+
+First write the failing test. Add to `crates/freshell-ws/tests/opencode_switch_rebind.rs`, mirroring the existing `tui_switch_signal_rebinds_and_restart_resumes_the_new_id` test (:437) — reuse its exact helpers (`spawn_server_returning_state`, `write_opencode_signal`, `send_create`, frame-wait helpers) and extend the seeded opencode.db with a root + child row (parent_id = root):
+
+```rust
+#[tokio::test]
+async fn tui_switch_signal_reclassifies_is_subagent_in_both_directions() {
+    // Setup: copy tui_switch_signal_rebinds_and_restart_resumes_the_new_id's
+    // scaffolding; seed the isolated opencode.db with 'ses_switchroot'
+    // (parent_id NULL) and 'ses_switchchild' (parent_id = 'ses_switchroot').
+    // Create an opencode terminal resuming ses_switchroot, then:
+
+    // 1) signal a switch to the CHILD id -> flag becomes Some(true).
+    //    (write_opencode_signal(root, &terminal_id, 1, "ses_switchchild"),
+    //     drain, then poll state.identity bounded like the sibling test polls
+    //     its frames)
+    //    assert_eq!(state.identity.get(&terminal_id).and_then(|i| i.is_subagent), Some(true));
+
+    // 2) signal a switch back to the ROOT id -> flag becomes Some(false)
+    //    (the clearing direction — a stale true must not keep hiding the pane).
+    //    assert_eq!(state.identity.get(&terminal_id).and_then(|i| i.is_subagent), Some(false));
+}
+```
+
+(The comment block describes the required scenario — inline it as real code copied from the sibling test's structure; the two `assert_eq!` lines are the contract. Bounded polling, not fixed sleeps, per the file's idiom.)
+
+Run: `cargo test -p freshell-ws --test opencode_switch_rebind tui_switch_signal_reclassifies_is_subagent_in_both_directions -- --exact`
+Expected: FAIL — the flag stays `None`/stale.
+
+Then implement in `crates/freshell-ws/src/opencode_signal.rs`:
+
+1. Inside `rebind_fanout` (:399-437), after the `state.identity.upsert(...)` + `state.registry.set_meta(...)` pair, add:
+```rust
+    // Bug-1 (sidebar rail): the resume target just changed — re-classify the
+    // newly bound session id (both directions; a switch back to a root
+    // session must clear a stale subagent flag).
+    crate::opencode_association::classify_and_mark_resume_target(
+        state,
+        &sig.terminal_id,
+        "opencode",
+        Some(&sig.session_id),
+    );
+```
+2. The same call in the (0b) retired-pane rebind branch (~:508), after its `identity.upsert` (before the re-`retire`), with that scope's variable names.
+
+**PLACEMENT CAVEAT (do not skip):** this lane no-ops when the identity already carries the signal's session id (same-id short-circuit at `opencode_signal.rs:494-496`) — so this hook does NOT cover REST-created terminals, whose identity is already bound to the requested id before the TUI plugin's first signal arrives. That is exactly what hook site #4 (Step 6) is for.
+
+Run the test again. Expected: PASS.
+
+- [ ] **Step 6: Hook site #4 — REST/fresh-agent binder (`pane_identity_binder.rs`)**
+
+Why: `LedgerPaneIdentityBinder::register_create_identity` (`crates/freshell-ws/src/pane_identity_binder.rs:109-122`) seeds identity with the RAW child id for ALL REST spawn lanes — `POST /api/tabs`, `/api/panes/:id/split`, and `/api/panes/:id/respawn` all funnel through `spawn_terminal_pane`'s single binder call at `terminal_tabs.rs:1973` — and never enters WS `terminal.create`. This lane is production-reachable via MCP `new-tab`/`split-pane`/`respawn-pane` and the CLI, which accept arbitrary `ses_` ids today. The binder seam has no `WsState` (`pane_identity_binder.rs:14-18`), so it gets an injected classifier instead of calling `classify_and_mark_resume_target`.
+
+First write the failing test. Add a sibling next to `register_create_identity_writes_identity_row_and_binding` (`pane_identity_binder.rs:214`), reusing its `binder(...)` fixture but constructing the binder with a real classifier over a seeded opencode.db (same rusqlite temp-db seeding idiom as Task 5's tests: `ses_root` with `parent_id NULL`, `ses_child` with `parent_id = 'ses_root'`):
+
+```rust
+    #[test]
+    fn register_create_identity_classifies_opencode_resume_targets() {
+        use freshell_terminal::registry::PaneIdentityBinder as _;
+        // Build the binder as in `binder(...)` but pass a classifier wrapping
+        // Task 5's classify_resume_target over a temp data home seeded with
+        // ses_root (parent_id NULL) and ses_child (parent_id = 'ses_root').
+        b.register_create_identity("t-rest-child", "opencode", Some("ses_child"), Some("/tmp"), Some("req-c"));
+        assert_eq!(
+            identity.get("t-rest-child").and_then(|i| i.is_subagent),
+            Some(true),
+            "REST-created child-target terminal must be classified"
+        );
+        b.register_create_identity("t-rest-root", "opencode", Some("ses_root"), Some("/tmp"), Some("req-r"));
+        assert_eq!(
+            identity.get("t-rest-root").and_then(|i| i.is_subagent),
+            Some(false),
+            "definite root classifies Some(false) (both-directions semantics)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+```
+
+(Follow the sibling test's exact fixture/variable names; the assertions are the contract — `Some(false)` for the root case matches the both-directions semantics chosen for every hook in this task.)
+
+Run: `cargo test -p freshell-ws register_create_identity_classifies_opencode_resume_targets -- --exact`
+Expected: FAIL — no classifier parameter exists / flag stays `None`.
+
+Then implement:
+
+1. `LedgerPaneIdentityBinder` (`pane_identity_binder.rs:26-34`): add a field `classify_resume_target: Option<Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>>` and extend `new(...)` to take it (update the existing test fixture `binder(...)` to pass `None` where classification is irrelevant).
+2. In `register_create_identity`, immediately after the `:110` `self.identity.upsert(...)`, add:
+```rust
+        // Bug-1 (sidebar rail): classify the REST resume target. This call
+        // site already runs inside the caller's spawn_blocking
+        // (terminal_tabs.rs:1973), so the one-row SQLite read is off the
+        // async path. Log-only on error / no ping — this seam has no
+        // WsState (matching its existing degradation policy); the flag is
+        // set before the create response returns, ahead of any client
+        // refetch.
+        if mode == "opencode" {
+            if let Some(classify) = self.classify_resume_target.as_ref() {
+                if let Some(value) = classify(session_id) {
+                    self.identity.set_is_subagent(terminal_id, Some(value));
+                }
+            }
+        }
+```
+3. Wire it at construction in `crates/freshell-server/src/main.rs` (:313-318 region — where `LedgerPaneIdentityBinder::new(terminal_identity.clone(), pane_ledger)` is built and main already holds the shared `OpencodeLocator` ws_state uses): pass `Some(Arc::new(move |sid: &str| locator.classify_resume_target(sid)))` (clone the shared locator handle into the closure).
+
+Run the test again. Expected: PASS.
+
+- [ ] **Step 7: Run to verify pass**
 
 Run: `cargo test -p freshell-ws`
-Expected: PASS — the new tests plus all pre-existing association/broadcast tests (including the exact-frame `broadcast_emits_legacy_wire_shape` at `terminal.rs:5639`, which is untouched because `TerminalMetaRecord` is unchanged).
+Expected: PASS — the new tests plus all pre-existing association/broadcast/signal tests (including the exact-frame `broadcast_emits_legacy_wire_shape` at `terminal.rs:5639`, which is untouched because `TerminalMetaRecord` is unchanged). Also `cargo build -p freshell-server` (the main.rs wiring compiles).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/freshell-ws/src/identity.rs crates/freshell-ws/src/opencode_association.rs crates/freshell-ws/src/terminal.rs
+git add crates/freshell-ws/src/identity.rs crates/freshell-ws/src/opencode_association.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/opencode_signal.rs crates/freshell-ws/src/pane_identity_binder.rs crates/freshell-ws/tests/opencode_switch_rebind.rs crates/freshell-server/src/main.rs
 git commit -m "feat(ws): classify opencode subagent resume targets on the terminal identity (Bug 1)"
 ```
 
@@ -1154,6 +1386,8 @@ git commit -m "feat(ws): classify opencode subagent resume targets on the termin
 - Produces:
   - `/api/terminals` items carry `"resumeTargetIsSubagent": true` ONLY when the terminal's identity says `Some(true)` (omitted otherwise) — on BOTH the bare-array and the paged (`?priority=`) response branches (the sidebar fetches the paged form).
   - Session-directory live-terminal items: `is_subagent` mirrors the identity flag (wire `isSubagent: true` via the existing `DirItem::to_value` emission at `session_directory.rs:168-170`).
+
+**Cascade note (V2 — for implementers AND reviewers):** once fabricated live session-directory items carry `isSubagent: true`, the client's DEFAULT session-directory fetch (`includeSubagents` falsy — `sessionsThunks.ts:316`) may exclude them SERVER-SIDE; any such terminal then surfaces (if at all) as a tab/pane-derived FALLBACK row on the client, which Task 8's fallback-row extension classifies. BOTH branches yield "hidden" — the desired outcome — so do NOT treat disappearing live items as a regression. Consequence for tests: any positive assertion that a FLAGGED live item is present in a session-directory ENDPOINT response must pass `includeSubagents=1` on the request (otherwise the server may filter it out and the test asserts on an absence caused by the filter, not the projection). This task's Step 3 live-item test is a unit test on `build_live_terminal_session_item` (no endpoint), so it is unaffected; negative/default-visibility assertions stay as they are.
 
 - [ ] **Step 1: Write the failing `/api/terminals` projection test**
 
@@ -1276,16 +1510,19 @@ git commit -m "feat(server): project subagent-target classification on /api/term
 
 ---
 
-### Task 8: Client — Bug 1: classify manufactured live-terminal rail entries
+### Task 8: Client — Bug 1: classify manufactured AND tab/pane-derived (fallback) live-terminal rail entries
 
 **Files:**
 - Modify: `src/store/types.ts` (`BackgroundTerminal` at 69-81)
-- Modify: `src/store/selectors/sidebarSelectors.ts` (manufacture block at 467-520)
+- Modify: `src/store/selectors/sidebarSelectors.ts` (sessionRef-bearing terminals loop at ~175-225; `pushFallbackItem` new-item branch at ~336-367; manufacture block at 467-520)
 - Test: `test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts` (append)
 
 **Interfaces:**
 - Consumes: `resumeTargetIsSubagent?: boolean` on `/api/terminals` items (Tasks 4 & 7) — these land verbatim in `state.terminalDirectory.windows.sidebar.items` (`src/store/terminalDirectoryThunks.ts:87` applies no whitelist) and are passed as the `terminals` array into `buildSessionItems` by `Sidebar.tsx:221-224`.
-- Produces: manufactured `SidebarSessionItem`s (the `terminal:<id>` rows) carry `isSubagent: true` when the terminal record is flagged; `filterSessionItemsByVisibility` (`sidebarSelectors.ts:656`) then hides them under the default `showSubagents: false`. `SidebarSessionItem.isSubagent` already exists (`sidebarSelectors.ts:38`) — no interface change there.
+- Produces: BOTH rail-entry variants the client can mint for a live terminal carry `isSubagent`:
+  - Manufactured `SidebarSessionItem`s (the `terminal:<id>` rows) carry `isSubagent: true` when the terminal record is flagged. NOTE the `:469` guard (`if (terminal.sessionRef) continue`): only sessionRef-LESS terminals ever take this block.
+  - Tab/pane-derived FALLBACK rows (keyed `opencode:<sessionId>`, minted by `pushFallbackItem` for paned terminals whose pane content carries `sessionRef`) consult the `runningSessionMap` — `RunningSessionInfo` (`sidebarSelectors.ts:128`) gains `resumeTargetIsSubagent?: boolean`, recorded in the `:175-225` loop. This is the LOAD-BEARING half for the production shape (child-target terminals normally carry `sessionRef`).
+  - `filterSessionItemsByVisibility` (`sidebarSelectors.ts:656`) then hides both under the default `showSubagents: false`. `SidebarSessionItem.isSubagent` already exists (`sidebarSelectors.ts:38`) — no interface change there.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1374,6 +1611,91 @@ describe('subagent-target live terminals (Bug 1)', () => {
     })
     expect(visible.map((i) => i.sessionId)).toContain('terminal:term-oc-subagent')
   })
+
+  it('classifies tab/pane-derived FALLBACK rows for sessionRef-bearing child-target terminals (the load-bearing half)', () => {
+    // sessionRef-bearing live terminals NEVER take the manufactured block
+    // (sidebarSelectors.ts:469 `if (terminal.sessionRef) continue`); when
+    // paned, they surface via pushFallbackItem as an `opencode:<child>` row.
+    const CHILD_ID = 'ses_024e59f87ffeEvZWqgMpBXAo78'
+    const ROOT_ID = 'ses_rootcontrol000000000000000'
+    const makePanedFixture = (tag: string, terminalId: string, sessionId: string) => ({
+      tab: {
+        id: `tab-${tag}`,
+        title: 'OpenCode',
+        mode: 'opencode',
+        createRequestId: `tab-${tag}`,
+        status: 'running',
+        createdAt: 1_000,
+      },
+      layout: {
+        type: 'leaf',
+        id: `pane-${tag}`,
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          terminalId,
+          status: 'running',
+          sessionRef: { provider: 'opencode', sessionId },
+        },
+      },
+    })
+    const child = makePanedFixture('oc-child', 'term-oc-paned-child', CHILD_ID)
+    const root = makePanedFixture('oc-root', 'term-oc-paned-root', ROOT_ID)
+    const tabs = [child.tab, root.tab] as any
+    const panes = {
+      layouts: {
+        [child.tab.id]: child.layout,
+        [root.tab.id]: root.layout,
+      },
+      activePaneByTabId: {},
+      paneTitles: {},
+    } as any
+    const terminals = [
+      {
+        terminalId: 'term-oc-paned-child',
+        title: `opencode --session ${CHILD_ID}`,
+        createdAt: 1_100,
+        lastActivityAt: 1_200,
+        status: 'running' as const,
+        hasClients: true,
+        mode: 'opencode' as const,
+        cwd: '/repo/live',
+        sessionRef: { provider: 'opencode' as const, sessionId: CHILD_ID },
+        resumeTargetIsSubagent: true,
+      },
+      {
+        terminalId: 'term-oc-paned-root',
+        title: 'OpenCode',
+        createdAt: 1_100,
+        lastActivityAt: 1_200,
+        status: 'running' as const,
+        hasClients: true,
+        mode: 'opencode' as const,
+        cwd: '/repo/live',
+        sessionRef: { provider: 'opencode' as const, sessionId: ROOT_ID },
+      },
+    ]
+    // NO matching indexed session for either id (empty projects) -> both
+    // become pushFallbackItem rows, not indexed-session rows.
+    const items = buildSessionItems([], tabs, panes, terminals, {}, 'repo')
+    const fallback = items.find((i) => i.sessionId === CHILD_ID)
+    expect(fallback?.isFallback).toBe(true)
+    expect(fallback?.isSubagent).toBe(true)
+    const rootFallback = items.find((i) => i.sessionId === ROOT_ID)
+    expect(rootFallback?.isSubagent).toBeUndefined()
+
+    const visible = filterSessionItemsByVisibility(items, {
+      showSubagents: false,
+      ignoreCodexSubagents: true,
+      showNoninteractiveSessions: true,
+      hideEmptySessions: false,
+      excludeFirstChatSubstrings: [],
+      excludeFirstChatMustStart: false,
+    })
+    const ids = visible.map((i) => i.sessionId)
+    expect(ids).not.toContain(CHILD_ID)
+    expect(ids).toContain(ROOT_ID)
+  })
 })
 ```
 
@@ -1391,9 +1713,10 @@ Expected: FAIL — TypeScript rejects `resumeTargetIsSubagent` on the terminal o
 1. `src/store/types.ts` — `BackgroundTerminal` (69-81), add after `codexDurability`:
 ```ts
   /**
-   * Server-computed: this terminal was launched targeting an opencode
-   * SUBAGENT (child) session. Manufactured rail entries copy it into
-   * SidebarSessionItem.isSubagent so showSubagents filtering applies.
+   * Server-computed: this terminal's resume target is an opencode
+   * SUBAGENT (child) session. Manufactured rail entries and tab/pane
+   * fallback rows copy it into SidebarSessionItem.isSubagent so
+   * showSubagents filtering applies.
    */
   resumeTargetIsSubagent?: boolean
 ```
@@ -1401,6 +1724,18 @@ Expected: FAIL — TypeScript rejects `resumeTargetIsSubagent` on the terminal o
 ```ts
       isSubagent: terminal.resumeTargetIsSubagent === true ? true : undefined,
 ```
+   Keep this manufactured-block patch — it covers sessionRef-LESS terminals — but note it is gated by `:469` (`if (terminal.sessionRef) continue`): sessionRef-bearing live terminals (the production shape for child-target terminals) never reach it, which is why the fallback-row extension below is the load-bearing half.
+3. `src/store/selectors/sidebarSelectors.ts` — `RunningSessionInfo` (type at :128): add `resumeTargetIsSubagent?: boolean`. In the sessionRef-bearing terminals loop (~:175-225) that builds `runningSessionMap`, record it on the entry: in the `runningSessionMap.set(sessionKey, { ... })` new-entry literal add `resumeTargetIsSubagent: terminal.resumeTargetIsSubagent,` and in the existing-entry merge branch OR-merge it (like `isRestorable`): `existing.resumeTargetIsSubagent = existing.resumeTargetIsSubagent || terminal.resumeTargetIsSubagent`.
+4. `src/store/selectors/sidebarSelectors.ts` — in `pushFallbackItem`'s new-item branch (the `SidebarSessionItem` literal at ~:341-366), change the `:357` line from:
+```ts
+      isSubagent: input.metadata?.isSubagent,
+```
+   to:
+```ts
+      isSubagent: input.metadata?.isSubagent
+        ?? (runningSessionMap.get(key)?.resumeTargetIsSubagent === true ? true : undefined),
+```
+   (Adapt to the actual local variable names — the branch already computes `const runningTerminal = runningSessionMap.get(key)`, so `runningTerminal?.resumeTargetIsSubagent` is equivalent and preferred; verified code shape in `reports/V2-a2-a10.md` §6.)
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1426,7 +1761,7 @@ git commit -m "fix(sidebar): classify subagent-target live terminals so showSuba
 - Modify: `test/e2e-browser/playwright.config.ts` (add the spec to the `rust-chromium` project's `testMatch` — NOT to `RUST_ONLY_SPECS`, so the default chromium/legacy project also runs it against the Node server)
 
 **Interfaces:**
-- Consumes: `createE2eServerHandle(process.env, { kind: e2eServerKind, construct: { env, setupHome } })` from `../helpers/external-target.js`; `TestHarness` (`waitForHarness`, `waitForConnection`, in-page `__FRESHELL_TEST_HARNESS__.sendWsMessage`); the fake opencode CLI fixture `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`; `info.baseUrl` / `info.token` / `info.homeDir` from `server.start()`; REST auth header `x-auth-token`.
+- Consumes: `createE2eServerHandle(process.env, { kind: e2eServerKind, construct: { env, setupHome } })` from `../helpers/external-target.js`; `TestHarness` (`waitForHarness`, `waitForConnection`, in-page `__FRESHELL_TEST_HARNESS__.sendWsMessage` and `__FRESHELL_TEST_HARNESS__.dispatch` — both exposed by `src/lib/test-harness.ts`); the fake opencode CLI fixture `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`; `info.baseUrl` / `info.token` / `info.homeDir` from `server.start()`; REST auth header `x-auth-token`.
 - Produces: user-level proof of both bugs against both servers. No new helpers exported.
 
 - [ ] **Step 1: Write the spec**
@@ -1572,6 +1907,80 @@ test.describe('sidebar opencode rail', () => {
         await page.waitForTimeout(2_000) // let a terminals.changed refetch land
         expect(await page.getByText(new RegExp(CHILD_ID)).count()).toBe(0)
         expect(await page.getByText(/opencode --session/).count()).toBe(0)
+
+        // ── Bug 1 (paned variant, V2): a child-target terminal that sits in
+        // a tab/pane takes the client's FALLBACK-row pathway (sessionRef on
+        // the pane content), not the manufactured-row block — assert that
+        // pathway hides it too. Create a second child-target terminal, then
+        // open it into a tab so the pane content carries sessionRef (the
+        // session-resume open shape, tabsSlice.ts:706-717).
+        const listTerminalIds = async (): Promise<string[]> => {
+          const res = await fetch(`${info.baseUrl}/api/terminals`, {
+            headers: { 'x-auth-token': info.token },
+          })
+          const items = await res.json() as Array<Record<string, unknown>>
+          return items.map((t) => String(t.terminalId))
+        }
+        const idsBefore = await listTerminalIds()
+        await page.evaluate(({ sessionId }) => {
+          (window as unknown as { __FRESHELL_TEST_HARNESS__?: { sendWsMessage: (m: unknown) => void } })
+            .__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+              type: 'terminal.create',
+              requestId: `e2e-rail-subagent-paned-${Date.now()}`,
+              mode: 'opencode',
+              sessionRef: { provider: 'opencode', sessionId },
+            })
+        }, { sessionId: CHILD_ID })
+        let panedTerminalId: string | undefined
+        await expect.poll(async () => {
+          const idsNow = await listTerminalIds()
+          panedTerminalId = idsNow.find((id) => !idsBefore.includes(id))
+          return panedTerminalId != null
+        }, { timeout: 60_000 }).toBe(true)
+        // Open it into a tab/pane via the harness store dispatch (the
+        // openSessionTab terminalId branch's resulting state shape). If the
+        // harness exposes a higher-level open API, use it instead — the
+        // REQUIREMENT is only that the pane content carries
+        // `sessionRef: { provider: 'opencode', sessionId: CHILD_ID }`.
+        await page.evaluate(({ terminalId, sessionId }) => {
+          const harness = (window as unknown as {
+            __FRESHELL_TEST_HARNESS__?: { dispatch: (a: unknown) => void }
+          }).__FRESHELL_TEST_HARNESS__
+          const tabId = `e2e-rail-paned-tab`
+          harness?.dispatch({
+            type: 'tabs/addTab',
+            payload: {
+              id: tabId,
+              title: 'OpenCode',
+              status: 'running',
+              mode: 'opencode',
+              codingCliProvider: 'opencode',
+              sessionRef: { provider: 'opencode', sessionId },
+            },
+          })
+          harness?.dispatch({
+            type: 'panes/initLayout',
+            payload: {
+              tabId,
+              content: {
+                kind: 'terminal',
+                mode: 'opencode',
+                terminalId,
+                sessionRef: { provider: 'opencode', sessionId },
+                status: 'running',
+              },
+            },
+          })
+        }, { terminalId: panedTerminalId!, sessionId: CHILD_ID })
+        // (Match the real action type strings/payloads of `addTab` and
+        // `initLayout` in src/store/tabsSlice.ts / src/store/panesSlice.ts —
+        // mirror what openSessionTab dispatches at tabsSlice.ts:706-717.)
+
+        // Re-assert under default visibility: the paned child-target
+        // terminal's fallback row never surfaces either.
+        await page.waitForTimeout(2_000) // let the rail settle
+        expect(await page.getByText(new RegExp(CHILD_ID)).count()).toBe(0)
+        expect(await page.getByText(/opencode --session/).count()).toBe(0)
       } finally {
         await server.stop()
       }
@@ -1646,7 +2055,7 @@ git add -A && git commit -m "chore: green the coordinated suite for sidebar-open
 
 **1. Spec coverage.**
 - Bug 2 Node listing fallback (`opencode.ts:185`) → Task 1. Bug 2 Rust listing (`parse/opencode.rs:341-344`) + by-id (`:555`, the spec's "by-id fallback path") + wire proof → Task 2. (Spec's `session_directory.rs:337-341` attribution was corrected by file:line-verified exploration: the worktree SQL/mapping lives in `parse/opencode.rs`; `session_directory.rs` consumes `project_path` verbatim — the Task 2 wire test pins that consumption.) Client `getLeafDirectoryName('/')` needs no change once servers stop emitting `/`.
-- Bug 1 server classification exposure → Tasks 3-7 (Node: query → registry → `/api/terminals`/inventory; Rust: by-id lookup → identity flag at create/respawn → `/api/terminals` + session-directory live item, covering BOTH rail-entry variants: client-manufactured `terminal:<id>` rows and server-fabricated live items). Client classification + `showSubagents` filtering → Task 8. "Real user-started sessions must still appear" → root-session control cases in Tasks 4, 5, 6, 7, 8, 9. "Do NOT remove the by-design refusal" → Global Constraints + Task 5 Step 3 re-runs `row_with_parent_id_is_never_a_candidate` untouched. "Fix both Node and Rust for parity" → mirrored task pairs + the dual-project e2e (Task 9). The Rust `is_subagent`-means-3-views caution → classification reads `parent_id` directly (Tasks 3/5), never `OpencodeSession.is_subagent`. The Rust `TerminalTitleUpdated` gap → explicit Non-Goal with rationale (not needed for the desired outcome; classification hides the entries).
-**1b. No silent deferrals.** Every user-facing outcome has a production path and a real test: Bug 2 is proven at SQL-fixture (unit), HTTP-wire (Task 2 Step 6), and browser (Task 9) levels; Bug 1 at query-unit, registry/projection, selector, and browser levels — the Playwright spec runs against real spawned Node AND Rust servers with a real seeded opencode.db and the repo's standard fake opencode CLI (the established production-shaped fixture). No stubs stand in for required behavior. No known-limitations bucket used.
-**2. Placeholder scan.** Steps that reference sibling-test scaffolding (Task 2 Step 6, Task 4 Step 3, Task 6 Step 3, Task 7 Steps 1/3) name the exact sibling test/file:line to copy from and give the complete new assertions — the only adaptation allowed is matching existing local helper/builder names, which cannot be known more precisely without freezing brittle line-level duplicates. No TBD/TODO/"handle edge cases" items remain.
-**3. Type consistency.** `meaningfulWorktree` (Node) / `meaningful_worktree` (Rust, private) — per-language names, single definition each. `resumeTargetIsSubagent` is the wire + record + client-store name everywhere (Tasks 4, 7, 8, 9). `TerminalIdentity.is_subagent: Option<bool>` + `set_is_subagent` (Task 6) are what Task 7 reads. `session_is_subagent_by_id -> Result<Option<bool>, OpencodeReadError>` (Task 5) is what `classify_resume_target -> Option<bool>` wraps and what Task 6 consumes via the locator. `SidebarSessionItem.isSubagent` is pre-existing and unchanged.
+- Bug 1 server classification exposure → Tasks 3-7 (Node: query → registry → `/api/terminals`/inventory + `bindSession` re-classification (Task 4 Step 6) + the `shared/ws-protocol.ts`/frozen-schema declaration (Task 4 Step 7); Rust: by-id lookup → identity flag at ALL FOUR production hook sites — WS create, auto-resume respawn (`terminal.rs`), signal rebind lane (`opencode_signal.rs:399`/`:508`), REST/fresh-agent binder (`pane_identity_binder.rs:111`) — verified-complete by exhaustive enumeration (the locator lane fresh-mints only, `opencode_association.rs:127`) → `/api/terminals` + session-directory live item). Client classification + `showSubagents` filtering → Task 8, covering BOTH rail-entry variants the client mints: manufactured `terminal:<id>` rows (sessionRef-less terminals) AND tab/pane-derived fallback rows (sessionRef-bearing paned terminals, via the `runningSessionMap` consult — the load-bearing half, since the `:469` guard keeps sessionRef-bearing terminals out of the manufactured block). "Real user-started sessions must still appear" → root-session control cases in Tasks 4, 5, 6, 7, 8, 9 (including root cases for the rebind/binder hooks and the fallback row). "Do NOT remove the by-design refusal" → Global Constraints + Task 5 Step 3 re-runs `row_with_parent_id_is_never_a_candidate` untouched. "Fix both Node and Rust for parity" → mirrored task pairs + the dual-project e2e (Task 9, including the paned fallback-row variant). The Rust `is_subagent`-means-3-views caution → classification reads `parent_id` directly (Tasks 3/5), never `OpencodeSession.is_subagent`. The Rust `TerminalTitleUpdated` gap → explicit Non-Goal with rationale (not needed for the desired outcome; classification hides the entries).
+**1b. No silent deferrals.** Every user-facing outcome has a production path and a real test: Bug 2 is proven at SQL-fixture (unit), HTTP-wire (Task 2 Step 6), and browser (Task 9) levels; Bug 1 at query-unit, registry/projection, selector, and browser levels — including the new pieces: `bindSession` re-classification (unit, Task 4 Step 6), the signal-rebind hook (integration, `opencode_switch_rebind.rs`, both directions), the REST-binder hook (unit, `pane_identity_binder.rs` sibling test with a seeded opencode.db), the fallback-row pathway (selector unit test + the Task 9 paned e2e variant), and the contract regeneration (`npm run test:port` gate). The Playwright spec runs against real spawned Node AND Rust servers with a real seeded opencode.db and the repo's standard fake opencode CLI (the established production-shaped fixture). No stubs stand in for required behavior. No known-limitations bucket used.
+**2. Placeholder scan.** Steps that reference sibling-test scaffolding (Task 2 Step 6, Task 4 Step 3, Task 6 Step 3, Task 6 Step 5 — mirrors `tui_switch_signal_rebinds_and_restart_resumes_the_new_id` at `crates/freshell-ws/tests/opencode_switch_rebind.rs:437`, Task 6 Step 6 — sibling of `register_create_identity_writes_identity_row_and_binding` at `pane_identity_binder.rs:214`, Task 7 Steps 1/3) name the exact sibling test/file:line to copy from and give the complete new assertions — the only adaptation allowed is matching existing local helper/builder names, which cannot be known more precisely without freezing brittle line-level duplicates. No TBD/TODO/"handle edge cases" items remain.
+**3. Type consistency.** `meaningfulWorktree` (Node) / `meaningful_worktree` (Rust, private) — per-language names, single definition each. `resolveOpencodeDatabasePath(dataHome: string = defaultOpencodeDataHome())` is the single Node DB-path definition (Task 3) — the provider's public `getDatabasePath()` delegates to it and `isOpencodeSubagentSession` defaults through it. `resumeTargetIsSubagent` is the wire + record + protocol (`shared/ws-protocol.ts`) + client-store (`BackgroundTerminal`, `RunningSessionInfo`) name everywhere (Tasks 4, 7, 8, 9). `TerminalIdentity.is_subagent: Option<bool>` + `set_is_subagent` (Task 6) are what Task 7 reads. `session_is_subagent_by_id -> Result<Option<bool>, OpencodeReadError>` (Task 5) is what `classify_resume_target -> Option<bool>` wraps; Task 6 consumes it via the locator in `classify_and_mark_resume_target` (both-directions write semantics) and via the injected binder classifier (`Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>` wrapping the same `classify_resume_target`) — one classifier, two transports. `SidebarSessionItem.isSubagent` is pre-existing and unchanged.
