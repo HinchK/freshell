@@ -48,6 +48,36 @@ pub struct TerminalIdentity {
     /// REST bind); preserved across plain upserts. Never consulted by
     /// association logic.
     pub is_subagent: Option<bool>,
+    /// Out-of-order guard for the async classification writes feeding
+    /// [`Self::is_subagent`] (Bug-1 review): the latest classification
+    /// REQUEST generation for this terminal. Advanced synchronously by
+    /// [`TerminalIdentityRegistry::begin_subagent_classification`] at
+    /// request time; an async answer writes only while its captured
+    /// generation is still current
+    /// ([`TerminalIdentityRegistry::complete_subagent_classification`]),
+    /// so the newest request wins regardless of resolution order. Private:
+    /// bookkeeping between the two registry methods, not identity data.
+    /// Memory hygiene: rides the identity entry itself (entries are
+    /// retained-on-retire by design, see [`TerminalIdentityRegistry::retire`]),
+    /// so it adds no new growth beyond the map that already exists.
+    classify_generation: u64,
+}
+
+/// The minimal entry created when a write lands before the terminal's first
+/// identity upsert (classification and its generation guard can both fire
+/// before the create-path seed — terminal.rs orders the classify hook ahead
+/// of `identity.upsert`).
+fn minimal_entry(terminal_id: &str) -> TerminalIdentity {
+    TerminalIdentity {
+        terminal_id: terminal_id.to_string(),
+        provider: None,
+        session_id: None,
+        cwd: None,
+        updated_at: 0,
+        retired: false,
+        is_subagent: None,
+        classify_generation: 0,
+    }
 }
 
 /// Shared, cheaply-cloneable registry (`Arc<RwLock<..>>`), analogous to
@@ -96,13 +126,11 @@ impl TerminalIdentityRegistry {
                 map.insert(
                     terminal_id.to_string(),
                     TerminalIdentity {
-                        terminal_id: terminal_id.to_string(),
                         provider: provider.map(str::to_string),
                         session_id: session_id.map(str::to_string),
                         cwd: cwd.map(str::to_string),
                         updated_at,
-                        retired: false,
-                        is_subagent: None,
+                        ..minimal_entry(terminal_id)
                     },
                 );
             }
@@ -117,17 +145,53 @@ impl TerminalIdentityRegistry {
         let mut map = self.inner.write().expect("identity registry lock poisoned");
         let entry = map
             .entry(terminal_id.to_string())
-            .or_insert_with(|| TerminalIdentity {
-                terminal_id: terminal_id.to_string(),
-                provider: None,
-                session_id: None,
-                cwd: None,
-                updated_at: 0,
-                retired: false,
-                is_subagent: None,
-            });
+            .or_insert_with(|| minimal_entry(terminal_id));
         entry.is_subagent = value;
         entry.updated_at = crate::terminal::now_ms();
+    }
+
+    /// Out-of-order guard, request half (Bug-1 review): atomically advance
+    /// and return this terminal's subagent-classification generation. Call
+    /// SYNCHRONOUSLY at the moment a classification request is made (before
+    /// any async resolution), so the program order of requests is captured
+    /// even though their answers may resolve out of order. Creates a
+    /// minimal entry when the terminal has no identity yet — the WS
+    /// create-path hook fires before the identity seed (terminal.rs), so
+    /// requiring an existing entry would wrongly invalidate legitimate
+    /// create-path classifications.
+    pub fn begin_subagent_classification(&self, terminal_id: &str) -> u64 {
+        let mut map = self.inner.write().expect("identity registry lock poisoned");
+        let entry = map
+            .entry(terminal_id.to_string())
+            .or_insert_with(|| minimal_entry(terminal_id));
+        entry.classify_generation += 1;
+        entry.classify_generation
+    }
+
+    /// Out-of-order guard, answer half (Bug-1 review): write the subagent
+    /// classification IFF `generation` is still this terminal's latest —
+    /// newest-request-wins regardless of resolution order. Returns whether
+    /// the write happened, so callers gate their change broadcast on it.
+    /// The compare-and-write is atomic under the registry lock: a stale
+    /// answer can never land after a newer one.
+    pub fn complete_subagent_classification(
+        &self,
+        terminal_id: &str,
+        generation: u64,
+        value: Option<bool>,
+    ) -> bool {
+        let mut map = self.inner.write().expect("identity registry lock poisoned");
+        match map.get_mut(terminal_id) {
+            Some(entry) if entry.classify_generation == generation => {
+                entry.is_subagent = value;
+                entry.updated_at = crate::terminal::now_ms();
+                true
+            }
+            // Entry missing (nothing ever removes entries, so only possible
+            // if begin() was never called) or a newer request superseded
+            // this one: skip the write.
+            _ => false,
+        }
     }
 
     /// `TerminalMetadataService.retire` (`terminal-metadata-service.ts:203-219`):
@@ -394,6 +458,41 @@ mod tests {
             1_000,
         );
         assert_eq!(registry.get("t-plain").unwrap().is_subagent, None);
+    }
+
+    #[test]
+    fn stale_subagent_classification_cannot_overwrite_a_newer_request() {
+        let reg = TerminalIdentityRegistry::new();
+
+        // Two rapid classification requests for the same terminal, in
+        // program order: A (old resume target), then B (new resume target).
+        let gen_a = reg.begin_subagent_classification("t1");
+        let gen_b = reg.begin_subagent_classification("t1");
+        assert!(gen_b > gen_a, "generations must advance monotonically");
+
+        // B's answer resolves FIRST and writes.
+        assert!(reg.complete_subagent_classification("t1", gen_b, Some(false)));
+        assert_eq!(reg.get("t1").unwrap().is_subagent, Some(false));
+
+        // A's answer lands LATE: newest-request-wins, so it must be skipped.
+        assert!(!reg.complete_subagent_classification("t1", gen_a, Some(true)));
+        assert_eq!(reg.get("t1").unwrap().is_subagent, Some(false));
+    }
+
+    #[test]
+    fn create_path_identity_seed_does_not_invalidate_an_in_flight_classification() {
+        let reg = TerminalIdentityRegistry::new();
+
+        // The WS create-path hook begins classification BEFORE the identity
+        // seed lands (terminal.rs: classify_and_mark_resume_target fires
+        // before identity.upsert), so the upsert must PRESERVE the
+        // classification generation — resetting it would wrongly skip every
+        // legitimate create-path write.
+        let generation = reg.begin_subagent_classification("t1");
+        reg.upsert("t1", Some("opencode"), Some("ses_x"), Some("/repo"), 1_000);
+
+        assert!(reg.complete_subagent_classification("t1", generation, Some(true)));
+        assert_eq!(reg.get("t1").unwrap().is_subagent, Some(true));
     }
 
     #[test]
