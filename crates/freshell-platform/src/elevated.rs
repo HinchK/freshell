@@ -12,6 +12,7 @@
 //! [`CommandRunner`], which in tests is always a [`crate::FakeCommandRunner`].
 //! **No elevated command is ever run against a live host.**
 
+use crate::network::timing_safe_compare;
 use crate::CommandRunner;
 
 /// `ELEVATED_POWERSHELL_TIMEOUT_MS` (`elevated-powershell.ts:3`).
@@ -42,6 +43,17 @@ pub fn spawn_elevated_powershell(
     let args = build_elevated_powershell_args(script);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     runner.run(command, &arg_refs)
+}
+
+/// The [`CommandRunner`] for REAL elevation dispatch: [`crate::StdCommandRunner`]
+/// carrying [`ELEVATED_POWERSHELL_TIMEOUT_MS`] (120s, `elevated-powershell.ts:3`)
+/// instead of the 5s read-only `tryExec` default. `Start-Process -Verb RunAs
+/// -Wait` blocks on the interactive UAC prompt plus the elevated script, so the
+/// short default would kill the outer PowerShell and misreport the outcome.
+pub fn elevated_std_runner() -> crate::StdCommandRunner {
+    crate::StdCommandRunner::with_timeout(std::time::Duration::from_millis(
+        ELEVATED_POWERSHELL_TIMEOUT_MS,
+    ))
 }
 
 /// `ConfirmationAction` (`network-router.ts:50`).
@@ -167,7 +179,7 @@ impl ConfirmationGate {
     /// `matchesConfirmation` (`network-router.ts:230-235`).
     pub fn matches_confirmation(&self, token: Option<&str>, action: ConfirmationAction) -> bool {
         match (&self.current, token) {
-            (Some(c), Some(t)) => c.token == t && c.action == action,
+            (Some(c), Some(t)) => timing_safe_compare(&c.token, t) && c.action == action,
             _ => false,
         }
     }
@@ -191,7 +203,7 @@ impl ConfirmationGate {
     /// token matches the current confirmation (regardless of action).
     pub fn consume_current_confirmation(&mut self, token: Option<&str>) -> bool {
         match (&self.current, token) {
-            (Some(c), Some(t)) if c.token == t => {
+            (Some(c), Some(t)) if timing_safe_compare(&c.token, t) => {
                 self.current = None;
                 true
             }
@@ -265,6 +277,70 @@ impl ConfirmationGate {
     }
 }
 
+/// The outcome of a spawn_via elevation request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ElevationOutcome {
+    Started,
+    Denied,
+    TimedOut,
+    PartialFailure,
+    VerificationFailed,
+    NotSupported,
+}
+
+pub enum ElevationRunner<'a> {
+    /// Test/injected path — dispatches through a CommandRunner fake.
+    Fake(&'a dyn crate::CommandRunner),
+    /// Real elevation. EXISTS ONLY on Windows: on this Linux host the live
+    /// constructor cannot produce this variant, so real netsh mutation is
+    /// structurally unreachable (safety satisfied by the type system).
+    #[cfg(windows)]
+    Real,
+    /// Non-Windows host: elevation is not supported and never spawns.
+    Unsupported,
+}
+
+pub fn elevation_runner_live() -> ElevationRunner<'static> {
+    #[cfg(windows)]
+    {
+        ElevationRunner::Real
+    }
+    #[cfg(not(windows))]
+    {
+        ElevationRunner::Unsupported
+    }
+}
+
+fn classify(out: &crate::CommandOutput) -> ElevationOutcome {
+    // A runner kill on wall-clock timeout is authoritative: the elevated
+    // PowerShell never settled, so the outcome is TimedOut, not Denied.
+    if out.timed_out {
+        return ElevationOutcome::TimedOut;
+    }
+    let text = format!("{} {}", out.stdout, out.stderr).to_ascii_lowercase();
+    if text.contains("canceled by the user") || text.contains("cancelled") {
+        return ElevationOutcome::Denied;
+    }
+    if out.ok() {
+        ElevationOutcome::Started
+    } else {
+        ElevationOutcome::Denied
+    }
+}
+
+pub fn spawn_via(runner: &ElevationRunner<'_>, command: &str, script: &str) -> ElevationOutcome {
+    match runner {
+        ElevationRunner::Fake(r) => classify(&spawn_elevated_powershell(*r, command, script)),
+        #[cfg(windows)]
+        ElevationRunner::Real => classify(&spawn_elevated_powershell(
+            &elevated_std_runner(),
+            command,
+            script,
+        )),
+        ElevationRunner::Unsupported => ElevationOutcome::NotSupported,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,8 +374,36 @@ protocol=tcp localport=3001 profile=private'"
     }
 
     #[test]
-    fn timeout_constant() {
+    fn real_elevation_runner_carries_the_120s_timeout() {
+        // Strictly stronger than the old constant-value-only assertion: the
+        // constant must be 120_000 AND the runner used for real elevation
+        // dispatch must actually carry it (not the 5s read-only default).
         assert_eq!(ELEVATED_POWERSHELL_TIMEOUT_MS, 120_000);
+        let runner = elevated_std_runner();
+        assert_eq!(
+            runner.timeout,
+            std::time::Duration::from_millis(ELEVATED_POWERSHELL_TIMEOUT_MS)
+        );
+        assert_eq!(runner.timeout, std::time::Duration::from_millis(120_000));
+    }
+
+    #[test]
+    fn real_dispatch_wires_the_elevated_runner_not_the_5s_default() {
+        // The `ElevationRunner::Real` arm is cfg(windows)-gated, so on non-Windows
+        // hosts the wiring is pinned by source inspection (repo convention:
+        // needles are concat!-split so this test's OWN source never satisfies
+        // the contains() checks).
+        let src = include_str!("elevated.rs");
+        let banned = concat!("StdCommandRunner::", "default()");
+        let required = concat!("elevated_std", "_runner()");
+        assert!(
+            !src.contains(banned),
+            "Real elevation dispatch must not use the 5s-default StdCommandRunner"
+        );
+        assert!(
+            src.contains(required),
+            "Real elevation dispatch must go through the 120s elevated runner"
+        );
     }
 
     // ---- action metadata ---------------------------------------------------
@@ -468,5 +572,119 @@ protocol=tcp localport=3001 profile=private'"
         assert!(!gate.consume_current_confirmation(Some("nope")));
         assert!(gate.consume_current_confirmation(Some("T")));
         assert!(!gate.consume_current_confirmation(Some("T"))); // already cleared
+    }
+
+    #[test]
+    fn matches_confirmation_uses_constant_time_compare_not_equality() {
+        // Falsifier for NET-08-C: this test fails only if `==` is still used,
+        // because it asserts the source no longer contains the equality compare.
+        // Both needles are concat!-split so this test's OWN source never contains
+        // them intact -- otherwise the negative assert would fail forever and the
+        // positive assert would pass vacuously.
+        let src = include_str!("elevated.rs");
+        let banned = concat!("c.token ", "== t");
+        let required = concat!("timing_safe", "_compare");
+        assert!(
+            !src.contains(banned),
+            "raw == token compare still present; NET-08-C not applied"
+        );
+        assert!(
+            src.contains(required),
+            "constant-time compare not wired into the confirmation gate"
+        );
+    }
+
+    #[test]
+    fn matches_confirmation_rejects_equal_length_mismatched_token() {
+        let mut gate = ConfirmationGate::new();
+        let issued = gate.issue_confirmation(ConfirmationAction::WindowsRepair, "aaaaaaaa");
+        // Same length, different content -> must NOT match.
+        assert!(!gate.matches_confirmation(Some("bbbbbbbb"), ConfirmationAction::WindowsRepair));
+        // The genuinely-issued token still matches.
+        assert!(gate.matches_confirmation(
+            Some(&issued.confirmation_token),
+            ConfirmationAction::WindowsRepair
+        ));
+    }
+
+    #[test]
+    fn consume_current_confirmation_rejects_differing_length_token() {
+        let mut gate = ConfirmationGate::new();
+        let issued = gate.issue_confirmation(ConfirmationAction::Wsl2Repair, "tokseed");
+        assert!(!gate.consume_current_confirmation(Some("x")));
+        assert!(gate.consume_current_confirmation(Some(&issued.confirmation_token)));
+    }
+
+    // ---- ElevationRunner: structural unreachability of real OS mutation (Task 3.1) ----
+
+    #[test]
+    fn on_non_windows_the_live_runner_is_unsupported_and_never_spawns() {
+        #[cfg(not(windows))]
+        {
+            let runner = elevation_runner_live();
+            assert!(matches!(runner, ElevationRunner::Unsupported));
+            let out = spawn_via(
+                &runner,
+                "powershell.exe",
+                "netsh advfirewall firewall add rule ...",
+            );
+            assert_eq!(out, ElevationOutcome::NotSupported);
+        }
+    }
+
+    #[test]
+    fn source_only_constructs_real_under_cfg_windows() {
+        // Needles are concat!-split so this test's OWN source never satisfies the
+        // contains() checks -- the assertions genuinely inspect the implementation
+        // code elsewhere in this file instead of passing vacuously.
+        let src = include_str!("elevated.rs");
+        let cfg_gate = concat!("#[cfg(", "windows)]");
+        let unsupported = concat!("ElevationRunner::", "Unsupported");
+        assert!(
+            src.contains(cfg_gate),
+            "the Real elevation runner must be cfg(windows)-gated"
+        );
+        assert!(
+            src.contains(unsupported),
+            "Unsupported variant missing from elevated.rs"
+        );
+    }
+
+    #[test]
+    fn fake_runner_dispatch_classifies_outcomes() {
+        use crate::{CommandOutput, FakeCommandRunner};
+        let denied = FakeCommandRunner::new().with_default(CommandOutput::failure(
+            1,
+            "",
+            "The operation was canceled by the user",
+        ));
+        let out = spawn_via(&ElevationRunner::Fake(&denied), "powershell.exe", "script");
+        assert_eq!(out, ElevationOutcome::Denied);
+        let ok = FakeCommandRunner::new().with_default(CommandOutput::success(""));
+        let out = spawn_via(&ElevationRunner::Fake(&ok), "powershell.exe", "script");
+        assert_eq!(out, ElevationOutcome::Started);
+    }
+
+    #[test]
+    fn timed_out_outcome_classifies_as_timed_out_not_denied() {
+        // A runner kill on wall-clock timeout must surface as TimedOut...
+        let timed_out = FakeCommandRunner::new().with_default(CommandOutput::timeout("", ""));
+        let out = spawn_via(
+            &ElevationRunner::Fake(&timed_out),
+            "powershell.exe",
+            "script",
+        );
+        assert_eq!(out, ElevationOutcome::TimedOut);
+
+        // ...while a plain spawn failure (`exit_code: None`, no timeout flag)
+        // still classifies as Denied, exactly as before.
+        let spawn_fail =
+            FakeCommandRunner::new().with_default(CommandOutput::spawn_failure("boom"));
+        let out = spawn_via(
+            &ElevationRunner::Fake(&spawn_fail),
+            "powershell.exe",
+            "script",
+        );
+        assert_eq!(out, ElevationOutcome::Denied);
     }
 }

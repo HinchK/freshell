@@ -26,6 +26,8 @@ mod files;
 mod identity_sink;
 mod instance_id;
 mod logging;
+mod managed_ports;
+mod net_bind;
 mod network;
 mod proxy;
 mod rate_limit;
@@ -46,7 +48,7 @@ mod tabs_snapshots;
 mod terminals;
 mod updater;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -103,7 +105,6 @@ async fn main() -> ExitCode {
     };
 
     let port = resolve_port();
-    let bind_host = resolve_bind_host();
     let home = resolve_home();
 
     // DIAG-01/DIAG-03: structured JSONL logging to
@@ -197,6 +198,11 @@ async fn main() -> ExitCode {
             .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
+    // NET-02/06 restart truthfulness: the BOOT bind honors the persisted
+    // `settings.network` (a disable that persisted loopback must survive a
+    // restart), so the bind host is resolved only now, AFTER the settings
+    // store loads. `FRESHELL_BIND_HOST` still outranks it (platform-side).
+    let bind_host = resolve_bind_host(&settings_store.get().await.network);
     // GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
     // notice, if the primary config needed to fall back at boot. `None` for
     // a healthy config or an ordinary fresh install. Threaded into
@@ -911,12 +917,38 @@ async fn main() -> ExitCode {
     // The read-only network status surface (`GET /api/network/status`, Follow-up
     // 3.19): the full `NetworkStatus` shape, with firewall/LAN facts detected
     // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
+    let rebind =
+        crate::net_bind::RebindController::new(port, crate::net_bind::reuse_port_enabled());
+    let managed_ports_store = Arc::new(managed_ports::ManagedPortsStore::windows(
+        home.clone(),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        port,
+    ));
     let network_state = network::NetworkState {
         auth_token: Arc::clone(&auth_token),
-        settings: Arc::clone(&settings),
-        effective_host: Arc::new(bind_host.clone()),
+        settings: settings_store.clone(),
+        bind: Arc::new(network::BindState::new(bind_host.clone())),
         port,
-        facts: Arc::new(tokio::sync::OnceCell::new()),
+        facts: Arc::new(network::NetworkFactsCache::new()),
+        probe: Arc::new(network::TcpPortProbe::default()),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        rebind: Arc::clone(&rebind),
+        net_mutation: Arc::new(tokio::sync::Mutex::new(())),
+        // Task 3.3: the confirmation/elevation gate + the instance-scoped
+        // managed-ports store (keyed by the real home/cwd/port) + the live
+        // elevated-dispatch seam (Unsupported off Windows -- no real OS
+        // mutation can occur on a non-Windows host).
+        gate: Arc::new(tokio::sync::Mutex::new(
+            freshell_platform::elevated::ConfirmationGate::new(),
+        )),
+        managed_ports: Arc::clone(&managed_ports_store),
+        elevated_dispatch: Arc::new(network::LiveElevatedDispatch),
+        // Task 3.5: the live post-`Started` verification seam (the TS
+        // `verifySuccess` spawn-callback step) — READ-ONLY recomputes.
+        elevation_verifier: Arc::new(network::LiveElevationVerifier {
+            port,
+            managed_ports: managed_ports_store,
+        }),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
@@ -1364,16 +1396,17 @@ async fn main() -> ExitCode {
             logging::request_logging_middleware,
         ));
 
-    let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    let addr = SocketAddr::new(ip, port);
-
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("freshell-server: failed to bind {addr}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // Slice 2 (Task 2.2): the boot listener is served through the
+    // RebindController — the same transactional bind/swap path the network
+    // mutation endpoints (2.3/2.4) use — so there is exactly ONE serving
+    // mechanism to reason about. `serve_on` binds (proof) and starts the
+    // accept loop; a bind failure here is the old bind-error exit path.
+    rebind.set_app(app.clone());
+    let boot_ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    if let Err(err) = rebind.serve_on(boot_ip).await {
+        eprintln!("freshell-server: failed to bind {boot_ip}:{port}: {err}");
+        return ExitCode::FAILURE;
+    }
     // Single startup line (stderr, so it never pollutes any stdout protocol).
     // Provenance-hardening lane (#613): timestamp + pid + commit + dirty
     // (the same `commit`/`buildDirty` values `GET /api/server-info` reports,
@@ -1387,7 +1420,7 @@ async fn main() -> ExitCode {
     eprintln!(
         "{}",
         diag::boot_line(
-            &addr.to_string(),
+            &format!("{boot_ip}:{port}"),
             diag::build_commit(),
             diag::build_dirty_str(),
             std::process::id(),
@@ -1395,14 +1428,16 @@ async fn main() -> ExitCode {
         )
     );
 
-    // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
-    // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(
-            Arc::clone(&shutdown_notify),
-            std::sync::Arc::clone(&shutdown_started),
-        ))
-        .await;
+    // Block until SIGTERM/SIGINT (the same graceful-shutdown trigger the old
+    // `axum::serve(...).with_graceful_shutdown(...)` used), then drain the
+    // live listener so every owned child (PTY terminals, the
+    // Codex/claude/opencode sidecars) is reaped — no orphans.
+    shutdown_signal(
+        Arc::clone(&shutdown_notify),
+        std::sync::Arc::clone(&shutdown_started),
+    )
+    .await;
+    rebind.shutdown_all().await;
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
     // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
@@ -1451,10 +1486,6 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
-    if let Err(err) = serve_result {
-        eprintln!("freshell-server: serve error: {err}");
-        return ExitCode::FAILURE;
-    }
     ExitCode::SUCCESS
 }
 
@@ -1643,26 +1674,24 @@ fn resolve_allowed_origins() -> Vec<String> {
 }
 
 /// Resolve the bind host, faithfully to `server/get-network-host.ts`:
-/// an explicit `FRESHELL_BIND_HOST` (`0.0.0.0`/`127.0.0.1`) wins; otherwise **on WSL
-/// bind `0.0.0.0`** so the Windows host (browser / the legacy Electron app) can reach
-/// the server across the WSL2 NAT boundary — "not remote access, basic WSL2
-/// functionality" (get-network-host.ts:11-13,40-42); else fall back to `127.0.0.1`.
+/// an explicit `FRESHELL_BIND_HOST` (`0.0.0.0`/`127.0.0.1`) wins; then the
+/// persisted `settings.network` when `configured: true` (NET-02/06 restart
+/// truthfulness — a disable that persisted loopback survives a restart);
+/// otherwise **on WSL bind `0.0.0.0`** so the Windows host (browser / the
+/// legacy Electron app) can reach the server across the WSL2 NAT boundary —
+/// "not remote access, basic WSL2 functionality"
+/// (get-network-host.ts:11-13,40-42); else the config host hint, the `HOST`
+/// env fallback, and finally `127.0.0.1`.
 ///
-/// NOTE: the earlier loopback-only default diverged from the original (it left the
-/// server unreachable from Windows). The oracle never caught it because the harness
-/// always forces `FRESHELL_BIND_HOST=127.0.0.1` for test isolation — which this still
-/// honors, so T0/T1/T2/T3 remain loopback and unaffected.
-fn resolve_bind_host() -> String {
+/// NOTE: the harness always forces `FRESHELL_BIND_HOST=127.0.0.1` for test
+/// isolation — which this still honors (it outranks the persisted config),
+/// so T0/T1/T2/T3 remain loopback and unaffected.
+fn resolve_bind_host(network: &freshell_protocol::settings::SettingsNetwork) -> String {
     let is_wsl = is_wsl_proc(read_proc_version().as_deref());
     freshell_platform::network::resolve_bind_host(
         &freshell_platform::RealEnv,
         is_wsl,
-        // No config-file host override wired here; FRESHELL_BIND_HOST + the WSL
-        // default + the `HOST` env fallback are what the standalone run needs.
-        freshell_platform::network::BindHostConfig::Ok {
-            raw_host: None,
-            configured: false,
-        },
+        network::boot_bind_config(network),
     )
 }
 

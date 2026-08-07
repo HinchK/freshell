@@ -1041,6 +1041,88 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   instead of a fresh client-minted key per hydrate; snapshot-restored panes are re-created
   under their captured key.
 
+
+### DEV-0011 — Transactional rebind with bind-new-before-persist and SO_REUSEPORT
+
+- **objective_defect:** *breaks invariant / persistence before proof* — `server/network-manager.ts:417` persists before bind completion, contradicts NET-02's "bind then prove"; escalated to CATASTROPHIC by `:477-483` ("server has no active listener" on rebind rollback failure).
+- **original_behavior:** On `configure` to a new host, `NetworkManager.setActivePort` persists config changes BEFORE proving the listener binds successfully; if bind fails, config is already written and the next boot is silently broken.
+- **port_behavior:** Use SO_REUSEPORT to bind the new listener FIRST (proving it works on the requested host), then persist config, then gracefully drain the old listener. Rollback on persist failure drops the socket (infallible). Escape hatch: `FRESHELL_REBIND_NO_REUSEPORT=1`.
+- **fingerprint:** net_bind transactional test + harness Phase 3/4 (bind proves before state change).
+- **pinning_test:** `crates/freshell-server/src/net_bind.rs::serve_on_proves_bind_before_swapping_and_serves_traffic` + `foreign_squatter_blocks_our_bind` + harness Phase 3/4.
+- **status:** proposed
+
+### DEV-0012 — Settled-status response to configure endpoint
+
+- **objective_defect:** *contract-legal deliberate choice* — `src/store/networkSlice.ts:123-130` documents that the client reducer accepts both settled truth (current state post-mutation) and desired-state preview (`rebindScheduled:true`); the port chooses to return settled truth (listener already active post-transactional bind), whereas the original returns a preview. Both are contract-legal client behavior; the port's choice to report reality instead of anticipation is an intentional improvement.
+- **original_behavior:** `POST /api/network/configure` returns `rebindScheduled:true` as a preview/plan, not the actual state after the mutation.
+- **port_behavior:** `POST /api/network/configure` returns `{..., rebindScheduled:false}` (the listener is already active; no further rebind scheduled) and other settled fields matching the transactional reality.
+- **fingerprint:** configure response shape (rebindScheduled field value).
+- **pinning_test:** `crates/freshell-server/src/network.rs::configure_to_all_interfaces_persists_and_reports_settled_host`.
+- **status:** proposed
+
+### DEV-0013 — No mass 4009 on rebind (in-flight connections drain across the listener swap)
+
+- **objective_defect:** *UX improvement / intentional divergence* — the rebind swap retires only the accept loop, never accepted connections, so existing WS/HTTP connections drain gracefully instead of receiving abrupt closure.
+- **original_behavior:** On rebind, old listener is torn down immediately, causing connected clients to receive 4009 (going away) en masse.
+- **port_behavior:** The old accept loop is RETIRED at the swap (`Notify::notify_one` permit + awaiting its JoinHandle — a deterministic "old socket closed" barrier); in-flight connections are unaffected because each accepted connection runs in its own detached spawned task, which keeps draining after the swap while new requests route to the new listener. (SO_REUSEPORT overlap exists only for the bind-proof; drain comes from the detached per-connection tasks, not a kept accept loop.)
+- **fingerprint:** net_bind drain pin (live connection held open across a `serve_on` swap completes; new listener serves concurrently).
+- **pinning_test:** `crates/freshell-server/src/net_bind.rs::inflight_connection_survives_rebind_and_drains_to_completion` (holds an in-flight request open across the swap, proves the new listener serves during the drain, then completes the old request — fails if the swap force-closes in-flight connections).
+- **status:** proposed
+
+### DEV-0014 — NET-08-A/B/C hardening (Ipv4Addr typing, constant-time compare, Slice 0)
+
+- **objective_defect:** *security hardening* — missing `Ipv4Addr` type enforcement and timing-safe comparisons on host validation (Slice 0, Task 2.3).
+- **original_behavior:** TS host string comparisons are loose and timing-sensitive.
+- **port_behavior:** Rust uses `Ipv4Addr` type for host binding and `timing_safe_compare` (or equivalent) for validation, providing compile-time type safety and resistance to timing attacks.
+- **fingerprint:** net_bind host-enum type enforcement (Slice 0, Task 2.3).
+- **pinning_test:** crate-level type tests + NET-08 negative matrix (harness Phase 6).
+- **status:** proposed
+
+### DEV-0015 — Action-bound token consumption, instance-scoped managed-ports file, separate action enums
+
+- **objective_defect:** *security + data integrity* — Fixes D1 (token not bound to action), D15 (managed-ports not instance-scoped / `FRESHELL_HOME` ignored), D16 (managed-ports writes non-atomic), D19 (repair/disable modeled as one type, unreachable `terminal` state).
+- **original_behavior:** Tokens consumed without action binding; WSL managed-ports file ignores `FRESHELL_HOME` and is not atomic; disable/repair actions share one enum type.
+- **port_behavior:** (a) Every action handler verifies the token's action matches the endpoint; (b) WSL managed-ports file is `FRESHELL_HOME`-scoped and uses atomic write (rename); (c) Disable and repair actions have separate enums (net_mutation.rs).
+- **fingerprint:** token_action_binding + managed_ports atomicity + net_mutation enum (Slice 0 + 2).
+- **pinning_test:** `crates/freshell-platform/src/elevated.rs` action-bound token tests + WSL managed-ports atomic-write tests + net_mutation enum type tests.
+- **status:** proposed
+
+### DEV-0016 — WSL2 listener rebind is real (disable truly rebinds to loopback)
+
+- **objective_defect:** *contradicts NET-06 truthfulness* — the TS forces `hostChanged=false` on WSL2 (`network-manager.ts:412-413`), claiming no rebind happened; but disable MUST rebind to loopback on all platforms for safety (NET-06, Task 2.4).
+- **original_behavior:** On WSL2 `disable`, the listener stays on 0.0.0.0 (Windows still exposed via portproxy), and `hostChanged=false` is returned.
+- **port_behavior:** On WSL2 `disable`, bind truthfully rebinds to 127.0.0.1, `hostChanged=true` is reported, and the port is no longer LAN-reachable (portproxy is not re-exposed). Windows portproxy is NOT a substitute for truthful rebind.
+- **fingerprint:** harness Phase 3/4 tier-b transitions (disable on wsl2 rebinds to loopback).
+- **pinning_test:** `crates/freshell-server/src/network.rs::disable_from_exposed_linux_rebinds_to_loopback_and_persists` + harness Phase 3/4 tier-b WSL2 disable path.
+- **status:** proposed
+
+### DEV-0017 — Kept-as-contract: wsl2 remoteAccessEnabled = rawPortOpen === true
+
+- **objective_defect:** *contract compliance (not a bug to fix)* — wsl2 `remoteAccessEnabled = rawPortOpen === true` (`server/network-manager.ts:349-350`) is depended on by `src/lib/share-utils.ts:17-34` and is part of the frozen contract. This is reviewed and deliberately KEPT, not changed.
+- **original_behavior:** `remoteAccessEnabled` on WSL2 is computed as the boolean value of `rawPortOpen`.
+- **port_behavior:** Ported faithfully in Slice 1 (Task 2.2); no change to this contract.
+- **fingerprint:** WSL2 remoteAccessEnabled computation (no divergence, kept as reference).
+- **pinning_test:** N/A — this is a kept contract, not a fix. Slice 1 parity tests verify it.
+- **status:** proposed
+
+### DEV-0018 — Persisted configured host outranks WSL wildcard default
+
+- **objective_defect:** *contradicts NET-02/NET-06 truthfulness* — `server/get-network-host.ts:42` returns `0.0.0.0` for WSL BEFORE consulting persisted config; a disable that persisted loopback is silently re-exposed on next boot (validated live in reports/V2.md).
+- **original_behavior:** On WSL, the bind host is always `0.0.0.0` (wildcard default), ignoring the persisted `configured:true` host.
+- **port_behavior:** Host precedence is: (1) `FRESHELL_BIND_HOST` env override, (2) persisted config when `configured:true`, (3) WSL default `0.0.0.0`, (4) `HOST` env var, (5) `127.0.0.1` fallback. Unconfigured WSL keeps the wildcard default.
+- **fingerprint:** host-precedence logic (WSL default used only when no persisted config).
+- **pinning_test:** `crates/freshell-platform/src/network.rs::wsl_with_configured_host_outranks_wsl_default` + `wsl_unconfigured_keeps_wildcard_default` + harness Phase 5.
+- **status:** proposed
+
+### DEV-0019 — Fail-safe persist-failure handling on mutation endpoints
+
+- **objective_defect:** *data integrity / silent divergence* — `server/network-manager.ts:501-503` swallows revert-persist errors after rebind rollback (listener and config silently diverge; client never told); disable path has no revert at all.
+- **original_behavior:** On persist failure after a successful bind swap, the listener is rolled back but the error is swallowed; on disable persist failure, the listener is already changed and no rollback happens.
+- **port_behavior:** `configure` rolls the LISTENER back when persist fails after successful bind (reality matches unchanged config; if rollback bind itself fails, bind stays truthful and a CATASTROPHIC error is logged). `disable-remote-access` NEVER re-exposes on error path — it keeps the loopback listener, sets bind truthfully, and surfaces the error to the client.
+- **fingerprint:** persist-failure error handling paths (listener rollback on configure, no re-expose on disable).
+- **pinning_test:** `crates/freshell-server/src/network.rs::configure_rolls_back_the_listener_when_persist_fails` + `disable_keeps_loopback_and_reports_error_when_persist_fails`.
+- **status:** proposed
+
 <!--
 Template:
 

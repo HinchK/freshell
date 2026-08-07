@@ -444,6 +444,18 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
         );
     }
 
+    /// Task 3.4 golden (NET-04 negative space): the managed-Windows delete
+    /// builder only ever names `Freshell (port <p>)` rules — the real WSL
+    /// `FreshellLANAccess` rule and an unrelated sentinel are NEVER deleted.
+    #[test]
+    fn delete_commands_never_touch_unrelated_or_freshelllanaccess_rules() {
+        let cmds = build_windows_firewall_delete_commands(&[3001]);
+        let joined = cmds.join(" ; ");
+        assert!(!joined.contains("FreshellLANAccess"));
+        assert!(!joined.contains("SomeUnrelatedSentinelRule"));
+        assert!(joined.contains(&managed_windows_firewall_rule_name(3001)));
+    }
+
     // ---- detection via fakes ----------------------------------------------
 
     #[test]
