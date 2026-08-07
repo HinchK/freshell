@@ -320,7 +320,7 @@ describe('subagent-target live terminals (Bug 1)', () => {
 
   it('classifies tab/pane-derived FALLBACK rows for sessionRef-bearing child-target terminals (the load-bearing half)', () => {
     // sessionRef-bearing live terminals NEVER take the manufactured block
-    // (sidebarSelectors.ts:469 `if (terminal.sessionRef) continue`); when
+    // (sidebarSelectors.ts's `if (terminal.sessionRef) continue` guard); when
     // paned, they surface via pushFallbackItem as an `opencode:<child>` row.
     const CHILD_ID = 'ses_024e59f87ffeEvZWqgMpBXAo78'
     const ROOT_ID = 'ses_rootcontrol000000000000000'

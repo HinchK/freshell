@@ -472,8 +472,10 @@ pub fn session_is_subagent_by_id(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| OpencodeReadError(e.to_string()))?;
-    conn.busy_timeout(std::time::Duration::from_millis(500))
-        .map_err(|e| OpencodeReadError(e.to_string()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        OPENCODE_BYID_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
 
     // PRAGMA table_info(session) -> hasParentId (same guard as run_opencode_query_inner).
     let has_parent_id = {
@@ -517,6 +519,7 @@ pub fn session_is_subagent_by_id(
 
 /// SHORT busy timeout (`opencode-by-id-query.ts:12`): a locked DB must fail
 /// FAST — the failure surfaces as provider-unavailable, never "not found".
+/// Shared by the by-id row lookup and `session_is_subagent_by_id`.
 const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
 
 /// Code-PRESERVING error for the by-id query (the plain `OpencodeReadError`

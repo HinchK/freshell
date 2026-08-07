@@ -13,6 +13,8 @@ export type TerminalSeedRecord = {
   terminalId: string
   mode: TerminalMode
   resumeSessionId?: string
+  // Snapshot of the registry's flag at seed time — freshness caveats on
+  // TerminalMeta.resumeTargetIsSubagent below apply here too.
   resumeTargetIsSubagent?: boolean
   cwd?: string
 }
@@ -31,6 +33,10 @@ export type TerminalMeta = {
   // opencode SUBAGENT (child) session — classified by the registry at
   // terminal.create and carried here so server-fabricated live-terminal
   // session-directory items can be hidden under default visibility.
+  // FRESHNESS: the flag is only as fresh as the `sessionId` beside it —
+  // create-time-frozen, and the `??` merge in upsert() never unsets it. If a
+  // future opencode rebind lane updates sessionId on TerminalMeta, the flag
+  // must travel with it (re-classify or clear alongside the new sessionId).
   resumeTargetIsSubagent?: boolean
   tokenUsage?: TokenSummary
   updatedAt: number
@@ -257,6 +263,8 @@ export class TerminalMetadataService {
       cwd: patch.cwd ?? current?.cwd,
       provider: patch.provider ?? current?.provider,
       sessionId: patch.sessionId ?? current?.sessionId,
+      // NOTE: `??` keeps the last known flag — it never UNSETS. See the
+      // freshness breadcrumb on TerminalMeta.resumeTargetIsSubagent.
       resumeTargetIsSubagent: patch.resumeTargetIsSubagent ?? current?.resumeTargetIsSubagent,
       branch: current?.branch,
       isDirty: current?.isDirty,
