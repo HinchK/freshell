@@ -126,6 +126,11 @@ function buildLiveTerminalSessionItem(meta: TerminalMeta): SessionDirectoryItem 
     isRunning: true,
     runningTerminalId: meta.terminalId,
     liveTerminalOnly: !meta.sessionId,
+    // Bug-1 (sidebar rail): mirror the Rust projection
+    // (session_directory.rs build_live_terminal_session_item) — a terminal
+    // whose opencode resume target is a SUBAGENT (child) session must carry
+    // the classification so the default-visibility filter below can drop it.
+    ...(meta.resumeTargetIsSubagent ? { isSubagent: true } : {}),
   }
 }
 

@@ -72,6 +72,34 @@ describe('TerminalMetadataService', () => {
     })
   })
 
+  it('carries the resume-target subagent classification through seeding', async () => {
+    const { service } = createService()
+
+    const flagged = await service.seedFromTerminal({
+      ...createTerminalRecord({
+        terminalId: 'term-opencode-subagent',
+        mode: 'opencode',
+        cwd: '/workspace/repo/src',
+        resumeSessionId: 'ses_child',
+      }),
+      resumeTargetIsSubagent: true,
+    })
+    const unflagged = await service.seedFromTerminal(
+      createTerminalRecord({
+        terminalId: 'term-opencode-root',
+        mode: 'opencode',
+        cwd: '/workspace/repo/src',
+        resumeSessionId: 'ses_root',
+      }),
+    )
+
+    expect(flagged?.resumeTargetIsSubagent).toBe(true)
+    expect(unflagged?.resumeTargetIsSubagent).toBeUndefined()
+    expect(
+      service.list().find((meta) => meta.terminalId === 'term-opencode-subagent')?.resumeTargetIsSubagent,
+    ).toBe(true)
+  })
+
   it('prefers live git branch/dirty over stale session snapshots and updates token usage', async () => {
     const { service } = createService({ branch: 'feature/live', isDirty: true })
     const seeded = await service.seedFromTerminal(

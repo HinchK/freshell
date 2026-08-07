@@ -13,6 +13,7 @@ export type TerminalSeedRecord = {
   terminalId: string
   mode: TerminalMode
   resumeSessionId?: string
+  resumeTargetIsSubagent?: boolean
   cwd?: string
 }
 
@@ -26,6 +27,11 @@ export type TerminalMeta = {
   isDirty?: boolean
   provider?: TerminalProvider
   sessionId?: string
+  // Bug-1 (sidebar rail): whether the terminal's resume target is an
+  // opencode SUBAGENT (child) session — classified by the registry at
+  // terminal.create and carried here so server-fabricated live-terminal
+  // session-directory items can be hidden under default visibility.
+  resumeTargetIsSubagent?: boolean
   tokenUsage?: TokenSummary
   updatedAt: number
 }
@@ -101,6 +107,7 @@ function terminalMetaEquals(a: TerminalMeta, b: TerminalMeta): boolean {
     a.isDirty === b.isDirty &&
     a.provider === b.provider &&
     a.sessionId === b.sessionId &&
+    a.resumeTargetIsSubagent === b.resumeTargetIsSubagent &&
     tokenUsageEquals(a.tokenUsage, b.tokenUsage)
   )
 }
@@ -138,10 +145,12 @@ export class TerminalMetadataService {
   async seedFromTerminal(record: TerminalSeedRecord): Promise<TerminalMeta | undefined> {
     const provider = isTerminalProvider(record.mode) ? record.mode : undefined
     const sessionId = provider ? record.resumeSessionId : undefined
+    const resumeTargetIsSubagent = provider ? record.resumeTargetIsSubagent : undefined
     return this.upsert(record.terminalId, {
       cwd: record.cwd,
       provider,
       sessionId,
+      resumeTargetIsSubagent,
     })
   }
 
@@ -239,6 +248,7 @@ export class TerminalMetadataService {
       cwd?: string
       provider?: TerminalProvider
       sessionId?: string
+      resumeTargetIsSubagent?: boolean
     },
   ): Promise<TerminalMeta | undefined> {
     const current = this.byTerminalId.get(terminalId)
@@ -247,6 +257,7 @@ export class TerminalMetadataService {
       cwd: patch.cwd ?? current?.cwd,
       provider: patch.provider ?? current?.provider,
       sessionId: patch.sessionId ?? current?.sessionId,
+      resumeTargetIsSubagent: patch.resumeTargetIsSubagent ?? current?.resumeTargetIsSubagent,
       branch: current?.branch,
       isDirty: current?.isDirty,
       tokenUsage: current?.tokenUsage,
