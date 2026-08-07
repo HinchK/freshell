@@ -256,6 +256,45 @@ fn missing_db_file_reports_missing_degrade_without_error() {
 }
 
 #[test]
+fn global_project_worktree_slash_falls_back_to_cwd() {
+    let dir =
+        std::env::temp_dir().join(format!("freshell-oc-worktree-slash-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let conn = rusqlite::Connection::open(dir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                project_id TEXT, parent_id TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project (id, worktree) VALUES ('global', '/')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_globalroot','/tmp/analysis/work/timeline','Global',1000,3000,NULL,'global',NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let provider = OpencodeProvider::new(dir.clone());
+    let listing = provider.list_sessions(42).expect("read ok");
+
+    assert_eq!(listing.sessions.len(), 1);
+    assert_eq!(
+        listing.sessions[0].project_path, "/tmp/analysis/work/timeline",
+        "worktree '/' must not win over cwd"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn provider_path_derivations_match_reference() {
     let provider = OpencodeProvider::new(PathBuf::from("/home/u/.local/share/opencode"));
     assert_eq!(

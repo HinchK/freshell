@@ -260,6 +260,35 @@ fn locked_db_is_an_error_after_the_busy_timeout() {
 }
 
 #[test]
+fn by_id_row_worktree_slash_yields_no_project_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "freshell-oc-byid-worktree-slash-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let conn = rusqlite::Connection::open(dir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER
+             );
+             INSERT INTO project (id, worktree) VALUES ('global', '/');
+             INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated, time_archived)
+               VALUES ('ses_globalbyid', 'global', NULL, '/tmp/real/dir', 'By id', 100, 200, NULL);",
+        )
+        .unwrap();
+    }
+
+    let row = opencode_session_row_by_id(&dir, "ses_globalbyid")
+        .expect("query ok")
+        .expect("row found");
+    assert_eq!(row.project_path, None, "worktree '/' must map to None");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn real_time_updated_is_floored_to_integer_ms() {
     let home = temp_data_home("realms");
     let conn = create_db(&home);

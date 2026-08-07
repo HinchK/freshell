@@ -338,10 +338,7 @@ impl OpencodeProvider {
             // collapse is applied by the indexer's project-path resolver (a later step);
             // when the DB already stores `p.worktree` (the common case) the result is the
             // worktree verbatim, which is what we return here.
-            let project_path = row
-                .project_path
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| cwd.clone());
+            let project_path = meaningful_worktree(row.project_path).unwrap_or_else(|| cwd.clone());
             let is_three_views = row.has_three_views_marker == Some(1);
             sessions.push(OpencodeSession {
                 session_id: row.session_id,
@@ -386,6 +383,13 @@ impl OpencodeProvider {
 
         Ok(result.rows)
     }
+}
+
+/// OpenCode's catch-all "global" project stores `worktree = "/"` — a
+/// non-informative placeholder, not a real checkout. Treat it (and empty)
+/// as absent so callers fall back to the session's real cwd.
+fn meaningful_worktree(p: Option<String>) -> Option<String> {
+    p.filter(|p| !p.is_empty() && p != "/")
 }
 
 /// Busy timeout for the existence probe's by-id lookup. Deliberately much
@@ -552,7 +556,7 @@ pub fn opencode_session_row_by_id(
             title: to_opt_string(&row.get::<_, SqlValue>(2)?),
             created_at: to_opt_i64(&row.get::<_, SqlValue>(3)?),
             last_activity_at: to_opt_i64(&row.get::<_, SqlValue>(4)?),
-            project_path: to_opt_string(&row.get::<_, SqlValue>(5)?),
+            project_path: meaningful_worktree(to_opt_string(&row.get::<_, SqlValue>(5)?)),
         })
     }) {
         Ok(row) => Ok(Some(row)),
