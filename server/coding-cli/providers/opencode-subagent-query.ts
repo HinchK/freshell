@@ -32,3 +32,48 @@ export async function isOpencodeSubagentSession(
     return false
   }
 }
+
+/**
+ * Cap for the terminal-create-path classification wait (ws-handler.ts): the
+ * by-id worker runner carries a 15s OUTER timeout, so a wedged worker would
+ * otherwise park terminal creation for up to 15s — violating "classification
+ * never blocks terminal creation". On deadline the target stays UNCLASSIFIED
+ * (`undefined`); the bindSession re-classification lane self-corrects later.
+ */
+export const OPENCODE_SUBAGENT_CLASSIFY_DEADLINE_MS = 1000
+
+/**
+ * Race `promise` against a `deadlineMs` timer: the promise's value if it
+ * settles first, `undefined` on deadline. The timer is cleared (and unref'd)
+ * so it never holds the process open; a late-resolving race loser is simply
+ * ignored. Only safe for promises that never REJECT (the
+ * isOpencodeSubagentSession contract) — a late rejection would be unhandled.
+ */
+export async function raceWithDeadline<T>(promise: Promise<T>, deadlineMs: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), deadlineMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * Deadline-capped variant of {@link isOpencodeSubagentSession} for callers on
+ * a latency budget (the terminal.create path). Identical answers on the fast
+ * path; `undefined` (unclassified, NOT "root") when the lookup outlives the
+ * deadline.
+ */
+export function isOpencodeSubagentSessionWithDeadline(
+  sessionId: string,
+  dbPath: string = resolveOpencodeDatabasePath(),
+  deadlineMs: number = OPENCODE_SUBAGENT_CLASSIFY_DEADLINE_MS,
+): Promise<boolean | undefined> {
+  return raceWithDeadline(isOpencodeSubagentSession(sessionId, dbPath), deadlineMs)
+}

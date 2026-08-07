@@ -11,7 +11,7 @@ import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { makeSessionKey, type CodingCliProviderName, type ProjectGroup } from './coding-cli/types.js'
-import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subagent-query.js'
+import { isOpencodeSubagentSessionWithDeadline } from './coding-cli/providers/opencode-subagent-query.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
@@ -2594,11 +2594,14 @@ export class WsHandler {
               // WORKER-THREAD SQLite read (Task 3) — the event loop stays free;
               // this create path already awaits allocateLocalhostPort() just
               // below (~:2562), so an await here is the established shape.
+              // Deadline-capped (~1s): the by-id runner's 15s outer timeout must
+              // never park terminal creation — on deadline the target stays
+              // unclassified (undefined) and the bindSession lane self-corrects.
               const requestedOpencodeTarget = m.mode === 'opencode'
                 ? (m.resumeSessionId ?? (m.sessionRef?.provider === 'opencode' ? m.sessionRef.sessionId : undefined))
                 : undefined
               const resumeTargetIsSubagent = requestedOpencodeTarget
-                ? await isOpencodeSubagentSession(requestedOpencodeTarget)
+                ? await isOpencodeSubagentSessionWithDeadline(requestedOpencodeTarget)
                 : undefined
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
