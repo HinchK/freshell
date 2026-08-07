@@ -160,10 +160,37 @@ fn walk_metadata_files(root: &Path, dir: &Path, out: &mut Vec<FileStat>) {
             let under_sessions = relative.components().any(|c| c.as_os_str() == "sessions");
             if under_sessions {
                 if let Some(stat) = stat_metadata_file(&path) {
-                    out.push(stat);
+                    out.push(fold_activity_mtime(stat));
                 }
             }
         }
+    }
+}
+
+/// Fold the activity sidecars' mtimes (`transcript.jsonl` / `events.jsonl`,
+/// STAT-only -- content never read here) into the discovered metadata.json
+/// [`FileStat`]'s `mtime_ms`, so `SessionIndex`'s incremental cache
+/// (`directory_index.rs`, keyed on the discovered `(mtime, size)`) re-parses
+/// this session when its ACTIVITY changes even though metadata.json itself
+/// did not. Node parity: the reference refreshes `activityMtimeMs` on EVERY
+/// scan -- cache hit included (`session-indexer.ts:922-942`) -- precisely so
+/// "a session that was active/resumed after its metadata timestamps still
+/// rises in the recency-sorted sidebar" (`session-indexer.ts:1014-1017`).
+/// Keying the cache on the raw metadata mtime alone froze `last_activity_at`
+/// (and the first-user-message preview) at first-parse values forever.
+/// `size` stays metadata.json's own size; the folded mtime alone is what
+/// invalidates the cache entry.
+fn fold_activity_mtime(stat: FileStat) -> FileStat {
+    let Some(dir) = stat.path.parent() else {
+        return stat;
+    };
+    let activity = max_defined(
+        file_mtime_ms(&dir.join("transcript.jsonl")),
+        file_mtime_ms(&dir.join("events.jsonl")),
+    );
+    FileStat {
+        mtime_ms: max_defined(Some(stat.mtime_ms), activity).unwrap_or(stat.mtime_ms),
+        ..stat
     }
 }
 
@@ -702,6 +729,71 @@ mod tests {
         let providers: Vec<&str> = snapshot.iter().map(|s| s.provider.as_str()).collect();
         assert!(providers.contains(&"amplifier"));
         assert!(providers.contains(&"claude"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- sidecar activity must refresh THROUGH the incremental index cache --
+    //
+    // Node parity pin: the reference refreshes `activityMtimeMs` on EVERY
+    // scan, cache hit included (`session-indexer.ts:922-942`), precisely so
+    // "a session that was active/resumed after its metadata timestamps still
+    // rises in the recency-sorted sidebar" (`session-indexer.ts:1014-1017`).
+    // `scan()` (used by the mtime-fold test above) bypasses the cache, so it
+    // can't catch a regression here -- this test goes through SessionIndex's
+    // incremental sweep, where a session whose ONLY change is a sidecar
+    // write (metadata.json untouched) must still re-surface with fresh
+    // recency instead of being served from the stale cached entry forever.
+
+    #[tokio::test]
+    async fn session_index_refreshes_amplifier_recency_when_only_sidecar_changes() {
+        let home = unique_temp_dir("sidecar-recency");
+        let dir = write_session(
+            &home,
+            "proj",
+            "sess-active",
+            r#"{"session_id":"sess-active","working_dir":"/p","created":1000}"#,
+            None,
+        );
+
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(AmplifierSource::new(home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(1),
+            None, // no persistence: isolated, deterministic
+        );
+        let first = index.snapshot().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].last_activity_at, 1000,
+            "no sidecars yet: recency comes from metadata alone"
+        );
+
+        // New activity: events.jsonl appears (mtime = now); metadata.json is
+        // NOT touched -- exactly what an ongoing/resumed amplifier turn does.
+        // The sleep guarantees the sidecar's mtime lands in a LATER
+        // millisecond than metadata.json's (mtime_ms granularity), so the
+        // test exercises the cache-invalidation contract, not a same-ms race.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::write(dir.join("events.jsonl"), "{\"event\":\"turn\"}\n").unwrap();
+
+        // TTL is 1ms, so every snapshot() triggers a refresh; with
+        // stale-while-revalidate the fresh value lands within a few polls.
+        // Without the sidecar-aware discovery this NEVER updates (the cached
+        // entry is reused as long as metadata.json's mtime/size is unchanged).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let snap = index.snapshot().await;
+            let last = snap.first().map(|s| s.last_activity_at);
+            if last.is_some_and(|l| l > 1000) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sidecar activity (events.jsonl mtime) never refreshed \
+                 last_activity_at through the incremental index cache; \
+                 stuck at {last:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
