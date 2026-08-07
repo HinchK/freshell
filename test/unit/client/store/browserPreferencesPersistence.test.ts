@@ -168,6 +168,27 @@ describe('browserPreferencesPersistence', () => {
     expect(blob.settings?.panes?.multirowTabs).toBe(false)
   })
 
+  it('persists panes.tabBarRows when it differs from the default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({ panes: { tabBarRows: 5 } }))
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const blob = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(blob.settings?.panes?.tabBarRows).toBe(5)
+  })
+
+  it('omits panes.tabBarRows at its default value', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({ panes: { tabBarRows: 3, snapThreshold: 4 } }))
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const blob = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(blob.settings?.panes?.snapThreshold).toBe(4)
+    expect(blob.settings?.panes?.tabBarRows).toBeUndefined()
+  })
+
   it('persists freshAgent.showThinking/showTools/showTimecodes to browser preferences', () => {
     const store = createStore()
 

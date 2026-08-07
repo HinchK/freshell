@@ -631,6 +631,45 @@ describe('shared settings contract', () => {
     })
   })
 
+  describe('panes.tabBarRows (browser-local)', () => {
+    it('defaults to 3', () => {
+      expect(resolveLocalSettings(undefined).panes.tabBarRows).toBe(3)
+    })
+
+    it('applies a numeric patch', () => {
+      expect(resolveLocalSettings({ panes: { tabBarRows: 5 } }).panes.tabBarRows).toBe(5)
+    })
+
+    it('merges patches preserving other pane keys', () => {
+      const merged = mergeLocalSettings(
+        { panes: { multirowTabs: false } },
+        { panes: { tabBarRows: 6 } },
+      )
+      expect(merged.panes?.multirowTabs).toBe(false)
+      expect(merged.panes?.tabBarRows).toBe(6)
+    })
+
+    it('rounds and clamps tabBarRows in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 4.4 },
+      } as Record<string, unknown>)).toEqual({ panes: { tabBarRows: 4 } })
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 42 },
+      } as Record<string, unknown>)).toEqual({ panes: { tabBarRows: 10 } })
+    })
+
+    it('rejects a non-numeric tabBarRows in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: { tabBarRows: 'lots' },
+      } as Record<string, unknown>)).toEqual(undefined)
+    })
+
+    it('is rejected by the server patch schema (stays local)', () => {
+      const schema = buildServerSettingsPatchSchema()
+      expect(schema.safeParse({ panes: { tabBarRows: 5 } }).success).toBe(false)
+    })
+  })
+
   describe('deprecated fresh-agent font scale is dropped', () => {
     it('resolves the default fresh-agent settings without a fontScale key', () => {
       expect(resolveLocalSettings(undefined).freshAgent).toEqual({
