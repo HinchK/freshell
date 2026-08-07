@@ -32,20 +32,15 @@ import { TestHarness } from '../helpers/test-harness.js'
  * This spec NEVER touches a live/self-hosted server: `createE2eServerHandle`
  * boots an isolated instance on an ephemeral port with its own HOME.
  *
- * STATUS (2026-08-07, at authoring):
- *   - `rust-chromium` (Rust server): GREEN.
- *   - `chromium` (Node server): RED, on a REAL and unfixed product gap, not
- *     on a spec defect. `server/session-directory/service.ts`'s
- *     `buildLiveTerminalSessionItem` (~:110-129) fabricates a session item
- *     for every running terminal and never sets `isSubagent`, so the
- *     server-side default-visibility filter (`service.ts:245`,
- *     `items.filter((item) => !item.isSubagent)`) cannot drop it -- and the
- *     client's projects-loop item (which carries `isSubagent:
- *     session.isSubagent`) wins over the terminal-derived classification
- *     the fix added for manufactured/fallback rows. The Rust server got
- *     exactly this projection in `crates/freshell-server/src/session_directory.rs`
- *     (`build_live_terminal_session_item`, commit 238f16bd); the Node
- *     counterpart was never written. This spec is the RED test for it.
+ * STATUS (2026-08-07): GREEN on BOTH projects. The `chromium` (Node) leg
+ * was RED at authoring on a real product gap: the Node server's
+ * `buildLiveTerminalSessionItem` (`server/session-directory/service.ts`)
+ * fabricated a session item for every running terminal without ever
+ * setting `isSubagent`, so the default-visibility filter could not drop
+ * it. Fixed by mirroring the Rust projection (`session_directory.rs`
+ * `build_live_terminal_session_item`, commit 238f16bd): the registry's
+ * `resumeTargetIsSubagent` now flows through `TerminalMeta` into the
+ * fabricated item's `isSubagent`.
  */
 
 const __filename = fileURLToPath(import.meta.url)
