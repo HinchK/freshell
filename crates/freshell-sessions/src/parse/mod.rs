@@ -12,7 +12,7 @@ pub use claude::{parse_session_content, ParseSessionOptions};
 pub use codex::parse_codex_session_content;
 pub use opencode::{
     default_opencode_data_home, opencode_session_row_by_id, run_opencode_listing_query,
-    session_exists_by_id, OpencodeByIdError, OpencodeByIdRow, OpencodeDegrade, OpencodeListing,
-    OpencodeListingResult, OpencodeProvider, OpencodeReadError, OpencodeSession,
-    OpencodeSessionRow, THREE_VIEWS_MARKER_SQL_PATTERN,
+    session_exists_by_id, session_is_subagent_by_id, OpencodeByIdError, OpencodeByIdRow,
+    OpencodeDegrade, OpencodeListing, OpencodeListingResult, OpencodeProvider, OpencodeReadError,
+    OpencodeSession, OpencodeSessionRow, THREE_VIEWS_MARKER_SQL_PATTERN,
 };

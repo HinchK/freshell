@@ -36,6 +36,18 @@ export type OpencodeRootResolution = {
   unresolvedSessionIds: Set<string>
 }
 
+/**
+ * OpenCode's catch-all "global" project stores `worktree = '/'` — a
+ * non-informative placeholder, not a real checkout. Treat it (and empty)
+ * as absent so callers fall back to deriving from the session's real cwd.
+ */
+export function meaningfulWorktree(worktree: string | null | undefined): string | undefined {
+  if (typeof worktree !== 'string') return undefined
+  const trimmed = worktree.trim()
+  if (!trimmed || trimmed === '/') return undefined
+  return trimmed
+}
+
 export function defaultOpencodeDataHome(): string {
   if (process.env.XDG_DATA_HOME) {
     return path.join(process.env.XDG_DATA_HOME, 'opencode')
@@ -45,6 +57,16 @@ export function defaultOpencodeDataHome(): string {
     return path.join(localAppData, 'opencode')
   }
   return path.join(os.homedir(), '.local', 'share', 'opencode')
+}
+
+/**
+ * The opencode.db path inside an opencode DATA home. With no argument this
+ * is the PRODUCTION default: `$XDG_DATA_HOME/opencode/opencode.db`,
+ * `%LOCALAPPDATA%\opencode\opencode.db`, or `~/.local/share/opencode/opencode.db`
+ * (whatever defaultOpencodeDataHome() resolves).
+ */
+export function resolveOpencodeDatabasePath(dataHome: string = defaultOpencodeDataHome()): string {
+  return path.join(dataHome, 'opencode.db')
 }
 
 function toValidTimestamp(value: unknown): number | undefined {
@@ -79,7 +101,7 @@ export class OpencodeProvider implements CodingCliProvider {
 
   /** Public: resolve-fallbacks builds the off-thread by-id lookup from this path. */
   getDatabasePath(): string {
-    return path.join(this.homeDir, 'opencode.db')
+    return resolveOpencodeDatabasePath(this.homeDir)
   }
 
   private getWatchedDatabasePaths(): [string, string] {
@@ -182,7 +204,7 @@ export class OpencodeProvider implements CodingCliProvider {
     const sessions: CodingCliSession[] = []
     for (const row of result.rows) {
       if (typeof row.cwd !== 'string' || !row.cwd) continue
-      const projectPath = row.projectPath || await resolveGitRepoRoot(row.cwd)
+      const projectPath = meaningfulWorktree(row.projectPath) ?? await resolveGitRepoRoot(row.cwd)
       const isThreeViewsSession = toSqliteBoolean(row.hasThreeViewsMarker)
       sessions.push({
         provider: this.name,

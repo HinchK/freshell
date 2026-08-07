@@ -127,6 +127,7 @@ async fn spawn_merged_server() -> Harness {
         freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
             identity.clone(),
             Arc::clone(&ledger),
+            None,
         ),
     ));
 

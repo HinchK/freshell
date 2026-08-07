@@ -2,7 +2,7 @@ import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
+import { OpencodeProvider, meaningfulWorktree } from '../../../../server/coding-cli/providers/opencode'
 import { inProcessListingRunner } from '../../../../server/coding-cli/providers/opencode-listing-runner'
 
 vi.unmock('node:sqlite')
@@ -180,5 +180,54 @@ describe('OpencodeProvider SQLite marker detection', () => {
         lastActivityAt: 2000,
       },
     ])
+  })
+})
+
+describe('meaningfulWorktree', () => {
+  it('rejects \"/\", empty, whitespace, and nullish; passes real paths through trimmed', () => {
+    expect(meaningfulWorktree('/')).toBeUndefined()
+    expect(meaningfulWorktree('')).toBeUndefined()
+    expect(meaningfulWorktree('   ')).toBeUndefined()
+    expect(meaningfulWorktree(null)).toBeUndefined()
+    expect(meaningfulWorktree(undefined)).toBeUndefined()
+    expect(meaningfulWorktree('/repo/root')).toBe('/repo/root')
+    expect(meaningfulWorktree(' /repo/root ')).toBe('/repo/root')
+  })
+})
+
+describe('global project worktree \"/\" fallback (Bug 2)', () => {
+  it('treats worktree=\"/\" as absent and falls back to the git repo root of cwd', async () => {
+    // Throwaway tmp dirs — never the user's real opencode data dir (session safety rule).
+    const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oc-worktree-'))
+    const dataDir = path.join(homeDir, '.local', 'share', 'opencode')
+    await fsp.mkdir(dataDir, { recursive: true })
+    const realCwd = path.join(homeDir, 'work', 'timeline')
+    await fsp.mkdir(realCwd, { recursive: true })
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(path.join(dataDir, 'opencode.db'))
+    try {
+      db.exec(`
+        CREATE TABLE project (id text PRIMARY KEY, worktree text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, sandboxes text NOT NULL);
+        CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, parent_id text, slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer);
+      `)
+      db.prepare(`INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES (?, ?, ?, ?, ?)`) 
+        .run('global', '/', 900, 4000, '[]')
+      db.prepare(`INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`) 
+        .run('ses_globalroot', 'global', null, 'ses_globalroot', realCwd, 'Global session', 'test', 1000, 3000, null)
+    } finally {
+      db.close()
+    }
+
+    // The ctor arg is the opencode DATA HOME (the directory containing
+    // opencode.db, e.g. ~/.local/share/opencode) — NOT the user home. Same
+    // as this file's existing tests, which pass the mkdtemp data dir directly.
+    const provider = new OpencodeProvider(dataDir, { queryRunner: inProcessListingRunner })
+    const sessions = await provider.listSessionsDirect()
+
+    expect(sessions).toHaveLength(1)
+    // realCwd is not a git repo, so resolveGitRepoRoot returns the cwd itself.
+    expect(sessions[0].projectPath).toBe(realCwd)
+    expect(sessions[0].projectPath).not.toBe('/')
+    await fsp.rm(homeDir, { recursive: true, force: true })
   })
 })

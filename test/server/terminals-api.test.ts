@@ -59,7 +59,8 @@ class FakeRegistry extends EventEmitter {
     terminalId: string
     title: string
     description?: string
-    mode: 'shell' | 'claude' | 'codex'
+    mode: 'shell' | 'claude' | 'codex' | 'opencode'
+    resumeTargetIsSubagent?: boolean
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
@@ -76,7 +77,8 @@ class FakeRegistry extends EventEmitter {
     terminalId: string
     title: string
     description?: string
-    mode: 'shell' | 'claude' | 'codex'
+    mode: 'shell' | 'claude' | 'codex' | 'opencode'
+    resumeTargetIsSubagent: boolean
     status: 'running' | 'exited'
     cwd?: string
     cols: number
@@ -89,6 +91,7 @@ class FakeRegistry extends EventEmitter {
       title: overrides.title || 'Shell',
       description: overrides.description,
       mode: overrides.mode || 'shell',
+      resumeTargetIsSubagent: overrides.resumeTargetIsSubagent,
       createdAt: Date.now(),
       lastActivityAt: Date.now(),
       status: overrides.status || 'running',
@@ -460,6 +463,32 @@ describe('Terminals API', () => {
         ],
         nextCursor: '1',
       })
+    })
+
+    it('carries resumeTargetIsSubagent on directory items only when true', async () => {
+      // Seed two running opencode terminals through the file's existing
+      // registry-seeding helper: one with resumeTargetIsSubagent: true, one without.
+      registry.addTerminal({
+        terminalId: 'term_oc_subagent',
+        title: 'OpenCode (subagent target)',
+        mode: 'opencode',
+        resumeTargetIsSubagent: true,
+      })
+      registry.addTerminal({
+        terminalId: 'term_oc_root',
+        title: 'OpenCode (root target)',
+        mode: 'opencode',
+      })
+
+      const res = await request(app).get('/api/terminals').set('x-auth-token', AUTH_TOKEN)
+      expect(res.status).toBe(200)
+      const items = res.body as Array<Record<string, unknown>>
+      const flagged = items.find((t) => t.resumeTargetIsSubagent === true)
+      expect(flagged).toBeTruthy()
+      const unflagged = items.filter((t) => t.resumeTargetIsSubagent !== true)
+      for (const item of unflagged) {
+        expect(item).not.toHaveProperty('resumeTargetIsSubagent')
+      }
     })
   })
 

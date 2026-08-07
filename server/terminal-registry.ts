@@ -23,6 +23,7 @@ import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-ut
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { LoopbackServerEndpoint } from './local-port.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subagent-query.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
   CodexApprovalRequestedEvent,
@@ -35,6 +36,7 @@ import type {
   TerminalOutputRawEvent,
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
+  TerminalSubagentClassifiedEvent,
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
@@ -570,6 +572,16 @@ export type TerminalRecord = {
   mode: TerminalMode
   opencodeServer?: LoopbackServerEndpoint
   resumeSessionId?: string
+  /**
+   * True when this terminal's resume target is an opencode subagent
+   * (child) session (`parent_id NOT NULL` in opencode.db). Computed at
+   * create time from the requested resume id and RECOMPUTED whenever the
+   * resume target changes (bindSession re-classifies when it overwrites
+   * resumeSessionId — root-resolved ids in the happy path, raw child ids
+   * possible in the degraded chain-walk-failure edge). Server→client only;
+   * drives the sidebar's showSubagents visibility filter.
+   */
+  resumeTargetIsSubagent?: boolean
   pendingResumeName?: string
   createdAt: number
   lastActivityAt: number
@@ -1586,6 +1598,7 @@ export class TerminalRegistry extends EventEmitter {
     cols?: number
     rows?: number
     resumeSessionId?: string
+    resumeTargetIsSubagent?: boolean
     sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
     envContext?: { tabId?: string; paneId?: string }
@@ -1680,6 +1693,7 @@ export class TerminalRegistry extends EventEmitter {
       mode: opts.mode,
       opencodeServer: opts.mode === 'opencode' ? opts.providerSettings?.opencodeServer : undefined,
       resumeSessionId: undefined,
+      resumeTargetIsSubagent: opts.resumeTargetIsSubagent || undefined,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
@@ -4340,6 +4354,7 @@ export class TerminalRegistry extends EventEmitter {
     description?: string
     mode: TerminalMode
     resumeSessionId?: string
+    resumeTargetIsSubagent?: boolean
     sessionRef?: { provider: CodingCliProviderName; sessionId: string }
     createdAt: number
     lastActivityAt: number
@@ -4354,6 +4369,7 @@ export class TerminalRegistry extends EventEmitter {
       description: t.description,
       mode: t.mode,
       resumeSessionId: t.resumeSessionId,
+      resumeTargetIsSubagent: t.resumeTargetIsSubagent,
       sessionRef: buildTerminalSessionRef(t),
       createdAt: t.createdAt,
       lastActivityAt: t.lastActivityAt,
@@ -4857,6 +4873,39 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     term.resumeSessionId = normalized
+    // Bug-1 (sidebar rail): the resume target just changed — re-derive the
+    // subagent classification for the NEW target (both directions: a switch
+    // to a root session must CLEAR a stale true). Fire-and-forget:
+    // classification must never block or fail binding (bindSession is fully
+    // synchronous), and the SQLite read itself runs on a worker thread
+    // (Task 3), so nothing here can stall the event loop.
+    // (The `as string` widening sidesteps a TS narrowing artifact: the
+    // `term.mode !== provider` guard above narrows `provider` to 'shell'
+    // because TerminalMode is `'shell' | (string & {})`, making the literal
+    // comparison a TS2367 error despite being correct at runtime.)
+    if ((provider as string) === 'opencode') {
+      void isOpencodeSubagentSession(normalized)
+        .then((isSubagent) => {
+          const current = this.terminals.get(terminalId)
+          if (current && current.resumeSessionId === normalized) {
+            current.resumeTargetIsSubagent = isSubagent || undefined
+            // Propagate the answer to TerminalMetadataService's copy
+            // (TerminalMeta.resumeTargetIsSubagent): the 'associated'
+            // broadcast lane overwrites meta.sessionId WITHOUT touching the
+            // flag, so server-fabricated live session-directory items would
+            // otherwise carry a stale classification across a rebind.
+            // Emitted only when the registry guard above passed; the
+            // metadata service applies its own sessionId-match guard.
+            this.emit('terminal.subagent.classified', {
+              terminalId,
+              provider,
+              sessionId: normalized,
+              isSubagent,
+            } satisfies TerminalSubagentClassifiedEvent)
+          }
+        })
+        .catch(() => {})
+    }
     this.emit('terminal.session.bound', {
       terminalId,
       provider,

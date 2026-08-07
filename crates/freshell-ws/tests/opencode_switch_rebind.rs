@@ -195,6 +195,7 @@ async fn wait_for_frame(
 async fn spawn_server_returning_state(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
     ledger_root: std::path::PathBuf,
+    opencode_data_home: Option<std::path::PathBuf>,
 ) -> (
     String,
     freshell_terminal::TerminalRegistry,
@@ -249,7 +250,11 @@ async fn spawn_server_returning_state(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        opencode_locator: None,
+        opencode_locator: opencode_data_home.map(|home| {
+            Arc::new(freshell_sessions::opencode_locator::OpencodeLocator::new(
+                home,
+            ))
+        }),
         codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
@@ -432,6 +437,141 @@ fn assert_ledger_superseded(
     );
 }
 
+/// Seed `<data_home>/opencode.db` with the real `session`/`project` schema
+/// and one root + one child row — the same fixture shape as
+/// `opencode_association.rs`'s `open_seed_db`/`insert_session` twins.
+#[cfg(unix)]
+fn seed_opencode_db_with_root_and_child(
+    data_home: &std::path::Path,
+    root_id: &str,
+    child_id: &str,
+) {
+    std::fs::create_dir_all(data_home).unwrap();
+    let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_id TEXT,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            time_archived INTEGER
+         );",
+    )
+    .unwrap();
+    let insert = |id: &str, parent_id: Option<&str>| {
+        conn.execute(
+            "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
+            rusqlite::params![format!("proj-{id}"), "/proj"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session
+                (id, project_id, parent_id, slug, directory, title, version,
+                 time_created, time_updated, time_archived)
+             VALUES (?1, ?2, ?3, ?1, '/proj', ?1, 'test', 100, 100, NULL)",
+            rusqlite::params![id, format!("proj-{id}"), parent_id],
+        )
+        .unwrap();
+    };
+    insert(root_id, None);
+    insert(child_id, Some(root_id));
+}
+
+/// Bounded poll of the identity registry until `is_subagent` reaches
+/// `expected` (the file's deadline-poll idiom — never a fixed sleep).
+#[cfg(unix)]
+async fn wait_for_is_subagent(
+    state: &freshell_ws::WsState,
+    terminal_id: &str,
+    expected: Option<bool>,
+    label: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if state.identity.get(terminal_id).and_then(|i| i.is_subagent) == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "[{label}] is_subagent for {terminal_id} never reached {expected:?} \
+                 (current: {:?})",
+                state.identity.get(terminal_id).and_then(|i| i.is_subagent)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Bug 1b, hook site #3: a TUI session-switch signal INTO a child (subagent)
+/// session must re-classify the pane's `is_subagent` to `Some(true)`, and a
+/// switch back OUT to the root must CLEAR it to `Some(false)` — the
+/// both-directions contract (a stale `true` must not keep hiding the pane).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_switch_signal_reclassifies_is_subagent_in_both_directions() {
+    const ROOT: &str = "ses_switchroot";
+    const CHILD: &str = "ses_switchchild";
+
+    // Isolated opencode.db (root + child rows) that the state's locator
+    // classifies against. NO OPENCODE_CMD/OPENCODE_ARGV_CAPTURE_PATH use:
+    // the sleeper spec's env_var is None, so this test never races the
+    // sibling test's process-wide env swaps.
+    let data_home = tempfile::tempdir().expect("opencode data home");
+    seed_opencode_db_with_root_and_child(data_home.path(), ROOT, CHILD);
+
+    let signal_dir = tempfile::tempdir().expect("signal root");
+    let signal_root = signal_dir.path().to_path_buf();
+    let watcher = freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root.clone());
+
+    let ledger_dir = tempfile::tempdir().expect("ledger root");
+    let (url, registry, state) = spawn_server_returning_state(
+        vec![common::sleeper_cli_spec("opencode")],
+        ledger_dir.path().to_path_buf(),
+        Some(data_home.path().to_path_buf()),
+    )
+    .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    // An opencode pane resuming the ROOT session. The create-path hook
+    // (site #1) classifies it Some(false); waiting for that write also
+    // removes any race with the rebind classifications below.
+    let created = send_create(&mut ws, restore_create_body("req-oc-reclass-1", ROOT)).await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    wait_for_is_subagent(&state, &terminal_id, Some(false), "create/root-classified").await;
+
+    // 1) signal a switch to the CHILD id -> flag becomes Some(true).
+    write_opencode_signal(&signal_root, &terminal_id, 1, CHILD);
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    wait_for_is_subagent(&state, &terminal_id, Some(true), "switch-to-child").await;
+    assert_eq!(
+        state.identity.get(&terminal_id).and_then(|i| i.is_subagent),
+        Some(true)
+    );
+
+    // 2) signal a switch back to the ROOT id -> flag becomes Some(false)
+    //    (the clearing direction — a stale true must not keep hiding the pane).
+    write_opencode_signal(&signal_root, &terminal_id, 2, ROOT);
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    wait_for_is_subagent(&state, &terminal_id, Some(false), "switch-back-to-root").await;
+    assert_eq!(
+        state.identity.get(&terminal_id).and_then(|i| i.is_subagent),
+        Some(false)
+    );
+
+    registry.kill(&terminal_id);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
@@ -460,6 +600,7 @@ async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
     let (url, registry, state) = spawn_server_returning_state(
         vec![opencode_capture_spec()],
         ledger_dir.path().to_path_buf(),
+        None,
     )
     .await;
     let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;

@@ -234,3 +234,172 @@ describe('sidebarSelectors running session mapping', () => {
     ])
   })
 })
+
+describe('subagent-target live terminals (Bug 1)', () => {
+  const subagentTerminal = {
+    terminalId: 'term-oc-subagent',
+    title: 'opencode --session ses_024e59f87ffeEvZWqgMpBXAo78',
+    createdAt: 1_100,
+    lastActivityAt: 1_200,
+    status: 'running' as const,
+    hasClients: true,
+    mode: 'opencode' as const,
+    cwd: '/repo/live',
+    resumeTargetIsSubagent: true,
+  }
+  const rootTerminal = {
+    terminalId: 'term-oc-root',
+    title: 'OpenCode',
+    createdAt: 1_100,
+    lastActivityAt: 1_200,
+    status: 'running' as const,
+    hasClients: true,
+    mode: 'opencode' as const,
+    cwd: '/repo/live',
+  }
+
+  it('marks the manufactured entry isSubagent when the terminal record is flagged', () => {
+    const state = createState()
+    const items = buildSessionItems(
+      state.sessions.projects,
+      state.tabs.tabs,
+      state.panes,
+      [subagentTerminal, rootTerminal],
+      {},
+      'repo',
+    )
+    const flagged = items.find((i) => i.sessionId === 'terminal:term-oc-subagent')
+    expect(flagged?.isSubagent).toBe(true)
+    const unflagged = items.find((i) => i.sessionId === 'terminal:term-oc-root')
+    expect(unflagged?.isSubagent).toBeUndefined()
+  })
+
+  it('hides the flagged entry under default visibility (showSubagents=false) but keeps the root one', () => {
+    const state = createState()
+    const items = buildSessionItems(
+      state.sessions.projects,
+      state.tabs.tabs,
+      state.panes,
+      [subagentTerminal, rootTerminal],
+      {},
+      'repo',
+    )
+    const visible = filterSessionItemsByVisibility(items, {
+      showSubagents: false,
+      ignoreCodexSubagents: true,
+      showNoninteractiveSessions: true,
+      hideEmptySessions: false,
+      excludeFirstChatSubstrings: [],
+      excludeFirstChatMustStart: false,
+    })
+    const ids = visible.map((i) => i.sessionId)
+    expect(ids).not.toContain('terminal:term-oc-subagent')
+    expect(ids).toContain('terminal:term-oc-root')
+  })
+
+  it('shows the flagged entry when showSubagents is true (opt-in visibility)', () => {
+    const state = createState()
+    const items = buildSessionItems(
+      state.sessions.projects,
+      state.tabs.tabs,
+      state.panes,
+      [subagentTerminal],
+      {},
+      'repo',
+    )
+    const visible = filterSessionItemsByVisibility(items, {
+      showSubagents: true,
+      ignoreCodexSubagents: true,
+      showNoninteractiveSessions: true,
+      hideEmptySessions: false,
+      excludeFirstChatSubstrings: [],
+      excludeFirstChatMustStart: false,
+    })
+    expect(visible.map((i) => i.sessionId)).toContain('terminal:term-oc-subagent')
+  })
+
+  it('classifies tab/pane-derived FALLBACK rows for sessionRef-bearing child-target terminals (the load-bearing half)', () => {
+    // sessionRef-bearing live terminals NEVER take the manufactured block
+    // (sidebarSelectors.ts's `if (terminal.sessionRef) continue` guard); when
+    // paned, they surface via pushFallbackItem as an `opencode:<child>` row.
+    const CHILD_ID = 'ses_024e59f87ffeEvZWqgMpBXAo78'
+    const ROOT_ID = 'ses_rootcontrol000000000000000'
+    const makePanedFixture = (tag: string, terminalId: string, sessionId: string) => ({
+      tab: {
+        id: `tab-${tag}`,
+        title: 'OpenCode',
+        mode: 'opencode',
+        createRequestId: `tab-${tag}`,
+        status: 'running',
+        createdAt: 1_000,
+      },
+      layout: {
+        type: 'leaf',
+        id: `pane-${tag}`,
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          terminalId,
+          status: 'running',
+          sessionRef: { provider: 'opencode', sessionId },
+        },
+      },
+    })
+    const child = makePanedFixture('oc-child', 'term-oc-paned-child', CHILD_ID)
+    const root = makePanedFixture('oc-root', 'term-oc-paned-root', ROOT_ID)
+    const tabs = [child.tab, root.tab] as any
+    const panes = {
+      layouts: {
+        [child.tab.id]: child.layout,
+        [root.tab.id]: root.layout,
+      },
+      activePaneByTabId: {},
+      paneTitles: {},
+    } as any
+    const terminals = [
+      {
+        terminalId: 'term-oc-paned-child',
+        title: `opencode --session ${CHILD_ID}`,
+        createdAt: 1_100,
+        lastActivityAt: 1_200,
+        status: 'running' as const,
+        hasClients: true,
+        mode: 'opencode' as const,
+        cwd: '/repo/live',
+        sessionRef: { provider: 'opencode' as const, sessionId: CHILD_ID },
+        resumeTargetIsSubagent: true,
+      },
+      {
+        terminalId: 'term-oc-paned-root',
+        title: 'OpenCode',
+        createdAt: 1_100,
+        lastActivityAt: 1_200,
+        status: 'running' as const,
+        hasClients: true,
+        mode: 'opencode' as const,
+        cwd: '/repo/live',
+        sessionRef: { provider: 'opencode' as const, sessionId: ROOT_ID },
+      },
+    ]
+    // NO matching indexed session for either id (empty projects) -> both
+    // become pushFallbackItem rows, not indexed-session rows.
+    const items = buildSessionItems([], tabs, panes, terminals, {}, 'repo')
+    const fallback = items.find((i) => i.sessionId === CHILD_ID)
+    expect(fallback?.isFallback).toBe(true)
+    expect(fallback?.isSubagent).toBe(true)
+    const rootFallback = items.find((i) => i.sessionId === ROOT_ID)
+    expect(rootFallback?.isSubagent).toBeUndefined()
+
+    const visible = filterSessionItemsByVisibility(items, {
+      showSubagents: false,
+      ignoreCodexSubagents: true,
+      showNoninteractiveSessions: true,
+      hideEmptySessions: false,
+      excludeFirstChatSubstrings: [],
+      excludeFirstChatMustStart: false,
+    })
+    const ids = visible.map((i) => i.sessionId)
+    expect(ids).not.toContain(CHILD_ID)
+    expect(ids).toContain(ROOT_ID)
+  })
+})

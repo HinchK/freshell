@@ -72,6 +72,34 @@ describe('TerminalMetadataService', () => {
     })
   })
 
+  it('carries the resume-target subagent classification through seeding', async () => {
+    const { service } = createService()
+
+    const flagged = await service.seedFromTerminal({
+      ...createTerminalRecord({
+        terminalId: 'term-opencode-subagent',
+        mode: 'opencode',
+        cwd: '/workspace/repo/src',
+        resumeSessionId: 'ses_child',
+      }),
+      resumeTargetIsSubagent: true,
+    })
+    const unflagged = await service.seedFromTerminal(
+      createTerminalRecord({
+        terminalId: 'term-opencode-root',
+        mode: 'opencode',
+        cwd: '/workspace/repo/src',
+        resumeSessionId: 'ses_root',
+      }),
+    )
+
+    expect(flagged?.resumeTargetIsSubagent).toBe(true)
+    expect(unflagged?.resumeTargetIsSubagent).toBeUndefined()
+    expect(
+      service.list().find((meta) => meta.terminalId === 'term-opencode-subagent')?.resumeTargetIsSubagent,
+    ).toBe(true)
+  })
+
   it('prefers live git branch/dirty over stale session snapshots and updates token usage', async () => {
     const { service } = createService({ branch: 'feature/live', isDirty: true })
     const seeded = await service.seedFromTerminal(
@@ -234,6 +262,101 @@ describe('TerminalMetadataService', () => {
     const secondApply = await service.applySessionMetadata('term-3', session)
     expect(secondApply).toBeUndefined()
     expect(service.list()).toHaveLength(1)
+  })
+
+  describe('setResumeTargetIsSubagent (opencode rebind re-sync, Bug-1 sidebar rail)', () => {
+    it('root->child rebind: sets the flag once the new target classifies as a subagent', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-rebind',
+          mode: 'opencode',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'ses_root',
+        }),
+      )
+
+      // The live rebind lane (promoteAssociation -> 'associated' ->
+      // broadcastTerminalSessionAssociation) overwrites sessionId first...
+      service.associateSession('term-rebind', 'opencode', 'ses_child')
+      // ...then bindSession's async re-classification lands here.
+      const updated = service.setResumeTargetIsSubagent('term-rebind', 'opencode', 'ses_child', true)
+
+      expect(updated?.resumeTargetIsSubagent).toBe(true)
+      expect(service.get('term-rebind')?.resumeTargetIsSubagent).toBe(true)
+    })
+
+    it('child->root rebind: an explicit false UNSETS the stale flag (the `??` merge cannot)', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal({
+        ...createTerminalRecord({
+          terminalId: 'term-rebind-back',
+          mode: 'opencode',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'ses_child',
+        }),
+        resumeTargetIsSubagent: true,
+      })
+
+      // Rebind lane: associateSession spreads the old meta -- the create-time
+      // flag survives the sessionId overwrite (the staleness being fixed).
+      const associated = service.associateSession('term-rebind-back', 'opencode', 'ses_root')
+      expect(associated?.resumeTargetIsSubagent).toBe(true)
+
+      const updated = service.setResumeTargetIsSubagent('term-rebind-back', 'opencode', 'ses_root', false)
+      expect(updated).toBeDefined()
+      expect(updated?.resumeTargetIsSubagent).toBeUndefined()
+      expect(service.get('term-rebind-back')?.resumeTargetIsSubagent).toBeUndefined()
+    })
+
+    it('staleness guard: a classification for a superseded sessionId is dropped', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-stale',
+          mode: 'opencode',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'ses_old_child',
+        }),
+      )
+      // Meta already moved on to the newer root target...
+      service.associateSession('term-stale', 'opencode', 'ses_new_root')
+
+      // ...so a slow classification answer for the OLD target must not land.
+      const dropped = service.setResumeTargetIsSubagent('term-stale', 'opencode', 'ses_old_child', true)
+      expect(dropped).toBeUndefined()
+      expect(service.get('term-stale')?.resumeTargetIsSubagent).toBeUndefined()
+      expect(service.get('term-stale')?.sessionId).toBe('ses_new_root')
+    })
+
+    it('drops provider mismatches and unknown terminals', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-provider',
+          mode: 'opencode',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'ses_x',
+        }),
+      )
+      expect(service.setResumeTargetIsSubagent('term-provider', 'codex', 'ses_x', true)).toBeUndefined()
+      expect(service.get('term-provider')?.resumeTargetIsSubagent).toBeUndefined()
+      expect(service.setResumeTargetIsSubagent('term-missing', 'opencode', 'ses_x', true)).toBeUndefined()
+    })
+
+    it('returns undefined for idempotent writes (no duplicate change payloads)', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-idem',
+          mode: 'opencode',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'ses_root',
+        }),
+      )
+      // Already unset -- a false answer changes nothing.
+      expect(service.setResumeTargetIsSubagent('term-idem', 'opencode', 'ses_root', false)).toBeUndefined()
+    })
   })
 
   describe('get', () => {

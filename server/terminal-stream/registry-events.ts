@@ -28,6 +28,22 @@ export type TerminalSessionBoundEvent = {
   previousSessionId?: string
 }
 
+/**
+ * bindSession's fire-and-forget opencode subagent re-classification resolved
+ * AND passed the registry's staleness guard (the terminal still targets the
+ * classified session). Emitted on the registry as
+ * 'terminal.subagent.classified' so TerminalMetadataService's copy of the
+ * flag (TerminalMeta.resumeTargetIsSubagent) re-syncs in both directions
+ * across the live opencode rebind lane (TUI session switch) -- Node mirror
+ * of the Rust rebind hook (crates/freshell-ws/src/opencode_signal.rs).
+ */
+export type TerminalSubagentClassifiedEvent = {
+  terminalId: string
+  provider: CodingCliProviderName
+  sessionId: string
+  isSubagent: boolean
+}
+
 export type TerminalSessionUnboundEvent = {
   terminalId: string
   provider: CodingCliProviderName

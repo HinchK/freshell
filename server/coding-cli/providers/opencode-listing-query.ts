@@ -6,6 +6,7 @@ export type OpencodeSessionRow = {
   lastActivityAt: number
   projectPath: string | null
   hasThreeViewsMarker?: number | null
+  parentId?: string | null
 }
 
 export type OpencodeListingResult = {

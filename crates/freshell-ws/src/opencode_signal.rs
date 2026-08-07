@@ -410,6 +410,15 @@ async fn rebind_fanout(
         Some("opencode".to_string()),
         Some(sig.session_id.clone()),
     );
+    // Bug-1 (sidebar rail): the resume target just changed — re-classify the
+    // newly bound session id (both directions; a switch back to a root
+    // session must clear a stale subagent flag).
+    crate::opencode_association::classify_and_mark_resume_target(
+        state,
+        &sig.terminal_id,
+        "opencode",
+        Some(&sig.session_id),
+    );
     crate::pane_ledger::ledger_resolve_identity(
         state,
         &sig.terminal_id,
@@ -511,6 +520,15 @@ async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> SignalD
             Some(&sig.session_id),
             current.cwd.as_deref(),
             now_ms(),
+        );
+        // Bug-1 (sidebar rail): the resume target just changed — re-classify
+        // the newly bound session id (both directions; a switch back to a
+        // root session must clear a stale subagent flag).
+        crate::opencode_association::classify_and_mark_resume_target(
+            state,
+            &sig.terminal_id,
+            "opencode",
+            Some(&sig.session_id),
         );
         // upsert cleared the retired flag; re-retire preserves fields.
         state.identity.retire(&sig.terminal_id);

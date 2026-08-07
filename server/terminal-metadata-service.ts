@@ -13,6 +13,9 @@ export type TerminalSeedRecord = {
   terminalId: string
   mode: TerminalMode
   resumeSessionId?: string
+  // Snapshot of the registry's flag at seed time — freshness caveats on
+  // TerminalMeta.resumeTargetIsSubagent below apply here too.
+  resumeTargetIsSubagent?: boolean
   cwd?: string
 }
 
@@ -26,6 +29,19 @@ export type TerminalMeta = {
   isDirty?: boolean
   provider?: TerminalProvider
   sessionId?: string
+  // Bug-1 (sidebar rail): whether the terminal's resume target is an
+  // opencode SUBAGENT (child) session — classified by the registry at
+  // terminal.create and carried here so server-fabricated live-terminal
+  // session-directory items can be hidden under default visibility.
+  // FRESHNESS: the flag tracks the `sessionId` beside it. The LIVE opencode
+  // rebind lane (TUI session switch: opencode-session-controller
+  // promoteAssociation → bindSession → 'associated' → associateSession)
+  // overwrites sessionId here; bindSession's async re-classification then
+  // lands through setResumeTargetIsSubagent() (via the registry's
+  // 'terminal.subagent.classified' event), which sets AND unsets under a
+  // sessionId-match staleness guard. Note upsert()'s `??` merge never
+  // unsets — only setResumeTargetIsSubagent() can clear a stale true.
+  resumeTargetIsSubagent?: boolean
   tokenUsage?: TokenSummary
   updatedAt: number
 }
@@ -101,6 +117,7 @@ function terminalMetaEquals(a: TerminalMeta, b: TerminalMeta): boolean {
     a.isDirty === b.isDirty &&
     a.provider === b.provider &&
     a.sessionId === b.sessionId &&
+    a.resumeTargetIsSubagent === b.resumeTargetIsSubagent &&
     tokenUsageEquals(a.tokenUsage, b.tokenUsage)
   )
 }
@@ -138,10 +155,12 @@ export class TerminalMetadataService {
   async seedFromTerminal(record: TerminalSeedRecord): Promise<TerminalMeta | undefined> {
     const provider = isTerminalProvider(record.mode) ? record.mode : undefined
     const sessionId = provider ? record.resumeSessionId : undefined
+    const resumeTargetIsSubagent = provider ? record.resumeTargetIsSubagent : undefined
     return this.upsert(record.terminalId, {
       cwd: record.cwd,
       provider,
       sessionId,
+      resumeTargetIsSubagent,
     })
   }
 
@@ -157,6 +176,42 @@ export class TerminalMetadataService {
       ...current,
       provider,
       sessionId,
+    }
+
+    return this.commitIfChanged(next)
+  }
+
+  /**
+   * Bug-1 (sidebar rail), opencode rebind re-sync lane: bindSession's
+   * fire-and-forget subagent re-classification resolved for `sessionId`
+   * (registry 'terminal.subagent.classified' event) — land the answer on
+   * this terminal's metadata copy. Both directions: `true` sets the flag
+   * (root→child switch), `false` clears it (child→root switch) — this is
+   * the only lane that can UNSET (upsert()'s `??` merge cannot).
+   *
+   * Staleness guard (spirit of the Rust generation guard,
+   * crates/freshell-ws/src/identity.rs complete_subagent_classification):
+   * the write lands IFF this meta is still associated with the classified
+   * provider+session. associateSession() runs synchronously in the rebind
+   * lane before any classification can resolve, so `sessionId` here always
+   * names the NEWEST target — a slow older classification for a superseded
+   * target mismatches and is dropped.
+   */
+  setResumeTargetIsSubagent(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    isSubagent: boolean,
+  ): TerminalMeta | undefined {
+    const current = this.byTerminalId.get(terminalId)
+    if (!current) return undefined
+    if (current.provider !== provider || current.sessionId !== sessionId) return undefined
+
+    const next: TerminalMeta = {
+      ...current,
+      // Same normalization as the registry record: absent means "not a
+      // subagent target" (the wire field is additive/optional).
+      resumeTargetIsSubagent: isSubagent || undefined,
     }
 
     return this.commitIfChanged(next)
@@ -239,6 +294,7 @@ export class TerminalMetadataService {
       cwd?: string
       provider?: TerminalProvider
       sessionId?: string
+      resumeTargetIsSubagent?: boolean
     },
   ): Promise<TerminalMeta | undefined> {
     const current = this.byTerminalId.get(terminalId)
@@ -247,6 +303,11 @@ export class TerminalMetadataService {
       cwd: patch.cwd ?? current?.cwd,
       provider: patch.provider ?? current?.provider,
       sessionId: patch.sessionId ?? current?.sessionId,
+      // NOTE: `??` keeps the last known flag — seeding never UNSETS. The
+      // opencode rebind lane clears a stale true via
+      // setResumeTargetIsSubagent() (explicit false-capable write). See the
+      // freshness breadcrumb on TerminalMeta.resumeTargetIsSubagent.
+      resumeTargetIsSubagent: patch.resumeTargetIsSubagent ?? current?.resumeTargetIsSubagent,
       branch: current?.branch,
       isDirty: current?.isDirty,
       tokenUsage: current?.tokenUsage,

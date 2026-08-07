@@ -467,6 +467,76 @@ describe('querySessionDirectory', () => {
     ])
   })
 
+  it('marks live-terminal items for subagent resume targets and leaves root targets unmarked', async () => {
+    const page = await querySessionDirectory({
+      projects: [],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-opencode-subagent',
+          provider: 'opencode',
+          sessionId: 'ses_subagent_child',
+          cwd: '/repo/live',
+          resumeTargetIsSubagent: true,
+          updatedAt: 1_900,
+        }),
+        makeTerminalMeta({
+          terminalId: 'term-opencode-root',
+          provider: 'opencode',
+          sessionId: 'ses_root',
+          cwd: '/repo/live',
+          updatedAt: 1_800,
+        }),
+      ],
+      query: {
+        priority: 'visible',
+        includeSubagents: true,
+        includeNonInteractive: true,
+        includeEmpty: true,
+        limit: 50,
+      },
+    })
+
+    const subagentItem = page.items.find((item) => item.sessionId === 'ses_subagent_child')
+    expect(subagentItem).toBeDefined()
+    expect(subagentItem?.isSubagent).toBe(true)
+
+    // ROOT CONTROL: an unflagged terminal's item must NOT carry the flag
+    // (the shared item type declares `isSubagent?: boolean`, and the Node
+    // convention is to omit it entirely for non-subagents).
+    const rootItem = page.items.find((item) => item.sessionId === 'ses_root')
+    expect(rootItem).toBeDefined()
+    expect(rootItem?.isSubagent).toBeUndefined()
+  })
+
+  it('hides subagent-target live terminals under default visibility while keeping root targets', async () => {
+    const page = await querySessionDirectory({
+      projects: [],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-opencode-subagent',
+          provider: 'opencode',
+          sessionId: 'ses_subagent_child',
+          cwd: '/repo/live',
+          resumeTargetIsSubagent: true,
+          updatedAt: 1_900,
+        }),
+        makeTerminalMeta({
+          terminalId: 'term-opencode-root',
+          provider: 'opencode',
+          sessionId: 'ses_root',
+          cwd: '/repo/live',
+          updatedAt: 1_800,
+        }),
+      ],
+      query: {
+        priority: 'visible',
+        limit: 50,
+      },
+    })
+
+    expect(page.items.map((item) => item.sessionId)).toEqual(['ses_root'])
+  })
+
   it('caps page size at 50 even when a larger limit is requested', async () => {
     const manyProjects: ProjectGroup[] = [
       makeProject('/repo/many', Array.from({ length: 75 }, (_, index) => makeSession({

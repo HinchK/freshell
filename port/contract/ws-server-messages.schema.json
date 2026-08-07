@@ -2588,6 +2588,9 @@
               "mode": {
                 "type": "string"
               },
+              "resumeTargetIsSubagent": {
+                "type": "boolean"
+              },
               "runtimeStatus": {
                 "enum": [
                   "running",

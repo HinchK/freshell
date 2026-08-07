@@ -805,7 +805,10 @@ fn build_live_terminal_session_item(
         last_activity_at: identity.updated_at,
         created_at: Some(identity.updated_at),
         cwd: identity.cwd.clone(),
-        is_subagent: false,
+        // Bug-1 (sidebar rail): a live terminal launched at a subagent
+        // session projects the classification; the client's existing
+        // showSubagents filter (sidebarSelectors.ts:656) then hides it.
+        is_subagent: identity.is_subagent.unwrap_or(false),
         is_non_interactive: false,
         is_running: true,
         archived: false,
@@ -942,6 +945,30 @@ mod join_tests {
         assert_eq!(item.running_terminal_id.as_deref(), Some("term-9"));
         assert!(!item.live_terminal_only);
         assert_eq!(item.last_activity_at, 2000);
+    }
+
+    /// Bug-1 (sidebar rail): a live terminal launched at a subagent session
+    /// projects the identity classification onto the synthesized item (and its
+    /// `isSubagent` wire emission); unclassified identities stay non-subagent.
+    #[test]
+    fn live_terminal_item_mirrors_identity_subagent_flag() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert(
+            "term-9",
+            Some("opencode"),
+            Some("sess-77"),
+            Some("/home/dan/project"),
+            2000,
+        );
+        let mut identity = reg.list().into_iter().next().unwrap();
+        identity.is_subagent = Some(true);
+        let item = build_live_terminal_session_item(&identity).expect("item");
+        assert!(item.is_subagent, "identity Some(true) must project");
+        assert_eq!(item.to_value()["isSubagent"], serde_json::json!(true));
+
+        identity.is_subagent = None;
+        let item = build_live_terminal_session_item(&identity).expect("item");
+        assert!(!item.is_subagent, "unclassified stays non-subagent");
     }
 
     /// A codex terminal established at create time with NO session id yet
@@ -2493,6 +2520,86 @@ mod tests {
             .find(|i| i["sessionId"] == json!("oc-1"))
             .expect("oc-1 present");
         assert_eq!(opencode_item["archived"], json!(true));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Bug 2 wire-level pin: opencode's catch-all "global" project stores
+    /// `worktree = '/'` -- a placeholder, not a real checkout -- so the
+    /// directory endpoint must report the session's real cwd as
+    /// `projectPath`, not `/`.
+    #[tokio::test]
+    async fn global_project_session_reports_real_directory_as_project_path() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let opencode_home = home.join("opencode-data");
+        std::fs::create_dir_all(&opencode_home).unwrap();
+        {
+            let conn = rusqlite::Connection::open(opencode_home.join("opencode.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                    time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                    project_id TEXT, parent_id TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project (id, worktree) VALUES ('global', '/')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session VALUES ('oc-global','/tmp/real/dir','OC Global',1,2,NULL,'global',NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["opencode".into()]);
+        let auth_token: Arc<String> = Arc::new("tok".into());
+        let session_index =
+            Arc::new(SessionIndex::new(vec![
+                Arc::new(OpencodeSource::new(opencode_home)) as Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        };
+        let app = router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeEmpty=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().expect("items array");
+        let item = items
+            .iter()
+            .find(|i| i["sessionId"] == json!("oc-global"))
+            .expect("seeded session present");
+        assert_eq!(
+            item["projectPath"],
+            json!("/tmp/real/dir"),
+            "wire projectPath must be the cwd, not '/'"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

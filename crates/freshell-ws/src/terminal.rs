@@ -2805,6 +2805,16 @@ pub(crate) async fn handle_create(
         resume_session_id.clone(),
     );
 
+    // Bug-1 (sidebar rail): classify an opencode resume target as
+    // subagent/root off the dispatch path. No-op for fresh panes and other
+    // modes.
+    crate::opencode_association::classify_and_mark_resume_target(
+        state,
+        &terminal_id,
+        &mode,
+        resume_session_id.as_deref(),
+    );
+
     // Task 10: attach the per-terminal opencode SSE lane (attention bell).
     // The endpoint was allocated pre-launch and rode into argv; the hub's
     // OpencodeAttach arm re-checks the tracked mode, so this only arms for
@@ -3506,6 +3516,16 @@ pub async fn respawn_agent_terminal(
         resume_session_id.clone(),
     );
 
+    // Bug-1 (sidebar rail): classify an opencode resume target as
+    // subagent/root off the dispatch path. No-op for fresh panes and other
+    // modes.
+    crate::opencode_association::classify_and_mark_resume_target(
+        state,
+        &terminal_id,
+        &mode,
+        resume_session_id.as_deref(),
+    );
+
     // Task 10: attach the per-terminal opencode SSE lane (attention bell).
     // The respawn re-allocated a fresh loopback port above;
     // `attach_opencode_serve` replaces the old lane by contract (A6
@@ -3802,7 +3822,7 @@ fn broadcast_terminal_meta_created(state: &WsState, record: TerminalMetaRecord) 
 /// unported), and the live capture (`port/oracle/robustness/exit-orig.json`) shows
 /// no `terminals.changed` on a plain exit. `recoverableTerminalIds` never applies
 /// on the wired paths.
-fn broadcast_terminals_changed(state: &WsState) {
+pub(crate) fn broadcast_terminals_changed(state: &WsState) {
     let revision = state
         .terminals_revision
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

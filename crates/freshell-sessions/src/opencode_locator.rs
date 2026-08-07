@@ -128,6 +128,11 @@ struct Inner {
 /// terminals. See the module doc for the row-diff algorithm.
 pub struct OpencodeLocator {
     provider: OpencodeProvider,
+    /// Retained copy of the data home for by-id reads
+    /// ([`OpencodeLocator::classify_resume_target`]) — the original is
+    /// consumed into the private `OpencodeProvider`, which exposes no
+    /// accessor for it.
+    data_home: PathBuf,
     window_ms: i64,
     pre_epsilon_ms: i64,
     /// Spawn-anchored fallback deadline duration (spec §4.4 proposes reusing
@@ -155,6 +160,7 @@ impl OpencodeLocator {
     /// spawn-anchored fallback duration reuses `window_ms` (spec §4.4).
     pub fn with_config(data_home: PathBuf, window_ms: i64, pre_epsilon_ms: i64) -> Self {
         Self {
+            data_home: data_home.clone(),
             provider: OpencodeProvider::new(data_home),
             window_ms,
             pre_epsilon_ms,
@@ -174,6 +180,19 @@ impl OpencodeLocator {
     /// `AmplifierLocator::fs_scan_count`, kata qmpk).
     pub fn db_scan_count(&self) -> u64 {
         self.db_scan_count.load(Ordering::SeqCst)
+    }
+
+    /// Best-effort resume-target classification for the sidebar rail:
+    /// `Some(true)` when the target row exists and has a parent (subagent),
+    /// `Some(false)` for a definite root, `None` when unknown (missing
+    /// DB/row, read error). Bounded by the 500ms by-id busy timeout; never
+    /// panics. This is a READ for display classification only — it does not
+    /// participate in association (the candidate SQL keeps refusing
+    /// `parent_id` rows by design).
+    pub fn classify_resume_target(&self, session_id: &str) -> Option<bool> {
+        crate::parse::session_is_subagent_by_id(&self.data_home, session_id)
+            .ok()
+            .flatten()
     }
 
     /// Arm a terminal for Enter↔row correlation. Only fresh opencode panes
@@ -509,6 +528,20 @@ mod tests {
 
         let located = locator.tick(100 + OPENCODE_WINDOW_MS + 1);
         assert!(located.is_empty(), "subagent/child row must never bind");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn classify_resume_target_answers_child_root_unknown() {
+        let home = unique_temp_dir("classify");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+        insert_session(&db, "ses_root", "/proj", 100, None, None);
+        insert_session(&db, "ses_child", "/proj", 150, Some("ses_root"), None);
+
+        assert_eq!(locator.classify_resume_target("ses_child"), Some(true));
+        assert_eq!(locator.classify_resume_target("ses_root"), Some(false));
+        assert_eq!(locator.classify_resume_target("ses_missing"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

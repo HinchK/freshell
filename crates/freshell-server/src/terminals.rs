@@ -655,6 +655,14 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
             !js_truthy(deleted)
         })
         .map(|e| {
+            // Bug-1 (sidebar rail): additive, omitted-when-absent flag (the
+            // server_messages.rs:1099-1102 additive-field precedent). Pure
+            // in-memory read — no new I/O on this request path.
+            let resume_target_is_subagent = state
+                .identity
+                .get(&e.terminal_id)
+                .and_then(|i| i.is_subagent)
+                == Some(true);
             let ov = overrides.get(&e.terminal_id).and_then(Value::as_object);
             let title = match ov.and_then(|o| o.get("titleOverride")) {
                 Some(Value::String(s)) if !s.is_empty() => s.clone(),
@@ -727,6 +735,9 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
                 ),
             );
             obj.insert("hasClients".into(), Value::Bool(e.has_clients));
+            if resume_target_is_subagent {
+                obj.insert("resumeTargetIsSubagent".into(), Value::Bool(true));
+            }
             if let Some(cwd) = e.cwd {
                 obj.insert("cwd".into(), Value::String(cwd));
             }
@@ -1196,7 +1207,10 @@ mod cascade_tests {
 #[cfg(test)]
 mod sidebar_projection_tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
     use freshell_terminal::registry::HeadlessTerminal;
+    use tower::util::ServiceExt;
 
     fn dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1293,6 +1307,92 @@ mod sidebar_projection_tests {
                 "sessionRef must stay omitted for {id}, got {item:?}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bug-1 (sidebar rail): a terminal whose resume target was classified as
+    /// an opencode SUBAGENT session carries `resumeTargetIsSubagent: true` on
+    /// its `/api/terminals` directory item; unflagged terminals OMIT the key
+    /// entirely (the undefined-omitted wire convention).
+    #[tokio::test]
+    async fn directory_item_carries_resume_target_is_subagent_only_when_flagged() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        state
+            .registry
+            .register_headless(headless("t-sub", "opencode"));
+        state
+            .registry
+            .register_headless(headless("t-root", "opencode"));
+        state.identity.set_is_subagent("t-sub", Some(true));
+
+        let items = directory_items(&state).await;
+        let sub = items
+            .iter()
+            .find(|i| i["terminalId"] == "t-sub")
+            .expect("t-sub present");
+        assert_eq!(sub["resumeTargetIsSubagent"], serde_json::json!(true));
+
+        let root = items
+            .iter()
+            .find(|i| i["terminalId"] == "t-root")
+            .expect("t-root present");
+        assert!(
+            root.get("resumeTargetIsSubagent").is_none(),
+            "unflagged terminals must OMIT the key (undefined-omitted convention)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Paged branch (what the sidebar actually fetches): the same projection
+    /// must appear on the `{items, nextCursor, revision}` response of
+    /// `GET /api/terminals?priority=visible`.
+    #[tokio::test]
+    async fn paged_terminals_response_carries_resume_target_is_subagent() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        state
+            .registry
+            .register_headless(headless("t-sub", "opencode"));
+        state
+            .registry
+            .register_headless(headless("t-root", "opencode"));
+        state.identity.set_is_subagent("t-sub", Some(true));
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/terminals?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = body["items"].as_array().expect("paged items array");
+
+        let sub = items
+            .iter()
+            .find(|i| i["terminalId"] == "t-sub")
+            .expect("t-sub present in paged items");
+        assert_eq!(sub["resumeTargetIsSubagent"], serde_json::json!(true));
+
+        let root = items
+            .iter()
+            .find(|i| i["terminalId"] == "t-root")
+            .expect("t-root present in paged items");
+        assert!(
+            root.get("resumeTargetIsSubagent").is_none(),
+            "unflagged terminals must OMIT the key (undefined-omitted convention)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

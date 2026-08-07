@@ -26,6 +26,7 @@ type TerminalListRecord = {
   description?: string
   mode: TerminalMode
   resumeSessionId?: string
+  resumeTargetIsSubagent?: boolean
   sessionRef?: SessionLocator
   codexDurability?: CodexDurabilityRef
   createdAt: number
@@ -155,6 +156,7 @@ function buildDirectoryItem(terminal: TerminalListRecord): TerminalDirectoryItem
     status: terminal.status,
     hasClients: terminal.hasClients,
     cwd: terminal.cwd,
+    ...(terminal.resumeTargetIsSubagent ? { resumeTargetIsSubagent: true } : {}),
   }
 }
 

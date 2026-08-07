@@ -175,6 +175,89 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     }
 }
 
+/// Bug-1 (sidebar rail): classify a resume target at the moment a `ses_` id
+/// is acquired or CHANGES (WS create, auto-resume respawn, signal rebind),
+/// and mark the terminal identity so the directory projections
+/// (`/api/terminals`, session-directory live items) can expose it. The write
+/// goes BOTH directions (Some(true) AND Some(false)) so a rebind to a root
+/// session clears a stale flag. Display classification only — association
+/// keeps refusing `parent_id` rows via its candidate SQL, untouched.
+///
+/// Fire-and-forget: the one-row SQLite read runs on the blocking pool (the
+/// drain_and_associate precedent) and any failure classifies as "unknown"
+/// (no write), so terminal creation is never blocked or failed by this.
+///
+/// Out-of-order guard (review fix): two rapid resume-target changes for the
+/// same terminal (e.g. create targeting child A, then a signal rebind to
+/// root B) spawn two independent classification tasks, and the OLD target's
+/// answer can resolve AFTER the NEW target's. Each request captures a
+/// per-terminal generation SYNCHRONOUSLY here (before spawning), and the
+/// spawned task writes only while its generation is still the terminal's
+/// latest — newest-request-wins regardless of resolution order. A plain
+/// write-time compare against `identity.session_id` cannot do this: the WS
+/// create-path hook fires BEFORE the identity seed (terminal.rs), so at
+/// write time the entry may not carry the session id yet. Mirrors the
+/// Node-side guard in server/terminal-registry.ts (`bindSession`
+/// re-classification).
+pub(crate) fn classify_and_mark_resume_target(
+    state: &WsState,
+    terminal_id: &str,
+    mode: &str,
+    resume_session_id: Option<&str>,
+) {
+    if mode != "opencode" {
+        return;
+    }
+    let Some(session_id) = resume_session_id.map(str::to_string) else {
+        return;
+    };
+    // Reuse the SAME locator handle drain_and_associate reads from state.
+    let Some(locator) = &state.opencode_locator else {
+        return;
+    };
+    let locator = std::sync::Arc::clone(locator);
+    let generation = state.identity.begin_subagent_classification(terminal_id);
+    tokio::spawn(classify_resume_target_task(
+        state.clone(),
+        locator,
+        terminal_id.to_string(),
+        session_id,
+        generation,
+    ));
+}
+
+/// The spawned half of [`classify_and_mark_resume_target`], factored out so
+/// tests can drive adversarial resolution orders deterministically.
+async fn classify_resume_target_task(
+    state: WsState,
+    locator: std::sync::Arc<freshell_sessions::opencode_locator::OpencodeLocator>,
+    terminal_id: String,
+    session_id: String,
+    generation: u64,
+) {
+    let classified =
+        tokio::task::spawn_blocking(move || locator.classify_resume_target(&session_id))
+            .await
+            .ok()
+            .flatten();
+    if let Some(value) = classified {
+        // BOTH directions: Some(true) flags, Some(false) clears a stale
+        // flag after a rebind to a root session. None (unknown) writes
+        // nothing. Guarded: skipped entirely (write AND ping) when a newer
+        // classification request superseded this one.
+        if state
+            .identity
+            .complete_subagent_classification(&terminal_id, generation, Some(value))
+        {
+            // Ping clients to refetch /api/terminals with the new flag. This
+            // is a standalone lifecycle ping — NOT inserted between the pinned
+            // `terminal.session.associated` -> `terminal.meta.updated` pair
+            // (codex_identity.rs:234-237 ordering contract).
+            crate::terminal::broadcast_terminals_changed(&state);
+        }
+    }
+}
+
 /// Fan `terminal.session.associated` (the sessionRef the client's
 /// `reconcileTerminalSessionAssociation` persists) AND a `terminal.meta.updated`
 /// upsert (the same shape `terminal.rs`'s `broadcast_terminal_meta_created`
@@ -357,7 +440,14 @@ mod tests {
         conn
     }
 
-    fn insert_session(conn: &rusqlite::Connection, id: &str, cwd: &str, time_created: i64) {
+    fn insert_session(
+        conn: &rusqlite::Connection,
+        id: &str,
+        cwd: &str,
+        time_created: i64,
+        parent_id: Option<&str>,
+        time_archived: Option<i64>,
+    ) {
         conn.execute(
             "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
             rusqlite::params![format!("proj-{id}"), cwd],
@@ -367,8 +457,15 @@ mod tests {
             "INSERT INTO session
                 (id, project_id, parent_id, slug, directory, title, version,
                  time_created, time_updated, time_archived)
-             VALUES (?1, ?2, NULL, ?1, ?3, ?1, 'test', ?4, ?4, NULL)",
-            rusqlite::params![id, format!("proj-{id}"), cwd, time_created],
+             VALUES (?1, ?2, ?3, ?1, ?4, ?1, 'test', ?5, ?5, ?6)",
+            rusqlite::params![
+                id,
+                format!("proj-{id}"),
+                parent_id,
+                cwd,
+                time_created,
+                time_archived
+            ],
         )
         .unwrap();
     }
@@ -485,7 +582,14 @@ mod tests {
         maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
         note_possible_submit(&state, "t1", "\r");
 
-        insert_session(&db, "ses_drain", "/tmp", crate::terminal::now_ms());
+        insert_session(
+            &db,
+            "ses_drain",
+            "/tmp",
+            crate::terminal::now_ms(),
+            None,
+            None,
+        );
 
         // Drain repeatedly until the locator's correlation window has
         // definitely closed relative to wall-clock `now_ms()`.
@@ -532,6 +636,117 @@ mod tests {
         assert!(saw_meta, "expected a terminal.meta.updated broadcast");
 
         state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn classify_and_mark_resume_target_flags_child_targets() {
+        let home = unique_temp_dir("classify-mark");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_root", "/proj", 100, None, None);
+        insert_session(&db, "ses_child", "/proj", 150, Some("ses_root"), None);
+        let (state, mut rx) = state_with_locator(home.clone());
+
+        // Child target -> identity flagged + terminals.changed ping.
+        classify_and_mark_resume_target(&state, "t-child", "opencode", Some("ses_child"));
+        // The work is spawned; poll for the identity write (bounded).
+        for _ in 0..100 {
+            if state.identity.get("t-child").and_then(|i| i.is_subagent) == Some(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.identity.get("t-child").and_then(|i| i.is_subagent),
+            Some(true)
+        );
+        let mut saw_changed = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("terminals.changed") {
+                saw_changed = true;
+            }
+        }
+        assert!(
+            saw_changed,
+            "expected a terminals.changed ping after classification"
+        );
+
+        // Root target -> classified Some(false), written BOTH directions so a
+        // rebind can CLEAR a stale true (pre-seed true to prove the clear).
+        state.identity.set_is_subagent("t-root", Some(true));
+        classify_and_mark_resume_target(&state, "t-root", "opencode", Some("ses_root"));
+        for _ in 0..100 {
+            if state.identity.get("t-root").and_then(|i| i.is_subagent) == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.identity.get("t-root").and_then(|i| i.is_subagent),
+            Some(false)
+        );
+
+        // Non-opencode / no-resume -> no-op.
+        classify_and_mark_resume_target(&state, "t-shell", "shell", Some("ses_child"));
+        classify_and_mark_resume_target(&state, "t-fresh", "opencode", None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Bug-1 review fix (out-of-order guard): two rapid resume-target
+    /// changes for the same terminal spawn two independent classification
+    /// tasks, and the OLD target's answer can resolve AFTER the NEW
+    /// target's. Drive the spawned task body directly in the adversarial
+    /// order (deterministic — no racing spawns) and pin
+    /// newest-request-wins: the stale answer neither writes nor pings.
+    #[tokio::test]
+    async fn stale_classification_answer_cannot_overwrite_a_newer_resume_target() {
+        let home = unique_temp_dir("classify-stale-guard");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_root", "/proj", 100, None, None);
+        insert_session(&db, "ses_child", "/proj", 150, Some("ses_root"), None);
+        let (state, mut rx) = state_with_locator(home.clone());
+        let locator = StdArc::clone(state.opencode_locator.as_ref().unwrap());
+
+        // Program order: request A targets the child, THEN request B
+        // rebinds to the root (the create -> signal-rebind shape).
+        let gen_a = state.identity.begin_subagent_classification("t1");
+        let gen_b = state.identity.begin_subagent_classification("t1");
+
+        // Adversarial resolution order: the NEWER request resolves first...
+        classify_resume_target_task(
+            state.clone(),
+            StdArc::clone(&locator),
+            "t1".to_string(),
+            "ses_root".to_string(),
+            gen_b,
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("t1").and_then(|i| i.is_subagent),
+            Some(false),
+            "the newest request's answer must write"
+        );
+        while rx.try_recv().is_ok() {} // drain B's terminals.changed ping
+
+        // ...then the OLD target's answer (which classifies Some(true))
+        // lands late. It must neither write nor ping.
+        classify_resume_target_task(
+            state.clone(),
+            StdArc::clone(&locator),
+            "t1".to_string(),
+            "ses_child".to_string(),
+            gen_a,
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("t1").and_then(|i| i.is_subagent),
+            Some(false),
+            "a stale answer must not overwrite the newest classification"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a skipped stale write must not ping terminals.changed"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -595,7 +810,14 @@ mod tests {
 
         note_possible_submit(&state, "t1", "\r");
 
-        insert_session(&db, "ses_restore", "/tmp", crate::terminal::now_ms());
+        insert_session(
+            &db,
+            "ses_restore",
+            "/tmp",
+            crate::terminal::now_ms(),
+            None,
+            None,
+        );
 
         // Drain repeatedly until the locator's correlation window has
         // definitely closed relative to wall-clock `now_ms()`.
@@ -690,7 +912,14 @@ mod tests {
         );
 
         // Seed a DIFFERENT session row that would otherwise associate.
-        insert_session(&db, "ses_dbcandidate", "/tmp", crate::terminal::now_ms());
+        insert_session(
+            &db,
+            "ses_dbcandidate",
+            "/tmp",
+            crate::terminal::now_ms(),
+            None,
+            None,
+        );
 
         // Drive drains until the locator EMITS its Located event — `tick`
         // disarms the terminal on emission, so armed_count reaching 0 is the
