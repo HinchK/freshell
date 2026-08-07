@@ -1217,6 +1217,29 @@ impl FreshClaudeState {
                 for durable in &removed_durables {
                     state.leases.clear_binding(PROVIDER, durable);
                 }
+                // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
+                // death must never be TOTAL SILENCE. The codex sibling broadcasts its
+                // crash self-heal `exited` status (`codex.rs spawn_exit_watcher`) and
+                // opencode's turn task emits an unconditional `idle`
+                // (`opencode_ws.rs run_turn`); the reference bridge broadcasts an
+                // explicit idle for exactly this edge so the pane doesn't stay stuck
+                // blue (`server/sdk-bridge.ts:344-353`). Claude alone dropped the pane
+                // into a forever-"working" wedge. Broadcast the `freshAgent.error`
+                // shape the client folds into a visible banner AND a
+                // running/streaming->idle drop (`fresh-agent-ws.ts:333-342`,
+                // `freshAgentSlice.sessionError`). This branch is UNREQUESTED-death
+                // only: `handle_kill`/`shutdown`/attach-teardown all remove the map
+                // entry (and abort this consumer) first, so `evicted` is false there
+                // and stays silent -- and no completion chime is ever fabricated
+                // (ADR Decision 2.1 holds).
+                let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                tracing::warn!(session_id = %stamp, "freshagent.claude.sidecar_death_detected");
+                state.emit_fresh_agent_error(
+                    &stamp,
+                    &session_type,
+                    "SIDECAR_EXITED",
+                    "Claude agent process exited unexpectedly - the in-flight turn was lost. Reopen the pane or create a new agent to continue.",
+                );
             }
         })
     }
@@ -2784,5 +2807,71 @@ rl.on('line', (line) => {
                 "a successful interrupt must not broadcast an error: {frame}"
             );
         }
+    }
+
+    /// Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar death
+    /// (crash/OOM/kill -9, never `freshAgent.kill`) must broadcast a pane-unwedging
+    /// `freshAgent.error` after the consumer-exit eviction. The codex sibling broadcasts
+    /// its crash self-heal `exited` status (`codex.rs spawn_exit_watcher`) and opencode's
+    /// turn task emits an unconditional `idle` (`opencode_ws.rs run_turn`); claude was the
+    /// only provider whose death edge was TOTAL SILENCE, leaving the pane stuck
+    /// busy/"working" forever (the reference bridge broadcasts an explicit idle for
+    /// exactly this reason -- `server/sdk-bridge.ts:344-353`). The client folds this frame
+    /// into a visible banner AND drops the stuck running/streaming state
+    /// (`fresh-agent-ws.ts:333-342`, `freshAgentSlice.sessionError`).
+    #[tokio::test]
+    async fn unrequested_sidecar_death_broadcasts_a_pane_unwedging_error() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-death-unwedge"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-claude-death-unwedge").await;
+        assert_eq!(created["type"], "freshAgent.created", "sanity: {created}");
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Simulate the crash: SIGKILL the sidecar child directly (NOT handle_kill, which
+        // removes the map entry first and must stay silent).
+        {
+            let mut guard = st.sessions.lock().await;
+            let session = guard.get_mut(&session_id).expect("live session in map");
+            let _ = session.child.start_kill();
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let raw = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect(
+                    "no SIDECAR_EXITED freshAgent.error was broadcast after an unrequested \
+                     sidecar death -- the pane stays wedged busy forever",
+                )
+                .expect("broadcast bus closed");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "SIDECAR_EXITED"
+            {
+                // Stamped with the session's broadcast id so the frozen client routes it
+                // to the right pane (fresh-agent-ws.ts:190-201).
+                assert_eq!(frame["sessionId"], json!(session_id), "{frame}");
+                assert_eq!(frame["event"]["sessionId"], json!(session_id), "{frame}");
+                assert_eq!(frame["provider"], "claude", "{frame}");
+                assert_eq!(frame["sessionType"], "freshclaude", "{frame}");
+                assert!(
+                    frame["event"]["message"].as_str().unwrap_or("").len() > 0,
+                    "user-facing message required: {frame}"
+                );
+                break;
+            }
+        }
+        // The pre-existing consumer-exit eviction (ledger A9) still happened.
+        assert!(
+            !st.sessions.lock().await.contains_key(&session_id),
+            "dead session must still be evicted from the sessions map"
+        );
     }
 }
