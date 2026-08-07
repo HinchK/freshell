@@ -27,6 +27,14 @@ test.describe('Sidebar', () => {
   })
 
   test('sidebar reopen button stays fixed when overflowing tabs are scrolled', async ({ freshellPage, page }) => {
+    // This test is single-row-specific: opt out of the multirow default explicitly.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { multirowTabs: false } },
+      })
+    })
+
     await page.setViewportSize({ width: 900, height: 700 })
     await page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__

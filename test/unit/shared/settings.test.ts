@@ -563,8 +563,8 @@ describe('shared settings contract', () => {
     })
   })
 
-  it('defaults multirowTabs to false in resolved local settings', () => {
-    expect(resolveLocalSettings(undefined).panes.multirowTabs).toBe(false)
+  it('defaults multirowTabs to true in resolved local settings', () => {
+    expect(resolveLocalSettings(undefined).panes.multirowTabs).toBe(true)
   })
 
   it('accepts multirowTabs boolean in local settings patch', () => {

@@ -63,7 +63,15 @@ function createStore(initialState: { tabs: Tab[]; activeTabId: string | null }) 
     preloadedState: {
       tabs: { tabs: initialState.tabs, activeTabId: initialState.activeTabId, renameRequestTabId: null },
       panes: { layouts: {}, activePane: {}, paneTitles: {} },
-      settings: { settings: defaultSettings, loaded: true },
+      // Every test in this file exercises the single-row scroll model
+      // (hard clip + arrow buttons), so pin multirowTabs off explicitly.
+      settings: {
+        settings: {
+          ...defaultSettings,
+          panes: { ...defaultSettings.panes, multirowTabs: false },
+        },
+        loaded: true,
+      },
       turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {} },
     },
   })

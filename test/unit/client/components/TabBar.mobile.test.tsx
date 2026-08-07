@@ -24,7 +24,14 @@ vi.stubGlobal('localStorage', {
   key: vi.fn(),
 })
 
-function createStore(tabsState: any, panesState: any) {
+function createStore(tabsState: any, panesState: any, options: { multirowTabs?: boolean } = {}) {
+  const settings = options.multirowTabs === undefined
+    ? defaultSettings
+    : {
+        ...defaultSettings,
+        panes: { ...defaultSettings.panes, multirowTabs: options.multirowTabs },
+      }
+
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -37,7 +44,7 @@ function createStore(tabsState: any, panesState: any) {
       panes: panesState,
       connection: { status: 'connected', error: null, reconnectAttempts: 0 },
       settings: {
-        settings: defaultSettings,
+        settings,
         loaded: true,
       },
     },
@@ -98,8 +105,8 @@ describe('TabBar mobile touch targets', () => {
     expect(newTabButton.className).toMatch(/min-w-11/)
   })
 
-  it('tab bar container has h-12 for mobile and md:h-10 for desktop', () => {
-    const store = createStore(defaultTabsState, defaultPanesState)
+  it('tab bar container has h-12 for mobile and md:h-10 for desktop (single-row)', () => {
+    const store = createStore(defaultTabsState, defaultPanesState, { multirowTabs: false })
     render(
       <Provider store={store}>
         <TabBar />

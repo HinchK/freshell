@@ -890,7 +890,7 @@ export const defaultLocalSettings: LocalSettings = {
     tabAttentionStyle: 'highlight',
     attentionDismiss: 'click',
     sessionOpenMode: 'tab',
-    multirowTabs: false,
+    multirowTabs: true,
     repoIconsOnTabs: true,
   },
   sidebar: {

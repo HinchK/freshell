@@ -158,6 +158,16 @@ describe('browserPreferencesPersistence', () => {
     setItemSpy.mockRestore()
   })
 
+  it('persists an explicit multirowTabs=false now that the default is true', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({ panes: { multirowTabs: false } }))
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const blob = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(blob.settings?.panes?.multirowTabs).toBe(false)
+  })
+
   it('persists freshAgent.showThinking/showTools/showTimecodes to browser preferences', () => {
     const store = createStore()
 

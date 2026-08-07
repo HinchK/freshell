@@ -198,7 +198,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? EMPTY_REPO_ICONS)
   const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
-  const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)
+  const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? true)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   // Compute display title for a single tab

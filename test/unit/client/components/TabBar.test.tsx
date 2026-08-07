@@ -8,7 +8,7 @@ import codexActivityReducer, { type CodexActivityState } from '@/store/codexActi
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import panesReducer from '@/store/panesSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
@@ -290,6 +290,8 @@ describe('TabBar', () => {
         tabs: [tab],
         activeTabId: 'tab-1',
       })
+      // Single-row-specific behavior: opt out of the multirow default explicitly.
+      store.dispatch(updateSettingsLocal({ panes: { multirowTabs: false } }))
 
       const { container } = renderWithStore(<TabBar />, store)
 

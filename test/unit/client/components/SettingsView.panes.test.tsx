@@ -228,6 +228,19 @@ describe('SettingsView Panes section', () => {
     expect(api.patch).not.toHaveBeenCalled()
   })
 
+  it('exposes the Multi-row tabs toggle as an accessible switch, checked by default', () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Panes')
+
+    const toggle = screen.getByRole('switch', { name: /multi-row tabs/i })
+    expect(toggle).toBeChecked()
+  })
+
   it('toggles repo icons on tabs locally without calling /api/settings', async () => {
     const store = createTestStore('ask', { panes: { repoIconsOnTabs: true } })
     render(

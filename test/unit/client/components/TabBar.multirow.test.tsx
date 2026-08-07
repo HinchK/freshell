@@ -53,7 +53,9 @@ function createTab(overrides: Partial<Tab> = {}): Tab {
 
 function createStore(options: { tabs: Tab[]; activeTabId: string | null; multirowTabs?: boolean }) {
   const localSettings = resolveLocalSettings(
-    options.multirowTabs ? { panes: { multirowTabs: true } } : undefined,
+    options.multirowTabs === undefined
+      ? undefined
+      : { panes: { multirowTabs: options.multirowTabs } },
   )
   const serverSettings = createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
@@ -104,7 +106,7 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap).not.toBeNull()
   })
 
-  it('does not use flex-wrap when multirowTabs is disabled (default)', () => {
+  it('does not use flex-wrap when multirowTabs is disabled (single-row)', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
     const { container } = renderWithStore(<TabBar />, store)
@@ -113,7 +115,7 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap).toBeNull()
   })
 
-  it('uses overflow-x-auto when multirowTabs is disabled (default)', () => {
+  it('uses overflow-x-auto when multirowTabs is disabled (single-row)', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
     const { container } = renderWithStore(<TabBar />, store)
@@ -219,6 +221,16 @@ describe('TabBar multirow tabs', () => {
     const flexWrap = container.querySelector('.flex-wrap')
     expect(flexWrap).not.toBeNull()
     expect(flexWrap!.className).not.toContain('overflow-x-hidden')
+  })
+
+  it('defaults to multirow mode when no local settings are stored', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const strip = screen.getByTestId('tab-strip')
+    expect(strip.className).toContain('flex-wrap')
+    expect(strip.className).not.toContain('overflow-x-auto')
   })
 
   it('does not apply h-full to sidebar reopen slot in multirow mode', () => {
