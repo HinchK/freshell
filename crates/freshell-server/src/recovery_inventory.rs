@@ -466,6 +466,45 @@ fn live_session_keys(
     keys
 }
 
+/// Test-only seam: simulate a concurrent `persist_generation` retention
+/// prune landing BETWEEN the overview scan and the union read (each takes
+/// the persist lock separately, so a `tabs.sync.push` from any reconnecting
+/// client can delete a just-selected generation file in that window). Each
+/// seeded batch is one such interleaved prune; batches are matched to the
+/// store root so parallel tests on other tempdirs are unaffected. Production
+/// builds compile this to a no-op.
+#[cfg(test)]
+static INJECTED_PRUNE_BATCHES: std::sync::Mutex<Vec<Vec<std::path::PathBuf>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn injected_prune_between_reads(_dir: &std::path::Path) {
+    #[cfg(test)]
+    {
+        let mut batches = INJECTED_PRUNE_BATCHES.lock().unwrap();
+        if let Some(position) = batches
+            .iter()
+            .position(|batch| batch.first().is_some_and(|path| path.starts_with(_dir)))
+        {
+            for path in batches.remove(position) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Bounded re-reads when a concurrent retention prune lands between the
+/// overview scan and the union read. The two reads each take the tabs-persist
+/// lock separately, so a `tabs.sync.push` — which every reconnecting client
+/// fires at exactly the moment a fresh window fetches the inventory — can
+/// delete a just-selected generation file in between (a client at its
+/// retention cap prunes its oldest retained generation on every push, and
+/// selection takes ALL retained generations of surviving clients). A fresh
+/// overview re-selects from what actually survives, so one re-read converges
+/// in the benign race; exhaustion means the store is churning or incoherent
+/// under the reader and MUST fail loud (500, `:373`), never a clean 200
+/// whose inventory silently omits the whole device.
+const UNION_READ_ATTEMPTS: usize = 3;
+
 fn read_foreign_unions(
     dir: &std::path::Path,
     exclude_client: &str,
@@ -478,26 +517,50 @@ fn read_foreign_unions(
     if !dir.is_dir() {
         return Ok(out);
     }
-    for device in list_snapshot_devices(dir)? {
-        let Some((_, generations)) = read_device_overview(dir, &device)? else {
-            continue;
-        };
-        // Task 1 helper: drops the requester's own generations, concurrent
-        // post-boot clients (A16), AND stale clients (A15).
-        let foreign =
-            select_foreign_recent_generation_ids(&generations, exclude_client, boot_cutoff);
-        if foreign.is_empty() {
-            continue;
+    'devices: for device in list_snapshot_devices(dir)? {
+        let mut last_missing: Vec<String> = Vec::new();
+        for _attempt in 0..UNION_READ_ATTEMPTS {
+            let Some((_, generations)) = read_device_overview(dir, &device)? else {
+                continue 'devices; // genuinely absent (e.g. evicted) — skip
+            };
+            // Task 1 helper: drops the requester's own generations, concurrent
+            // post-boot clients (A16), AND stale clients (A15).
+            let foreign =
+                select_foreign_recent_generation_ids(&generations, exclude_client, boot_cutoff);
+            if foreign.is_empty() {
+                continue 'devices;
+            }
+            injected_prune_between_reads(dir);
+            match read_generations_union_by_ids(dir, &device, &foreign)? {
+                ComponentsUnion::Found(union_doc) => {
+                    out.push(DeviceUnion {
+                        device_id: device,
+                        union_doc,
+                    });
+                    continue 'devices;
+                }
+                // A component pruned between the overview scan and the union
+                // read: re-run the WHOLE cycle so selection reflects what
+                // actually survives — never a silent whole-device drop.
+                ComponentsUnion::Missing(ids) => last_missing = ids,
+            }
         }
-        match read_generations_union_by_ids(dir, &device, &foreign)? {
-            ComponentsUnion::Found(union_doc) => out.push(DeviceUnion {
-                device_id: device,
-                union_doc,
-            }),
-            // A component pruned between the overview scan and the union read:
-            // zero surviving generations for this device — skip it.
-            ComponentsUnion::Missing(_) => continue,
-        }
+        tracing::error!(
+            target: "freshell_server::recovery_inventory",
+            device = %device,
+            missing = ?last_missing,
+            attempts = UNION_READ_ATTEMPTS,
+            "recovery_inventory_device_union_incoherent: selected generations kept \
+             disappearing between the overview scan and the union read; failing loud \
+             rather than silently omitting the device from the recovery offer"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "recovery inventory union read incoherent for device {device}: \
+                 {last_missing:?} still missing after {UNION_READ_ATTEMPTS} attempts"
+            ),
+        ));
     }
     Ok(out)
 }

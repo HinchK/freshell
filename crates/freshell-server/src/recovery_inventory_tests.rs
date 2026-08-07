@@ -647,6 +647,128 @@ async fn route_bootagoms_drops_concurrent_post_boot_clients() {
     assert!(tabs.iter().any(|t| t["tabKey"] == "k1"));
 }
 
+/// The generation-file path `write_snapshot` produced (alphanumeric ids need
+/// no escaping) — used to seed the interleaved-prune injection seam.
+fn snapshot_path(
+    dir: &std::path::Path,
+    device: &str,
+    client: &str,
+    captured_at: u64,
+    rev: u64,
+) -> std::path::PathBuf {
+    dir.join(device)
+        .join(format!("{client}-{captured_at:020}-r{rev:012}.json"))
+}
+
+fn open_tab_records(tab_key: &str, updated_at: u64) -> serde_json::Value {
+    json!([
+        {"tabKey": tab_key, "tabId": tab_key, "tabName": tab_key, "status": "open",
+         "revision": 1, "updatedAt": updated_at, "paneCount": 1,
+         "panes": [{"paneId": format!("p-{tab_key}"), "kind": "terminal", "payload": {"mode": "shell"}}]}
+    ])
+}
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// The restart-recovery interleave: every reconnecting client re-pushes right
+/// when the fresh window fetches the inventory, and a push from a client at
+/// its retention cap PRUNES that client's oldest generation — which the
+/// overview scan just selected (selection takes ALL retained generations of
+/// surviving clients). The union read must not answer that benign prune by
+/// silently omitting the ENTIRE device from the recovery offer: a re-read
+/// converges on what actually survives and the device is still offered.
+#[tokio::test]
+async fn transient_prune_between_reads_never_silently_drops_a_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_ms_u64();
+    // The lost client retains two generations (both pre-request, both fresh).
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "lost",
+        now - 240_000,
+        1,
+        open_tab_records("k-old", now - 240_000),
+    );
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "lost",
+        now - 60_000,
+        2,
+        open_tab_records("k1", now - 60_000),
+    );
+    // One concurrent retention prune lands between the overview scan and the
+    // union read, deleting the oldest just-selected generation.
+    INJECTED_PRUNE_BATCHES
+        .lock()
+        .unwrap()
+        .push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 240_000, 1)]);
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(
+        body["recoverable"], true,
+        "a benign concurrent prune must not silently empty the recovery offer"
+    );
+    assert_eq!(body["device"]["deviceId"], "dev1");
+    let tabs = body["device"]["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().any(|t| t["tabKey"] == "k1"),
+        "the device's surviving newest generation must still be offered"
+    );
+}
+
+/// Exhausted re-reads mean the store is churning or incoherent under the
+/// reader: answer LOUD (500 + error log), never a clean 200 whose inventory
+/// silently omits the device (`recovery_inventory.rs` fail-loud policy:
+/// "never a silent empty inventory").
+#[tokio::test]
+async fn persistent_union_incoherence_fails_loud_not_silent_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_ms_u64();
+    for (i, age) in [240_000u64, 180_000, 120_000, 60_000].iter().enumerate() {
+        write_snapshot(
+            tmp.path(),
+            "dev1",
+            "lost",
+            now - age,
+            (i + 1) as u64,
+            open_tab_records("k1", now - age),
+        );
+    }
+    // A prune lands between the two reads on EVERY attempt (each batch is
+    // consumed by one attempt), so the selected set never survives.
+    {
+        let mut batches = INJECTED_PRUNE_BATCHES.lock().unwrap();
+        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 240_000, 1)]);
+        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 180_000, 2)]);
+        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 120_000, 3)]);
+    }
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(
+        code,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "persistent union incoherence must fail loud, not 200 with the device silently missing; got body {body}"
+    );
+}
+
 #[test]
 fn concurrent_fresh_windows_generations_are_dropped() {
     // A16/D2: a client whose ENTIRE retained history postdates the requester's boot is a
