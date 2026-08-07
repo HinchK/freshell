@@ -379,6 +379,24 @@ describe('PaneDivider', () => {
       expect(onResize).toHaveBeenCalledWith(-10)
       expect(onResizeEnd).toHaveBeenCalled()
     })
+
+    it('uses a custom keyboardStep when provided', () => {
+      const onResize = vi.fn()
+      render(
+        <PaneDivider direction="vertical" onResize={onResize} onResizeEnd={vi.fn()} keyboardStep={34} />,
+      )
+      fireEvent.keyDown(screen.getByRole('separator'), { key: 'ArrowDown' })
+      expect(onResize).toHaveBeenCalledWith(34)
+      fireEvent.keyDown(screen.getByRole('separator'), { key: 'ArrowUp' })
+      expect(onResize).toHaveBeenCalledWith(-34)
+    })
+
+    it('uses a custom aria-label when provided', () => {
+      render(
+        <PaneDivider direction="vertical" onResize={vi.fn()} onResizeEnd={vi.fn()} ariaLabel="Resize tab bar height" />,
+      )
+      expect(screen.getByRole('separator', { name: 'Resize tab bar height' })).toBeTruthy()
+    })
   })
 
   describe('snap integration', () => {
