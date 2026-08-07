@@ -4886,7 +4886,9 @@ export class TerminalRegistry extends EventEmitter {
       void isOpencodeSubagentSession(normalized)
         .then((isSubagent) => {
           const current = this.terminals.get(terminalId)
-          if (current) current.resumeTargetIsSubagent = isSubagent || undefined
+          if (current && current.resumeSessionId === normalized) {
+            current.resumeTargetIsSubagent = isSubagent || undefined
+          }
         })
         .catch(() => {})
     }
