@@ -48,3 +48,18 @@
 - Tests: transient_prune_between_reads_never_silently_drops_a_device (RED->GREEN);
   persistent_union_incoherence_fails_loud_not_silent_empty (RED->GREEN).
 - Verify: cargo test -p freshell-server fully green (558 unit + integration binaries); fmt/clippy clean.
+
+## F5 — amplifier sessions freeze with stale recency/preview (effectively invisible in history)  [CONFIRMED, LANDED 73ad20d6c]
+- Promise: every past coding-agent session shows up in my history with correct recency/preview; a real session is never silently buried.
+- Observed: SessionIndex re-parses only when the discovered FileStat (mtime,size) changes
+  (crates/freshell-sessions/src/directory_index.rs:1342-1357), but AmplifierSource discovery statted ONLY
+  metadata.json (amplifier.rs:149-168), while recency + first-message preview come from the transcript/events
+  sidecars (folded at parse, amplifier.rs:379-386). Real amplifier turns/resumes append to sidecars without
+  touching metadata.json -> once cached, last_activity_at + preview freeze forever -> the session sinks to the
+  bottom of recency-sorted history and never resurfaces. Parity break vs Node (refreshes activityMtimeMs every
+  scan). Severity S3/S4 (wrong-silent: session there but unfindable where the user looks).
+- Fix: fold_activity_mtime() folds the two sidecars' mtimes (stat-only) into the discovered FileStat.mtime_ms,
+  so a sidecar write invalidates the cache and refreshes recency+preview. Provider-local; one call-site.
+- Test: session_index_refreshes_amplifier_recency_when_only_sidecar_changes (through the real incremental sweep) — RED (stuck at Some(1000)) -> GREEN.
+- Verify: cargo test -p freshell-sessions green (lib 176; parity/resolve/locators/liveness suites). Only amplifier.rs touched.
+- Review: PASS (independent) — confirmed the (mtime,size)-on-metadata-only gate froze sidecar-driven recency; fold is stat-only (no content read), test drives the REAL incremental sweep and fails pre-fix deterministically, other providers byte-identical, no churn.

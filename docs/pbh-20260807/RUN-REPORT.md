@@ -5,7 +5,7 @@
 **Coordination:** agmsg not installed → append-only JSONL equivalent.
 **Skill exercised:** `~/code/skill-parallel-development` (parallel-bug-hunt), first live run.
 
-## Outcome — 2 user-facing bugs fixed, closed-loop, both independently reviewed PASS
+## Outcome — 4 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
 
 ### F1 — freshclaude approvals/answers silently dropped  [S2/S3 · LANDED 6c5f9ad86 · review PASS]
 The freshAgent WS dispatch (`crates/freshell-ws/src/terminal.rs`) routed `approval.respond`,
@@ -27,6 +27,21 @@ promise. Fix distinguishes an explicit release (user closed it from every pane) 
 disconnected-but-wanted terminals now live under the existing 24h hard cap; genuine orphans still reap at
 the configured threshold (no PTY leak). Three tests (RED→GREEN). Independent review confirmed no leak, the
 flag resets on re-attach (not a one-way latch), and every case is bounded at 24h.
+
+### F4 — recover-my-panes inventory silently omits a whole device  [S3 · LANDED 75f641d47 · review PASS]
+`GET /api/recovery/inventory` did two separately-locked store reads; a concurrent `tabs.sync.push` at the
+retention cap prunes a just-selected snapshot generation between them, and the `Missing => continue` arm
+dropped the WHOLE device — a clean 200 with `recoverable:false` for a workspace fully on disk. Correlated
+with restart (every window re-pushes exactly when the fresh window fetches inventory). Fix: bounded per-device
+re-read that re-selects from survivors; still-incoherent → loud 500, never a silent empty. Two RED→GREEN tests.
+Review confirmed it discriminates true emptiness (still 200) from churn (loud 500), retry is bounded, normal path unchanged.
+
+### F5 — amplifier sessions freeze in history (stale recency/preview, effectively invisible)  [S3/S4 · LANDED 73ad20d6c · review PASS]
+The session index re-parses only when metadata.json's (mtime,size) changes, but amplifier recency + preview come
+from transcript/events sidecars — so real turns/resumes (sidecar-only appends) never refreshed, freezing the
+session at first-parse and sinking it to the bottom of the recency-sorted history where the user can't find it.
+Fix folds the sidecars' mtimes (stat-only) into the discovered stat so a sidecar write invalidates the cache.
+RED→GREEN through the real incremental sweep. Review confirmed stat-only (no perf regression), other providers byte-identical.
 
 ### F3 — provider resume after restart  [AUDIT_WRONG — already fixed]
 Candidate: codex/opencode sessions unresumable after a server restart. Adjudication found this is **not a
