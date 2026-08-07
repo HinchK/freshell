@@ -7,7 +7,7 @@
 
 **Goal:** Make multirow tabs the default, give tabs mode-specific widths (multirow: 150–200px stretch-to-fill; single-row: fixed 175px), and let users drag-resize how many tab rows are visible (default 3), persisted per-browser.
 
-**Architecture:** All changes are in the browser client. The multirow setting `panes.multirowTabs` already exists as a browser-local setting (persisted in the `freshell.browser-preferences.v1` localStorage blob, never sent to the server) — we flip its default. A new sibling local setting `panes.tabBarRows` (default 3, clamp 1–10) drives an inline `max-height` on the tab strip, replacing the hard-coded `max-h-32` Tailwind class. A new `TabBarResizeHandle` component wraps the existing `PaneDivider` splitter (the same one used for pane splits and sidebar width) at the bottom edge of the tab bar, converting drag deltas to row counts.
+**Architecture:** All changes are in the browser client. The multirow setting `panes.multirowTabs` already exists as a browser-local setting (persisted in the `freshell.browser-preferences.v1` localStorage blob, never sent to the server) — we flip its default. A new sibling local setting `panes.tabBarRows` (default 3, clamp 1–10) drives an inline rem-based `max-height` calc() on the tab strip, replacing the hard-coded `max-h-32` Tailwind class (rem so it tracks the app's `--ui-scale` root-font scaling). A new `TabBarResizeHandle` component wraps the existing `PaneDivider` splitter (the same one used for pane splits and sidebar width) at the bottom edge of the tab bar, converting drag deltas to row counts.
 
 **Tech Stack:** React 18 + Redux Toolkit + Tailwind (client under `src/`), shared settings contract in `shared/settings.ts`, Vitest + Testing Library (jsdom) for unit tests under `test/unit/`, Playwright for e2e under `test/e2e-browser/specs/`.
 
@@ -22,6 +22,7 @@
 - Red-Green-Refactor TDD is mandatory (AGENTS.md); every behavior change gets unit AND e2e coverage.
 - `console.error` is fatal in unit tests (`test/setup/dom.ts` throws in afterEach).
 - Tailwind JIT cannot see interpolated class names — dynamic heights MUST use inline `style`, never `` `max-h-${n}` ``.
+- All row-pitch math MUST be scale-aware. Tailwind spacing is rem-based and `src/index.css:16-20` scales the root font-size by `--ui-scale` = (terminal.fontSize/16) × uiScale (written unconditionally by `src/hooks/useTheme.ts`; real user range ~0.56–16; default 1.0). One row + gap is **2.125rem plus a fixed 1px `pt-px`**, NOT a constant 34px. Inline strip heights are emitted as rem-based `calc()`; any runtime px conversion reads the live root font-size at interaction/measure time. Hard-coded px row math in `src/` is a defect; px assertions are valid only in e2e at the default scale.
 - Do not run `gh pr create` or push to `origin/main` (AGENTS.md).
 - README.md is the only end-user markdown doc; do not create new user-facing .md files. `docs/index.html` (the marketing mock) must reflect the new default (major user-facing UI change).
 - Commit after every task with a focused conventional-commit message.
@@ -48,7 +49,7 @@ npm run lint && npm run typecheck
 |---|---|
 | `shared/settings.ts` | Modify: flip `multirowTabs` default; add `tabBarRows` (type, local-key registration, default, seed normalizer, min/max/default constants) |
 | `src/store/browserPreferencesPersistence.ts` | Modify: `assignChangedScalar` line for `tabBarRows` (without it the value is silently dropped on write) |
-| `src/lib/tab-bar-metrics.ts` | **Create**: pure row-count ⇄ pixel-height conversion helpers + layout constants |
+| `src/lib/tab-bar-metrics.ts` | **Create**: pure scale-aware row-count ⇄ height helpers (rem-based calc strings + px helpers parameterized by root font-size) |
 | `src/components/panes/PaneDivider.tsx` | Modify: optional `keyboardStep` and `ariaLabel` props (backward compatible) |
 | `src/components/TabBarResizeHandle.tsx` | **Create**: drag/keyboard handle that converts PaneDivider deltas into row counts |
 | `src/components/TabBar.tsx` | Modify: selector fallback, mode-specific tab widths, inline strip max-height, multiple-row detection, render handle |
@@ -74,7 +75,7 @@ Key reference points in current code (line numbers approximate; the code excerpt
 - Setting default: `shared/settings.ts` `defaultLocalSettings.panes.multirowTabs: false` (~line 893).
 - Selector: `src/components/TabBar.tsx` — `const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)` (~line 201/320 depending on revision).
 
-Row-height math used everywhere below: a tab row is `h-8` = 32px, wrapped rows are separated by `gap-0.5` = 2px, the strip has `pt-px` = 1px top padding. So **maxHeight(n rows) = 32n + 2(n−1) + 1 = 34n − 1**: 1 row → 33px, 2 → 67px, 3 → **101px**, 4 → 135px, 5 → 169px, 10 → 339px.
+Row-height math used everywhere below: a tab row is `h-8` = **2rem**, wrapped rows are separated by `gap-0.5` = **0.125rem**, the strip has `pt-px` = **1px** top padding (fixed physical px, non-rem). So **maxHeight(n rows) = calc((2.125n − 0.125)rem + 1px)**. The root font-size is 16px × `--ui-scale` (default 1.0 post-hydration — verified: `defaultLocalSettings` has `uiScale: 1`, `terminal.fontSize: 16`, and `useTheme.ts` always writes `--ui-scale`, overriding the 1.25 CSS fallback), so at the **default scale** this resolves to 34n − 1 px: 1 row → 33px, 2 → 67px, 3 → **101px**, 4 → 135px, 5 → 169px, 10 → 339px. These px values are used ONLY in e2e assertions (which run at the default scale) — never hard-code them in `src/`, where they are wrong for any scaled user.
 
 ---
 
@@ -446,7 +447,7 @@ git commit -m "feat(tabs): add browser-local panes.tabBarRows setting (default 3
 
 ---
 
-### Task 3: Tab bar metrics module (rows ⇄ pixels)
+### Task 3: Tab bar metrics module (rows ⇄ height, scale-aware)
 
 **Files:**
 - Create: `src/lib/tab-bar-metrics.ts`
@@ -455,10 +456,12 @@ git commit -m "feat(tabs): add browser-local panes.tabBarRows setting (default 3
 **Interfaces:**
 - Consumes: `TAB_BAR_ROWS_MIN`, `TAB_BAR_ROWS_MAX` from `@shared/settings` (Task 2).
 - Produces (used by Tasks 5, 6, 7):
-  - `tabBarRowsToMaxHeightPx(rows: number): number` — clamped; 3 → 101.
-  - `tabBarHeightPxToRows(px: number): number` — nearest row, clamped to 1–10.
-  - `TAB_BAR_KEYBOARD_STEP_PX = 34` (one row per arrow press).
-  - `TAB_BAR_MULTI_ROW_THRESHOLD_PX = 35` (strip scrollHeight above this ⇒ >1 row).
+  - `tabBarRowsToMaxHeightCss(rows: number): string` — clamped; 3 → `'calc(6.25rem + 1px)'` (the strip's inline max-height; rem-based so it tracks `--ui-scale` automatically).
+  - `getRootFontSizePx(): number` — live root font-size via `getComputedStyle(document.documentElement)`, falling back to 16 when unparseable (jsdom).
+  - `tabBarRowPitchPx(rootFontSizePx: number): number` — one row + gap in px; 16 → 34, 20 → 42.5 (the keyboard step: one row per arrow press).
+  - `tabBarRowsToMaxHeightPx(rows: number, rootFontSizePx: number): number` — clamped; (3, 16) → 101, (3, 20) → 126.
+  - `tabBarHeightPxToRows(px: number, rootFontSizePx: number): number` — nearest row, clamped to 1–10.
+  - `tabBarMultiRowThresholdPx(rootFontSizePx: number): number` — strip scrollHeight above this ⇒ >1 row; 16 → 35, 20 → 43.5 (sits strictly between one row = 2·root+1 and two rows = 4.125·root+1 at any scale).
 
 - [ ] **Step 1: Write the failing tests (RED)**
 
@@ -468,48 +471,70 @@ Create `test/unit/client/lib/tab-bar-metrics.test.ts`:
 import { describe, expect, it } from 'vitest'
 
 import {
-  TAB_BAR_KEYBOARD_STEP_PX,
-  TAB_BAR_MULTI_ROW_THRESHOLD_PX,
+  getRootFontSizePx,
   tabBarHeightPxToRows,
+  tabBarMultiRowThresholdPx,
+  tabBarRowPitchPx,
+  tabBarRowsToMaxHeightCss,
   tabBarRowsToMaxHeightPx,
 } from '@/lib/tab-bar-metrics'
 
 describe('tab-bar-metrics', () => {
-  it('computes the strip max-height for a row count (34n - 1)', () => {
-    expect(tabBarRowsToMaxHeightPx(1)).toBe(33)
-    expect(tabBarRowsToMaxHeightPx(2)).toBe(67)
-    expect(tabBarRowsToMaxHeightPx(3)).toBe(101)
-    expect(tabBarRowsToMaxHeightPx(5)).toBe(169)
+  it('emits a rem-based calc() max-height for a row count ((2.125n - 0.125)rem + 1px)', () => {
+    expect(tabBarRowsToMaxHeightCss(1)).toBe('calc(2rem + 1px)')
+    expect(tabBarRowsToMaxHeightCss(3)).toBe('calc(6.25rem + 1px)')
+    expect(tabBarRowsToMaxHeightCss(5)).toBe('calc(10.5rem + 1px)')
   })
 
   it('clamps the row count to the allowed range', () => {
-    expect(tabBarRowsToMaxHeightPx(0)).toBe(33)
-    expect(tabBarRowsToMaxHeightPx(99)).toBe(339)
+    expect(tabBarRowsToMaxHeightCss(0)).toBe('calc(2rem + 1px)')
+    expect(tabBarRowsToMaxHeightCss(99)).toBe('calc(21.125rem + 1px)')
+    expect(tabBarRowsToMaxHeightPx(0, 16)).toBe(33)
+    expect(tabBarRowsToMaxHeightPx(99, 16)).toBe(339)
   })
 
-  it('is inverted by tabBarHeightPxToRows', () => {
-    for (const rows of [1, 2, 3, 5, 10]) {
-      expect(tabBarHeightPxToRows(tabBarRowsToMaxHeightPx(rows))).toBe(rows)
+  it('computes px heights from an explicit root font-size (default and 1.25 scale)', () => {
+    expect(tabBarRowsToMaxHeightPx(1, 16)).toBe(33)
+    expect(tabBarRowsToMaxHeightPx(2, 16)).toBe(67)
+    expect(tabBarRowsToMaxHeightPx(3, 16)).toBe(101)
+    expect(tabBarRowsToMaxHeightPx(5, 16)).toBe(169)
+    expect(tabBarRowsToMaxHeightPx(3, 20)).toBe(126) // uiScale 1.25 => 20px root
+  })
+
+  it('is inverted by tabBarHeightPxToRows at any scale', () => {
+    for (const rootPx of [16, 20]) {
+      for (const rows of [1, 2, 3, 5, 10]) {
+        expect(tabBarHeightPxToRows(tabBarRowsToMaxHeightPx(rows, rootPx), rootPx)).toBe(rows)
+      }
     }
   })
 
   it('rounds a mid-drag height to the nearest row', () => {
-    expect(tabBarHeightPxToRows(117)).toBe(3)
-    expect(tabBarHeightPxToRows(118)).toBe(4)
+    expect(tabBarHeightPxToRows(117, 16)).toBe(3)
+    expect(tabBarHeightPxToRows(118, 16)).toBe(4)
   })
 
   it('clamps heights outside the range', () => {
-    expect(tabBarHeightPxToRows(-50)).toBe(1)
-    expect(tabBarHeightPxToRows(10_000)).toBe(10)
+    expect(tabBarHeightPxToRows(-50, 16)).toBe(1)
+    expect(tabBarHeightPxToRows(10_000, 16)).toBe(10)
   })
 
-  it('keyboard step is exactly one row pitch', () => {
-    expect(TAB_BAR_KEYBOARD_STEP_PX).toBe(34)
+  it('keyboard step is exactly one row pitch at the given scale', () => {
+    expect(tabBarRowPitchPx(16)).toBe(34)
+    expect(tabBarRowPitchPx(20)).toBe(42.5)
   })
 
-  it('single-row threshold sits between one and two rows', () => {
-    expect(TAB_BAR_MULTI_ROW_THRESHOLD_PX).toBeGreaterThan(33)
-    expect(TAB_BAR_MULTI_ROW_THRESHOLD_PX).toBeLessThan(67)
+  it('multi-row threshold sits strictly between one and two rows at any scale', () => {
+    for (const rootPx of [16, 20]) {
+      const oneRowScrollHeight = 2 * rootPx + 1 // h-8 + pt-px
+      const twoRowScrollHeight = 4.125 * rootPx + 1 // 2 rows + 1 gap + pt-px
+      expect(tabBarMultiRowThresholdPx(rootPx)).toBeGreaterThan(oneRowScrollHeight)
+      expect(tabBarMultiRowThresholdPx(rootPx)).toBeLessThan(twoRowScrollHeight)
+    }
+  })
+
+  it('falls back to a 16px root when the computed font-size is unparseable (jsdom)', () => {
+    expect(getRootFontSizePx()).toBe(16)
   })
 })
 ```
@@ -526,40 +551,67 @@ Create `src/lib/tab-bar-metrics.ts`:
 ```ts
 import { TAB_BAR_ROWS_MAX, TAB_BAR_ROWS_MIN } from '@shared/settings'
 
-/** Height of one tab row: TabItem is h-8 (32px). */
-export const TAB_ROW_HEIGHT_PX = 32
-/** Vertical gap between wrapped rows: the strip uses gap-0.5 (2px). */
-export const TAB_ROW_GAP_PX = 2
-/** Top padding of the strip: pt-px (1px). */
+/**
+ * All Tailwind spacing is rem-based and the app scales the root font-size via
+ * `--ui-scale` (src/index.css:16-20, written by src/hooks/useTheme.ts), so the
+ * rows ⇄ height model is expressed in rem — never absolute px. The strip's
+ * `pt-px` top padding is a fixed physical 1px and stays OUTSIDE the rem terms.
+ */
+
+/** Height of one tab row: TabItem is h-8 (2rem). */
+export const TAB_ROW_HEIGHT_REM = 2
+/** Vertical gap between wrapped rows: the strip uses gap-0.5 (0.125rem). */
+export const TAB_ROW_GAP_REM = 0.125
+/** One row plus its wrap gap — the row pitch. */
+export const TAB_ROW_PITCH_REM = TAB_ROW_HEIGHT_REM + TAB_ROW_GAP_REM
+/** Top padding of the strip: pt-px (fixed 1px, non-rem). */
 export const TAB_STRIP_TOP_PADDING_PX = 1
-/** One keyboard arrow press on the resize handle moves exactly one row. */
-export const TAB_BAR_KEYBOARD_STEP_PX = TAB_ROW_HEIGHT_PX + TAB_ROW_GAP_PX
-/** A strip whose scrollHeight exceeds this is rendering more than one row. */
-export const TAB_BAR_MULTI_ROW_THRESHOLD_PX =
-  TAB_ROW_HEIGHT_PX + TAB_STRIP_TOP_PADDING_PX + TAB_ROW_GAP_PX
 
 function clampRows(rows: number): number {
   return Math.min(TAB_BAR_ROWS_MAX, Math.max(TAB_BAR_ROWS_MIN, Math.round(rows)))
 }
 
-/** Max-height in px of the tab strip when showing `rows` full rows. */
-export function tabBarRowsToMaxHeightPx(rows: number): number {
+/** Inline max-height for the strip showing `rows` full rows; rem-based so it tracks --ui-scale. */
+export function tabBarRowsToMaxHeightCss(rows: number): string {
   const clamped = clampRows(rows)
-  return clamped * TAB_ROW_HEIGHT_PX + (clamped - 1) * TAB_ROW_GAP_PX + TAB_STRIP_TOP_PADDING_PX
+  return `calc(${TAB_ROW_PITCH_REM * clamped - TAB_ROW_GAP_REM}rem + ${TAB_STRIP_TOP_PADDING_PX}px)`
+}
+
+/** Live root font-size in px; falls back to 16 when unparseable (jsdom has no --ui-scale cascade). */
+export function getRootFontSizePx(): number {
+  const parsed = Number.parseFloat(getComputedStyle(document.documentElement).fontSize)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 16
+}
+
+/** One row pitch (row + gap) in px at the given root font-size — the keyboard step. */
+export function tabBarRowPitchPx(rootFontSizePx: number): number {
+  return TAB_ROW_PITCH_REM * rootFontSizePx
+}
+
+/** Max-height in px of the strip showing `rows` full rows at the given root font-size. */
+export function tabBarRowsToMaxHeightPx(rows: number, rootFontSizePx: number): number {
+  const clamped = clampRows(rows)
+  return (TAB_ROW_PITCH_REM * clamped - TAB_ROW_GAP_REM) * rootFontSizePx + TAB_STRIP_TOP_PADDING_PX
 }
 
 /** Nearest row count for a strip height in px (inverse of tabBarRowsToMaxHeightPx). */
-export function tabBarHeightPxToRows(px: number): number {
+export function tabBarHeightPxToRows(px: number, rootFontSizePx: number): number {
   return clampRows(
-    (px + TAB_ROW_GAP_PX - TAB_STRIP_TOP_PADDING_PX) / (TAB_ROW_HEIGHT_PX + TAB_ROW_GAP_PX),
+    (px - TAB_STRIP_TOP_PADDING_PX + TAB_ROW_GAP_REM * rootFontSizePx) /
+      tabBarRowPitchPx(rootFontSizePx),
   )
+}
+
+/** A strip whose scrollHeight exceeds this (at the given root font-size) renders >1 row. */
+export function tabBarMultiRowThresholdPx(rootFontSizePx: number): number {
+  return tabBarRowPitchPx(rootFontSizePx) + TAB_STRIP_TOP_PADDING_PX
 }
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/tab-bar-metrics.test.ts`
-Expected: PASS (8 tests).
+Expected: PASS (9 tests). (If jsdom's `getComputedStyle(document.documentElement).fontSize` returns a parseable `'16px'` rather than `''`, the fallback test still passes — both paths yield 16.)
 
 - [ ] **Step 5: Commit**
 
@@ -573,7 +625,7 @@ git commit -m "feat(tabs): add tab bar row/pixel metrics helpers"
 ### Task 4: Mode-specific tab widths (multirow 150–200 stretch, single-row fixed 175)
 
 **Files:**
-- Modify: `src/components/TabBar.tsx` (`SortableTabProps`, `SortableTab` wrapper className, `renderSortableTab` call site, `DragOverlay` width)
+- Modify: `src/components/TabBar.tsx` (`SortableTabProps`, `SortableTab` wrapper className + transform style, `renderSortableTab` call site, `DragOverlay` width)
 - Test: `test/unit/client/components/TabBar.multirow.test.tsx`
 - Test: `test/e2e-browser/specs/multirow-tabs.spec.ts`
 - Test (conditional): any other unit test asserting `w-[180px]` / `min-w-[100px]`
@@ -684,6 +736,14 @@ interface SortableTabProps {
 
 (The ghost is a fixed-size floating copy; 175px sits inside the multirow 150–200 range and exactly matches single-row tabs.)
 
+(e) In `SortableTab`'s style object (currently `transform: DndCSS.Transform.toString(transform)`, ~line 113), switch to the translate-only serializer:
+
+```ts
+    transform: DndCSS.Translate.toString(transform),
+```
+
+Why: `rectSortingStrategy` emits `scaleX`/`scaleY` = newRect/oldRect ratios; with the new variable tab widths (150–200px stretch-to-fill) `CSS.Transform` visibly stretches tabs up to ~1.33× mid-drag. `CSS.Translate` drops the scale factors — the dnd-kit maintainer's recommended fix for variable-size sortables (dnd-kit issue #117). With the old uniform widths the two serializers were visually identical, so no existing drag behavior changes; drop-order computation is unaffected either way.
+
 - [ ] **Step 4: Run the unit tests**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TabBar.multirow.test.tsx`
@@ -752,8 +812,8 @@ git commit -m "feat(tabs): mode-specific tab widths (multirow 150-200px stretch,
 - Test: `test/e2e-browser/specs/multirow-tabs.spec.ts`
 
 **Interfaces:**
-- Consumes: `panes.tabBarRows` (Task 2), `tabBarRowsToMaxHeightPx` + `TAB_BAR_ROWS_DEFAULT` (Tasks 2–3).
-- Produces: the strip (`data-testid="tab-strip"`) exposes `style.maxHeight = '<34n-1>px'` in multirow mode (101px at the default 3 rows) and no inline max-height in single-row mode. `max-h-32` is gone. Task 7's handle changes rows and this maxHeight follows via Redux.
+- Consumes: `panes.tabBarRows` (Task 2), `tabBarRowsToMaxHeightCss` + `TAB_BAR_ROWS_DEFAULT` (Tasks 2–3).
+- Produces: the strip (`data-testid="tab-strip"`) exposes `style.maxHeight = 'calc((2.125n − 0.125)rem + 1px)'` in multirow mode (`'calc(6.25rem + 1px)'` at the default 3 rows — computes to 101px at the default UI scale) and no inline max-height in single-row mode. `max-h-32` is gone. Task 7's handle changes rows and this maxHeight follows via Redux; UI-scale changes re-resolve the rem calc natively in CSS with no re-render needed.
 
 - [ ] **Step 1: Write/adjust the failing unit tests (RED)**
 
@@ -764,8 +824,10 @@ In `test/unit/client/components/TabBar.multirow.test.tsx`:
 ```tsx
       const strip = screen.getByTestId('tab-strip')
       expect(strip.className).not.toContain('max-h-32')
-      expect(strip.style.maxHeight).toBe('101px')
+      expect(strip.style.maxHeight).toBe('calc(6.25rem + 1px)')
 ```
+
+(If jsdom's CSSOM normalizes or drops the calc() value so `style.maxHeight` reads differently, assert on the raw attribute instead — `expect(strip.getAttribute('style')).toContain('calc(6.25rem + 1px)')` — adjust the assertion shape only, never the rem-based calc design.)
 
 (b) Add two new tests:
 
@@ -773,7 +835,7 @@ In `test/unit/client/components/TabBar.multirow.test.tsx`:
   it('derives the strip max-height from panes.tabBarRows', () => {
     const store = createStore({ tabs: [/* existing fixture */], activeTabId: /* its id */, multirowTabs: true, tabBarRows: 5 })
     renderWithStore(<TabBar />, store)
-    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('169px')
+    expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(10.5rem + 1px)')
   })
 
   it('applies no inline max-height in single-row mode', () => {
@@ -809,7 +871,7 @@ In `src/components/TabBar.tsx`:
 
 ```ts
 import { TAB_BAR_ROWS_DEFAULT } from '@shared/settings'
-import { tabBarRowsToMaxHeightPx } from '@/lib/tab-bar-metrics'
+import { tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
 ```
 
 (If this file does not already import from `@shared/settings`, keep the alias — it is the same alias the stores and tests use.)
@@ -832,7 +894,7 @@ import { tabBarRowsToMaxHeightPx } from '@/lib/tab-bar-metrics'
                 ? "flex-wrap overflow-y-auto"
                 : "overflow-x-auto overflow-y-hidden scrollbar-none"
             )}
-            style={multirowTabs ? { maxHeight: tabBarRowsToMaxHeightPx(tabBarRows) } : undefined}
+            style={multirowTabs ? { maxHeight: tabBarRowsToMaxHeightCss(tabBarRows) } : undefined}
           >
             {tabs.map(renderSortableTab)}
           </div>
@@ -848,6 +910,7 @@ Expected: tests PASS; grep finds no remaining `max-h-32` in `src/` or `test/unit
 In `test/e2e-browser/specs/multirow-tabs.spec.ts`, test `'multi-row mode applies flex-wrap to tab strip'`: replace `await expect(tabStrip).toHaveClass(/max-h-32/)` with:
 
 ```ts
+    // calc(6.25rem + 1px) computes to 101px at the default --ui-scale of 1.
     await expect(tabStrip).toHaveCSS('max-height', '101px')
 ```
 
@@ -877,7 +940,7 @@ git commit -m "feat(tabs): size the multirow tab strip from the tabBarRows setti
 - Consumes: `PaneDivider` (delta-based `onResize(delta, shiftHeld?)`, `onResizeEnd()`, document-level mouse/touch listeners, keyboard arrows), metrics from Task 3.
 - Produces (used by Task 7):
   - `PaneDivider` gains optional `keyboardStep?: number` (px per arrow press, default 10 — existing consumers unchanged) and `ariaLabel?: string` (defaults to the existing generic label).
-  - `TabBarResizeHandle` with props `{ rows: number; onRowsChange: (rows: number) => void }`; renders an absolutely-positioned hover splitter (`data-testid="tab-bar-resize-handle"`, accessible name `"Resize tab bar height"`) straddling the tab bar's bottom edge.
+  - `TabBarResizeHandle` with props `{ rows: number; onRowsChange: (rows: number) => void }`; renders an absolutely-positioned hover splitter (`data-testid="tab-bar-resize-handle"`, accessible name `"Resize tab bar height"`) sitting immediately BELOW the tab bar's bottom edge (bottom-only overlay — a straddling `translate-y-1/2` position would cover the bottom ~6px of every bottom-row tab and steal their click/close/drag pointerdown, verified by hit-testing analysis).
 
 - [ ] **Step 1: Write the failing PaneDivider prop tests (RED)**
 
@@ -1006,6 +1069,8 @@ describe('TabBarResizeHandle', () => {
 })
 ```
 
+(jsdom cannot resolve the app's `--ui-scale` CSS cascade, so `getRootFontSizePx()` falls back to 16 and the px math in these tests matches the default scale: pitch 34px, 3 rows = 101px.)
+
 Run: `npm run test:vitest -- run test/unit/client/components/TabBarResizeHandle.test.tsx`
 Expected: FAIL — module does not exist.
 
@@ -1018,8 +1083,9 @@ import { useCallback, useEffect, useRef } from 'react'
 
 import { PaneDivider } from '@/components/panes'
 import {
-  TAB_BAR_KEYBOARD_STEP_PX,
+  getRootFontSizePx,
   tabBarHeightPxToRows,
+  tabBarRowPitchPx,
   tabBarRowsToMaxHeightPx,
 } from '@/lib/tab-bar-metrics'
 
@@ -1031,8 +1097,9 @@ interface TabBarResizeHandleProps {
 }
 
 /**
- * Hover splitter at the bottom edge of the multirow tab bar. Converts
- * PaneDivider's incremental pixel deltas into whole-row changes.
+ * Hover splitter sitting just below the multirow tab bar's bottom edge. Converts
+ * PaneDivider's incremental pixel deltas into whole-row changes. All px math reads
+ * the live root font-size so it stays correct under any --ui-scale.
  */
 export default function TabBarResizeHandle({ rows, onRowsChange }: TabBarResizeHandleProps) {
   // Accumulated height in px during an active drag; null when idle.
@@ -1043,10 +1110,11 @@ export default function TabBarResizeHandle({ rows, onRowsChange }: TabBarResizeH
   }, [rows])
 
   const handleResize = useCallback((delta: number) => {
-    const base = dragPxRef.current ?? tabBarRowsToMaxHeightPx(rowsRef.current)
+    const rootPx = getRootFontSizePx()
+    const base = dragPxRef.current ?? tabBarRowsToMaxHeightPx(rowsRef.current, rootPx)
     const next = base + delta
     dragPxRef.current = next
-    const nextRows = tabBarHeightPxToRows(next)
+    const nextRows = tabBarHeightPxToRows(next, rootPx)
     if (nextRows !== rowsRef.current) {
       rowsRef.current = nextRows
       onRowsChange(nextRows)
@@ -1059,14 +1127,17 @@ export default function TabBarResizeHandle({ rows, onRowsChange }: TabBarResizeH
 
   return (
     <div
-      className="absolute inset-x-0 bottom-0 z-30 translate-y-1/2"
+      // Bottom-only overlay: sits entirely BELOW the bar's bottom edge, over the top
+      // 12px of the pane area. A straddling position (translate-y-1/2) would cover the
+      // bottom ~6px of every bottom-row tab and steal their click/close/drag pointerdown.
+      className="absolute inset-x-0 bottom-0 z-30 translate-y-full"
       data-testid="tab-bar-resize-handle"
     >
       <PaneDivider
         direction="vertical"
         onResize={handleResize}
         onResizeEnd={handleResizeEnd}
-        keyboardStep={TAB_BAR_KEYBOARD_STEP_PX}
+        keyboardStep={tabBarRowPitchPx(getRootFontSizePx())}
         ariaLabel="Resize tab bar height"
       />
     </div>
@@ -1074,7 +1145,7 @@ export default function TabBarResizeHandle({ rows, onRowsChange }: TabBarResizeH
 }
 ```
 
-(`PaneDivider` is exported from the barrel `src/components/panes/index.ts`. Note `onResizeEnd` fires after every keyboard step too, which resets the accumulator — that is exactly why `keyboardStep` is one full row pitch, 34px.)
+(`PaneDivider` is exported from the barrel `src/components/panes/index.ts`. Note `onResizeEnd` fires after every keyboard step too, which resets the accumulator — that is exactly why `keyboardStep` is one full row pitch: `tabBarRowPitchPx(getRootFontSizePx())`, 34px at the default scale. The render-time read can go stale if the UI scale changes without a TabBar re-render — an edge case of an edge case; drag conversion always reads the live root font-size at event time.)
 
 - [ ] **Step 5: Run the tests**
 
@@ -1098,7 +1169,7 @@ git commit -m "feat(tabs): tab bar resize handle built on PaneDivider (keyboardS
 - Test: `test/unit/client/components/TabBar.multirow.test.tsx`
 
 **Interfaces:**
-- Consumes: `TabBarResizeHandle` (Task 6), `TAB_BAR_MULTI_ROW_THRESHOLD_PX` (Task 3), `updateSettingsLocal` from `@/store/settingsSlice`, the strip node via the existing `multirowContainerRef`.
+- Consumes: `TabBarResizeHandle` (Task 6), `tabBarMultiRowThresholdPx` + `getRootFontSizePx` (Task 3), `updateSettingsLocal` from `@/store/settingsSlice`, the strip node via the existing `multirowContainerRef`.
 - Produces: handle rendered only when `multirowTabs && hasMultipleRows`; dragging/keying it dispatches `updateSettingsLocal({ panes: { tabBarRows } })`, which re-renders the strip max-height (Task 5) and persists via the browser-preferences middleware (Task 2).
 
 - [ ] **Step 1: Write the failing integration tests (RED)**
@@ -1136,11 +1207,11 @@ In `test/unit/client/components/TabBar.multirow.test.tsx`, add a `describe('tab 
       try {
         const store = createStore({ tabs: [/* fixture */], activeTabId: /* id */, multirowTabs: true })
         renderWithStore(<TabBar />, store)
-        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('101px')
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(6.25rem + 1px)')
 
         fireEvent.keyDown(screen.getByRole('separator', { name: 'Resize tab bar height' }), { key: 'ArrowDown' })
 
-        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('135px')
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(8.375rem + 1px)')
         expect(store.getState().settings.localSettings.panes.tabBarRows).toBe(4)
       } finally {
         scrollHeightSpy.mockRestore()
@@ -1165,7 +1236,7 @@ In `src/components/TabBar.tsx`:
 ```ts
 import { useState } from 'react' // merge into the existing react import
 import TabBarResizeHandle from '@/components/TabBarResizeHandle'
-import { TAB_BAR_MULTI_ROW_THRESHOLD_PX } from '@/lib/tab-bar-metrics' // merge with the Task 5 import
+import { getRootFontSizePx, tabBarMultiRowThresholdPx } from '@/lib/tab-bar-metrics' // merge with the Task 5 import
 import { updateSettingsLocal } from '@/store/settingsSlice'
 ```
 
@@ -1182,7 +1253,12 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
     const node = multirowContainerRef.current
     if (!node) return
     const update = () => {
-      setHasMultipleRows(node.scrollHeight > TAB_BAR_MULTI_ROW_THRESHOLD_PX)
+      // Threshold computed at measure time from the live root font-size: scrollHeight
+      // and threshold scale together under any --ui-scale, including the pre-hydration
+      // window where the CSS fallback (1.25) still governs (child effects run before
+      // App's useTheme effect writes --ui-scale; the scale write resizes the strip,
+      // which re-fires the ResizeObserver and re-measures).
+      setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(getRootFontSizePx()))
     }
     update()
     if (typeof ResizeObserver === 'undefined') return
@@ -1210,7 +1286,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
       )}
 ```
 
-(The wrapper is `relative`, so the handle's `absolute inset-x-0 bottom-0 translate-y-1/2` straddles the bar's bottom edge; `z-30` keeps it above the 1px bottom rule and the pane area below.)
+(The wrapper is `relative`, so the handle's `absolute inset-x-0 bottom-0 translate-y-full` sits immediately below the bar's bottom edge, over the top 12px of the pane area; `z-30` keeps it above the 1px bottom rule and the pane content below. It must NOT straddle the edge — that would cover the bottom ~6px of bottom-row tabs and steal their pointerdown.)
 
 - [ ] **Step 4: Run the tests**
 
@@ -1258,7 +1334,7 @@ test.describe('Tab bar height resize', () => {
 
     const tabStrip = page.getByTestId('tab-strip')
     await expect(tabStrip).toHaveClass(/flex-wrap/)
-    // Default: exactly 3 rows visible (3*32 + 2*2 + 1 = 101px).
+    // Default: exactly 3 rows visible — calc(6.25rem + 1px) = 101px at the default --ui-scale of 1.
     await expect(tabStrip).toHaveCSS('max-height', '101px')
 
     const handle = page.getByRole('separator', { name: 'Resize tab bar height' })
@@ -1270,10 +1346,10 @@ test.describe('Tab bar height resize', () => {
     const startY = box!.y + box!.height / 2
     await page.mouse.move(startX, startY)
     await page.mouse.down()
-    await page.mouse.move(startX, startY + 68, { steps: 4 }) // +2 rows
+    await page.mouse.move(startX, startY + 68, { steps: 4 }) // +2 rows at the default scale (row pitch 34px)
     await page.mouse.up()
 
-    // 5 rows: 5*32 + 4*2 + 1 = 169px.
+    // 5 rows: calc(10.5rem + 1px) = 169px at the default scale.
     await expect(tabStrip).toHaveCSS('max-height', '169px')
   })
 
@@ -1291,7 +1367,7 @@ test.describe('Tab bar height resize', () => {
     await handle.focus()
     await page.keyboard.press('ArrowUp')
 
-    // 2 rows: 2*32 + 1*2 + 1 = 67px.
+    // 2 rows: calc(4.125rem + 1px) = 67px at the default scale.
     await expect(tabStrip).toHaveCSS('max-height', '67px')
   })
 
@@ -1314,13 +1390,24 @@ test.describe('Tab bar height resize', () => {
     await expect(page.getByTestId('tab-strip')).toBeVisible()
     await expect(page.getByTestId('tab-bar-resize-handle')).toHaveCount(0)
   })
+
+  test('row heights track the UI scale (rem-based max-height)', async ({ freshellPage: page }) => {
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { uiScale: 1.25 },
+      })
+    })
+    // --ui-scale becomes 1.25 => root font-size 20px => 3 rows = calc(6.25rem + 1px) = 126px.
+    await expect(page.getByTestId('tab-strip')).toHaveCSS('max-height', '126px')
+  })
 })
 ```
 
 - [ ] **Step 2: Run it**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts tab-bar-resize --project=chromium`
-Expected: 4 passed. If the drag test is flaky on row math (sub-pixel handle position), adjust only the drag distance (`+68`), never the assertions.
+Expected: 5 passed. If the drag test is flaky on row math (sub-pixel handle position), adjust only the drag distance (`+68`), never the assertions.
 
 - [ ] **Step 3: Run the neighboring spec too (regression)**
 
@@ -1390,7 +1477,8 @@ git commit -m "test: refresh baselines and default-mode assumptions for multirow
 
 ## Self-Review (completed by the plan author)
 
-1. **Spec coverage:** (1) default TRUE → Task 1; (2) multirow min 150 / stretch / max 200 → Task 4; (3) single-row fixed 175 → Task 4; (4) resizable height, hover splitter at bottom edge, default exactly 3 rows, drag to more or fewer rows, per-browser localStorage persistence (not server config) → Tasks 2, 3, 5, 6, 7, with e2e proof in Task 8 (drag more, keyboard fewer, reload persistence, hidden when one row). Docs note (multirow-by-default is a major UI change) → Task 1 Step 10.
+1. **Spec coverage:** (1) default TRUE → Task 1; (2) multirow min 150 / stretch / max 200 → Task 4; (3) single-row fixed 175 → Task 4; (4) resizable height, hover splitter at bottom edge, default exactly 3 rows, drag to more or fewer rows, per-browser localStorage persistence (not server config) → Tasks 2, 3, 5, 6, 7, with e2e proof in Task 8 (drag more, keyboard fewer, reload persistence, hidden when one row). Docs note (multirow-by-default is a major UI change) → Task 1 Step 10. Scale correctness (Tailwind rem sizing × `--ui-scale`) → rem-based metrics (Task 3), calc() strip height (Task 5), live-root-font px conversions (Tasks 6–7), and the uiScale-1.25 e2e case (Task 8).
 2. **No silent deferrals:** every requirement lands as production behavior verified by real-browser e2e (widths via boundingBox, height via computed CSS, persistence via reload); the only mock is jsdom's `scrollHeight` in unit tests, and the production behavior it stands in for is proven by Task 8's real-browser handle-visibility assertions.
 3. **Placeholder scan:** the `/* fixture */` markers in unit-test snippets deliberately reuse the tab factory already defined in `TabBar.multirow.test.tsx` (named there, visible to the implementer in the same file) — every genuinely new API, class string, constant, and assertion is written out in full.
-4. **Type consistency:** `tabBarRows: number` (Tasks 2→5→7→8), `tabBarRowsToMaxHeightPx`/`tabBarHeightPxToRows`/`TAB_BAR_KEYBOARD_STEP_PX`/`TAB_BAR_MULTI_ROW_THRESHOLD_PX` (Tasks 3→6→7), `TabBarResizeHandle({ rows, onRowsChange })` (Tasks 6→7), `PaneDivider` `keyboardStep`/`ariaLabel` (Task 6 only), width class strings identical across Task 4 code, unit tests, and e2e assertions; heights 33/67/101/135/169/339 consistent everywhere with maxHeight(n) = 34n − 1.
+4. **Type consistency:** `tabBarRows: number` (Tasks 2→5→7→8), `tabBarRowsToMaxHeightCss(rows)` / `tabBarRowsToMaxHeightPx(rows, rootFontSizePx)` / `tabBarHeightPxToRows(px, rootFontSizePx)` / `tabBarRowPitchPx(rootFontSizePx)` / `tabBarMultiRowThresholdPx(rootFontSizePx)` / `getRootFontSizePx()` (Tasks 3→6→7), `TabBarResizeHandle({ rows, onRowsChange })` (Tasks 6→7), `PaneDivider` `keyboardStep`/`ariaLabel` (Task 6 only), width class strings identical across Task 4 code, unit tests, and e2e assertions; heights expressed once as maxHeight(n) = calc((2.125n − 0.125)rem + 1px) — calc strings (`'calc(6.25rem + 1px)'`, `'calc(8.375rem + 1px)'`, `'calc(10.5rem + 1px)'`) in unit tests, and their default-scale px values 33/67/101/135/169/339 (plus 126px at uiScale 1.25) only in e2e.
+5. **Load-bearing validation (stage 2):** three falsified assumptions were planned around — (A1) px row-pitch constants replaced by the scale-aware rem model above (`--ui-scale` scales all Tailwind rem sizing; verified default scale is 1.0 post-hydration, so default-scale e2e px assertions remain valid); (A2) the resize handle moved from straddling the bar's bottom edge to a bottom-only overlay (`translate-y-full`) so it cannot steal bottom-row tabs' pointerdown; (A3a) the sortable tab style switches to `CSS.Translate` to prevent mid-drag stretch with variable tab widths. Verified: default effective scale 1.0; scroll-into-view under clamp; layout/terminal reflow under a tall bar; the five-point settings-key plumbing (incl. generic cross-tab sync). Full ledger: `.worktrees/.the-usual-logs/tab-bar-multirow-sizing/load-bearing-ledger.md`.
