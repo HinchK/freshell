@@ -356,6 +356,9 @@ export default defineConfig({
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
         // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
         /opencode-rebind-rust\.spec\.ts$/,
+        // Sidebar opencode rail fixes (Bug 1 + Bug 2): runs in BOTH matrix
+        // projects — Node parity is part of the fix.
+        /sidebar-opencode-rail\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
