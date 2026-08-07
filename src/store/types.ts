@@ -78,6 +78,13 @@ export interface BackgroundTerminal {
   mode?: TabMode
   sessionRef?: SessionLocator
   codexDurability?: CodexDurabilityRef
+  /**
+   * Server-computed: this terminal's resume target is an opencode
+   * SUBAGENT (child) session. Manufactured rail entries and tab/pane
+   * fallback rows copy it into SidebarSessionItem.isSubagent so
+   * showSubagents filtering applies.
+   */
+  resumeTargetIsSubagent?: boolean
 }
 
 export interface CodingCliSession {

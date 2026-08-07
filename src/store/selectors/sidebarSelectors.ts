@@ -130,6 +130,7 @@ type RunningSessionInfo = {
   createdAt: number
   allTerminalIds: string[]
   isRestorable?: boolean
+  resumeTargetIsSubagent?: boolean
   codexDurability?: CodexDurabilityRef
   codexDurabilityState?: CodexDurabilityStateName
   codexDurabilityReason?: string
@@ -201,6 +202,7 @@ export function buildSessionItems(
       if (existing) {
         existing.allTerminalIds.push(terminal.terminalId)
         existing.isRestorable = existing.isRestorable || isRestorable
+        existing.resumeTargetIsSubagent = existing.resumeTargetIsSubagent || terminal.resumeTargetIsSubagent
         existing.codexDurability = existing.codexDurability ?? codexDurability
         if (!existing.codexDurabilityState || codexDurabilityState === 'durable') {
           existing.codexDurabilityState = codexDurabilityState
@@ -216,6 +218,7 @@ export function buildSessionItems(
           createdAt: terminal.createdAt,
           allTerminalIds: [terminal.terminalId],
           isRestorable,
+          resumeTargetIsSubagent: terminal.resumeTargetIsSubagent,
           codexDurability,
           codexDurabilityState,
           codexDurabilityReason,
@@ -354,7 +357,8 @@ export function buildSessionItems(
       isRunning: !!runningTerminalId,
       runningTerminalId,
       runningTerminalIds,
-      isSubagent: input.metadata?.isSubagent,
+      isSubagent: input.metadata?.isSubagent
+        ?? (runningTerminal?.resumeTargetIsSubagent === true ? true : undefined),
       isNonInteractive: input.metadata?.isNonInteractive,
       firstUserMessage: input.metadata?.firstUserMessage,
       isFallback: true,
@@ -514,6 +518,7 @@ export function buildSessionItems(
       isFallback: true,
       liveTerminalOnly: true,
       isRestorable: false,
+      isSubagent: terminal.resumeTargetIsSubagent === true ? true : undefined,
     }
     items.push(item)
     itemsByKey.set(key, item)
