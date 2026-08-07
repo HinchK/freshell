@@ -372,13 +372,15 @@ git commit -m "fix(opencode): treat global-project worktree '/' as absent in Rus
 **Files:**
 - Create: `server/coding-cli/providers/opencode-subagent-query.ts`
 - Modify: `server/coding-cli/providers/opencode.ts` (export the DB-path resolution)
+- Modify: `server/coding-cli/providers/opencode-listing-query.ts` (`OpencodeSessionRow` gains optional `parentId`)
+- Modify: `server/coding-cli/providers/opencode-by-id-query.ts` (project `parent_id`, schema-guarded)
 - Test: `test/unit/server/coding-cli/opencode-subagent-query.test.ts`
 
 **Interfaces:**
-- Consumes: `node:sqlite` `DatabaseSync` (lazy import, same pattern as `opencode-listing-query.ts:38` — the lazy import keeps `vi.mock('node:sqlite')` viable).
+- Consumes: the EXISTING off-thread by-id worker triad — `runOpencodeSessionByIdOffThread(dbPath, sessionId): Promise<OpencodeSessionRow | null>` (`server/coding-cli/providers/opencode-by-id-runner.ts:124-126`, production-wired at `resolve-fallbacks.ts:83,115`; one short-lived `worker_threads.Worker` per lookup, 500ms busy timeout inside the worker, 15s outer timeout, rejects on failure). NEVER `node:sqlite` `DatabaseSync` on the main thread: `opencode-by-id-query.ts:3-11` states the rule verbatim ("Never call it on the main thread in production" — `DatabaseSync` blocks whatever thread runs it for up to the busy timeout when the DB is locked), and every production opencode SQLite read in this codebase runs inside a worker thread.
 - Produces:
   - `export function resolveOpencodeDatabasePath(dataHome?: string): string` from `server/coding-cli/providers/opencode.ts` — a NEW module-level one-liner `path.join(dataHome, 'opencode.db')` whose `dataHome` parameter defaults to the ALREADY-EXPORTED `defaultOpencodeDataHome()` (`opencode.ts:39-48`, which owns the `XDG_DATA_HOME` branch and the win32/`~/.local/share/opencode` platform defaults). The provider's `getDatabasePath()` (`opencode.ts:80-83`) is PUBLIC (its doc comment cites an external consumer — resolve-fallbacks builds the off-thread by-id lookup from it; do NOT make it private) and is today a one-liner `path.join(this.homeDir, 'opencode.db')` with NO XDG logic — it delegates: `return resolveOpencodeDatabasePath(this.homeDir)`. Behavior must be byte-identical to today. (Note: the `OpencodeProvider` ctor arg `homeDir` is the opencode DATA HOME, defaulting to `defaultOpencodeDataHome()` — `opencode.ts:73-78`.)
-  - `export async function isOpencodeSubagentSession(sessionId: string, dbPath?: string): Promise<boolean>` from `server/coding-cli/providers/opencode-subagent-query.ts` — `true` ONLY when the session row exists AND has `parent_id NOT NULL`. Returns `false` for: missing DB file, `node:sqlite` unavailable, missing row, schema without a `parent_id` column, and ANY read error (classification is best-effort; it must never block or fail terminal creation). `dbPath` defaults to `resolveOpencodeDatabasePath()`.
+  - `export async function isOpencodeSubagentSession(sessionId: string, dbPath?: string): Promise<boolean>` from `server/coding-cli/providers/opencode-subagent-query.ts` — `true` ONLY when the session row exists AND has `parent_id NOT NULL`. Returns `false` for: missing DB file, missing row, schema without a `parent_id` column, and ANY read/worker error (classification is best-effort; it must never block or fail terminal creation). `dbPath` defaults to `resolveOpencodeDatabasePath()`. Implemented as a thin wrapper over the off-thread by-id runner: the SQLite read runs in a short-lived worker thread, and the runner's rejections (locked/corrupt DB, worker failure, timeout) are swallowed to `false` HERE at the call site — the runner itself keeps its reject-on-failure contract for its existing `resolve-fallbacks` consumer.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -488,25 +490,30 @@ Expected: FAIL — module `opencode-subagent-query` does not exist, and `resolve
 
 - [ ] **Step 3: Implement**
 
-Create `server/coding-cli/providers/opencode-subagent-query.ts`:
+The read MUST run OFF the event loop. The by-id worker triad already exists and is production-wired (`server/coding-cli/providers/opencode-by-id-query.ts` + `opencode-by-id.worker.ts` + `opencode-by-id-runner.ts`; `resolve-fallbacks.ts:83,115` is the precedent consumer) — the only gap is that its SELECT does not project `parent_id`. Close the gap additively, then wrap the runner:
+
+1. `server/coding-cli/providers/opencode-listing-query.ts` — add to `OpencodeSessionRow` (:1-9): `parentId?: string | null`.
+2. `server/coding-cli/providers/opencode-by-id-query.ts` — in `runOpencodeSessionByIdQuery` (:23-55), project `parent_id` guarded by the schema probe idiom the listing query already uses (`PRAGMA table_info(session)` — `opencode-listing-query.ts:42-43`): after the existing `sqlite_master` table checks, compute `hasParentId` from `PRAGMA table_info(session)`, then add `${hasParentId ? 's.parent_id' : 'NULL'} AS parentId,` to the SELECT's projection list. Old schemas keep returning rows (with `parentId: null`) — behavior for the existing `resolve-fallbacks` consumer is unchanged apart from an additive optional field. Worker entry, runner, and message validators need ZERO changes (`WorkerByIdInput` is already `{dbPath, sessionId}`; the worker passes `row` through at `opencode-by-id.worker.ts:39`; `isOkMessage` only checks object-or-null at `opencode-by-id-runner.ts:51-57`).
+3. Create `server/coding-cli/providers/opencode-subagent-query.ts` as a thin wrapper over the runner:
 
 ```ts
 import fsp from 'fs/promises'
+import { runOpencodeSessionByIdOffThread } from './opencode-by-id-runner.js'
 import { resolveOpencodeDatabasePath } from './opencode.js'
-
-const SUBAGENT_QUERY_BUSY_TIMEOUT_MS = 500
 
 /**
  * Best-effort classification: does `sessionId` name an opencode SUBAGENT
  * (child) session — a `session` row with `parent_id NOT NULL`?
  *
- * `false` for: missing DB, missing row, schema without parent_id, sqlite
- * unavailable, or ANY read error. Classification must never block or fail
- * terminal creation, so errors are swallowed (the caller treats "unknown"
- * as "not a subagent" — the safe default keeps real sessions visible).
+ * `false` for: missing DB, missing row, schema without parent_id, and ANY
+ * read/worker error. Classification must never block or fail terminal
+ * creation, so runner rejections are swallowed HERE at the call site (the
+ * runner keeps its reject-on-failure contract for resolve-fallbacks).
  *
- * Lazy `await import('node:sqlite')` matches opencode-listing-query.ts:38
- * (keeps vi.mock('node:sqlite') working).
+ * The SQLite read runs INSIDE A WORKER THREAD (one short-lived worker per
+ * lookup, 500ms busy timeout in the worker, hard outer timeout). NEVER open
+ * DatabaseSync on the main thread here — it blocks the whole event loop
+ * while the DB is locked (opencode-by-id-query.ts:3-11).
  */
 export async function isOpencodeSubagentSession(
   sessionId: string,
@@ -518,19 +525,8 @@ export async function isOpencodeSubagentSession(
     return false
   }
   try {
-    const { DatabaseSync } = await import('node:sqlite')
-    const db = new DatabaseSync(dbPath, { readOnly: true })
-    try {
-      db.exec(`PRAGMA busy_timeout = ${SUBAGENT_QUERY_BUSY_TIMEOUT_MS}`)
-      const columns = db.prepare('PRAGMA table_info(session)').all() as Array<{ name?: unknown }>
-      if (!columns.some((c) => c.name === 'parent_id')) return false
-      const row = db.prepare('SELECT parent_id AS parentId FROM session WHERE id = ?').get(sessionId) as
-        | { parentId?: unknown }
-        | undefined
-      return row != null && row.parentId != null
-    } finally {
-      db.close()
-    }
+    const row = await runOpencodeSessionByIdOffThread(dbPath, sessionId)
+    return row?.parentId != null
   } catch {
     return false
   }
@@ -555,17 +551,17 @@ and make the provider's public method delegate (behavior byte-identical to today
 
 - [ ] **Step 4: Run to verify pass**
 
-Same command as Step 2. Expected: PASS (7 tests). Also re-run Task 1's file to prove the delegation didn't regress:
+Same command as Step 2. Expected: PASS (7 tests — the wrapper's tests exercise a REAL worker against the temp DB; precedent: `test/unit/server/coding-cli/opencode-by-id-runner.test.ts:144-181`). Also re-run Task 1's file plus the by-id triad's own tests to prove the delegation and the projection change didn't regress anything:
 ```bash
-FRESHELL_TEST_SUMMARY="bug1-node-query-green" npm run test:vitest -- run test/unit/server/coding-cli/opencode-subagent-query.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts test/unit/server/coding-cli/opencode-provider.test.ts --config config/vitest/vitest.server.config.ts
+FRESHELL_TEST_SUMMARY="bug1-node-query-green" npm run test:vitest -- run test/unit/server/coding-cli/opencode-subagent-query.test.ts test/unit/server/coding-cli/opencode-by-id-query.test.ts test/unit/server/coding-cli/opencode-by-id-runner.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts test/unit/server/coding-cli/opencode-provider.test.ts --config config/vitest/vitest.server.config.ts
 ```
-Expected: PASS.
+Expected: PASS. (If `opencode-by-id-query.test.ts` pins the exact row projection with a full-object equality, extend its expected row with the additive `parentId` value rather than weakening the assertion.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add server/coding-cli/providers/opencode-subagent-query.ts server/coding-cli/providers/opencode.ts test/unit/server/coding-cli/opencode-subagent-query.test.ts
-git commit -m "feat(opencode): add best-effort subagent (parent_id) classification query on Node (Bug 1)"
+git add server/coding-cli/providers/opencode-subagent-query.ts server/coding-cli/providers/opencode.ts server/coding-cli/providers/opencode-listing-query.ts server/coding-cli/providers/opencode-by-id-query.ts test/unit/server/coding-cli/opencode-subagent-query.test.ts test/unit/server/coding-cli/opencode-by-id-query.test.ts
+git commit -m "feat(opencode): add best-effort off-thread subagent (parent_id) classification on Node (Bug 1)"
 ```
 
 ---
@@ -703,7 +699,10 @@ import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subag
         // Bug-1 (sidebar rail): classify the requested opencode resume target
         // at create time (bindSession later re-classifies whenever it
         // overwrites resumeSessionId — see Step 6). Best-effort:
-        // any failure classifies as "not a subagent".
+        // any failure classifies as "not a subagent". The await parks on a
+        // WORKER-THREAD SQLite read (Task 3) — the event loop stays free;
+        // this create path already awaits allocateLocalhostPort() just
+        // below (~:2562), so an await here is the established shape.
         const requestedOpencodeTarget = m.mode === 'opencode'
           ? (m.resumeSessionId ?? (m.sessionRef?.provider === 'opencode' ? m.sessionRef.sessionId : undefined))
           : undefined
@@ -747,7 +746,9 @@ Then implement in `server/terminal-registry.ts` — in `bindSession` (:4797), im
     // Bug-1 (sidebar rail): the resume target just changed — re-derive the
     // subagent classification for the NEW target (both directions: a switch
     // to a root session must CLEAR a stale true). Fire-and-forget:
-    // classification must never block or fail binding.
+    // classification must never block or fail binding (bindSession is fully
+    // synchronous), and the SQLite read itself runs on a worker thread
+    // (Task 3), so nothing here can stall the event loop.
     if (provider === 'opencode') {
       void isOpencodeSubagentSession(normalized)
         .then((isSubagent) => {
@@ -809,7 +810,7 @@ git commit -m "feat(terminals): expose resumeTargetIsSubagent on the Node termin
 - Consumes: rusqlite `Connection`, the `OpencodeReadError` type and the PRAGMA schema-guard idiom already in `parse/opencode.rs:135-145`.
 - Produces:
   - `pub fn session_is_subagent_by_id(data_home: &Path, session_id: &str) -> Result<Option<bool>, OpencodeReadError>` in `crates/freshell-sessions/src/parse/opencode.rs`, re-exported from `parse/mod.rs`. `Ok(None)` = DB file missing or row missing; `Ok(Some(true))` = row exists with `parent_id NOT NULL`; `Ok(Some(false))` = root row, or row exists under a legacy schema without `parent_id`. `Err` = read failure (callers treat as unknown).
-  - `impl OpencodeLocator { pub fn classify_resume_target(&self, session_id: &str) -> Option<bool> }` — thin best-effort wrapper: `Some(true|false)` on a definite answer, `None` on missing/unknown/error. Uses the locator's existing data-home field (the one `query_candidates` reads).
+  - `impl OpencodeLocator { pub fn classify_resume_target(&self, session_id: &str) -> Option<bool> }` — thin best-effort wrapper: `Some(true|false)` on a definite answer, `None` on missing/unknown/error. Uses a NEW private `data_home: PathBuf` field retained by both constructors (the locator does NOT keep the data home today — it is consumed into the private `OpencodeProvider`; Step 2 adds the field, constructor signatures unchanged).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -986,7 +987,12 @@ pub fn session_is_subagent_by_id(
 
 Re-export in `crates/freshell-sessions/src/parse/mod.rs` alongside the existing `session_exists_by_id` re-export (line ~14): add `session_is_subagent_by_id` to the same `pub use` list.
 
-In `crates/freshell-sessions/src/opencode_locator.rs`, add to `impl OpencodeLocator` (using the struct's existing data-home field — the same one `query_candidates`/`tick` read; check the struct definition at the top of the file for its exact name, e.g. `data_home` or `home`):
+In `crates/freshell-sessions/src/opencode_locator.rs`: the locator does NOT retain the data home today — both constructors (`new` at :150, `with_config` at :156) consume `data_home` straight into `OpencodeProvider::new(...)` (:158), the struct's fields (:129-144) don't include a path, and the provider's `home_dir` is itself private with no accessor (`parse/opencode.rs:243-248`). So first:
+
+1. Add a private field to the struct definition: `data_home: PathBuf,` (alongside `provider`).
+2. Set it in BOTH constructors: clone the incoming `data_home` into the new field before handing the original to `OpencodeProvider::new`. Constructor SIGNATURES are unchanged — zero call-site churn (e.g. the ws crate's `state_with_locator` fixture, which calls `OpencodeLocator::new(data_home)` at `opencode_association.rs:302`, keeps compiling untouched).
+
+Then add to `impl OpencodeLocator`:
 
 ```rust
     /// Best-effort resume-target classification for the sidebar rail:
@@ -1043,7 +1049,7 @@ git commit -m "feat(opencode): add parent_id subagent classification lookup + lo
 - Modify: `crates/freshell-ws/src/terminal.rs` (call sites after the create `set_meta` at ~2799-2806 and the auto-resume respawn `set_meta` at ~3498-3507; make `broadcast_terminals_changed` `pub(crate)`)
 - Modify: `crates/freshell-ws/src/opencode_signal.rs` (hook site #3: `rebind_fanout` at :399-437 and the (0b) retired-rebind branch at ~:508)
 - Modify: `crates/freshell-ws/src/pane_identity_binder.rs` (hook site #4: classifier injected into `LedgerPaneIdentityBinder`; classification after the `:110` upsert in `register_create_identity`)
-- Modify: `crates/freshell-server/src/main.rs` (:313-318 region — wire the classifier into the binder construction)
+- Modify: `crates/freshell-server/src/main.rs` (move the `opencode_locator` creation block from :433-437 up above the `fresh_agent_state` builder chain at :305-318, then wire the classifier into the binder construction at :314-317 — see Step 6.3)
 - Test: inline `#[cfg(test)]` additions in `identity.rs`, `opencode_association.rs`, `opencode_signal.rs`, and `pane_identity_binder.rs`
 
 **Interfaces:**
@@ -1120,7 +1126,9 @@ Run the Step 1 test again. Expected: PASS. Then run `cargo test -p freshell-ws` 
 
 - [ ] **Step 3: Write the failing classification-hook test**
 
-In `crates/freshell-ws/src/opencode_association.rs`'s existing `#[cfg(test)] mod tests` (fixtures `open_seed_db` at ~338 / `insert_session` at ~360 and `state_with_bus`-style state builders already exist — follow the `drain_and_associate` test's state construction at ~447-536):
+In `crates/freshell-ws/src/opencode_association.rs`'s existing `#[cfg(test)] mod tests` (schema fixture `open_seed_db` at :338-358 — its `session` table already HAS a `parent_id` column — and state builders already exist; follow the `drain_and_associate` test's state construction at ~447-536).
+
+FIXTURE WIDENING FIRST (required — the test below cannot compile without it): this file's `insert_session` (:360-374) takes only 4 arguments `(conn, id, cwd, time_created)` and hardcodes `parent_id`/`time_archived` as NULL literals in its SQL text, so it cannot seed a child session. Widen it to the exact 6-argument signature its `opencode_locator.rs` twin already has — `insert_session(conn, id, cwd, time_created, parent_id: Option<&str>, time_archived: Option<i64>)` (`opencode_locator.rs:428-435`) — binding the two new parameters instead of the NULL literals, and update its three existing call sites in this file (:488, :598, :693) to pass `, None, None`. Then add the test:
 
 ```rust
     #[tokio::test]
@@ -1355,7 +1363,17 @@ Then implement:
             }
         }
 ```
-3. Wire it at construction in `crates/freshell-server/src/main.rs` (:313-318 region — where `LedgerPaneIdentityBinder::new(terminal_identity.clone(), pane_ledger)` is built and main already holds the shared `OpencodeLocator` ws_state uses): pass `Some(Arc::new(move |sid: &str| locator.classify_resume_target(sid)))` (clone the shared locator handle into the closure).
+3. Wire it at construction in `crates/freshell-server/src/main.rs`. ORDERING FIX REQUIRED: the binder is built as an inline temporary inside the `fresh_agent_state` builder chain (:305-318; `LedgerPaneIdentityBinder::new(terminal_identity.clone(), Arc::clone(&pane_ledger))` at :314-317), but `opencode_locator` is created ~120 lines LATER (:433-437) — wiring it in place would be a use-before-definition and would not compile. First MOVE the `opencode_locator` creation block (the `let opencode_locator: Option<Arc<OpencodeLocator>> = ...` built from `default_opencode_data_home()`) up above the `fresh_agent_state` builder chain (above :305). The move is dependency-free: its only input is the zero-arg free function `default_opencode_data_home()`, and nothing in the span between :305 and its old position reads it (that span only builds registry config, the liveness closure, tabs, extension registry, and shutdown/revision plumbing); its downstream consumers (`with_opencode_locator` at ~:453, the `WsState` literal at ~:756, the sweep-spawn guard at ~:1024-1030) all sit after both positions and keep working unchanged. Then, in the binder construction, pass the classifier by MAPPING the `Option` (the local is `Option<Arc<OpencodeLocator>>`, not a bare locator):
+
+```rust
+opencode_locator.as_ref().map(|locator| {
+    let locator = Arc::clone(locator);
+    Arc::new(move |sid: &str| locator.classify_resume_target(sid))
+        as Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>
+})
+```
+
+which yields exactly the binder's new `Option<Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>>` parameter (`None` when the locator is disabled — REST-lane classification simply stays off, matching the seam's existing degradation policy).
 
 Run the test again. Expected: PASS.
 
