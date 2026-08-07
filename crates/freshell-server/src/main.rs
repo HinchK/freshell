@@ -302,6 +302,24 @@ async fn main() -> ExitCode {
         home.as_ref()
             .map(|h| h.join(".freshell").join("pane-ledger")),
     ));
+    // OpenCode terminal-pane restore fix
+    // (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): the
+    // opencode locator, resolved against the SAME `default_opencode_data_home()`
+    // root the `OpencodeSource` (History sidebar) uses below, so an opencode
+    // terminal's cwd is compared against the SAME `opencode.db` the CLI
+    // itself writes into. Unconditionally `Some` (unlike the deleted
+    // amplifier locator, which depended on `session_directory::provider_home()`;
+    // see kata qmpk — amplifier identity is now launcher-assigned at create
+    // time): opencode's data home resolves independent of the isolated
+    // `FRESHELL_HOME` config root. Created ABOVE the fresh-agent builder
+    // chain (dependency-free: its only input is the zero-arg
+    // `default_opencode_data_home()`) so the REST `PaneIdentityBinder` below
+    // can wrap its `classify_resume_target` as the injected classifier.
+    let opencode_locator = Some(Arc::new(
+        freshell_sessions::opencode_locator::OpencodeLocator::new(
+            freshell_sessions::parse::default_opencode_data_home(),
+        ),
+    ));
     let fresh_agent_state = fresh_agent_state
         .with_terminal_registry(registry.clone())
         .with_session_identity(std::sync::Arc::new(terminal_identity.clone()))
@@ -314,6 +332,15 @@ async fn main() -> ExitCode {
             freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
                 terminal_identity.clone(),
                 std::sync::Arc::clone(&pane_ledger),
+                // Bug-1 (sidebar rail): the REST lane's resume-target
+                // classifier — the same locator instance `ws_state` gets
+                // below; `None` when the locator is disabled (REST-lane
+                // classification simply stays off).
+                opencode_locator.as_ref().map(|locator| {
+                    let locator = Arc::clone(locator);
+                    Arc::new(move |sid: &str| locator.classify_resume_target(sid))
+                        as std::sync::Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>
+                }),
             ),
         ));
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
@@ -420,21 +447,6 @@ async fn main() -> ExitCode {
     // exists) -- see `freshell_ws::WsState::sessions_revision`'s doc comment
     // for the full parity rationale. Both producers now share this ONE
     // sequence (fix-forward: they previously used two independent counters).
-    // OpenCode terminal-pane restore fix
-    // (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): the
-    // opencode locator, resolved against the SAME `default_opencode_data_home()`
-    // root the `OpencodeSource` (History sidebar) uses above, so an opencode
-    // terminal's cwd is compared against the SAME `opencode.db` the CLI
-    // itself writes into. Unconditionally `Some` (unlike the deleted
-    // amplifier locator, which depended on `session_directory::provider_home()`;
-    // see kata qmpk — amplifier identity is now launcher-assigned at create
-    // time): opencode's data home resolves independent of the isolated
-    // `FRESHELL_HOME` config root.
-    let opencode_locator = Some(Arc::new(
-        freshell_sessions::opencode_locator::OpencodeLocator::new(
-            freshell_sessions::parse::default_opencode_data_home(),
-        ),
-    ));
     // Lane B2 (campaign §2.3.2): server-side codex identity locator. Same
     // sessions root the resume-time rollout locator below walks. `None`
     // when HOME/CODEX_HOME are unresolvable — every codex_association

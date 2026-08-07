@@ -23,14 +23,33 @@ use crate::identity::TerminalIdentityRegistry;
 use crate::pane_ledger::{BindingWrite, PaneLedger};
 use crate::terminal::now_ms;
 
+/// Resume-target display classifier injected at construction (wraps
+/// `OpencodeLocator::classify_resume_target`, Task 5): `Some(true)` = child
+/// (subagent) session, `Some(false)` = definite root, `None` = unknown.
+pub type ResumeTargetClassifier = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
 pub struct LedgerPaneIdentityBinder {
     identity: TerminalIdentityRegistry,
     ledger: Arc<PaneLedger>,
+    /// `None` when the opencode locator is disabled — REST-lane
+    /// classification simply stays off (the seam's existing degradation
+    /// policy). This seam has no `WsState`, so it cannot call
+    /// `classify_and_mark_resume_target`; it gets the classifier injected
+    /// instead.
+    classify_resume_target: Option<ResumeTargetClassifier>,
 }
 
 impl LedgerPaneIdentityBinder {
-    pub fn new(identity: TerminalIdentityRegistry, ledger: Arc<PaneLedger>) -> Self {
-        Self { identity, ledger }
+    pub fn new(
+        identity: TerminalIdentityRegistry,
+        ledger: Arc<PaneLedger>,
+        classify_resume_target: Option<ResumeTargetClassifier>,
+    ) -> Self {
+        Self {
+            identity,
+            ledger,
+            classify_resume_target,
+        }
     }
 
     fn warn_write_failure(terminal_id: &str, what: &str, err: &std::io::Error) {
@@ -109,6 +128,20 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
         if let Some(session_id) = resume_session_id.filter(|s| !s.is_empty()) {
             self.identity
                 .upsert(terminal_id, Some(mode), Some(session_id), cwd, now_ms());
+            // Bug-1 (sidebar rail): classify the REST resume target. This call
+            // site already runs inside the caller's spawn_blocking
+            // (terminal_tabs.rs:1973), so the one-row SQLite read is off the
+            // async path. Log-only on error / no ping — this seam has no
+            // WsState (matching its existing degradation policy); the flag is
+            // set before the create response returns, ahead of any client
+            // refetch.
+            if mode == "opencode" {
+                if let Some(classify) = self.classify_resume_target.as_ref() {
+                    if let Some(value) = classify(session_id) {
+                        self.identity.set_is_subagent(terminal_id, Some(value));
+                    }
+                }
+            }
             if let Err(err) = self.ledger.record_binding(&BindingWrite {
                 provider: mode, // keep exactly what the WS block does (provider = mode)
                 session_id,
@@ -182,7 +215,7 @@ mod tests {
         let ledger = Arc::new(PaneLedger::new(Some(dir.clone())));
         let identity = crate::identity::TerminalIdentityRegistry::default();
         (
-            LedgerPaneIdentityBinder::new(identity.clone(), Arc::clone(&ledger)),
+            LedgerPaneIdentityBinder::new(identity.clone(), Arc::clone(&ledger), None),
             ledger,
             identity,
             dir,
@@ -228,6 +261,87 @@ mod tests {
     }
 
     #[test]
+    fn register_create_identity_classifies_opencode_resume_targets() {
+        use freshell_terminal::registry::PaneIdentityBinder as _;
+        // Build the binder as in `binder(...)` but pass a classifier wrapping
+        // Task 5's classify_resume_target over a temp data home seeded with
+        // ses_root (parent_id NULL) and ses_child (parent_id = 'ses_root') —
+        // the same rusqlite temp-db seeding idiom as Task 5's tests.
+        let dir = temp_root("classify");
+        let data_home = dir.join("opencode-data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        {
+            let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    slug TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    time_archived INTEGER
+                 );",
+            )
+            .unwrap();
+            for (id, parent_id) in [("ses_root", None), ("ses_child", Some("ses_root"))] {
+                conn.execute(
+                    "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
+                    rusqlite::params![format!("proj-{id}"), "/tmp"],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO session
+                        (id, project_id, parent_id, slug, directory, title, version,
+                         time_created, time_updated, time_archived)
+                     VALUES (?1, ?2, ?3, ?1, '/tmp', ?1, 'test', 100, 100, NULL)",
+                    rusqlite::params![id, format!("proj-{id}"), parent_id],
+                )
+                .unwrap();
+            }
+        }
+        let ledger = Arc::new(PaneLedger::new(Some(dir.clone())));
+        let identity = crate::identity::TerminalIdentityRegistry::default();
+        let locator = Arc::new(freshell_sessions::opencode_locator::OpencodeLocator::new(
+            data_home,
+        ));
+        let classifier: ResumeTargetClassifier =
+            Arc::new(move |sid: &str| locator.classify_resume_target(sid));
+        let b =
+            LedgerPaneIdentityBinder::new(identity.clone(), Arc::clone(&ledger), Some(classifier));
+
+        b.register_create_identity(
+            "t-rest-child",
+            "opencode",
+            Some("ses_child"),
+            Some("/tmp"),
+            Some("req-c"),
+        );
+        assert_eq!(
+            identity.get("t-rest-child").and_then(|i| i.is_subagent),
+            Some(true),
+            "REST-created child-target terminal must be classified"
+        );
+        b.register_create_identity(
+            "t-rest-root",
+            "opencode",
+            Some("ses_root"),
+            Some("/tmp"),
+            Some("req-r"),
+        );
+        assert_eq!(
+            identity.get("t-rest-root").and_then(|i| i.is_subagent),
+            Some(false),
+            "definite root classifies Some(false) (both-directions semantics)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn register_create_identity_skips_shell_and_marks_pending_for_marker_modes() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         let (b, ledger, identity, dir) = binder("markers");
@@ -256,7 +370,8 @@ mod tests {
         // A disabled ledger (or an unwritable root) must degrade to a warn,
         // never an Err/panic — failure never blocks the create.
         let identity = crate::identity::TerminalIdentityRegistry::default();
-        let b = LedgerPaneIdentityBinder::new(identity.clone(), Arc::new(PaneLedger::disabled()));
+        let b =
+            LedgerPaneIdentityBinder::new(identity.clone(), Arc::new(PaneLedger::disabled()), None);
         b.record_prespawn_claude_binding(SID, "t-x", "claude", None, None);
         b.register_create_identity("t-x", "claude", Some(SID), None, None);
         // identity row still lands even when durability is degraded:

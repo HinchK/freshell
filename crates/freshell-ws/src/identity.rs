@@ -41,6 +41,13 @@ pub struct TerminalIdentity {
     /// terminal process exited, but the provider/sessionId association (and cwd)
     /// are deliberately preserved -- `retire()`'s doc explains why.
     pub retired: bool,
+    /// `Some(true)` when this terminal's resume target is an opencode
+    /// SUBAGENT (child) session — display classification for the sidebar
+    /// rail (`showSubagents` filter). `None` = unclassified. Recomputed
+    /// whenever the resume target changes (create, respawn, signal rebind,
+    /// REST bind); preserved across plain upserts. Never consulted by
+    /// association logic.
+    pub is_subagent: Option<bool>,
 }
 
 /// Shared, cheaply-cloneable registry (`Arc<RwLock<..>>`), analogous to
@@ -71,17 +78,56 @@ impl TerminalIdentityRegistry {
         updated_at: i64,
     ) {
         let mut map = self.inner.write().expect("identity registry lock poisoned");
-        map.insert(
-            terminal_id.to_string(),
-            TerminalIdentity {
+        match map.get_mut(terminal_id) {
+            Some(entry) => {
+                // Full replacement of the association fields (the signal
+                // rebinds upsert a NEW session_id over the old one and
+                // depend on replacement) + un-retire-on-reseed; the display
+                // classification (`is_subagent`) is carried forward
+                // UNCHANGED -- classification is recomputed only at
+                // resume-target acquisition, never wiped by a plain upsert.
+                entry.provider = provider.map(str::to_string);
+                entry.session_id = session_id.map(str::to_string);
+                entry.cwd = cwd.map(str::to_string);
+                entry.updated_at = updated_at;
+                entry.retired = false;
+            }
+            None => {
+                map.insert(
+                    terminal_id.to_string(),
+                    TerminalIdentity {
+                        terminal_id: terminal_id.to_string(),
+                        provider: provider.map(str::to_string),
+                        session_id: session_id.map(str::to_string),
+                        cwd: cwd.map(str::to_string),
+                        updated_at,
+                        retired: false,
+                        is_subagent: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Set the subagent display classification. Creates a minimal entry when
+    /// the terminal has no identity yet (classification can land before the
+    /// first provider/session upsert); otherwise patches the existing entry
+    /// in place without touching provider/session/cwd.
+    pub fn set_is_subagent(&self, terminal_id: &str, value: Option<bool>) {
+        let mut map = self.inner.write().expect("identity registry lock poisoned");
+        let entry = map
+            .entry(terminal_id.to_string())
+            .or_insert_with(|| TerminalIdentity {
                 terminal_id: terminal_id.to_string(),
-                provider: provider.map(str::to_string),
-                session_id: session_id.map(str::to_string),
-                cwd: cwd.map(str::to_string),
-                updated_at,
+                provider: None,
+                session_id: None,
+                cwd: None,
+                updated_at: 0,
                 retired: false,
-            },
-        );
+                is_subagent: None,
+            });
+        entry.is_subagent = value;
+        entry.updated_at = crate::terminal::now_ms();
     }
 
     /// `TerminalMetadataService.retire` (`terminal-metadata-service.ts:203-219`):
@@ -317,6 +363,37 @@ mod tests {
             reg.session_ref_for("t1").map(|r| r.session_id),
             Some("sess-9".to_string())
         );
+    }
+
+    #[test]
+    fn set_is_subagent_creates_minimal_entry_and_upsert_preserves_it() {
+        let registry = TerminalIdentityRegistry::new();
+
+        // Setter on a terminal with no identity entry yet: creates minimal entry.
+        registry.set_is_subagent("t-sub", Some(true));
+        assert_eq!(registry.get("t-sub").unwrap().is_subagent, Some(true));
+
+        // A later upsert (association writes provider/session) must PRESERVE it.
+        registry.upsert(
+            "t-sub",
+            Some("opencode"),
+            Some("ses_x"),
+            Some("/repo"),
+            1_000,
+        );
+        let identity = registry.get("t-sub").unwrap();
+        assert_eq!(identity.is_subagent, Some(true));
+        assert_eq!(identity.provider.as_deref(), Some("opencode"));
+
+        // Unclassified terminals stay None.
+        registry.upsert(
+            "t-plain",
+            Some("opencode"),
+            Some("ses_y"),
+            Some("/repo"),
+            1_000,
+        );
+        assert_eq!(registry.get("t-plain").unwrap().is_subagent, None);
     }
 
     #[test]

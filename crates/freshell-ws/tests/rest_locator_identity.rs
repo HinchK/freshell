@@ -154,6 +154,7 @@ async fn spawn_merged_server(
         freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
             identity.clone(),
             Arc::clone(&ledger),
+            None,
         ),
     ))
     .with_codex_locator(codex_locator.clone());
