@@ -249,6 +249,21 @@ struct TerminalShared {
     create_request_id: Option<String>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
+    /// Whether the client EXPLICITLY released its last reference to this
+    /// terminal (`terminal.detach` emptying `subscribers`) — as opposed to
+    /// merely losing its socket (`remove_connection`: browser closed, laptop
+    /// asleep, network drop). The client's detach reconciler
+    /// (`src/store/terminalDetachMiddleware.ts`) sends `terminal.detach` only
+    /// when a terminal disappears from EVERY pane layout, so an explicit
+    /// detach means "orphaned — nobody wants this anymore" while a
+    /// connection drop means "detached but still wanted" (the tmux-style
+    /// background-session promise, §1.3). `enforce_idle_kills` reaps
+    /// released terminals at the configured threshold (legacy cleanup) but
+    /// grants un-released ones the 24h hard cap instead of silently
+    /// SIGKILLing a wanted background shell after ~15 idle minutes.
+    /// Starts `true` (a never-attached row keeps legacy fast-reap
+    /// eligibility); any successful attach flips it `false`.
+    released_by_client: bool,
 }
 
 impl TerminalShared {
@@ -849,8 +864,13 @@ impl TerminalRegistry {
         )
     }
 
-    /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`]).
-    const AGENT_IDLE_HARD_CAP_MS: i64 = 24 * 60 * 60 * 1000;
+    /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`])
+    /// AND for detached-but-wanted terminals of any mode (connection lost
+    /// without an explicit `terminal.detach` — see
+    /// `TerminalShared::released_by_client`). Keeps the sweep as a cleanup
+    /// backstop for wedged/leaked rows without silently SIGKILLing a
+    /// background session the user intends to come back to.
+    const IDLE_HARD_CAP_MS: i64 = 24 * 60 * 60 * 1000;
 
     /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
     /// DETACHED **running** terminal idle beyond the configured threshold.
@@ -862,7 +882,13 @@ impl TerminalRegistry {
     /// Agent-mode terminals (see [`Self::is_agent_mode`]) use a 24-hour
     /// hard cap instead of the configured threshold — PTY silence is not
     /// idleness for an agent mid-work, but the sweep stays their cleanup
-    /// backstop for wedged exit detection (ITEM-3, ledger A14). Returns the
+    /// backstop for wedged exit detection (ITEM-3, ledger A14). The same
+    /// hard cap protects detached-but-WANTED terminals of any mode — ones
+    /// whose client socket dropped without an explicit `terminal.detach`
+    /// (browser closed, laptop asleep): the configured threshold applies
+    /// only to genuinely-orphaned rows (`released_by_client`), so a
+    /// background shell the user intends to return to is never silently
+    /// killed after mere idle minutes (§1.3). Returns the
     /// killed terminal ids (empty when nothing was eligible), for callers that
     /// want to log/observe the sweep and for deterministic test assertions.
     ///
@@ -895,8 +921,22 @@ impl TerminalRegistry {
                     // otherwise a detached animated TUI (spinner / ticking
                     // counter) is exempt from this sweep forever.
                     let idle_ms = now.saturating_sub(s.last_meaningful_activity_at);
-                    if Self::is_agent_mode(&s.mode) && idle_ms < Self::AGENT_IDLE_HARD_CAP_MS {
-                        // ITEM-3: agent session within the hard cap — spare.
+                    // Two classes get the 24h hard cap instead of the
+                    // configured threshold:
+                    //  * ITEM-3: agent sessions (PTY silence is not idleness
+                    //    for an agent mid-work);
+                    //  * detached-but-WANTED terminals: the client never
+                    //    explicitly released this terminal (its socket merely
+                    //    dropped — browser closed, laptop asleep). The tmux
+                    //    promise (§1.3 "background session") forbids silently
+                    //    SIGKILLing it after mere idle minutes; the hard cap
+                    //    keeps the sweep as the wedge/leak cleanup backstop.
+                    // Only genuinely-orphaned rows (explicit `terminal.detach`
+                    // of the last reference, or never referenced at all) are
+                    // reaped at the configured threshold, as before.
+                    if (Self::is_agent_mode(&s.mode) || !s.released_by_client)
+                        && idle_ms < Self::IDLE_HARD_CAP_MS
+                    {
                         return None;
                     }
                     if idle_ms < idle_threshold_ms {
@@ -1020,6 +1060,7 @@ impl TerminalRegistry {
             resume_session_id: resume_session_id.map(str::to_string),
             create_request_id: create_request_id.map(str::to_string),
             subscribers: HashMap::new(),
+            released_by_client: true,
         }));
 
         // The reader thread invokes this for every framed terminal.output: append to
@@ -1194,6 +1235,11 @@ impl TerminalRegistry {
                 terminal_output_batch_v1,
             },
         );
+        // Somebody attached => this terminal is wanted. A later socket drop
+        // (remove_connection) must NOT re-mark it fast-reap eligible — only an
+        // explicit `terminal.detach` of the last reference does (see
+        // `released_by_client`'s field docs).
+        s.released_by_client = false;
 
         let ready = ServerMessage::TerminalAttachReady(TerminalAttachReady {
             head_seq,
@@ -1270,6 +1316,13 @@ impl TerminalRegistry {
                 // threshold of grace — its meaningful clock may have expired
                 // while a watcher was attached (attached => reaper-exempt).
                 s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+                // The client explicitly released its LAST reference (the
+                // detach reconciler only sends `terminal.detach` when a
+                // terminal is gone from every pane layout): this terminal is
+                // now genuinely orphaned and reap-eligible at the configured
+                // threshold. Contrast `remove_connection`, which never sets
+                // this — a dropped socket is not a released terminal.
+                s.released_by_client = true;
             }
         }
     }
@@ -1841,6 +1894,7 @@ impl TerminalRegistry {
             resume_session_id: opts.resume_session_id,
             create_request_id,
             subscribers: HashMap::new(),
+            released_by_client: true,
         }));
         {
             let mut inner = self.inner.lock().expect("registry lock");
@@ -4108,6 +4162,82 @@ mod tests {
         // T was freshly detached by the disconnect => spared one threshold.
         // U never had a subscriber => its stale countdown stands => reaped.
         assert_eq!(killed, vec!["U".to_string()]);
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_spares_disconnect_detached_terminal_past_threshold() {
+        // The background-session promise (§1.3, "what if tmux and Claude fell
+        // in love"): a user who closes the browser / sleeps the laptop with a
+        // quiet shell in a pane must find it ALIVE when they come back — the
+        // client never sent terminal.detach, so the terminal is detached but
+        // still wanted. Before the fix, 20 idle minutes past the default
+        // 15-minute autoKillIdleMinutes threshold silently SIGKILLed it
+        // (scrollback gone). Now only the 24h hard cap applies.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        assert!(
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+                .found
+        );
+        reg.set_auto_kill_idle_minutes(15); // the shipped default
+        reg.remove_connection(1); // socket drop, NOT an explicit detach
+                                  // 20 minutes idle — past the old ~15-minute threshold, far under 24h.
+        reg.backdate_last_activity("T", now_ms() - 20 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(
+            killed.is_empty(),
+            "a detached-but-wanted terminal (connection lost, never released) \
+             must survive past the configured idle threshold, got {killed:?}"
+        );
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_reaps_disconnect_detached_terminal_past_the_hard_cap() {
+        // Counterweight: the sweep stays the cleanup backstop for sessions
+        // whose client never comes back — same 24h hard cap agents get.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        assert!(
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+                .found
+        );
+        reg.set_auto_kill_idle_minutes(15);
+        reg.remove_connection(1);
+        // 25 hours stale — past the 24-hour hard cap.
+        reg.backdate_last_activity("T", now_ms() - 25 * 60 * 60_000);
+
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    #[test]
+    fn reattach_after_explicit_detach_restores_disconnect_protection() {
+        // released_by_client must be a live flag, not a one-way latch:
+        // detach (orphaned) -> reattach (wanted again) -> socket drop must
+        // land back in the protected detached-but-wanted state.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        assert!(
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+                .found
+        );
+        reg.detach("T", 1); // explicitly released — fast-reap eligible
+        let (sink2, _seen2) = collector();
+        assert!(
+            reg.attach("T", 2, sink2, Some("b".into()), 0, false, None)
+                .found
+        );
+        reg.set_auto_kill_idle_minutes(15);
+        reg.remove_connection(2); // wanted again, then socket drop
+        reg.backdate_last_activity("T", now_ms() - 20 * 60_000);
+
+        assert!(reg.enforce_idle_kills().is_empty());
         assert_eq!(reg.inventory().len(), 1);
     }
 
