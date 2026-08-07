@@ -44,7 +44,13 @@ import type { RepoIconInfo } from '@/components/icons/RepoIcon'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
 import { TAB_BAR_ROWS_DEFAULT } from '@shared/settings'
-import { getRootFontSizePx, tabBarMultiRowThresholdPx, tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
+import {
+  TAB_ROW_GAP_REM,
+  getRootFontSizePx,
+  multirowUniformTabWidthPx,
+  tabBarMultiRowThresholdPx,
+  tabBarRowsToMaxHeightCss,
+} from '@/lib/tab-bar-metrics'
 import TabBarResizeHandle from '@/components/TabBarResizeHandle'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
@@ -71,6 +77,8 @@ interface SortableTabProps {
   isRenaming: boolean
   renameValue: string
   multirow: boolean
+  /** Locked uniform width when the strip wraps to 2+ rows; null keeps CSS stretch-to-fill. */
+  uniformWidthPx: number | null
   paneEntries?: Array<{ paneId: string; content: PaneContent; repoCwd?: string }>
   iconsOnTabs?: boolean
   repoIconsOnTabs?: boolean
@@ -95,6 +103,7 @@ function SortableTab({
   isRenaming,
   renameValue,
   multirow,
+  uniformWidthPx,
   paneEntries,
   iconsOnTabs,
   repoIconsOnTabs,
@@ -118,6 +127,9 @@ function SortableTab({
   const style = {
     transform: DndCSS.Translate.toString(transform),
     transition: transition || 'transform 150ms ease',
+    // Locked uniform width (2+ wrapped rows). Inline style, never a Tailwind
+    // class: the JIT cannot generate w-[Npx] from a computed value.
+    ...(multirow && uniformWidthPx != null ? { width: `${uniformWidthPx}px` } : {}),
   }
 
   // Create tab with display title for rendering
@@ -132,11 +144,17 @@ function SortableTab({
       style={style}
       {...attributes}
       {...listeners}
-      // Multirow: pack rows at a 150px minimum, stretch to fill the row, cap at 200px.
-      // Single row: fixed 175px at all times; the strip scrolls horizontally.
+      // Multirow, wrapped to 2+ rows: every tab is locked to the full-row width
+      // (multirowUniformTabWidthPx via the inline style above) so the partial
+      // last row cannot stretch wider than the rows above.
+      // Multirow, single row: pack at a 150px minimum, stretch to fill the row,
+      // cap at 200px.
+      // Single-row mode: fixed 175px at all times; the strip scrolls horizontally.
       className={cn(
         multirow
-          ? "grow basis-[150px] min-w-[150px] max-w-[200px]"
+          ? uniformWidthPx != null
+            ? "shrink-0"
+            : "grow basis-[150px] min-w-[150px] max-w-[200px]"
           : "w-[175px] shrink-0"
       )}
     >
@@ -344,6 +362,11 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     [tabs, dispatch]
   )
 
+  // Locked uniform tab width when the tabs wrap to 2+ rows; null = CSS stretch.
+  // Declared here (before renderSortableTab, its first use); measured by the
+  // ResizeObserver effect further down, next to hasMultipleRows.
+  const [uniformTabWidthPx, setUniformTabWidthPx] = useState<number | null>(null)
+
   const renderSortableTab = useCallback((tab: Tab) => {
     const busyPaneIds = getBusyPaneIds(tab)
     return (
@@ -359,6 +382,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         isRenaming={renamingId === tab.id}
         renameValue={renameValue}
         multirow={multirowTabs}
+        uniformWidthPx={uniformTabWidthPx}
         paneEntries={getPaneEntries(tab)}
         iconsOnTabs={iconsOnTabs}
         repoIconsOnTabs={repoIconsOnTabs}
@@ -410,6 +434,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     getTerminalIdsForTab,
     iconsOnTabs,
     multirowTabs,
+    uniformTabWidthPx,
     repoIconsOnTabs,
     repoIconInfoByCwd,
     renameValue,
@@ -458,6 +483,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   useEffect(() => {
     if (!multirowTabs) {
       setHasMultipleRows(false)
+      setUniformTabWidthPx(null)
       return
     }
     const node = multirowContainerRef.current
@@ -468,7 +494,26 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
       // window where the CSS fallback (1.25) still governs (child effects run before
       // App's useTheme effect writes --ui-scale; the scale write resizes the strip,
       // which re-fires the ResizeObserver and re-measures).
-      setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(getRootFontSizePx()))
+      const rootFontSizePx = getRootFontSizePx()
+      setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(rootFontSizePx))
+      // Lock every tab to the full-row width whenever the tabs wrap to 2+ rows.
+      // Conservative width measurement (validated in real Chromium):
+      // - clientWidth excludes a classic vertical scrollbar but ROUNDS TO
+      //   NEAREST, over-reporting row capacity in a ~0.5px window below each
+      //   wrap threshold (which would re-wrap a full row's last tab);
+      // - getBoundingClientRect().width is fractional (exact) but INCLUDES a
+      //   space-taking scrollbar.
+      // min() of the two is exact when the strip has no scrollbar and falls
+      // back to the verified clientWidth behavior when it does. A 0 rect
+      // (jsdom / pre-layout) falls back to clientWidth, and the helper returns
+      // null for <= 0, keeping the CSS stretch-to-fill classes. Scale changes
+      // re-fire the observer (above), so the rem-based gap term stays fresh.
+      const rectWidth = node.getBoundingClientRect().width
+      const stripWidthPx =
+        rectWidth > 0 ? Math.min(node.clientWidth, Math.floor(rectWidth)) : node.clientWidth
+      setUniformTabWidthPx(
+        multirowUniformTabWidthPx(stripWidthPx, tabs.length, TAB_ROW_GAP_REM * rootFontSizePx),
+      )
     }
     update()
     if (typeof ResizeObserver === 'undefined') return

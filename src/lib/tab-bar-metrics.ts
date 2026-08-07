@@ -9,7 +9,11 @@ import { TAB_BAR_ROWS_MAX, TAB_BAR_ROWS_MIN } from '@shared/settings'
 
 /** Height of one tab row: TabItem is h-8 (2rem). */
 export const TAB_ROW_HEIGHT_REM = 2
-/** Vertical gap between wrapped rows: the strip uses gap-0.5 (0.125rem). */
+/**
+ * Gap between tabs: the strip uses gap-0.5 (0.125rem), which is BOTH the
+ * vertical gap between wrapped rows and the horizontal gap between tabs
+ * within a row (single `gap` shorthand).
+ */
 export const TAB_ROW_GAP_REM = 0.125
 /** One row plus its wrap gap — the row pitch. */
 export const TAB_ROW_PITCH_REM = TAB_ROW_HEIGHT_REM + TAB_ROW_GAP_REM
@@ -54,4 +58,49 @@ export function tabBarHeightPxToRows(px: number, rootFontSizePx: number): number
 /** A strip whose scrollHeight exceeds this (at the given root font-size) renders >1 row. */
 export function tabBarMultiRowThresholdPx(rootFontSizePx: number): number {
   return tabBarRowPitchPx(rootFontSizePx) + TAB_STRIP_TOP_PADDING_PX
+}
+
+/**
+ * Multirow tab width bounds. Deliberately absolute px — matching the Tailwind
+ * `basis-[150px] min-w-[150px] max-w-[200px]` classes on the tab wrappers —
+ * so tab WIDTHS do not scale with --ui-scale, unlike the rem-based row
+ * heights above. The e2e suite asserts these exact px values at scale 1.
+ */
+export const MULTIROW_TAB_MIN_WIDTH_PX = 150
+export const MULTIROW_TAB_MAX_WIDTH_PX = 200
+
+/**
+ * Uniform per-tab width for a wrapped (2+ row) multirow strip, or null when
+ * the lock must not apply (all tabs fit on one row, or the width is unknown).
+ *
+ * The width is derived from the FULL rows: pack as many tabs as fit at the
+ * 150px minimum, stretch them to fill the row, cap at 200px — then apply that
+ * same width to every tab, so a partial last row ends short of the right edge
+ * instead of stretching wider than the rows above.
+ *
+ * `Math.floor` guards the re-wrap knife-edge: rounding up would push a full
+ * row past the container width and drop its last tab onto the next row,
+ * oscillating on every ResizeObserver tick.
+ *
+ * Pure px math — callers pass the strip's measured content width in px (see
+ * TabBar's measurement effect for the exact conservative composition) and the
+ * gap in px (TAB_ROW_GAP_REM * root font-size); this function never reads the
+ * DOM.
+ */
+export function multirowUniformTabWidthPx(
+  containerWidthPx: number,
+  tabCount: number,
+  gapPx: number,
+): number | null {
+  if (containerWidthPx <= 0 || tabCount <= 0) return null
+  const tabsPerFullRow = Math.max(
+    1,
+    Math.floor((containerWidthPx + gapPx) / (MULTIROW_TAB_MIN_WIDTH_PX + gapPx)),
+  )
+  if (tabCount <= tabsPerFullRow) return null
+  const stretched = (containerWidthPx - (tabsPerFullRow - 1) * gapPx) / tabsPerFullRow
+  return Math.max(
+    MULTIROW_TAB_MIN_WIDTH_PX,
+    Math.min(MULTIROW_TAB_MAX_WIDTH_PX, Math.floor(stretched)),
+  )
 }

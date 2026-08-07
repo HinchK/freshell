@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   getRootFontSizePx,
+  multirowUniformTabWidthPx,
   tabBarHeightPxToRows,
   tabBarMultiRowThresholdPx,
   tabBarRowPitchPx,
@@ -65,5 +66,62 @@ describe('tab-bar-metrics', () => {
 
   it('falls back to a 16px root when the computed font-size is unparseable (jsdom)', () => {
     expect(getRootFontSizePx()).toBe(16)
+  })
+})
+
+describe('multirowUniformTabWidthPx', () => {
+  const GAP = 2 // TAB_ROW_GAP_REM (0.125rem) at the 16px default root
+
+  it('returns null when all tabs fit on a single row', () => {
+    // 1000px strip, 2px gap: floor((1000 + 2) / 152) = 6 tabs per full row.
+    expect(multirowUniformTabWidthPx(1000, 1, GAP)).toBeNull()
+    expect(multirowUniformTabWidthPx(1000, 6, GAP)).toBeNull()
+  })
+
+  it('locks wrapped tabs to the full-row width', () => {
+    // 6 tabs per full row: (1000 - 5*2) / 6 = 165.
+    expect(multirowUniformTabWidthPx(1000, 7, GAP)).toBe(165)
+    // The width comes from the container, not the tab count.
+    expect(multirowUniformTabWidthPx(1000, 20, GAP)).toBe(165)
+  })
+
+  it('floors fractional widths so a full row never overflows', () => {
+    // (1003 - 5*2) / 6 = 165.5 -> 165.
+    expect(multirowUniformTabWidthPx(1003, 7, GAP)).toBe(165)
+  })
+
+  it('caps the locked width at 200px', () => {
+    // 2 tabs per full row: (450 - 2) / 2 = 224 -> capped to 200.
+    expect(multirowUniformTabWidthPx(450, 3, GAP)).toBe(200)
+  })
+
+  it('never returns less than the 150px minimum', () => {
+    // Degenerate 120px strip: 1 tab per row at raw width 120 -> clamped to 150,
+    // matching the CSS min-width floor (the tab overflows, same as today).
+    expect(multirowUniformTabWidthPx(120, 2, GAP)).toBe(150)
+  })
+
+  it('returns null for unmeasured or empty strips', () => {
+    expect(multirowUniformTabWidthPx(0, 10, GAP)).toBeNull() // jsdom / pre-layout
+    expect(multirowUniformTabWidthPx(-5, 10, GAP)).toBeNull()
+    expect(multirowUniformTabWidthPx(1000, 0, GAP)).toBeNull()
+  })
+
+  it('is gap-aware for scaled roots', () => {
+    // At a 20px root, gap-0.5 is 2.5px: floor((1000 + 2.5) / 152.5) = 6 per row,
+    // (1000 - 5*2.5) / 6 = 164.58 -> 164.
+    expect(multirowUniformTabWidthPx(1000, 8, 2.5)).toBe(164)
+  })
+
+  it('locked width preserves the full-row packing (no re-wrap knife-edge)', () => {
+    for (let width = 320; width <= 2000; width += 7) {
+      const tabsPerFullRow = Math.floor((width + GAP) / (150 + GAP))
+      const locked = multirowUniformTabWidthPx(width, tabsPerFullRow + 1, GAP)
+      expect(locked).not.toBeNull()
+      // A full row of locked tabs still fits in the strip...
+      expect(tabsPerFullRow * locked! + (tabsPerFullRow - 1) * GAP).toBeLessThanOrEqual(width)
+      // ...and one more locked tab would not fit on that row.
+      expect((tabsPerFullRow + 1) * locked! + tabsPerFullRow * GAP).toBeGreaterThan(width)
+    }
   })
 })
