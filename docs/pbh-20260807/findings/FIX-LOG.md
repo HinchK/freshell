@@ -32,3 +32,19 @@
   Regression tests already pin it (codex_session_ref_resume.rs, opencode_switch_rebind.rs). No change made.
 - Lesson: several top-map candidates sit in freshly-hardened areas (#614 attention, #615 remote, auto-resume);
   the map surfaced real historical pain that is already addressed. Confirm-before-fix earned its keep.
+
+## F4 — recovery inventory silently omits a whole device  [CONFIRMED, LANDED 75f641d47]
+- Promise: after a server restart, the recover-my-panes offer shows everything that is on disk — never a
+  silent "nothing to recover" for a recoverable workspace.
+- Observed: GET /api/recovery/inventory does two separately-locked store reads
+  (recovery_inventory.rs:492-500); a concurrent tabs.sync.push at the retention cap prunes a just-selected
+  generation between them, and the ComponentsUnion::Missing arm dropped the WHOLE device: 200 OK,
+  recoverable:false, zero log. Correlated with restart (every window re-pushes exactly when the fresh
+  window fetches inventory). Severity S3 wrong-silent (contradicts the module's own "never a silent empty
+  inventory" policy at recovery_inventory.rs:373-375).
+- Fix: bounded per-device re-read (3 attempts; fresh overview re-selects what survives); still-incoherent
+  after retries -> tracing::error + 500 via the existing fail-loud arm. Test-only injection seam for the
+  interleaved prune (same idiom as INJECTED_DELETE_FAILURES); no-op in production.
+- Tests: transient_prune_between_reads_never_silently_drops_a_device (RED->GREEN);
+  persistent_union_incoherence_fails_loud_not_silent_empty (RED->GREEN).
+- Verify: cargo test -p freshell-server fully green (558 unit + integration binaries); fmt/clippy clean.
