@@ -926,8 +926,9 @@ import { tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
 
 - [ ] **Step 4: Run the unit tests; sweep for `max-h-32`**
 
-Run: `npm run test:vitest -- run test/unit/client/components/ && grep -rn "max-h-32" src/ test/unit/`
-Expected: tests PASS; grep finds no remaining `max-h-32` in `src/` or `test/unit/` (fix any stragglers to the new inline-style contract).
+Run: `npm run test:vitest -- run test/unit/client/components/ && ! grep -rn "max-h-32" src/components/TabBar.tsx src/components/TabItem.tsx test/unit/client/components/`
+Expected: tests PASS; the negated grep succeeds because no `max-h-32` remains in the tab bar components or their unit tests (if it finds stragglers there, fix those tab-bar occurrences to the new inline-style contract).
+NOTE: the sweep is deliberately scoped to the tab bar files. There is a pre-existing, unrelated `max-h-32` on the error-details `<pre>` in `src/components/ui/error-boundary.tsx` — it is NOT part of this change and MUST NOT be modified.
 
 - [ ] **Step 5: Update the e2e max-height assertion**
 
