@@ -45,4 +45,31 @@ test.describe('Multi-row tabs', () => {
     await expect(tabStrip).toHaveClass(/overflow-x-auto/)
     await expect(tabStrip).not.toHaveClass(/flex-wrap/)
   })
+
+  test('multirow tabs render between 150 and 200px wide', async ({ freshellPage: page, harness }) => {
+    await page.locator('[data-context="tab-add"]').click()
+    await harness.waitForTabCount(2)
+
+    const firstTab = page.getByTestId('tab-strip').locator(':scope > div').first()
+    await expect(firstTab).toBeVisible()
+    const box = await firstTab.boundingBox()
+    expect(box).not.toBeNull()
+    expect(box!.width).toBeGreaterThanOrEqual(149)
+    expect(box!.width).toBeLessThanOrEqual(201)
+  })
+
+  test('single-row tabs are fixed at 175px', async ({ freshellPage: page }) => {
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { multirowTabs: false } },
+      })
+    })
+
+    const firstTab = page.getByTestId('tab-strip').locator(':scope > div').first()
+    await expect(firstTab).toBeVisible()
+    const box = await firstTab.boundingBox()
+    expect(box).not.toBeNull()
+    expect(Math.round(box!.width)).toBe(175)
+  })
 })

@@ -245,4 +245,29 @@ describe('TabBar multirow tabs', () => {
     expect(slot).not.toBeNull()
     expect(slot!.className).not.toContain('h-full')
   })
+
+  describe('tab widths', () => {
+    it('fixes tabs at 175px in single-row mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+      renderWithStore(<TabBar />, store)
+      const wrapper = screen.getByTestId('tab-strip').firstElementChild as HTMLElement
+      expect(wrapper.className).toContain('w-[175px]')
+      expect(wrapper.className).toContain('shrink-0')
+      expect(wrapper.className).not.toContain('grow')
+      expect(wrapper.className).not.toContain('max-w-[200px]')
+    })
+
+    it('sizes tabs between 150px and 200px in multirow mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+      renderWithStore(<TabBar />, store)
+      const wrapper = screen.getByTestId('tab-strip').firstElementChild as HTMLElement
+      expect(wrapper.className).toContain('grow')
+      expect(wrapper.className).toContain('basis-[150px]')
+      expect(wrapper.className).toContain('min-w-[150px]')
+      expect(wrapper.className).toContain('max-w-[200px]')
+      expect(wrapper.className).not.toContain('w-[175px]')
+    })
+  })
 })

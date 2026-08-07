@@ -66,6 +66,7 @@ interface SortableTabProps {
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
+  multirow: boolean
   paneEntries?: Array<{ paneId: string; content: PaneContent; repoCwd?: string }>
   iconsOnTabs?: boolean
   repoIconsOnTabs?: boolean
@@ -89,6 +90,7 @@ function SortableTab({
   isDragging,
   isRenaming,
   renameValue,
+  multirow,
   paneEntries,
   iconsOnTabs,
   repoIconsOnTabs,
@@ -110,7 +112,7 @@ function SortableTab({
   } = useSortable({ id: tab.id })
 
   const style = {
-    transform: DndCSS.Transform.toString(transform),
+    transform: DndCSS.Translate.toString(transform),
     transition: transition || 'transform 150ms ease',
   }
 
@@ -126,9 +128,13 @@ function SortableTab({
       style={style}
       {...attributes}
       {...listeners}
-      // Uniform tab width: 180px when space allows, shrinking equally
-      // (never below 100px) before the strip starts scrolling.
-      className="w-[180px] min-w-[100px] shrink"
+      // Multirow: pack rows at a 150px minimum, stretch to fill the row, cap at 200px.
+      // Single row: fixed 175px at all times; the strip scrolls horizontally.
+      className={cn(
+        multirow
+          ? "grow basis-[150px] min-w-[150px] max-w-[200px]"
+          : "w-[175px] shrink-0"
+      )}
     >
       <TabItem
         tab={tabWithDisplayTitle}
@@ -347,6 +353,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         isDragging={activeId === tab.id}
         isRenaming={renamingId === tab.id}
         renameValue={renameValue}
+        multirow={multirowTabs}
         paneEntries={getPaneEntries(tab)}
         iconsOnTabs={iconsOnTabs}
         repoIconsOnTabs={repoIconsOnTabs}
@@ -397,6 +404,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     getPaneEntries,
     getTerminalIdsForTab,
     iconsOnTabs,
+    multirowTabs,
     repoIconsOnTabs,
     repoIconInfoByCwd,
     renameValue,
@@ -593,7 +601,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         <DragOverlay>
           {activeTab ? (
             <div
-              className="w-[180px]"
+              className="w-[175px]"
               style={{
                 opacity: 0.9,
                 transform: 'scale(1.02)',
