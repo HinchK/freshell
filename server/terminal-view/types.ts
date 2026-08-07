@@ -15,6 +15,7 @@ export type TerminalDirectoryItem = {
   hasClients: boolean
   cwd?: string
   codexDurability?: CodexDurabilityRef
+  resumeTargetIsSubagent?: boolean
 }
 
 export type TerminalDirectoryPage = {

@@ -1120,6 +1120,8 @@ export type TerminalInventoryMessage = {
     runtimeStatus?: 'running' | 'recovering'
     cwd?: string
     codexDurability?: CodexDurabilityRef
+    /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */
+    resumeTargetIsSubagent?: boolean
   }>
   terminalMeta: TerminalMetaRecord[]
 }

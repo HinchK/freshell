@@ -11,6 +11,7 @@ import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { makeSessionKey, type CodingCliProviderName, type ProjectGroup } from './coding-cli/types.js'
+import { isOpencodeSubagentSession } from './coding-cli/providers/opencode-subagent-query.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
@@ -2586,11 +2587,25 @@ export class WsHandler {
               const terminalSessionBindingReason = codexPlan
                 ? getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId)
                 : sessionBindingReason
+              // Bug-1 (sidebar rail): classify the requested opencode resume target
+              // at create time (bindSession later re-classifies whenever it
+              // overwrites resumeSessionId — see Step 6). Best-effort:
+              // any failure classifies as "not a subagent". The await parks on a
+              // WORKER-THREAD SQLite read (Task 3) — the event loop stays free;
+              // this create path already awaits allocateLocalhostPort() just
+              // below (~:2562), so an await here is the established shape.
+              const requestedOpencodeTarget = m.mode === 'opencode'
+                ? (m.resumeSessionId ?? (m.sessionRef?.provider === 'opencode' ? m.sessionRef.sessionId : undefined))
+                : undefined
+              const resumeTargetIsSubagent = requestedOpencodeTarget
+                ? await isOpencodeSubagentSession(requestedOpencodeTarget)
+                : undefined
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                 cwd: m.cwd,
                 resumeSessionId: effectiveResumeSessionId,
+                resumeTargetIsSubagent,
                 ...(terminalSessionBindingReason ? { sessionBindingReason: terminalSessionBindingReason } : {}),
                 envContext: { tabId: m.tabId, paneId: m.paneId },
                 providerSettings: spawnProviderSettings,

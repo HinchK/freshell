@@ -3204,6 +3204,49 @@ describe('TerminalRegistry', () => {
       expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'opencode', record.mcpCwd)
     })
   })
+
+  describe('resumeTargetIsSubagent (opencode subagent-target classification)', () => {
+    it('stores the flag from create opts and surfaces it from list()', () => {
+      registry.create({
+        mode: 'opencode',
+        cwd: '/home/user/project',
+        resumeSessionId: 'ses_child0000000000000000000000',
+        resumeTargetIsSubagent: true,
+        providerSettings: { opencodeServer: TEST_OPENCODE_SERVER },
+      })
+      expect(registry.list()[0]).toMatchObject({
+        mode: 'opencode',
+        resumeTargetIsSubagent: true,
+      })
+    })
+
+    it('omits the flag when not provided (root/unknown target)', () => {
+      registry.create({
+        mode: 'opencode',
+        cwd: '/home/user/project',
+        providerSettings: { opencodeServer: TEST_OPENCODE_SERVER },
+      })
+      expect(registry.list()[0].resumeTargetIsSubagent).toBeUndefined()
+    })
+
+    it('re-classifies resumeTargetIsSubagent when bindSession changes the resume target (both directions)', async () => {
+      const created = registry.create({
+        mode: 'opencode',
+        cwd: '/home/user/project',
+        resumeSessionId: 'ses_child0000000000000000000000',
+        resumeTargetIsSubagent: true,
+        providerSettings: { opencodeServer: TEST_OPENCODE_SERVER },
+      })
+      // Rebind to a ROOT id: the fire-and-forget re-classification must clear
+      // the stale flag (no opencode.db here -> isOpencodeSubagentSession
+      // resolves false, which is exactly the root/unknown answer).
+      const bound = registry.bindSession(created.terminalId, 'opencode', 'ses_root0000000000000000000000', 'association')
+      expect(bound.ok).toBe(true)
+      await vi.waitFor(() => {
+        expect(registry.list().find((t) => t.terminalId === created.terminalId)?.resumeTargetIsSubagent).toBeUndefined()
+      })
+    })
+  })
 })
 
 describe('buildSpawnSpec Unix paths', () => {
