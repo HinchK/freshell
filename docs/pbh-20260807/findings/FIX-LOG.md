@@ -93,3 +93,17 @@
   one_row_inside_two_same_cwd_windows_binds_neither_terminal, solo_enter_still_binds_when_same_cwd_sibling_has_no_open_window — RED→GREEN.
 - Verify: freshell-sessions green (178 lib+integration); freshell-ws 424 lib green, integration failures baseline-identical (env-dependent e2e).
 - Review: PASS (independent) — confirmed opencode lacked codex's misbind guards; census + drain refusal mirror codex one-for-one (with the correct !resolved translation for opencode's spawn-window), tests fail pre-fix, no starvation of a solo contender, rightful owner never rejected, all refusals warn-logged.
+
+## F8 — freshclaude pane wedged "working" forever after unrequested sidecar death  [CONFIRMED, LANDED f401dd7d0]
+- Promise: freshclaude/freshcodex/freshopencode chat behaves consistently; one provider isn't silently broken where others work.
+- Observed: member asymmetry — when the claude/kilroy sidecar dies UNREQUESTED mid-turn (crash/OOM/SIGKILL), the
+  claude adapter's stdout consumer evicted the session in TOTAL SILENCE (crates/freshell-freshagent/src/claude.rs:1190-1220),
+  so the pane stays "working"/streaming forever. codex (codex.rs:3289-3311 exit watcher) and opencode
+  (opencode_ws.rs:721-723 unconditional idle) both self-heal; Node reference broadcasts idle on claude stream death too.
+  Severity S2/S3 (blocked + wrong-silent).
+- Fix: in the unrequested-death (evicted) branch only, broadcast one freshAgent.error{SIDECAR_EXITED} stamped with the
+  session broadcast_id; client folds it to a visible banner + running/streaming->idle. No false completion chime
+  (ADR 2.1 "death never yields false completion" preserved). Matches the sibling adapters. claude.rs only.
+- Test: unrequested_sidecar_death_broadcasts_a_pane_unwedging_error (SIGKILL child directly, not via handle_kill) — RED->GREEN.
+- Verify: cargo test -p freshell-freshagent — 334 pass; the 24 failures are pre-existing terminal_tabs e2e, byte-identical to baseline. claude:: module 34/34 green.
+- Review: PASS (independent) — confirmed claude was the one silent provider on unrequested death (codex exit-watcher + opencode unconditional idle both self-heal); exactly-once frame structurally guaranteed (remove-before-signal on every requested path + identity guard), no false completion, envelope stamped to the pane's current durable id, test SIGKILLs the child directly and times out pre-fix.

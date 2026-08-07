@@ -5,7 +5,7 @@
 **Coordination:** agmsg not installed → append-only JSONL equivalent.
 **Skill exercised:** `~/code/skill-parallel-development` (parallel-bug-hunt), first live run.
 
-## Outcome — 6 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
+## Outcome — 7 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
 
 ### F1 — freshclaude approvals/answers silently dropped  [S2/S3 · LANDED 6c5f9ad86 · review PASS]
 The freshAgent WS dispatch (`crates/freshell-ws/src/terminal.rs`) routed `approval.respond`,
@@ -56,6 +56,13 @@ fresh-agent `opencode serve` sharing opencode.db) could bind a pane to another p
 so a later resume opens someone else's conversation, silently. Fix mirrors codex one-for-one: a contested-cwd census
 (a sole candidate shared by >=2 same-cwd contenders binds nobody) + drain-side claim refusal (bound-elsewhere,
 fresh-agent), all warn-logged. RED→GREEN. Review confirmed no starvation, rightful owner never rejected, symmetric with codex.
+
+### F8 — freshclaude pane wedged "working" forever after sidecar crash  [S2/S3 · LANDED f401dd7d0 · review PASS]
+Member asymmetry: when the claude sidecar dies UNREQUESTED mid-turn (crash/OOM), the claude adapter evicted the
+session in total silence — pane stuck busy forever — while codex (exit watcher) and opencode (unconditional idle)
+both self-heal. Fix broadcasts exactly one freshAgent.error{SIDECAR_EXITED} in the unrequested-death branch only
+(structurally impossible on user kill/shutdown); client shows a banner and clears busy. No false completion chime.
+RED→GREEN (test SIGKILLs the child directly). Review confirmed exactly-once, correct stamping, ADR preserved.
 
 ### F3 — provider resume after restart  [AUDIT_WRONG — already fixed]
 Candidate: codex/opencode sessions unresumable after a server restart. Adjudication found this is **not a
