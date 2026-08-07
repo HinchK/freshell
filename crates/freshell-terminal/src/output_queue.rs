@@ -18,8 +18,15 @@
 //! `(terminalId, connection)` broker attachment; only replay/live terminal
 //! OUTPUT frames pass through it (`broker.ts` calls
 //! `attachment.queue.enqueue()` only for those -- `attach.ready`,
-//! `terminal.created`, `terminal.exit`, etc. are sent directly and are never
-//! subject to eviction).
+//! `terminal.created`, etc. are sent directly and are never subject to
+//! eviction). ONE deliberate Rust-port deviation: `terminal.exit` ALSO
+//! travels this queue (as a non-evictable, zero-weight sequenced frame via
+//! [`OutputQueue::push_sequenced`]) because the port's connection loop
+//! drains its direct channel ahead of this queue -- a directly-sent exit
+//! would deterministically overtake still-queued replay/final output on the
+//! wire, and the client's exit teardown then discards that output (blank
+//! exited pane on attach-to-an-exited-terminal; truncated tail on a busy
+//! live exit). See `freshell-ws::backpressure`'s `route`.
 //!
 //! The Rust port's connection loop (`freshell-ws::terminal::run`) instead
 //! multiplexes EVERY server-to-client message for a connection (all
@@ -85,7 +92,11 @@ pub fn output_frame_meta(msg: &ServerMessage) -> Option<OutputFrameMeta> {
 struct QueuedItem {
     msg: ServerMessage,
     bytes: usize,
-    meta: OutputFrameMeta,
+    /// `Some` for a measured, evictable output frame; `None` for a sequenced
+    /// control frame ([`OutputQueue::push_sequenced`]) that must keep its
+    /// FIFO position relative to output but is NEVER evicted and carries no
+    /// queued-byte weight.
+    meta: Option<OutputFrameMeta>,
 }
 
 /// A pending, not-yet-delivered gap. Kept per-stream (mirrors legacy's
@@ -140,9 +151,35 @@ impl OutputQueue {
     /// (mirrors `enqueue(frame, queuedBytes = frame.bytes)`). Evicts the
     /// oldest frames first if this push takes the queue over `max_bytes`.
     pub fn push(&mut self, msg: ServerMessage, bytes: usize, meta: OutputFrameMeta) {
-        self.items.push_back(QueuedItem { msg, bytes, meta });
+        self.items.push_back(QueuedItem {
+            msg,
+            bytes,
+            meta: Some(meta),
+        });
         self.total_bytes += bytes;
         self.evict_overflow();
+    }
+
+    /// Push a sequenced CONTROL frame (e.g. `terminal.exit`) that must be
+    /// delivered strictly AFTER every output frame already queued here, but
+    /// is never itself evicted and never counts toward the byte budget.
+    ///
+    /// Why: the producer side guarantees `terminal.exit` is emitted only
+    /// after the final `terminal.output` frame (`crate::pty`'s ExitHook
+    /// contract; the registry's attach enqueues ready -> replay -> exit). A
+    /// connection loop that sends direct frames ahead of this queue would
+    /// invert that order whenever output is still pending -- the client's
+    /// exit teardown then discards the queued replay (a blank exited pane).
+    /// Routing the exit through the SAME FIFO preserves the wire order.
+    /// Zero-byte weight keeps `evict_overflow`'s loop invariant airtight
+    /// (`total_bytes > max_bytes` always implies an evictable frame exists)
+    /// and keeps [`Self::pending_bytes`] an output-only backpressure proxy.
+    pub fn push_sequenced(&mut self, msg: ServerMessage) {
+        self.items.push_back(QueuedItem {
+            msg,
+            bytes: 0,
+            meta: None,
+        });
     }
 
     /// Bytes currently retained (NEVER exceeds `max_bytes` after `push`
@@ -190,12 +227,22 @@ impl OutputQueue {
 
     fn evict_overflow(&mut self) {
         while self.total_bytes > self.max_bytes {
-            let Some(dropped) = self.items.pop_front() else {
+            // Evict the OLDEST measured output frame; sequenced control
+            // frames (`push_sequenced`, meta `None`) keep their FIFO slot and
+            // are never dropped -- losing a queued `terminal.exit` would
+            // leave the client's pane running forever. They carry zero bytes,
+            // so `total_bytes > max_bytes` guarantees an evictable frame
+            // exists (the `else break` is unreachable-in-practice safety).
+            let Some(index) = self.items.iter().position(|item| item.meta.is_some()) else {
+                break;
+            };
+            let Some(dropped) = self.items.remove(index) else {
                 break;
             };
             self.total_bytes -= dropped.bytes;
             self.dropped_frames += 1;
-            self.extend_gap(dropped.meta);
+            let meta = dropped.meta.expect("evicted items carry output meta");
+            self.extend_gap(meta);
         }
     }
 
@@ -359,6 +406,68 @@ mod tests {
         // 10 pushes of 100 bytes each into a 150-byte cap: only the LAST
         // frame (seq 9) fits after eviction settles.
         assert_eq!(gap.to_seq, 8);
+    }
+
+    fn exit_msg(terminal_id: &str) -> ServerMessage {
+        ServerMessage::TerminalExit(freshell_protocol::TerminalExit {
+            exit_code: 0,
+            terminal_id: terminal_id.to_string(),
+        })
+    }
+
+    /// A sequenced control frame keeps its FIFO position: output pushed
+    /// before it drains before it, output pushed after drains after it.
+    #[test]
+    fn sequenced_frame_preserves_fifo_position_relative_to_output() {
+        let mut q = OutputQueue::new(1_000_000);
+        push_frame(&mut q, 1, 1, 100);
+        q.push_sequenced(exit_msg("term-1"));
+
+        let drained = q.drain_all();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(drained[0], ServerMessage::TerminalOutput(_)));
+        assert!(
+            matches!(drained[1], ServerMessage::TerminalExit(_)),
+            "exit stays strictly after the output it followed"
+        );
+    }
+
+    /// A sequenced control frame is NEVER evicted by an overflow (losing a
+    /// queued `terminal.exit` would leave the pane running forever), carries
+    /// no byte weight, and never appears in a gap range.
+    #[test]
+    fn sequenced_frame_survives_overflow_eviction_and_carries_no_weight() {
+        let mut q = OutputQueue::new(150); // room for ~1 output frame
+        push_frame(&mut q, 1, 1, 100);
+        q.push_sequenced(exit_msg("term-1"));
+        assert_eq!(q.pending_bytes(), 100, "sequenced frames weigh nothing");
+
+        // Another terminal floods the SAME connection queue past the cap:
+        // eviction must skip the sequenced frame and drop output only.
+        push_frame(&mut q, 2, 2, 100); // 200 > 150 -> evict oldest OUTPUT (seq 1)
+        assert!(q.pending_bytes() <= 150);
+
+        let drained = q.drain_all();
+        let ServerMessage::TerminalOutputGap(gap) = &drained[0] else {
+            panic!("expected the overflow gap first, got {:?}", drained[0]);
+        };
+        assert_eq!((gap.from_seq, gap.to_seq), (1, 1), "gap covers output only");
+        assert!(
+            drained
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalExit(_))),
+            "the sequenced exit must survive eviction: {drained:?}"
+        );
+        // And it still sits BEFORE the output that was pushed after it.
+        let exit_pos = drained
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalExit(_)))
+            .unwrap();
+        let out_pos = drained
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalOutput(_)))
+            .unwrap();
+        assert!(exit_pos < out_pos, "FIFO position preserved: {drained:?}");
     }
 
     /// Two different terminals/streams overflowing on the SAME connection's
