@@ -5,8 +5,9 @@
 
 use freshell_platform::path::{
     convert_windows_path_to_wsl_path, convert_wsl_drive_path_to_windows_path,
-    detect_user_path_flavor, is_linux_path, resolve_launch_cwd, sanitize_user_path_input,
-    win32_resolve, LaunchCwdConversion, LaunchCwdTargetRuntime, UserPathFlavor,
+    detect_user_path_flavor, is_linux_path, join_windows_display_path, resolve_launch_cwd,
+    sanitize_user_path_input, split_windows_display_path, win32_resolve, LaunchCwdConversion,
+    LaunchCwdTargetRuntime, UserPathFlavor,
 };
 use freshell_platform::MapEnv;
 
@@ -338,6 +339,66 @@ fn launch_cwd_windows_process_matrix() {
             resolve_launch_cwd(Some(c), wp, &env, true).launch_cwd,
             None,
             "{c:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// Windows display split/join — the Rust counterpart of the files endpoints'
+// `path.win32.dirname/basename/join` usage (files-router.ts:194-211).
+// ===========================================================================
+
+#[test]
+fn split_windows_display_path_matrix() {
+    let rows: &[(&str, Option<(&str, &str)>)] = &[
+        ("C:\\Users\\dan", Some(("C:\\Users", "dan"))),
+        // one level below the drive root: parent keeps the root backslash
+        ("C:\\Us", Some(("C:\\", "Us"))),
+        // drive root is its own parent with an empty leaf (win32.dirname("C:\\") == "C:\\")
+        ("C:\\", Some(("C:\\", ""))),
+        // forward slashes normalize to backslashes first
+        ("C:/Users/dan", Some(("C:\\Users", "dan"))),
+        // drive-letter case preserved as typed
+        ("c:\\users", Some(("c:\\", "users"))),
+        // trailing separator stripped by win32_resolve before splitting
+        ("C:\\Users\\", Some(("C:\\", "Users"))),
+        // UNC: share root keeps its trailing backslash (win32.dirname semantics)
+        ("\\\\srv\\share\\dir", Some(("\\\\srv\\share\\", "dir"))),
+        // deliberate deviation: Node win32.basename would give "share" here —
+        // we return an empty leaf (endpoint-unreachable corner; see helper docs)
+        ("\\\\srv\\share", Some(("\\\\srv\\share\\", ""))),
+        // cwd-dependent inputs are not absolutely resolvable -> None
+        ("C:foo", None),
+        ("C:", None),
+        ("\\foo", None),
+        ("relative", None),
+        ("", None),
+    ];
+    for (input, expected) in rows {
+        let got = split_windows_display_path(input);
+        let got_ref = got
+            .as_ref()
+            .map(|(parent, leaf)| (parent.as_str(), leaf.as_str()));
+        assert_eq!(got_ref, *expected, "split_windows_display_path({input:?})");
+    }
+}
+
+#[test]
+fn join_windows_display_path_matrix() {
+    let rows: &[(&str, &str, &str)] = &[
+        // roots already end with the separator — no doubling (win32.join("C:\\","Users") == "C:\\Users")
+        ("C:\\", "Users", "C:\\Users"),
+        ("\\\\srv\\share\\", "dir", "\\\\srv\\share\\dir"),
+        // deeper parents get a separator inserted
+        ("C:\\Users", "dan", "C:\\Users\\dan"),
+        // casing flows through untouched
+        ("c:\\users", "dan", "c:\\users\\dan"),
+    ];
+    for (parent, name, expected) in rows {
+        assert_eq!(
+            join_windows_display_path(parent, name),
+            *expected,
+            "join_windows_display_path({parent:?}, {name:?})"
         );
     }
 }

@@ -24,6 +24,17 @@ async fn fresh_amplifier_create_carries_launcher_assigned_session_ref_and_stub()
     // through it — set the var eagerly before anything can spawn.
     let amp_home = isolate_amplifier_home();
 
+    // ITEM-1: the launcher must stamp the user's configured bundle into the
+    // stub. NOTE: `isolate_amplifier_home()` is OnceLock-memoized — this
+    // settings.yaml is visible to every test in this binary. That is safe:
+    // no other test asserts on the bundle key, and a surprise partial read
+    // degrades to omission by design.
+    std::fs::write(
+        amp_home.join("settings.yaml"),
+        "bundle:\n  active: foundation\n",
+    )
+    .expect("write isolated settings.yaml");
+
     let (url, registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
@@ -99,9 +110,11 @@ async fn fresh_amplifier_create_carries_launcher_assigned_session_ref_and_stub()
         serde_json::from_str(&std::fs::read_to_string(stub_dir.join("metadata.json")).unwrap())
             .unwrap();
     assert_eq!(meta["session_id"], sid);
-    assert!(
-        meta.get("bundle").is_none(),
-        "stub metadata must have NO bundle key so the user's default bundle resolves"
+    assert_eq!(
+        meta["bundle"], "foundation",
+        "stub metadata must stamp the user's configured bundle (bare name): \
+         the CLI's resume path never consults settings.yaml and would \
+         otherwise run its hardcoded default bundle, got: {meta}"
     );
 
     registry.kill(&terminal_id);

@@ -35,23 +35,116 @@
 //! # Accepted Residuals
 //!
 //! The following edge cases are accepted design trade-offs (not deferrals):
-//! 1. Mid-turn `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and
-//!    the TUI's ~2s shutdown budget can exit before the abort evidence lands
-//!    — may ring on a human force-quit of a visibly-working pane. No in-band
-//!    discriminator exists; accepted.
+//! 1. (CLOSED for freshell-owned input by #612, 2026-08-06) Mid-turn
+//!    `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and the
+//!    TUI's ~2s shutdown budget can exit before the abort evidence lands —
+//!    could ring on a human force-quit of a visibly-working pane. User-typed
+//!    quits through freshell's own input stream — /quit, /exit, Ctrl+D,
+//!    Ctrl+C — now suppress the death bell via a 15s quit-intent marker
+//!    (signal::classify_input; exact rules there, including bracketed-paste
+//!    unwrapping — a PASTED /quit evaluated by a real Enter is detected —
+//!    and the DECRQM exact-grammar skip for freshell's own synthetic
+//!    replies). Remaining residual, adjudicated: /quit typed as literal
+//!    prompt text followed by a crash within 15s is the one accepted
+//!    false-suppress.
 //! 2. Out-of-band `kill -9`/SIGTERM of the CLI by the user: observationally
-//!    identical to a crash — rings; accepted.
-//! 3. Claude/amplifier Enter-executed quits (`/exit`): input-driven Busy is
-//!    those trackers' ONLY turn evidence, so it stays death-bell engagement;
-//!    same residual family as (1); accepted.
+//!    identical to a crash — rings; accepted. (#612, 2026-08-06)
+//!    Adjudicated: out-of-band kill -9 RINGS (intended — a working agent
+//!    killed externally is worth announcing).
+//! 3. (CLOSED for freshell-owned input by #612, 2026-08-06) Claude/amplifier
+//!    Enter-executed quits (`/exit`): input-driven Busy is those trackers'
+//!    ONLY turn evidence, so it stays death-bell engagement — but the same
+//!    15s quit-intent marker as entry 1 (signal::classify_input) now
+//!    suppresses the bell when the quit line arrived through freshell's own
+//!    input stream; same residual family as (1); accepted.
 //! 4. Node 120s busy-deadman swallow (audit A17): a recovery window longer
 //!    than `BUSY_DEADMAN_MS` demotes busy→unknown and `unknown` never arms the
 //!    death bell — a MISSED bell (never a false ring); accepted.
 //! 5. A SENT approval request auto-resolved server-side slower than ~2s rings
 //!    once (decision 5); accepted.
-//! 6. Node opencode death bells: deliberately excluded (noisy busy proxy) —
-//!    follow-up. Rust opencode: no hub tracker exists — N/A.
-//! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
+//!  6. (CLOSED for lane-backed panes by #609, 2026-08-06) A busy root on
+//!     the pane's own per-pane lane binds identity directly (KnownBusy) —
+//!     first-turn deaths ring and the indefinite-candidate tail cannot
+//!     form. Identity-by-construction holds because opencode v1.18.14
+//!     creates sessions only client-initiated and internal features
+//!     never mint ROOT sessions (title/summary run in-place; subagents
+//!     are CHILDREN carrying parentID — child filtering in root
+//!     resolution stays load-bearing). D4 unchanged:
+//!     Candidate/Ambiguous/AwaitingAssociation still never death-ring.
+//!     Residuals (adjudicated): externally-attached panes on a SHARED
+//!     opencode endpoint have no lane and keep conservative silence;
+//!     and `opencode run --attach http://127.0.0.1:<port>` against a
+//!     pane's port can DELIBERATELY mint foreign busy roots — named,
+//!     accepted (it requires local intent, and two busy roots still
+//!     demote to Ambiguous, which stays honest-blue and death-silent).
+//!  7. (ADJUDICATED by owner ruling 2026-08-05, #607) Unmanaged/PTY-only
+//!     codex panes make NO approval-notification promise: when codex
+//!     pauses for approval, such panes keep an honest busy light until
+//!     the turn resumes or ends. The approval-pause guarantee (demote +
+//!     attention boundary + death-bell engagement) is scoped to MANAGED
+//!     proxy-lane panes (note_approval_requested/resolved). PTY
+//!     text-parsing heuristics were considered and REJECTED (owner
+//!     policy: no heuristics). Freshell-launched codex panes use the
+//!     managed lane, so the unmanaged population is externally-attached
+//!     panes only.
+//!  8. (CLOSED by #608, 2026-08-06) SSE reconnect resyncs outstanding
+//!     asks via GET /permission AND GET /question (disjoint pending
+//!     stores at v1.18.14; both replayed BEFORE the snapshot), busy
+//!     snapshots no longer clear an outstanding pause, and the fetched
+//!     sets reconcile stale local pauses (instance-dispose drains with
+//!     NO events — a locally-pending id absent from the listing is
+//!     treated as replied, so pauses cannot wedge). The
+//!     pending-attention bell survives connection blips.
+//!     Ambiguous ownership stays bell-free. Child sessions
+//!     unseen on-stream (reconnect gap, mid-turn attach) are recovered by the
+//!     lane's HTTP root resolver (GET /session/{id} exposes parentID); only
+//!     resolver FAILURE degrades to ambiguous (conservative silence), retried
+//!     on the next occurrence.
+//! 9. (RE-SCOPED by #604, 2026-08-06) permission.* and question.*
+//!    families (v1 AND v2) are translated onto the same pause
+//!    machinery, source-verified against opencode v1.18.14: TUI-driven
+//!    turns emit the V1 names; v2 names fire only via /api/* routes
+//!    (kept as forward-compat). Permission rejection has NO event type
+//!    of its own — it arrives as *.replied with reply:"reject", which
+//!    the replied translation drains. Residual: a FUTURE
+//!    never-before-seen event family cannot be handled in advance —
+//!    mitigated by the snapshot poll (turn lights stay correct
+//!    regardless of stream vocabulary, #603) and the loud drift
+//!    detector (#604); bells for a brand-new family stay deaf until
+//!    vocabulary is updated (adjudicated: acceptable).
+//! 10. Opencode abort window W1: an abort landing between the prompt loop-top
+//!     and processor.create emits NO abort evidence at all before idle — a
+//!     ms-scale window where a completion bell can ring on a human abort
+//!     (window W2 is closed by the abort-marked message.updated fallback).
+//! 11. Pathological opencode TUI quits — worker dispose exceeding the 5s
+//!     hard-terminate cap, or a raw SIGTERM (no drain path) — can leave
+//!     engagement set at spontaneous exit, so a death bell can ring on those
+//!     rare human quits. Normal quit paths verified to abort+drain (all four
+//!     quit inputs dispose runners via the abort path before exit); the
+//!     wire-flush instant is unprovable from code but mitigated upstream by
+//!     graceful SSE stream termination. (#612, 2026-08-06) The 15s
+//!     quit-intent marker (signal::classify_input) now suppresses the death
+//!     bell for quits observed on freshell's own input stream — the TTL
+//!     covers slow TUI shutdowns including opencode's 5s dispose cap.
+//!     Remaining residuals, adjudicated: TUI-menu quits driven by escape
+//!     sequences produce no detectable byte sequence and stay
+//!     agent-evidence-dependent; a paste that embeds its own newline after
+//!     the quit line ("/exit\r…" INSIDE one paste) is treated as a
+//!     multi-line blob, not a submit; a raw SIGTERM is out-of-band input
+//!     and RINGS (entry 2's adjudication).
+//! 12. (CLOSED by #603, 2026-08-06) The opencode busy deadman no longer
+//!     drops the record on event silence: it verifies via GET
+//!     /session/status through the lane and stays busy; a failed probe
+//!     clears busy AND rings the attention boundary (owner ruling:
+//!     verify-probe failure = crash/needs-attention).
+//! 13. (NAMED by #606, 2026-08-06) An EARLY-ESC interrupt — ESC before
+//!     any assistant output — writes NO transcript record at all
+//!     (corpus-verified), so the JSONL truth source cannot distinguish
+//!     it from a long silent tool call: the pane keeps an honest-stale
+//!     blue until the user's next input, at which point the submit
+//!     probe / deadman verify self-heals it. Accepted: no deterministic
+//!     discriminator exists, and a stale blue that self-heals is the
+//!     conservative direction (never a false green).
 
 use std::collections::HashMap;
 

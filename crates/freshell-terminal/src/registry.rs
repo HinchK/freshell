@@ -830,13 +830,39 @@ impl TerminalRegistry {
             .is_some_and(|count| *count >= cap)
     }
 
+    /// ITEM-3: agent-CLI terminals (long-running assistant sessions) get a
+    /// 24-hour idle HARD CAP instead of the configured threshold. An agent
+    /// mid-work can be PTY-silent far longer than any reasonable idle
+    /// threshold (long LLM calls, long tool runs), and `terminal.killed
+    /// by="idle"` forensics showed busy amplifier sessions being reaped.
+    /// NOT a full exemption: `status == Running` is not a loss-proof
+    /// live-child signal (the Running→Exited flip's only natural trigger is
+    /// the PTY reader's EOF; a descendant holding the slave fd wedges it —
+    /// ledger A14), and this sweep is the only cleanup for wedged rows.
+    /// CLOSED list mirroring the shipped agent-CLI extensions (`category:
+    /// "cli"`, picker group `"agents"` under `extensions/`): unknown /
+    /// future modes stay reapable (legacy behavior) until added here.
+    fn is_agent_mode(mode: &str) -> bool {
+        matches!(
+            mode,
+            "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi"
+        )
+    }
+
+    /// ITEM-3: idle hard cap for agent modes (see [`Self::is_agent_mode`]).
+    const AGENT_IDLE_HARD_CAP_MS: i64 = 24 * 60 * 60 * 1000;
+
     /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
     /// DETACHED **running** terminal idle beyond the configured threshold.
     /// `auto_kill_idle_minutes() <= 0` is legacy's disabled state -- a no-op.
     /// Idleness is measured against `last_meaningful_activity_at` (DEV-0009):
     /// self-generated repaint noise does not keep a detached terminal alive.
     /// "Detached" mirrors `term.clients.size > 0` continue-guard: any attached
-    /// subscriber exempts the terminal regardless of idle time. Returns the
+    /// subscriber exempts the terminal regardless of idle time.
+    /// Agent-mode terminals (see [`Self::is_agent_mode`]) use a 24-hour
+    /// hard cap instead of the configured threshold — PTY silence is not
+    /// idleness for an agent mid-work, but the sweep stays their cleanup
+    /// backstop for wedged exit detection (ITEM-3, ledger A14). Returns the
     /// killed terminal ids (empty when nothing was eligible), for callers that
     /// want to log/observe the sweep and for deterministic test assertions.
     ///
@@ -868,7 +894,12 @@ impl TerminalRegistry {
                     // activity clock, not the every-frame last_activity_at —
                     // otherwise a detached animated TUI (spinner / ticking
                     // counter) is exempt from this sweep forever.
-                    if now.saturating_sub(s.last_meaningful_activity_at) < idle_threshold_ms {
+                    let idle_ms = now.saturating_sub(s.last_meaningful_activity_at);
+                    if Self::is_agent_mode(&s.mode) && idle_ms < Self::AGENT_IDLE_HARD_CAP_MS {
+                        // ITEM-3: agent session within the hard cap — spare.
+                        return None;
+                    }
+                    if idle_ms < idle_threshold_ms {
                         return None; // not idle long enough yet
                     }
                     Some(id.clone())
@@ -3900,6 +3931,88 @@ mod tests {
 
         assert_eq!(killed, vec!["T".to_string()]);
         assert!(reg.inventory().is_empty());
+    }
+
+    #[test]
+    fn enforce_idle_kills_spares_agent_mode_terminals_past_threshold() {
+        // ITEM-3 (`terminal.killed by="idle"` forensics): agent CLIs are
+        // legitimately PTY-silent far beyond any idle threshold while
+        // mid-work (long LLM calls, long tool runs), and their spinner
+        // repaints are deliberately noise-classified (DEV-0009). PTY
+        // silence is NOT evidence of idleness for these modes — within
+        // the 24 h hard cap they must be spared (999 min << 24 h).
+        let reg = TerminalRegistry::new();
+        reg.set_auto_kill_idle_minutes(5);
+        for mode in ["claude", "codex", "opencode", "amplifier", "gemini", "kimi"] {
+            let id = format!("T-{mode}");
+            reg.register_headless(HeadlessTerminal {
+                terminal_id: id.clone(),
+                stream_id: format!("S-{mode}"),
+                mode: mode.to_string(),
+                resume_session_id: None,
+                create_request_id: None,
+                created_at: Some(now_ms()),
+            });
+            // 999 minutes stale vs a 5-minute threshold.
+            reg.backdate_last_activity(&id, now_ms() - 999 * 60_000);
+        }
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(
+            killed.is_empty(),
+            "agent-mode terminals with a live child must never be idle-reaped, got {killed:?}"
+        );
+        assert_eq!(reg.inventory().len(), 6);
+    }
+
+    #[test]
+    fn enforce_idle_kills_mixed_sweep_reaps_only_the_shell() {
+        // The hard cap applies to a CLOSED list: plain shells (and future
+        // modes) keep the legacy reap behavior — the sweep still does its
+        // resource-cleanup job.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-shell", "S-shell"); // fixture mode: "shell"
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-amp".to_string(),
+            stream_id: "S-amp".to_string(),
+            mode: "amplifier".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        reg.set_auto_kill_idle_minutes(5);
+        reg.backdate_last_activity("T-shell", now_ms() - 6 * 60_000);
+        reg.backdate_last_activity("T-amp", now_ms() - 6 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T-shell".to_string()]);
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_reaps_agent_terminals_past_the_hard_cap() {
+        // ITEM-3 counterweight (ledger A14): Running is NOT a loss-proof
+        // live-child signal (a descendant holding the PTY slave fd wedges
+        // exit detection), and this sweep is the only cleanup for wedged
+        // rows — so agents are capped, not fully exempt.
+        let reg = TerminalRegistry::new();
+        reg.set_auto_kill_idle_minutes(5);
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-amp-wedged".to_string(),
+            stream_id: "S-amp-wedged".to_string(),
+            mode: "amplifier".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        // 25 hours stale — past the 24-hour agent hard cap.
+        reg.backdate_last_activity("T-amp-wedged", now_ms() - 25 * 60 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T-amp-wedged".to_string()]);
     }
 
     #[test]

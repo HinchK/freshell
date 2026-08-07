@@ -1,0 +1,61 @@
+# Optional systemd USER unit for the self-hosted Rust freshell-server.
+#
+# This is an ALTERNATIVE to scripts/launch-rust.sh (which detaches via
+# setsid and needs no systemd). RECOMMENDED for unattended operation:
+# WSL2 shuts the whole VM down after the last console closes, which kills
+# a setsid-detached server too — this unit (with linger) restores the
+# server at the next distro boot and supervises restarts meanwhile.
+#
+# WSL2 REQUIREMENT: systemd must be enabled — /etc/wsl.conf:
+#   [boot]
+#   systemd=true
+# then restart the distro (`wsl --shutdown` from Windows). Without systemd,
+# use scripts/launch-rust.sh; do NOT install this unit.
+#
+# Install:
+#   1. Build once:  cargo build --release -p freshell-server
+#   2. mkdir -p ~/.config/systemd/user
+#   3. cp installers/systemd/freshell-rust.service ~/.config/systemd/user/
+#   4. EDIT WorkingDirectory/ExecStart below to your checkout path.
+#      AUTH_TOKEN is read from WorkingDirectory/.env by the server itself.
+#   5. systemctl --user daemon-reload
+#   6. systemctl --user enable --now freshell-rust
+#   7. Recommended on WSL2 (survive logout): loginctl enable-linger "$USER"
+#
+# Stop/status:
+#   systemctl --user stop freshell-rust
+#   systemctl --user status freshell-rust
+
+[Unit]
+Description=freshell Rust server (self-hosted)
+After=network.target
+
+[Service]
+Type=simple
+# EDIT: absolute path to your freshell checkout (the server loads .env and
+# serves dist/client relative to its cwd).
+WorkingDirectory=%h/code/freshell
+ExecStart=%h/code/freshell/target/release/freshell-server
+Environment=PORT=3002
+# AUTH_TOKEN: the server reads it from WorkingDirectory/.env itself
+# (main.rs:76-87). Alternatively make it explicit to systemd:
+# EnvironmentFile=%h/code/freshell/.env
+# REQUIRED EDIT: the claude sidecar resolves bare `node` via PATH
+# (crates/freshell-freshagent/src/claude.rs:1372), and systemd user units
+# get a minimal PATH that lacks nvm/fnm installs. Either extend PATH to a
+# dir containing `node`, or point FRESHELL_CLAUDE_NODE at the binary:
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Environment=FRESHELL_CLAUDE_NODE=%h/.nvm/versions/node/v22.14.0/bin/node
+# SINGLE lifecycle owner: when this unit is installed, systemd owns
+# start/stop/restart on this port -- use `systemctl --user stop/restart
+# freshell-rust`, NEVER scripts/launch-rust.sh on the same port (its
+# pid-file stop and this Restart= policy would fight each other).
+# Restart=on-failure does not resist a deliberate `systemctl --user stop`
+# or a clean SIGTERM exit (exit 0).
+Restart=on-failure
+RestartSec=2
+# Give the graceful-shutdown path (WS close 4009 + PTY teardown) time to run.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
