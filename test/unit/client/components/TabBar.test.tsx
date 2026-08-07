@@ -39,8 +39,11 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-// Mock lucide-react icons
-vi.mock('lucide-react', () => ({
+// Mock lucide-react icons. Partial mock: TabBar's import chain
+// (TabBarResizeHandle -> @/components/panes) pulls in many icons; keep the
+// real module and override only the ones stubbed with testids below.
+vi.mock('lucide-react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('lucide-react')>()),
   X: ({ className }: { className?: string }) => (
     <svg data-testid="x-icon" className={className} />
   ),

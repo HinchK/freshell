@@ -44,7 +44,9 @@ import type { RepoIconInfo } from '@/components/icons/RepoIcon'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
 import { TAB_BAR_ROWS_DEFAULT } from '@shared/settings'
-import { tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
+import { getRootFontSizePx, tabBarMultiRowThresholdPx, tabBarRowsToMaxHeightCss } from '@/lib/tab-bar-metrics'
+import TabBarResizeHandle from '@/components/TabBarResizeHandle'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 
 function escapeSelector(id: string): string {
   if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
@@ -451,6 +453,34 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     multirowContainerRef.current = node
   }, [callbackRef])
 
+  // The resize handle only appears when the strip actually wraps to 2+ rows.
+  const [hasMultipleRows, setHasMultipleRows] = useState(false)
+  useEffect(() => {
+    if (!multirowTabs) {
+      setHasMultipleRows(false)
+      return
+    }
+    const node = multirowContainerRef.current
+    if (!node) return
+    const update = () => {
+      // Threshold computed at measure time from the live root font-size: scrollHeight
+      // and threshold scale together under any --ui-scale, including the pre-hydration
+      // window where the CSS fallback (1.25) still governs (child effects run before
+      // App's useTheme effect writes --ui-scale; the scale write resizes the strip,
+      // which re-fires the ResizeObserver and re-measures).
+      setHasMultipleRows(node.scrollHeight > tabBarMultiRowThresholdPx(getRootFontSizePx()))
+    }
+    update()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(update)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [multirowTabs, tabs.length])
+
+  const handleTabBarRowsChange = useCallback((rows: number) => {
+    dispatch(updateSettingsLocal({ panes: { tabBarRows: rows } }))
+  }, [dispatch])
+
   // Container-scoped scroll for active tab in multirow mode (vertical)
   useEffect(() => {
     if (!multirowTabs || !activeTabId) return
@@ -638,6 +668,9 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           ) : null}
         </DragOverlay>
       </DndContext>
+      {multirowTabs && hasMultipleRows && (
+        <TabBarResizeHandle rows={tabBarRows} onRowsChange={handleTabBarRowsChange} />
+      )}
     </div>
   )
 }

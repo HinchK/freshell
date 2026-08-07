@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
@@ -20,7 +20,11 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({ send: vi.fn() }),
 }))
 
-vi.mock('lucide-react', () => ({
+// Partial mock: TabBar's import chain (TabBarResizeHandle -> @/components/panes)
+// pulls in many icons; keep the real module and override only the ones the
+// original mock stubbed with testids.
+vi.mock('lucide-react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('lucide-react')>()),
   X: ({ className }: { className?: string }) => <svg data-testid="x-icon" className={className} />,
   Plus: ({ className }: { className?: string }) => <svg data-testid="plus-icon" className={className} />,
   Circle: ({ className }: { className?: string }) => <svg data-testid="circle-icon" className={className} />,
@@ -287,6 +291,52 @@ describe('TabBar multirow tabs', () => {
       expect(wrapper.className).toContain('min-w-[150px]')
       expect(wrapper.className).toContain('max-w-[200px]')
       expect(wrapper.className).not.toContain('w-[175px]')
+    })
+  })
+
+  describe('tab bar resize handle', () => {
+    it('does not render in single-row mode', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: false })
+      renderWithStore(<TabBar />, store)
+      expect(screen.queryByTestId('tab-bar-resize-handle')).toBeNull()
+    })
+
+    it('does not render when tabs fit in one row', () => {
+      // jsdom scrollHeight is 0 -> below the multi-row threshold.
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+      renderWithStore(<TabBar />, store)
+      expect(screen.queryByTestId('tab-bar-resize-handle')).toBeNull()
+    })
+
+    it('renders when the strip wraps to multiple rows', () => {
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      try {
+        const tab = createTab({ id: 'tab-1' })
+        const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        expect(screen.getByTestId('tab-bar-resize-handle')).toBeTruthy()
+      } finally {
+        scrollHeightSpy.mockRestore()
+      }
+    })
+
+    it('keyboard-resizing the handle updates the strip max-height via the store', () => {
+      const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(67)
+      try {
+        const tab = createTab({ id: 'tab-1' })
+        const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
+        renderWithStore(<TabBar />, store)
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(6.25rem + 1px)')
+
+        fireEvent.keyDown(screen.getByRole('separator', { name: 'Resize tab bar height' }), { key: 'ArrowDown' })
+
+        expect(screen.getByTestId('tab-strip').style.maxHeight).toBe('calc(8.375rem + 1px)')
+        expect(store.getState().settings.localSettings.panes.tabBarRows).toBe(4)
+      } finally {
+        scrollHeightSpy.mockRestore()
+      }
     })
   })
 })
