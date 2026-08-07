@@ -63,3 +63,17 @@
 - Test: session_index_refreshes_amplifier_recency_when_only_sidecar_changes (through the real incremental sweep) — RED (stuck at Some(1000)) -> GREEN.
 - Verify: cargo test -p freshell-sessions green (lib 176; parity/resolve/locators/liveness suites). Only amplifier.rs touched.
 - Review: PASS (independent) — confirmed the (mtime,size)-on-metadata-only gate froze sidecar-driven recency; fold is stat-only (no content read), test drives the REAL incremental sweep and fails pre-fix deterministically, other providers byte-identical, no churn.
+
+## F6 — terminal.exit overtakes queued output/replay, discarding scrollback  [CONFIRMED, LANDED 108f1365b]
+- Promise: what the terminal shows is what the program printed; scrollback survives detach/reattach; no lost/truncated output.
+- Observed: output frames go through the bounded ConnectionOutputQueue but TerminalExit went straight to conn_tx
+  (crates/freshell-ws/src/backpressure.rs route; drain arm terminal.rs:339-351 sends all direct frames before
+  queued output). Attaching to an EXITED terminal → wire order ready→exit→replay; client clears terminalId on
+  exit (TerminalView.tsx:4464-4527) so the replay is dropped → blank exited pane / scrollback lost on reattach.
+  Deterministic. Severity S3 (wrong-silent: lost output the program actually produced).
+- Fix: route TerminalExit through the same per-connection FIFO as output via new push_sequenced() (zero-weight,
+  non-evictable, keeps FIFO slot; overflow eviction skips sequenced frames). Preserves output→exit order
+  unconditionally; attach.ready-before-replay untouched. 2 files.
+- Tests: terminal_exit_never_overtakes_queued_output (RED→GREEN) + 2 output_queue mechanism tests.
+- Verify: cargo test -p freshell-terminal -p freshell-ws green (175/175, lib 422/422); auto_resume_e2e 2 failures baseline-identical (pre-existing).
+- Review: PASS (independent) — confirmed the deterministic ready→exit→replay inversion (direct exit vs queued output, drain sends direct first) and the blank-exited-pane consequence; fix preserves output→exit FIFO order, sequenced frame non-evictable/zero-weight/can't be lost, eviction+gap accounting intact, attach.ready ordering held; test fails pre-fix.

@@ -5,7 +5,7 @@
 **Coordination:** agmsg not installed → append-only JSONL equivalent.
 **Skill exercised:** `~/code/skill-parallel-development` (parallel-bug-hunt), first live run.
 
-## Outcome — 4 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
+## Outcome — 5 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
 
 ### F1 — freshclaude approvals/answers silently dropped  [S2/S3 · LANDED 6c5f9ad86 · review PASS]
 The freshAgent WS dispatch (`crates/freshell-ws/src/terminal.rs`) routed `approval.respond`,
@@ -42,6 +42,13 @@ from transcript/events sidecars — so real turns/resumes (sidecar-only appends)
 session at first-parse and sinking it to the bottom of the recency-sorted history where the user can't find it.
 Fix folds the sidecars' mtimes (stat-only) into the discovered stat so a sidecar write invalidates the cache.
 RED→GREEN through the real incremental sweep. Review confirmed stat-only (no perf regression), other providers byte-identical.
+
+### F6 — terminal.exit overtakes queued output/replay, blank exited panes  [S3 · LANDED 108f1365b · review PASS]
+`TerminalExit` bypassed the per-connection output FIFO (direct channel) while output/replay were queued, and the
+drain loop sends direct frames before queued output — so attaching to an exited terminal delivered ready→exit→replay,
+and the client clears the pane binding on exit, dropping the replay. Result: blank exited pane / scrollback lost on
+reattach to an exited terminal. Fix routes exit through the same FIFO (zero-weight, non-evictable) so output→exit
+order holds unconditionally. RED→GREEN. Review confirmed no exit-loss, eviction/gap accounting intact, attach.ready ordering preserved.
 
 ### F3 — provider resume after restart  [AUDIT_WRONG — already fixed]
 Candidate: codex/opencode sessions unresumable after a server restart. Adjudication found this is **not a
