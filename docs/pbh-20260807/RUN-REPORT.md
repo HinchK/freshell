@@ -5,7 +5,7 @@
 **Coordination:** agmsg not installed → append-only JSONL equivalent.
 **Skill exercised:** `~/code/skill-parallel-development` (parallel-bug-hunt), first live run.
 
-## Outcome — 5 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
+## Outcome — 6 user-facing bugs fixed, closed-loop, all independently reviewed PASS (+1 adjudicated already-fixed)
 
 ### F1 — freshclaude approvals/answers silently dropped  [S2/S3 · LANDED 6c5f9ad86 · review PASS]
 The freshAgent WS dispatch (`crates/freshell-ws/src/terminal.rs`) routed `approval.respond`,
@@ -49,6 +49,13 @@ drain loop sends direct frames before queued output — so attaching to an exite
 and the client clears the pane binding on exit, dropping the replay. Result: blank exited pane / scrollback lost on
 reattach to an exited terminal. Fix routes exit through the same FIFO (zero-weight, non-evictable) so output→exit
 order holds unconditionally. RED→GREEN. Review confirmed no exit-loss, eviction/gap accounting intact, attach.ready ordering preserved.
+
+### F7 — opencode pane can silently bind the WRONG session  [S3 · LANDED 5aeae9c10 · review PASS]
+The opencode locator/drain lacked the misbind guards codex already has: two same-cwd opencode panes (or a
+fresh-agent `opencode serve` sharing opencode.db) could bind a pane to another pane's or a fresh-agent's session —
+so a later resume opens someone else's conversation, silently. Fix mirrors codex one-for-one: a contested-cwd census
+(a sole candidate shared by >=2 same-cwd contenders binds nobody) + drain-side claim refusal (bound-elsewhere,
+fresh-agent), all warn-logged. RED→GREEN. Review confirmed no starvation, rightful owner never rejected, symmetric with codex.
 
 ### F3 — provider resume after restart  [AUDIT_WRONG — already fixed]
 Candidate: codex/opencode sessions unresumable after a server restart. Adjudication found this is **not a

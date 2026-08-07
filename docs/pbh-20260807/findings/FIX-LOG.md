@@ -77,3 +77,19 @@
 - Tests: terminal_exit_never_overtakes_queued_output (RED→GREEN) + 2 output_queue mechanism tests.
 - Verify: cargo test -p freshell-terminal -p freshell-ws green (175/175, lib 422/422); auto_resume_e2e 2 failures baseline-identical (pre-existing).
 - Review: PASS (independent) — confirmed the deterministic ready→exit→replay inversion (direct exit vs queued output, drain sends direct first) and the blank-exited-pane consequence; fix preserves output→exit FIFO order, sequenced frame non-evictable/zero-weight/can't be lost, eviction+gap accounting intact, attach.ready ordering held; test fails pre-fix.
+
+## F7 — opencode locator can silently bind a pane to the WRONG session  [CONFIRMED, LANDED 5aeae9c10]
+- Promise: resuming/attaching a coding session gives ME my session — never silently bound to another pane's or a fresh-agent's session.
+- Observed: opencode locator drain (crates/freshell-ws/src/opencode_association.rs:105-133) adopted a Located
+  candidate WITHOUT the claim guards codex pins as required misbind hardening (codex_identity.rs:128-179) and that
+  the opencode signal lane already has; and OpencodeLocator::resolve_windows (crates/freshell-sessions/src/opencode_locator.rs:284-366)
+  had no contested-cwd census. Two same-cwd opencode panes (or a fresh-agent opencode serve sharing opencode.db)
+  → one new session row visible to ≥2 windows binds to whichever pane evaluates first → wrong conversation resumes
+  later, silently. Severity S3 (wrong-silent, near-undiagnosable).
+- Fix: mirror codex's guards — contested-cwd census (a sole candidate shared by ≥2 same-cwd contenders binds nobody;
+  no starvation of a solo contender) + drain-side claim refusal (bound-elsewhere incl. retired, fresh-agent live
+  session, durable fresh-agent ledger row), all warn-logged not silent.
+- Tests: located_session_bound_elsewhere_is_rejected, located_freshagent_known_session_is_rejected,
+  one_row_inside_two_same_cwd_windows_binds_neither_terminal, solo_enter_still_binds_when_same_cwd_sibling_has_no_open_window — RED→GREEN.
+- Verify: freshell-sessions green (178 lib+integration); freshell-ws 424 lib green, integration failures baseline-identical (env-dependent e2e).
+- Review: PASS (independent) — confirmed opencode lacked codex's misbind guards; census + drain refusal mirror codex one-for-one (with the correct !resolved translation for opencode's spawn-window), tests fail pre-fix, no starvation of a solo contender, rightful owner never rejected, all refusals warn-logged.
