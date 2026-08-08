@@ -1336,7 +1336,7 @@ mod tests {
             item.project_path,
             "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell"
         );
-        assert_eq!(item.title.as_deref(), Some("Test session 1"));
+        assert_eq!(item.title.as_deref(), Some("Test Session 1"));
         assert_eq!(item.last_activity_at, 1_769_753_759_234);
         assert!(item.is_non_interactive);
 
@@ -1437,7 +1437,7 @@ mod tests {
         // has a title → shown.
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["title"], json!("Test session 1"));
+        assert_eq!(arr[0]["title"], json!("Test Session 1"));
         assert_eq!(arr[0]["provider"], json!("claude"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1516,7 +1516,7 @@ mod tests {
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["matchedIn"], json!("title"));
-        assert_eq!(arr[0]["snippet"], json!("Test session 1"));
+        assert_eq!(arr[0]["snippet"], json!("Test Session 1"));
 
         // A non-matching query → empty.
         let items2 = list_claude_sessions(&claude_home(&home));
@@ -1948,7 +1948,7 @@ mod tests {
         let page: Value = serde_json::from_slice(&bytes).unwrap();
         let items = page["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["title"], json!("Test session 1"));
+        assert_eq!(items[0]["title"], json!("Test Session 1"));
         // Oracle-compat: archived always present.
         assert_eq!(items[0]["archived"], json!(false));
         assert_eq!(page["nextCursor"], Value::Null);

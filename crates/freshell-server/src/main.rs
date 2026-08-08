@@ -1332,6 +1332,7 @@ mod sessions_sweep_tests {
             title: None,
             summary: None,
             first_user_message: None,
+            title_source: None,
             last_activity_at,
             created_at: None,
             cwd: Some("/tmp".to_string()),
