@@ -259,6 +259,7 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let mut title: Option<String> = None;
     let mut custom_title: Option<String> = None;
     let mut agent_name: Option<String> = None;
+    let mut generated_summary_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
     let mut git_branch: Option<String> = None;
@@ -363,6 +364,18 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         if obj.get("type").and_then(Value::as_str) == Some("agent-name") {
             if let Some(an) = obj.get("agentName").and_then(as_trimmed_nonempty) {
                 agent_name = Some(slice_chars(an, 200));
+            }
+        }
+        // Extract generated summary title from `type:'summary'` records (additive work item 1).
+        // Node's claude-title.ts:3-9 extracts the title from summary records.
+        if obj.get("type").and_then(Value::as_str) == Some("summary") {
+            if let Some(s) = obj.get("summary").and_then(as_trimmed_nonempty) {
+                if generated_summary_title.is_none() {
+                    let title = extract_title_from_message(s, 200);
+                    if !title.is_empty() {
+                        generated_summary_title = Some(title);
+                    }
+                }
             }
         }
 
@@ -503,14 +516,28 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         }
     });
 
+    // Compute title_source: "provider-generated" if title came from custom_title,
+    // agent_name, or generated_summary_title; None otherwise (derived from first
+    // user message). Mirrors Node's claude.ts:505 logic.
+    let title_source =
+        if custom_title.is_some() || agent_name.is_some() || generated_summary_title.is_some() {
+            Some("provider-generated".to_string())
+        } else {
+            None
+        };
+
     ParsedSessionMeta {
         session_id,
         cwd,
         created_at,
         last_activity_at,
-        title: custom_title.or(agent_name).or(title),
+        title: custom_title
+            .or(agent_name)
+            .or(generated_summary_title)
+            .or(title),
         summary,
         first_user_message,
+        title_source,
         message_count: lines.len() as i64,
         is_subagent: None,
         is_non_interactive,

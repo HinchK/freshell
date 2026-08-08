@@ -201,6 +201,16 @@ pub fn parse_amplifier_metadata(content: &str) -> ParsedSessionMeta {
     // not JSON `null` -- an absent key must NOT count as a subagent.
     let is_subagent = data.get("parent_id").map(|v| !v.is_null()).unwrap_or(false);
 
+    // Amplifier's `name` is an AI-generated session title. Mark it
+    // `provider-generated` so freshell's own auto-generated title overrides
+    // (dir/first-message/ai) yield to it; explicit user renames still win.
+    // Mirrors Node's amplifier.ts:93 logic.
+    let title_source = if title.is_some() {
+        Some("provider-generated".to_string())
+    } else {
+        None
+    };
+
     ParsedSessionMeta {
         session_id: data
             .get("session_id")
@@ -214,6 +224,7 @@ pub fn parse_amplifier_metadata(content: &str) -> ParsedSessionMeta {
         last_activity_at,
         title,
         summary,
+        title_source,
         is_subagent: Some(is_subagent),
         ..Default::default()
     }
@@ -299,6 +310,7 @@ fn indexed_from_meta(
         title: meta.title.clone(),
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
+        title_source: meta.title_source.clone(),
         last_activity_at,
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),

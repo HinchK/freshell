@@ -62,6 +62,17 @@ pub struct IndexedSession {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub first_user_message: Option<String>,
+    /// Mirror of Node's ParsedSessionTitleSource for the parsed (pre-override) title.
+    /// The auto-title pipeline only compares against "provider-generated"
+    /// (server/auto-title.ts:88). Mapping per provider:
+    /// - **claude**: `"provider-generated"` if the title came from a provider-authored
+    ///   record (custom-title, agent-name, or generated summary record with `type:'summary'`).
+    ///   `None` otherwise (title derived from first user message).
+    /// - **codex**: `None` (no provider-authored titles in codex transcripts).
+    /// - **amplifier**: `"provider-generated"` if the session has an AI-generated name
+    ///   (Amplifier's own session title). `None` if unnamed.
+    /// - **opencode**: Always `None` (opencode has no concept of provider-generated titles).
+    pub title_source: Option<String>,
     pub last_activity_at: i64,
     pub created_at: Option<i64>,
     pub cwd: Option<String>,
@@ -315,6 +326,7 @@ fn item_from_meta(
         title: meta.title.clone(),
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
+        title_source: meta.title_source.clone(),
         last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
@@ -519,6 +531,8 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         // `message`/`part` content for these fields) — faithful, not a gap.
         summary: None,
         first_user_message: None,
+        // OpenCode has no concept of provider-generated titles -- always None.
+        title_source: None,
         last_activity_at: s.last_activity_at,
         created_at: s.created_at,
         // `OpencodeSession::cwd` is always present (`list_sessions` already
@@ -1384,6 +1398,7 @@ mod tests {
             title: Some(format!("t-{session_id}")),
             summary: None,
             first_user_message: None,
+            title_source: None,
             last_activity_at,
             created_at: None,
             cwd: Some("/p".to_string()),
@@ -2195,6 +2210,27 @@ mod tests {
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 
+    // Task 4 additive requirement (a): claude fixture with type:'summary' record
+    // must have title_source == Some("provider-generated").
+    #[test]
+    fn indexed_session_carries_first_user_message_and_provider_generated_title_source() {
+        let claude_home = claude_home_with("claudesrc-title-source", &["real-corrupted.jsonl"]);
+        let sessions = ClaudeSource::new(claude_home.clone()).scan();
+        let s = sessions
+            .iter()
+            .find(|s| s.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d")
+            .expect("fixture session must be found");
+        // Fixture has first user message.
+        assert!(s
+            .first_user_message
+            .as_deref()
+            .is_some_and(|m| !m.is_empty()));
+        // Fixture has type:'summary' record, marking title as provider-generated.
+        assert_eq!(s.title_source.as_deref(), Some("provider-generated"));
+        // Verify first_user_message is capped at 4000 chars.
+        assert!(s.first_user_message.as_ref().unwrap().chars().count() <= 4000);
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
     // ── Batch C: CodexSource ─────────────────────────────────────────────
 
     fn codex_fixture() -> String {

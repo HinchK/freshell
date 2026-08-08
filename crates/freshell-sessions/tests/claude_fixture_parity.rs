@@ -128,9 +128,13 @@ fn real_corrupted_extracts_full_metadata_and_token_usage() {
         cwd: Some("D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell".to_string()),
         created_at: Some(1_769_753_756_713),
         last_activity_at: Some(1_769_753_759_234),
-        title: Some("Test session 1".to_string()),
+        // The title comes from the generated summary title (Test Session 1 from the summary record),
+        // not the first message (Test session 1), because generated_summary_title is in the priority chain.
+        title: Some("Test Session 1".to_string()),
         summary: Some("Test Session 1".to_string()),
         first_user_message: Some("Test session 1".to_string()),
+        // The fixture contains a type:'summary' record, which marks the title as provider-generated.
+        title_source: Some("provider-generated".to_string()),
         message_count: 6,
         is_non_interactive: Some(true),
         token_usage: Some(TokenSummary {
