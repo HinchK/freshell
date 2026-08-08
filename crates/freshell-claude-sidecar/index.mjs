@@ -279,6 +279,7 @@ rl.on('line', (line) => {
   switch (req?.type) {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
+    case 'interrupt': handleInterrupt(req); break
     case 'shutdown': shutdown(); process.exit(0); break
     default: logerr(`unknown request type: ${req?.type}`)
   }
