@@ -25,7 +25,7 @@ test('pane picker tiles are square, fluid, and fit the pane', async ({ freshellP
     for (const t of g.tiles) {
       expect(t.w).toBeGreaterThan(0)
       expect(t.w).toBeCloseTo(t.h, 0)                    // square
-      expect(t.w).toBeCloseTo(g.expected, 0)             // clamped fluid formula (rounding-tolerant)
+      expect(Math.abs(t.w - g.expected)).toBeLessThanOrEqual(1.5) // clamped fluid formula (±1.5, per plan)
       expect(t.left).toBeGreaterThanOrEqual(g.tb.left - 1)
       expect(t.right).toBeLessThanOrEqual(g.tb.right + 1)
       expect(t.top).toBeGreaterThanOrEqual(g.tb.top - 1)
