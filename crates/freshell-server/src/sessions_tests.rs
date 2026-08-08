@@ -525,8 +525,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
     .join("\n");
     std::fs::write(project.join("healthy-session-id.jsonl"), content).unwrap();
 
-    let settings =
-        crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+    let settings = crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
     let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
 
     // Patch title + archived through the sessions router.
@@ -566,8 +565,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
             std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
                 crate::session_directory::claude_home(&home),
-            ))
-                as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            )) as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
         ]));
     let dir_app =
         crate::session_directory::router(crate::session_directory::SessionDirectoryState {
