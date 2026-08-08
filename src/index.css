@@ -84,6 +84,37 @@ html {
   }
 }
 
+/* Pane picker: balanced adaptive grid */
+.pane-picker {
+  container-type: size;
+  --pad: clamp(8px, 3cqw, 28px);
+  --gap: clamp(6px, 2cqw, 18px);
+  --tile: clamp(36px,
+    min(
+      calc((100cqw - 2 * var(--pad) - (var(--cols) - 1) * var(--gap)) / var(--cols)),
+      calc((100cqh - 2 * var(--pad) - (var(--rows) - 1) * var(--gap)) / var(--rows))
+    ),
+    120px);
+}
+.pane-picker-options { display: flex; flex-direction: column; align-items: center; gap: var(--gap); }
+.pane-picker-option-row { display: flex; justify-content: center; gap: var(--gap); }
+.pane-picker-tile {
+  width: var(--tile); height: var(--tile);
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: calc(var(--tile) * 0.1);
+}
+.pane-picker-tile svg { width: calc(var(--tile) * 0.44); height: calc(var(--tile) * 0.44); }
+.pane-picker-tile .pane-picker-tile-label {
+  font-size: clamp(9px, calc(var(--tile) * 0.15), 15px);
+  line-height: 1.25;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pane-picker-tile .pane-picker-tile-hint {
+  position: absolute; left: 0; right: 0; bottom: 2px; text-align: center;
+  font-size: clamp(8px, calc(var(--tile) * 0.11), 12px);
+}
+
 /* Fresh-agent panes use their real pane geometry. Transcript copy inherits the
    terminal font-size setting, while chrome, rails, buttons, and textarea layout
    keep normal responsive UI sizing on desktop and phone. */

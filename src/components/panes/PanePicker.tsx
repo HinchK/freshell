@@ -9,6 +9,7 @@ import { getVisibleFreshAgentConfigs, type FreshAgentProviderName } from '@/lib/
 import { FRESH_AGENT_REGISTRY } from '@/lib/fresh-agent-registry'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { computePanePickerLayout } from '@/lib/pane-picker-layout'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
@@ -39,37 +40,10 @@ const nonShellOptions: PickerOption[] = [
   { type: 'browser', label: 'Browser', icon: Globe, shortcut: 'B' },
 ]
 
-const MAX_OPTIONS_PER_ROW = 3
 const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
 const EMPTY_ENABLED_PROVIDERS: CodingCliProviderName[] = []
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
-
-interface PickerRowOption {
-  option: PickerOption
-  index: number
-}
-
-function buildBalancedOptionRows(options: PickerOption[]): PickerRowOption[][] {
-  if (options.length === 0) return []
-
-  const rowCount = Math.ceil(options.length / MAX_OPTIONS_PER_ROW)
-  const baseRowSize = Math.floor(options.length / rowCount)
-  const rowsWithExtra = options.length % rowCount
-  const rowSizes = Array.from({ length: rowCount }, (_, rowIndex) => (
-    baseRowSize + (rowIndex < rowsWithExtra ? 1 : 0)
-  ))
-
-  let cursor = 0
-  return rowSizes.map((size) => {
-    const row = options.slice(cursor, cursor + size).map((option, offset) => ({
-      option,
-      index: cursor + offset,
-    }))
-    cursor += size
-    return row
-  })
-}
 
 function cliConfigToOption(config: CodingCliProviderConfig, ext?: { picker?: { shortcut?: string } }): PickerOption {
   return {
@@ -169,6 +143,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
   const [fading, setFading] = useState(false)
+  const [gridDims, setGridDims] = useState({ width: 0, height: 0 })
   const pendingSelection = useRef<PanePickerType | null>(null)
   const buttonRefs = useRef<(HTMLButtonElement | null)[]>([])
   const containerRef = useRef<HTMLDivElement>(null)
@@ -238,8 +213,43 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     containerRef.current?.focus()
   }, [])
 
+  // Measure the container once and track its size with a ResizeObserver so the
+  // adaptive grid re-layouts as the pane resizes.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const measure = () => {
+      setGridDims({ width: el.clientWidth, height: el.clientHeight })
+    }
+    measure()
+    let observer: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(measure)
+      observer.observe(el)
+    }
+    return () => {
+      observer?.disconnect()
+    }
+  }, [])
+
   const showHint = (index: number) => focusedIndex === index || hoveredIndex === index
-  const optionRows = useMemo(() => buildBalancedOptionRows(options), [options])
+
+  const layout = useMemo(
+    () => computePanePickerLayout(options.length, gridDims.width, gridDims.height),
+    [options.length, gridDims.width, gridDims.height],
+  )
+
+  // Slice options into rows by the computed layout, preserving the global
+  // flattened index for each option (rowStart + offset).
+  const optionRows = useMemo(() => {
+    const rows: { options: PickerOption[]; start: number }[] = []
+    let rowStart = 0
+    for (const size of layout.rowSizes) {
+      rows.push({ options: options.slice(rowStart, rowStart + size), start: rowStart })
+      rowStart += size
+    }
+    return rows
+  }, [options, layout])
 
   return (
     <div
@@ -248,12 +258,12 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       aria-label="Pane type picker"
       tabIndex={0}
       className={cn(
-        '@container h-full w-full flex items-center justify-center',
-        'p-2 @[250px]:p-4 @[400px]:p-8',
+        'pane-picker h-full w-full flex items-center justify-center',
         'transition-opacity duration-150 ease-out',
         'focus:outline-none',
         fading && 'opacity-0'
       )}
+      style={{ '--cols': layout.maxCols, '--rows': layout.rowSizes.length } as React.CSSProperties}
       data-context={ContextIds.PanePicker}
       data-tab-id={tabId}
       data-pane-id={paneId}
@@ -261,51 +271,50 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       onKeyDown={handleContainerKeyDown}
     >
       <div
-        className="flex flex-col items-center gap-2 @[250px]:gap-4 @[400px]:gap-8"
+        className="pane-picker-options"
         data-testid="pane-picker-options"
       >
         {optionRows.map((row, rowIndex) => (
           <div
             key={`row-${rowIndex}`}
-            className="flex justify-center gap-2 @[250px]:gap-4 @[400px]:gap-8"
+            className="pane-picker-option-row"
             data-testid="pane-picker-option-row"
           >
-            {row.map(({ option, index }) => (
-              <button
-                key={option.type}
-                ref={(el) => { buttonRefs.current[index] = el }}
-                aria-label={option.label}
-                onClick={() => handleSelect(option.type)}
-                onKeyDown={(e) => handleArrowNav(e, index)}
-                onFocus={() => setFocusedIndex(index)}
-                onBlur={() => setFocusedIndex(null)}
-                onMouseEnter={() => setHoveredIndex(index)}
-                onMouseLeave={() => setHoveredIndex(null)}
-                className={cn(
-                  'flex flex-col items-center gap-2 @[250px]:gap-3',
-                  'p-2 @[250px]:p-3 @[400px]:p-6 rounded-lg',
-                  'transition-all duration-150',
-                  'hover:opacity-100 focus:opacity-100 focus:outline-none',
-                  'opacity-50 hover:scale-105'
-                )}
-              >
-                {option.providerName ? (
-                  <ProviderIcon
-                    provider={option.providerName}
-                    className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12"
-                  />
-                ) : option.icon ? (
-                  <option.icon className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12" />
-                ) : null}
-                <span className="text-xs @[400px]:text-sm font-medium">{option.label}</span>
-                <span className={cn(
-                  'shortcut-hint text-xs -mt-1 transition-opacity duration-150',
-                  showHint(index) ? 'opacity-40' : 'opacity-0'
-                )}>
-                  {option.shortcut}
-                </span>
-              </button>
-            ))}
+            {row.options.map((option, offset) => {
+              const index = row.start + offset
+              return (
+                <button
+                  key={option.type}
+                  ref={(el) => { buttonRefs.current[index] = el }}
+                  aria-label={option.label}
+                  onClick={() => handleSelect(option.type)}
+                  onKeyDown={(e) => handleArrowNav(e, index)}
+                  onFocus={() => setFocusedIndex(index)}
+                  onBlur={() => setFocusedIndex(null)}
+                  onMouseEnter={() => setHoveredIndex(index)}
+                  onMouseLeave={() => setHoveredIndex(null)}
+                  className={cn(
+                    'pane-picker-tile flex flex-col items-center justify-center rounded-lg',
+                    'transition-all duration-150',
+                    'hover:opacity-100 focus:opacity-100 focus:outline-none',
+                    'opacity-50 hover:scale-105'
+                  )}
+                >
+                  {option.providerName ? (
+                    <ProviderIcon provider={option.providerName} />
+                  ) : option.icon ? (
+                    <option.icon />
+                  ) : null}
+                  <span className="pane-picker-tile-label font-medium">{option.label}</span>
+                  <span className={cn(
+                    'shortcut-hint pane-picker-tile-hint transition-opacity duration-150',
+                    showHint(index) ? 'opacity-40' : 'opacity-0'
+                  )}>
+                    {option.shortcut}
+                  </span>
+                </button>
+              )
+            })}
           </div>
         ))}
       </div>

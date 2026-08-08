@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
@@ -145,6 +145,34 @@ const completeFadeAnimation = () => {
   fireEvent.transitionEnd(getContainer())
 }
 
+// Controllable ResizeObserver: captures the callback so tests can drive
+// container re-measures with setContainerSize().
+class MockResizeObserver {
+  static instances: MockResizeObserver[] = []
+  readonly callback: ResizeObserverCallback
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback
+    MockResizeObserver.instances.push(this)
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+
+// Override the container's measured size and notify the observer so the
+// picker recomputes its adaptive grid layout.
+const setContainerSize = (width: number, height: number) => {
+  const container = getContainer()
+  Object.defineProperty(container, 'clientWidth', { value: width, configurable: true })
+  Object.defineProperty(container, 'clientHeight', { value: height, configurable: true })
+  const observer = MockResizeObserver.instances[0]
+  if (observer) {
+    act(() => {
+      observer.callback([], {} as ResizeObserver)
+    })
+  }
+}
+
 describe('PanePicker', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -152,11 +180,14 @@ describe('PanePicker', () => {
     resetEnsureExtensionsRegistryCacheForTests()
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token')
+    MockResizeObserver.instances = []
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
   afterEach(() => {
     cleanup()
     resetEnsureExtensionsRegistryCacheForTests()
+    vi.unstubAllGlobals()
   })
 
   describe('rendering', () => {
@@ -507,6 +538,22 @@ describe('PanePicker', () => {
       expect(browserButton).toHaveFocus()
     })
 
+    it('moves focus across rows with ArrowRight using the global index', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
+        freshClientsEnabled: true,
+      })
+      const buttons = screen.getAllByRole('button')
+      expect(buttons).toHaveLength(7)
+      // Fallback [2,3,2]: global index 1 (Claude CLI) is the last of row 1;
+      // ArrowRight must jump to global index 2 (Codex CLI), the first of row 2.
+      buttons[1].focus()
+      fireEvent.keyDown(buttons[1], { key: 'ArrowRight' })
+      expect(buttons[2]).toHaveFocus()
+    })
+
     it('selects focused option on Enter after fade', () => {
       const { onSelect } = renderPicker()
       const browserButton = screen.getByText('Browser').closest('button')!
@@ -634,33 +681,120 @@ describe('PanePicker', () => {
   })
 
   describe('responsive sizing', () => {
-    it('applies @container class to outer wrapper', () => {
+    it('applies the pane-picker class to the outer wrapper', () => {
       renderPicker()
       const container = getContainer()
-      expect(container).toHaveClass('@container')
+      expect(container).toHaveClass('pane-picker')
     })
 
-    it('applies responsive padding classes to outer wrapper', () => {
+    it('marks the outer wrapper as a toolbar', () => {
       renderPicker()
       const container = getContainer()
-      expect(container).toHaveClass('p-2')
+      expect(container).toHaveAttribute('role', 'toolbar')
+      expect(container).toHaveAttribute('aria-label', 'Pane type picker')
     })
 
-    it('applies responsive gap classes to button container', () => {
+    it('applies the pane-picker-options class to the options container', () => {
       renderPicker()
       const buttonContainer = screen.getByTestId('pane-picker-options')
-      expect(buttonContainer).toHaveClass('gap-2')
+      expect(buttonContainer).toHaveClass('pane-picker-options')
     })
 
-    it('applies responsive padding classes to buttons', () => {
+    it('applies the pane-picker-option-row class to each row', () => {
       renderPicker()
-      const shellButton = screen.getByText('Shell').closest('button')!
-      expect(shellButton).toHaveClass('p-2')
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows.length).toBeGreaterThan(0)
+      for (const row of rows) {
+        expect(row).toHaveClass('pane-picker-option-row')
+      }
+    })
+
+    it('applies the pane-picker-tile class to each button', () => {
+      renderPicker()
+      const buttons = screen.getAllByRole('button')
+      expect(buttons.length).toBeGreaterThan(0)
+      for (const button of buttons) {
+        expect(button).toHaveClass('pane-picker-tile')
+      }
+    })
+  })
+
+  describe('adaptive reflow', () => {
+    const sevenOptionStore = {
+      availableClis: { claude: true, codex: true },
+      enabledProviders: ['claude', 'codex'],
+      extensions: defaultCliExtensions,
+      freshClientsEnabled: true,
+    }
+
+    it('lays out 7 options as [2,3,2] at 480x400', () => {
+      renderPicker(sevenOptionStore)
+      setContainerSize(480, 400)
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows).toHaveLength(3)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+      expect(within(rows[2]).getAllByRole('button')).toHaveLength(2)
+      expect(getContainer().style.getPropertyValue('--cols')).toBe('3')
+      expect(getContainer().style.getPropertyValue('--rows')).toBe('3')
+    })
+
+    it('lays out 7 options as [4,3] at 640x300', () => {
+      renderPicker(sevenOptionStore)
+      setContainerSize(640, 300)
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows).toHaveLength(2)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(4)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+      expect(getContainer().style.getPropertyValue('--cols')).toBe('4')
+      expect(getContainer().style.getPropertyValue('--rows')).toBe('2')
+    })
+
+    it('lays out 7 options as [2,3,2] at 300x500 (no trailing singleton)', () => {
+      renderPicker(sevenOptionStore)
+      setContainerSize(300, 500)
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows).toHaveLength(3)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+      expect(within(rows[2]).getAllByRole('button')).toHaveLength(2)
+    })
+
+    it('lays out 13 options as [3,4,4,2] at 480x400', () => {
+      const clientExt = (name: string, label: string): ClientExtensionEntry => ({
+        name,
+        version: '1.0.0',
+        label,
+        description: '',
+        category: 'client',
+      })
+      const threeClientExtensions = [
+        clientExt('widget-a', 'Widget A'),
+        clientExt('widget-b', 'Widget B'),
+        clientExt('widget-c', 'Widget C'),
+      ]
+      renderPicker({
+        freshClientsEnabled: true,
+        featureFlags: { kilroy: true },
+        availableClis: { claude: true, codex: true, opencode: true },
+        enabledProviders: ['claude', 'codex', 'opencode'],
+        extensions: [...defaultCliExtensions, mockOpencodeExt, ...threeClientExtensions],
+      })
+      expect(screen.getAllByRole('button')).toHaveLength(13)
+      setContainerSize(480, 400)
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows).toHaveLength(4)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(4)
+      expect(within(rows[2]).getAllByRole('button')).toHaveLength(4)
+      expect(within(rows[3]).getAllByRole('button')).toHaveLength(2)
+      expect(getContainer().style.getPropertyValue('--cols')).toBe('4')
+      expect(getContainer().style.getPropertyValue('--rows')).toBe('4')
     })
   })
 
   describe('balanced icon layout', () => {
-    it('prefers a balanced 3+2+2 arrangement when seven options are visible', () => {
+    it('prefers a balanced 2+3+2 arrangement when seven options are visible', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -670,8 +804,8 @@ describe('PanePicker', () => {
 
       const rows = screen.getAllByTestId('pane-picker-option-row')
       expect(rows).toHaveLength(3)
-      expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
-      expect(within(rows[1]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
       expect(within(rows[2]).getAllByRole('button')).toHaveLength(2)
     })
   })
