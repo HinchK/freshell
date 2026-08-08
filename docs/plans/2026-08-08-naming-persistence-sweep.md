@@ -206,7 +206,12 @@ Interface notes for reviewers: `freshell-ws` depends on `freshell-freshagent`
 (`crates/freshell-ws/Cargo.toml:37`), NOT vice versa — so the `LayoutStore`
 lives in `freshell-freshagent` and `freshell-ws` imports it. `sha2 = "0.10"`
 is already a `freshell-ws` dependency (`Cargo.toml:72`). `reqwest 0.13`
-(rustls) is already a plain `freshell-server` dependency (`Cargo.toml:54`).
+(rustls) is already a plain `freshell-server` dependency (`Cargo.toml:54`)
+— but with `default-features = false, features = ["stream", "rustls"]`, so
+reqwest's `json` feature is NOT enabled anywhere in the workspace: never use
+`RequestBuilder::json(..)` / `Response::json::<T>()`; serialize/deserialize
+manually with `serde_json` (already a direct dep, `Cargo.toml:44`) the way
+`updater.rs:101-114` does (`.bytes()` + `serde_json::from_slice`).
 For Task 16's rename cascade, NO new freshell-ws-side trait is needed: the
 `freshell_terminal::TerminalRegistry` is ALREADY injected into
 `FreshAgentState` (`crates/freshell-freshagent/src/lib.rs:111`, `:362`) and
@@ -520,7 +525,7 @@ git commit -m "feat(server): port auto-title pure logic (computeAutoTitlePatch/S
 - Test: inline `#[cfg(test)]` in `ai_title.rs`
 
 **Interfaces:**
-- Consumes: `freshell_protocol::ServerSettings` (`settings.ai.gemini_api_key`, `settings.ai.title_prompt` — `crates/freshell-protocol/src/settings.rs:67-74`); `reqwest` (already a dep, `crates/freshell-server/Cargo.toml:54`).
+- Consumes: `freshell_protocol::ServerSettings` (`settings.ai.gemini_api_key`, `settings.ai.title_prompt` — `crates/freshell-protocol/src/settings.rs:67-74`); `reqwest` (already a dep, `crates/freshell-server/Cargo.toml:54` — `default-features = false, features = ["stream", "rustls"]`; the `json` feature is NOT enabled, so the transport serializes the request body with `serde_json::to_vec` and decodes responses via `.bytes()` + `serde_json::from_slice`, matching `updater.rs:101-114`; no Cargo.toml change needed).
 - Produces (later tasks use these exact items):
   - `pub const GEMINI_MODEL: &str = "gemini-2.5-flash-lite";`
   - `pub const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";`
@@ -795,10 +800,17 @@ impl GeminiTransport for GeminiHttp {
                 "generationConfig": { "maxOutputTokens": max_output_tokens },
                 "contents": [ { "role": "user", "parts": [ { "text": prompt } ] } ]
             });
+            // NOTE: reqwest is built with default-features = false,
+            // features = ["stream", "rustls"] (Cargo.toml:54) — the `json`
+            // feature is NOT enabled, so do NOT use .json(&body) or
+            // resp.json::<T>(). Serialize/deserialize manually via
+            // serde_json, matching the existing updater.rs:101-114 idiom.
+            let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
             let resp = client
                 .post(&url)
                 .header("x-goog-api-key", key)
-                .json(&body)
+                .header("content-type", "application/json")
+                .body(body_bytes)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
@@ -806,7 +818,9 @@ impl GeminiTransport for GeminiHttp {
             if !status.is_success() {
                 return Err(format!("gemini http {status}"));
             }
-            let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
             // Only candidates[0] is consulted; parts with "thought": true are
             // reasoning output and MUST be excluded (validator-A1 live capture).
             let mut text = String::new();
@@ -1514,7 +1528,7 @@ auto_title_sweep::spawn_auto_title_sweep(
         pending_ai_titles: Default::default(),
     },
     index.clone(),
-    std::time::Duration::from_millis(SESSIONS_SWEEP_INTERVAL_MS), // 2000, main.rs:1107
+    SESSIONS_SWEEP_INTERVAL, // already a Duration const (2s), main.rs:1107
 );
 ```
 
@@ -1962,6 +1976,7 @@ semantics — keep it as the CROSS-IMPL hash-compatibility proof for the
 reachable (all-camelCase) payload-key inventory:
 
 ```bash
+mkdir -p crates/freshell-ws/tests/fixtures  # dir does not exist yet; redirect below fails with ENOENT without this
 node --input-type=module -e '
 import { createHash } from "node:crypto";
 const stableStringify = (v) => {
