@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::tabs_persist::atomic_write_durable;
+use crate::tabs_store_migrate::migrate_legacy_jsonl;
 use crate::tabs_store_model::{
     archive_timestamp, build_snapshot_payload_hash, canonical_stringify, client_snapshot_key,
     empty_state, normalize_registry_pane_kinds, sha256_hex_full, validate_registry_record,
@@ -170,9 +171,9 @@ impl DurableTabsStore {
     /// `TabsRegistryStore.open` (store.ts:668-710): ensure `v1/objects` and
     /// `v1/tmp` exist; if `v1/manifest.json` exists, load it (with the ONLY
     /// self-heal: a missing referenced object archives the manifest and falls
-    /// through); else if the legacy `tabs-registry.jsonl` exists, fail LOUDLY
-    /// until Task 10 ports the migration; else start empty — writing NOTHING
-    /// until the first commit.
+    /// through); else if the legacy `tabs-registry.jsonl` exists, migrate it
+    /// (commit, THEN archive); else start empty — writing NOTHING until the
+    /// first commit.
     pub fn open(root: &Path, caps: TabsStoreCaps, now_ms: i64) -> Result<Self, TabsStoreOpenError> {
         std::fs::create_dir_all(root.join("v1").join("objects")).map_err(TabsStoreOpenError::Io)?;
         std::fs::create_dir_all(root.join("v1").join("tmp")).map_err(TabsStoreOpenError::Io)?;
@@ -211,11 +212,33 @@ impl DurableTabsStore {
             }
         }
 
-        if root.join("tabs-registry.jsonl").exists() {
-            // Task 10 hook: replace this arm with the ported jsonl migration.
-            return Err(TabsStoreOpenError::Corrupt(
-                "legacy jsonl present; migration not yet ported".to_string(),
+        let legacy_path = root.join("tabs-registry.jsonl");
+        if legacy_path.exists() {
+            // store.ts:694-700: migrate -> commit (publishes manifestRevision 1)
+            // -> archive STRICTLY after publish (crash between = manifest wins).
+            let migrated =
+                migrate_legacy_jsonl(&legacy_path, now_ms, &caps, DEFAULT_CLOSED_RETENTION_DAYS)
+                    .map_err(TabsStoreOpenError::Corrupt)?;
+            let mut store = Self {
+                root: root.to_path_buf(),
+                state: empty_state(now_ms, DEFAULT_CLOSED_RETENTION_DAYS),
+                manifest_revision: 0,
+                caps,
+                prev: None,
+            };
+            store
+                .commit(migrated, now_ms)
+                .map_err(|err| match err.kind() {
+                    std::io::ErrorKind::InvalidData => TabsStoreOpenError::Corrupt(err.to_string()),
+                    _ => TabsStoreOpenError::Io(err),
+                })?;
+            let archive_path = root.join(format!(
+                "tabs-registry.jsonl.migrated-{}",
+                archive_timestamp(now_ms)
             ));
+            std::fs::rename(&legacy_path, &archive_path).map_err(TabsStoreOpenError::Io)?;
+            fsync_dir_best_effort(root);
+            return Ok(store);
         }
 
         Ok(Self {

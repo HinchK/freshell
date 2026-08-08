@@ -343,21 +343,28 @@ fn oversized_component_object_fails_commit_without_swapping_state() {
     assert_states_equal(reopened.state(), &base);
 }
 
-/// Clause 1's Task-10 hook: until the legacy-jsonl migration is ported, a
-/// legacy log with no compact manifest must fail boot LOUDLY (Task 10
-/// replaces this arm with the real migration).
+/// The legacy arm is live (Task 10): a legacy log containing ONLY
+/// schema-invalid lines migrates to an EMPTY state, publishes
+/// `manifestRevision: 1`, and archives the legacy file. Full migration
+/// coverage lives in `tabs_store_migrate/tests.rs`.
 #[test]
-fn legacy_jsonl_without_manifest_fails_open_as_loud_stub() {
+fn legacy_jsonl_with_only_invalid_lines_migrates_to_empty_state() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(root.join("tabs-registry.jsonl"), "{}\n").unwrap();
 
-    let err = DurableTabsStore::open(root, default_caps(), NOW).unwrap_err();
-    match err {
-        TabsStoreOpenError::Corrupt(message) => {
-            assert_eq!(message, "legacy jsonl present; migration not yet ported");
-        }
-        other => panic!("expected Corrupt, got {other:?}"),
-    }
+    let store = DurableTabsStore::open(root, default_caps(), NOW).unwrap();
+    assert!(store.state().open_snapshots_by_client.is_empty());
+    assert!(store.state().closed_by_tab_key.is_empty());
+    assert_eq!(
+        store.manifest_revision(),
+        1,
+        "migration commits manifestRevision 1"
+    );
+    assert!(manifest_path(root).exists());
+    assert!(
+        !root.join("tabs-registry.jsonl").exists(),
+        "legacy file archived after publish"
+    );
 }
