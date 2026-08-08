@@ -62,6 +62,19 @@ pub struct SessionsState {
     /// every `codingCliIndexer.refresh()` call, which the legacy PATCH
     /// route always triggers.
     pub sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// Task 6: the process-local Gemini key cell -- `generate_title` gates its
+    /// AI branch on key presence ONLY, never on
+    /// `settings.sidebar.autoGenerateTitles` (that gate belongs exclusively to
+    /// the background sweep; real Node asymmetry, Scope Decision 7,
+    /// `sessions-router.ts:181-184`).
+    pub ai_key: crate::ai_title::AiKeyCell,
+    /// Trait-injected Gemini transport (same seam as
+    /// `AutoTitleSweepState.gemini`) so tests fake the wire -- no live calls.
+    pub gemini: Arc<dyn crate::ai_title::GeminiTransport>,
+    /// The shared session index, consulted ONLY for the provider-generated
+    /// short-circuit (`sessions-router.ts:186-192`). `None` when no provider
+    /// home resolves (the same `Option` main.rs threads everywhere else).
+    pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
 }
 
 /// The sessions sub-router (`PATCH /api/sessions/:id` + `POST .../generate-title`).
@@ -202,15 +215,33 @@ async fn patch_session(
     // `sessions.changed`, preserving the existing cascade test's
     // single-`try_recv()` assumption.
     if !patch.is_empty() {
-        let revision = state
-            .sessions_revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let frame = json!({ "type": "sessions.changed", "revision": revision }).to_string();
-        let _ = state.broadcast_tx.send(frame);
+        broadcast_sessions_changed_from(&state);
     }
 
     Json(Value::Object(out)).into_response()
+}
+
+/// The one `sessions.changed` emit site (revision bump + frame send), factored
+/// from `patch_session` so the generate-title write paths (heuristic + AI)
+/// share it exactly (D11: Node reaches the equivalent broadcast via
+/// `codingCliIndexer.refresh()` -> sessionsSync publish).
+fn broadcast_sessions_changed_from(state: &SessionsState) {
+    let revision = state
+        .sessions_revision
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    let frame = json!({ "type": "sessions.changed", "revision": revision }).to_string();
+    let _ = state.broadcast_tx.send(frame);
+}
+
+/// Snapshot the shared index (same accessor as the sweeps) and find the
+/// session whose `provider:sessionId` key equals `key`.
+async fn lookup_indexed_session(
+    index: &freshell_sessions::directory_index::SessionIndex,
+    key: &str,
+) -> Option<freshell_sessions::directory_index::IndexedSession> {
+    let items = index.snapshot().await;
+    items.iter().find(|s| s.key() == key).cloned()
 }
 
 /// Faithful subset of `SessionPatchSchema` — returns zod-shaped `details` on a
@@ -293,11 +324,20 @@ fn extract_title_from_message(content: &str, max_len: usize) -> String {
 
 /// `POST /api/sessions/:sessionId/generate-title` — a blank `firstMessage` is
 /// the only 400 this emits (`sessions-router.ts:167-179`); everything else
-/// resolves to `200`, never `5xx` (Global Constraint 8). No Gemini/AI key path
-/// in this port (matches legacy no-key behavior): the first-message heuristic
-/// is applied and persisted through the title-source ladder, then the STORED
-/// (ladder-resolved) title/source is returned — faithfully reflecting a
-/// ladder-blocked write (`sessions-router.ts:185-190`).
+/// resolves to `200`, never `5xx` (Global Constraint 8). Resolution order
+/// (`sessions-router.ts:180-221`): (1) a parsed session whose `titleSource` is
+/// `provider-generated` short-circuits with the parsed title — NO write, no
+/// broadcast; (2) no AI key → the first-message heuristic, persisted through
+/// the title-source ladder; (3) key present → Gemini via the injected
+/// transport, persisted as `titleSource:'ai'` through the ladder (`Ok(None)`
+/// → `{title:null,source:'none'}` with no write; `Err` → 200
+/// `{title:null,source:'none',error}` with no write). Deliberately NOT gated
+/// on `settings.sidebar.autoGenerateTitles` (real Node asymmetry, Scope
+/// Decision 7) — key presence alone selects the AI branch. Both write paths
+/// broadcast `sessions.changed` after the write (D11: Node reaches this via
+/// `codingCliIndexer.refresh()`), and both respond with the STORED
+/// (ladder-resolved) title/source — faithfully reflecting a ladder-blocked
+/// write (`sessions-router.ts:185-190`).
 async fn generate_title(
     State(state): State<SessionsState>,
     AxumPath(raw_id): AxumPath<String>,
@@ -320,24 +360,76 @@ async fn generate_title(
             .into_response();
     }
     let key = composite_key(&raw_id, &provider_of(&q));
-    let heuristic = extract_title_from_message(first_message, 50);
-    if heuristic.is_empty() {
-        return Json(json!({ "title": null, "source": "none" })).into_response();
+
+    // (1) provider-generated short-circuit (`sessions-router.ts:186-192`): a
+    // session whose PARSED title is provider-authored is never renamed by
+    // this route -- echo the parsed title; no write, no broadcast.
+    if let Some(index) = &state.index {
+        if let Some(parsed) = lookup_indexed_session(index, &key).await {
+            if parsed.title_source.as_deref() == Some("provider-generated") {
+                return Json(json!({
+                    "title": parsed.title.clone().map(Value::from).unwrap_or(Value::Null),
+                    "source": "provider-generated",
+                }))
+                .into_response();
+            }
+        }
     }
-    let stored = state
-        .settings
-        .patch_session_override(
-            &key,
-            &[
-                ("titleOverride", Some(json!(heuristic))),
-                ("titleSource", Some(json!("first-message"))),
-            ],
+
+    if !state.ai_key.enabled() {
+        // (2) AI disabled: the first-message heuristic (`sessions-router.ts:196-209`).
+        let heuristic = extract_title_from_message(first_message, 50);
+        if heuristic.is_empty() {
+            return Json(json!({ "title": null, "source": "none" })).into_response();
+        }
+        let stored = state
+            .settings
+            .patch_session_override(
+                &key,
+                &[
+                    ("titleOverride", Some(json!(heuristic))),
+                    ("titleSource", Some(json!("first-message"))),
+                ],
+            )
+            .await;
+        broadcast_sessions_changed_from(&state);
+        // Respond with the STORED (ladder-resolved) value, faithfully.
+        let title = stored.get("titleOverride").cloned().unwrap_or(Value::Null);
+        let source = stored.get("titleSource").cloned().unwrap_or(json!("none"));
+        Json(json!({ "title": title, "source": source })).into_response()
+    } else {
+        // (3) AI enabled -- key presence ONLY (Scope Decision 7; the
+        // `autoGenerateTitles` toggle never gates this route).
+        let custom_prompt = state.settings.get().await.ai.title_prompt;
+        match crate::ai_title::generate_ai_session_title(
+            &*state.gemini,
+            first_message,
+            custom_prompt.as_deref(),
         )
-        .await;
-    // Respond with the STORED (ladder-resolved) value, faithfully.
-    let title = stored.get("titleOverride").cloned().unwrap_or(Value::Null);
-    let source = stored.get("titleSource").cloned().unwrap_or(json!("none"));
-    Json(json!({ "title": title, "source": source })).into_response()
+        .await
+        {
+            Ok(None) => Json(json!({ "title": null, "source": "none" })).into_response(),
+            Ok(Some(title)) => {
+                let stored = state
+                    .settings
+                    .patch_session_override(
+                        &key,
+                        &[
+                            ("titleOverride", Some(json!(title))),
+                            ("titleSource", Some(json!("ai"))),
+                        ],
+                    )
+                    .await;
+                broadcast_sessions_changed_from(&state);
+                Json(json!({
+                    "title": stored.get("titleOverride").cloned().unwrap_or(Value::Null),
+                    "source": stored.get("titleSource").cloned().unwrap_or(Value::Null),
+                }))
+                .into_response()
+            }
+            Err(e) => Json(json!({ "title": null, "source": "none", "error": e })).into_response(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +448,11 @@ mod tests {
             broadcast_tx: std::sync::Arc::new(tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            // AI disabled by default; tests that exercise the AI branch
+            // overwrite these fields (the no-key path never touches gemini).
+            ai_key: crate::ai_title::AiKeyCell::init(None, None),
+            gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+            index: None,
         }
     }
 
@@ -878,6 +975,9 @@ mod tests {
             broadcast_tx: std::sync::Arc::new(tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            ai_key: crate::ai_title::AiKeyCell::init(None, None),
+            gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+            index: None,
         });
         let patch_resp = sessions_app
             .oneshot(
@@ -933,6 +1033,152 @@ mod tests {
         assert_eq!(item["title"], serde_json::json!("Overlay Title"));
         assert_eq!(item["archived"], serde_json::json!(true));
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Same 4-line fake as `auto_title_sweep`'s test transport: the wired-in
+    /// result IS the Gemini reply. NO live Gemini calls in tests, ever.
+    struct FakeGemini(Result<String, String>);
+    impl crate::ai_title::GeminiTransport for FakeGemini {
+        fn generate_content(
+            &self,
+            _p: String,
+            _m: u32,
+        ) -> crate::ai_title::BoxFuture<Result<String, String>> {
+            let r = self.0.clone();
+            Box::pin(async move { r })
+        }
+    }
+
+    /// Oneshots `POST /api/sessions/{sid}/generate-title` with
+    /// `{"firstMessage": first}` and the auth header against a router built
+    /// from a CLONE of `st` (the caller keeps the original for post-request
+    /// assertions on settings/broadcast state).
+    async fn post_generate_title(
+        st: &super::SessionsState,
+        sid: &str,
+        first: &str,
+    ) -> axum::response::Response {
+        super::router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{sid}/generate-title"))
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "firstMessage": first }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn generate_title_uses_gemini_when_key_present_and_broadcasts_sessions_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = state(dir.path());
+        st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+        st.gemini = std::sync::Arc::new(FakeGemini(Ok("  Sardine crash investigation  ".into())));
+        let mut rx = st.broadcast_tx.subscribe();
+        let sid = uuid_like();
+        let resp = post_generate_title(&st, &sid, "investigate the sardine crash").await;
+        let body = body_json(resp).await;
+        assert_eq!(body["title"], "Sardine crash investigation");
+        assert_eq!(body["source"], "ai");
+        let row = st
+            .settings
+            .session_overrides()
+            .get(&format!("claude:{sid}"))
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleSource"], "ai");
+        let frames: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(frames.iter().any(|f| f.contains("sessions.changed")));
+    }
+
+    #[tokio::test]
+    async fn generate_title_gemini_error_returns_200_none_with_error_and_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = state(dir.path());
+        st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+        st.gemini = std::sync::Arc::new(FakeGemini(Err("boom".into())));
+        let sid = uuid_like();
+        let body = body_json(post_generate_title(&st, &sid, "hello").await).await;
+        assert_eq!(body["title"], serde_json::Value::Null);
+        assert_eq!(body["source"], "none");
+        assert_eq!(body["error"], "boom");
+        assert!(st
+            .settings
+            .session_overrides()
+            .get(&format!("claude:{sid}"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_title_after_user_rename_is_still_ladder_blocked_for_ai() {
+        // AI write attempted, ladder rejects, response echoes the user's stored title.
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = state(dir.path());
+        st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+        st.gemini = std::sync::Arc::new(FakeGemini(Ok("AI Title".into())));
+        let sid = uuid_like();
+        st.settings
+            .patch_session_override(
+                &format!("claude:{sid}"),
+                &[
+                    ("titleOverride", Some(serde_json::json!("Mine"))),
+                    ("titleSource", Some(serde_json::json!("user"))),
+                ],
+            )
+            .await;
+        let body = body_json(post_generate_title(&st, &sid, "hello").await).await;
+        assert_eq!(body["title"], "Mine");
+        assert_eq!(body["source"], "user");
+    }
+
+    /// The provider-generated short-circuit (`sessions-router.ts:186-192`):
+    /// a session whose PARSED title is provider-authored is never renamed by
+    /// this route -- the parsed title is echoed with NO override write, even
+    /// with an AI key present and a transport that WOULD return a title. The
+    /// index fixture is the committed claude `real-corrupted.jsonl` (its
+    /// `type:'summary'` record marks the parsed title provider-generated --
+    /// proven by directory_index.rs's
+    /// `indexed_session_carries_first_user_message_and_provider_generated_title_source`;
+    /// opencode sessions can never be provider-generated), seeded the same
+    /// way `patch_override_is_visible_through_session_directory_overlay`
+    /// above builds its `SessionIndex`.
+    #[tokio::test]
+    async fn generate_title_provider_generated_short_circuits_without_write() {
+        let home = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        let project = home.join(".claude").join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/sessions/real-corrupted.jsonl");
+        std::fs::copy(&fixture, project.join("real-corrupted.jsonl")).unwrap();
+
+        let mut st = state(&home);
+        st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+        st.gemini = std::sync::Arc::new(FakeGemini(Ok("AI Title".into())));
+        st.index = Some(std::sync::Arc::new(
+            freshell_sessions::directory_index::SessionIndex::new(vec![std::sync::Arc::new(
+                freshell_sessions::directory_index::ClaudeSource::new(
+                    crate::session_directory::claude_home(&home),
+                ),
+            )
+                as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>]),
+        ));
+        let sid = "b7936c10-4935-441c-837c-c1f33cafec2d"; // the fixture's sessionId
+        let body = body_json(post_generate_title(&st, sid, "hello").await).await;
+        assert_eq!(body["title"], "Test Session 1"); // the fixture's parsed summary title
+        assert_eq!(body["source"], "provider-generated");
+        assert!(st
+            .settings
+            .session_overrides()
+            .get(&format!("claude:{sid}"))
+            .is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 

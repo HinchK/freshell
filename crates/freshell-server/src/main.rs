@@ -573,6 +573,9 @@ async fn main() -> ExitCode {
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
+    // Task 6: the sessions router's provider-generated short-circuit reads
+    // the SAME session index (another clone before the move below).
+    let sessions_state_index = session_index.clone();
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -744,6 +747,14 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
+            // Task 6: the SAME key cell / Gemini transport the auto-title
+            // sweep uses (generate-title's AI branch gates on key presence
+            // ONLY -- never on `settings.sidebar.autoGenerateTitles`), plus
+            // the shared session index for the provider-generated
+            // short-circuit.
+            ai_key: ai_key.clone(),
+            gemini: gemini.clone(),
+            index: sessions_state_index,
         }))
         .merge(files::router(files_state))
         .merge(terminals::router(terminals_state))
