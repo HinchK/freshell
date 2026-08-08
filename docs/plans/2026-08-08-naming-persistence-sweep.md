@@ -1185,8 +1185,11 @@ sidebar. Every per-session failure logs a warning and continues. One
 harness pattern: copy `sessions.rs`'s test helpers (`state()` at
 `sessions.rs:349` builds a `SettingsStore` over a tempdir;
 `spawn_headless_terminal_for_test` at `sessions.rs:401` spawns
-`/bin/sh -c "sleep 5"`). Subscribe to `broadcast_tx` BEFORE the call and drain
-frames after.
+`/bin/sh -c "sleep 5"`). The spawn helper is synchronous and returns nothing —
+`fn spawn_headless_terminal_for_test(registry: &freshell_terminal::TerminalRegistry, terminal_id: &str)`
+— the caller picks the terminal id and pairs it with `identity.upsert`,
+exactly as the existing call site does (`sessions.rs:451`). Subscribe to
+`broadcast_tx` BEFORE the call and drain frames after.
 
 ```rust
 #[cfg(test)]
@@ -1237,8 +1240,9 @@ mod tests {
     async fn no_key_first_message_finalizes_and_pushes_terminal_title_with_broadcast() {
         let dir = tempfile::tempdir().unwrap();
         let (state, mut rx) = sweep_state(dir.path(), None);
-        let tid = spawn_headless_terminal_for_test(&state.registry, "claude").await;
-        state.identity.upsert(&tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
         let changed = run_auto_title_pass(&state, &[session("claude", "s1", "/x/proj", Some("Fix the flux\nrest"))]).await;
         assert!(changed);
         let ov = state.settings.session_overrides();
@@ -1264,8 +1268,9 @@ mod tests {
     async fn ai_enabled_holds_dir_then_finalizes_ai_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let (state, _rx) = sweep_state(dir.path(), Some("key"));
-        let tid = spawn_headless_terminal_for_test(&state.registry, "claude").await;
-        state.identity.upsert(&tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
         let s = [session("claude", "s1", "/x/proj", Some("Fix the flux"))];
         run_auto_title_pass(&state, &s).await;
         // pass 1: dir placeholder persisted (never first-message when AI on)
@@ -1288,8 +1293,9 @@ mod tests {
     async fn user_rename_is_never_clobbered_and_sweep_pushes_it_to_stale_terminals() {
         let dir = tempfile::tempdir().unwrap();
         let (state, mut rx) = sweep_state(dir.path(), None);
-        let tid = spawn_headless_terminal_for_test(&state.registry, "claude").await;
-        state.identity.upsert(&tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
         state.settings.patch_session_override("claude:s1",
             &[("titleOverride", Some(json!("My Name"))), ("titleSource", Some(json!("user")))]).await;
         let mut s = session("claude", "s1", "/x/proj", Some("hi"));
@@ -1307,8 +1313,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, _rx) = sweep_state(dir.path(), Some("key"));
         state.settings.patch(&json!({"sidebar": {"autoGenerateTitles": false}})).await.unwrap();
-        let tid = spawn_headless_terminal_for_test(&state.registry, "claude").await;
-        state.identity.upsert(&tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
         run_auto_title_pass(&state, &[session("claude", "s1", "/x/proj", Some("Fix it"))]).await;
         let row = state.settings.session_overrides().get("claude:s1").cloned().unwrap();
         assert_eq!(row["titleSource"], "first-message"); // heuristic path, no Gemini
