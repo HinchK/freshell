@@ -708,7 +708,13 @@ async fn transient_prune_between_reads_never_silently_drops_a_device() {
     INJECTED_PRUNE_BATCHES
         .lock()
         .unwrap()
-        .push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 240_000, 1)]);
+        .push(vec![snapshot_path(
+            tmp.path(),
+            "dev1",
+            "lost",
+            now - 240_000,
+            1,
+        )]);
     let router = router(test_state(Some(tmp.path().to_path_buf()), None));
     let (code, body) = get(
         router,
@@ -751,9 +757,27 @@ async fn persistent_union_incoherence_fails_loud_not_silent_empty() {
     // consumed by one attempt), so the selected set never survives.
     {
         let mut batches = INJECTED_PRUNE_BATCHES.lock().unwrap();
-        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 240_000, 1)]);
-        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 180_000, 2)]);
-        batches.push(vec![snapshot_path(tmp.path(), "dev1", "lost", now - 120_000, 3)]);
+        batches.push(vec![snapshot_path(
+            tmp.path(),
+            "dev1",
+            "lost",
+            now - 240_000,
+            1,
+        )]);
+        batches.push(vec![snapshot_path(
+            tmp.path(),
+            "dev1",
+            "lost",
+            now - 180_000,
+            2,
+        )]);
+        batches.push(vec![snapshot_path(
+            tmp.path(),
+            "dev1",
+            "lost",
+            now - 120_000,
+            3,
+        )]);
     }
     let router = router(test_state(Some(tmp.path().to_path_buf()), None));
     let (code, body) = get(

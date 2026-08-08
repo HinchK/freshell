@@ -160,10 +160,13 @@ pub async fn run(
     // TERM-09: live terminal OUTPUT frames (`TerminalOutput`/`TerminalOutputBatch`)
     // are intercepted by `output_queue` BEFORE reaching this channel -- a bounded,
     // drop-oldest queue (mirrors `ClientOutputQueue`) that keeps ONE slow reader
-    // from growing server memory without bound. Every other frame family
-    // (`attach.ready`, `terminal.created`, `terminal.exit`, ...) is unaffected,
-    // exactly matching legacy's scoping (see `freshell_terminal::output_queue`
-    // and `crate::backpressure` module docs for the full mapping).
+    // from growing server memory without bound. `terminal.exit` ALSO travels the
+    // queue (as a zero-weight, non-evictable sequenced frame) so it can never
+    // overtake queued output/replay and blank an exited pane -- see
+    // `ConnectionOutputQueue::route`. Other frame families (`attach.ready`,
+    // `terminal.created`, ...) go direct on this channel (see
+    // `freshell_terminal::output_queue` and `crate::backpressure` module docs
+    // for the full mapping).
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
         state.term09.queue_max_bytes,

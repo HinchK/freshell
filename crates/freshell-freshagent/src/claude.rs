@@ -2862,7 +2862,7 @@ rl.on('line', (line) => {
                 assert_eq!(frame["provider"], "claude", "{frame}");
                 assert_eq!(frame["sessionType"], "freshclaude", "{frame}");
                 assert!(
-                    frame["event"]["message"].as_str().unwrap_or("").len() > 0,
+                    !frame["event"]["message"].as_str().unwrap_or("").is_empty(),
                     "user-facing message required: {frame}"
                 );
                 break;
