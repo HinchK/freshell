@@ -16,6 +16,7 @@
 //! * `FRESHELL_HOME` / `HOME` — the isolated home whose `.freshell/config.json`
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
+mod ai_router;
 mod ai_title;
 mod auto_title;
 mod auto_title_sweep;
@@ -733,6 +734,15 @@ async fn main() -> ExitCode {
         }))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
+        // Task 7: `POST /api/ai/terminals/:terminalId/summary` — the SAME key
+        // cell / Gemini transport the sweep and generate-title use, plus the
+        // shared terminal registry for the scrollback snapshot.
+        .merge(ai_router::router(ai_router::AiRouterState {
+            auth_token: Arc::clone(&auth_token),
+            registry: registry.clone(),
+            ai_key: ai_key.clone(),
+            gemini: gemini.clone(),
+        }))
         .merge(sessions::router(sessions::SessionsState {
             auth_token: Arc::clone(&auth_token),
             settings: settings_store.clone(),
