@@ -18,6 +18,7 @@
 
 mod ai_title;
 mod auto_title;
+mod auto_title_sweep;
 mod boot;
 mod checkpoints;
 mod diag;
@@ -218,7 +219,6 @@ async fn main() -> ExitCode {
         .get("FRESHELL_GEMINI_BASE_URL")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ai_title::GEMINI_DEFAULT_BASE_URL.to_string());
-    #[allow(unused_variables)] // consumed by Tasks 5/6/7 (auto-title sweep + summaries)
     let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
         ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
     );
@@ -528,6 +528,25 @@ async fn main() -> ExitCode {
         // this borrows nothing from the `ws_state` binding consumed by the
         // router merge below.
         spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
+        // Task 5: the background auto-name pass (dir -> first-message ->
+        // Gemini AI) -- `server/index.ts:868-950`. Same cadence + index
+        // accessor as the sessions sweep above; see `auto_title_sweep`'s
+        // module doc for the full semantics (only THIS sweep honors
+        // `settings.sidebar.autoGenerateTitles`).
+        auto_title_sweep::spawn_auto_title_sweep(
+            auto_title_sweep::AutoTitleSweepState {
+                settings: settings_store.clone(),
+                identity: terminal_identity.clone(),
+                registry: registry.clone(),
+                broadcast_tx: Arc::clone(&broadcast_tx),
+                sessions_revision: Arc::clone(&sessions_revision),
+                ai_key: ai_key.clone(),
+                gemini: gemini.clone(),
+                pending_ai_titles: Default::default(),
+            },
+            Arc::clone(index),
+            SESSIONS_SWEEP_INTERVAL,
+        );
     }
     // Restore-across-restart fix: the amplifier locator's polling cycle (its
     // Enter↔session-dir correlation is entirely poll-driven -- see

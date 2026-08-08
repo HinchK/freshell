@@ -1062,6 +1062,23 @@ impl TerminalRegistry {
         self.set_meta(terminal_id, Some(title.to_string()), None, None, None);
     }
 
+    /// Single-id read of a terminal's live title -- the SAME field the
+    /// directory listing serves as `DirectoryEntry.title` (see
+    /// [`directory`](Self::directory)), without cloning the whole directory.
+    /// `None` for an unknown terminal id. Added for the auto-title sweep's
+    /// out-of-sync comparison (`server/index.ts:885-905`'s per-terminal
+    /// `term.title` read).
+    pub fn title_of(&self, terminal_id: &str) -> Option<String> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|s| s.lock().expect("terminal lock").title.clone())
+    }
+
     /// `registry.updateDescription()` — the PATCH write-through for
     /// `descriptionOverride` (`terminals-router.ts:304`).
     pub fn update_description(&self, terminal_id: &str, description: &str) {
