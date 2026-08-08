@@ -267,7 +267,12 @@ async fn create_terminal_or_content_tab_with_delivery(
 }
 
 /// The "cheap" content kinds (`router.ts:720-723`): no process, no rollback
-/// concerns -- attach the pane content, broadcast, respond.
+/// concerns -- attach the pane content, broadcast, respond. Task 14 (AUTO-03):
+/// the `{tabId,paneId}` pair is minted by the shared LayoutStore
+/// (`layoutStore.createTab`, `router.ts:797`) and the pane content attached to
+/// it (`attachPaneContent`, `:799`), so REST-created tabs are visible to the
+/// store exactly like Node's `ensureSnapshot()` bootstrap; the legacy
+/// `tabs`/`pane_tabs`/`content_panes` maps shadow it for bookkeeping only.
 fn create_content_tab(
     state: &FreshAgentState,
     name: Option<String>,
@@ -276,8 +281,10 @@ fn create_content_tab(
     restore_key: Option<&str>,
     broadcast: bool,
 ) -> Response {
-    let tab_id = Uuid::new_v4().to_string();
-    let pane_id = Uuid::new_v4().to_string();
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
 
     state
         .content_panes
@@ -1021,13 +1028,21 @@ async fn create_terminal_tab(
     // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
     // `layoutStore.createTab()` before `registry.create()`) so the CLI env
     // (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`) can carry them, matching the WS
-    // path's `create.tab_id`/`create.pane_id` plumbing.
-    let tab_id = Uuid::new_v4().to_string();
-    let pane_id = Uuid::new_v4().to_string();
+    // path's `create.tab_id`/`create.pane_id` plumbing. Task 14 (AUTO-03):
+    // minted BY the shared LayoutStore now — the store registers the ordered
+    // tab row + terminal leaf under the SAME ids this route returns, exactly
+    // like Node's `ensureSnapshot()` bootstrap.
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
 
     let spawned = match spawn_terminal_pane(state, body, &tab_id, &pane_id).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => {
+            // Node's failed-create catch closes the store tab it minted
+            // (`layoutStore.closeTab(createdTabId)`, `router.ts:824-830`) —
+            // no phantom tab survives a failed spawn.
+            state.layout.close_tab(&tab_id);
+            return resp;
+        }
     };
     let TerminalSpawnResult {
         pane_content,
@@ -1046,6 +1061,13 @@ async fn create_terminal_tab(
             kind: "terminal".to_string(),
         },
     );
+    // The SAME paneContent this route broadcasts, attached to the store leaf
+    // (`layoutStore.attachPaneContent(tabId, paneId, paneContent)`,
+    // `router.ts:774`) — `GET /api/layout/snapshot`/`listPanes` consumers see
+    // the real terminal content, not `createTab`'s detached placeholder.
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
     // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
     // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
     // `sessionRef` (whichever `paneContent` carries -- mutually exclusive,
@@ -1121,11 +1143,11 @@ async fn create_terminal_tab(
 
 // ── GET /api/tabs ───────────────────────────────────────────────────────────
 
-/// `GET /api/tabs` (`router.ts:879-883`): `{tabs, activeTabId}`. Reduced shape
-/// vs. the legacy `layoutStore.listTabs()` row (no split/layout tree -- this
-/// port keeps no server-side layout store, see `rename_pane`'s doc comment in
-/// `lib.rs` for the established precedent) -- sufficient for MCP target
-/// resolution (`resolveTabTarget` only needs `id`/`title`).
+/// `GET /api/tabs` (`router.ts:879-883`): `{tabs, activeTabId}` from the
+/// shared LayoutStore (Task 14, AUTO-03 — retires Slice 1's unordered
+/// legacy-map rows and hard-coded `activeTabId: null`). Node-exact row shape:
+/// `{id, title /*falls back to id*/, activePaneId}`, in snapshot order
+/// (`listTabs`, `layout-store.ts:327-334`; `getActiveTabId`, `:187-189`).
 pub(crate) async fn list_tabs(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -1133,14 +1155,8 @@ pub(crate) async fn list_tabs(
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    let tabs: Vec<Value> = state
-        .tabs
-        .lock()
-        .expect("tabs mutex")
-        .values()
-        .map(|t| json!({ "id": t.id, "title": t.title, "paneId": t.pane_id, "kind": t.kind }))
-        .collect();
-    ok_json(json!({ "tabs": tabs, "activeTabId": Value::Null }), "")
+    let (tabs, active_tab_id) = state.layout.list_tabs();
+    ok_json(json!({ "tabs": tabs, "activeTabId": active_tab_id }), "")
 }
 
 /// `GET /api/panes` (`router.ts:898-902`): `{panes}`, optionally filtered by
@@ -1899,33 +1915,9 @@ mod tests {
         assert_eq!(panes[0]["kind"], json!("terminal"));
     }
 
-    #[tokio::test]
-    async fn get_tabs_lists_every_created_tab_kind() {
-        let state = state_with_registry();
-        let router = app(state.clone());
-        let _ = post(
-            router.clone(),
-            "/api/tabs",
-            json!({ "mode": "shell" }),
-            true,
-        )
-        .await;
-        let _ = post(
-            router.clone(),
-            "/api/tabs",
-            json!({ "browser": "https://example.com" }),
-            true,
-        )
-        .await;
-
-        let (status, body) = get(router, "/api/tabs", true).await;
-        assert_eq!(status, StatusCode::OK);
-        let tabs = body["data"]["tabs"].as_array().expect("tabs array");
-        assert_eq!(tabs.len(), 2);
-        let kinds: Vec<&str> = tabs.iter().map(|t| t["kind"].as_str().unwrap()).collect();
-        assert!(kinds.contains(&"terminal"));
-        assert!(kinds.contains(&"browser"));
-    }
+    // `GET /api/tabs` row-shape tests live in `pane_ops_tab_tests.rs` (Task
+    // 14, AUTO-03): the route now reads the shared LayoutStore, and its tests
+    // sit with the rest of the tab-route suite.
 
     // ── terminal send-keys / capture / wait-for (real PTY round trip) ──────
 
