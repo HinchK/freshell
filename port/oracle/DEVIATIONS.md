@@ -852,6 +852,41 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   click instead of opening a duplicate, and survives a server restart + browser refresh
   with its session identity intact.
 
+### EDEV-08 — Pane-rename cascade reads `paneContent.sessionRef` as an EXPLICIT session-resolution superset (Node never reads it)
+- what_differs: `PATCH /api/panes/:id`'s syncable-terminal rename cascade
+  (`crates/freshell-freshagent/src/rename_persistence.rs`,
+  `persist_syncable_terminal_rename`) resolves the session-override target as
+  (1) the terminal registry's session binding — the post-association metadata
+  a locator writes back server-side via `set_meta`, mirroring Node's
+  terminal-metadata-first preference (`server/agent-api/router.ts:658-676`) —
+  then (2) `paneContent.resumeSessionId` (Node's fallback, `:676`), then
+  (3) **`paneContent.sessionRef` — a source Node NEVER consults**
+  (`router.ts:655`/`:676` read only `meta.sessionId`/`resumeSessionId`). The
+  superset read is LAST, so it can only ADD a cascade where Node's resolution
+  found nothing — it can never change the target Node would have picked.
+- why_intentional: Rust is the better side. The SPA reconcile CLEARS
+  `resumeSessionId` and writes the canonical identity into `sessionRef`
+  instead (`src/store/panesSlice.ts:1705-1708`, 200 ms debounced) — so for a
+  long-lived SPA-reconciled pane whose terminal metadata was never populated,
+  Node's own resolution silently no-ops and the rename never reaches the
+  session override. Reading the canonical `sessionRef` closes that hole.
+  (A10.1: while the Rust server lacks a client-independent association path,
+  registry-first + sessionRef covers both directions the identity can
+  arrive from; the seam lands NOW so the gap does not silently reopen when
+  association parity lands.)
+- evidence: RED-first unit coverage in
+  `crates/freshell-freshagent/src/rename_cascade_tests.rs`
+  (`rename_pane_cascades_to_syncable_terminal_via_injected_persistence` —
+  sessionRef-only pane cascades to `claude:sess-ref-1`;
+  `rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields`
+  — registry-first resolution, validator-A10;
+  `rename_pane_shell_pane_never_cascades` — non-syncable modes untouched).
+  Node reference: `persistSyncableTerminalRename`, `router.ts:649-693`.
+- user_impact: Renaming a coding-CLI pane whose session identity lives only in
+  the client-written `sessionRef` now persists the new title onto the session
+  directory entry too (survives restart/reindex), instead of silently updating
+  only the terminal override.
+
 <!--
 Template:
 

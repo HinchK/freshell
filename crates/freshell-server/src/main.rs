@@ -70,6 +70,48 @@ const APP_VERSION: &str = "0.7.0";
 /// never overridden by the file. A missing `.env` file is a silent no-op —
 /// `dotenvy::from_path` returns an `Io(NotFound)` error we deliberately ignore,
 /// matching `dotenv/config`'s own silent-missing-file behavior.
+/// Task 16 (`PATCH /api/panes/:id` cascade): the production
+/// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
+/// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
+/// live settings store. Both writes are plain `{titleOverride}` patches; the
+/// session write carries NO `titleSource` ON PURPOSE, mirroring the
+/// original's plain `{titleOverride}` patch (the title-source ladder only
+/// engages when BOTH title keys are patched — see
+/// [`settings_store::SettingsStore::patch_session_override`]).
+struct SettingsRenamePersistence(settings_store::SettingsStore);
+
+impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
+    fn patch_terminal_override_title(
+        &self,
+        terminal_id: &str,
+        title: &str,
+    ) -> freshell_freshagent::BoxFuture<()> {
+        let store = self.0.clone();
+        let terminal_id = terminal_id.to_string();
+        let title = serde_json::json!(title);
+        Box::pin(async move {
+            let _ = store
+                .patch_terminal_override(&terminal_id, &[("titleOverride", Some(title))])
+                .await;
+        })
+    }
+
+    fn patch_session_override_title(
+        &self,
+        key: &str,
+        title: &str,
+    ) -> freshell_freshagent::BoxFuture<()> {
+        let store = self.0.clone();
+        let key = key.to_string();
+        let title = serde_json::json!(title);
+        Box::pin(async move {
+            let _ = store
+                .patch_session_override(&key, &[("titleOverride", Some(title))])
+                .await;
+        })
+    }
+}
+
 fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
 }
@@ -419,7 +461,13 @@ async fn main() -> ExitCode {
     let fresh_agent_state = fresh_agent_state
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
-        .with_opencode_locator(opencode_locator.clone());
+        .with_opencode_locator(opencode_locator.clone())
+        // Task 16 (`PATCH /api/panes/:id` cascade): the configStore seam over
+        // the live settings store, plus the SAME handler-scoped
+        // `terminals.changed` revision counter the WS lifecycle and REST
+        // `/api/terminals` broadcasts stamp — one monotonic sequence.
+        .with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))
+        .with_shared_terminals_revision(Arc::clone(&terminals_revision));
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
