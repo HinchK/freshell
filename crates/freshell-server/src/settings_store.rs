@@ -1594,6 +1594,11 @@ pub struct SettingsRouterState {
     /// boot (`main.rs`'s TERM-11/TERM-13 seeding). Mirrors the legacy
     /// `registry.setSettings(updated)` call, `server/settings-router.ts:138`.
     pub registry: freshell_terminal::TerminalRegistry,
+    /// Task 2 (AI key cell): every successful settings save re-applies
+    /// `settings.ai.geminiApiKey` with FORCE — the Rust mirror of Node's
+    /// `AI_CONFIG.applySettingsKey(key, { force: true })` on the settings
+    /// save path (`ai-prompts.ts:17-23`). A blank/absent key never clears.
+    pub ai_key: crate::ai_title::AiKeyCell,
 }
 
 /// `GET`/`PATCH`/`PUT` `/api/settings` (R1: PUT === PATCH, matching
@@ -1626,6 +1631,12 @@ async fn patch_settings(
         Ok(merged) => {
             state.fresh_codex.set_enabled(merged.fresh_agent.enabled);
             apply_live_registry_settings(&state.registry, &merged);
+            // Task 2: force-re-apply the settings key on EVERY successful save
+            // (Node's `AI_CONFIG.applySettingsKey(key, { force: true })`,
+            // `ai-prompts.ts:17-23`); blank/absent never clears the cell.
+            state
+                .ai_key
+                .apply_settings_key_forced(merged.ai.gemini_api_key.as_deref());
             if let Ok(frame) =
                 serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
             {
@@ -1695,6 +1706,7 @@ mod tests {
             broadcast_tx,
             fresh_codex,
             registry: freshell_terminal::TerminalRegistry::new(),
+            ai_key: crate::ai_title::AiKeyCell::default(),
         }
     }
 
@@ -1730,6 +1742,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert_eq!(state.registry.auto_kill_idle_minutes(), 42);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 2 (AI key cell): a successful PATCH re-applies `ai.geminiApiKey`
+    /// to the shared [`crate::ai_title::AiKeyCell`] with FORCE — the Rust
+    /// mirror of Node's `AI_CONFIG.applySettingsKey(key, { force: true })`
+    /// on every settings save (`ai-prompts.ts:17-23`).
+    #[tokio::test]
+    async fn patch_applies_gemini_api_key_forced_to_cell() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+        assert!(state.ai_key.get().is_none()); // pre-patch: no key anywhere
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "ai": { "geminiApiKey": "k2" } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.ai_key.get().as_deref(), Some("k2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -16,6 +16,7 @@
 //! * `FRESHELL_HOME` / `HOME` — the isolated home whose `.freshell/config.json`
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
+mod ai_title;
 mod auto_title;
 mod boot;
 mod checkpoints;
@@ -49,6 +50,7 @@ use freshell_freshagent::FreshAgentState;
 use freshell_platform::detect::{
     detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version,
 };
+use freshell_platform::Env as _;
 use freshell_ws::WsState;
 use uuid::Uuid;
 
@@ -197,6 +199,29 @@ async fn main() -> ExitCode {
     // (`freshell_ws::build_handshake`), mirroring the original's
     // per-connection `configFallback` (`server/index.ts:372-380`).
     let config_fallback = settings_store.config_fallback();
+
+    // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`
+    // (`server/ai-prompts.ts:13-23`). Boot semantics = `server/index.ts:251`:
+    // env `GOOGLE_GENERATIVE_AI_API_KEY` wins over `settings.ai.geminiApiKey`
+    // (non-forcing); every successful settings save re-applies the settings
+    // key with force via `SettingsRouterState.ai_key` (blank never clears).
+    let ai_key = ai_title::AiKeyCell::init(
+        freshell_platform::RealEnv
+            .get("GOOGLE_GENERATIVE_AI_API_KEY")
+            .filter(|v| !v.is_empty()),
+        settings.ai.gemini_api_key.clone(),
+    );
+    // `FRESHELL_GEMINI_BASE_URL` is a Rust-only test seam for the e2e
+    // fake-Gemini server (Task 21) — Node has NO env base-URL override (its
+    // default is hardcoded), a deliberate documented superset (validator-A1).
+    let gemini_base_url = freshell_platform::RealEnv
+        .get("FRESHELL_GEMINI_BASE_URL")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ai_title::GEMINI_DEFAULT_BASE_URL.to_string());
+    #[allow(unused_variables)] // consumed by Tasks 5/6/7 (auto-title sweep + summaries)
+    let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
+        ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
+    );
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -417,10 +442,7 @@ async fn main() -> ExitCode {
     let boot_state = BootState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
-        platform: Arc::new(build_platform_payload(
-            available_clis,
-            &freshell_platform::RealEnv,
-        )),
+        platform: Arc::new(build_platform_payload(available_clis, ai_key.enabled())),
         // The SAME resolved version `GET /api/health` reports (shared above), so
         // `/api/version` `currentVersion` and health `version` never diverge.
         app_version: Arc::clone(&app_version),
@@ -667,6 +689,9 @@ async fn main() -> ExitCode {
                 // (TERM-11/TERM-13, above) so a successful PATCH also pushes
                 // `safety.autoKillIdleMinutes`/`terminal.scrollback` live.
                 registry: registry.clone(),
+                // Task 2: the SAME process-local AI key cell constructed at
+                // boot, so every settings save force-re-applies the key.
+                ai_key: ai_key.clone(),
             },
         ))
         .merge(boot::router(boot_state))
@@ -1049,26 +1074,20 @@ fn resolve_home() -> Option<PathBuf> {
 /// is the extension-driven `which`/`where.exe` detection result (Follow-up 3.19,
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
 /// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
-/// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
+/// mirrors `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`) — since Task 2
+/// backed by [`ai_title::AiKeyCell::enabled`] (env boot precedence + settings
+/// key fallback), not the raw env var alone.
 fn build_platform_payload(
     available_clis: serde_json::Value,
-    env: &dyn freshell_platform::Env,
+    ai_enabled: bool,
 ) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env) },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled },
     })
-}
-
-/// `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
-/// `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`. JS
-/// `Boolean(str | undefined)` is true iff the var is set AND non-empty, which
-/// is exactly [`freshell_platform::Env::truthy`]'s semantics.
-fn ai_enabled(env: &dyn freshell_platform::Env) -> bool {
-    env.truthy("GOOGLE_GENERATIVE_AI_API_KEY")
 }
 
 /// The OS hostname (mirrors `detectHostName`). `/proc/sys/kernel/hostname` →
@@ -1468,38 +1487,44 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_platform::MapEnv;
 
-    // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
-    // `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`.
-    // These use an injected `MapEnv` (not real process env), so they need no
-    // env-isolation guard: each test constructs its own independent view.
+    // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`) — since Task 2
+    // backed by the process-local [`ai_title::AiKeyCell`] (boot: env key wins
+    // over settings key, non-forcing). Each test constructs its own cell, so
+    // no env-isolation guard is needed.
 
     #[test]
-    fn ai_enabled_true_when_key_set_non_empty() {
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
-        assert!(ai_enabled(&env));
+    fn ai_enabled_true_when_env_key_set_non_empty() {
+        let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
+        assert!(cell.enabled());
     }
 
     #[test]
-    fn ai_enabled_false_when_key_unset() {
-        let env = MapEnv::new();
-        assert!(!ai_enabled(&env));
+    fn ai_enabled_true_when_settings_key_present_without_env() {
+        // The settings-key case: env absent + settings.ai.geminiApiKey present
+        // → the feature flag is on (Node: applySettingsKey at boot, index.ts:251).
+        let cell = ai_title::AiKeyCell::init(None, Some("settings-key".into()));
+        assert!(cell.enabled());
     }
 
     #[test]
-    fn ai_enabled_false_when_key_set_empty() {
-        // JS `Boolean("")` is `false` — an explicitly-empty var is still falsy.
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "");
-        assert!(!ai_enabled(&env));
+    fn ai_enabled_false_when_no_key_anywhere() {
+        assert!(!ai_title::AiKeyCell::init(None, None).enabled());
+    }
+
+    #[test]
+    fn ai_enabled_false_when_keys_explicitly_empty() {
+        // JS `Boolean("")` is `false` — explicitly-empty values are still falsy.
+        let cell = ai_title::AiKeyCell::init(Some(String::new()), Some(String::new()));
+        assert!(!cell.enabled());
     }
 
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled }`,
         // camelCase, no extra fields — mirrored 1:1 in the Rust payload.
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
-        let payload = build_platform_payload(serde_json::json!({}), &env);
+        let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
+        let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
             serde_json::json!({ "kilroy": false, "aiEnabled": true })
@@ -1508,8 +1533,8 @@ mod tests {
 
     #[test]
     fn platform_payload_ai_enabled_false_without_key() {
-        let env = MapEnv::new();
-        let payload = build_platform_payload(serde_json::json!({}), &env);
+        let cell = ai_title::AiKeyCell::init(None, None);
+        let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
             serde_json::json!({ "kilroy": false, "aiEnabled": false })
