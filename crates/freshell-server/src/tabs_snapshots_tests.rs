@@ -14,7 +14,8 @@ const TOKEN: &str = "test-token";
 fn codex_record(session_id: &str, rev: i64) -> serde_json::Value {
     json!({
         "tabKey": "dev-1:tab-1", "tabId": "tab-1", "tabName": "codex",
-        "status": "open", "revision": rev, "updatedAt": 1000 + rev, "paneCount": 1,
+        "status": "open", "revision": rev, "updatedAt": 1000 + rev, "createdAt": 1000 + rev,
+        "titleSetByUser": false, "paneCount": 1,
         "panes": [{ "paneId": "p1", "kind": "terminal", "payload": {
             "mode": "codex",
             "sessionRef": { "provider": "codex", "sessionId": session_id },
@@ -283,7 +284,8 @@ fn seed_records(dir: &std::path::Path, device: &str, client: &str, rev: i64, rec
 // tests deterministic regardless of sibling env pollution.
 fn rec(tab: &str, kind: &str, payload: Value) -> Value {
     json!({ "tabKey": format!("dev-1:{tab}"), "tabId": tab, "tabName": tab, "status": "open",
-            "revision": 1, "updatedAt": 2000, "paneCount": 1,
+            "revision": 1, "updatedAt": 2000, "createdAt": 2000, "titleSetByUser": false,
+            "paneCount": 1,
             "panes": [{ "paneId": format!("p-{tab}"), "kind": kind, "payload": payload }] })
 }
 

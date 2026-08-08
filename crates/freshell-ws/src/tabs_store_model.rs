@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 /// `DAY_MS` (store.ts:9).
 pub const DAY_MS: i64 = 86_400_000;
 /// `MINUTE_MS` (store.ts:10).
-const MINUTE_MS: i64 = 60_000;
+pub const MINUTE_MS: i64 = 60_000;
 /// `DEFAULT_CLOSED_RETENTION_DAYS` (store.ts:11).
 pub const DEFAULT_CLOSED_RETENTION_DAYS: i64 = 30;
 /// `DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES` (store.ts:12).
@@ -686,7 +686,7 @@ pub fn validate_record_caps(
 
 // ── Queued maintenance (store.ts:484-522) ────────────────────────────────────
 
-fn closed_at_or_updated(record: &Value) -> i64 {
+pub(crate) fn closed_at_or_updated(record: &Value) -> i64 {
     record
         .get("closedAt")
         .and_then(Value::as_i64)

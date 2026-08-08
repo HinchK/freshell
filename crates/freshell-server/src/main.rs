@@ -303,18 +303,48 @@ async fn main() -> ExitCode {
     // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
     // session-directory live-terminal join (`session_directory_state`).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-    // The shared in-memory tabs registry — cloned into both the WS handler
+    // The shared tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
     //
-    // Tabs registry now persists rolling snapshot generations under
+    // Task 11 (CFG-08/AUTO-15): the registry is now backed by the DURABLE
+    // Node-parity store under `<home>/.freshell/tabs-registry` (manifest +
+    // content-addressed objects, `server/tabs-registry/store.ts`). Opening is
+    // blocking, which is fine at boot (Node blocks too); a corrupt store
+    // REFUSES boot with the error message (Node parity: `open()` throws out
+    // of server startup rather than silently discarding user data). No home →
+    // memory-only registry exactly as before.
+    //
+    // The registry additionally persists rolling snapshot generations under
     // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
     // device's tabs can be rebuilt after client-state loss (continuity trio,
     // docs/plans/2026-07-22-continuity-safety-trio.md).
     let tabs = match &home {
-        Some(home) => freshell_ws::tabs::TabsRegistry::with_persist_dir(
-            home.join(".freshell").join("tabs-snapshots"),
-        ),
+        Some(home) => {
+            let store_root = home.join(".freshell").join("tabs-registry");
+            let boot_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let store = match freshell_ws::tabs_store::DurableTabsStore::open(
+                &store_root,
+                freshell_ws::tabs_store_model::default_caps(),
+                boot_now,
+            ) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!(
+                        "Failed to open tabs registry store at {}: {err}",
+                        store_root.display()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            freshell_ws::tabs::TabsRegistry::with_durable_store(
+                store,
+                Some(home.join(".freshell").join("tabs-snapshots")),
+            )
+        }
         None => freshell_ws::tabs::TabsRegistry::new(),
     };
 

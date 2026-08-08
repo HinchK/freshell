@@ -445,7 +445,7 @@ async fn handle_client_text(
             "tabs.sync.push" => return handle_tabs_push(&value, ws_tx, state).await,
             "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
             "tabs.sync.client.retire" => {
-                handle_tabs_retire(&value, state);
+                handle_tabs_retire(&value, state).await;
                 return true;
             }
             _ => {}
@@ -1935,7 +1935,8 @@ mod tabs_push_validation_tests {
             "rejected push must not create a persisted generation"
         );
         assert_eq!(
-            tabs.query("dev-1", "client-1")["localOpen"],
+            tabs.query("dev-1", "client-1", 30, crate::tabs::now_ms())
+                .unwrap()["localOpen"],
             serde_json::json!([]),
             "rejected push must not mutate the in-memory registry"
         );
@@ -1958,6 +1959,8 @@ mod tabs_push_validation_tests {
                 "status": "open",
                 "revision": 1,
                 "updatedAt": 1,
+                "createdAt": 1,
+                "titleSetByUser": false,
                 "paneCount": 1,
                 "panes": [{
                     "paneId": "pane-1",
@@ -1993,7 +1996,8 @@ mod tabs_push_validation_tests {
             "acme-custom-cli"
         );
         assert_eq!(
-            tabs.query("dev-1", "client-1")["localOpen"][0]["tabKey"],
+            tabs.query("dev-1", "client-1", 30, crate::tabs::now_ms())
+                .unwrap()["localOpen"][0]["tabKey"],
             "dev-1:tab-1",
             "accepted push must update the in-memory registry"
         );
@@ -2014,7 +2018,28 @@ async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state:
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let data = state.tabs.query(device_id, client_instance_id);
+    // `TabsSyncQuerySchema` (server/ws-handler.ts:452): `closedTabRetentionDays`
+    // is REQUIRED — an integer 1..=30. Missing or invalid → INVALID_MESSAGE.
+    let Some(retention_days) = value
+        .get("closedTabRetentionDays")
+        .and_then(|v| v.as_i64())
+        .filter(|days| (1..=30).contains(days))
+    else {
+        let frame = tabs_error_frame(
+            "tabs.sync.query `closedTabRetentionDays` must be an integer from 1 to 30",
+        );
+        return send_raw(ws_tx, &frame).await;
+    };
+
+    let data = match state.tabs.query(
+        device_id,
+        client_instance_id,
+        retention_days,
+        crate::tabs::now_ms(),
+    ) {
+        Ok(data) => data,
+        Err(message) => return send_raw(ws_tx, &tabs_error_frame(&message)).await,
+    };
     let frame = serde_json::json!({
         "type": "tabs.sync.snapshot",
         "requestId": request_id,
@@ -2026,19 +2051,32 @@ async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state:
 /// `tabs.sync.client.retire` — drop this client's open snapshot (background retire;
 /// no reply). The unload beacon also hits `POST /api/tabs-sync/client-retire`, which
 /// routes to the same [`crate::tabs::TabsRegistry`], so the retire is idempotent.
-fn handle_tabs_retire(value: &serde_json::Value, state: &WsState) {
-    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+async fn handle_tabs_retire(value: &serde_json::Value, state: &WsState) {
+    let device_id = value
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let client_instance_id = value
         .get("clientInstanceId")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let snapshot_revision = value
         .get("snapshotRevision")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    state
-        .tabs
-        .retire_client_snapshot(device_id, client_instance_id, snapshot_revision);
+    // A durable-backed retire commits to disk, so it must NOT run on a Tokio
+    // worker: route through `spawn_blocking` exactly like `process_tabs_push`.
+    let reg = state.tabs.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        reg.retire_client_snapshot(&device_id, &client_instance_id, snapshot_revision)
+    })
+    .await;
+    if let Err(join_err) = joined {
+        tracing::warn!(target: "freshell_ws::tabs", error = %join_err,
+            "tabs_retire_task_panicked");
+    }
 }
 
 /// Send a raw JSON value as a text frame. Returns `false` if the socket is closed.
