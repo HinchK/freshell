@@ -38,9 +38,12 @@
 
 pub mod claude;
 pub mod codex;
+pub mod layout_store;
+pub mod layout_tree;
 pub mod opencode_ws;
 pub mod pane_ops;
 pub mod snapshot;
+pub mod target_resolver;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
