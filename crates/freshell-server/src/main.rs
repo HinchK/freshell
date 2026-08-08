@@ -264,9 +264,17 @@ async fn main() -> ExitCode {
     // instance -- one `opencode serve` sidecar shared by both surfaces (Batch D PR-2).
     // `with_shared_sessions_revision` unifies its `sessions.changed` emission onto the
     // SAME sequence as `ws_state.sessions_revision` below (SESSION-09 fix-forward).
+    // AUTO-01 spine (Task 13): ONE shared server-side layout store. The WS
+    // `ui.layout.sync` ingestion (`ws_state.layout`, below) REPLACES its
+    // snapshot; the REST automation surface (Tasks 14-16) reads/mutates the
+    // SAME instance via `fresh_agent_state.layout`. Constructed BEFORE
+    // `fresh_agent_state` and wired at `new()`-time so the
+    // `fresh_opencode_state` clone (taken immediately below) shares it too.
+    let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
-            .with_shared_sessions_revision(Arc::clone(&sessions_revision));
+            .with_shared_sessions_revision(Arc::clone(&sessions_revision))
+            .with_layout(layout_store.clone());
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let fresh_opencode_state =
@@ -433,6 +441,8 @@ async fn main() -> ExitCode {
         fresh_opencode: fresh_opencode_state.clone(),
         registry: registry.clone(),
         tabs: tabs.clone(),
+        // The SAME store `fresh_agent_state.layout` holds (AUTO-01 spine).
+        layout: layout_store.clone(),
         screenshots: screenshots.clone(),
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),

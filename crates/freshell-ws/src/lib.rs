@@ -120,6 +120,17 @@ pub struct WsState {
     /// `client-retire` beacon — shares one cross-device tab view. This is what makes
     /// a closed device's tab disappear from other clients' Tabs UI.
     pub tabs: crate::tabs::TabsRegistry,
+    /// The shared server-side layout snapshot (AUTO-01 spine, Task 13):
+    /// `ui.layout.sync` client frames REPLACE it
+    /// (`terminal::handle_client_text`'s `ClientMessage::UiLayoutSync` arm
+    /// -> `LayoutStore::update_from_ui` -- the port of
+    /// `this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')`,
+    /// `server/ws-handler.ts:1966-1969`). No reply frame (Node sends none).
+    /// `freshell-server`'s `main.rs` constructs ONE store and clones it into
+    /// BOTH this state and `freshell_freshagent::FreshAgentState` (via
+    /// `with_layout`), so the REST automation surface (Tasks 14-16) reads
+    /// the SAME snapshot the socket path ingests.
+    pub layout: freshell_freshagent::layout_store::LayoutStore,
     /// The shared terminal-identity registry (Fix Spec: Session Naming Cluster --
     /// the port-side closure of `TerminalMetadataService`'s provider/sessionId
     /// association slice, see [`crate::identity`]). Populated at terminal-create
@@ -661,6 +672,7 @@ mod tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),

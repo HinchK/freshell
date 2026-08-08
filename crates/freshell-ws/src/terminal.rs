@@ -706,6 +706,17 @@ async fn handle_client_text(
             );
             true
         }
+        // `ui.layout.sync` (AUTO-01 spine, Task 13): the client's layout mirror
+        // REPLACES the shared server-side `LayoutStore` snapshot -- the port of
+        // the dedicated arm's `this.layoutStore.updateFromUi(m, ws.connectionId
+        // || 'unknown')` (`server/ws-handler.ts:1966-1969`). No reply frame
+        // (Node sends none). The Node arm's second half (the
+        // sidebar-open-session-keys recompute, `ws:1970-1979`) is a separate
+        // session-directory concern, out of this task's scope.
+        ClientMessage::UiLayoutSync(sync) => {
+            state.layout.update_from_ui(&sync, &conn_id.to_string());
+            true
+        }
         // Application-level liveness ping (legacy parity: `ws-handler.ts:1832-1835`
         // -- `if (m.type === 'ping') { this.send(ws, { type: 'pong', timestamp:
         // nowIso() }); return }`). Byte-identical reply shape: exactly
@@ -2359,6 +2370,7 @@ mod terminals_changed_tests {
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
@@ -2560,6 +2572,7 @@ mod terminal_meta_created_tests {
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),

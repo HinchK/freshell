@@ -173,6 +173,16 @@ pub struct FreshAgentState {
     /// restore fix -- the SAME shared instance
     /// `freshell_ws::opencode_association::maybe_arm` arms.
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// The shared server-side layout snapshot (AUTO-01 spine, Task 13): the
+    /// WS `ui.layout.sync` ingestion (`freshell_ws::terminal`'s
+    /// `ClientMessage::UiLayoutSync` arm) REPLACES it, and the REST
+    /// automation surface (Tasks 14-16) reads/mutates the SAME store.
+    /// `freshell-server`'s `main.rs` constructs ONE instance and wires it
+    /// into both this state (via [`Self::with_layout`]) and
+    /// `freshell_ws::WsState::layout`. A fresh `Default` store (empty, no
+    /// snapshot) everywhere it isn't wired, matching the other Slice-1/3a
+    /// fields' "unwired == degrades honestly" convention.
+    pub layout: layout_store::LayoutStore,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -237,6 +247,7 @@ impl FreshAgentState {
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
+            layout: layout_store::LayoutStore::default(),
         }
     }
 
@@ -343,6 +354,17 @@ impl FreshAgentState {
         locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
     ) -> Self {
         self.amplifier_locator = locator;
+        self
+    }
+
+    /// AUTO-01 spine (Task 13): wire in the SAME
+    /// [`layout_store::LayoutStore`] `freshell_ws::WsState::layout` holds,
+    /// so the WS `ui.layout.sync` ingestion and this crate's REST
+    /// automation surface (Tasks 14-16) share ONE snapshot.
+    /// `freshell-server`'s `main.rs` calls this once at boot. Mirrors the
+    /// established `with_terminal_registry` builder pattern.
+    pub fn with_layout(mut self, layout: layout_store::LayoutStore) -> Self {
+        self.layout = layout;
         self
     }
 
