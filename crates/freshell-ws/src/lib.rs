@@ -33,6 +33,7 @@ pub mod screenshot;
 pub mod spawn_gate;
 pub mod tabs;
 pub mod tabs_persist;
+pub mod tabs_store;
 pub mod tabs_store_model;
 pub mod terminal;
 
