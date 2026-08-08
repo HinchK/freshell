@@ -70,6 +70,10 @@ const APP_VERSION: &str = "0.7.0";
 /// never overridden by the file. A missing `.env` file is a silent no-op —
 /// `dotenvy::from_path` returns an `Io(NotFound)` error we deliberately ignore,
 /// matching `dotenv/config`'s own silent-missing-file behavior.
+fn load_dotenv_from(dir: &Path) {
+    let _ = dotenvy::from_path(dir.join(".env"));
+}
+
 /// Task 16 (`PATCH /api/panes/:id` cascade): the production
 /// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
 /// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
@@ -110,10 +114,6 @@ impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
                 .await;
         })
     }
-}
-
-fn load_dotenv_from(dir: &Path) {
-    let _ = dotenvy::from_path(dir.join(".env"));
 }
 
 #[tokio::main]
