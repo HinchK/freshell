@@ -23,7 +23,7 @@
 ## Requirements
 
 - **R1 — Adaptive rows:** The picker chooses its row count from the pane's width and height so tiles are as large as possible: wide panes get fewer rows, tall panes get more rows. With no measurable size it falls back to a deterministic square-aspect layout.
-- **R2 — Balanced distribution:** Options are distributed with extras in the middle rows (center-out). An even row count with a single leftover balances the middle pair by taking one from the last row. Examples the user approved: 13 → 3-4-4-2 (not 4-4-4-1), 10 → 3-4-3 (not 4-4-2), 10 tall → 2-3-3-2. Rows never contain zero items; a dangling singleton last row is avoided when the base is ≥ 2.
+- **R2 — Balanced distribution:** Options are distributed with extras in the middle rows (center-out). An even row count with a single leftover balances the middle pair by taking one from the last row, guarded so the last row never drops below `base−1 ≥ 2`. Examples the user approved: 13 → 3-4-4-2 (not 4-4-4-1), 10 → 3-4-3 (not 4-4-2), 10 tall → 2-3-3-2. Rows never contain zero items; a dangling singleton last row is avoided whenever `base ≥ 3`.
 - **R3 — Fluid fit-to-pane sizing:** Tile size = `min(width − padding − gaps)/cols, (height − padding − gaps)/rows)` in container-query units (`cqw`/`cqh`), clamped 36–120px. Gap, padding, icon, and label scale relative to the tile. Icons/labels never overflow the pane.
 - **R4 — Preserve behavior:** Option ordering, keyboard shortcuts, arrow navigation, Escape cancel, fade-on-select, Windows shell variants, and extension options behave exactly as before.
 - **R5 — Evidence:** Pure-function unit tests for the layout math, component tests proving ResizeObserver-driven reflow and the fallback layout, updated existing row/responsive tests, a real-browser Playwright geometry spec for R3, docs mock updated, and the default-config unit suite + typecheck + lint green at the end.
@@ -36,7 +36,7 @@
 
 **Behavior:**
 - `centerOutRowOrder(rowCount)` returns row indices in center-out order: `4 → [1,2,0,3]`, `3 → [1,0,2]`, `5 → [2,1,3,0,4]`, `6 → [2,3,1,4,0,5]`.
-- `distributeRows(optionCount, rowCount)` returns an array of per-row sizes (top→bottom) summing to `optionCount`, base `floor(n/r)` everywhere plus extras to the first `rem` center-out rows; when `rowCount` is even, `rem === 1`, and `base >= 2`, instead bump both middle rows by 1 and subtract 1 from the last row (the 3-4-4-2 move).
+- `distributeRows(optionCount, rowCount)` returns an array of per-row sizes (top→bottom) summing to `optionCount`, base `floor(n/r)` everywhere plus extras to the first `rem` center-out rows; when `rowCount` is even, `rem === 1`, and `base >= 3`, instead bump both middle rows by 1 and subtract 1 from the last row (the 3-4-4-2 move). The `base >= 3` guard is required so the diamond move never drops the last row below `base - 1 >= 2` — with `base = 2` (e.g. 9 items in 4 rows) the move would create a trailing singleton `[2,3,3,1]`, so those cases take the ordinary center-out path (`[2,3,2,2]`).
 - `chooseRowCount(optionCount, width, height)` returns the row count in `[1, optionCount]` maximizing `min(width/ceil(n/r), height/r)`; `width`/`height` ≤ 0 are treated as 1 (deterministic square-aspect fallback); ties resolve to the smaller row count.
 - `computePanePickerLayout(optionCount, width, height)` returns `{ rowSizes, maxCols }` where `maxCols = Math.max(...rowSizes)`.
 
@@ -55,8 +55,8 @@
 **Test cases:**
 - `chooseRowCount(13, 480, 400)` → 4; `chooseRowCount(13, 640, 300)` → 3; `chooseRowCount(13, 300, 500)` → 5.
 - `chooseRowCount(10, 480, 400)` → 3; `chooseRowCount(10, 300, 500)` → 4 (tie with 5 → smaller row count wins); `chooseRowCount(13, 0, 0)` → 4; `chooseRowCount(1, 100, 100)` → 1.
-- `distributeRows(13, 4)` → `[3,4,4,2]`; `(10, 4)` → `[2,3,3,2]`; `(10, 3)` → `[3,4,3]`; `(11, 4)` → `[3,3,3,2]`; `(12, 4)` → `[3,3,3,3]`; `(14, 4)` → `[3,4,4,3]`; `(15, 4)` → `[4,4,4,3]`; `(13, 5)` → `[2,3,3,3,2]`; `(7, 3)` → `[2,3,2]` (center-heavy, unlike the old top-heavy `[3,2,2]`); `(7, 4)` → `[2,2,2,1]`; `(9, 3)` → `[3,3,3]`; `(1, 1)` → `[1]`.
-- Property sweep: for `n` in 1..30 and `r` in 1..n, `distributeRows(n, r)` sums to `n` and every row ≥ 1.
+- `distributeRows(13, 4)` → `[3,4,4,2]`; `(10, 4)` → `[2,3,3,2]`; `(10, 3)` → `[3,4,3]`; `(11, 4)` → `[3,3,3,2]`; `(12, 4)` → `[3,3,3,3]`; `(14, 4)` → `[3,4,4,3]`; `(15, 4)` → `[4,4,4,3]`; `(13, 5)` → `[2,3,3,3,2]`; `(7, 3)` → `[2,3,2]` (center-heavy, unlike the old top-heavy `[3,2,2]`); `(7, 4)` → `[2,2,2,1]`; `(9, 4)` → `[2,3,2,2]` (base 2 → ordinary path, no trailing singleton); `(17, 4)` → `[4,5,5,3]`; `(9, 3)` → `[3,3,3]`; `(1, 1)` → `[1]`.
+- Property sweep: for `n` in 1..30 and `r` in 1..n, `distributeRows(n, r)` sums to `n`, every row ≥ 1, and when `floor(n/r) >= 3` every row ≥ `floor(n/r) - 1` (no avoidable trailing singleton).
 - `centerOutRowOrder(4)` → `[1,2,0,3]`; `(3)` → `[1,0,2]`; `(5)` → `[2,1,3,0,4]`; `(6)` → `[2,3,1,4,0,5]`.
 - `computePanePickerLayout(13, 480, 400)` → `{ rowSizes: [3,4,4,2], maxCols: 4 }`; `(10, 300, 500)` → `{ rowSizes: [2,3,3,2], maxCols: 3 }`.
 
@@ -123,6 +123,7 @@ git commit -m "feat(panes): add adaptive picker layout math library"
 - Modify: `src/components/panes/PanePicker.tsx`
 - Modify: `src/index.css`
 - Modify: `test/unit/client/components/panes/PanePicker.test.tsx`
+- Create: `test/e2e-browser/specs/pane-picker-layout.spec.ts` (real-browser geometry evidence for R3 — authored in this task's Red step, before the production change)
 
 **Interfaces:**
 - Consumes: `computePanePickerLayout` from `@/lib/pane-picker-layout` (Task 1).
@@ -136,20 +137,31 @@ git commit -m "feat(panes): add adaptive picker layout math library"
 - Root keeps `role="toolbar"` and `aria-label="Pane type picker"`.
 - Root has class `pane-picker`; options container has class `pane-picker-options`; each row has class `pane-picker-option-row`; each option button has class `pane-picker-tile`.
 
+**Test cases (browser, in `test/e2e-browser/specs/pane-picker-layout.spec.ts`):**
+- Open the real picker via `openPanePicker` (helpers/pane-picker.ts). Read the toolbar (`[data-context="pane-picker"]`) box (W, H via `offsetWidth`/`offsetHeight`), the inline `--cols`/`--rows`, and the per-row button counts (`[data-testid="pane-picker-option-row"]`).
+- For every option button: `offsetWidth === offsetHeight` (square), `> 0`, and its `getBoundingClientRect()` is fully inside the toolbar rect (no overflow).
+- Fluid fit (this is the load-bearing R3 proof, which jsdom cannot provide): expected tile = `min((W − 2·pad − (cols−1)·gap)/cols, (H − 2·pad − (rows−1)·gap)/rows)` with `pad = clamp(8, 0.03·W, 28)` and `gap = clamp(6, 0.02·W, 18)` (the cq values resolve against the container's width). Assert each measured tile width equals the expected value within ±2.5px. Repeat at a second, materially different viewport (e.g. 1280×800 then 900×600 via `page.setViewportSize`), asserting the tiles reflow to a different size that again matches the formula and stays square + contained (poll with `expect.poll` until the ResizeObserver re-render settles).
+
 - [ ] **Step 1: Write the failing behavioral test**
 
-In `PanePicker.test.tsx`:
-1. Add a module-level controllable `MockResizeObserver` (captures the callback; `vi.stubGlobal('ResizeObserver', MockResizeObserver)` in a `beforeEach`, `vi.unstubAllGlobals()` in `afterEach`) and a helper `setContainerSize(width, height)` that defines `clientWidth`/`clientHeight` on the `[data-context="pane-picker"]` container and invokes the captured callback inside `act`.
-2. Update the `responsive sizing` describe block: replace the `@container`/`p-2`/`gap-2`/button-`p-2` assertions with the class assertions listed in **Test cases** (classes `pane-picker`, `pane-picker-options`, `pane-picker-option-row`, `pane-picker-tile`) plus the `role`/`aria-label` assertion.
-3. Add the reflow tests (7 options at 480×400 / 640×300 / 300×500) and the 13-option 480×400 → `[3,4,4,2]` test. The 13-option store uses `freshClientsEnabled: true`, `featureFlags: { kilroy: true }`, `availableClis: { claude: true, codex: true, opencode: true }`, `enabledProviders: ['claude','codex','opencode']`, `extensions: [...defaultCliExtensions, mockOpencodeExt, three client extensions]` — this yields 4 fresh agents + 3 CLIs + Editor/Browser/Shell + 3 extensions = 13. Assert `expect(screen.getAllByRole('button')).toHaveLength(13)` first so the row-shape assertion (`[3,4,4,2]` = 4 rows with 3, 4, 4, 2 buttons) is guaranteed to run against exactly 13 options; if the count differs, adjust the number of client extensions up/down until it is exactly 13.
-4. Add the cross-row arrow test: with the default store plus 4 more options (so 7 total, fallback rows `[2,3,2]`), focus the button at global index 1 and fire `ArrowRight`; assert the button at global index 2 (`buttonRefs`/DOM order) has focus. Add the store helper used by the existing tests (e.g. `availableClis`/`enabledProviders`/`extensions` yielding 7 options).
-5. Change the existing 7-option "balanced icon layout" test from `[3,2,2]` to `[2,3,2]` (rows of 2, 3, 2 buttons) as the no-size fallback case.
+Write BOTH test layers (they are this task's Red step and must exist before the production change):
+1. In `PanePicker.test.tsx` (jsdom):
+   - Add a module-level controllable `MockResizeObserver` (captures the callback; `vi.stubGlobal('ResizeObserver', MockResizeObserver)` in `beforeEach`, `vi.unstubAllGlobals()` in `afterEach`) and a helper `setContainerSize(width, height)` that defines `clientWidth`/`clientHeight` on the `[data-context="pane-picker"]` container and invokes the captured callback inside `act`.
+   - Update the `responsive sizing` describe block: replace the `@container`/`p-2`/`gap-2`/button-`p-2` assertions with the class assertions listed in **Test cases** plus the `role`/`aria-label` assertion.
+   - Add the reflow tests (7 options at 480×400 / 640×300 / 300×500) and the 13-option 480×400 → `[3,4,4,2]` test. The 13-option store uses `freshClientsEnabled: true`, `featureFlags: { kilroy: true }`, `availableClis: { claude: true, codex: true, opencode: true }`, `enabledProviders: ['claude','codex','opencode']`, `extensions: [...defaultCliExtensions, mockOpencodeExt, three client extensions]` — this yields 4 fresh agents + 3 CLIs + Editor/Browser/Shell + 3 extensions = 13. Assert `expect(screen.getAllByRole('button')).toHaveLength(13)` first so the row-shape assertion (`[3,4,4,2]` = 4 rows with 3, 4, 4, 2 buttons) is guaranteed to run against exactly 13 options; if the count differs, adjust the number of client extensions up/down until it is exactly 13.
+   - Add the cross-row arrow test: with the default store plus 4 more options (so 7 total, fallback rows `[2,3,2]`), focus the button at global index 1 and fire `ArrowRight`; assert the button at global index 2 (`buttonRefs`/DOM order) has focus. Add the store helper used by the existing tests (e.g. `availableClis`/`enabledProviders`/`extensions` yielding 7 options).
+   - Change the existing 7-option "balanced icon layout" test from `[3,2,2]` to `[2,3,2]` (rows of 2, 3, 2 buttons) as the no-size fallback case.
+2. In `test/e2e-browser/specs/pane-picker-layout.spec.ts` (Playwright): implement the browser test cases above using `test`, `expect` from `../helpers/fixtures.js` and `openPanePicker` from `../helpers/pane-picker.js`.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/components/panes/PanePicker.test.tsx`
+Run the jsdom tests: `npm run test:vitest -- run test/unit/client/components/panes/PanePicker.test.tsx`
 
 Expected: FAIL — new class/reflow/13-option assertions fail against the current layout (`@container`, `p-2`, `gap-2`, 3-per-row fixed rows). The reflow tests fail because the current component has no ResizeObserver and no `--cols`/`--rows`.
+
+Then run the browser test against the CURRENT (unimplemented) layout: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
+
+Expected: FAIL — the current content-sized, non-square buttons do not satisfy the square/expected-size assertions. This is the Red run for the R3 geometry; do not implement Task 2's production change before seeing this failure. If Chromium genuinely cannot launch in this environment, STOP and record the exact error as a blocker (R5 requires this evidence; do not silently continue).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -161,11 +173,15 @@ In `PanePicker.tsx`:
 - Move icon/label/hint size classes to the new CSS classes; keep `.shortcut-hint` and its `opacity-*` transition classes on the hint span.
 - In `src/index.css`, add the `/* Pane picker: balanced adaptive grid */` block exactly as specified.
 
-- [ ] **Step 4: Run the focused test**
+- [ ] **Step 4: Run the focused tests**
 
 Run: `npm run test:vitest -- run test/unit/client/components/panes/PanePicker.test.tsx`
 
 Expected: PASS (all updated + new tests).
+
+Then run: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
+
+Expected: PASS — real-browser tiles are square, match the expected fluid formula at both viewports, and stay within the pane bounds.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -173,14 +189,14 @@ Confirm no leftover references to `buildBalancedOptionRows`/`MAX_OPTIONS_PER_ROW
 
 - [ ] **Step 6: Run broader verification**
 
-Run: `npm run test:vitest -- run test/unit/client/components/panes test/e2e/directory-picker-flow.test.tsx` then `npm run typecheck:client` and `npm run lint`
+Run: `npm run test:vitest -- run test/unit/client/components/panes test/e2e/directory-picker-flow.test.tsx` then `npm run typecheck:client` and `npm run lint`, then `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line`
 
-Expected: PASS — panes unit tests, the jsdom directory-picker e2e, typecheck, and lint all exit 0. (Any pre-existing lint issues unrelated to this change are recorded out-of-scope.)
+Expected: PASS — panes unit tests, the jsdom directory-picker e2e, typecheck, lint, and both browser specs (existing pane-picker + new geometry) all pass.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/panes/PanePicker.tsx src/index.css test/unit/client/components/panes/PanePicker.test.tsx
+git add src/components/panes/PanePicker.tsx src/index.css test/unit/client/components/panes/PanePicker.test.tsx test/e2e-browser/specs/pane-picker-layout.spec.ts
 git commit -m "feat(panes): adaptive balanced rows and fluid tile sizing for the pane picker"
 ```
 
@@ -241,71 +257,13 @@ git commit -m "docs: refresh picker mock to balanced adaptive tile layout"
 
 ---
 
-### Task 4: Real-browser geometry spec for R3 (Playwright)
-
-**Requirements served:** R3, R5
-
-**Behavior:**
-- A Playwright spec opens the actual pane picker in a real Chromium against the served app and asserts the fluid-fit geometry that jsdom cannot prove: option tiles are square, sized from the pane, and do not overflow the picker's bounds at the default pane size.
-- Uses the existing helpers (`openPanePicker` from `test/e2e-browser/helpers/pane-picker.ts`, the `freshellPage` fixture).
-
-**Files:**
-- Create: `test/e2e-browser/specs/pane-picker-layout.spec.ts`
-
-**Interfaces:**
-- Consumes: `test, expect` from `../helpers/fixtures.js`; `openPanePicker` from `../helpers/pane-picker.js`.
-
-**Test cases:**
-- Open the picker; assert the toolbar is visible.
-- For every option button inside the picker: `offsetWidth === offsetHeight` and `> 0` (square tiles), and `getBoundingClientRect()` is fully inside the picker toolbar's `getBoundingClientRect()` (no overflow).
-- Assert the buttons render in more than one row (the toolbar has >1 `[data-testid="pane-picker-option-row"]` when 7+ options are visible — use the base options only if the environment shows 3, else assert `>= 1` row and square/no-overflow geometry which is the load-bearing claim).
-
-- [ ] **Step 1: Write the failing behavioral test**
-
-Create `test/e2e-browser/specs/pane-picker-layout.spec.ts` using the fixture and `openPanePicker`. Collect each button's `offsetWidth`/`offsetHeight` and its rect vs the toolbar rect via `locator.evaluate`. Assert squareness, positivity, and containment. (jsdom unit tests cannot prove this — this is the browser-level evidence for R3.)
-
-- [ ] **Step 2: Run the test and verify the intended failure**
-
-Run: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
-
-Expected: FAIL (or the test cannot run yet if the old layout is fixed-width buttons) — against the current fixed-size picker, tiles are not square/contained the same way. If the Playwright infra cannot launch in this environment (browser binary version mismatch or no build), record the exact error, mark the test `Not run` with that reason, and continue — the complete verification section then records it honestly.
-
-- [ ] **Step 3: Add the minimal production implementation**
-
-No production change in this task; Task 2 already ships the geometry. If the test fails for a real layout bug (e.g. non-square tiles), fix the CSS in Task 2's block.
-
-- [ ] **Step 4: Run the focused test**
-
-Run: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
-
-Expected: PASS.
-
-- [ ] **Step 5: Refactor while green**
-
-Not needed.
-
-- [ ] **Step 6: Run broader verification**
-
-Run: `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line`
-
-Expected: PASS (existing pane-picker spec still green with the new geometry).
-
-- [ ] **Step 7: Commit the task**
-
-```bash
-git add test/e2e-browser/specs/pane-picker-layout.spec.ts
-git commit -m "test(e2e): assert pane-picker tile geometry in real browser"
-```
-
----
-
 ## Complete verification (Stage 4 end, before final Fresh Eyes)
 
 - `npm run typecheck:client` → exit 0
 - `npm run lint` → exit 0
 - `npm run test:unit` (coordinated default-config `test/unit` workload) → green
 - `npm run test:vitest -- run test/e2e/directory-picker-flow.test.tsx` → green (jsdom e2e covering the picker)
-- `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line` → green (real-browser geometry + existing picker spec)
+- `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line` → green (REQUIRED: real-browser geometry evidence for R3 + the existing picker spec). If Chromium cannot launch, this is a blocker for ready-to-merge — record the exact error; do not claim the browser evidence green.
 - Record the committed `HEAD` that produced the receipt in the run-state and progress ledger.
 
 Not run (with reason): full Playwright suite (heavy, runs against both Node and Rust servers in CI); server-config suite — client-only change. The `role="toolbar"`/`aria-label` selector used by browser specs is asserted in unit tests too.
