@@ -16,6 +16,7 @@
 //! * `FRESHELL_HOME` / `HOME` — the isolated home whose `.freshell/config.json`
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
+mod auto_title;
 mod boot;
 mod checkpoints;
 mod diag;
