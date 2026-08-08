@@ -486,6 +486,9 @@ mod tests {
         assert_eq!(item.provider, "amplifier");
         assert_eq!(item.cwd.as_deref(), Some("/home/dan/myproj"));
         assert_eq!(item.title.as_deref(), Some("Fixture Session"));
+        // Amplifier's `name` is an AI-generated session title -> marked
+        // provider-generated (amplifier.ts:93 parity; see build at :208-212).
+        assert_eq!(item.title_source.as_deref(), Some("provider-generated"));
         assert_eq!(item.summary.as_deref(), Some("a summary"));
         assert_eq!(
             item.first_user_message.as_deref(),

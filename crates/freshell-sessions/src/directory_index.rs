@@ -2387,6 +2387,22 @@ mod tests {
     }
 
     #[test]
+    fn opencode_source_preserves_none_first_user_message_parity() {
+        // validator-A4-A3: Node's opencode provider has no firstUserMessage
+        // (opencode.ts:184-195) -- Rust must preserve None for opencode
+        // sessions (parity, not a gap): they can never hit the
+        // first-message/AI-title rungs.
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-no-fum",
+            &[("ses_fum", "/repo/f", "Titled Session", 1000, 5000)],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].first_user_message.is_none());
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
     fn opencode_source_missing_db_scans_empty_without_panicking() {
         let data_home = unique_temp_dir("opencodesrc-missing");
         std::fs::create_dir_all(&data_home).unwrap();

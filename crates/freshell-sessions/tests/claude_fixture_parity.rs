@@ -196,6 +196,21 @@ fn title_precedence_custom_title_then_agent_name_then_first_message() {
 }
 
 #[test]
+fn summary_title_last_record_wins() {
+    // Node parity: claude.ts:416-419 overwrites generatedSummaryTitle on EVERY
+    // `type:'summary'` record (no first-wins guard), and session-indexer.ts:150
+    // makes last-wins load-bearing. A transcript with two summary records must
+    // surface the LATER title, not freeze the stale first one.
+    let meta = parse_str(concat!(
+        "{\"type\":\"summary\",\"summary\":\"Stale Early Title\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"hello there\"}\n",
+        "{\"type\":\"summary\",\"summary\":\"Fresh Later Title\"}\n",
+    ));
+    assert_eq!(meta.title.as_deref(), Some("Fresh Later Title"));
+    assert_eq!(meta.title_source.as_deref(), Some("provider-generated"));
+}
+
+#[test]
 fn ai_title_records_are_ignored_for_parity() {
     // Real Claude CLI transcripts may contain `{"type":"ai-title","aiTitle":"..."}`
     // records. The legacy server does not parse ai-title records (verified against

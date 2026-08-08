@@ -367,15 +367,17 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
             }
         }
         // Extract generated summary title from `type:'summary'` records (additive work item 1).
-        // Node's claude-title.ts:3-9 extracts the title from summary records.
+        // Node's claude-title.ts:3-9 extracts the title from summary records, and
+        // claude.ts:416-419 overwrites on EVERY summary record (last-wins; no guard) --
+        // session-indexer.ts:150 makes last-wins load-bearing.
         if obj.get("type").and_then(Value::as_str) == Some("summary") {
-            if let Some(s) = obj.get("summary").and_then(as_trimmed_nonempty) {
-                if generated_summary_title.is_none() {
-                    let title = extract_title_from_message(s, 200);
-                    if !title.is_empty() {
-                        generated_summary_title = Some(title);
-                    }
-                }
+            if let Some(t) = obj
+                .get("summary")
+                .and_then(as_trimmed_nonempty)
+                .map(|s| extract_title_from_message(s, 200))
+                .filter(|t| !t.is_empty())
+            {
+                generated_summary_title = Some(t);
             }
         }
 
