@@ -304,6 +304,23 @@ impl OpencodeLocator {
         let mut located = Vec::new();
         let terminal_ids: Vec<String> = inner.armed.keys().cloned().collect();
 
+        // Contested-cwd census over CONTENDERS -- armed terminals with an
+        // in-flight (unresolved) evaluation window -- mirroring the codex
+        // locator's cross-tick census (codex_locator.rs). One new session
+        // row landing inside >=2 same-cwd windows is unattributable: without
+        // this census whichever terminal evaluates first silently claims a
+        // sibling pane's session (and the sibling could claim it too). A
+        // resolved (or never-armed) same-cwd pane is NOT a contender, so an
+        // idle sibling never starves a later solo Enter (the codex census's
+        // P2 rule). Computed BEFORE the per-terminal loop so a terminal
+        // resolving mid-loop still counts against its cwd-mates this tick.
+        let mut cwd_counts: HashMap<String, usize> = HashMap::new();
+        for a in inner.armed.values() {
+            if !a.resolved {
+                *cwd_counts.entry(a.cwd_normalized.clone()).or_insert(0) += 1;
+            }
+        }
+
         for terminal_id in terminal_ids {
             let Some(armed) = inner.armed.get(&terminal_id) else {
                 continue;
@@ -366,6 +383,19 @@ impl OpencodeLocator {
                     terminal_id = %terminal_id,
                     candidates = ?matches.iter().map(|r| r.session_id.clone()).collect::<Vec<_>>(),
                     "opencode_locator_ambiguous: multiple cwd-confirmed opencode session rows within the correlation window; refusing to bind"
+                );
+                continue;
+            }
+
+            if cwd_counts.get(&cwd_normalized).copied().unwrap_or(0) >= 2 {
+                // Contested cwd (see the census above): a sole candidate
+                // visible to >=2 same-cwd in-flight windows is
+                // unattributable — refuse (never guess). Refusal never
+                // disarms: a later solo Enter re-evaluates.
+                tracing::warn!(
+                    terminal_id = %terminal_id,
+                    session_id = %matches[0].session_id,
+                    "opencode_locator_contested_cwd: >=2 contenders (in-flight evaluation windows) share this cwd; refusing to bind"
                 );
                 continue;
             }
@@ -846,6 +876,75 @@ mod tests {
         let located = locator.tick(enter_at + OPENCODE_WINDOW_MS + 1);
         assert_eq!(located.len(), 1);
         assert_eq!(located[0].session_id, "ses_at_enter");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 16b. contested cwd: ONE new row inside TWO armed same-cwd
+    // terminals' windows must bind NEITHER (mirrors the codex locator's
+    // contested-cwd census, codex_locator.rs). Without the census, pane A
+    // silently claims pane B's session row AND pane B claims it too --
+    // the same session id bound to two different panes. --
+
+    #[test]
+    fn one_row_inside_two_same_cwd_windows_binds_neither_terminal() {
+        let home = unique_temp_dir("contested-cwd");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.arm("t2", "opencode", true, None, Some("/proj"), 10));
+        assert!(locator.note_submit("t1", 100));
+        assert!(locator.note_submit("t2", 150));
+
+        // Pane t2's real session row -- created after BOTH arms, same cwd,
+        // so it is a candidate inside BOTH evaluation windows.
+        insert_session(&db, "ses_contested", "/proj", 200, None, None);
+
+        let located = locator.tick(150 + OPENCODE_WINDOW_MS + 1);
+        assert!(
+            located.is_empty(),
+            "a row claimable by >=2 same-cwd contenders is unattributable and \
+             must bind NOBODY, got: {located:?}"
+        );
+        assert_eq!(
+            locator.armed_count(),
+            2,
+            "contested refusal must not disarm (a later solo Enter re-evaluates)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 16c. no starvation: an armed same-cwd sibling with NO in-flight
+    // evaluation window (its spawn-anchored evaluation already resolved
+    // empty) is NOT a contender -- a later solo Enter still binds. Mirrors
+    // the codex census's contender definition (in-flight windows only;
+    // codex_locator.rs P2 incident 2026-07-27). --
+
+    #[test]
+    fn solo_enter_still_binds_when_same_cwd_sibling_has_no_open_window() {
+        let home = unique_temp_dir("census-no-starvation");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.arm("t2", "opencode", true, None, Some("/proj"), 10));
+        // Both spawn-anchored evaluations resolve EMPTY (no rows yet).
+        assert!(locator.tick(10 + OPENCODE_WINDOW_MS + 1).is_empty());
+        assert_eq!(locator.armed_count(), 2);
+
+        // Only t2 re-opens a window (solo Enter); its row appears inside it.
+        let enter_at = 10_000;
+        assert!(locator.note_submit("t2", enter_at));
+        insert_session(&db, "ses_solo", "/proj", enter_at + 50, None, None);
+
+        let located = locator.tick(enter_at + OPENCODE_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "an idle armed sibling must not starve the solo contender"
+        );
+        assert_eq!(located[0].terminal_id, "t2");
+        assert_eq!(located[0].session_id, "ses_solo");
         let _ = std::fs::remove_dir_all(&home);
     }
 

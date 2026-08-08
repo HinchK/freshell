@@ -59,10 +59,10 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
-    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
-    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalMetaRecord,
-    TerminalMetaUpdated, TerminalResize,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent, Pong, ServerMessage,
+    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
+    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
+    TerminalKill, TerminalMetaRecord, TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -160,10 +160,13 @@ pub async fn run(
     // TERM-09: live terminal OUTPUT frames (`TerminalOutput`/`TerminalOutputBatch`)
     // are intercepted by `output_queue` BEFORE reaching this channel -- a bounded,
     // drop-oldest queue (mirrors `ClientOutputQueue`) that keeps ONE slow reader
-    // from growing server memory without bound. Every other frame family
-    // (`attach.ready`, `terminal.created`, `terminal.exit`, ...) is unaffected,
-    // exactly matching legacy's scoping (see `freshell_terminal::output_queue`
-    // and `crate::backpressure` module docs for the full mapping).
+    // from growing server memory without bound. `terminal.exit` ALSO travels the
+    // queue (as a zero-weight, non-evictable sequenced frame) so it can never
+    // overtake queued output/replay and blank an exited pane -- see
+    // `ConnectionOutputQueue::route`. Other frame families (`attach.ready`,
+    // `terminal.created`, ...) go direct on this channel (see
+    // `freshell_terminal::output_queue` and `crate::backpressure` module docs
+    // for the full mapping).
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
         state.term09.queue_max_bytes,
@@ -521,6 +524,14 @@ async fn handle_client_text(
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
+    // Silent-drop fix (bug-hunt pbh-20260807): the fresh-agent control frames
+    // this port has no runtime handler for (approval.respond / question.respond /
+    // fork / compact) used to fall into the dispatch's `_ => true` catch-all and
+    // vanish -- the pane hung waiting forever. Answer them BEFORE the typed
+    // dispatch; see `unhandled_fresh_agent_control_reply`.
+    if let Some(reply) = unhandled_fresh_agent_control_reply(&message) {
+        return send(ws_tx, &reply).await;
+    }
     match message {
         // SAFE-08: structured restore-diagnostic record, parity with
         // server/ws-handler.ts:1901-1915's `client_restore_unavailable`
@@ -946,8 +957,16 @@ async fn handle_client_text(
             )
             .await
         }
-        // Everything else (opencode fresh-agent, activity lists, other ui.*) is
-        // out of scope for this path; ignore.
+        // Deliberately inert remainder -- every arm here is unreachable from the
+        // frozen client's live surface: `hello` was already consumed by the
+        // pre-loop handshake (`evaluate_hello`); `ui.layout.sync` is not consumed
+        // anywhere in this port yet (documented deferral --
+        // freshell-freshagent/src/pane_ops.rs `resize_pane`); `codingcli.*` has
+        // no runtime here and the frozen client never sends it (zero senders in
+        // `src/`). The user-reachable fresh-agent control frames
+        // (approval.respond / question.respond / fork / compact) are answered
+        // BEFORE this match by `unhandled_fresh_agent_control_reply` -- they must
+        // never fall through to this silent arm again.
         _ => true,
     }
 }
@@ -4351,6 +4370,90 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
         reason: TerminalInputBlockedReason::UnknownTerminal,
         terminal_id: terminal_id.to_string(),
     })
+}
+
+/// `AgentProvider` -> its wire string (the enum serializes lowercase).
+fn agent_provider_wire(provider: AgentProvider) -> &'static str {
+    match provider {
+        AgentProvider::Claude => "claude",
+        AgentProvider::Codex => "codex",
+        AgentProvider::Opencode => "opencode",
+        AgentProvider::Amplifier => "amplifier",
+    }
+}
+
+/// `SessionType` -> its wire string (the enum serializes lowercase).
+fn session_type_wire(session_type: SessionType) -> &'static str {
+    match session_type {
+        SessionType::Freshclaude => "freshclaude",
+        SessionType::Freshcodex => "freshcodex",
+        SessionType::Kilroy => "kilroy",
+        SessionType::Freshopencode => "freshopencode",
+    }
+}
+
+/// Silent-drop fix (bug-hunt pbh-20260807): the four fresh-agent control frames
+/// the frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
+/// click, `FreshAgentView.tsx:2208/2339`), `freshAgent.question.respond`
+/// (`:2462`), `freshAgent.fork` (`:1080`) and `freshAgent.compact` (`:1100`) --
+/// previously fell into the typed dispatch's silent `_ => true` catch-all and
+/// vanished: no reply, no log, and the pane hung waiting forever. No runtime
+/// handler exists in this port yet (the claude sidecar's interactive
+/// permission/question response channel is explicitly out of scope --
+/// `crates/freshell-claude-sidecar/index.mjs:42-45` -- and the codex/opencode
+/// slices expose no approval/fork/compact RPC), so follow the kata-dtfn
+/// discipline (see [`unknown_terminal_input_blocked`]): never TOTAL SILENCE for
+/// a user action. Answer with the `freshAgent.error` event shape the client
+/// folds into a visible pane error (`fresh-agent-ws.ts:333-342` -- any code
+/// other than `INVALID_SESSION_ID` dispatches `sessionError`), so the click
+/// fails loudly instead of wedging the pane. Returns `None` for every message
+/// that has a real dispatch arm.
+pub(crate) fn unhandled_fresh_agent_control_reply(
+    message: &ClientMessage,
+) -> Option<ServerMessage> {
+    let (msg_type, provider, session_id, session_type) = match message {
+        ClientMessage::FreshAgentApprovalRespond(m) => (
+            "freshAgent.approval.respond",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        ClientMessage::FreshAgentQuestionRespond(m) => (
+            "freshAgent.question.respond",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        ClientMessage::FreshAgentFork(m) => (
+            "freshAgent.fork",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        ClientMessage::FreshAgentCompact(m) => (
+            "freshAgent.compact",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        _ => return None,
+    };
+    tracing::warn!(
+        message_type = msg_type,
+        session_id = %session_id,
+        "fresh-agent control frame has no handler in this port; answering freshAgent.error instead of dropping it"
+    );
+    Some(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: serde_json::json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": "UNSUPPORTED_MESSAGE",
+            "message": format!("{msg_type} is not supported by this server"),
+        }),
+        provider: agent_provider_wire(provider).to_string(),
+        session_id: session_id.to_string(),
+        session_type: session_type_wire(session_type).to_string(),
+    }))
 }
 
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire

@@ -117,9 +117,30 @@ impl ConnectionOutputQueue {
     /// handed straight back (`Some(msg)`) so the caller sends it directly and
     /// unconditionally -- mirrors legacy exactly: only replay/live output
     /// passes through `ClientOutputQueue`; every other frame family
-    /// (`attach.ready`, `terminal.created`, `terminal.exit`, ...) is sent
-    /// immediately and is never subject to eviction.
+    /// (`attach.ready`, `terminal.created`, ...) is sent immediately and is
+    /// never subject to eviction. ONE deliberate deviation: `terminal.exit`
+    /// also travels the queue (non-evictable, zero-weight) to preserve its
+    /// output-then-exit wire order -- see the comment inside.
     pub fn route(&self, msg: ServerMessage) -> Option<ServerMessage> {
+        // `terminal.exit` is the ONE non-output frame with a producer-side
+        // ordering guarantee AGAINST output: it is only ever emitted after
+        // the final `terminal.output` frame (`freshell_terminal::pty`'s
+        // ExitHook contract; the registry's attach enqueues ready -> replay
+        // -> exit). Sending it on the direct channel while output waits in
+        // this queue would invert that order on the wire -- the connection
+        // loop drains direct frames FIRST -- and the client's exit teardown
+        // then discards the still-queued replay/final output (blank exited
+        // pane on attach-to-exited; truncated tail on a busy live exit). It
+        // therefore travels the SAME FIFO, as a non-evictable, zero-weight
+        // sequenced frame (never dropped, never counted as backpressure).
+        if matches!(msg, ServerMessage::TerminalExit(_)) {
+            {
+                let mut queue = self.inner.lock().expect("output queue mutex poisoned");
+                queue.push_sequenced(msg);
+            }
+            self.notify.notify_one();
+            return None;
+        }
         let Some(meta) = output_frame_meta(&msg) else {
             // Not a queueable output frame -- hand it straight back so the
             // caller sends it directly and unconditionally.
@@ -233,6 +254,55 @@ mod tests {
         assert!(
             m.tick(200),
             "sustained overflow past the stall duration must fire"
+        );
+    }
+
+    /// The producer-side invariant "terminal.exit can never overtake the
+    /// final terminal.output frames" (freshell-terminal/src/pty.rs:47-55;
+    /// registry attach enqueues ready -> replay -> exit) must survive the
+    /// connection loop's dual-channel design: output frames travel this
+    /// bounded queue while direct frames travel `conn_rx`, and the loop
+    /// drains `conn_rx` FIRST (terminal.rs `output_queue.notified()` arm).
+    /// If `route` hands a `TerminalExit` straight back while output is
+    /// pending here, the exit deterministically overtakes the replay on the
+    /// wire and the client's exit teardown discards the still-queued
+    /// scrollback (blank exited pane -- DEFECT 5b resurfaced at the ws
+    /// layer). `terminal.exit` must therefore travel the SAME FIFO.
+    #[test]
+    fn terminal_exit_never_overtakes_queued_output() {
+        let q = ConnectionOutputQueue::new(1_000_000);
+        let output = ServerMessage::TerminalOutput(freshell_protocol::TerminalOutput {
+            data: "final error text".to_string(),
+            seq_start: 1,
+            seq_end: 1,
+            stream_id: "s".to_string(),
+            terminal_id: "t".to_string(),
+            attach_request_id: Some("req-1".to_string()),
+            source: None,
+        });
+        assert!(q.route(output).is_none(), "output frame is queued");
+
+        let exit = ServerMessage::TerminalExit(freshell_protocol::TerminalExit {
+            exit_code: 1,
+            terminal_id: "t".to_string(),
+        });
+        assert!(
+            q.route(exit).is_none(),
+            "terminal.exit must travel the same FIFO as queued output, \
+             else it overtakes the replay/final output on the wire"
+        );
+
+        let drained = q.drain_all();
+        assert_eq!(drained.len(), 2);
+        assert!(
+            matches!(drained[0], ServerMessage::TerminalOutput(_)),
+            "output first, got {:?}",
+            drained[0]
+        );
+        assert!(
+            matches!(drained[1], ServerMessage::TerminalExit(_)),
+            "exit strictly after the output it followed, got {:?}",
+            drained[1]
         );
     }
 
