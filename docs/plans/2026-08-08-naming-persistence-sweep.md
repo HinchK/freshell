@@ -119,10 +119,30 @@ specs in Part F. Do not split into separate plans — the acceptance criteria
    `POST /api/terminals/:terminalId/summary` is shorthand. Port the real path.
 5. **Durable tabs store reads are Node-format-compatible** (same `v1/manifest.json`
    + `objects/<sha256>.json` layout, full 64-hex SHA-256 over raw file bytes on
-   load). Canonical serialization for *writing* uses byte-order key sorting
-   (BTreeMap); all registry JSON keys are lowercase-first camelCase ASCII, for
-   which byte order and Node's `localeCompare` order agree — pinned by a
-   fixture test in Task 8.
+   load); canonical serialization for *writing* uses byte-order (BTreeMap) key
+   sorting. The earlier premise — "all registry JSON keys are lowercase-first
+   camelCase ASCII, for which byte order and Node's `localeCompare` order
+   agree" — is FALSE for MAP KEYS (validator-A2): `openSnapshotsByClient` /
+   `clientRevisionsByClient` are keyed by base64url `deviceId:clientInstanceId`
+   (mixed case `A-Za-z0-9-_`) and `closedByTabKey` by `uuid:nanoid` (mixed
+   case) — a real-store scan found 59,041 objects whose sibling keys sort
+   differently under byte order vs ICU `localeCompare` (e.g.
+   `...:--0MNzJnmn...` vs `...:_fuUJwgE...`). Compatibility nevertheless holds
+   because (i) object digests are verified against RAW stored bytes on load
+   (writer-computed, collation-agnostic — each impl reads the other's
+   objects), and (ii) the `openSnapshotPayloadHash` preimage ({deviceId,
+   deviceLabel, clientInstanceId, snapshotRevision, records}) shows 0
+   divergent key pairs across 11.96M real objects (all 43 observed payload
+   keys are camelCase; the first-party client emits a closed camelCase set —
+   only extension `props` is open). Do NOT port `localeCompare` (ICU root
+   collation is version-unstable; Node is not self-consistent across
+   upgrades). Known narrow residual (ledgered as A2-R1): exotic future
+   extension-prop keys written by one impl could fail the other's payload-hash
+   re-verification → loud boot refusal, recoverable (archive the manifest or
+   run the writing server once); zero such keys exist in 2.6 GiB of production
+   data. Cross-impl dedupe divergence for map-keyed component objects is
+   benign (one-time object churn on impl switch; `objects/*` are never GC'd).
+   Pinned by the Task 8 fixture tests.
 6. **Gemini API key resolution** mirrors Node's `AI_CONFIG.applySettingsKey`
    exactly via an in-process cell: boot = env `GOOGLE_GENERATIVE_AI_API_KEY`
    wins over `settings.ai.geminiApiKey` (non-forcing, `server/index.ts:251`);
@@ -170,14 +190,14 @@ Modified files (main ones):
 | `crates/freshell-server/src/settings.rs` + settings router state | apply forced AI key on settings save |
 | `crates/freshell-server/src/session_directory.rs` | session-metadata read-join (Task 20) |
 | `crates/freshell-sessions/src/directory_index.rs` | `IndexedSession` gains `first_user_message` / `title_source` (if absent) |
-| `crates/freshell-ws/src/identity.rs` | `find_all_by_session` |
+| `crates/freshell-ws/src/identity.rs` | `find_all_by_session(provider, session_id, cwd)` — 3-arg, cwd-scoped for claude (Task 3) |
 | `crates/freshell-ws/src/tabs.rs` | Node-parity semantics (hashes, guards, TTLs, base64url keys) + durable-store backing |
 | `crates/freshell-ws/src/terminal.rs` | tabs.sync handler updates; `ui.layout.sync` ingestion; create-time meta enrichment |
 | `crates/freshell-ws/src/lib.rs` | `WsState` gains `layout` + `terminal_meta`; handshake ships real `terminal_meta` |
 | `crates/freshell-freshagent/src/lib.rs` | `FreshAgentState` gains `layout`, `terminals_revision`, `rename_persistence`; `rename_pane` full behavior |
 | `crates/freshell-freshagent/src/pane_ops.rs` | routes rebased onto `LayoutStore` (next/prev/resize un-deferred, swap titles, snapshot tree) |
 | `crates/freshell-freshagent/src/terminal_tabs.rs` | `list_tabs`/`list_panes` rebased onto `LayoutStore`; create/split also register in it |
-| `src/store/titleSync.ts`, `src/store/paneTitleSync.ts`, `src/store/panesSlice.ts`, `src/components/context-menu/ContextMenuProvider.tsx`, `src/components/HistoryView.tsx` | Task 19 client convergence fixes (user-authorized src/ change) |
+| `src/store/titleSync.ts`, `src/store/paneTitleSync.ts`, `src/store/panesSlice.ts`, `src/components/context-menu/ContextMenuProvider.tsx`, `src/components/HistoryView.tsx`, `src/components/OverviewView.tsx` | Task 19 client convergence fixes (user-authorized src/ change) |
 | `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` | evidence + checkboxes |
 | `port/oracle/DEVIATIONS.md` | EDEV entries for client fixes; DEV-0008 closure note |
 | `test/e2e-browser/playwright.config.ts` | new specs registered (matrix / rust-only lists) |
@@ -187,6 +207,11 @@ Interface notes for reviewers: `freshell-ws` depends on `freshell-freshagent`
 lives in `freshell-freshagent` and `freshell-ws` imports it. `sha2 = "0.10"`
 is already a `freshell-ws` dependency (`Cargo.toml:72`). `reqwest 0.13`
 (rustls) is already a plain `freshell-server` dependency (`Cargo.toml:54`).
+For Task 16's rename cascade, NO new freshell-ws-side trait is needed: the
+`freshell_terminal::TerminalRegistry` is ALREADY injected into
+`FreshAgentState` (`crates/freshell-freshagent/src/lib.rs:111`, `:362`) and
+is the terminal-metadata seam for provider/sessionId resolution
+(validator-A10).
 
 ---
 
@@ -512,11 +537,22 @@ git commit -m "feat(server): port auto-title pure logic (computeAutoTitlePatch/S
 
 Node reference: `server/ai-title.ts:10-27`, `server/ai-prompts.ts` (AI_CONFIG
 `:13-23`, sessionTitle `:42-60`, terminalSummary `:27-41`, stripAnsi `:7-10`).
-Exact HTTP wire contract (from the installed `@ai-sdk/google`):
-`POST {base}/models/gemini-2.5-flash-lite:generateContent`, header
-`x-goog-api-key: <key>`, body
-`{"generationConfig":{"maxOutputTokens":N},"contents":[{"role":"user","parts":[{"text":"<prompt>"}]}]}`,
-response text = concatenation of `candidates[0].content.parts[].text`.
+Exact HTTP wire contract — VERIFIED by live capture of the installed
+`ai@6.0.240` + `@ai-sdk/google@3.0.103` (validator-A1):
+`POST {base}/models/gemini-2.5-flash-lite:generateContent`; auth header
+`x-goog-api-key: <key>` ONLY (never a `?key=` query param); request body
+exactly
+`{"generationConfig":{"maxOutputTokens":N},"contents":[{"role":"user","parts":[{"text":"<prompt>"}]}]}`;
+default base `https://generativelanguage.googleapis.com/v1beta`, joined with
+without-trailing-slash semantics (a base with or without a trailing slash must
+yield the same URL). Response text = concatenation of
+`candidates[0].content.parts[].text` EXCLUDING parts carrying
+`"thought": true`; only `candidates[0]` is consulted. Node has NO env
+base-URL override (the default is hardcoded) — `FRESHELL_GEMINI_BASE_URL` is
+a Rust-only test seam, a deliberate documented superset (see Step 5).
+Test-shape guidance: fake servers assert the REQUIRED fields (method, path,
+header, the essential body fields above), not byte-exact bodies, so the tests
+survive SDK version skew.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -584,9 +620,13 @@ mod tests {
     }
 
     /// Loopback HTTP test for GeminiHttp — no live Gemini, no mock crates:
-    /// bind an axum server on 127.0.0.1:0 that asserts the wire contract.
+    /// bind an axum server on 127.0.0.1:0 that asserts the wire contract
+    /// (required fields only — method, path, header, essential body fields —
+    /// not byte-exact bodies; validator-A1 test-shape guidance). The response
+    /// includes a `"thought": true` part which MUST be excluded from the
+    /// extracted text (validator-A1 live capture).
     #[tokio::test]
-    async fn gemini_http_posts_expected_body_and_parses_candidates() {
+    async fn gemini_http_posts_expected_body_and_parses_candidates_excluding_thoughts() {
         use axum::{routing::post, Router, Json};
         let app = Router::new().route(
             "/v1beta/models/gemini-2.5-flash-lite:generateContent",
@@ -596,7 +636,10 @@ mod tests {
                 assert_eq!(body["contents"][0]["role"], "user");
                 assert!(body["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("hello world"));
                 Json(serde_json::json!({
-                    "candidates": [{ "content": { "parts": [ {"text": "Flux "}, {"text": "repair"} ] } }]
+                    "candidates": [{ "content": { "parts": [
+                        {"text": "internal reasoning", "thought": true},
+                        {"text": "Flux "}, {"text": "repair"}
+                    ] } }]
                 }))
             }),
         );
@@ -764,9 +807,14 @@ impl GeminiTransport for GeminiHttp {
                 return Err(format!("gemini http {status}"));
             }
             let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            // Only candidates[0] is consulted; parts with "thought": true are
+            // reasoning output and MUST be excluded (validator-A1 live capture).
             let mut text = String::new();
             if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()) {
                 for part in parts {
+                    if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                        continue;
+                    }
                     if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                         text.push_str(t);
                     }
@@ -817,8 +865,10 @@ In `main.rs`:
    ```
    (Use the existing `freshell_platform::Env` handle the way `ai_enabled` at
    `main.rs:1064-1071` does; if `env.get` doesn't exist use the same accessor
-   `ai_enabled` uses. `FRESHELL_GEMINI_BASE_URL` is a test-only seam used by
-   the e2e fake-Gemini server in Task 21.)
+   `ai_enabled` uses. `FRESHELL_GEMINI_BASE_URL` is a Rust-only test seam used
+   by the e2e fake-Gemini server in Task 21 — Node has NO env base-URL
+   override (its default is hardcoded), so this is a deliberate documented
+   superset, not a ported behavior; validator-A1.)
 2. Change the `featureFlags.aiEnabled` computation (`main.rs:1061`) to
    `ai_key.enabled()` and update the `ai_enabled` tests at `main.rs:1473-1505`
    to cover the settings-key case (env absent + settings key present → true).
@@ -845,36 +895,58 @@ git commit -m "feat(server): Gemini transport + prompts + AI key cell (settings-
 - Modify: `crates/freshell-ws/src/identity.rs` (280 lines — room to grow)
 
 **Interfaces:**
-- Produces: `pub fn find_all_by_session(&self, provider: &str, session_id: &str) -> Vec<TerminalIdentity>` — live (non-retired) terminals only, all matches (Node's `findTerminalsBySession` fans out to MANY terminals; the existing `find_by_session` at `identity.rs:160-165` returns at most one and stays untouched — 4 existing callers).
+- Produces: `pub fn find_all_by_session(&self, provider: &str, session_id: &str, cwd: Option<&str>) -> Vec<TerminalIdentity>` — live (non-retired) terminals only, all matches, cwd-scoped for cwd-scoped session modes (Node's 3-arg `findTerminalsBySession` fans out to MANY terminals; the existing `find_by_session` at `identity.rs:160-165` returns at most one and stays untouched — 4 existing callers).
 
-- [ ] **Step 1: Read the Node matcher first.** Read
-`server/terminal-registry.ts` `findTerminalsBySession(provider, sessionId, cwd)`
-(search for the function name). Mirror its matching exactly: if it uses `cwd`
-only as a tie-breaker/fallback for session-less terminals, replicate that with
-`TerminalIdentity.cwd`; if it matches strictly on provider+sessionId, the code
-below is already exact. Record which in the function's doc comment with the
-Node file:line.
+- [ ] **Step 1: Port the Node matcher semantics (validator-A4-A3 falsified
+the "strict provider+sessionId" assumption).** Node's 3-arg
+`findTerminalsBySession(provider, sessionId, cwd)`
+(`server/terminal-registry.ts:4538`) matches via `matchesScopedSession`
+(`:442-447`), which requires normalized-cwd EQUALITY whenever
+`isCwdScopedSessionMode(mode)` — true precisely for `claude` (`:410-412`).
+Normalization (`:414-431`): realpath (native preferred, lexical fallback on
+error) → backslashes→`/` → strip trailing slashes → lowercase on win32.
+Absent session cwd → the cwd check is skipped; a terminal WITHOUT a cwd while
+the session cwd is present → excluded. Node's sweep passes `session.cwd`
+(`server/index.ts:841`, `:884`). Record these cites in the function's doc
+comment.
 
 - [ ] **Step 2: Write the failing test** (append to the existing
 `#[cfg(test)] mod tests` at `identity.rs:168`, following its style):
 
 ```rust
 #[test]
-fn find_all_by_session_returns_every_live_match_and_skips_retired() {
+fn find_all_by_session_scopes_claude_by_normalized_cwd_and_skips_retired() {
     let reg = TerminalIdentityRegistry::new();
     reg.upsert("t1", Some("claude"), Some("s1"), Some("/a"), 1);
-    reg.upsert("t2", Some("claude"), Some("s1"), Some("/b"), 2);
-    reg.upsert("t3", Some("codex"), Some("s1"), None, 3);
-    reg.upsert("t4", Some("claude"), Some("s2"), None, 4);
-    reg.upsert("t5", Some("claude"), Some("s1"), None, 5);
-    reg.retire("t5");
+    reg.upsert("t2", Some("claude"), Some("s1"), Some("/a/"), 2); // trailing slash normalizes equal
+    reg.upsert("t3", Some("claude"), Some("s1"), Some("/b"), 3);  // different cwd -> excluded when scoped
+    reg.upsert("t4", Some("claude"), Some("s1"), None, 4);        // no terminal cwd while session cwd present -> excluded
+    reg.upsert("t5", Some("codex"), Some("s1"), Some("/a"), 5);   // provider mismatch for the claude query
+    reg.upsert("t6", Some("claude"), Some("s2"), Some("/a"), 6);  // session mismatch
+    reg.upsert("t7", Some("claude"), Some("s1"), Some("/a"), 7);
+    reg.retire("t7");
     let mut ids: Vec<String> = reg
-        .find_all_by_session("claude", "s1")
+        .find_all_by_session("claude", "s1", Some("/a"))
         .into_iter()
         .map(|t| t.terminal_id)
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+    // absent session cwd -> the cwd check is skipped entirely
+    let mut all: Vec<String> = reg
+        .find_all_by_session("claude", "s1", None)
+        .into_iter()
+        .map(|t| t.terminal_id)
+        .collect();
+    all.sort();
+    assert_eq!(all, vec!["t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()]);
+    // non-cwd-scoped provider (codex) ignores cwd even when both sides carry one
+    let codex: Vec<String> = reg
+        .find_all_by_session("codex", "s1", Some("/zzz"))
+        .into_iter()
+        .map(|t| t.terminal_id)
+        .collect();
+    assert_eq!(codex, vec!["t5".to_string()]);
 }
 ```
 
@@ -886,18 +958,54 @@ Expected: compile error (method not found).
 - [ ] **Step 4: Implement**
 
 ```rust
-/// All LIVE terminals bound to (provider, session_id). Port of
-/// `server/terminal-registry.ts::findTerminalsBySession` (fan-out variant used
-/// by the auto-name pass, server/index.ts:884). Unlike `find_by_session`,
-/// returns every match.
-pub fn find_all_by_session(&self, provider: &str, session_id: &str) -> Vec<TerminalIdentity> {
+/// All LIVE terminals bound to (provider, session_id), cwd-scoped for
+/// cwd-scoped session modes. Port of Node's 3-arg
+/// `server/terminal-registry.ts::findTerminalsBySession` (:4538) +
+/// `matchesScopedSession` (:442-447): when `isCwdScopedSessionMode(mode)` —
+/// true precisely for `claude` (:410-412) — the terminal's normalized cwd
+/// must equal the session's. Absent session cwd (`cwd == None`) skips the
+/// cwd check; a terminal without a cwd while the session HAS one is
+/// excluded. Callers pass `session.cwd` (server/index.ts:841, :884).
+/// Unlike `find_by_session`, returns every match.
+pub fn find_all_by_session(&self, provider: &str, session_id: &str, cwd: Option<&str>) -> Vec<TerminalIdentity> {
+    // isCwdScopedSessionMode (terminal-registry.ts:410-412): claude only.
+    let scoped = provider == "claude";
+    let session_cwd = cwd.filter(|c| !c.is_empty()).map(normalize_scoped_cwd);
     self.list()
         .into_iter()
         .filter(|t| {
-            t.provider.as_deref() == Some(provider)
-                && t.session_id.as_deref() == Some(session_id)
+            if t.provider.as_deref() != Some(provider)
+                || t.session_id.as_deref() != Some(session_id)
+            {
+                return false;
+            }
+            if !scoped {
+                return true;
+            }
+            match &session_cwd {
+                None => true, // absent session cwd -> cwd check skipped
+                Some(want) => t
+                    .cwd
+                    .as_deref()
+                    .map(normalize_scoped_cwd)
+                    .is_some_and(|have| have == *want), // no terminal cwd -> excluded
+            }
         })
         .collect()
+}
+
+/// `normalizeScopedSessionCwd` (terminal-registry.ts:414-431): realpath
+/// (native preferred, lexical fallback on error) -> backslashes to `/` ->
+/// strip trailing slashes -> lowercase on win32.
+fn normalize_scoped_cwd(cwd: &str) -> String {
+    let resolved = std::fs::canonicalize(cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_string());
+    let mut s = resolved.replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    if cfg!(windows) { s.to_lowercase() } else { s }
 }
 ```
 
@@ -907,7 +1015,7 @@ Run: `cargo test -p freshell-ws identity 2>&1 | tail -3` — expected ok.
 
 ```bash
 git add crates/freshell-ws/src/identity.rs
-git commit -m "feat(ws): identity find_all_by_session for auto-title fan-out"
+git commit -m "feat(ws): identity find_all_by_session (cwd-scoped) for auto-title fan-out"
 ```
 
 ### Task 4: `IndexedSession` carries `first_user_message` + `title_source`
@@ -923,15 +1031,24 @@ git commit -m "feat(ws): identity find_all_by_session for auto-title fan-out"
   - `pub title_source: Option<String>` (values mirror Node's `ParsedSessionTitleSource`; the sweep only ever compares against `"provider-generated"`)
 - Consumed by: Task 5 sweep and Task 6 route.
 
-**Precondition check (do this FIRST):** `IndexedSession` may already carry one
-or both fields. Run:
+**Verified state of the code (validator-A4-A3 — read before writing any
+code):** `IndexedSession.first_user_message` ALREADY exists
+(`crates/freshell-sessions/src/directory_index.rs:64`), and the claude
+(`parse/claude.rs:369-375`), codex (`parse/codex.rs:399-402`), and amplifier
+(`amplifier.rs:230-271`, `:328`) parsers already extract it single-pass.
+opencode has NO `firstUserMessage` in Node either (`opencode.ts:184-195`) —
+Rust must preserve `None` for opencode (it can never hit the
+first-message/AI-title rungs; that is parity, not a gap). The 4000-char cap
+(Node `types.ts:192-199`, trim → `slice(0,4000)`) is already ported at
+`crates/freshell-sessions/src/text.rs:14, 98-108`. What remains is
+`title_source` plus the two ADDITIVE work items in Step 4. Re-verify with:
 
 ```bash
 grep -n "first_user_message\|title_source" crates/freshell-sessions/src/directory_index.rs
 ```
 
-If a field already exists, skip its addition and only verify (with a test) the
-population semantics below.
+For any field that already exists, skip its addition and only verify (with a
+test) the population semantics below.
 
 - [ ] **Step 1: Mirror-map the Node source of truth.** Read the Node side:
 
@@ -973,6 +1090,12 @@ and for claude/codex (first-message-derived titles): assert
 assert!(s.first_user_message.as_ref().unwrap().chars().count() <= 4000);
 ```
 
+Add two more required tests (validator-A4-A3): (a) a claude fixture carrying
+a `type:'summary'` record → `title_source == Some("provider-generated")`
+(Step 4 item (a)); (b) an opencode fixture →
+`s.first_user_message.is_none()` (Node has no opencode firstUserMessage —
+parity, `opencode.ts:184-195`).
+
 - [ ] **Step 3: Run to verify failure**
 
 Run: `cargo test -p freshell-sessions 2>&1 | tail -10` — expected compile
@@ -992,12 +1115,23 @@ pub title_source: Option<String>,
 ```
 
 Populate both in each `SessionSource` implementation. The parsers already
-extract titles and (for claude/codex) parse messages
-(`crates/freshell-sessions/src/parse/claude.rs`, `parse/codex.rs`, and
-`meta.rs` — reuse whatever field carries the first user text; if only the
-title is currently extracted, extend the parser's meta struct with
-`first_user_message`, filling it from the first `role == "user"` text record
-and truncating with `.chars().take(4000).collect()`).
+extract titles and first user messages single-pass (verified: claude
+`parse/claude.rs:369-375`, codex `parse/codex.rs:399-402`, amplifier
+`amplifier.rs:230-271`, `:328`; opencode stays `None` — parity). Two ADDITIVE
+work items are REQUIRED here (validator-A4-A3):
+
+1. Port Node's claude `type:'summary'` generated-title extractor
+   (`server/coding-cli/claude-title.ts` semantics; `claude.ts:421-426`,
+   `:504-505`) so `title_source` can be `"provider-generated"` for claude
+   sessions carrying a provider-authored summary title — without it the AI
+   gate misfires (the sweep would Gemini-title sessions Node leaves alone).
+   This is ~10 additive lines in the existing parse loop in
+   `parse/claude.rs`.
+2. Thread `title_source` the way Node does via the applyOverride cache path
+   (`session-indexer.ts:204-219`, `:1012`) — i.e. surface it through the
+   directory-index overlay/cache used for override-applied listings, not
+   only at parse time, so consumers (Task 5 sweep, Task 6 route) see the
+   parsed source on cached rows too.
 
 - [ ] **Step 5: Run the crate suite, then the workspace fast gate**
 
@@ -1225,8 +1359,9 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
     let mut changed = false;
 
     for s in sessions {
-        // BOUNDED to live terminals only (server/index.ts:885)
-        let matching = state.identity.find_all_by_session(&s.provider, &s.session_id);
+        // BOUNDED to live terminals only (server/index.ts:885); Node passes
+        // session.cwd for the cwd-scoped claude match (index.ts:884, Task 3).
+        let matching = state.identity.find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref());
         if matching.is_empty() {
             continue;
         }
@@ -1269,7 +1404,8 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 };
                 if should_spawn {
                     spawn_ai_title_task(state, key.clone(), s.provider.clone(),
-                        s.session_id.clone(), first, settings.ai.title_prompt.clone());
+                        s.session_id.clone(), s.cwd.clone(), first,
+                        settings.ai.title_prompt.clone());
                 }
             }
         }
@@ -1295,6 +1431,7 @@ fn spawn_ai_title_task(
     key: String,
     provider: String,
     session_id: String,
+    cwd: Option<String>,
     first_message: String,
     title_prompt: Option<String>,
 ) {
@@ -1315,7 +1452,9 @@ fn spawn_ai_title_task(
                     ("titleOverride", Some(serde_json::json!(title))),
                     ("titleSource", Some(serde_json::json!("ai"))),
                 ]).await;
-                for term in identity.find_all_by_session(&provider, &session_id) {
+                // Node's AI completion re-fans-out with session.cwd too
+                // (server/index.ts:914-938 uses the same cwd-scoped lookup).
+                for term in identity.find_all_by_session(&provider, &session_id, cwd.as_deref()) {
                     registry.update_title(&term.terminal_id, &title);
                     emit_terminal_title_updated(&broadcast_tx, &term.terminal_id, &title);
                 }
@@ -1809,9 +1948,11 @@ pub fn compare_by_event_time(a: &serde_json::Value, b: &serde_json::Value) -> st
 pub fn pick_event_winner<'a>(a: &'a serde_json::Value, b: &'a serde_json::Value) -> &'a serde_json::Value
 ```
 
-- [ ] **Step 1: Capture a Node hash fixture (proves Scope Decision 5).** Run
-this one-off inside the worktree to generate the fixture with Node's own
-`stableStringify` + sha256 semantics:
+- [ ] **Step 1: Capture the Node hash fixtures (the Scope Decision 5 proof,
+scoped per validator-A2).** Run this one-off inside the worktree to generate
+the camelCase differential fixture with Node's own `stableStringify` + sha256
+semantics — keep it as the CROSS-IMPL hash-compatibility proof for the
+reachable (all-camelCase) payload-key inventory:
 
 ```bash
 node --input-type=module -e '
@@ -1835,6 +1976,22 @@ console.log(JSON.stringify({ input: snapshot, canonical: raw,
 ' > crates/freshell-ws/tests/fixtures/node-tabs-registry-hash.json
 cat crates/freshell-ws/tests/fixtures/node-tabs-registry-hash.json | head -5
 ```
+
+Then extend the Node-generated fixture (or add a second fixture file) to
+include map keys with DIVERGENT-order pairs — base64url snapshot keys with
+mixed case and tabKeys like `<uuid>:--0MNzJnmn-oNjHjMXnPf` vs
+`<uuid>:_fuUJwgE1XOONeyzvyZMk` (the real-store divergence class from
+validator-A2) — used to assert Rust's SELF-consistent write/read roundtrip
+and to pin Rust's byte-order output; cross-impl hash equality is NOT asserted
+for these keys (ledger A2-R1). Note: golden Node MIGRATION outputs (snapshot
+keys `ZGV2QQ:bGVnYWN5LW1pZ3JhdGlvbg` / `ZGV2Qg:bGVnYWN5LW1pZ3JhdGlvbg`, snapA
+payload hash
+`d7304a3a73d48d1417661e0cd3b1f696bf42ae6b065aa918ea99b1ebb86b865c`, snapB
+`0fb29d631c8257861f60371576fc458dbd626817c135b888d508027a90e6dcbc`, fixed
+clock 1_750_000_000_000) are preserved at
+`.worktrees/.the-usual-logs/naming-persistence-sweep/artifacts/a8a9-harness/`
+and can be regenerated by importing the real `store.ts` via `npx tsx`
+(v4.23.5 available).
 
 - [ ] **Step 2: Write the failing tests** (inline `#[cfg(test)]`):
 
@@ -1893,6 +2050,24 @@ fn record_validation_rejects_duplicate_tab_keys_and_pane_cap() { /* two records 
 fn record_validation_requires_closed_at_on_closed_records() { /* status closed without closedAt -> Err */ }
 #[test]
 fn agent_chat_pane_kind_migrates_to_fresh_agent() { /* record with pane kind "agent-chat" -> normalize -> kind "fresh-agent" */ }
+#[test]
+fn divergent_order_map_keys_roundtrip_self_consistently_in_byte_order() {
+    // Load the divergent-map-keys fixture from Step 1 (mixed-case base64url
+    // snapshot keys; tabKeys `<uuid>:--0MNzJnmn-oNjHjMXnPf` vs
+    // `<uuid>:_fuUJwgE1XOONeyzvyZMk`). Assert canonical_stringify orders the
+    // sibling keys in BYTE order ('-' 0x2D < 'A-Z' < '_' 0x5F < 'a-z') and
+    // that re-parsing the canonical output and re-stringifying it is a fixed
+    // point (Rust's self-consistent write/read roundtrip). Cross-impl hash
+    // equality is deliberately NOT asserted here (validator-A2, ledger A2-R1).
+}
+#[test]
+fn adversarial_payload_keys_pin_rust_byte_order_canonical_output() {
+    // Cross-impl hash compatibility is NOT claimed for such keys — Node's
+    // ICU localeCompare orders them differently (known divergence class,
+    // ledger A2-R1); this pins Rust's deterministic byte-order output only.
+    let v = serde_json::json!({"Zebra": 1, "a-b": 1, "a_b": 1, "é": 1});
+    assert_eq!(canonical_stringify(&v), "{\"Zebra\":1,\"a-b\":1,\"a_b\":1,\"é\":1}");
+}
 ```
 
 Write the elided test bodies in full following the shapes above.
@@ -1944,7 +2119,7 @@ git commit -m "feat(ws): tabs registry durable-store model — caps, hashes, TTL
     - `pub fn commit(&mut self, next: CompactState, now_ms: i64) -> std::io::Result<()>` — validates caps (as `io::Error` on violation), writes changed objects, publishes the manifest atomically, swaps in-memory state ONLY after publish, then best-effort clears `v1/tmp/`.
   - `pub(crate) fn write_object(root: &std::path::Path, value: &serde_json::Value, max_bytes: usize) -> std::io::Result<ObjectRef>`
   - `#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = "camelCase")] pub struct ObjectRef { pub path: String, pub sha256: String, pub bytes: u64 }`
-  - Manifest types `ManifestV1` / `ManifestSettings` (serde camelCase; schema in the Task 8 preamble table; `version: 1` literal enforced on load; `settings.openSnapshotTtlMinutes` must equal 30 and `deviceDisplayTtlDays` must equal 7 on load — Node `z.literal`s, `store.ts:116-119`).
+  - Manifest types `ManifestV1` / `ManifestSettings` (serde camelCase; schema in the Task 8 preamble table; `version: 1` literal enforced on load; `settings.openSnapshotTtlMinutes` must equal 30 and `deviceDisplayTtlDays` must equal 7 on load — the ENFORCING Node `z.literal`s are `store.ts:219-223` (`:220-221`); `store.ts:116-119` is only the TS type, not the validator — validator-A8-A9).
 
 Behavioral contract (each clause maps to a Node cite):
 1. `open()`: `mkdir -p v1/objects v1/tmp`; if `v1/manifest.json` exists → load;
@@ -1979,7 +2154,10 @@ Behavioral contract (each clause maps to a Node cite):
 5. `commit` (`store.ts:1062-1083`): validate caps → write the four component
    objects (reuse previous `ObjectRef` when the component is structurally
    unchanged — compare `canonical_stringify` output against the cached
-   previous canonical string) → build `ManifestV1 { manifest_revision: prev+1,
+   previous canonical string; Node's component reuse is object identity +
+   content-addressed dedupe, and this canonical-string comparison is
+   observably equivalent — keep it, validator-A8-A9) → build
+   `ManifestV1 { manifest_revision: prev+1,
    committed_at: now, ... }` → publish via
    `atomic_write_durable(v1/manifest.json, v1/manifest.json.tmp, bytes)` →
    swap `self.state`/`self.manifest_revision` → clear `v1/tmp/*` best-effort
@@ -2069,7 +2247,16 @@ Node contract (`store.ts:853-949`):
    record's `deviceLabel` rewritten to the group's first label (or deviceId)
    and `clientInstanceId` set to `"legacy-migration"`; both payload hashes set
    to the open-records hash; a matching watermark written per device.
-6. `apply_queued_maintenance` + `validate_state_caps` before returning.
+   Migration also enforces the snapshot-refs cap INSIDE this grouping loop
+   (store.ts:912-914; hard error with a migration-specific message — same
+   error class).
+6. Migration ALSO populates `devices_by_id` (validator-A8-A9): one entry per
+   device, `last_seen_at = migration_started_at`, and `device_label` = the
+   LAST open record's label for that device (overwritten per record;
+   store.ts:904-908) — which can DIFFER from the snapshot's first-label
+   rewrite in clause 5 (golden proof: `devices.devB.deviceLabel ==
+   "Device B RENAMED"` while `snapB.deviceLabel == "Device B"`).
+7. `apply_queued_maintenance` + `validate_state_caps` before returning.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -2078,11 +2265,19 @@ Node contract (`store.ts:853-949`):
 fn migrates_legacy_jsonl_lww_per_tab_key_and_archives_after_publish() {
     // Write a legacy file: 3 lines for tabKey "a" (updatedAt 1,3,2 -> winner updatedAt 3),
     // 1 malformed JSON line, 1 schema-invalid line, 1 closed record within retention,
-    // 1 closed record older than retention. Two deviceIds.
+    // 1 closed record older than retention. Two deviceIds; give devB TWO open
+    // records whose labels differ ("Device B" then "Device B RENAMED").
     // open() -> state has: per-device synthetic snapshots (clientInstanceId
     // "legacy-migration", revision 1), winner record only for "a",
     // in-retention tombstone only; watermarks written; legacy file renamed
     // to tabs-registry.jsonl.migrated-*; v1/manifest.json manifestRevision == 1.
+    // devices_by_id (contract clause 6, validator-A8-A9): one entry per
+    // device, last_seen_at == migration_started_at, and LAST-label-wins:
+    // devices["devB"].device_label == "Device B RENAMED" while the synthetic
+    // snapshot's records carry the FIRST label rewrite ("Device B").
+    // Golden Node outputs for exactly this shape live at
+    // .worktrees/.the-usual-logs/naming-persistence-sweep/artifacts/a8a9-harness/
+    // (see Task 8 Step 1; regenerate with `npx tsx` against the real store.ts).
 }
 #[test]
 fn oversized_legacy_line_is_a_hard_error() { /* one 300 KiB line -> open() Err(Corrupt) */ }
@@ -2165,10 +2360,11 @@ Semantics to implement (the AUTO-15 heart; every clause has a Node cite):
    list filtered by the 7-day display TTL (this also replaces the
    `diagnostic_counts`-only cutoff).
 8. **WS handlers** (`terminal.rs`): `handle_tabs_query` reads
-   `closedTabRetentionDays` from the envelope — FIRST check the Zod schema for
-   `tabs.sync.query` in `shared/ws-protocol.ts` (read-only!): if the field is
-   required there, mirror required (invalid → `tabs_error_frame`); if
-   optional, default to 30. `handle_tabs_retire` currently runs blocking work
+   `closedTabRetentionDays` from the envelope. The `tabs.sync.query` schema
+   lives in `server/ws-handler.ts:452` (NOT `shared/ws-protocol.ts`):
+   `closedTabRetentionDays` is REQUIRED there (int 1..=30). Mirror it as
+   required — missing or invalid → `tabs_error_frame`.
+   `handle_tabs_retire` currently runs blocking work
    on the async runtime (`terminal.rs:2030-2043` — flagged in the module doc);
    route the registry call through `tokio::task::spawn_blocking` like
    `process_tabs_push` does (`terminal.rs:1772`). The REST retire handler
@@ -2227,6 +2423,21 @@ fn durable_registry_survives_reconstruction() {
 }
 #[test]
 fn commit_failure_leaves_memory_state_unchanged() { /* make the store root read-only (chmod 0o555) after open; push -> Err; query shows pre-push state */ }
+#[test]
+fn concurrent_distinct_client_pushes_both_survive_reopen() {
+    // REQUIRED (validator-A6): durable-backed registry; two threads push for
+    // DIFFERENT clients concurrently, in a loop (e.g. 20 rounds); every push
+    // accepted; drop the registry; reopen from the same store root; BOTH
+    // clients' records present. Under the old (falsified) discipline the
+    // second commit could publish a manifest missing the first push's
+    // accepted records (disk AND memory).
+}
+#[test]
+fn push_retire_same_client_race_never_resurrects() {
+    // REQUIRED (validator-A6): race push(rev N) against retire(rev N) in a
+    // loop; after EACH round assert the invariant: no retired snapshot is
+    // resurrected and the persisted watermark is monotone non-decreasing.
+}
 ```
 
 Update the two existing call sites of `query()` in tests and the handlers for
@@ -2234,11 +2445,23 @@ the new signature.
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p freshell-ws tabs 2>&1 | tail -10`.
 
-- [ ] **Step 3: Implement** clauses 1–7 in `tabs.rs`, keeping the existing
-"drop the mutex before FS IO" discipline (`tabs.rs:233`): compute the next
-in-memory state and the next `CompactState` while holding the lock, release
-it, take the durable-store mutex (`Arc<std::sync::Mutex<DurableTabsStore>>`),
-commit, then re-take the registry lock and swap. On commit error, do not swap.
+- [ ] **Step 3: Implement** clauses 1–7 in `tabs.rs`. Lock discipline
+(REWRITTEN — validator-A6 falsified the previous one): in durable-backed
+mode, EVERY mutation (push and retire, INCLUDING the idempotent-accept hash
+fast path) executes under the durable-store mutex
+(`Arc<std::sync::Mutex<DurableTabsStore>>`) held across the ENTIRE
+read → derive → commit → swap sequence — the store mutex IS the mutation
+lock. Node parity: `enqueueMutation` (store.ts:1085-1089) serializes the
+whole read-clone-mutate-commit closure, not just the commit.
+`std::sync::Mutex` is fine because all mutators already run in
+`spawn_blocking`. The registry inner lock stays IO-free: take it briefly
+inside the mutation section to read the current state, and again at the end
+to swap — readers never block on FS IO (this preserves the actual intent of
+the `tabs.rs:233` discipline). On commit error, do not swap. Why the old
+"derive under the registry lock, release, commit, re-lock, swap" discipline
+was wrong: two pushes could both derive from the same predecessor state, and
+the second commit published a manifest missing the first's accepted records
+(disk and memory) — see the validator-A6 interleaving.
 
 - [ ] **Step 4: Implement clauses 8–9** (handlers + boot). Update
 `crates/freshell-ws/tests/` WsState constructions if the type changed (it
@@ -2546,8 +2769,9 @@ git commit -m "feat(freshagent): pane routes + authoritative layout snapshot on 
 ### Task 16: `PATCH /api/panes/:id` — real rename with cascade (kills D10)
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/lib.rs` (`rename_pane` `:1395-1428`; `FreshAgentState` gains `pub(crate) rename_persistence: Option<std::sync::Arc<dyn RenamePersistence>>` and `pub(crate) terminals_revision: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>` — the `Option`-until-wired convention `amplifier_locator` already uses, `lib.rs:167-172`)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (`rename_pane` `:1395-1428`; `FreshAgentState` gains `pub(crate) rename_persistence: Option<std::sync::Arc<dyn RenamePersistence>>` and `pub(crate) terminals_revision: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>` — the `Option`-until-wired convention `amplifier_locator` already uses, `lib.rs:167-172`; if the ALREADY-INJECTED `freshell_terminal::TerminalRegistry` (`lib.rs:111`, `:362`) does not yet expose provider/resume_session_id, add an accessor there — validator-A10)
 - Modify: `crates/freshell-server/src/main.rs` (implement + inject the trait; share the existing `terminals_revision` counter)
+- Modify: `port/oracle/DEVIATIONS.md` (sessionRef-superset note — see behavior clause 4)
 
 **Interfaces:**
 - Produces in `freshell-freshagent`:
@@ -2567,7 +2791,33 @@ Node behavior to match (`router.ts:1396-1427` + `persistSyncableTerminalRename :
 1. blank name → 400 `name required`; > 500 chars → 400 `name must be 500 characters or fewer` (already present).
 2. `pane_snapshot = layout.get_pane_snapshot(pane_id)` BEFORE the rename.
 3. `outcome = layout.rename_pane(pane_id, name)`; no snapshot/pane → 200 `ok({message})` (Node's `{message:'pane not found'|'no layout snapshot'}` at 200 replaces today's unconditional fake ack).
-4. On success: best-effort cascade — resolve mode from `pane_content.mode` → `terminal_registry.get(tid).mode` equivalent; if the mode ∈ `SYNCABLE_TERMINAL_MODES` and a `terminalId` exists: `patch_terminal_override_title` → `registry.update_title` → (provider+sessionId known from paneContent `sessionRef`/`resumeSessionId`) `patch_session_override_title("provider:sessionId")` — all failures swallowed with a `tracing::warn!`; then broadcast `terminals.changed` (bump the shared revision + send, same shape as `terminals.rs:1057-1061`).
+4. On success: best-effort cascade — resolve mode from `pane_content.mode` → `terminal_registry.get(tid).mode` equivalent; if the mode ∈ `SYNCABLE_TERMINAL_MODES` and a `terminalId` exists: `patch_terminal_override_title` → `registry.update_title` → resolve provider+sessionId following Node's preference order (`router.ts:649-693`, esp. `:658-676`; validator-A10):
+   1. **Terminal metadata first** — the session binding learned
+      post-association, read via the ALREADY-INJECTED
+      `freshell_terminal::TerminalRegistry` in `FreshAgentState`
+      (`crates/freshell-freshagent/src/lib.rs:111`, `:362`); add an accessor
+      there if provider/resume_session_id is not yet exposed.
+   2. **Fallback:** paneContent `resumeSessionId`.
+
+   Rationale for registry-first: agent-api-created claude tabs get
+   server-attached paneContent with NO session fields (`router.ts:762-773`);
+   association populates terminal metadata server-side with zero client
+   involvement (`index.ts:817-833`;
+   `session-association-broadcast.ts:202-206`); only the SPA writes
+   `sessionRef` back (`App.tsx:968-1006` → `panesSlice.ts:1705-1708`, 200 ms
+   debounced) and the SPA reconcile CLEARS `resumeSessionId`
+   (`panesSlice.ts:1708`) — with no SPA connected, a paneContent-only
+   resolution silently no-ops where Node cascades. This plan ALSO reads
+   `paneContent.sessionRef` as an EXPLICIT intentional superset (Node never
+   reads sessionRef: `router.ts:655`/`:676`) — since it can cascade where
+   Node would not, ledger a `port/oracle/DEVIATIONS.md` note per the plan's
+   port-equivalence discipline. (A10.1: if the Rust server today lacks a
+   client-independent association path, the no-SPA case is currently
+   unreachable in Rust — the seam still goes in NOW so the gap does not
+   silently reopen when association parity lands.) Then
+   `patch_session_override_title("provider:sessionId")` — all failures
+   swallowed with a `tracing::warn!`; then broadcast `terminals.changed`
+   (bump the shared revision + send, same shape as `terminals.rs:1057-1061`).
 5. `tab_renamed = layout.list_panes(tab_id).len() == 1`; broadcast `ui.command{pane.rename,{tabId,paneId,title}}`; respond `ok({tabId, paneId, tabRenamed}, ...)`.
 
 - [ ] **Step 1: Write the failing tests** (this file's oneshot helpers):
@@ -2578,17 +2828,23 @@ single-pane tab + store title changed); `rename_pane_unknown_pane_is_200_with_me
 recording fake `RenamePersistence`; seed a terminal-pane content with
 `mode:"claude"` + a real registry terminal + sessionRef; assert both fake
 methods called with the right args, registry title updated, and a
-`terminals.changed` frame); `rename_pane_shell_pane_never_cascades`.
+`terminals.changed` frame); `rename_pane_shell_pane_never_cascades`;
+`rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields`
+(validator-A10: agent-api-created claude pane — paneContent carries NO
+`sessionRef`/`resumeSessionId`; seed the session binding ONLY in the terminal
+registry, simulating post-association metadata; assert the rename still
+cascades to the session override via the registry-first resolution).
 
 - [ ] **Step 2: Run to verify failure.** **Step 3: Implement** (rewrite
-`rename_pane`; delete its "validating no-op" doc block `lib.rs:1366-1394`).
+`rename_pane`; delete its "validating no-op" doc block `lib.rs:1366-1394`;
+add the sessionRef-superset DEVIATIONS.md note from behavior clause 4).
 **Step 4:** `cargo test -p freshell-freshagent 2>&1 | tail -5` then
 `cargo test --workspace --exclude freshell-tauri 2>&1 | tail -5` → green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/freshell-freshagent/ crates/freshell-server/src/main.rs
+git add crates/freshell-freshagent/ crates/freshell-server/src/main.rs port/oracle/DEVIATIONS.md
 git commit -m "feat(freshagent): real PATCH /api/panes/:id — store rename, ui.command broadcast, syncable-terminal cascade (D10)"
 ```
 
@@ -2629,7 +2885,13 @@ pub fn resolve_git_checkout_root(cwd: &str) -> Option<String>;
 pub struct BranchAndDirty { pub branch: Option<String>, pub is_dirty: Option<bool> }
 /// BLOCKING (spawns `git` twice) — call via tokio spawn_blocking.
 /// `git -C <checkoutRoot> symbolic-ref --short HEAD` -> fallback
-/// `rev-parse --abbrev-ref HEAD`; `git -C <checkoutRoot> status --porcelain`.
+/// `rev-parse --abbrev-ref HEAD`;
+/// `git -C <checkoutRoot> --no-optional-locks status --porcelain`.
+/// EVERY spawned git command sets `GIT_OPTIONAL_LOCKS=0` (env) or passes
+/// `--no-optional-locks` (validator-A7): Node uses plain
+/// `git status --porcelain` (server/coding-cli/utils.ts:102) but is
+/// event-driven; the Task 18 throttled polling without this would
+/// continually rewrite .git/index.
 /// "no branch AND clean" -> Default() (is_dirty stays None — utils.ts:105-107);
 /// any error -> Default(). NOT cached (Node parity).
 pub fn resolve_git_branch_and_dirty(cwd: &str) -> BranchAndDirty;
@@ -2782,16 +3044,34 @@ non-empty array whose row carries the created terminal's `terminalId` and a
 - [ ] **Step 2: Run to verify failure** — `cargo test -p freshell-ws terminal_meta 2>&1 | tail -5` and the two extended suites.
 
 - [ ] **Step 3: Implement** registry + wiring per the Interfaces block. The
-auto-title sweep hook (Node's `applySessionMetadata` analog): in
-`run_auto_title_pass`, for each `matching` identity, spawn (throttled by
-`commit_if_changed`'s suppression — broadcast only when content changed):
-build the record from the identity + session (`cwd` =
+auto-title sweep hook (Node's `applySessionMetadata` analog) is REDESIGNED
+after validator-A7 falsified per-tick trigger equivalence: enrichment runs
+per UNIQUE normalized cwd (NOT per terminal), change-gated — run git for a
+cwd only when (a) that cwd's terminal-set/cwd signature changed since its
+last enrichment, or (b) its last git run is >= 30 s old (throttled refresh so
+dirty-status drift still surfaces). Keep `spawn_blocking` for the git calls.
+Then, per `matching` identity (the cwd-scoped
+`find_all_by_session(provider, session_id, session.cwd)` fan-out from
+Task 5): build the record from the identity + session (`cwd` =
 `select_more_specific_cwd(identity.cwd, session.cwd)` — port the "more path
 segments wins" chooser from `terminal-metadata-service.ts:63-76`), fold the
 parsed session `git_branch` (`freshell-sessions/src/meta.rs:58`) as fallback
-under the live git result, `enrich_from_cwd`, `commit_if_changed`, broadcast.
+under the live git result, reuse that cwd's cached enrichment result,
+`commit_if_changed`, broadcast (only when content changed).
 Add field `terminal_meta: freshell_ws::terminal_meta::TerminalMetaRegistry`
 to `AutoTitleSweepState`.
+
+Record the trigger divergence honestly (validator-A7): Node runs its
+metadata pass ONLY on indexer update events (`server/index.ts:873` onUpdate;
+debounce 2 s, `session-indexer.ts:436`) — an idle Node spawns ZERO git
+processes — and its pass is per-terminal and uncached (`utils.ts:93-116`,
+with only repo roots cached `:24-26`). The Rust design keeps a throttled
+per-cwd poll instead, with `GIT_OPTIONAL_LOCKS=0` / `--no-optional-locks` on
+every spawned git (a 0.5 Hz poll without it would continually rewrite
+`.git/index`). Measured local cost: 0.01 s per
+`git --no-optional-locks status --porcelain` on this repo (validator-A7).
+Residual: /mnt/c DrvFs cwds are 10-100x slower; the >= 30 s throttle bounds
+the worst case to delayed badges.
 
 - [ ] **Step 4: Run** `cargo test --workspace --exclude freshell-tauri 2>&1 | tail -5`
 (update the 12 `WsState` literal constructions in `crates/freshell-ws/tests/`
@@ -2804,39 +3084,59 @@ git add crates/freshell-ws/ crates/freshell-server/
 git commit -m "feat(ws): terminal metadata registry + git-enriched terminal.meta.updated/inventory (closes DEV-0008 gap)"
 ```
 
-- [ ] **Step 6: Update the DEV-0008 ledger entry.** In
-`port/oracle/DEVIATIONS.md`, append to the DEV-0008 entry (do NOT rewrite its
-history): a dated `closure_update` line stating the `terminal.meta.updated`
-producer + `TerminalMetadataService` equivalent is now ported (this plan,
-commit sha), the user-facing disclosure sentence no longer applies, and the
-pinning coverage is `crates/freshell-ws/src/terminal_meta.rs` tests +
-`tests/session_identity_frames.rs` + the Task 23 Playwright spec. Commit:
+- [ ] **Step 6: Update the ledger.** In `port/oracle/DEVIATIONS.md`:
+1. Append to the DEV-0008 entry (do NOT rewrite its history): a dated
+   `closure_update` line stating the `terminal.meta.updated` producer +
+   `TerminalMetadataService` equivalent is now ported (this plan, commit
+   sha), the user-facing disclosure sentence no longer applies, and the
+   pinning coverage is `crates/freshell-ws/src/terminal_meta.rs` tests +
+   `tests/session_identity_frames.rs` + the Task 23 Playwright spec.
+2. Add a NEW entry for the KEPT git-enrichment trigger divergence
+   (validator-A7): throttled per-unique-cwd polling + optional-locks
+   suppression vs Node's indexer-event-driven, per-terminal, uncached pass
+   (`server/index.ts:873`; `session-indexer.ts:436`; `utils.ts:93-116`,
+   `:24-26`). Include the fingerprint (trigger schedule + `git
+   --no-optional-locks` invocations), the pinning test (Task 18/Task 23 git
+   badge coverage), the measured 0.01 s local cost and the /mnt/c DrvFs
+   residual, and antagonist adjudication — NEVER self-approved. Task 24
+   references this entry.
+
+Commit:
 
 ```bash
 git add port/oracle/DEVIATIONS.md
-git commit -m "docs(deviations): record DEV-0008 closure — terminal metadata push subsystem ported"
+git commit -m "docs(deviations): DEV-0008 closure + git-enrichment trigger-divergence entry"
 ```
 
 ---
 
 # PART E — Sidebar ↔ pane title convergence (Item 6)
 
-Server-side convergence is now structural: the Task 5 sweep heals any
-divergence for live coding-CLI terminals within one tick (canonical override →
-`registry.update_title` + `terminal.title.updated`), exactly like Node. The
-remaining desync paths are CLIENT bugs that exist on BOTH backends (verified
-by the audit in `.the-usual-logs/naming-persistence-sweep/reports/client-title-sync.md`,
-paths D3/D4/D7). The task spec explicitly authorizes fixing them and requires
-DEVIATIONS ledgering. These are the ONLY `src/` changes in this plan.
+The Task 5 sweep heals divergence for LIVE syncable coding-CLI terminals
+within one tick (canonical override → `registry.update_title` +
+`terminal.title.updated`), exactly like Node — a BACKSTOP healer, not a
+proven universal property. Acceptance #6 (convergence) is evidenced by: a
+closed static writer inventory (all 12 `titleOverride` call sites audited —
+validator-A5), the fixed client paths below, the title-sync-convergence e2e
+rename journeys (Task 21, both projects), and the server sweep as backstop
+for live syncable terminals; the accepted residual is ledgered as A5-R1. The
+client desync paths are bugs that exist on BOTH backends: D3/D4/D7 (verified
+by the audit in
+`.the-usual-logs/naming-persistence-sweep/reports/client-title-sync.md`)
+plus two paths validator-A5 found — the exited-terminal pane-rename drop
+(D8) and the OverviewView inline-rename blind spot. The task spec explicitly
+authorizes fixing them and requires DEVIATIONS ledgering. These are the ONLY
+`src/` changes in this plan.
 
-### Task 19: client convergence fixes (D3, D4, D7) + ledger entries
+### Task 19: client convergence fixes (D3, D4, D7, D8, Overview) + ledger entries
 
 **Files:**
 - Modify: `src/store/panesSlice.ts` (new reducer `updatePaneTitleBySessionRef`)
 - Modify: `src/store/paneTitleSync.ts` (`syncPaneTitleByTerminalId` gains optional `setByUser`)
-- Modify: `src/store/titleSync.ts` (new exported helper `applySessionRenameCascade`)
+- Modify: `src/store/titleSync.ts` (new exported helper `applySessionRenameCascade`; exited-terminal rename fallback — the `:35` bail is replaced with a `sessionRef` resolution, validator-A5)
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx` (`renameSession` `:470-491` uses the helper; `renameTerminal` `:700-729` also updates the pane title)
 - Modify: `src/components/HistoryView.tsx:101-107` (switch to the shared helper)
+- Modify: `src/components/OverviewView.tsx` (`:167-177`, `:224-230` — TerminalCard inline rename re-routed through the shared rename helper, validator-A5)
 - Modify: `port/oracle/DEVIATIONS.md` (EDEV entry)
 - Test: `test/unit/client/store/paneSessionTitleSync.test.ts` (new)
 
@@ -2857,6 +3157,19 @@ DEVIATIONS ledgering. These are the ONLY `src/` changes in this plan.
     // 2. always: dispatch(updatePaneTitleBySessionRef({provider, sessionId, title, setByUser: true}))
     //    (covers SDK/fresh-agent panes that can never cascade server-side — D4)
     ```
+  - `titleSync.ts` exited-terminal fix (D8, validator-A5): `titleSync.ts:35`
+    currently bails when the coding-CLI terminal has exited
+    (`TerminalView.tsx:3841`), so the user's pane rename intent never persists
+    and the sweep cannot heal it (it only sees live terminals). Fix: when the
+    terminal is gone, fall back to the pane's `sessionRef` to resolve
+    `provider:sessionId` and PATCH the session override anyway.
+  - `OverviewView.tsx` fix (validator-A5): the TerminalCard inline rename
+    (`:167-177`, `:224-230`) PATCHes the terminal/session but never writes
+    `paneTitles` — and the sweep is structurally blind post-PATCH
+    (registry == override → no mismatch → no `terminal.title.updated` push).
+    Fix: re-route it through the shared rename helper the other surfaces use
+    (`applySessionRenameCascade` / `updatePaneTitleByTerminalId`) so the pane
+    mirror updates too.
 - Policy (Scope Decision 3): these are USER renames → `setByUser: true`, so
   they land even on previously user-renamed panes and stay sticky.
 
@@ -2919,6 +3232,24 @@ describe('applySessionRenameCascade', () => {
 })
 ```
 
+Add two more test groups to the same file (write them in full, same harness;
+validator-A5):
+
+```ts
+// describe('exited-terminal pane rename (D8)'): seed a terminal pane whose
+//   coding-CLI terminal has EXITED (no live terminalId in the registry mock)
+//   but whose content carries sessionRef {provider:'claude', sessionId:'s1'};
+//   invoke the titleSync pane-rename path (the code that today bails at
+//   titleSync.ts:35) and assert the session-override PATCH is still issued
+//   (api mock called with claude:s1 + titleOverride) — the rename intent
+//   persists even though the terminal is gone.
+// describe('OverviewView TerminalCard rename'): drive the extracted rename
+//   handler OverviewView now shares with the other surfaces and assert it
+//   dispatches the pane-title mirror (updatePaneTitleByTerminalId or
+//   updatePaneTitleBySessionRef with setByUser: true) IN ADDITION to the
+//   terminal/session PATCH — pinning that Overview renames update paneTitles.
+```
+
 - [ ] **Step 2: Run to verify failure**
 
 Run: `npm run test:vitest -- run test/unit/client/store/paneSessionTitleSync.test.ts 2>&1 | tail -10`
@@ -2954,27 +3285,45 @@ npm run test:vitest -- run test/unit/client/store/paneSessionTitleSync.test.ts t
 3. `HistoryView.tsx:104-106`: replace the bare `syncPaneTitleByTerminalId`
    dispatch with the same `applySessionRenameCascade` helper (gives history
    renames the D4 sessionRef mirror too).
+4. `titleSync.ts:35` (D8, validator-A5): replace the exited-terminal bail
+   with a fallback that resolves the pane's `sessionRef`
+   (provider+sessionId) and PATCHes the session override even when the
+   coding-CLI terminal is gone (`TerminalView.tsx:3841` is where the exited
+   state originates) — the user's rename intent must persist; the sweep
+   cannot heal exited terminals.
+5. `OverviewView.tsx:167-177, :224-230` (validator-A5): re-route the
+   TerminalCard inline rename through the shared rename helper so the pane
+   mirror (`paneTitles`) updates alongside the terminal/session PATCH — the
+   sweep is structurally blind post-PATCH (registry == override → no
+   mismatch → no `terminal.title.updated` push), so the client MUST do the
+   mirroring itself.
 Typecheck: `npm run typecheck:client 2>&1 | tail -3` → clean.
 
 - [ ] **Step 6: Ledger the client change.** Append to the EDEV section of
 `port/oracle/DEVIATIONS.md`:
 
 ```markdown
-### EDEV-08 — client title-convergence fixes (sidebar/history/terminal-menu renames now mirror into pane titles)
-- what_differs: `src/store/titleSync.ts` gains `applySessionRenameCascade`; `src/store/panesSlice.ts`
+### EDEV-08 — client title-convergence fixes (sidebar/history/terminal-menu/Overview renames now mirror into pane titles; exited-terminal renames persist)
+- what_differs: `src/store/titleSync.ts` gains `applySessionRenameCascade` and replaces the
+  exited-terminal bail (titleSync.ts:35) with a `sessionRef` fallback PATCH; `src/store/panesSlice.ts`
   gains `updatePaneTitleBySessionRef`; `ContextMenuProvider.renameSession`/`renameTerminal` and
-  `HistoryView.renameSession` dispatch pane mirrors with `setByUser: true`. Applies identically to
-  BOTH backends (shared client).
+  `HistoryView.renameSession` dispatch pane mirrors with `setByUser: true`;
+  `src/components/OverviewView.tsx` TerminalCard inline rename is re-routed through the shared
+  rename helper so `paneTitles` updates too. Applies identically to BOTH backends (shared client).
 - why_intentional: explicit user directive in the naming-persistence-sweep task: "for the same
   underlying session/terminal, the sidebar item title and the pane title must never disagree";
-  the pre-fix client dropped `cascadedTerminalId` (ContextMenuProvider.tsx:483-487) and never
-  mirrored session renames into SDK panes — a defect on the original too (desync paths D3/D4/D7,
-  audit: .the-usual-logs report client-title-sync.md).
-- evidence: test/e2e-browser/specs/title-sync-convergence.spec.ts (both projects) + 
-  test/unit/client/store/paneSessionTitleSync.test.ts; commit <sha>.
-- user_impact: renaming a session from the sidebar/history/terminal menus now updates the open
-  pane header immediately on both servers; previously the pane kept the stale name until a
-  sidebar click.
+  the pre-fix client dropped `cascadedTerminalId` (ContextMenuProvider.tsx:483-487), never
+  mirrored session renames into SDK panes, silently dropped pane renames on exited coding-CLI
+  terminals (titleSync.ts:35 / TerminalView.tsx:3841), and left Overview renames invisible to
+  paneTitles while the sweep is structurally blind post-PATCH — defects on the original too
+  (desync paths D3/D4/D7 audit: .the-usual-logs report client-title-sync.md; D8 + Overview:
+  validator-A5).
+- evidence: test/e2e-browser/specs/title-sync-convergence.spec.ts (both projects, incl. the
+  Overview rename journey) + test/unit/client/store/paneSessionTitleSync.test.ts; commit <sha>.
+- user_impact: renaming a session from the sidebar/history/terminal menus or the Overview page
+  now updates the open pane header immediately on both servers, and renaming a pane whose
+  coding-CLI terminal already exited still persists; previously the pane kept the stale name
+  until a sidebar click (or the rename was silently lost).
 ```
 
 (Fill `<sha>` after committing. The purity note: this src/ diff is authorized
@@ -2985,8 +3334,9 @@ by the task spec; the e2e matrix spec is its pinning test.)
 ```bash
 git add src/store/panesSlice.ts src/store/titleSync.ts src/store/paneTitleSync.ts \
         src/components/context-menu/ContextMenuProvider.tsx src/components/HistoryView.tsx \
+        src/components/OverviewView.tsx \
         test/unit/client/store/paneSessionTitleSync.test.ts port/oracle/DEVIATIONS.md
-git commit -m "fix(client): converge sidebar/history/terminal-menu renames into pane titles (D3/D4/D7, EDEV-08)"
+git commit -m "fix(client): converge sidebar/history/terminal-menu/Overview renames into pane titles (D3/D4/D7/D8, EDEV-08)"
 ```
 
 ---
@@ -3141,6 +3491,13 @@ for the automation surface):
 //   run doubles as the regression control.
 // Test 4 "history-view rename converges the pane":
 //   open History, rename the session there, assert pane header converges.
+// Test 5 "Overview inline rename converges pane + sidebar (pins the
+//   OverviewView fix, validator-A5)":
+//   open the Overview page, inline-rename a TerminalCard (OverviewView.tsx
+//   editing affordance), assert the pane header AND the sidebar row converge.
+//   Pre-fix, the PATCH left paneTitles stale and the sweep was structurally
+//   blind post-PATCH (registry == override -> no mismatch -> no
+//   terminal.title.updated push).
 ```
 
 Register in `MATRIX_SPECS`. Run both projects:
@@ -3204,6 +3561,11 @@ checklist's validation wording):
 //  - stop server; delete one <home>/.freshell/tabs-registry/v1/objects/<sha>.json
 //  - start server -> boots, tabs query returns EMPTY, and a
 //    manifest.json.invalid-* archive exists (missing-object self-heal)
+//  - IMPORTANT (validator-A8-A9): after the missing-object archive, open()
+//    falls through to the LEGACY branch BEFORE empty (store.ts:692-709) —
+//    ensure no stray legacy <home>/.freshell/tabs-registry.jsonl coexists in
+//    the isolated home (or explicitly account for it) before asserting
+//    archive => empty
 //  - (Node-parity note recorded in the checklist: any OTHER corruption fails
 //    boot; the checklist's "only that record is quarantined" wording is
 //    superseded by Node's actual all-or-nothing behavior — see Task 24.)
@@ -3277,7 +3639,7 @@ git commit -m "test(e2e): automation tab/pane/layout parity + git branch/dirty b
 
 **Files:**
 - Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`
-- Modify: `port/oracle/DEVIATIONS.md` (only if any additional intentional divergence surfaced during Parts A–E; otherwise it already carries EDEV-08 + the DEV-0008 closure)
+- Modify: `port/oracle/DEVIATIONS.md` (only if any additional intentional divergence surfaced during Parts A–E; otherwise it already carries EDEV-08, the DEV-0008 closure, and the Task 18 git-enrichment trigger-divergence entry — verify the latter's antagonist adjudication is recorded, never self-approved)
 
 - [ ] **Step 1: Update checklist items with evidence** (respect the exact
 conventions at checklist `:8-22` and the evidence shape described in Global
@@ -3323,7 +3685,8 @@ git diff --name-only origin/feat/rust-tauri-port -- server/ shared/
 # EXPECTED: empty output. If not empty: STOP and revert those files.
 git diff --name-only origin/feat/rust-tauri-port -- src/
 # EXPECTED: exactly the Task 19 file set (panesSlice.ts, titleSync.ts,
-# paneTitleSync.ts, ContextMenuProvider.tsx, HistoryView.tsx). Anything else: revert it.
+# paneTitleSync.ts, ContextMenuProvider.tsx, HistoryView.tsx,
+# components/OverviewView.tsx). Anything else: revert it.
 ```
 
 - [ ] **Step 2: Full Rust gates**
@@ -3394,8 +3757,14 @@ declaring done.
 - Item 4 (automation REST tabs/panes/layout parity): Tasks 12–16; e2e Task 23.
 - Item 5 (git enrichment → sidebar badges): Tasks 17–18; e2e Task 23.
 - Item 6 (sidebar↔pane always in sync, any-surface rename convergence, Node
-  defects fixed + ledgered): Tasks 5 (sweep healer), 6 (D11), 16 (D10), 19
-  (D3/D4/D7 + EDEV-08); e2e Task 21 (`title-sync-convergence`, both projects).
+  defects fixed + ledgered): Tasks 5 (sweep backstop healer), 6 (D11), 16
+  (D10), 19 (D3/D4/D7 + exited-terminal D8 + OverviewView + EDEV-08); e2e
+  Task 21 (`title-sync-convergence`, both projects, incl. the Overview rename
+  journey). Convergence is evidenced by the closed static writer inventory
+  (all 12 `titleOverride` call sites audited — validator-A5), the fixed
+  paths, the e2e rename journeys, and the server sweep as backstop for live
+  syncable terminals — NOT as a proven universal property (accepted residual
+  ledgered as A5-R1).
 - Minor cleanups: session-metadata read-join (Task 20); CFG-12 verification
   (Task 21 spec + Task 24 evidence); SESSION-01..04 verify-not-reimplement
   (Task 24 table).
@@ -3419,11 +3788,25 @@ file:line cites; no TBD/TODO/"handle edge cases"/"similar to Task N" remain.
 
 **3. Type consistency:** `AutoTitlePatch`/`SessionTerminal`/`TitleSyncPlan`
 (Task 1) are consumed with the same names in Task 5; `AiKeyCell`/
-`GeminiTransport`/`BoxFuture` (Task 2) in Tasks 5–7; `find_all_by_session`
-(Task 3) in Tasks 5–6 and 18; `TabsStoreCaps`/`CompactState`/`ObjectRef`
+`GeminiTransport`/`BoxFuture` (Task 2) in Tasks 5–7; the 3-arg
+`find_all_by_session(provider, session_id, cwd)` (Task 3, cwd-scoped per
+validator-A4-A3) is propagated through Tasks 5/6/18 — every call site and
+test snippet passes the session's cwd, no 2-arg form remains; the Task 16
+cascade resolves provider/sessionId through the registry-lookup seam (the
+already-injected `freshell_terminal::TerminalRegistry` accessor,
+validator-A10); `TabsStoreCaps`/`CompactState`/`ObjectRef`
 (Task 8) in Tasks 9–11; `LayoutStore`/`PaneNode`/`RenameOutcome`/`PaneRow`
 (Task 12) in Tasks 13–16; `RenamePersistence` defined and consumed in Task 16;
 `TerminalMetaRegistry`/`enrich_from_cwd` (Task 18) consume Task 17's helpers;
 `updatePaneTitleBySessionRef`/`applySessionRenameCascade` (Task 19) match
 their test imports. `query()`'s signature change (Task 11) is propagated to
 both WS handler call sites and the tests in the same task.
+
+**4. Load-bearing validation pass:** this plan was revised against the
+load-bearing-assumption validation ledger at
+`.worktrees/.the-usual-logs/naming-persistence-sweep/load-bearing-ledger.md`:
+A2/A3/A5/A6/A7/A10 were FALSIFIED and are planned around above (Scope
+Decision 5 + Task 8 fixtures; Task 3/5/18 cwd scoping; Task 19/21 extra
+convergence paths; Task 11 lock discipline; Task 17/18 git trigger redesign;
+Task 16 registry-first resolution); A2-R1 and A5-R1 are the accepted,
+ledgered residuals.
