@@ -26,7 +26,7 @@
 - **R2 — Balanced distribution:** Options are distributed with extras in the middle rows (center-out). An even row count with a single leftover balances the middle pair by taking one from the last row. Examples the user approved: 13 → 3-4-4-2 (not 4-4-4-1), 10 → 3-4-3 (not 4-4-2), 10 tall → 2-3-3-2. Rows never contain zero items; a dangling singleton last row is avoided when the base is ≥ 2.
 - **R3 — Fluid fit-to-pane sizing:** Tile size = `min(width − padding − gaps)/cols, (height − padding − gaps)/rows)` in container-query units (`cqw`/`cqh`), clamped 36–120px. Gap, padding, icon, and label scale relative to the tile. Icons/labels never overflow the pane.
 - **R4 — Preserve behavior:** Option ordering, keyboard shortcuts, arrow navigation, Escape cancel, fade-on-select, Windows shell variants, and extension options behave exactly as before.
-- **R5 — Evidence:** Pure-function unit tests for the layout math, component tests proving ResizeObserver-driven reflow and the fallback layout, updated existing row/responsive tests, docs mock updated, and the default-config unit suite + typecheck + lint green at the end.
+- **R5 — Evidence:** Pure-function unit tests for the layout math, component tests proving ResizeObserver-driven reflow and the fallback layout, updated existing row/responsive tests, a real-browser Playwright geometry spec for R3, docs mock updated, and the default-config unit suite + typecheck + lint green at the end.
 
 ---
 
@@ -55,7 +55,7 @@
 **Test cases:**
 - `chooseRowCount(13, 480, 400)` → 4; `chooseRowCount(13, 640, 300)` → 3; `chooseRowCount(13, 300, 500)` → 5.
 - `chooseRowCount(10, 480, 400)` → 3; `chooseRowCount(10, 300, 500)` → 4 (tie with 5 → smaller row count wins); `chooseRowCount(13, 0, 0)` → 4; `chooseRowCount(1, 100, 100)` → 1.
-- `distributeRows(13, 4)` → `[3,4,4,2]`; `(10, 4)` → `[2,3,3,2]`; `(10, 3)` → `[3,4,3]`; `(11, 4)` → `[3,3,3,2]`; `(12, 4)` → `[3,3,3,3]`; `(14, 4)` → `[3,4,4,3]`; `(15, 4)` → `[4,4,4,3]`; `(13, 5)` → `[2,3,3,3,2]`; `(7, 3)` → `[3,2,2]`; `(7, 4)` → `[2,2,2,1]`; `(9, 3)` → `[3,3,3]`; `(1, 1)` → `[1]`.
+- `distributeRows(13, 4)` → `[3,4,4,2]`; `(10, 4)` → `[2,3,3,2]`; `(10, 3)` → `[3,4,3]`; `(11, 4)` → `[3,3,3,2]`; `(12, 4)` → `[3,3,3,3]`; `(14, 4)` → `[3,4,4,3]`; `(15, 4)` → `[4,4,4,3]`; `(13, 5)` → `[2,3,3,3,2]`; `(7, 3)` → `[2,3,2]` (center-heavy, unlike the old top-heavy `[3,2,2]`); `(7, 4)` → `[2,2,2,1]`; `(9, 3)` → `[3,3,3]`; `(1, 1)` → `[1]`.
 - Property sweep: for `n` in 1..30 and `r` in 1..n, `distributeRows(n, r)` sums to `n` and every row ≥ 1.
 - `centerOutRowOrder(4)` → `[1,2,0,3]`; `(3)` → `[1,0,2]`; `(5)` → `[2,1,3,0,4]`; `(6)` → `[2,3,1,4,0,5]`.
 - `computePanePickerLayout(13, 480, 400)` → `{ rowSizes: [3,4,4,2], maxCols: 4 }`; `(10, 300, 500)` → `{ rowSizes: [2,3,3,2], maxCols: 3 }`.
@@ -109,11 +109,14 @@ git commit -m "feat(panes): add adaptive picker layout math library"
 - The root element:
   - gains class `pane-picker` and loses `@container` and `p-2 @[250px]:p-4 @[400px]:p-8`;
   - keeps `h-full w-full flex items-center justify-center`, the fade `transition-opacity`/`opacity-0` behavior, `focus:outline-none`, `role="toolbar"`, `aria-label="Pane type picker"`, and all `data-*` attributes;
-  - gets inline style `{ '--cols': layout.maxCols, '--rows': layout.rowSizes.length }`.
+  - gets inline style `{ '--cols': layout.maxCols, '--rows': layout.rowSizes.length } as React.CSSProperties` (the cast is required — the repo's React CSSProperties type rejects uncast custom-property keys; this matches the existing precedent).
 - Rows render from `layout.rowSizes` (top→bottom), each row a `div` with `data-testid="pane-picker-option-row"` and class `pane-picker-option-row`; buttons keep `data-testid`-independent classes and all event handlers, now with class `pane-picker-tile`.
+- **Preserve the global flattened index.** The current `buildBalancedOptionRows` assigns each option a global index (`cursor + offset`) that drives `buttonRefs`, `focusedIndex`/`hoveredIndex`, `showHint(index)`, and `handleArrowNav(e, index)`. When rendering rows from `layout.rowSizes` by slicing `options`, compute each option's index as `rowStart + offset` (a running `rowStart` accumulated from prior row sizes) and keep using that global index for all refs/focus/hints/nav — never a local per-row index, or cross-row arrow navigation and hint focus break.
 - Icon/label/hint sizing classes (`h-6 w-6 @[250px]:h-8...`, `text-xs @[400px]:text-sm`, `shortcut-hint ... -mt-1`) move into CSS rules in `src/index.css` driven by `--tile`.
-- Add to `src/index.css` (near the existing `@container` block, around line 85) a `/* Pane picker: balanced adaptive grid */` block defining `.pane-picker` (`container-type: size; --pad: 12px; --gap: clamp(6px, 2cqw, 18px); --tile: clamp(36px, min(calc((100cqw - 2*var(--pad) - (var(--cols) - 1)*var(--gap)) / var(--cols)), calc((100cqh - 2*var(--pad) - (var(--rows) - 1)*var(--gap)) / var(--rows))), 120px); padding: var(--pad);`), `.pane-picker-options` (flex column, `align-items:center; gap: var(--gap)`), `.pane-picker-option-row` (flex row, `justify-content:center; gap: var(--gap)`), `.pane-picker-tile` (`width/height: var(--tile); display:flex; flex-direction:column; align-items:center; justify-content:center; gap: calc(var(--tile)*0.1)`), `.pane-picker-tile svg` (`width/height: calc(var(--tile)*0.44)`), `.pane-picker-tile .pane-picker-tile-label` (`font-size: clamp(9px, calc(var(--tile)*0.15), 15px); max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap`), `.pane-picker-tile .pane-picker-tile-hint` (`font-size: clamp(8px, calc(var(--tile)*0.11), 12px)`).
-  - CSS container-unit rule for this block: `--pad` is a plain length (12px) so it behaves identically on the root's own `padding` and inside the tile calc. `--gap` and `--tile` contain `cqw`/`cqh` and MUST only be *used* on descendant elements (rows/tiles), never on the `.pane-picker` root's own properties — a query container is not its own ancestor, so cq units used on the root itself would resolve against an outer container. This keeps every cq resolution anchored to the `.pane-picker` container.
+- Add to `src/index.css` (near the existing `@container` block, around line 85) a `/* Pane picker: balanced adaptive grid */` block defining `.pane-picker` (`container-type: size; --pad: clamp(8px, 3cqw, 28px); --gap: clamp(6px, 2cqw, 18px); --tile: clamp(36px, min(calc((100cqw - 2*var(--pad) - (var(--cols) - 1)*var(--gap)) / var(--cols)), calc((100cqh - 2*var(--pad) - (var(--rows) - 1)*var(--gap)) / var(--rows))), 120px);` — note: NO `padding` property on the root; the tile calc reserves the margin and the root's flex centering places the grid inside it), `.pane-picker-options` (flex column, `align-items:center; gap: var(--gap)`), `.pane-picker-option-row` (flex row, `justify-content:center; gap: var(--gap)`), `.pane-picker-tile` (`width/height: var(--tile); display:flex; flex-direction:column; align-items:center; justify-content:center; gap: calc(var(--tile)*0.1)`), `.pane-picker-tile svg` (`width/height: calc(var(--tile)*0.44)`), `.pane-picker-tile .pane-picker-tile-label` (`font-size: clamp(9px, calc(var(--tile)*0.15), 15px); max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap`), `.pane-picker-tile .pane-picker-tile-hint` (`font-size: clamp(8px, calc(var(--tile)*0.11), 12px)`).
+  - CSS container-unit rules for this block (empirically validated in Chromium — see load-bearing reports/load-bearing-validator-cq.md):
+    - `cqw`/`cqh` resolve against the container's padding box (no border here), so `100cqw` is the picker's full width and the calc's `2*var(--pad)` subtraction is exactly the reserved margin — it is NOT double-counting padding. Do not "simplify" the calc.
+    - `--pad`, `--gap`, and `--tile` contain cq units and MUST only be *used* on descendant elements (rows/tiles), never on the `.pane-picker` root's own properties — a query container is not its own ancestor, so cq units used on the root itself would resolve against an outer container. This is why the root carries no `padding` property: the margin comes entirely from the tile calc + centering.
 - Keep the existing label `<span className="pane-picker-tile-label font-medium">` and hint `<span className="shortcut-hint pane-picker-tile-hint transition-opacity duration-150 ...">` (the `.shortcut-hint` class is asserted by tests).
 
 **Files:**
@@ -126,9 +129,10 @@ git commit -m "feat(panes): add adaptive picker layout math library"
 - Produces: none new (internal layout only).
 
 **Test cases (component, in `PanePicker.test.tsx`):**
-- Existing "balanced icon layout" test (7 options, no explicit size) still yields rows `[3,2,2]` via the square-aspect fallback.
-- After stubbing a controllable `ResizeObserver` and setting the container to 480×400, 7 options reflow to rows `[3,2,2]`; at 640×300 → `[4,3]`; at 300×500 → `[2,2,2,1]`.
+- Existing "balanced icon layout" test (7 options, no explicit size) still yields rows `[2,3,2]` via the square-aspect fallback (changed from the old top-heavy `[3,2,2]`).
+- After stubbing a controllable `ResizeObserver` and setting the container to 480×400, 7 options reflow to rows `[2,3,2]`; at 640×300 → `[4,3]`; at 300×500 → `[2,2,2,1]`.
 - With a store producing 13 options (fresh agents incl. Kilroy flag, Claude/Codex/OpenCode CLIs, Editor/Browser/Shell, three client extensions) at 480×400 → rows `[3,4,4,2]` (4 rows: 3,4,4,2 buttons).
+- Cross-row arrow navigation stays intact (R4): with the 7-option fallback layout `[2,3,2]`, focus the last option of row 1 (global index 1) and press `ArrowRight` → the first option of row 2 (global index 2) receives focus.
 - Root keeps `role="toolbar"` and `aria-label="Pane type picker"`.
 - Root has class `pane-picker`; options container has class `pane-picker-options`; each row has class `pane-picker-option-row`; each option button has class `pane-picker-tile`.
 
@@ -138,7 +142,8 @@ In `PanePicker.test.tsx`:
 1. Add a module-level controllable `MockResizeObserver` (captures the callback; `vi.stubGlobal('ResizeObserver', MockResizeObserver)` in a `beforeEach`, `vi.unstubAllGlobals()` in `afterEach`) and a helper `setContainerSize(width, height)` that defines `clientWidth`/`clientHeight` on the `[data-context="pane-picker"]` container and invokes the captured callback inside `act`.
 2. Update the `responsive sizing` describe block: replace the `@container`/`p-2`/`gap-2`/button-`p-2` assertions with the class assertions listed in **Test cases** (classes `pane-picker`, `pane-picker-options`, `pane-picker-option-row`, `pane-picker-tile`) plus the `role`/`aria-label` assertion.
 3. Add the reflow tests (7 options at 480×400 / 640×300 / 300×500) and the 13-option 480×400 → `[3,4,4,2]` test. The 13-option store uses `freshClientsEnabled: true`, `featureFlags: { kilroy: true }`, `availableClis: { claude: true, codex: true, opencode: true }`, `enabledProviders: ['claude','codex','opencode']`, `extensions: [...defaultCliExtensions, mockOpencodeExt, three client extensions]` — this yields 4 fresh agents + 3 CLIs + Editor/Browser/Shell + 3 extensions = 13. Assert `expect(screen.getAllByRole('button')).toHaveLength(13)` first so the row-shape assertion (`[3,4,4,2]` = 4 rows with 3, 4, 4, 2 buttons) is guaranteed to run against exactly 13 options; if the count differs, adjust the number of client extensions up/down until it is exactly 13.
-4. Keep the existing 7-option `[3,2,2]` "balanced icon layout" test as the no-size fallback case.
+4. Add the cross-row arrow test: with the default store plus 4 more options (so 7 total, fallback rows `[2,3,2]`), focus the button at global index 1 and fire `ArrowRight`; assert the button at global index 2 (`buttonRefs`/DOM order) has focus. Add the store helper used by the existing tests (e.g. `availableClis`/`enabledProviders`/`extensions` yielding 7 options).
+5. Change the existing 7-option "balanced icon layout" test from `[3,2,2]` to `[2,3,2]` (rows of 2, 3, 2 buttons) as the no-size fallback case.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -151,7 +156,7 @@ Expected: FAIL — new class/reflow/13-option assertions fail against the curren
 In `PanePicker.tsx`:
 - Remove `MAX_OPTIONS_PER_ROW`, `buildBalancedOptionRows`, and `PickerRowOption`; import `computePanePickerLayout` from `@/lib/pane-picker-layout`.
 - Add `const [gridDims, setGridDims] = useState({ width: 0, height: 0 })`; add a `useEffect` on the existing `containerRef` that calls `measure()` once and registers a `ResizeObserver` (guarded by `typeof ResizeObserver !== 'undefined'`), where `measure` sets `setGridDims({ width: el.clientWidth, height: el.clientHeight })`; clean up with `ro.disconnect()`.
-- Replace `const optionRows = useMemo(() => buildBalancedOptionRows(options), [options])` with `const layout = useMemo(() => computePanePickerLayout(options.length, gridDims.width, gridDims.height), [options.length, gridDims.width, gridDims.height])`, then build rows from `layout.rowSizes` (slice `options` cumulatively).
+- Replace `const optionRows = useMemo(() => buildBalancedOptionRows(options), [options])` with `const layout = useMemo(() => computePanePickerLayout(options.length, gridDims.width, gridDims.height), [options.length, gridDims.width, gridDims.height])`, then build rows from `layout.rowSizes` by slicing `options` cumulatively, keeping a running `rowStart` and passing `rowStart + offset` as the option's global index to `buttonRefs`, focus/hover setters, `showHint`, and `handleArrowNav` (see **Behavior**).
 - Update root/options/row/button className strings per **Behavior** and add the inline `--cols`/`--rows` style to the root.
 - Move icon/label/hint size classes to the new CSS classes; keep `.shortcut-hint` and its `opacity-*` transition classes on the hint span.
 - In `src/index.css`, add the `/* Pane picker: balanced adaptive grid */` block exactly as specified.
@@ -195,7 +200,7 @@ git commit -m "feat(panes): adaptive balanced rows and fluid tile sizing for the
 - None (standalone static mock; no JS).
 
 **Test cases:**
-- The mock markup wraps the 7 option buttons into 3 row groups of `[3,2,2]` (matching the layout for 7 options), and the CSS sizes `.picker-option` as square tiles (e.g. `width: 96px; height: 96px; justify-content: center; padding: 0`) with `.picker-grid` as a centered column of rows and a new `.picker-row` class for each centered row.
+- The mock markup wraps the 7 option buttons into 3 row groups of `[2,3,2]` (matching the adaptive layout for 7 options: 2, then 3, then 2), and the CSS sizes `.picker-option` as square tiles (e.g. `width: 96px; height: 96px; justify-content: center; padding: 0`) with `.picker-grid` as a centered column of rows and a new `.picker-row` class for each centered row.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -209,13 +214,13 @@ Expected: no matches yet (the new structure/classes do not exist).
 
 - [ ] **Step 3: Update `docs/index.html`**
 
-Edit the picker CSS block: `.picker-grid` → `display:flex; flex-direction:column; align-items:center; gap:24px`, add `.picker-row { display:flex; justify-content:center; gap:24px }`, and `.picker-option { width:96px; height:96px; justify-content:center; padding:0 }` (shrink `.picker-icon`/`.picker-lucide` to `40px` so icons fit the tile). Wrap the 7 option buttons into three `.picker-row` divs containing 3, 2, and 2 options respectively.
+Edit the picker CSS block: `.picker-grid` → `display:flex; flex-direction:column; align-items:center; gap:24px`, add `.picker-row { display:flex; justify-content:center; gap:24px }`, and `.picker-option { width:96px; height:96px; justify-content:center; padding:0 }` (shrink `.picker-icon`/`.picker-lucide` to `40px` so icons fit the tile). Wrap the 7 option buttons into three `.picker-row` divs containing 2, 3, and 2 options respectively.
 
 - [ ] **Step 4: Verify the change**
 
 Run: `rg -n "picker-row" docs/index.html`
 
-Expected: 3 matches (one `.picker-row` CSS rule + 3 row wrappers in markup).
+Expected: 4 matches total — one `.picker-row` CSS rule plus three `.picker-row` wrappers in the markup.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -236,12 +241,71 @@ git commit -m "docs: refresh picker mock to balanced adaptive tile layout"
 
 ---
 
+### Task 4: Real-browser geometry spec for R3 (Playwright)
+
+**Requirements served:** R3, R5
+
+**Behavior:**
+- A Playwright spec opens the actual pane picker in a real Chromium against the served app and asserts the fluid-fit geometry that jsdom cannot prove: option tiles are square, sized from the pane, and do not overflow the picker's bounds at the default pane size.
+- Uses the existing helpers (`openPanePicker` from `test/e2e-browser/helpers/pane-picker.ts`, the `freshellPage` fixture).
+
+**Files:**
+- Create: `test/e2e-browser/specs/pane-picker-layout.spec.ts`
+
+**Interfaces:**
+- Consumes: `test, expect` from `../helpers/fixtures.js`; `openPanePicker` from `../helpers/pane-picker.js`.
+
+**Test cases:**
+- Open the picker; assert the toolbar is visible.
+- For every option button inside the picker: `offsetWidth === offsetHeight` and `> 0` (square tiles), and `getBoundingClientRect()` is fully inside the picker toolbar's `getBoundingClientRect()` (no overflow).
+- Assert the buttons render in more than one row (the toolbar has >1 `[data-testid="pane-picker-option-row"]` when 7+ options are visible — use the base options only if the environment shows 3, else assert `>= 1` row and square/no-overflow geometry which is the load-bearing claim).
+
+- [ ] **Step 1: Write the failing behavioral test**
+
+Create `test/e2e-browser/specs/pane-picker-layout.spec.ts` using the fixture and `openPanePicker`. Collect each button's `offsetWidth`/`offsetHeight` and its rect vs the toolbar rect via `locator.evaluate`. Assert squareness, positivity, and containment. (jsdom unit tests cannot prove this — this is the browser-level evidence for R3.)
+
+- [ ] **Step 2: Run the test and verify the intended failure**
+
+Run: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
+
+Expected: FAIL (or the test cannot run yet if the old layout is fixed-width buttons) — against the current fixed-size picker, tiles are not square/contained the same way. If the Playwright infra cannot launch in this environment (browser binary version mismatch or no build), record the exact error, mark the test `Not run` with that reason, and continue — the complete verification section then records it honestly.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+No production change in this task; Task 2 already ships the geometry. If the test fails for a real layout bug (e.g. non-square tiles), fix the CSS in Task 2's block.
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `npm run test:e2e:chromium -- pane-picker-layout --reporter=line`
+
+Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+Not needed.
+
+- [ ] **Step 6: Run broader verification**
+
+Run: `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line`
+
+Expected: PASS (existing pane-picker spec still green with the new geometry).
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/pane-picker-layout.spec.ts
+git commit -m "test(e2e): assert pane-picker tile geometry in real browser"
+```
+
+---
+
 ## Complete verification (Stage 4 end, before final Fresh Eyes)
 
 - `npm run typecheck:client` → exit 0
 - `npm run lint` → exit 0
 - `npm run test:unit` (coordinated default-config `test/unit` workload) → green
 - `npm run test:vitest -- run test/e2e/directory-picker-flow.test.tsx` → green (jsdom e2e covering the picker)
+- `npm run test:e2e:chromium -- pane-picker pane-picker-layout --reporter=line` → green (real-browser geometry + existing picker spec)
 - Record the committed `HEAD` that produced the receipt in the run-state and progress ledger.
 
-Not run (with reason): Playwright browser suite (`test/e2e-browser/pane-picker.spec.ts`) — requires browser binaries and runs separately; the `role="toolbar"`/`aria-label` selector it uses is asserted in unit tests. Server-config suite — client-only change.
+Not run (with reason): full Playwright suite (heavy, runs against both Node and Rust servers in CI); server-config suite — client-only change. The `role="toolbar"`/`aria-label` selector used by browser specs is asserted in unit tests too.
