@@ -1420,6 +1420,7 @@ dependencies = [
  "freshell-terminal",
  "futures-util",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "socket2",

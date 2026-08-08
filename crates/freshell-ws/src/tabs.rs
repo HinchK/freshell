@@ -32,6 +32,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::tabs_store_model::{
+    compare_by_event_time, pick_event_winner, record_status, record_str, sort_by_closed_desc,
+    sort_by_updated_desc,
+};
+
 /// `DAY_MS` (store.ts:9): milliseconds in a day. Used only by
 /// [`TabsRegistry::diagnostic_counts`]'s device-display TTL cutoff below.
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -185,7 +190,10 @@ impl TabsRegistry {
         // Fold closed records into the tombstone map, event-time-winner per tabKey.
         for closed in &closed_records {
             if let Some(tab_key) = record_tab_key(closed) {
-                let winner = pick_event_winner(state.closed_by_tab_key.get(&tab_key), closed);
+                let winner = match state.closed_by_tab_key.get(&tab_key) {
+                    None => closed.clone(),
+                    Some(current) => pick_event_winner(current, closed).clone(),
+                };
                 state.closed_by_tab_key.insert(tab_key, winner);
             }
         }
@@ -418,93 +426,18 @@ impl TabsRegistry {
 }
 
 // ── Record field accessors + ordering (store.ts:341-365) ─────────────────────
+// `record_str`/`record_status`/`record_i64`, `source_key`,
+// `compare_by_event_time`, `pick_event_winner`, `sort_by_updated_desc`, and
+// `sort_by_closed_desc` moved to [`crate::tabs_store_model`] (imported above)
+// so the in-memory registry and the durable store model share ONE
+// implementation.
 
 fn client_key(device_id: &str, client_instance_id: &str) -> String {
     format!("{device_id}::{client_instance_id}")
 }
 
-fn record_str(record: &Value, field: &str) -> Option<String> {
-    record.get(field).and_then(Value::as_str).map(String::from)
-}
-
 fn record_tab_key(record: &Value) -> Option<String> {
     record_str(record, "tabKey")
-}
-
-fn record_status(record: &Value) -> String {
-    record_str(record, "status").unwrap_or_default()
-}
-
-fn record_i64(record: &Value, field: &str) -> i64 {
-    record.get(field).and_then(Value::as_i64).unwrap_or(0)
-}
-
-/// `sourceKey` (store.ts:341): the deterministic tiebreaker string.
-fn source_key(record: &Value) -> String {
-    format!(
-        "{}:{}:{}:{}:{}",
-        record_str(record, "deviceId").unwrap_or_default(),
-        record_str(record, "clientInstanceId").unwrap_or_default(),
-        record_str(record, "tabKey").unwrap_or_default(),
-        record_status(record),
-        record_str(record, "tabId").unwrap_or_default(),
-    )
-}
-
-/// `compareRegistryRecordsByEventTime` (store.ts:345): updatedAt, then revision,
-/// then status (closed sorts *after* open), then sourceKey.
-fn compare_by_event_time(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let ua = record_i64(a, "updatedAt");
-    let ub = record_i64(b, "updatedAt");
-    if ua != ub {
-        return ua.cmp(&ub);
-    }
-    let ra = record_i64(a, "revision");
-    let rb = record_i64(b, "revision");
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
-    let sa = record_status(a);
-    let sb = record_status(b);
-    if sa != sb {
-        return if sa == "closed" {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        };
-    }
-    source_key(a).cmp(&source_key(b))
-}
-
-/// `pickEventWinner` (store.ts:352): the later record wins; ties keep the incumbent.
-fn pick_event_winner(current: Option<&Value>, candidate: &Value) -> Value {
-    match current {
-        None => candidate.clone(),
-        Some(cur) => {
-            if compare_by_event_time(cur, candidate).is_lt() {
-                candidate.clone()
-            } else {
-                cur.clone()
-            }
-        }
-    }
-}
-
-fn sort_by_updated_desc(a: &Value, b: &Value) -> std::cmp::Ordering {
-    record_i64(b, "updatedAt").cmp(&record_i64(a, "updatedAt"))
-}
-
-fn sort_by_closed_desc(a: &Value, b: &Value) -> std::cmp::Ordering {
-    let a_closed = a
-        .get("closedAt")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| record_i64(a, "updatedAt"));
-    let b_closed = b
-        .get("closedAt")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| record_i64(b, "updatedAt"));
-    b_closed.cmp(&a_closed)
 }
 
 fn touch_device(state: &mut State, device_id: &str, now: i64) {
