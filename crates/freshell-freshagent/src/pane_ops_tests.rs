@@ -142,7 +142,11 @@ async fn select_pane_requires_auth() {
 // ── split ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn split_unknown_pane_is_404() {
+async fn split_unknown_pane_on_empty_store_is_404_no_layout_snapshot() {
+    // Node parity: with no snapshot, `layoutStore.resolveTarget` yields
+    // `{message:'no layout snapshot'}` -> `rejectPaneTargetError` 404
+    // (`router.ts:530-538, 591-596`). The snapshot-present miss is the
+    // approx path (see `store_tests`).
     let state = state_with_registry();
     let (status, body) = post(
         app(state),
@@ -152,7 +156,7 @@ async fn split_unknown_pane_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["message"], json!("pane not found"));
+    assert_eq!(body["message"], json!("no layout snapshot"));
 }
 
 #[tokio::test]
@@ -241,16 +245,19 @@ async fn split_browser_pane_registers_cheap_content_no_terminal() {
 
 #[tokio::test]
 async fn close_unknown_pane_is_ok_with_not_found_message() {
+    // With a snapshot present, an unresolvable target falls back to the raw
+    // pane id (Node `resolvePaneTarget`) and the STORE reports the graceful
+    // `{message:'pane not found'}` (the empty-store 404 lives in
+    // `store_tests`).
     let state = state_with_registry();
-    let (status, body) = post(
-        app(state),
-        "/api/panes/does-not-exist/close",
-        json!({}),
-        true,
-    )
-    .await;
+    let router = app(state.clone());
+    let (_tab_id, _pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+
+    let (status, body) = post(router, "/api/panes/does-not-exist/close", json!({}), true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["message"], json!("pane not found"));
+
+    state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }
 
 #[tokio::test]
@@ -338,21 +345,23 @@ async fn split_then_close_removes_bookkeeping_but_keeps_pty_alive_no_orphan() {
 
 #[tokio::test]
 async fn select_unknown_pane_is_ok_with_not_found_message_and_no_broadcast() {
+    // Snapshot present (create seeds the store), unresolvable target ->
+    // raw-id fallback -> the STORE's graceful `{message:'pane not found'}`
+    // (the empty-store 404 lives in `store_tests`).
     let state = state_with_registry();
+    let router = app(state.clone());
+    let (_tab_id, _pane_id, terminal_id) = create_shell_tab(router.clone()).await;
     let mut rx = state.broadcast_tx.subscribe();
-    let (status, body) = post(
-        app(state),
-        "/api/panes/does-not-exist/select",
-        json!({}),
-        true,
-    )
-    .await;
+
+    let (status, body) = post(router, "/api/panes/does-not-exist/select", json!({}), true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["message"], json!("pane not found"));
     assert!(
         rx.try_recv().is_err(),
         "must not broadcast for unresolved pane"
     );
+
+    state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }
 
 #[tokio::test]
@@ -426,7 +435,9 @@ async fn layout_snapshot_single_pane_tab_is_a_real_leaf_node() {
 }
 
 #[tokio::test]
-async fn layout_snapshot_multi_pane_tab_is_an_honest_unknown_marker_not_a_fabricated_split() {
+async fn layout_snapshot_multi_pane_tab_is_a_real_split_node() {
+    // The Slice 3b-2 `{type:'unknown'}` honest-deferral marker is dead: the
+    // shared LayoutStore tracks real split geometry now (Task 15, AUTO-06).
     let state = state_with_registry();
     let router = app(state.clone());
     let (tab_id, first_pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
@@ -435,7 +446,7 @@ async fn layout_snapshot_multi_pane_tab_is_an_honest_unknown_marker_not_a_fabric
     let (status, split_body) = post(
         router.clone(),
         &format!("/api/panes/{first_pane_id}/split"),
-        json!({ "cwd": tmp.to_string_lossy() }),
+        json!({ "cwd": tmp.to_string_lossy(), "direction": "vertical" }),
         true,
     )
     .await;
@@ -449,17 +460,11 @@ async fn layout_snapshot_multi_pane_tab_is_an_honest_unknown_marker_not_a_fabric
     let (status, body) = get(router, "/api/layout/snapshot", true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let node = &body["data"]["layouts"][&tab_id];
-    assert_eq!(node["type"], json!("unknown"));
-    let mut ids: Vec<String> = node["paneIds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    ids.sort();
-    let mut expected = vec![first_pane_id.clone(), second_pane_id.clone()];
-    expected.sort();
-    assert_eq!(ids, expected);
+    assert_eq!(node["type"], json!("split"), "{body}");
+    assert_eq!(node["direction"], json!("vertical"));
+    assert_eq!(node["sizes"], json!([50, 50]));
+    assert_eq!(node["children"][0]["id"], json!(first_pane_id));
+    assert_eq!(node["children"][1]["id"], json!(second_pane_id));
 
     let registry = state.terminal_registry.clone().unwrap();
     registry.kill(&first_terminal_id);
@@ -654,16 +659,6 @@ async fn resize_pane_requires_auth() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[tokio::test]
-async fn resize_pane_is_honest_400_deferral() {
-    let state = state_with_registry();
-    let (status, body) = post(app(state), "/api/panes/nope/resize", json!({}), true).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    let msg = body["message"].as_str().unwrap();
-    assert!(msg.contains("splitId"), "{msg}");
-    assert!(msg.contains("ui.layout.sync"), "{msg}");
-}
-
 // ── swap ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -683,7 +678,9 @@ async fn swap_pane_missing_target_is_approx() {
 }
 
 #[tokio::test]
-async fn swap_unknown_pane_is_404() {
+async fn swap_unknown_pane_is_ok_with_panes_not_found_message() {
+    // Node parity fix (survey B.4): unknown panes are the store's graceful
+    // 200 `{message:'panes not found'}`, not the Slice 3b-1 404.
     let state = state_with_registry();
     let router = app(state.clone());
     let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
@@ -695,14 +692,14 @@ async fn swap_unknown_pane_is_404() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["message"], json!("pane not found"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["message"], json!("panes not found"));
 
     state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }
 
 #[tokio::test]
-async fn swap_unknown_other_is_404() {
+async fn swap_unknown_other_is_ok_with_panes_not_found_message() {
     let state = state_with_registry();
     let router = app(state.clone());
     let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
@@ -714,8 +711,8 @@ async fn swap_unknown_other_is_404() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["message"], json!("pane not found"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["message"], json!("panes not found"));
 
     state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }

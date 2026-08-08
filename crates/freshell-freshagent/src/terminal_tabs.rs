@@ -294,7 +294,6 @@ fn create_content_tab(
     state.tabs.lock().expect("tabs mutex").insert(
         tab_id.clone(),
         TabRecord {
-            id: tab_id.clone(),
             title: name.clone(),
             pane_id: pane_id.clone(),
             kind: kind.to_string(),
@@ -1055,7 +1054,6 @@ async fn create_terminal_tab(
     state.tabs.lock().expect("tabs mutex").insert(
         tab_id.clone(),
         TabRecord {
-            id: tab_id.clone(),
             title: name.clone(),
             pane_id: pane_id.clone(),
             kind: "terminal".to_string(),
@@ -1159,25 +1157,14 @@ pub(crate) async fn list_tabs(
     ok_json(json!({ "tabs": tabs, "activeTabId": active_tab_id }), "")
 }
 
-/// `GET /api/panes` (`router.ts:898-902`): `{panes}`, optionally filtered by
-/// `?tabId=`. Added post-hoc (proof round in `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
-/// \u00a76.2/\u00a78.3): the legacy Node MCP binary's `resolvePaneTarget`/`fetchPanes`
-/// (`freshell-tool.js:130-136`) calls this to resolve a bare pane-id target
-/// before `send-keys`/`capture-pane`/`wait-for` -- WITHOUT it, every MCP action
-/// past `new-tab` 404s inside the MCP client's own target resolution, even
-/// though the underlying REST routes work fine when hit directly (proven by
-/// the direct-REST e2e round trip). Each row carries `id`/`tabId`/`title`/
-/// `kind`/`terminalId` -- the fields `resolvePaneTarget` and `handleDisplay`
-/// read (`freshell-tool.js:151-207`).
-/// `GET /api/panes` (`router.ts:898-902`): iterates the [`FreshAgentState::pane_tabs`]
-/// reverse index (NOT `state.tabs`) so every pane ANY pane-minting path has ever
-/// registered is listed -- including `pane_ops::split_pane` panes, which have no
-/// `TabRecord` of their own (a tab can now own more than one pane; `TabRecord` still
-/// only carries the tab's ORIGINAL pane for `GET /api/tabs`'s reduced row shape). Falls
-/// back to the owning tab's title (no independent per-pane title is tracked at this
-/// slice, matching `rename_pane`'s documented reduced fidelity) and resolves `kind`/
-/// `terminalId` from whichever per-kind map (`terminal_panes`/`content_panes`/
-/// fresh-agent `panes`) actually holds the pane.
+/// `GET /api/panes` (`router.ts:898-902`): `{panes}` from the shared
+/// LayoutStore (Task 15, AUTO-06 -- retires the Slice-1 `pane_tabs`
+/// reverse-index rows). Node-exact row shape `{id, index, kind?,
+/// terminalId?, title?}` in depth-first leaf order, default tab = active
+/// then first (`listPanes`, `layout-store.ts:341-355`); absent fields are
+/// OMITTED like `JSON.stringify` drops `undefined`. An empty `?tabId=`
+/// normalizes to no filter; an empty store is `[]` (Node's `listPanes?.() ||
+/// []`).
 pub(crate) async fn list_panes(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -1186,45 +1173,27 @@ pub(crate) async fn list_panes(
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    let tab_filter = params.get("tabId");
-    let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex").clone();
-    let tabs = state.tabs.lock().expect("tabs mutex").clone();
-    let terminal_panes = state
-        .terminal_panes
-        .lock()
-        .expect("terminal_panes mutex")
-        .clone();
-    let content_panes = state
-        .content_panes
-        .lock()
-        .expect("content_panes mutex")
-        .clone();
-    let panes: Vec<Value> = pane_tabs
-        .iter()
-        .filter(|(_, tab_id)| tab_filter.is_none_or(|tid| tid == *tab_id))
-        .map(|(pane_id, tab_id)| {
-            let title = tabs.get(tab_id).and_then(|t| t.title.clone());
-            let (kind, terminal_id) = if let Some(tp) = terminal_panes.get(pane_id) {
-                ("terminal".to_string(), Some(tp.terminal_id.clone()))
-            } else if let Some(content) = content_panes.get(pane_id) {
-                (
-                    content
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    None,
-                )
-            } else {
-                ("fresh-agent".to_string(), None)
-            };
-            json!({
-                "id": pane_id,
-                "tabId": tab_id,
-                "title": title,
-                "kind": kind,
-                "terminalId": terminal_id,
-            })
+    let tab_filter = params
+        .get("tabId")
+        .map(String::as_str)
+        .filter(|t| !t.is_empty());
+    let rows = state.layout.list_panes(tab_filter).unwrap_or_default();
+    let panes: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let mut pane = serde_json::Map::new();
+            pane.insert("id".to_string(), json!(row.id));
+            pane.insert("index".to_string(), json!(row.index));
+            if let Some(kind) = row.kind {
+                pane.insert("kind".to_string(), json!(kind));
+            }
+            if let Some(terminal_id) = row.terminal_id {
+                pane.insert("terminalId".to_string(), json!(terminal_id));
+            }
+            if let Some(title) = row.title {
+                pane.insert("title".to_string(), json!(title));
+            }
+            Value::Object(pane)
         })
         .collect();
     ok_json(json!({ "panes": panes }), "")

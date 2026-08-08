@@ -38,11 +38,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use freshell_protocol::{ServerMessage, UiCommand};
 
 use crate::layout_store::RenameOutcome;
+use crate::target_resolver::{resolve_target, ResolvedTarget};
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
 use crate::{approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState};
 
@@ -55,7 +55,10 @@ pub fn router(state: FreshAgentState) -> Router {
         .route("/api/panes/{id}/split", axum::routing::post(split_pane))
         .route("/api/panes/{id}/close", axum::routing::post(close_pane))
         .route("/api/panes/{id}/select", axum::routing::post(select_pane))
-        .route("/api/panes/{id}/resize", axum::routing::post(resize_pane))
+        .route(
+            "/api/panes/{id}/resize",
+            axum::routing::post(crate::pane_resize::resize_pane),
+        )
         .route("/api/panes/{id}/swap", axum::routing::post(swap_pane))
         .route("/api/panes/{id}/respawn", axum::routing::post(respawn_pane))
         .route("/api/panes/{id}/attach", axum::routing::post(attach_pane))
@@ -73,21 +76,74 @@ pub fn router(state: FreshAgentState) -> Router {
         .with_state(state)
 }
 
+// ── shared target resolution (Node `resolvePaneTarget`) ────────────────────
+
+/// The outcome of [`resolve_pane_target`]: a pane id to proceed with, or a
+/// ready-made rejection response.
+pub(crate) enum PaneTarget {
+    Pane {
+        /// The owning tab when the resolver found one (`resolved.tabId`).
+        tab_id: Option<String>,
+        pane_id: String,
+        /// The resolver's advisory message (`'tab matched; active pane
+        /// used'` / `'active tab used'`) -- Node surfaces it as the response
+        /// envelope message (`resolved.message || ...`).
+        message: Option<&'static str>,
+    },
+    /// 409 (ambiguous pane title) or 404 (memberless resolver outcome).
+    Reject(Response),
+}
+
+/// Node's `resolvePaneTarget` + `rejectPaneTargetError` (`router.ts:530-538,
+/// 591-596`) as one helper. The raw `:id` runs through
+/// [`crate::target_resolver::resolve_target`] (pane id / tab id / tab title /
+/// `tab.pane` / numeric index / pane title); ONLY the bare
+/// `'target not resolved'` miss falls back to `{paneId: raw}` -- every other
+/// pane-less outcome carries a message and is rejected (409 when the message
+/// contains "ambiguous", else 404), exactly like the original.
+pub(crate) fn resolve_pane_target(state: &FreshAgentState, raw: &str) -> PaneTarget {
+    match resolve_target(&state.layout, raw) {
+        ResolvedTarget::Pane {
+            tab_id,
+            pane_id,
+            message,
+        } => PaneTarget::Pane {
+            tab_id: Some(tab_id),
+            pane_id,
+            message,
+        },
+        ResolvedTarget::Ambiguous(message) => {
+            PaneTarget::Reject(fail_json(StatusCode::CONFLICT, message.to_string()))
+        }
+        ResolvedTarget::NotFound("target not resolved") => PaneTarget::Pane {
+            tab_id: None,
+            pane_id: raw.to_string(),
+            message: None,
+        },
+        ResolvedTarget::NotFound(message) => {
+            PaneTarget::Reject(fail_json(StatusCode::NOT_FOUND, message.to_string()))
+        }
+    }
+}
+
 // ── POST /api/panes/:id/split ──────────────────────────────────────────────
 
-/// `POST /api/panes/:id/split` (`router.ts:1250-1394`). This port keeps no
-/// server-side layout tree (see `lib.rs::rename_pane`'s doc comment for the
-/// established precedent), so the source pane is resolved via
-/// [`FreshAgentState::pane_tabs`] rather than `resolvePaneTarget`'s ambiguous-title
-/// matching -- an unknown `paneId` is an honest 404, not the original's
-/// title-resolution 409. `agent`-based fresh-agent splits (`router.ts:1258-1285`)
-/// are an explicit, documented deferral (honest 400) -- out of this slice's
-/// bounded scope (reusing the create/send-keys/capture agent machinery for a
-/// split target is a separate, larger unit of work); browser/editor/terminal
-/// splits are fully implemented.
+/// `POST /api/panes/:id/split` (`router.ts:1250-1394`): the source pane
+/// resolves via [`resolve_pane_target`], then the STORE splits FIRST
+/// (`layoutStore.splitPane`, `router.ts:1305-1315`) -- the new pane id is
+/// store-minted, so the store tree, the legacy bookkeeping, the broadcast and
+/// the response all carry the SAME id -- then the pre-existing PTY-side spawn
+/// pipeline runs unchanged and the spawned content lands back in the store
+/// via `attachPaneContent` (`router.ts:1374`). A store miss (unknown pane)
+/// responds Node's `approx('pane split requested; not applied')`
+/// (`router.ts:1312-1314`). `agent`-based fresh-agent splits
+/// (`router.ts:1258-1285`) remain an explicit, documented deferral (honest
+/// 400) -- out of this slice's bounded scope; browser/editor/terminal splits
+/// are fully implemented. Response + broadcast shapes are unchanged from
+/// Slice 3b-1.
 pub(crate) async fn split_pane(
     State(state): State<FreshAgentState>,
-    Path(pane_id): Path<String>,
+    Path(raw_pane_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -95,14 +151,9 @@ pub(crate) async fn split_pane(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let Some(tab_id) = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned()
-    else {
-        return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+    let pane_id = match resolve_pane_target(&state, &raw_pane_id) {
+        PaneTarget::Pane { pane_id, .. } => pane_id,
+        PaneTarget::Reject(resp) => return resp,
     };
 
     if body.get("agent").and_then(Value::as_str).is_some() {
@@ -121,7 +172,12 @@ pub(crate) async fn split_pane(
         .unwrap_or("horizontal")
         .to_string();
 
-    let new_pane_id = Uuid::new_v4().to_string();
+    let (tab_id, new_pane_id) = match state.layout.split_pane(&pane_id, &direction) {
+        Ok(split) => split,
+        // Node: `if (!result?.tabId || !result?.newPaneId) res.json(approx(
+        // result, 'pane split requested; not applied'))` (router.ts:1312-1314).
+        Err(_) => return approx_json(Value::Null, "pane split requested; not applied"),
+    };
 
     let new_content = if let Some(url) = body.get("browser").and_then(Value::as_str) {
         let content = json!({
@@ -167,6 +223,13 @@ pub(crate) async fn split_pane(
         .expect("pane_tabs mutex")
         .insert(new_pane_id.clone(), tab_id.clone());
 
+    // `layoutStore.attachPaneContent(tabId, newPaneId, content)`
+    // (`router.ts:1374`): replace the store split's placeholder leaf content
+    // with what actually spawned.
+    state
+        .layout
+        .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
+
     let terminal_id = new_content.get("terminalId").cloned();
 
     // `ui.command{pane.split}` payload (`router.ts:1373-1382`): tabId, paneId
@@ -195,72 +258,56 @@ pub(crate) async fn split_pane(
 
 // ── POST /api/panes/:id/close ──────────────────────────────────────────────
 
-/// `POST /api/panes/:id/close` (`router.ts:1429-1437`). See this module's top
-/// doc comment for the PTY-cleanup-parity finding: this NEVER kills the
+/// `POST /api/panes/:id/close` (`router.ts:1429-1437`): resolve via
+/// [`resolve_pane_target`], then the store's `closePane` drives everything --
+/// the layout-tree rebuild, the `'cannot close only pane'` guard and the
+/// response `{tabId}`/`{message}` data (Task 15, AUTO-06). PTY-side behavior
+/// is unchanged (this module's top doc comment): a successful store close
+/// ALSO drops this crate's local bookkeeping for the pane
+/// (`terminal_panes`/`content_panes`/`pane_tabs`) and NEVER kills the
 /// registry terminal, matching `layoutStore.closePane`'s pure layout-tree
-/// mutation exactly. Mirrors the original's "cannot close only pane" guard
-/// (`layout-store.ts:509`) -- refuses (leaves everything untouched) if this
-/// pane is the tab's LAST remaining pane, and mirrors the original's
-/// unconditional `ui.command{pane.close}` broadcast (`router.ts:1435`) even on
-/// the not-found/refused paths (`tabId` is simply absent from the payload in
-/// that case -- an inert fold on the frozen client, since
-/// `closePaneWithCleanup({tabId: undefined, paneId})` no-ops when the tab
-/// doesn't resolve).
+/// mutation exactly. The `ui.command{pane.close}` broadcast stays
+/// unconditional (`router.ts:1435`) -- `tabId` is null on the
+/// not-found/refused paths, an inert fold on the frozen client.
 pub(crate) async fn close_pane(
     State(state): State<FreshAgentState>,
-    Path(pane_id): Path<String>,
+    Path(raw_pane_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let tab_id = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned();
+    let (pane_id, resolve_message) = match resolve_pane_target(&state, &raw_pane_id) {
+        PaneTarget::Pane {
+            pane_id, message, ..
+        } => (pane_id, message),
+        PaneTarget::Reject(resp) => return resp,
+    };
 
-    let (broadcast_tab_id, message, data) = match &tab_id {
-        None => (
-            None,
-            "pane not found",
-            json!({ "message": "pane not found" }),
-        ),
-        Some(tid) => {
-            let siblings = state
+    let outcome = state.layout.close_pane(&pane_id);
+    let (broadcast_tab_id, data, store_message) = match &outcome {
+        Ok(tab_id) => {
+            // Keep the PTY-side behavior: remove ONLY local bookkeeping;
+            // the terminal (if any) keeps running as a background session.
+            state
+                .terminal_panes
+                .lock()
+                .expect("terminal_panes mutex")
+                .remove(&pane_id);
+            state
+                .content_panes
+                .lock()
+                .expect("content_panes mutex")
+                .remove(&pane_id);
+            state
                 .pane_tabs
                 .lock()
                 .expect("pane_tabs mutex")
-                .values()
-                .filter(|t| *t == tid)
-                .count();
-            if siblings <= 1 {
-                (
-                    None,
-                    "cannot close only pane",
-                    json!({ "message": "cannot close only pane" }),
-                )
-            } else {
-                state
-                    .terminal_panes
-                    .lock()
-                    .expect("terminal_panes mutex")
-                    .remove(&pane_id);
-                state
-                    .content_panes
-                    .lock()
-                    .expect("content_panes mutex")
-                    .remove(&pane_id);
-                state
-                    .pane_tabs
-                    .lock()
-                    .expect("pane_tabs mutex")
-                    .remove(&pane_id);
-                (Some(tid.clone()), "pane closed", json!({ "tabId": tid }))
-            }
+                .remove(&pane_id);
+            (Some(tab_id.clone()), json!({ "tabId": tab_id }), None)
         }
+        Err(message) => (None, json!({ "message": message }), Some(*message)),
     };
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
@@ -268,20 +315,23 @@ pub(crate) async fn close_pane(
         payload: Some(json!({ "tabId": broadcast_tab_id, "paneId": pane_id })),
     }));
 
+    // `ok(result, resolved.message || result?.message || 'pane closed')`.
+    let message = resolve_message.or(store_message).unwrap_or("pane closed");
     ok_json(data, message)
 }
 
 // ── POST /api/panes/:id/select ─────────────────────────────────────────────
 
-/// `POST /api/panes/:id/select` (`router.ts:1439-1450`). Honors an explicit
-/// `tabId` in the body when it names a real tab (`selectPane`'s
-/// `tabExists`/`targetTab` fallback, `layout-store.ts:526-540`); otherwise
-/// resolves the pane's owning tab via [`FreshAgentState::pane_tabs`]. Only
-/// broadcasts `ui.command{pane.select}` when a tab actually resolved
+/// `POST /api/panes/:id/select` (`router.ts:1439-1450`): resolve via
+/// [`resolve_pane_target`], then the store's `selectPane` persists
+/// `activePane` (Task 15, AUTO-06). The target tab is `req.body?.tabId ||
+/// resolved.tabId`; `selectPane` itself falls back to the pane's owning tab
+/// when that tab doesn't exist (`layout-store.ts:526-540`). Only broadcasts
+/// `ui.command{pane.select}` when a tab actually resolved
 /// (`router.ts:1446`'s `if (result?.tabId)` guard).
 pub(crate) async fn select_pane(
     State(state): State<FreshAgentState>,
-    Path(pane_id): Path<String>,
+    Path(raw_pane_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -289,35 +339,39 @@ pub(crate) async fn select_pane(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let requested_tab_id = body
+    let (resolved_tab_id, pane_id, resolve_message) =
+        match resolve_pane_target(&state, &raw_pane_id) {
+            PaneTarget::Pane {
+                tab_id,
+                pane_id,
+                message,
+            } => (tab_id, pane_id, message),
+            PaneTarget::Reject(resp) => return resp,
+        };
+
+    let tab_id = body
         .get("tabId")
         .and_then(Value::as_str)
-        .map(str::to_string);
-    let tabs = state.tabs.lock().expect("tabs mutex");
-    let tab_id = requested_tab_id
-        .filter(|t| tabs.contains_key(t))
-        .or_else(|| drop_and_lookup_pane_tab(&state, &pane_id));
-    drop(tabs);
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or(resolved_tab_id);
 
-    match tab_id {
-        Some(tid) => {
+    match state.layout.select_pane(tab_id.as_deref(), &pane_id) {
+        Ok((tab_id, pane_id)) => {
             state.broadcast(&ServerMessage::UiCommand(UiCommand {
                 command: "pane.select".to_string(),
-                payload: Some(json!({ "tabId": tid, "paneId": pane_id })),
+                payload: Some(json!({ "tabId": tab_id, "paneId": pane_id })),
             }));
-            ok_json(json!({ "tabId": tid, "paneId": pane_id }), "pane selected")
+            ok_json(
+                json!({ "tabId": tab_id, "paneId": pane_id }),
+                resolve_message.unwrap_or("pane selected"),
+            )
         }
-        None => ok_json(json!({ "message": "pane not found" }), "pane not found"),
+        Err(message) => ok_json(
+            json!({ "message": message }),
+            resolve_message.unwrap_or(message),
+        ),
     }
-}
-
-fn drop_and_lookup_pane_tab(state: &FreshAgentState, pane_id: &str) -> Option<String> {
-    state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(pane_id)
-        .cloned()
 }
 
 // ── POST /api/tabs/:id/select ───────────────────────────────────────────────
@@ -540,22 +594,13 @@ pub(crate) async fn tabs_prev(
 
 // ── GET /api/layout/snapshot ────────────────────────────────────────────
 
-/// `GET /api/layout/snapshot?tabId=` (`router.ts:885-896`): the normalized
-/// `{tabs, activeTabId, layouts, activePane, paneTitles, paneTitleSetByUser}`
-/// read model. Legacy's `layouts[tabId]` is a REAL binary split tree (nested
-/// `{type:'split', direction, sizes, children}` nodes) -- this port keeps no
-/// such tree (see this module's top doc comment and `rename_pane`'s doc
-/// comment in `lib.rs` for the established precedent: no server-side layout
-/// store at all). Rather than fabricate split geometry (direction/sizes)
-/// this port never tracked, `layouts[tabId]` is built HONESTLY from what
-/// bookkeeping actually exists: a single-pane tab (the common case, and the
-/// only case any OTHER route in this module can meaningfully mutate) gets a
-/// real `{type:'leaf', id, content}` node; a tab with more than one owned
-/// pane (post-split, geometry unknown) gets a self-describing
-/// `{type:'unknown', paneIds:[...]}` marker instead of a lying `'split'`
-/// node with invented direction/sizes. `activeTabId`/`paneTitles`/
-/// `paneTitleSetByUser` mirror `terminal_tabs::list_tabs`'s existing
-/// reduced-fidelity choices (`null`/`{}`) since this port tracks neither.
+/// `GET /api/layout/snapshot?tabId=` (`router.ts:885-896`): the store's
+/// normalized `{tabs, activeTabId, layouts, activePane, paneTitles,
+/// paneTitleSetByUser[, timestamp]}` read model, verbatim
+/// (`getNormalizedSnapshot`, `layout-store.ts:191-210`) -- REAL `PaneNode`
+/// trees now that the shared `LayoutStore` exists (Tasks 12-14); the Slice
+/// 3b-2 `{type:'unknown'}` honest-deferral marker is dead. An empty `tabId=`
+/// query param normalizes to no filter.
 pub(crate) async fn layout_snapshot(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -564,78 +609,11 @@ pub(crate) async fn layout_snapshot(
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    let tab_filter = params.get("tabId").cloned();
-
-    let tabs_map = state.tabs.lock().expect("tabs mutex").clone();
-    let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex").clone();
-    let terminal_panes = state
-        .terminal_panes
-        .lock()
-        .expect("terminal_panes mutex")
-        .clone();
-    let content_panes = state
-        .content_panes
-        .lock()
-        .expect("content_panes mutex")
-        .clone();
-
-    let mut panes_by_tab: HashMap<String, Vec<String>> = HashMap::new();
-    for (pane_id, tab_id) in pane_tabs.iter() {
-        if tab_filter.as_ref().is_some_and(|f| f != tab_id) {
-            continue;
-        }
-        panes_by_tab
-            .entry(tab_id.clone())
-            .or_default()
-            .push(pane_id.clone());
-    }
-
-    let tabs_list: Vec<Value> = tabs_map
-        .values()
-        .filter(|t| tab_filter.as_ref().is_none_or(|f| f == &t.id))
-        .map(|t| json!({ "id": t.id, "title": t.title }))
-        .collect();
-
-    let mut layouts = serde_json::Map::new();
-    for (tab_id, mut pane_ids) in panes_by_tab {
-        pane_ids.sort();
-        let value = if pane_ids.len() == 1 {
-            let pane_id = &pane_ids[0];
-            let (kind, terminal_id) = if let Some(tp) = terminal_panes.get(pane_id) {
-                ("terminal", Some(tp.terminal_id.clone()))
-            } else if let Some(content) = content_panes.get(pane_id) {
-                (
-                    content
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    None,
-                )
-            } else {
-                ("fresh-agent", None)
-            };
-            json!({
-                "type": "leaf",
-                "id": pane_id,
-                "content": { "kind": kind, "terminalId": terminal_id },
-            })
-        } else {
-            json!({ "type": "unknown", "paneIds": pane_ids })
-        };
-        layouts.insert(tab_id, value);
-    }
-
-    ok_json(
-        json!({
-            "tabs": tabs_list,
-            "activeTabId": Value::Null,
-            "layouts": Value::Object(layouts),
-            "activePane": {},
-            "paneTitles": {},
-            "paneTitleSetByUser": {},
-        }),
-        "",
-    )
+    let tab_filter = params
+        .get("tabId")
+        .map(String::as_str)
+        .filter(|t| !t.is_empty());
+    ok_json(state.layout.get_normalized_snapshot(tab_filter), "")
 }
 
 // ── POST /api/panes/:id/navigate ────────────────────────────────────────
@@ -804,66 +782,21 @@ pub(crate) async fn attach_pane(
     )
 }
 
-// ── POST /api/panes/:id/resize (honest deferral) ────────────────────────
-
-/// `POST /api/panes/:id/resize` (`router.ts:1452-1524`): resize a split by
-/// `splitId` (or a pane id whose PARENT split is resized). Deferred: the
-/// `splitId` legacy targets is a real, server-tracked split-tree node id.
-/// In THIS port, a split node id is minted CLIENT-SIDE ONLY -- the frozen
-/// `splitPane` reducer (`src/store/panesSlice.ts`) calls its own `nanoid()`
-/// for the new split node and never sends it back to the server (the
-/// `pane.split` ui.command payload this port emits carries `newPaneId`, not
-/// a split id). The one channel that WOULD let the server learn the real
-/// id -- `ui.layout.sync`, the client-to-server layout mirror
-/// (`src/store/layoutMirrorMiddleware.ts`, `ClientMessage::UiLayoutSync` in
-/// `freshell-protocol`) -- is not consumed anywhere in this port yet (no
-/// `freshell-ws`/`freshell-server` handler reads it). A server-issued resize
-/// would therefore target a splitId the connected client has never seen,
-/// silently no-op on fold (`resizePanes` finds no matching `node.id`), and
-/// falsely report success. Returns 400 naming exactly this rather than
-/// shipping a call that always 200s and never visibly resizes anything.
-pub(crate) async fn resize_pane(
-    State(state): State<FreshAgentState>,
-    Path(_pane_id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !authorized(&headers, &state.auth_token) {
-        return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
-    }
-    fail_json(
-        StatusCode::BAD_REQUEST,
-        "pane resize is not implemented on this server: legacy targets a server-tracked \
-         split-tree node id (splitId) that this port never learns -- it is minted \
-         client-side only (splitPane's reducer calls its own nanoid()) and the one channel \
-         that could report it back (ui.layout.sync, the client->server layout mirror) is not \
-         yet consumed anywhere in this port. A server-issued resize would target a splitId \
-         the connected client has never seen and silently no-op. Deferred pending \
-         ui.layout.sync ingestion (AUTO-01)."
-            .to_string(),
-    )
-}
-
 // ── POST /api/panes/:id/swap ────────────────────────────────────────────
 
-/// `POST /api/panes/:id/swap` (`router.ts:1526-1544`): exchange the CONTENT
-/// of two panes (not their tree position -- legacy's `swapPane`/the frozen
-/// client's `swapPanes` reducer both search the tree by id and swap
-/// `.content`, no split geometry involved). Unlike resize, this needs no
-/// split-tree/splitId knowledge at all, so it is fully implementable: both
-/// `pane_id` (path) and `target`/`otherId` (body) resolve via
-/// [`FreshAgentState::pane_tabs`] (404 "pane not found" on a miss, matching
-/// `split_pane`'s established precedent); a resolved pair in DIFFERENT tabs
-/// mirrors legacy's own `{message:'panes not found'}` (200, not an error --
-/// `swapPane`'s tree search only ever finds both leaves within a SINGLE
-/// tab). The actual exchange swaps whichever bookkeeping bucket
-/// (`terminal_panes` or `content_panes`) each pane occupies; a pane
-/// resolving to NEITHER (a fresh-agent pane -- tracked in
-/// `FreshAgentState`'s private `panes` map, unreachable from this module)
-/// is out of this slice's reach and reported the same graceful
-/// `{message:'panes not found'}` way, never a hard error.
+/// `POST /api/panes/:id/swap` (`router.ts:1526-1544`): both `:id` and the
+/// body `target`/`otherId` resolve via [`resolve_pane_target`], then the
+/// store's `swapPane` exchanges the two leaves' CONTENT plus BOTH title-map
+/// entries (Task 15, AUTO-06 -- `layout-store.ts:609-654`). Unknown panes
+/// are the store's graceful 200 `{message:'panes not found'}`, fixing the
+/// Slice 3b-1 404 divergence (survey B.4). A successful store swap ALSO
+/// exchanges this crate's legacy per-kind bookkeeping
+/// (`terminal_panes`/`content_panes`) so send-keys/capture/wait-for keep
+/// dispatching to the terminal each pane now shows. Broadcast unchanged:
+/// `ui.command{pane.swap,{tabId,paneId,otherId}}` only when a tab resolved.
 pub(crate) async fn swap_pane(
     State(state): State<FreshAgentState>,
-    Path(pane_id): Path<String>,
+    Path(raw_pane_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -871,91 +804,80 @@ pub(crate) async fn swap_pane(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let other_id = body
+    let other_raw = body
         .get("target")
         .or_else(|| body.get("otherId"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let Some(other_id) = other_id else {
+    let Some(other_raw) = other_raw else {
         return approx_json(Value::Null, "swap target missing");
     };
 
-    let (tab_a, tab_b) = {
-        let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex");
-        let Some(tab_a) = pane_tabs.get(&pane_id).cloned() else {
-            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
-        };
-        let Some(tab_b) = pane_tabs.get(&other_id).cloned() else {
-            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
-        };
-        (tab_a, tab_b)
+    let (pane_id, resolve_message) = match resolve_pane_target(&state, &raw_pane_id) {
+        PaneTarget::Pane {
+            pane_id, message, ..
+        } => (pane_id, message),
+        PaneTarget::Reject(resp) => return resp,
+    };
+    let (other_id, other_message) = match resolve_pane_target(&state, &other_raw) {
+        PaneTarget::Pane {
+            pane_id, message, ..
+        } => (pane_id, message),
+        PaneTarget::Reject(resp) => return resp,
     };
 
-    if tab_a != tab_b {
-        return ok_json(json!({ "message": "panes not found" }), "panes not found");
-    }
+    let requested_tab_id = body
+        .get("tabId")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty());
 
-    let (a_terminal, b_terminal, a_content, b_content) = {
-        let terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
-        let content_panes = state.content_panes.lock().expect("content_panes mutex");
-        (
-            terminal_panes.get(&pane_id).cloned(),
-            terminal_panes.get(&other_id).cloned(),
-            content_panes.get(&pane_id).cloned(),
-            content_panes.get(&other_id).cloned(),
-        )
-    };
-
-    if (a_terminal.is_none() && a_content.is_none())
-        || (b_terminal.is_none() && b_content.is_none())
+    match state
+        .layout
+        .swap_pane(requested_tab_id, &pane_id, &other_id)
     {
-        return ok_json(json!({ "message": "panes not found" }), "panes not found");
-    }
+        Ok(tab_id) => {
+            // Legacy per-kind bookkeeping follows the store swap.
+            swap_entries(
+                &mut state.terminal_panes.lock().expect("terminal_panes mutex"),
+                &pane_id,
+                &other_id,
+            );
+            swap_entries(
+                &mut state.content_panes.lock().expect("content_panes mutex"),
+                &pane_id,
+                &other_id,
+            );
 
-    {
-        let mut terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
-        match (a_terminal, b_terminal) {
-            (Some(a), Some(b)) => {
-                terminal_panes.insert(pane_id.clone(), b);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                terminal_panes.remove(&pane_id);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                terminal_panes.remove(&other_id);
-                terminal_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
+            state.broadcast(&ServerMessage::UiCommand(UiCommand {
+                command: "pane.swap".to_string(),
+                payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "otherId": other_id })),
+            }));
+
+            // `resolved.message || otherResolved.message || result?.message
+            // || 'panes swapped'`.
+            let message = resolve_message.or(other_message).unwrap_or("panes swapped");
+            ok_json(json!({ "tabId": tab_id }), message)
+        }
+        Err(store_message) => {
+            let message = resolve_message.or(other_message).unwrap_or(store_message);
+            ok_json(json!({ "message": store_message }), message)
         }
     }
-    {
-        let mut content_panes = state.content_panes.lock().expect("content_panes mutex");
-        match (a_content, b_content) {
-            (Some(a), Some(b)) => {
-                content_panes.insert(pane_id.clone(), b);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                content_panes.remove(&pane_id);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                content_panes.remove(&other_id);
-                content_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
-        }
+}
+
+/// Exchange two keys' entries in a legacy bookkeeping map (a missing entry on
+/// one side DELETES the other's, same semantics as the store's title-map
+/// swap).
+fn swap_entries<V>(map: &mut HashMap<String, V>, a: &str, b: &str) {
+    let value_a = map.remove(a);
+    let value_b = map.remove(b);
+    if let Some(v) = value_b {
+        map.insert(a.to_string(), v);
     }
-
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
-        command: "pane.swap".to_string(),
-        payload: Some(json!({ "tabId": tab_a, "paneId": pane_id, "otherId": other_id })),
-    }));
-
-    ok_json(json!({ "tabId": tab_a }), "panes swapped")
+    if let Some(v) = value_a {
+        map.insert(b.to_string(), v);
+    }
 }
 
 #[cfg(test)]
@@ -965,3 +887,7 @@ mod tests;
 #[cfg(test)]
 #[path = "pane_ops_tab_tests.rs"]
 mod tab_tests;
+
+#[cfg(test)]
+#[path = "pane_ops_store_tests.rs"]
+mod store_tests;

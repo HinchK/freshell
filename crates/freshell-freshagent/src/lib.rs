@@ -42,6 +42,7 @@ pub mod layout_store;
 pub mod layout_tree;
 pub mod opencode_ws;
 pub mod pane_ops;
+mod pane_resize;
 pub mod snapshot;
 pub mod target_resolver;
 pub mod terminal_tabs;
@@ -220,7 +221,6 @@ pub struct RestoreKeyEntry {
 /// doc comment for the deviation from legacy's full layout-tree row).
 #[derive(Clone)]
 pub(crate) struct TabRecord {
-    pub(crate) id: String,
     pub(crate) title: Option<String>,
     pub(crate) pane_id: String,
     pub(crate) kind: String,
