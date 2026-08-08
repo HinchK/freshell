@@ -107,3 +107,16 @@
 - Test: unrequested_sidecar_death_broadcasts_a_pane_unwedging_error (SIGKILL child directly, not via handle_kill) — RED->GREEN.
 - Verify: cargo test -p freshell-freshagent — 334 pass; the 24 failures are pre-existing terminal_tabs e2e, byte-identical to baseline. claude:: module 34/34 green.
 - Review: PASS (independent) — confirmed claude was the one silent provider on unrequested death (codex exit-watcher + opencode unconditional idle both self-heal); exactly-once frame structurally guaranteed (remove-before-signal on every requested path + identity guard), no false completion, envelope stamped to the pane's current durable id, test SIGKILLs the child directly and times out pre-fix.
+
+## Holistic fresh-eyes review of the full changeset (superpowers:code-reviewer, cold, 2 iterations)
+- Iteration 1: FAIL — 2 CI-gate blockers in the changeset's own new test code (cargo fmt violations in
+  recovery_inventory_tests.rs; clippy len_zero in a claude.rs test assertion) + 1 stale TERM-09 comment in
+  ws/terminal.rs still claiming terminal.exit bypasses the output queue (contradicted the F6 invariant).
+  All fixed + verified (fmt --all --check green, clippy --workspace --all-targets -D warnings green,
+  targeted tests green) in 4ee87cb03.
+- Iteration 2: PASS (APPROVED) — fresh cold session; reviewer independently re-ran fmt/clippy/targeted suites
+  (freshell-terminal 178, freshell-sessions 269, recovery_inventory 20, ws backpressure/association 16,
+  freshagent_control_reply 5, claude:: 34 — all green; terminal_tabs failures = pre-declared env baseline).
+  Zero blocking, zero important issues. Nice-to-haves noted for PR description: wire-string helpers could
+  derive from serde; one-device incoherence 500s the whole recovery inventory (documented fail-loud choice);
+  fold_activity_mtime adds 2 stats/session/sweep (matches Node cost profile).
