@@ -173,7 +173,12 @@ impl TerminalIdentityRegistry {
     /// cwd check; a terminal without a cwd while the session HAS one is
     /// excluded. Callers pass `session.cwd` (server/index.ts:841, :884).
     /// Unlike `find_by_session`, returns every match.
-    pub fn find_all_by_session(&self, provider: &str, session_id: &str, cwd: Option<&str>) -> Vec<TerminalIdentity> {
+    pub fn find_all_by_session(
+        &self,
+        provider: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> Vec<TerminalIdentity> {
         // isCwdScopedSessionMode (terminal-registry.ts:410-412): claude only.
         let scoped = provider == "claude";
         let session_cwd = cwd.filter(|c| !c.is_empty()).map(normalize_scoped_cwd);
@@ -212,7 +217,11 @@ fn normalize_scoped_cwd(cwd: &str) -> String {
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
     }
-    if cfg!(windows) { s.to_lowercase() } else { s }
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -333,10 +342,10 @@ mod tests {
         let reg = TerminalIdentityRegistry::new();
         reg.upsert("t1", Some("claude"), Some("s1"), Some("/a"), 1);
         reg.upsert("t2", Some("claude"), Some("s1"), Some("/a/"), 2); // trailing slash normalizes equal
-        reg.upsert("t3", Some("claude"), Some("s1"), Some("/b"), 3);  // different cwd -> excluded when scoped
-        reg.upsert("t4", Some("claude"), Some("s1"), None, 4);        // no terminal cwd while session cwd present -> excluded
-        reg.upsert("t5", Some("codex"), Some("s1"), Some("/a"), 5);   // provider mismatch for the claude query
-        reg.upsert("t6", Some("claude"), Some("s2"), Some("/a"), 6);  // session mismatch
+        reg.upsert("t3", Some("claude"), Some("s1"), Some("/b"), 3); // different cwd -> excluded when scoped
+        reg.upsert("t4", Some("claude"), Some("s1"), None, 4); // no terminal cwd while session cwd present -> excluded
+        reg.upsert("t5", Some("codex"), Some("s1"), Some("/a"), 5); // provider mismatch for the claude query
+        reg.upsert("t6", Some("claude"), Some("s2"), Some("/a"), 6); // session mismatch
         reg.upsert("t7", Some("claude"), Some("s1"), Some("/a"), 7);
         reg.retire("t7");
         let mut ids: Vec<String> = reg
@@ -353,7 +362,15 @@ mod tests {
             .map(|t| t.terminal_id)
             .collect();
         all.sort();
-        assert_eq!(all, vec!["t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()]);
+        assert_eq!(
+            all,
+            vec![
+                "t1".to_string(),
+                "t2".to_string(),
+                "t3".to_string(),
+                "t4".to_string()
+            ]
+        );
         // non-cwd-scoped provider (codex) ignores cwd even when both sides carry one
         let codex: Vec<String> = reg
             .find_all_by_session("codex", "s1", Some("/zzz"))
