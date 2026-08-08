@@ -163,7 +163,7 @@ pub struct DurableTabsStore {
     root: PathBuf,
     state: CompactState,
     manifest_revision: i64,
-    caps: TabsStoreCaps,
+    pub(crate) caps: TabsStoreCaps, // shared with `crate::tabs` push pre-checks (Task 11)
     prev: Option<PrevComponents>,
 }
 
@@ -260,12 +260,6 @@ impl DurableTabsStore {
     /// committed yet).
     pub fn manifest_revision(&self) -> i64 {
         self.manifest_revision
-    }
-
-    /// The caps this store was opened with — shared by the live registry's
-    /// push pre-checks so both layers enforce the SAME limits (Task 11).
-    pub(crate) fn caps(&self) -> TabsStoreCaps {
-        self.caps.clone()
     }
 
     /// `commitState` (store.ts:1062-1083): validate caps → write the four

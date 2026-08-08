@@ -115,7 +115,7 @@ impl TabsRegistry {
     /// state from the store's [`CompactState`] and keeps the store handle so
     /// every accepted mutation is committed before it becomes visible.
     pub fn with_durable_store(store: DurableTabsStore, persist_dir: Option<PathBuf>) -> Self {
-        let caps = store.caps();
+        let caps = store.caps.clone();
         let state = store.state().clone();
         Self {
             inner: Arc::new(Mutex::new(state)),
