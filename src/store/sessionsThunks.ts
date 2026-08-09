@@ -66,12 +66,18 @@ export function _resetSessionWindowThunkState(): void {
   invalidationRefreshState.clear()
 }
 
-function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessions>>['results']): ProjectGroup[] {
+function searchResultsToProjects(
+  results: Awaited<ReturnType<typeof searchSessions>>['results'],
+  projectColors?: Record<string, string>,
+): ProjectGroup[] {
   const grouped = new Map<string, ProjectGroup>()
 
   for (const result of results) {
     const existing = grouped.get(result.projectPath) ?? {
       projectPath: result.projectPath,
+      // SESSION-05: overlay the page's color map so search windows render
+      // the same project colors as the plain session list.
+      ...(projectColors?.[result.projectPath] ? { color: projectColors[result.projectPath] } : {}),
       sessions: [],
     }
 
@@ -169,7 +175,13 @@ function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): Proj
       keys.add(key)
       current.sessions.push(session)
     }
-    if (project.color && !current.color) {
+    // SESSION-05: the incoming page is server-authoritative for color.
+    // The previous additive-only adoption (`&& !current.color`) silently
+    // kept a STALE color when another browser changed it — the refetch
+    // after `sessions.changed` is the only recolor channel, so an incoming
+    // color must win. (Removal is unobservable: no server path deletes a
+    // project color, matching the legacy no-clear-UI surface.)
+    if (project.color) {
       current.color = project.color
     }
     seenKeys.set(project.projectPath, keys)
@@ -291,12 +303,14 @@ function buildSearchPayload(
     partialReason?: 'budget' | 'io_error'
     hasMore?: boolean
     searchCursor?: string | null
+    /** SESSION-05: colors from the freshest search response page. */
+    projectColors?: Record<string, string>
   },
 ) {
   const last = results.at(-1)
   return {
     surface,
-    projects: searchResultsToProjects(results),
+    projects: searchResultsToProjects(results, opts?.projectColors),
     totalSessions: results.length,
     oldestLoadedTimestamp: last?.lastActivityAt ?? 0,
     oldestLoadedSessionId: last ? `${last.provider}:${last.sessionId}` : '',
@@ -393,7 +407,9 @@ async function refreshVisibleSessionWindowSilently(args: {
           signal: controller.signal,
           ...visibilityOpts,
         })
-        if (!commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, true))) {
+        if (!commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, true, {
+          projectColors: titleResponse.projectColors,
+        }))) {
           return
         }
 
@@ -408,9 +424,12 @@ async function refreshVisibleSessionWindowSilently(args: {
           commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
             partial: deepResponse.partial,
             partialReason: deepResponse.partialReason,
+            projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
           }))
         } catch {
-          commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false))
+          commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
+            projectColors: titleResponse.projectColors,
+          }))
         }
         return
       }
@@ -424,6 +443,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
         partial: response.partial,
         partialReason: response.partialReason,
+        projectColors: response.projectColors,
       }))
       return
     }
@@ -558,6 +578,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               partialReason: response.partialReason,
               hasMore: response.hasMore,
               searchCursor: response.nextCursor,
+              projectColors: response.projectColors,
             })
             const mergedProjects = mergeProjects(windowState?.projects ?? [], pagePayload.projects)
             dispatch(commitSessionWindowReplacement({
@@ -578,7 +599,9 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true)))
+            dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true, {
+              projectColors: titleResponse.projectColors,
+            })))
 
             // Phase 2: file-based search
             try {
@@ -594,12 +617,15 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
                 partialReason: deepResponse.partialReason,
+                projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
               })))
             } catch (phase2Error) {
               if (controller.signal.aborted) return
               // Phase 2 failed but Phase 1 data is already displayed.
               // Clear the pending indicator and report the error.
-              dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false)))
+              dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false, {
+                projectColors: titleResponse.projectColors,
+              })))
               dispatch(setSessionWindowError({
                 surface,
                 error: phase2Error instanceof Error ? phase2Error.message : 'Deep search failed',
@@ -620,6 +646,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               partialReason: response.partialReason,
               hasMore: response.hasMore,
               searchCursor: response.nextCursor,
+              projectColors: response.projectColors,
             })))
           }
           return
