@@ -77,6 +77,18 @@ pub struct SettingsStore {
     session_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The `terminal_overrides` analog of `session_overrides_dirty`.
     terminal_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `config.projectColors` (`config-store.ts:66, 549-562`): per-project
+    /// path → CSS color string map the `PUT /api/project-colors` route
+    /// writes (legacy `setProjectColor`) and the session-directory read
+    /// model embeds in each page (legacy `getProjectColors`). std `Mutex`
+    /// (not tokio) so the sync `persist` path can snapshot it (same as the
+    /// override maps above).
+    project_colors: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
+    /// The `project_colors` analog of `session_overrides_dirty`: color
+    /// keys written via [`SettingsStore::set_project_color`] THIS boot
+    /// always win over disk; keys never touched defer to disk (side-by-side
+    /// bake-in: the legacy Node server writing the same `config.json`).
+    project_colors_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Throttled mtime-check state backing the freshness reload
     /// (`maybe_reload_overrides`) on the override READ path
     /// (`session_overrides()`/`terminal_overrides()`).
@@ -246,6 +258,7 @@ impl SettingsStore {
         let codex_display_id_secret = load_or_mint_codex_display_id_secret(home);
         let terminal_overrides = load_terminal_overrides(home);
         let session_overrides = load_session_overrides(home);
+        let project_colors = load_project_colors(home);
         let store = Self {
             inner: Arc::new(RwLock::new(settings.clone())),
             home: home.map(|p| Arc::new(p.to_path_buf())),
@@ -253,11 +266,13 @@ impl SettingsStore {
             codex_display_id_secret: Arc::new(codex_display_id_secret),
             terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
             session_overrides: Arc::new(std::sync::Mutex::new(session_overrides)),
+            project_colors: Arc::new(std::sync::Mutex::new(project_colors)),
             // Nothing is dirty yet at boot -- every key we just loaded came
             // straight from disk, so it defers to disk until THIS process
             // actually patches it.
             session_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             terminal_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
+            project_colors_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
             reload_throttle_window: std::time::Duration::from_secs(1),
             config_fallback,
@@ -492,6 +507,32 @@ impl SettingsStore {
             Value::Object(merged_terminal_overrides),
         );
 
+        // `projectColors` gets the SAME adopt-from-disk + dirty-overlay
+        // treatment (SESSION-05): fresh disk read overlaid with only the
+        // color keys THIS process wrote this boot. Pre-SESSION-05 this key
+        // fell through to the passthrough below (`map.entry(...)`), which
+        // preserved it but could never accept a Rust-originated write.
+        let disk_project_colors = map
+            .get("projectColors")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let merged_project_colors = {
+            let memory = self
+                .project_colors
+                .lock()
+                .expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            overlay_dirty_keys(disk_project_colors, &memory, &dirty)
+        };
+        map.insert(
+            "projectColors".to_string(),
+            Value::Object(merged_project_colors),
+        );
+
         // `serverSecrets` is overlaid onto whatever was already there (not
         // replaced wholesale), so a sibling secret this store doesn't know
         // about would survive too.
@@ -507,10 +548,12 @@ impl SettingsStore {
         map.insert("serverSecrets".to_string(), Value::Object(secrets));
 
         // Everything else -- `completedMigrations`, `recentDirectories`,
-        // `projectColors`, any unrecognized top-level key -- is left exactly
-        // as loaded above. Only seed the original's first-write defaults
-        // when truly absent (`config-store.ts:356-360`).
-        map.entry("projectColors").or_insert_with(|| json!({}));
+        // any unrecognized top-level key -- is left exactly as loaded
+        // above. Only seed the original's first-write defaults when truly
+        // absent (`config-store.ts:356-360`). (`projectColors` moved out of
+        // this passthrough into the adopt-from-disk overlay above for
+        // SESSION-05; the seed-default-if-absent effect is preserved there:
+        // a fresh disk read of a missing key starts from empty.)
         map.entry("recentDirectories").or_insert_with(|| json!([]));
 
         let text = serde_json::to_string_pretty(&doc)
@@ -582,6 +625,19 @@ impl SettingsStore {
         };
         if !changed {
             return;
+        }
+
+        let disk_colors = load_project_colors(Some(home));
+        {
+            let mut memory = self
+                .project_colors
+                .lock()
+                .expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            *memory = overlay_dirty_keys(disk_colors, &memory, &dirty);
         }
 
         let disk_session = load_session_overrides(Some(home));
@@ -779,6 +835,53 @@ impl SettingsStore {
             let _ = self.persist(&settings);
         }
         next
+    }
+
+    /// A snapshot of `config.projectColors` (the `PUT /api/project-colors`
+    /// route writes it; the session-directory read model embeds it in each
+    /// page — `getProjectColors`, `config-store.ts:561-563`). Same
+    /// mtime-checked freshness reload as the override maps (`freshness
+    /// reload` above), so a bake-in partner's color write shows up on the
+    /// next read without a restart.
+    pub fn project_colors(&self) -> serde_json::Map<String, Value> {
+        self.maybe_reload_overrides();
+        self.project_colors
+            .lock()
+            .expect("project colors lock")
+            .clone()
+    }
+
+    /// `configStore.setProjectColor(projectPath, color)`
+    /// (`config-store.ts:549-558`): `projectColors = {...cfg.projectColors,
+    /// [projectPath]: color}` then save. Additive (other paths preserved),
+    /// overwrites an existing path's color, persists the whole config
+    /// atomically, and marks the path dirty for the boot (side-by-side:
+    /// this process's write wins over a concurrent external edit to the
+    /// same path; untouched paths adopt disk values — see
+    /// [`overlay_dirty_keys`]).
+    ///
+    /// Unlike the override patchers, the persist failure surfaces to the
+    /// caller: the legacy route AWAITS the save
+    /// (`project-colors-router.ts:24`, `await configStore.setProjectColor`)
+    /// before responding, so a failed write is a failed request — and an
+    /// axum handler can translate that error, which the original's
+    /// unwrapped express-4 async handler cannot do gracefully. On failure
+    /// the in-memory value REMAINS set (marked dirty) exactly like a
+    /// concurrent-writer race loss: a later successful persist lands it.
+    pub async fn set_project_color(&self, path: &str, color: &str) -> std::io::Result<()> {
+        {
+            let mut all = self
+                .project_colors
+                .lock()
+                .expect("project colors lock");
+            all.insert(path.to_string(), json!(color));
+            self.project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock")
+                .insert(path.to_string());
+        }
+        let settings = self.get().await;
+        self.persist(&settings)
     }
 }
 
@@ -1242,6 +1345,28 @@ fn load_terminal_overrides(home: Option<&Path>) -> serde_json::Map<String, Value
         return serde_json::Map::new();
     };
     doc.get("terminalOverrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Load `config.projectColors` from `<home>/.freshell/config.json`
+/// (tolerant: any read/parse error or a non-object field degrades to
+/// empty — matching the original's load normalization
+/// `projectColors: existing.projectColors || {}`, `config-store.ts:358`,
+/// and `readConfigFile`'s tolerance).
+fn load_project_colors(home: Option<&Path>) -> serde_json::Map<String, Value> {
+    let Some(home) = home else {
+        return serde_json::Map::new();
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return serde_json::Map::new();
+    };
+    doc.get("projectColors")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default()
@@ -3604,6 +3729,270 @@ mod tests {
         // Restore permissions so cleanup (and any other test running
         // concurrently against a colliding tmp dir name) can proceed.
         std::fs::set_permissions(&freshell, original_perms).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // SESSION-05 (project colors): `config.projectColors`
+    // (`config-store.ts:549-562`) — the legacy config-store exposes
+    // `setProjectColor`/`getProjectColors` over a top-level
+    // `Record<string,string>` map; the Rust store must hold the same map
+    // in memory with the SAME side-by-side adopt-from-disk discipline as
+    // the override maps (dirty keys win; untouched keys defer to disk).
+    // ------------------------------------------------------------------
+
+    /// LOAD + ROUND-TRIP: a boot-time `projectColors` map is readable via
+    /// `project_colors()`; `set_project_color` persists so the color is
+    /// visible to a FRESH `SettingsStore::load` without clobbering either
+    /// the boot-seeded color, an unrelated unknown top-level key, or the
+    /// seeded empty defaults (`sessionOverrides`/`terminalOverrides`).
+    #[tokio::test]
+    async fn project_colors_round_trip_preserves_existing_entries_and_unrelated_keys() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": { "claude:s1": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/alpha": "#ff0000" },
+                "customPluginState": { "anything": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000"),
+            "a boot-seeded project color must be visible without any write"
+        );
+
+        store
+            .set_project_color("/proj/beta", "#00ff00")
+            .await
+            .expect("set_project_color must succeed on a writable config dir");
+
+        // The in-memory reader reflects the write immediately.
+        let colors = store.project_colors();
+        assert_eq!(colors.get("/proj/beta").and_then(Value::as_str), Some("#00ff00"));
+        assert_eq!(colors.get("/proj/alpha").and_then(Value::as_str), Some("#ff0000"));
+
+        // On disk: both colors plus every unrelated key.
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["projectColors"]["/proj/alpha"], json!("#ff0000"));
+        assert_eq!(cfg["projectColors"]["/proj/beta"], json!("#00ff00"));
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:s1"]["titleOverride"],
+            json!("KeepMe"),
+            "unrelated session overrides must survive a color write"
+        );
+        assert_eq!(
+            cfg["customPluginState"]["anything"],
+            json!(true),
+            "unknown top-level keys must round-trip through a color write"
+        );
+
+        // A fresh process (another load) sees both colors.
+        let reloaded = store_at(&dir);
+        let colors = reloaded.project_colors();
+        assert_eq!(colors.get("/proj/alpha").and_then(Value::as_str), Some("#ff0000"));
+        assert_eq!(colors.get("/proj/beta").and_then(Value::as_str), Some("#00ff00"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// OVERWRITE + ADDITIVE: setting a second color must never clobber the
+    /// first, and re-setting the same path replaces its value.
+    #[tokio::test]
+    async fn project_colors_set_is_additive_and_overwrites_same_path() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/a", "#111111").await.unwrap();
+        store.set_project_color("/proj/b", "#222222").await.unwrap();
+        store.set_project_color("/proj/a", "#333333").await.unwrap();
+
+        let colors = store.project_colors();
+        assert_eq!(colors.get("/proj/a").and_then(Value::as_str), Some("#333333"));
+        assert_eq!(colors.get("/proj/b").and_then(Value::as_str), Some("#222222"));
+        assert_eq!(colors.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FRESH-INSTALL SEED: with no config at all, the first persist still
+    /// writes the legacy first-write defaults (`projectColors: {}` —
+    /// `config-store.ts:356-360, 394`).
+    #[tokio::test]
+    async fn project_colors_seeds_empty_map_on_first_write_like_the_original() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/only", "#abcdef").await.unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert!(cfg["projectColors"].is_object(), "projectColors must be an object");
+        assert_eq!(cfg["projectColors"]["/proj/only"], json!("#abcdef"));
+        assert!(
+            cfg["sessionOverrides"].is_object(),
+            "the legacy first-write defaults still seed alongside"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// EXTERNAL-WRITER SURVIVAL (project colors): an external writer's new
+    /// color key AND edit to a color key Rust never touched this boot both
+    /// survive a Rust persist for a DIFFERENT color (same discipline as
+    /// `external_writer_edits_survive_a_rust_persist_of_a_different_key`).
+    #[tokio::test]
+    async fn project_colors_external_writer_edits_survive_a_rust_persist_of_a_different_color() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": { "/proj/orig": "#aaaaaa" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        // External writer (the legacy Node server, or another Rust
+        // process): edits the EXT pre-existing key and adds a new one.
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {
+                    "/proj/orig": "#bbbbbb",
+                    "/proj/external": "#cccccc"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Rust colors a DIFFERENT project -- triggers a persist.
+        store.set_project_color("/proj/ours", "#dddddd").await.unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["projectColors"]["/proj/orig"],
+            json!("#bbbbbb"),
+            "external edit to a key Rust never touched this boot must survive"
+        );
+        assert_eq!(
+            cfg["projectColors"]["/proj/external"],
+            json!("#cccccc"),
+            "a brand-new external color key must survive"
+        );
+        assert_eq!(cfg["projectColors"]["/proj/ours"], json!("#dddddd"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DIRTY-KEY WINS (project colors): once THIS process has set a color,
+    /// a concurrent external edit to the SAME path must not survive a later
+    /// Rust persist (same rule as `session_overrides_dirty`).
+    #[tokio::test]
+    async fn project_colors_dirty_key_wins_over_a_concurrent_external_edit() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let freshell = dir.join(".freshell");
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/hot", "#111111").await.unwrap();
+
+        // External writer overwrites the SAME path.
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/hot"] = json!("#999999");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        // A persist for ANY other reason (here: another color write).
+        store.set_project_color("/proj/cold", "#222222").await.unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["projectColors"]["/proj/hot"],
+            json!("#111111"),
+            "a key this process touched must reflect Rust's last write"
+        );
+        assert_eq!(cfg["projectColors"]["/proj/cold"], json!("#222222"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FRESHNESS RELOAD reads project colors too: an external write becomes
+    /// visible via `project_colors()` without a restart (the mtime-checked
+    /// reload applied to the override maps must cover colors, so a bake-in
+    /// partner's color write shows up on the next directory read).
+    #[tokio::test]
+    async fn project_colors_external_write_becomes_visible_without_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Zero-width throttle window: every read re-stats (test-scaled).
+        let store = store_at(&dir).with_reload_throttle_window(std::time::Duration::ZERO);
+        assert!(store.project_colors().is_empty());
+
+        // Ensure the external write lands on a LATER mtime tick than the
+        // boot load's initial `last_known_mtime` stamp.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/later"] = json!("#fedcba");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/later").and_then(Value::as_str),
+            Some("#fedcba"),
+            "an external color write must be adopted by the freshness reload"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
