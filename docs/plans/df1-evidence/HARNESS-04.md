@@ -110,3 +110,9 @@ Non-findings recorded: rust-leg "theater" concern (intentional per validation te
 in spec header + here); ad-hoc-tsc TS2322 (identical to merged matrix-spec instance; e2e tree
 not repo-tscscope). No remaining P0–P2 findings. Specs re-run green (6/6, both projects, 3rd
 consecutive) after the fixes.
+
+Round 2 — re-read of the final diff post-fixes (same fallback discipline, fresh-eyes):
+tripwire scan scoping (freshellConfig excluded consistently from dir scans; marker empties
+guarded), leg B key-based lookup unaffected by titles, subagent sidechain schedule invariants
+(writer-thrown) consistent across unit/spec/orchestrator, no stale count references left in
+plan/evidence. Verdict: clean. 2 rounds total, 2 hardening findings applied in round 1.
