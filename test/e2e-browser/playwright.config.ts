@@ -115,6 +115,13 @@ const MATRIX_SPECS = [
   // termination, slow-consumer pause, raw orchestration REST) against BOTH
   // server kinds. See docs/plans/df1/HARNESS-05.md.
   /harness-05-raw-clients\.spec\.ts$/,
+  // HARNESS-06 -- deterministic misc-fixture smoke (HTTP/WS/hot-reload
+  // target, file/SMB trees, fake editor, fake Gemini, fake Kilroy runtime,
+  // signed update feed, trusted HTTPS). Server-kind-agnostic: the spec
+  // requests only Playwright base fixtures (the worker-lazy `testServer`
+  // never boots), so it runs identically under all three projects. See
+  // harness-06-misc-fixtures.spec.ts + docs/plans/df1-evidence/HARNESS-06.md.
+  /harness-06-misc-fixtures\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
