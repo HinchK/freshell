@@ -9,7 +9,8 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import WebSocket from 'ws'
 import { EchoWsFixture } from './echo-ws-fixture.js'
-import { RawWsClient, WS_OPCODE } from './raw-clients.js'
+import { RawWsClient, WS_OPCODE, rawHttpRequest } from './raw-clients.js'
+import http from 'node:http'
 
 /** Connect a vendored ws client and resolve once open. */
 async function connectVendorWs(wsUrl: string): Promise<WebSocket> {
@@ -389,5 +390,89 @@ describe('RawWsClient — behaviors (pause / malformed / close codes / abort)', 
     expect(parsed.type).toBe('hello')
     expect(parsed.token).toBe('test-token-123')
     expect(typeof parsed.protocolVersion).toBe('number')
+  })
+})
+
+describe('rawHttpRequest — byte-accounted orchestration HTTP client', () => {
+  let stub: http.Server | undefined
+  let stubBaseUrl = ''
+
+  afterEach(async () => {
+    if (stub) {
+      await new Promise<void>((resolve) => stub!.close(() => resolve()))
+      stub = undefined
+    }
+  })
+
+  async function startStub(
+    handler: (req: http.IncomingMessage, body: Buffer, res: http.ServerResponse) => void,
+  ): Promise<void> {
+    stub = http.createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => handler(req, Buffer.concat(chunks), res))
+    })
+    await new Promise<void>((resolve) => stub!.listen(0, '127.0.0.1', resolve))
+    stubBaseUrl = `http://127.0.0.1:${(stub.address() as import('net').AddressInfo).port}`
+  }
+
+  it('sends an exact method/headers/body and reports status, headers, body, byte counters', async () => {
+    let seen: { method?: string; path?: string; origin?: string; auth?: string; body?: string } = {}
+    await startStub((req, body, res) => {
+      seen = {
+        method: req.method,
+        path: req.url,
+        origin: req.headers['origin'] as string | undefined,
+        auth: req.headers['x-auth-token'] as string | undefined,
+        body: body.toString('utf8'),
+      }
+      res.writeHead(201, { 'content-type': 'application/json', 'x-stub': 'yes' })
+      res.end(JSON.stringify({ ok: true, n: 7 }))
+    })
+
+    const res = await rawHttpRequest(stubBaseUrl, {
+      method: 'POST',
+      path: '/api/tabs?x=1',
+      headers: { 'x-auth-token': 'tok-abc', Origin: 'https://example.test', 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'tab-from-test' }),
+    })
+
+    expect(seen.method).toBe('POST')
+    expect(seen.path).toBe('/api/tabs?x=1')
+    expect(seen.origin).toBe('https://example.test')
+    expect(seen.auth).toBe('tok-abc')
+    expect(seen.body).toBe('{"name":"tab-from-test"}')
+
+    expect(res.status).toBe(201)
+    expect(res.headers['x-stub']).toBe('yes')
+    expect(res.json()).toEqual({ ok: true, n: 7 })
+    expect(res.body.toString('utf8')).toBe('{"ok":true,"n":7}')
+    expect(res.rawHeaders.join(' ')).toContain('x-stub')
+    expect(res.bytesSent).toBeGreaterThan(50)
+    expect(res.bytesReceived).toBeGreaterThan(20)
+    expect(res.durationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('honors header OMISSION (no implicit auth is ever added)', async () => {
+    let auth: string | undefined = 'unset'
+    await startStub((req, _body, res) => {
+      auth = req.headers['x-auth-token'] as string | undefined
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end('{"error":"no token"}')
+    })
+    const res = await rawHttpRequest(stubBaseUrl, { path: '/api/tabs' })
+    expect(res.status).toBe(401)
+    expect(auth).toBeUndefined()
+  })
+
+  it('times out with a labeled error instead of hanging', async () => {
+    await startStub((_req, _body, _res) => {
+      // never respond
+    })
+    await expect(rawHttpRequest(stubBaseUrl, { timeoutMs: 250 })).rejects.toThrow(/timed out after 250ms/)
+  })
+
+  it('reports connection-refused errors with the target in the message', async () => {
+    await expect(rawHttpRequest('http://127.0.0.1:1', { timeoutMs: 2000 })).rejects.toThrow(/127\.0\.0\.1:1/)
   })
 })

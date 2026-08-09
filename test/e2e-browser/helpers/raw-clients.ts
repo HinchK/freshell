@@ -723,9 +723,91 @@ export interface RawHttpResponse {
 }
 
 /**
- * Byte-accounted raw HTTP/1.1 request (orchestration routes from specs).
- * Not yet implemented — see docs/plans/df1/HARNESS-05.md Task 4.
+ * Byte-accounted raw HTTP/1.1 request for calling orchestration routes
+ * (`/api/tabs`, `/api/panes/:id/...`) from specs, without a browser page.
+ * Full method/header/body control (nothing is ever added implicitly except
+ * `Content-Length` when a body is supplied and the caller didn't set one),
+ * and socket-truth byte counters via per-request `agent: false` sockets.
  */
-export function rawHttpRequest(_baseUrl: string, _options: RawHttpRequestOptions = {}): Promise<RawHttpResponse> {
-  throw new Error('rawHttpRequest: not implemented (HARNESS-05 Task 4)')
+export function rawHttpRequest(baseUrl: string, options: RawHttpRequestOptions = {}): Promise<RawHttpResponse> {
+  const url = new URL(baseUrl)
+  if (url.protocol !== 'http:') {
+    return Promise.reject(new Error(`rawHttpRequest: only http:// base URLs are supported (got ${url.protocol})`))
+  }
+  const method = (options.method ?? 'GET').toUpperCase()
+  const path = options.path ?? '/'
+  const timeoutMs = options.timeoutMs ?? 10_000
+  const body = options.body === undefined
+    ? undefined
+    : Buffer.isBuffer(options.body) ? options.body : Buffer.from(options.body, 'utf8')
+
+  const headers: Record<string, string> = { ...(options.headers ?? {}) }
+  const callerSetLength = Object.keys(headers).some((h) => h.toLowerCase() === 'content-length')
+  if (body !== undefined && !callerSetLength) {
+    headers['Content-Length'] = String(body.length)
+  }
+
+  const target = `${method} ${baseUrl}${path.startsWith('/') ? path : `/${path}`}`
+
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+    let settled = false
+    let socket: import('node:net').Socket | null = null
+
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port ? Number(url.port) : 80,
+      path: path.startsWith('/') ? path : `/${path}`,
+      method,
+      headers,
+      agent: false, // fresh socket per request: byte counters are per-request truth
+    })
+
+    req.on('socket', (sock) => {
+      socket = sock
+    })
+
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`rawHttpRequest: timed out after ${timeoutMs}ms (${target})`))
+    })
+
+    req.on('error', (err) => {
+      if (/rawHttpRequest: /.test(err.message)) {
+        fail(err)
+      } else {
+        fail(new Error(`rawHttpRequest: ${err.message} (${target})`))
+      }
+    })
+
+    req.on('response', (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        if (settled) return
+        settled = true
+        const responseBody = Buffer.concat(chunks)
+        resolve({
+          status: res.statusCode ?? 0,
+          statusMessage: res.statusMessage ?? '',
+          httpVersion: res.httpVersion,
+          headers: res.headers,
+          rawHeaders: res.rawHeaders,
+          body: responseBody,
+          json: () => JSON.parse(responseBody.toString('utf8')),
+          bytesSent: socket?.bytesWritten ?? 0,
+          bytesReceived: socket?.bytesRead ?? 0,
+          durationMs: Date.now() - startedAt,
+        })
+      })
+    })
+
+    if (body !== undefined) req.write(body)
+    req.end()
+  })
 }
