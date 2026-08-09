@@ -62,12 +62,18 @@ const test = base.extend({
                 fontSize: 18,
                 fontFamily: 'Fira Code',
               },
+              // NOTE: `collapsed` is deliberately NOT seeded here — a collapsed
+              // sidebar unmounts the sidebar nav (including the Settings
+              // button, `App.tsx`'s `{!sidebarCollapsed && <Sidebar/>}`), which
+              // the user-change step below needs. `sortMode`+`width` fully
+              // represent the "browser-local sidebar presentation" category;
+              // the collapsed member IS covered at crate level
+              // (`legacy_local_seed.rs` / `settings_store.rs` fixtures).
               sidebar: {
                 excludeFirstChatSubstrings: ['welcome'],
                 excludeFirstChatMustStart: false,
                 sortMode: 'project',
                 width: 280,
-                collapsed: true,
               },
               notifications: {
                 soundEnabled: false,
@@ -118,7 +124,6 @@ async function expectSeededPreferencesResolved(page: any): Promise<void> {
   // browser-local sidebar presentation
   expect(resolved?.sidebar?.sortMode).toBe('project')
   expect(resolved?.sidebar?.width).toBe(280)
-  expect(resolved?.sidebar?.collapsed).toBe(true)
   // sound
   expect(resolved?.notifications?.soundEnabled).toBe(false)
   // server-backed first-chat exclusions (SESSION-13) stay server-backed
@@ -187,7 +192,7 @@ test.describe('CFG-04 legacy browser-preference seeding', () => {
       theme: 'light',
       uiScale: 1.25,
       terminal: { fontSize: 18, fontFamily: 'Fira Code' },
-      sidebar: { sortMode: 'project', width: 280, collapsed: true },
+      sidebar: { sortMode: 'project', width: 280 },
       notifications: { soundEnabled: false },
     })
     expect(config.settings.theme).toBeUndefined()
@@ -197,6 +202,7 @@ test.describe('CFG-04 legacy browser-preference seeding', () => {
     expect(config.settings.terminal.fontFamily).toBeUndefined()
     expect(config.settings.terminal.scrollback).toBe(4000)
     expect(config.settings.sidebar.sortMode).toBeUndefined()
+    expect(config.settings.sidebar.width).toBeUndefined()
     expect(config.settings.sidebar.excludeFirstChatSubstrings).toEqual(['welcome'])
 
     await context.close()
