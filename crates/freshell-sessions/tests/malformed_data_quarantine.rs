@@ -389,7 +389,7 @@ async fn claude_partial_record_is_indexed_once_it_becomes_valid() {
         .open(&path_a)
         .unwrap();
     use std::io::Write as _;
-    f.write_all(full_a[cut_a..].as_bytes()).unwrap();
+    f.write_all(&full_a.as_bytes()[cut_a..]).unwrap();
     drop(f);
     // Complete (b): the corrupt first line is never FIXED — it is TERMINATED (the `\n`
     // of a later append lands) and a complete record arrives after it. Appending a bare
@@ -622,7 +622,7 @@ async fn codex_partial_record_is_indexed_once_it_becomes_valid() {
         .open(&target)
         .unwrap();
     use std::io::Write as _;
-    f.write_all(meta_line[cut..].as_bytes()).unwrap();
+    f.write_all(&meta_line.as_bytes()[cut..]).unwrap();
     // A turn follows, as it would in a real rollout.
     f.write_all(b"{\"timestamp\":\"2026-07-18T09:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"resumed codex request\"}]}}\n").unwrap();
     drop(f);

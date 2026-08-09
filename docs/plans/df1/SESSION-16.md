@@ -104,16 +104,17 @@ filter + no error state), never snippet contents.
 
 | # | Assumption (falsifiable) | Method | Result |
 |---|---|---|---|
-| A1 | A cached EXCLUSION is re-parsed when the file's `(mtime,size)` changes (mechanism for clause 3) | run code: RED-first crate test `excluded_record_becomes_valid...` — must pass against unmodified source | PENDING |
-| A2 | `from_utf8_lossy` on the LIVE `ClaudeSource` path indexes invalid-UTF-8 records lossily (only the oracle path `list_claude_sessions` is pinned today) | grep + crate test (live source, invalid-UTF-8 fixture) | PENDING |
-| A3 | Garbage-bytes opencode.db at cold boot → `direct_list` Err → empty snapshot + "opencode" recorded in `scan_failures` (no panic, no silent-healthy) | run code: crate test with garbage file | PENDING |
-| A4 | Warm corrupt-replace → prior sessions preserved + failure recorded; restore → clears (mtime-moved leg; existing tests cover the unchanged-mtime health-check leg) | run code: crate test | PENDING |
-| A5 | Amplifier malformed/empty/`working_dir`-less metadata.json → excluded (R10b), healthy sibling intact | crate test via `AmplifierSource` + `SessionIndex` | PENDING |
-| A6 | Legacy control: frozen indexer skips empty/malformed/cwd-less and indexes the completed-once-partial record on refresh | run vitest control file against `session-indexer.ts` | PENDING |
-| A7 | E2e seam: `setupHome` + `helpers/fixtures.ts` matrix routing supports per-provider seeds and mid-test writes (spec feasibility without new helpers) | inspect `session-directory-matrix.spec.ts` + `helpers/external-target.js` | VERIFIED (read; `setupHome`/`serverInfo.homeDir` give exactly this) |
+| A1 | A cached EXCLUSION is re-parsed when the file's `(mtime,size)` changes (mechanism for clause 3) | run code: crate tests (`*_becomes_valid` per provider) + mutation spot-check (gate exclusion re-parse → exactly the become-valid tests go red; revert) | VERIFIED (proven-present; teeth: 3 tests red under mutation, 7 green) |
+| A2 | `from_utf8_lossy` on the LIVE `ClaudeSource` path indexes invalid-UTF-8 records lossily (only the oracle path `list_claude_sessions` is pinned today) | grep + crate test `claude_invalid_utf8_record_is_indexed_lossily_not_quarantined` | VERIFIED green (title carries U+FFFD via live source; healthy sibling intact) |
+| A3 | Garbage-bytes opencode.db at cold boot → `direct_list` Err → empty snapshot + "opencode" recorded in `scan_failures` (no panic, no silent-healthy) | crate test `opencode_corrupt_db_at_cold_boot_...` | VERIFIED green |
+| A4 | Warm corrupt-replace → prior sessions preserved + failure recorded; restore → clears (mtime-moved leg) | crate test `opencode_corrupt_replace_preserves_sessions_and_healthy_restore_recovers` | VERIFIED green |
+| A5 | Amplifier malformed/empty/`working_dir`-less metadata.json → excluded (R10b), healthy sibling intact | crate test `amplifier_healthy_survives_quarantined_siblings_and_partial_completes` | VERIFIED green |
+| A6 | Legacy control: frozen indexer skips empty/malformed/cwd-less and indexes the completed-once-partial record on refresh | vitest control `session-indexer-malformed-corpus.test.ts` | VERIFIED green ×2 (incl. REAL watcher→dirty-file→incremental-refresh healing channel) |
+| A7 | E2e seam: `setupHome` + `helpers/fixtures.ts` matrix routing supports per-provider seeds and mid-test writes (spec feasibility without new helpers) | inspect `session-directory-matrix.spec.ts` + `helpers/external-target.js` | VERIFIED |
 | A8 | MATRIX_SPECS registration is one additive regex line, `...\.spec\.ts$` shape | inspect `test/e2e-browser/playwright.config.ts:13-43` | VERIFIED |
 | A9 | `sessions_sweep_signature` moves on excluded→included even with old timestamps (count component) — so the PW live-addition leg has a delivery channel | read `main.rs:2154-2174` + existing `new_older_session_file_is_still_detected_as_a_change` | VERIFIED |
 | A10 | `parse_amplifier_file` requires metadata.json `working_dir` (transcript lines never supply cwd) — the malformed-metadata amplifier record is genuinely unindexable | read `amplifier.rs:400-424` | VERIFIED |
+| A11 | Sidebar default browse projection hides non-interactive sessions → every UI-asserted-visible seed needs ≥2 user-authored messages | read `buildSessionJsonl` two-turn realism note in `session-directory-matrix.spec.ts` | VERIFIED (all visible seeds are two-turn) |
 
 ## Tasks (each red → green → commit)
 
