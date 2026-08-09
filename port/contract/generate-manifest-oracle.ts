@@ -569,6 +569,13 @@ const cases: { name: string; rawText: string }[] = [
     ...validClientManifest,
     contentSchema: { f: { type: 'string', label: 'L', required: 'yes' } },
   }),
+  // Field-refine gating: an ABORTING member failure (required: wrong type)
+  // suppresses the field's default-type refine even when type/default would
+  // mismatch — the field reports ONLY the invalid_type.
+  synth('field-refine-gated-by-aborting-member', {
+    ...validClientManifest,
+    contentSchema: { f: { type: 'number', label: 'L', default: 's', required: 'no' } },
+  }),
   synth('contentschema-field-wrong-type', {
     ...validClientManifest,
     contentSchema: { f: 'not-an-object' },

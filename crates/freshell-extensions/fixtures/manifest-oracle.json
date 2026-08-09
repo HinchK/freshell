@@ -1929,6 +1929,24 @@
       }
     },
     {
+      "name": "field-refine-gated-by-aborting-member",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"number\",\"label\":\"L\",\"default\":\"s\",\"required\":\"no\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema",
+              "f",
+              "required"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          }
+        ]
+      }
+    },
+    {
       "name": "contentschema-field-wrong-type",
       "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":\"not-an-object\"}}",
       "expected": {

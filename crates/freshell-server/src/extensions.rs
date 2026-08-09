@@ -107,9 +107,14 @@ impl ExtensionRegistry {
 
             for name in sub_names {
                 let manifest_path = dir.join(&name).join(MANIFEST_FILE);
-                let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+                let Ok(bytes) = std::fs::read(&manifest_path) else {
                     continue;
                 };
+                // Legacy `fs.readFileSync(path, 'utf-8')` replaces invalid
+                // UTF-8 with U+FFFD rather than throwing; match that exactly so
+                // corrupted manifests land on the same warn/skip path (and
+                // U+FFFD inside a string literal parses identically both ways).
+                let raw = String::from_utf8_lossy(&bytes);
                 let manifest = match parse_manifest(&raw) {
                     Ok(manifest) => manifest,
                     Err(ManifestError::InvalidJson(err)) => {
