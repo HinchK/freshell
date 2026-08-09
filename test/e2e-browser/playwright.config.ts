@@ -94,6 +94,12 @@ const RUST_ONLY_SPECS = [
   // RustServers (the durable `~/.freshell/tabs-registry/v1/` store is a
   // Rust-only feature of this sweep; legacy has no durable tabs store).
   /tabs-registry-persistence-rust\.spec\.ts$/,
+  // Task 23 -- automation tab/pane/layout REST parity + git branch/dirty
+  // badges: both boot OWNED per-test RustServers (isolated HOME, ephemeral
+  // port; automation-layout test 3 needs a server NO client ever synced a
+  // layout into), so they only ever run under the rust-chromium project.
+  /automation-layout-rust\.spec\.ts$/,
+  /git-badges-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -216,6 +222,20 @@ export default defineConfig({
         // `<home>/.freshell/tabs-registry/v1/` exists only in the Rust
         // server on this branch.
         /tabs-registry-persistence-rust\.spec\.ts$/,
+        // Task 23 -- automation tab/pane/layout REST parity over the shared
+        // LayoutStore (AUTO-03/AUTO-06 + the AUTO-01 snapshot/rename slice)
+        // against per-test owned RustServers, including the no-client
+        // `{message:'no layout snapshot'}` degradation leg (which needs a
+        // server NO page ever connected to). Rust-only: the LayoutStore-backed
+        // automation routes are this sweep's Rust work; the frozen legacy
+        // `server/` tree is not under test.
+        /automation-layout-rust\.spec\.ts$/,
+        // Task 23 -- git branch/dirty badges (TerminalMetaRegistry +
+        // create-time git enrichment + handshake `terminal_meta` reload
+        // persistence, Tasks 17-18), plus a `test.fail()` KNOWN-GAP pin for
+        // REST-created terminals never receiving meta records (see the
+        // spec's own doc comment + flip instruction).
+        /git-badges-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
