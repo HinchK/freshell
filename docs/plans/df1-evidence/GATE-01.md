@@ -79,40 +79,198 @@ and individual tests are NOT pinned (the interference floats; a per-test
 
 ## Results table (per spec × leg)
 
-Updated per slice; `test/e2e-browser/gate01-baseline.json` is authoritative
-(per-spec × per-leg verdicts, latest-run counters, per-run history, failure
-excerpts, attributions). This table summarizes per slice.
+Authoritative machine-readable data: `test/e2e-browser/gate01-baseline.json`
+(per-spec × per-leg verdicts, latest-run counters, full per-run history,
+failure excerpts, attributions; re-runs REPLACE a leg's counters and append
+to `runHistory`, so isolated reproofs never corrupt the suite-context
+record).
 
-| slice | specs (files) | legacy verdict | rust verdict | notes |
-|---|---|---|---|---|
-| 0 | harness-02-matrix-bite, screenshot-baselines, editor-pane | | | validation slice (interference F1 found here) |
+Counts legend: `p`=passed `f`=failed `s`=skipped `e`=expected-fail (pinned
+`test.fail` consumed as expected). Verdicts reflect the LATEST run for the
+leg; F1-attributed legs failed in suite context with dialog-verified cause.
 
+FINAL TALLY (69 specs × 2 legs = 138 legs, 560 tests enumerated):
+- legacy: 53 pass / 15 fail / 1 skip-all — NO leg pending
+- rust:   37 pass / 32 fail / 0 skip-all — NO leg pending
+- Per-test totals: see baseline JSON (suite-context runs) + `runHistory`.
+
+| spec | bucket | legacy | rust |
+|---|---|---|---|
+| agent-checkpoint-rewind.spec.ts | product | pass (1p/0f/0s/0e) | fail/gap→AGENT-14 (0p/0f/1s/0e) |
+| agent-continuity-matrix.spec.ts | product | pass (2p/0f/0s/0e) | pass (2p/0f/0s/0e) |
+| amplifier-restore-rust.spec.ts | product | fail/preexisting (0p/1f/0s/0e) | fail/gap→TERM-27 (0p/1f/0s/0e) |
+| auth.spec.ts | product | pass (6p/0f/0s/0e) | pass (6p/0f/0s/0e) |
+| browser-pane-screenshot.spec.ts | product | pass (2p/0f/0s/0e) | fail/F1-interference (1p/1f/0s/0e) |
+| browser-pane.spec.ts | product | pass (5p/0f/0s/0e) | fail/F1-interference (2p/3f/0s/0e) |
+| cfg03-backup-restore.spec.ts | product | pass (2p/0f/2s/0e) | pass (4p/0f/0s/0e) |
+| cfg04-legacy-browser-seed.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| codex-terminal-bounce-rust.spec.ts | product | fail/design-guard (0p/1f/0s/0e) | fail/gap→TERM-22 (0p/1f/0s/0e) |
+| diag03-rotation-redaction-rust.spec.ts | product | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| editor-pane.spec.ts | product | pass (6p/0f/0s/0e) | fail/F1-interference (4p/2f/0s/0e) |
+| fresh-agent-centralization-smoke.spec.ts | product | fail/preexisting (2p/2f/0s/0e) | fail/gap→AGENT-10 (2p/2f/0s/0e) |
+| fresh-agent-mobile.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| fresh-agent.spec.ts | product | pass (9p/0f/0s/0e) | fail/F1-interference (5p/4f/0s/0e) |
+| freshopencode-db-history.spec.ts | product | fail/preexisting (1p/2f/0s/0e) | fail/preexisting (1p/2f/0s/0e) |
+| freshopencode-first-send-reload-repro.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| freshopencode-model-picker.spec.ts | product | fail/preexisting (0p/1f/0s/0e) | fail/preexisting (0p/1f/0s/0e) |
+| freshopencode-restart-recovery.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| harness-01-rust-server.spec.ts | harness | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| harness-02-matrix-bite.spec.ts | harness | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| harness-03-provider-fixtures.spec.ts | harness | pass (26p/0f/0s/0e) | pass (26p/0f/0s/0e) |
+| harness-04-session-corpus.spec.ts | harness | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| harness-05-raw-clients.spec.ts | harness | pass (10p/0f/0s/0e) | pass (10p/0f/0s/0e) |
+| harness-06-misc-fixtures.spec.ts | harness | pass (10p/0f/0s/0e) | pass (10p/0f/0s/0e) |
+| harness-11-a11y-gate.spec.ts | harness | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| harness-14-server-clock.spec.ts | harness | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| mcp-bridge-rust.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| mcp-qa-smoke-rust.spec.ts | product | fail/preexisting (0p/1f/0s/0e) | fail/preexisting (0p/1f/0s/0e) |
+| mobile-viewport.spec.ts | product | fail/preexisting (6p/1f/0s/0e) | fail/F1-interference (4p/3f/0s/0e) |
+| multi-client.spec.ts | product | pass (6p/0f/0s/0e) | fail/F1-interference (4p/2f/0s/0e) |
+| multirow-tabs.spec.ts | product | pass (6p/0f/0s/0e) | fail/F1-interference (4p/2f/0s/0e) |
+| opencode-replay-write-progression.spec.ts | product | pass (1p/0f/0s/0e) | fail/F1-interference (0p/1f/0s/0e) |
+| opencode-restart-recovery.spec.ts | product | fail/preexisting (0p/5f/0s/0e) | fail/preexisting (0p/5f/0s/0e) |
+| opencode-terminal-restore-rust.spec.ts | product | fail/design-guard (0p/1f/0s/0e) | pass (1p/0f/0s/0e) |
+| pane-activity-indicator.spec.ts | product | fail/preexisting (2p/1f/0s/0e) | fail/F1-interference (1p/2f/0s/0e) |
+| pane-picker-layout.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| pane-picker.spec.ts | product | pass (2p/0f/0s/0e) | pass (2p/0f/0s/0e) |
+| pane-system.spec.ts | product | pass (10p/0f/0s/0e) | fail/F1-interference (5p/5f/0s/0e) |
+| project-colors-matrix.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| reconcile-handshake-rust.spec.ts | product | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| reconnection.spec.ts | product | pass (6p/0f/0s/0e) | fail/F1-interference (4p/2f/0s/0e) |
+| remote-tab-linkage-rust.spec.ts | product | fail/design-guard (0p/1f/0s/0e) | pass (1p/0f/0s/0e) |
+| rest-tab-persistence.spec.ts | product | fail/design-guard (0p/1f/0s/0e) | pass (1p/0f/0s/0e) |
+| restore-double-restart.spec.ts | product | pass (2p/0f/0s/0e) | pass (2p/0f/0s/0e) |
+| restore-matrix.spec.ts | product | pass (10p/0f/0s/0e) | pass (10p/0f/0s/0e) |
+| restore-sync05.spec.ts | product | pass (2p/0f/0s/0e) | pass (2p/0f/0s/0e) |
+| resume-button.spec.ts | product | pass (3p/0f/0s/0e) | pass (3p/0f/0s/0e) |
+| safe01-auth-matrix.spec.ts | product | pass (12p/0f/0s/0e) | pass (12p/0f/0s/0e) |
+| safe03-origin-matrix.spec.ts | product | pass (6p/0f/0s/0e) | pass (6p/0f/0s/0e) |
+| screenshot-baselines.spec.ts | product | pass (6p/0f/0s/0e) | fail/F1-interference (3p/3f/0s/0e) |
+| server-restart-recovery.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| session-directory-matrix.spec.ts | product | pass (7p/0f/0s/0e) | fail/F1-interference (6p/1f/0s/0e) |
+| settings-live-reload.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| settings-persistence-split.spec.ts | product | pass (2p/0f/0s/0e) | pass (1p/0f/0s/1e) |
+| settings.spec.ts | product | pass (8p/0f/0s/0e) | fail/F1-interference (4p/4f/0s/0e) |
+| sidebar-click-resume.spec.ts | product | skip-all/preexisting (0p/0f/2s/0e) | fail/gap→TERM-22 (1p/1f/0s/0e) |
+| sidebar-opencode-rail.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| sidebar.spec.ts | product | pass (8p/0f/0s/0e) | fail/F1-interference (5p/3f/0s/0e) |
+| stress.spec.ts | product | pass (5p/0f/0s/0e) | fail/F1-interference (2p/3f/0s/0e) |
+| tab-bar-resize.spec.ts | product | pass (5p/0f/0s/0e) | fail/F1-interference (4p/1f/0s/0e) |
+| tab-management.spec.ts | product | pass (11p/0f/0s/0e) | fail/F1-interference (6p/5f/0s/0e) |
+| tab-recency-sync.spec.ts | product | pass (1p/0f/0s/0e) | pass (1p/0f/0s/0e) |
+| tabs-client-retire.spec.ts | product | fail/preexisting (0p/1f/0s/0e) | fail/F1-interference (0p/1f/0s/0e) |
+| term13-scrollback-boundary.spec.ts | product | pass (2p/0f/0s/0e) | fail/F1-interference (2p/0f/0s/0e) |
+| term28-path-shadow-rust.spec.ts | product | fail/design-guard (0p/2f/0s/0e) | pass (2p/0f/0s/0e) |
+| terminal-background-freeze-catchup.spec.ts | product | pass (1p/0f/0s/0e) | fail/F1-interference (0p/1f/0s/0e) |
+| terminal-lifecycle.spec.ts | product | pass (13p/0f/0s/0e) | fail/F1-interference (6p/7f/0s/0e) |
+| truly-idle-alerting.spec.ts | product | fail/preexisting (0p/1f/0s/0e) | fail/preexisting (0p/1f/0s/0e) |
+| ws-ping-pong-matrix.spec.ts | product | pass (2p/0f/0s/0e) | pass (2p/0f/0s/0e) |
 
 ## Attribution log
 
-(rust-red and legacy-red legs, each classified per the plan's protocol:
-gap→owner item / gap-unscoped / flake→reproof / known-flake→ref /
-preexisting→ref. None yet.)
+**Rust-red legs (32):**
 
-## test.fail annotation changes
+1. **Named-owner product gaps (4 legs, 3 pinned with conditional
+   `test.fail`):**
+   - `amplifier-restore-rust.spec.ts` rust → **TERM-27** (Amplifier hardened
+     association): after restart, `amplifier resume <id>` reports the saved
+     session "could not be found on disk — started a fresh session".
+     Deterministic across slice-3 AND isolated rerun
+     `reproof-s3-amplifier-rust`. Pinned in-spec.
+   - `codex-terminal-bounce-rust.spec.ts` rust → **TERM-22** (Codex lifecycle
+     hardening/expected-restart): post-restart re-resume leaves
+     `content.terminalId` null (20 s poll). Deterministic (slice-5 +
+     `reproof-s5-codexbounce`). Pinned in-spec.
+   - `sidebar-click-resume.spec.ts` rust → **TERM-22** (same family):
+     sidebar Codex click-resume never assigns `terminalId` (20 s poll).
+     Deterministic (slice-7 + `reproof-s7-sideclick`; amplifier leg of the
+     same file stayed GREEN on rust). Pinned in-spec.
+   - `fresh-agent-centralization-smoke.spec.ts` rust → **AGENT-10**
+     (model capabilities): `GET /api/fresh-agent/model-capabilities/
+     freshclaude` → **404 on rust** (route exists on legacy,
+     `server/index.ts:753`). Second same-file divergence: legacy layout-sync
+     normalization yields `[]` fresh-agent panes on rust (candidate
+     AUTO-12/AGENT-16 — owner adjudication needed). Deterministic
+     (slice-7 + `reproof-s7-facent`). NOT pinned: pinning is per-test, and
+     this file's two tests each need separate owner adjudication; the leg is
+     recorded red with full detail instead (B001: a pin here would mask a
+     second, differently-owned failure — exactly the masking trap the
+     campaign already burned on).
+2. **F1 RecoveryOfferPanel interference (26 legs, `gap-unscoped`, note
+   "recovery-offer interference (F1)"):** browser-pane,
+   browser-pane-screenshot, editor-pane, fresh-agent, mobile-viewport,
+   multi-client, multirow-tabs, opencode-replay-write-progression,
+   pane-activity-indicator, pane-system, reconnection, screenshot-baselines,
+   session-directory-matrix, settings, sidebar, stress, tab-bar-resize,
+   tab-management, tabs-client-retire (rust leg only; legacy leg
+   preexisting), term13-scrollback-boundary, terminal-background-freeze-catchup,
+   terminal-lifecycle. All verified by `Restore N pane(s) from server
+   memory?` presence in the Playwright error-context (ratios recorded
+   per-leg in baseline `attribution.note`) and/or the `.xterm `-never-
+   visible-under-modal signature, always with a GREEN legacy leg in the same
+   run. Root cause + draft follow-up item: see F1 above.
+3. **Rust leg red only via same pre-existing both-leg redness (6, kind
+   `preexisting`):** freshopencode-db-history, freshopencode-model-picker,
+   mcp-qa-smoke-rust, opencode-restart-recovery (identical assertions as
+   legacy; legacy reproofed deterministic), truly-idle-alerting (identical).
 
-(None yet. Convention when required:
-`test.fail(e2eServerKind === 'rust', '<OWNER-ID>: <one-liner> (2026-08-09)')`
-with a comment block naming the owning checklist item — style exemplar:
-`settings-persistence-split.spec.ts:161-166`.)
+**Legacy-red legs (15) + 1 skip-all:**
 
-## Skipped-test report (gate requirement: "machine-readable skipped-test
-report required to be empty or explicitly approved")
+- **Design-guard class (6, fail-by-design, registration errata):**
+  term28-path-shadow-rust, amplifier-restore-rust,
+  opencode-terminal-restore-rust, rest-tab-persistence,
+  remote-tab-linkage-rust, codex-terminal-bounce-rust — each hard-asserts
+  `e2eServerKind === 'rust'` (deliberate loud guard) and is ALSO in
+  `rust-chromium`'s testMatch + the match-all chromium lane while missing
+  from `RUST_ONLY_SPECS`. The legacy reading is therefore deterministically
+  red; the fix belongs to config consolidation (add to RUST_ONLY_SPECS),
+  deliberately not done here (union-hot shared config mid-campaign; the
+  evidence record suffices for the gate). `sidebar-click-resume` legacy is
+  `skip-all` by its own documented `test.fixme` + `test.skip`.
+- **Pre-existing suite redness on legacy (9):** freshopencode-db-history,
+  opencode-restart-recovery, fresh-agent-centralization-smoke,
+  mobile-viewport, pane-activity-indicator, tabs-client-retire,
+  truly-idle-alerting, freshopencode-model-picker, mcp-qa-smoke-rust — EVERY
+  ONE reproofed deterministic in an isolated legacy rerun (run ids in
+  baseline `runHistory`/`attribution.ref`). None are load flakes; all are
+  spec-vs-current-code drift or frozen-branch divergences. Headline: **the
+  unchanged legacy chromium lane is NOT green on df1/integration today**
+  (15 files red of 69) — independent of the rust port.
 
-Extracted from the baseline JSON after the last slice:
+## test.fail annotation changes (all in campaign convention style)
 
-```
-npx tsx test/e2e-browser/helpers/gate01-collate.ts tally
-# plus per-leg skipped counts in gate01-baseline.json
-```
+Exemplar style: conditional `test.fail(e2eServerKind === 'rust',
+'<ID>: … (2026-08-09)')` + comment; the pin fails HARD on unexpected pass
+(self-deleting signal when the owner lands).
 
-(Pending — every skip must trace to a spec-file KNOWN-DIVERGENCE comment or
-an explicit approval.)
+1. `amplifier-restore-rust.spec.ts` — TERM-27 (post-restart resume loses
+   on-disk session).
+2. `codex-terminal-bounce-rust.spec.ts` — TERM-22 (re-resume terminalId null).
+3. `sidebar-click-resume.spec.ts` — TERM-22 (click-resume terminalId null).
+
+Pre-existing pin honored (not added by this gate):
+`settings-persistence-split.spec.ts` CFG-12 — recorded green-with-pin on
+rust (e1), legacy clean.
+
+## Skipped-test report (gate bar: "empty or explicitly approved")
+
+Machine-enumerated from all slice JSON reports — **5 skipped test-legs
+across 560 tests × …**, every one carrying an in-spec annotation:
+
+1. `agent-checkpoint-rewind.spec.ts` [gate01-rust] — `test.skip`
+   KNOWN DIVERGENCE (rust-only skip of the Rewind UI gesture; user-visible
+   feature). **NOT approvable by this worker** — recorded as gap candidate
+   AGENT-14 in the baseline; requires orchestrator/user approval or
+   AGENT-14 closure.
+2. `cfg03-backup-restore.spec.ts` [gate01-legacy] ×2 — documented
+   RUST-ONLY hardening legs (legacy has no forensic-preservation behavior).
+3. `sidebar-click-resume.spec.ts` [gate01-legacy] ×2 — Amplifier leg
+   KNOWN DIVERGENCE (frozen legacy has no amplifier provider) + Codex leg
+   documented `test.fixme` (frozen server settles create to error).
+
+No rust-only skip exists for a user-visible feature EXCEPT
+`agent-checkpoint-rewind` (flagged above). No unannotated skip exists
+anywhere in the gate run.
 
 ## Slice appendix (committed run plan)
 

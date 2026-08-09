@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "e14bc54983c0d43f9f3c71d9f265e7b970c81676",
+  "head": "74fe71b17cbcccc766ff232b30e7d905373b55b6",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -3976,13 +3976,14 @@
         },
         "rust": {
           "verdict": "fail",
-          "passed": 1,
-          "failed": 1,
+          "passed": 2,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 35680,
+          "durationMs": 22344,
           "runs": [
-            "slice-9"
+            "slice-9",
+            "reproof-s9-term13"
           ],
           "runHistory": [
             {
@@ -3992,16 +3993,21 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 35680
-            }
-          ],
-          "failures": [
+            },
             {
-              "title": "a LARGE scrollback cap retains the earliest needle/search match, byte-perfect and Unicode-clean",
-              "line": 280,
-              "error": "Error: No shell option available for the active tab\n\n  94 |       }\n  95 |     }\n> 96 |     throw new Error('No shell option available for the active tab')\n     |           ^\n  97 |   }\n  98 |\n  99 |   async function patchScrollback(page: any, serverInfo: any, lines: number): Promise<void> {\n    at selectShell (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:96:11)\n    at runScrollbackScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:199:5)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:287:61"
+              "run": "reproof-s9-term13",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 22344
             }
           ],
-          "attribution": null
+          "failures": [],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): slice-9 red w/ dialog ctx ('No shell option available' = picker blocked by modal); isolated rust reproof-s9-term13 GREEN 2/2 -> interference, not scrollback parity gap; legacy green"
+          }
         }
       }
     },
