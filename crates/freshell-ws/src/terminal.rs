@@ -99,6 +99,30 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// DIAG-01 connection ownership: run the whole serve loop inside a
+/// per-connection span, so EVERY event emitted while serving this
+/// connection carries `connection_id` + `origin_kind` when the server-side
+/// JsonLayer flattens span fields into the JSONL line.
+///
+/// The span is created at ERROR level ON PURPOSE (this is context
+/// infrastructure, not a message: our JsonLayer never renders span
+/// open/close, so the level has zero output effect). An INFO-level span is
+/// silently disabled by an operator's `RUST_LOG=warn`/`error` filter, and
+/// once disabled its fields vanish from the scope of the very WARN/ERROR
+/// in-connection events that still get logged (empirically confirmed:
+/// `ws.keepalive.terminated` & friends would lose `connection_id` exactly
+/// when an operator cranks the filter up to investigate). ERROR is the one
+/// level enabled under EVERY filter that still admits any events at all
+/// (a filter stricter than `error` logs nothing for the span to enrich).
+pub(crate) fn connection_span(conn_id: u64, origin_kind: &'static str) -> tracing::Span {
+    tracing::span!(
+        tracing::Level::ERROR,
+        "ws_conn",
+        connection_id = conn_id,
+        origin_kind = origin_kind,
+    )
+}
+
 /// `tokio::task::spawn_blocking` does NOT propagate the caller's tracing
 /// span context across the thread hop (spans are thread-local), which would
 /// silently strip `connection_id` (and any future request-scoped context)
@@ -184,11 +208,8 @@ pub async fn run(
     // `span.enter()` held across `.await`s would instead leak the span into
     // unrelated tasks parked on the same OS thread -- hence `.instrument()`
     // on the loop future and explicit context hops at thread boundaries.
-    let span = tracing::info_span!(
-        "ws_conn",
-        connection_id = conn_id,
-        origin_kind = origin_kind,
-    );
+    // `connection_span`'s own doc explains why the span is ERROR-level.
+    let span = connection_span(conn_id, origin_kind);
     run_loop(
         ws_tx,
         ws_rx,
@@ -219,7 +240,6 @@ async fn run_loop(
     pane_reconcile_fresh_agent_v1: bool,
     conn_id: u64,
 ) {
-
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
     // FrameSink below); the loop drains it to the socket in FIFO — hence in-order.
@@ -791,16 +811,25 @@ async fn handle_client_text(
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
-                        tokio::spawn(async move { fresh_codex.handle_create(create).await }.instrument(tracing::Span::current()));
+                        tokio::spawn(
+                            async move { fresh_codex.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
-                        tokio::spawn(async move { fresh_claude.handle_create(create).await }.instrument(tracing::Span::current()));
+                        tokio::spawn(
+                            async move { fresh_claude.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
-                        tokio::spawn(async move { fresh_opencode.handle_create(create).await }.instrument(tracing::Span::current()));
+                        tokio::spawn(
+                            async move { fresh_opencode.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     _ => {}
                 }
@@ -820,15 +849,24 @@ async fn handle_client_text(
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_attach(attach).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_codex.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_claude.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_attach(attach).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_opencode.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 _ => {}
             }
@@ -838,16 +876,25 @@ async fn handle_client_text(
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_send(send).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_codex.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_send(send).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_claude.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_send(send).await }.instrument(tracing::Span::current()));
+                    tokio::spawn(
+                        async move { fresh_opencode.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 // `amplifier` exists on AgentProvider for the TERM-16
                 // terminal.turn.complete broadcast only — there is no
@@ -873,26 +920,44 @@ async fn handle_client_text(
         ClientMessage::FreshAgentInterrupt(interrupt) => {
             if is_codex_provider(interrupt.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_codex.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if interrupt.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_claude.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if interrupt.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_opencode.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             }
             true
         }
         ClientMessage::FreshAgentKill(kill) => {
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_kill(kill).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_codex.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if kill.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_kill(kill).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_claude.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_kill(kill).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_opencode.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             }
             true
         }
@@ -1794,8 +1859,8 @@ async fn gate_wire_resume(
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let retire_mode = mode.to_string();
         let stale_id = stale.to_string();
-        let _ = spawn_blocking_in_span(move || ledger.retire_missing(&retire_mode, &stale_id))
-            .await;
+        let _ =
+            spawn_blocking_in_span(move || ledger.retire_missing(&retire_mode, &stale_id)).await;
     }
     ResumeGateCarry {
         notice: outcome.notice,
@@ -3277,10 +3342,9 @@ pub async fn respawn_agent_terminal(
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
             let retire_provider = req.provider.clone();
             let stale_id = stale.to_string();
-            let _ = spawn_blocking_in_span(move || {
-                ledger.retire_missing(&retire_provider, &stale_id)
-            })
-            .await;
+            let _ =
+                spawn_blocking_in_span(move || ledger.retire_missing(&retire_provider, &stale_id))
+                    .await;
         }
         // Headless path: no per-create `out` sink. Broadcast the existing
         // Recovering status frame (precedent: auto_resume.rs emit_recovering)
@@ -6057,5 +6121,149 @@ mod terminal_dims_range_tests {
                 "terminalId": "t-gone",
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_span_filter_tests {
+    //! Regression for the fresh-eyes review finding: the `ws_conn` span is
+    //! context infrastructure, so its fields must survive ANY operator level
+    //! filter (`RUST_LOG`) that still admits events. An INFO-level span is
+    //! silently disabled by `warn`/`error` filters, stripping `connection_id`
+    //! from the very in-connection WARN/ERROR events an operator cranks the
+    //! filter up to inspect -- empirically confirmed during review with an
+    //! info-level probe (empty field set under a `warn` EnvFilter), then
+    //! fixed by creating the span at ERROR level (`connection_span`).
+
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    struct Captured {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct Visitor {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for Visitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct SpanFields(BTreeMap<String, String>);
+
+    struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl<S> Layer<S> for Capture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            attrs.record(&mut visitor);
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(SpanFields(visitor.fields));
+            }
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            let mut fields = BTreeMap::new();
+            if let Some(scope) = ctx.event_scope(event) {
+                for span in scope.from_root() {
+                    let extensions = span.extensions();
+                    if let Some(SpanFields(span_fields)) = extensions.get::<SpanFields>() {
+                        for (k, v) in span_fields {
+                            fields.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            for (k, v) in visitor.fields {
+                fields.insert(k, v);
+            }
+            self.events.lock().expect("capture lock").push(Captured {
+                message: visitor.message,
+                fields,
+            });
+        }
+    }
+
+    #[test]
+    fn ws_conn_span_fields_survive_every_operator_level_filter() {
+        // Any filter admitting events: error/warn admit WARN, INFO and finer
+        // admit INFO. A filter that admits nothing (`off`) has nothing to
+        // enrich and is out of scope by construction.
+        for filter_level in ["error", "warn", "info", "debug", "trace"] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter = tracing_subscriber::EnvFilter::new(filter_level);
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                match filter_level {
+                    "error" => tracing::error!("probe_event"),
+                    "warn" => tracing::warn!("probe_event"),
+                    _ => tracing::info!("probe_event"),
+                }
+            });
+            let captured = events.lock().unwrap().clone();
+            let probe = captured
+                .iter()
+                .find(|e| e.message == "probe_event")
+                .unwrap_or_else(|| {
+                    panic!("probe event must be captured under a {filter_level} filter")
+                });
+            assert_eq!(
+                probe.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "connection_id must survive a RUST_LOG={filter_level} filter"
+            );
+            assert_eq!(
+                probe.fields.get("origin_kind").map(String::as_str),
+                Some("same-origin"),
+                "origin_kind must survive a RUST_LOG={filter_level} filter"
+            );
+        }
     }
 }

@@ -132,9 +132,9 @@ fn every_line_stamps_app_version_and_server_pid() {
 
 **Test 1 `diag01_full_flow_log_schema_and_correlation`:** boot the compiled binary (`discover_server_binary()` copied from `diag01_diag03_logging.rs`) with temp `HOME`/`FRESHELL_HOME`, `FRESHELL_LOG_DIR` unset (assert the default `<home>/.freshell/logs/rust-server.jsonl` path), ephemeral port, real token. Then:
 1. **auth flow:** `GET /api/settings` with a WRONG token → 401; with the right token → 200.
-2. **WS flow:** real `tokio-tungstenite` client, `hello` (good token) → `ready`; send `ping` → `pong`.
-3. **terminal flow:** `terminal.create` (shell mode, cwd=temp) → `terminal.created` frame (capture `terminalId`); `terminal.kill` → await exit; close WS.
-4. **provider flow:** `freshAgent.create { sessionType: "freshcodex" }` with `CODEX_CMD` pointed at the committed fake fixture (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`, same pattern as `safe11_term22_shutdown_reaping.rs`) → await create success frame; kill the session.
+2. **WS flow:** real `tokio-tungstenite` client, `hello` (good token) → `ready`; send `ping` → `pong`. This ONE socket stays open through steps 3-4.
+3. **terminal flow:** `terminal.create` (shell mode, cwd=temp) → `terminal.created` frame (capture `terminalId`); `terminal.kill` → the kill's `terminal.exit` wire frame fans out to ATTACHED viewers only and this test never attaches, so await the `terminal.killed` JSONL event in the log file directly (synchronous flush) rather than a wire frame.
+4. **provider flow (same socket):** `freshAgent.create { sessionType: "freshcodex" }` with `CODEX_CMD` pointed at the committed fake fixture (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`, same pattern as `safe11_term22_shutdown_reaping.rs`) → await create success frame. THEN close the WS (once, here), so the log gains one coherent established->closed connection lifecycle.
 5. **recoverable-error flow:** `GET /api/session-directory/missing-id` (authenticated) → 404.
 6. **quit flow:** `libc::kill(pid, SIGTERM)` → expect exit 0 within 5s.
 

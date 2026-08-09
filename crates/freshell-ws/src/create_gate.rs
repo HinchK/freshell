@@ -74,196 +74,198 @@ pub(crate) fn spawn_gated_restore_create(
     // DIAG-01: this fn is called from within the connection loop's `ws_conn`
     // span context; carry it into the detached task so the restore create's
     // events (prepare/gate/spawn) keep the serving connection's `connection_id`.
-    tokio::spawn(async move {
-        // P1 (graceful restore/resume S1): prepare — resume-identity
-        // derivation + the codex managed plan — runs BEFORE the gate, so
-        // permits only ever cover fast, mode-uniform PTY-spawn->settle work
-        // and codex planning can no longer starve other modes' restores.
-        // The restore-class plan wait is cancel-aware with no wall-clock
-        // death (LaunchClass::Restore; overflow -> RATE_LIMITED).
-        let prepared = match crate::terminal::prepare_launch(&create, &state, &mut cancel_rx).await
-        {
-            Ok(prepared) => prepared,
-            Err(crate::terminal::PrepareError::Cancelled) => {
+    tokio::spawn(
+        async move {
+            // P1 (graceful restore/resume S1): prepare — resume-identity
+            // derivation + the codex managed plan — runs BEFORE the gate, so
+            // permits only ever cover fast, mode-uniform PTY-spawn->settle work
+            // and codex planning can no longer starve other modes' restores.
+            // The restore-class plan wait is cancel-aware with no wall-clock
+            // death (LaunchClass::Restore; overflow -> RATE_LIMITED).
+            let prepared =
+                match crate::terminal::prepare_launch(&create, &state, &mut cancel_rx).await {
+                    Ok(prepared) => prepared,
+                    Err(crate::terminal::PrepareError::Cancelled) => {
+                        tracing::info!(
+                            target: "freshell_ws::spawn_gate",
+                            request_id = %create.request_id,
+                            "restore_create_cancelled"
+                        );
+                        // Non-settled exit: drop the dedupe sentinel (and fail any
+                        // cross-connection waiters loud) so a resend proceeds fresh.
+                        state.create_dedupe.clear_if_in_flight(&create.request_id);
+                        return;
+                    }
+                    Err(crate::terminal::PrepareError::PlanQueueFull) => {
+                        let mut out = CreateOutput::Channel(&sink);
+                        let _ = crate::terminal::send_create_error(
+                            &mut out,
+                            ErrorCode::RateLimited,
+                            "Too many concurrent codex launches".to_string(),
+                            &create.request_id,
+                        )
+                        .await;
+                        state.create_dedupe.clear_if_in_flight(&create.request_id);
+                        return;
+                    }
+                    // (No Reject arm: post-A12, prepare_launch cannot reject — the
+                    // claude RESTORE_UNAVAILABLE ladder runs inside handle_create,
+                    // after the adopt/D8 arms, exactly as today.)
+                    Err(crate::terminal::PrepareError::PlanFailed(message)) => {
+                        // Same frame this failure produced when it happened inside
+                        // handle_create (`error{code:PTY_SPAWN_FAILED}`).
+                        let mut out = CreateOutput::Channel(&sink);
+                        let _ = crate::terminal::send_create_error(
+                            &mut out,
+                            ErrorCode::PtySpawnFailed,
+                            message,
+                            &create.request_id,
+                        )
+                        .await;
+                        state.create_dedupe.clear_if_in_flight(&create.request_id);
+                        return;
+                    }
+                };
+            // Restore-class gate wait: cancel-aware, NO timeout (D-GATE-SOFT
+            // generalized: contention may not kill a restore). QueueFull still
+            // fails loud (-> RATE_LIMITED via spawn_gate_error_parts); Timeout
+            // is unreachable on this path. Interactive creates never ride this
+            // fn and keep spawn_timeout_ms.
+            let permit = match state.spawn_gate.acquire_unbounded(&mut cancel_rx).await {
+                Ok(permit) => permit,
+                Err(SpawnGateError::Cancelled) => {
+                    tracing::info!(
+                        target: "freshell_ws::spawn_gate",
+                        request_id = %create.request_id,
+                        "restore_create_cancelled"
+                    );
+                    // `prepared` drops here: the RAII guard discards the sidecar.
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+                Err(err) => {
+                    // A prepared codex launch IS materialized now (P1 inverted
+                    // the old "nothing has been materialized yet" invariant);
+                    // dropping `prepared` on this return discards it via the
+                    // PreparedCodexLaunch guard. QueueFull maps to RATE_LIMITED
+                    // (spawn_gate_error_parts) — the ladder absorbs it.
+                    let (code, msg) = spawn_gate_error_parts(err);
+                    let mut out = CreateOutput::Channel(&sink);
+                    let _ = crate::terminal::send_create_error(
+                        &mut out,
+                        code,
+                        msg.to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+            };
+            // Last-instant check: the permit may have been granted a beat after
+            // the client vanished. Nothing has been spawned yet — abandon
+            // (dropping `prepared` discards the sidecar).
+            if *cancel_rx.borrow() {
                 tracing::info!(
                     target: "freshell_ws::spawn_gate",
                     request_id = %create.request_id,
                     "restore_create_cancelled"
                 );
-                // Non-settled exit: drop the dedupe sentinel (and fail any
-                // cross-connection waiters loud) so a resend proceeds fresh.
                 state.create_dedupe.clear_if_in_flight(&create.request_id);
                 return;
             }
-            Err(crate::terminal::PrepareError::PlanQueueFull) => {
-                let mut out = CreateOutput::Channel(&sink);
-                let _ = crate::terminal::send_create_error(
-                    &mut out,
-                    ErrorCode::RateLimited,
-                    "Too many concurrent codex launches".to_string(),
-                    &create.request_id,
-                )
-                .await;
-                state.create_dedupe.clear_if_in_flight(&create.request_id);
-                return;
-            }
-            // (No Reject arm: post-A12, prepare_launch cannot reject — the
-            // claude RESTORE_UNAVAILABLE ladder runs inside handle_create,
-            // after the adopt/D8 arms, exactly as today.)
-            Err(crate::terminal::PrepareError::PlanFailed(message)) => {
-                // Same frame this failure produced when it happened inside
-                // handle_create (`error{code:PTY_SPAWN_FAILED}`).
-                let mut out = CreateOutput::Channel(&sink);
-                let _ = crate::terminal::send_create_error(
-                    &mut out,
-                    ErrorCode::PtySpawnFailed,
-                    message,
-                    &create.request_id,
-                )
-                .await;
-                state.create_dedupe.clear_if_in_flight(&create.request_id);
-                return;
-            }
-        };
-        // Restore-class gate wait: cancel-aware, NO timeout (D-GATE-SOFT
-        // generalized: contention may not kill a restore). QueueFull still
-        // fails loud (-> RATE_LIMITED via spawn_gate_error_parts); Timeout
-        // is unreachable on this path. Interactive creates never ride this
-        // fn and keep spawn_timeout_ms.
-        let permit = match state.spawn_gate.acquire_unbounded(&mut cancel_rx).await {
-            Ok(permit) => permit,
-            Err(SpawnGateError::Cancelled) => {
-                tracing::info!(
-                    target: "freshell_ws::spawn_gate",
-                    request_id = %create.request_id,
-                    "restore_create_cancelled"
-                );
-                // `prepared` drops here: the RAII guard discards the sidecar.
-                state.create_dedupe.clear_if_in_flight(&create.request_id);
-                return;
-            }
-            Err(err) => {
-                // A prepared codex launch IS materialized now (P1 inverted
-                // the old "nothing has been materialized yet" invariant);
-                // dropping `prepared` on this return discards it via the
-                // PreparedCodexLaunch guard. QueueFull maps to RATE_LIMITED
-                // (spawn_gate_error_parts) — the ladder absorbs it.
-                let (code, msg) = spawn_gate_error_parts(err);
-                let mut out = CreateOutput::Channel(&sink);
-                let _ = crate::terminal::send_create_error(
-                    &mut out,
-                    code,
-                    msg.to_string(),
-                    &create.request_id,
-                )
-                .await;
-                state.create_dedupe.clear_if_in_flight(&create.request_id);
-                return;
-            }
-        };
-        // Last-instant check: the permit may have been granted a beat after
-        // the client vanished. Nothing has been spawned yet — abandon
-        // (dropping `prepared` discards the sidecar).
-        if *cancel_rx.borrow() {
-            tracing::info!(
-                target: "freshell_ws::spawn_gate",
-                request_id = %create.request_id,
-                "restore_create_cancelled"
-            );
-            state.create_dedupe.clear_if_in_flight(&create.request_id);
-            return;
-        }
-        // A10 shutdown-race pre-check (V3): kill_all snapshots ids once
-        // (registry.rs:889-892); if shutdown already began, nothing has been
-        // spawned yet — abandon instead of inserting a PTY the snapshot will
-        // never visit. (`prepared` drops -> sidecar discarded.)
-        if state
-            .shutdown_started
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            tracing::info!(
-                target: "freshell_ws::spawn_gate",
-                request_id = %create.request_id,
-                "restore_create_abandoned_for_shutdown"
-            );
-            state.create_dedupe.clear_if_in_flight(&create.request_id);
-            return;
-        }
-        // Permit held across PTY spawn -> registry insert -> meta/identity ->
-        // terminal.created -> broadcasts (the spawn-to-settled requirement,
-        // pinned by permit_released_only_after_work_completes). Codex
-        // planning happens ABOVE, outside the permit — the hold is now fast
-        // and mode-uniform. Replies go through the non-blocking conn sink,
-        // so no stalled client can wedge the permit (the da5d9b5c hazard
-        // still cannot exist on this path).
-        let request_id = create.request_id.clone();
-        // A5 residual signal (V3), hold side: the permit-held awaits below
-        // are deadline-free (PTY spawn terminal.rs:2253-2269, association
-        // fs walk :2431-2454, fsync ledger writes :2517-2545) — a wedged
-        // hold would otherwise be invisible. Warn ONCE at ~30s while the
-        // hold is still in flight; abort the watchdog when the hold
-        // settles. Logging only — no frames, no protocol change.
-        let hold_watchdog = tokio::spawn({
-            let request_id = request_id.clone();
-            async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                tracing::warn!(
-                    target: "freshell_ws::spawn_gate",
-                    request_id = %request_id,
-                    "spawn_gate_permit_hold_slow"
-                );
-            }
-            // DIAG-01: keep the connection context on the watchdog event too.
-            .instrument(tracing::Span::current())
-        });
-        hold_permit_across(permit, async {
-            let mut out = CreateOutput::Channel(&sink);
-            // Fresh limiter, never consulted: `handle_create`'s rate-limit
-            // check is gated on `create.restore != Some(true)`, and this
-            // path is restore:true by construction (the `if create.restore
-            // == Some(true)` branch in `handle_client_text`) — so this is a
-            // throwaway to satisfy the shared signature, not a live budget.
-            let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
-                state.create_protect.rate_limit,
-                state.create_protect.rate_window_ms,
-            );
-            let _ = crate::terminal::handle_create(
-                create,
-                Some(prepared),
-                &mut out,
-                &state,
-                conn_id,
-                pane_reconcile_v1,
-                &mut create_limiter,
-            )
-            .await;
-            // Covers create failure: no-op when handle_create settled the entry,
-            // drops the InFlight sentinel (failing waiters loud) when it did not.
-            state.create_dedupe.clear_if_in_flight(&request_id);
-            // A10 shutdown-race post-check (V3): shutdown may have begun DURING
-            // the create, after main's kill_all snapshot. The server is reaping
-            // everything anyway, so an idempotent kill_all here reaps our own
-            // just-inserted terminal (and any other late insert). Belt to the
-            // pre-check's braces; main.rs adds a drain re-sweep too (Task 7
-            // Step 2b).
+            // A10 shutdown-race pre-check (V3): kill_all snapshots ids once
+            // (registry.rs:889-892); if shutdown already began, nothing has been
+            // spawned yet — abandon instead of inserting a PTY the snapshot will
+            // never visit. (`prepared` drops -> sidecar discarded.)
             if state
                 .shutdown_started
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                let killed = state.registry.kill_all();
                 tracing::info!(
                     target: "freshell_ws::spawn_gate",
-                    request_id = %request_id,
-                    killed,
-                    "restore_create_settled_during_shutdown_reaped"
+                    request_id = %create.request_id,
+                    "restore_create_abandoned_for_shutdown"
                 );
+                state.create_dedupe.clear_if_in_flight(&create.request_id);
+                return;
             }
-        })
-        .await;
-        // Hold settled (fast path): silence the slow-hold watchdog.
-        hold_watchdog.abort();
-    }
-    .instrument(tracing::Span::current()));
+            // Permit held across PTY spawn -> registry insert -> meta/identity ->
+            // terminal.created -> broadcasts (the spawn-to-settled requirement,
+            // pinned by permit_released_only_after_work_completes). Codex
+            // planning happens ABOVE, outside the permit — the hold is now fast
+            // and mode-uniform. Replies go through the non-blocking conn sink,
+            // so no stalled client can wedge the permit (the da5d9b5c hazard
+            // still cannot exist on this path).
+            let request_id = create.request_id.clone();
+            // A5 residual signal (V3), hold side: the permit-held awaits below
+            // are deadline-free (PTY spawn terminal.rs:2253-2269, association
+            // fs walk :2431-2454, fsync ledger writes :2517-2545) — a wedged
+            // hold would otherwise be invisible. Warn ONCE at ~30s while the
+            // hold is still in flight; abort the watchdog when the hold
+            // settles. Logging only — no frames, no protocol change.
+            let hold_watchdog = tokio::spawn({
+                let request_id = request_id.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tracing::warn!(
+                        target: "freshell_ws::spawn_gate",
+                        request_id = %request_id,
+                        "spawn_gate_permit_hold_slow"
+                    );
+                }
+                // DIAG-01: keep the connection context on the watchdog event too.
+                .instrument(tracing::Span::current())
+            });
+            hold_permit_across(permit, async {
+                let mut out = CreateOutput::Channel(&sink);
+                // Fresh limiter, never consulted: `handle_create`'s rate-limit
+                // check is gated on `create.restore != Some(true)`, and this
+                // path is restore:true by construction (the `if create.restore
+                // == Some(true)` branch in `handle_client_text`) — so this is a
+                // throwaway to satisfy the shared signature, not a live budget.
+                let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+                    state.create_protect.rate_limit,
+                    state.create_protect.rate_window_ms,
+                );
+                let _ = crate::terminal::handle_create(
+                    create,
+                    Some(prepared),
+                    &mut out,
+                    &state,
+                    conn_id,
+                    pane_reconcile_v1,
+                    &mut create_limiter,
+                )
+                .await;
+                // Covers create failure: no-op when handle_create settled the entry,
+                // drops the InFlight sentinel (failing waiters loud) when it did not.
+                state.create_dedupe.clear_if_in_flight(&request_id);
+                // A10 shutdown-race post-check (V3): shutdown may have begun DURING
+                // the create, after main's kill_all snapshot. The server is reaping
+                // everything anyway, so an idempotent kill_all here reaps our own
+                // just-inserted terminal (and any other late insert). Belt to the
+                // pre-check's braces; main.rs adds a drain re-sweep too (Task 7
+                // Step 2b).
+                if state
+                    .shutdown_started
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let killed = state.registry.kill_all();
+                    tracing::info!(
+                        target: "freshell_ws::spawn_gate",
+                        request_id = %request_id,
+                        killed,
+                        "restore_create_settled_during_shutdown_reaped"
+                    );
+                }
+            })
+            .await;
+            // Hold settled (fast path): silence the slow-hold watchdog.
+            hold_watchdog.abort();
+        }
+        .instrument(tracing::Span::current()),
+    );
 }
 
 #[cfg(test)]

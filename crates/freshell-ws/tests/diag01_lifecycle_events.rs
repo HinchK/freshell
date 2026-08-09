@@ -442,8 +442,7 @@ async fn diag01_in_connection_events_carry_the_connection_id() {
                     continue;
                 };
                 if value.get("type").and_then(|v| v.as_str()) == Some("terminal.created")
-                    && value.get("requestId").and_then(|v| v.as_str())
-                        == Some(request_id.as_str())
+                    && value.get("requestId").and_then(|v| v.as_str()) == Some(request_id.as_str())
                 {
                     wire_terminal_id = value
                         .get("terminalId")
@@ -464,11 +463,10 @@ async fn diag01_in_connection_events_carry_the_connection_id() {
     while tokio::time::Instant::now() < deadline {
         let present = {
             let captured = events.lock().unwrap();
-            captured[start_index..]
-                .iter()
-                .any(|e| e.message == "terminal.created"
-                    && e.fields.get("terminal_id").map(String::as_str)
-                        == Some(terminal_id.as_str()))
+            captured[start_index..].iter().any(|e| {
+                e.message == "terminal.created"
+                    && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+            })
         };
         if present {
             break;
@@ -484,8 +482,10 @@ async fn diag01_in_connection_events_carry_the_connection_id() {
     // an event name here).
     let created = captured[start_index..]
         .iter()
-        .find(|e| e.message == "terminal.created"
-            && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str()))
+        .find(|e| {
+            e.message == "terminal.created"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+        })
         .expect("expected a terminal.created tracing event for our terminal_id");
     let conn_id = created
         .fields
@@ -505,8 +505,7 @@ async fn diag01_in_connection_events_carry_the_connection_id() {
     for name in ["ws.connection.established", "ws.connection.closed"] {
         let matching = captured[start_index..]
             .iter()
-            .any(|e| e.message == name
-                && e.fields.get("connection_id") == Some(&conn_id));
+            .any(|e| e.message == name && e.fields.get("connection_id") == Some(&conn_id));
         assert!(
             matching,
             "expected a {name} event with connection_id {conn_id}"
