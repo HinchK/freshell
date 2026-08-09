@@ -15,16 +15,14 @@ mod common;
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use futures_util::SinkExt;
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Connect + hello, then scan the ordered handshake frames for
 /// `settings.updated` (bounded; the clean handshake is 4 frames:
 /// ready -> settings.updated -> perf.logging -> terminal.inventory).
-async fn connect_and_capture_settings_updated(
-    url: &str,
-) -> (common::TestWs, serde_json::Value) {
+async fn connect_and_capture_settings_updated(url: &str) -> (common::TestWs, serde_json::Value) {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");

@@ -108,8 +108,8 @@ pub struct WsState {
     /// CFG-12: the LIVE server-settings tree, resolved on EVERY `/ws`
     /// connection for the handshake's `settings.updated` frame (legacy
     /// parity: the original's `handshakeSnapshotProvider` awaits
-    /// `configStore.getSettings()` per connection, `server/index.ts:415-427`
-    /// + `ws-handler.ts:1815-1845`). Freshell-server wires
+    /// `configStore.getSettings()` per connection (`server/index.ts:415-427`,
+    /// sent via `ws-handler.ts:1815-1845`). Freshell-server wires
     /// `SettingsStore::shared_settings_lock()` in here, so a value committed
     /// by `PATCH /api/settings` is exactly what the next (re)connecting
     /// client's handshake carries — with the client's last-write-wins

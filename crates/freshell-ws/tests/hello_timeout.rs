@@ -60,6 +60,9 @@ async fn spawn_server(hello_timeout_ms: u64) -> String {
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: Arc::new(tokio::sync::RwLock::new(
+            serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
+        )),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),

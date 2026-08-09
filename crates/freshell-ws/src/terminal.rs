@@ -5678,7 +5678,9 @@ mod terminal_meta_created_tests {
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
             boot_id: std::sync::Arc::new("boot-2222".to_string()),
             settings: std::sync::Arc::new(crate::test_settings()),
-            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
+            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::test_settings(),
+            )),
             broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
