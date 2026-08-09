@@ -43,9 +43,13 @@ const jsonOutput = process.env.GATE01_JSON_OUTPUT
 export default defineConfig({
   ...baseConfig,
   // Both legs compare screenshots against the SAME committed `chromium`
-  // baselines (see header comment).
+  // baselines (see header comment). NB: `{snapshotDir}/{testFilePath}` is the
+  // pair that reproduces the default on-disk `-snapshots` layout — using
+  // `{testFileDir}/{testFileName}` resolves to the EMPTY string + bare name
+  // for specs sitting directly in testDir, which broke with EACCES mkdir
+  // '/<spec>-snapshots' in the first slice-0 attempt.
   snapshotPathTemplate:
-    '{testFileDir}/{testFileName}-snapshots/{arg}-chromium-{platform}{ext}',
+    '{snapshotDir}/{testFilePath}-snapshots/{arg}-chromium-{platform}{ext}',
   // Keep human progress on the console AND emit a machine-readable report
   // when the runner asks for one (GATE01_JSON_OUTPUT is per-slice).
   reporter: jsonOutput

@@ -30,7 +30,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-REPORTS="$ROOT/test/e2e-browser/gate01-reports"
+# Reports go under the repo-root test-results/ tree: already gitignored (the
+# committed artifact is gate01-baseline.json; per-slice JSON is working state).
+REPORTS="$ROOT/test-results/gate01-reports"
 BASELINE="$ROOT/test/e2e-browser/gate01-baseline.json"
 HOLDER="${DF1_HOLDER:-df1-gate-01-unchanged-suite-both}"
 ACQUIRE="${DF1_ACQUIRE:-/home/dan/code/freshell/.worktrees/df1-control/df1-control/scripts/acquire.sh}"
