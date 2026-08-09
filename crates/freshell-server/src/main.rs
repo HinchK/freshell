@@ -25,6 +25,7 @@ mod extensions;
 mod files;
 mod identity_sink;
 mod instance_id;
+mod legacy_local_seed;
 mod logging;
 mod managed_ports;
 mod net_bind;

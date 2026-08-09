@@ -100,6 +100,14 @@ pub struct SettingsStore {
     /// fields, no heap data) -- matches the struct's own "Cheap to clone"
     /// contract, so no `Arc` wrapper is needed.
     config_fallback: Option<ConfigFallback>,
+    /// CFG-04: the boot-extracted/merged `legacyLocalSettingsSeed`
+    /// (`crate::legacy_local_seed`), served ONLY via `/api/bootstrap`
+    /// (`boot.rs`) and written to (or removed from) `config.json` on every
+    /// persist. Computed once during [`SettingsStore::load`] and never
+    /// mutated afterwards — mirroring the legacy `ConfigStore`'s cached copy
+    /// (`config-store.ts:337-347,459-462`) — so it needs no lock and is
+    /// cloned out per request, like `config_fallback`.
+    legacy_local_settings_seed: Option<Value>,
 }
 
 /// Throttle + change-detection state for [`SettingsStore::maybe_reload_overrides`].
@@ -176,6 +184,19 @@ impl SettingsStore {
             maybe_restore_config_from_backup(home);
         }
         let mut settings = load_full_settings(home);
+
+        // CFG-04: extract + merge the legacy local-settings seed from the raw
+        // document (`config-store.ts#loadInternal`: local-only keys move out
+        // of `settings` into a top-level `legacyLocalSettingsSeed`; a stored
+        // seed wins on conflict but merges with freshly-extracted strays).
+        // This runs AFTER `maybe_restore_config_from_backup`, so the read
+        // below sees the same recovered document as every other tolerant
+        // loader. `seed_normalization_persist` is the seed-scoped half of the
+        // original's `shouldPersistNormalizedConfig` (config-store.ts:364-366):
+        // true when local keys were stripped out of `settings`, or the merged
+        // seed differs from the raw stored key (incl. garbage → removal).
+        let (legacy_local_settings_seed, seed_normalization_persist) =
+            load_legacy_local_settings_seed(home);
 
         // (1) Legacy default-enabled migration (`settings-migrate.ts:17-49`).
         let mut migrated_legacy = false;
@@ -261,8 +282,9 @@ impl SettingsStore {
             overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
             reload_throttle_window: std::time::Duration::from_secs(1),
             config_fallback,
+            legacy_local_settings_seed,
         };
-        if needs_persist {
+        if needs_persist || seed_normalization_persist {
             // GAP2 legacy parity (`config-store.ts:367-374`): a failed
             // BOOT-time normalization/seed-migration persist logs a warning
             // and keeps running on the in-memory value -- there is no HTTP
@@ -301,6 +323,17 @@ impl SettingsStore {
     /// (`config-store.ts:304-306`).
     pub fn config_fallback(&self) -> Option<ConfigFallback> {
         self.config_fallback.clone()
+    }
+
+    /// CFG-04: the boot-extracted `legacyLocalSettingsSeed`
+    /// (`config-store.ts#getLegacyLocalSettingsSeed`, `config-store.ts:459-462`).
+    /// Served ONLY by `/api/bootstrap` — the seed is a bootstrap-time
+    /// migration bridge for fresh browser/WebView profiles, never part of the
+    /// live settings tree, `/api/settings`, or any WS message. Immutable after
+    /// boot (the legacy store likewise never mutates it post-load), so this is
+    /// a plain clone-out accessor.
+    pub fn legacy_local_settings_seed(&self) -> Option<Value> {
+        self.legacy_local_settings_seed.clone()
     }
 
     /// Deep-merge `patch_body` into the live settings (R1: same handler for
@@ -445,6 +478,20 @@ impl SettingsStore {
             "settings".to_string(),
             serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
         );
+        // CFG-04 owned key: the boot-extracted `legacyLocalSettingsSeed`.
+        // Written from memory when present; REMOVED when `None` — JS parity:
+        // the legacy config object carries `legacyLocalSettingsSeed:
+        // undefined` in that case, and `JSON.stringify` omits `undefined`
+        // object members, so "absent" (never "null") is the legacy on-disk
+        // shape.
+        match &self.legacy_local_settings_seed {
+            Some(seed) => {
+                map.insert("legacyLocalSettingsSeed".to_string(), seed.clone());
+            }
+            None => {
+                map.remove("legacyLocalSettingsSeed");
+            }
+        }
 
         // ADOPT-FROM-DISK MERGE (Batch B hardening): fresh disk read,
         // overlaid with ONLY the keys this process marked dirty. A key
@@ -1290,6 +1337,48 @@ fn load_full_settings(home: Option<&Path>) -> ServerSettings {
     let mut merged = serde_json::to_value(&defaults).unwrap_or_else(|_| json!({}));
     deep_merge(&mut merged, persisted);
     serde_json::from_value(merged).unwrap_or(defaults)
+}
+
+/// CFG-04: replicate the seed half of `config-store.ts#loadInternal`. Reads
+/// the raw `config.json` once (tolerantly — any read/parse failure degrades to
+/// "no seed", like every other loader in this module) and returns:
+///
+/// * the seed itself: `extractLegacyLocalSettingsSeed(rawSettings)` merged
+///   with the stored top-level key via `mergeLocalSettings(extracted,
+///   stored)`-when-stored semantics (`stored` wins on conflict;
+///   `config-store.ts:333-339`). A non-object stored key counts as absent for
+///   the merge but still schedules a normalization persist below, matching the
+///   original's raw-vs-normalized `JSON.stringify` comparison;
+/// * whether the seed machinery requires the boot normalization persist:
+///   `extracted.is_some()` (local keys were inside `settings`, which the typed
+///   `ServerSettings` round-trip strips on the next write — the original's
+///   first `shouldPersistNormalizedConfig` clause, seed-scoped) OR the merged
+///   seed differs from the RAW stored key (`config-store.ts:366`), including
+///   `Some`↔`None` transitions (garbage or un-normalizable stored content gets
+///   dropped from disk).
+fn load_legacy_local_settings_seed(home: Option<&Path>) -> (Option<Value>, bool) {
+    let Some(home) = home else {
+        return (None, false);
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return (None, false);
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return (None, false);
+    };
+
+    let extracted = doc
+        .get("settings")
+        .and_then(crate::legacy_local_seed::extract_legacy_local_settings_seed);
+    let stored_raw = doc.get("legacyLocalSettingsSeed");
+    let stored = stored_raw
+        .filter(|v| v.is_object())
+        .and_then(crate::legacy_local_seed::extract_legacy_local_settings_seed);
+    let merged = crate::legacy_local_seed::merge_legacy_seeds(extracted.as_ref(), stored.as_ref());
+
+    let seed_changed = merged.as_ref() != stored_raw;
+    (merged, extracted.is_some() || seed_changed)
 }
 
 /// Read an existing `serverSecrets.codexDisplayIdSecret` from `config.json`
@@ -2322,6 +2411,242 @@ mod tests {
     fn uuid_like() -> String {
         format!("{}-{:?}", std::process::id(), std::time::SystemTime::now())
             .replace([':', '.', ' '], "-")
+    }
+
+    // ── CFG-04: legacyLocalSettingsSeed ─────────────────────────────────────
+
+    /// A pre-settings-split legacy `config.json`: browser-local preferences
+    /// still live INSIDE `settings` (theme/scale/terminal font/sidebar
+    /// presentation/sound — the five categories CFG-04 names), alongside the
+    /// server-backed `sidebar.excludeFirstChat*` knobs (SESSION-13's surface,
+    /// which must NOT move).
+    fn write_legacy_mixed_config(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{
+  "version": 1,
+  "settings": {
+    "network": { "configured": true, "host": "127.0.0.1" },
+    "theme": "light",
+    "uiScale": 1.25,
+    "terminal": { "scrollback": 4000, "fontSize": 18, "fontFamily": "Fira Code" },
+    "sidebar": {
+      "excludeFirstChatSubstrings": ["welcome"],
+      "excludeFirstChatMustStart": false,
+      "sortMode": "project",
+      "width": 280,
+      "collapsed": true
+    },
+    "notifications": { "soundEnabled": false }
+  }
+}"#,
+        )
+        .unwrap();
+    }
+
+    /// The exact seed the legacy Node server extracts from
+    /// `write_legacy_mixed_config` (matches `extractLegacyLocalSettingsSeed`'s
+    /// real output — byte-pinned in `legacy_local_seed.rs`'s own tests).
+    fn expected_mixed_seed() -> Value {
+        json!({
+            "theme": "light",
+            "uiScale": 1.25,
+            "terminal": { "fontSize": 18, "fontFamily": "Fira Code" },
+            "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+            "notifications": { "soundEnabled": false }
+        })
+    }
+
+    fn read_disk_config(dir: &Path) -> Value {
+        let text = std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Boot extraction: the seed is extracted out of the legacy mixed
+    /// `settings`, holds all five CFG-04 categories, is stripped from the live
+    /// server-settings tree, and the server-backed exclusion knobs stay put.
+    #[tokio::test]
+    async fn legacy_mixed_config_seeds_and_strips_at_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+
+        let store = store_at(&dir);
+        assert_eq!(
+            store.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+
+        let live = store.get().await;
+        // Server-backed settings survive untouched (SESSION-13 boundary).
+        assert_eq!(live.terminal.scrollback, 4000);
+        assert_eq!(
+            live.sidebar.exclude_first_chat_substrings,
+            vec!["welcome".to_string()]
+        );
+        assert!(!live.sidebar.exclude_first_chat_must_start);
+        // The live tree cannot carry local keys at all (typed struct) — the
+        // disk assertion below proves they were stripped, not silently kept.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The boot normalization persist moves local keys out of `settings` and
+    /// writes the merged top-level seed, exactly like the legacy
+    /// `shouldPersistNormalizedConfig` re-persist.
+    #[tokio::test]
+    async fn boot_persist_strips_local_keys_and_writes_seed() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+        let _store = store_at(&dir);
+
+        let disk = read_disk_config(&dir);
+        assert_eq!(disk["legacyLocalSettingsSeed"], expected_mixed_seed());
+        let settings = disk["settings"].as_object().unwrap();
+        assert!(!settings.contains_key("theme"));
+        assert!(!settings.contains_key("uiScale"));
+        assert!(!settings.contains_key("notifications"));
+        let terminal = settings["terminal"].as_object().unwrap();
+        assert!(!terminal.contains_key("fontSize"));
+        assert!(!terminal.contains_key("fontFamily"));
+        assert_eq!(terminal["scrollback"], json!(4000));
+        let sidebar = settings["sidebar"].as_object().unwrap();
+        assert!(!sidebar.contains_key("sortMode"));
+        assert!(!sidebar.contains_key("width"));
+        assert!(!sidebar.contains_key("collapsed"));
+        assert_eq!(sidebar["excludeFirstChatSubstrings"], json!(["welcome"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second boot over the normalized file must rewrite NOTHING: the seed
+    /// change-check converges (merged == stored), and no other boot migration
+    /// fires — the file is byte-stable (side-by-side bake-in safety with the
+    /// legacy server reading the same home).
+    #[tokio::test]
+    async fn seeded_boot_is_byte_stable_on_second_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        let discovered = vec!["claude".to_string(), "codex".to_string()];
+        write_legacy_mixed_config(&dir);
+        let store1 = SettingsStore::load(Some(&dir), discovered.clone());
+        assert_eq!(
+            store1.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+        drop(store1);
+        let bytes1 = std::fs::read(dir.join(".freshell").join("config.json")).unwrap();
+
+        let store2 = SettingsStore::load(Some(&dir), discovered);
+        assert_eq!(
+            store2.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+        drop(store2);
+        let bytes2 = std::fs::read(dir.join(".freshell").join("config.json")).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&bytes1),
+            String::from_utf8_lossy(&bytes2),
+            "second boot rewrote the normalized config"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `config-store.ts:337-339`: `stored ? mergeLocalSettings(extracted,
+    /// stored) : extracted` — a pre-existing top-level seed wins on conflict
+    /// while extracted-only sections still join the merged seed.
+    #[tokio::test]
+    async fn stored_seed_wins_over_stray_local_keys_at_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{
+  "version": 1,
+  "settings": { "terminal": { "fontSize": 22 } },
+  "legacyLocalSettingsSeed": { "theme": "dark" }
+}"#,
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+        assert_eq!(
+            store.legacy_local_settings_seed(),
+            Some(json!({
+                "terminal": { "fontSize": 22 },
+                "theme": "dark"
+            }))
+        );
+        let disk = read_disk_config(&dir);
+        assert_eq!(
+            disk["legacyLocalSettingsSeed"],
+            json!({ "terminal": { "fontSize": 22 }, "theme": "dark" })
+        );
+        assert!(disk["settings"]["terminal"].get("fontSize").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every writer keeps the seed: an unrelated PATCH must not lose the
+    /// seeded `legacyLocalSettingsSeed` from `config.json` (the CFG-01
+    /// losslessness clause applied to this store's owned key).
+    #[tokio::test]
+    async fn seed_survives_unrelated_patch() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+        let store = store_at(&dir);
+        store
+            .patch(&json!({ "logging": { "debug": true } }))
+            .await
+            .expect("patch succeeds");
+
+        let disk = read_disk_config(&dir);
+        assert_eq!(disk["legacyLocalSettingsSeed"], expected_mixed_seed());
+        assert_eq!(disk["settings"]["logging"]["debug"], json!(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fresh install: no seed is synthesized, no seed key is ever written —
+    /// not at boot, not after an unrelated PATCH.
+    #[tokio::test]
+    async fn fresh_install_has_no_seed_and_never_writes_one() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        let store = store_at(&dir);
+        assert_eq!(store.legacy_local_settings_seed(), None);
+        store
+            .patch(&json!({ "logging": { "debug": true } }))
+            .await
+            .expect("patch succeeds");
+        let disk = read_disk_config(&dir);
+        assert!(
+            disk.get("legacyLocalSettingsSeed").is_none(),
+            "unexpected seed key on disk: {disk}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A garbage stored seed (non-object, or object with nothing valid) is
+    /// normalized away and removed from disk at boot, exactly like the legacy
+    /// `JSON.stringify(existing) !== JSON.stringify(normalized)` re-persist.
+    #[tokio::test]
+    async fn garbage_stored_seed_is_dropped_at_boot() {
+        for raw_seed in [r#""nope""#, r#"{"theme":"neon"}"#] {
+            let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            std::fs::write(
+                dir.join(".freshell").join("config.json"),
+                format!(
+                    r#"{{"version":1,"settings":{{"network":{{"configured":true,"host":"127.0.0.1"}}}},"legacyLocalSettingsSeed":{raw_seed}}}"#
+                ),
+            )
+            .unwrap();
+
+            let store = store_at(&dir);
+            assert_eq!(store.legacy_local_settings_seed(), None, "raw: {raw_seed}");
+            let disk = read_disk_config(&dir);
+            assert!(
+                disk.get("legacyLocalSettingsSeed").is_none(),
+                "garbage seed key survived on disk (raw: {raw_seed}): {disk}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// The real acceptance for the settings model: default settings + the
