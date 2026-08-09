@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import type { Page } from '@playwright/test'
+import type { Page, Response } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -113,9 +113,64 @@ function headerSwatch(page: Page, projectPath: string) {
 }
 
 /**
+ * Rust-leg recovery-offer handling (gate B001 fix2). The Rust server alone
+ * implements `GET /api/recovery/inventory` (B3/P1.9; legacy 404s and the
+ * client's `.catch` stays quiet — a documented KNOWN DIVERGENCE of the
+ * matrix). On a FRESH browser boot (empty localStorage, so the D1
+ * `hadPersistedLayoutAtBoot` gate cannot suppress it) the client's
+ * `RecoveryOfferPanel` fetches the inventory once at mount; when the other
+ * context's already-pushed tab snapshot predates this boot's cutoff (A16),
+ * the panel opens — a `fixed inset-0` modal overlay that intercepts EVERY
+ * pointer event, so its unhandled appearance hangs any later click up to the
+ * whole test budget (exactly the B001 rust-leg red; same failure class as
+ * sidebar-registry-sync-rust.spec.ts:110-131, whose decline idiom this
+ * refines).
+ *
+ * Discipline: register the response waiter BEFORE the fresh-boot `goto`
+ * (the inventory fetch fires at mount, seconds ahead of the harness/WS
+ * waits), then branch on the OBSERVED response instead of the server kind —
+ * both servers answer the fetch (legacy 404), so no leg pays a blind
+ * panel-poll, and a rust offer that renders slowly (f3wp: >10 s under load)
+ * is still caught: `recoverable: true` on the wire is followed by a strict
+ * panel-visibility assertion before the decline click. Only FIRST boots need
+ * this: reloads have a persisted layout (D1 suppresses), and a decisive
+ * decline records dismissal + clears the pending offer.
+ */
+async function declineRecoveryOfferIfMade(
+  page: Page,
+  inventoryResponse: Promise<Response | null>,
+): Promise<void> {
+  const response = await inventoryResponse
+  if (!response || !response.ok()) return
+  const inventory = await response.json().catch(() => null) as { recoverable?: boolean } | null
+  if (inventory?.recoverable !== true) return
+  const panel = page.getByTestId('recovery-offer-panel')
+  await expect(panel).toBeVisible({ timeout: 30_000 })
+  await page.getByTestId('recovery-decline').click()
+  await expect(panel).toHaveCount(0)
+}
+
+/** Register the inventory waiter, then perform a fresh-context boot. */
+async function bootFreshPage(
+  page: Page,
+  info: { baseUrl: string; token: string },
+): Promise<TestHarness> {
+  const inventoryResponse = page.waitForResponse(
+    (r) => r.url().includes('/api/recovery/inventory'),
+    { timeout: 30_000 },
+  ).catch(() => null)
+  await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+  const harness = new TestHarness(page)
+  await harness.waitForHarness()
+  await harness.waitForConnection()
+  await declineRecoveryOfferIfMade(page, inventoryResponse)
+  return harness
+}
+
+/**
  * The History color gesture. `input[type=color]` receives no `fill()` support
  * guarantees, so set the value through the native setter (React's
-   * valueTracker bookkeeping) and dispatch a bubbling `input` event — that is
+ * valueTracker bookkeeping) and dispatch a bubbling `input` event — that is
  * what React's `onChange` listens for on this input, and the handler PUTs
  * `/api/project-colors` (`HistoryView.tsx`).
  */
@@ -173,16 +228,12 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
     try {
       // --- Context A + Context B both open, both on the History (Projects)
       // view, BEFORE any color is set: both swatches show the default. ---
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-      const harnessA = new TestHarness(page)
-      await harnessA.waitForHarness()
-      await harnessA.waitForConnection()
+      // Both are FRESH boots (the only boots the rust RecoveryOfferPanel can
+      // appear on — see declineRecoveryOfferIfMade's doc block).
+      const harnessA = await bootFreshPage(page, info)
       await openHistoryView(page)
 
-      await pageB.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-      const harnessB = new TestHarness(pageB)
-      await harnessB.waitForHarness()
-      await harnessB.waitForConnection()
+      const harnessB = await bootFreshPage(pageB, info)
       await openHistoryView(pageB)
 
       await expect(headerSwatch(page, ALPHA_PROJECT)).toHaveCSS('background-color', DEFAULT_COLOR_RGB)
