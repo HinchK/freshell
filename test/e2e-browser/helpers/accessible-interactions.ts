@@ -127,6 +127,12 @@ export async function expectAccessible(
  * element literally holds `document.activeElement`. Throws with guidance when
  * focus never lands — e.g. a `<div onclick>` (not focusable) misses every
  * time, which is the gate's keyboard-leg deliberate failure.
+ *
+ * Focus starts from the TOP of the document's tab order: the helper first
+ * blurs whatever is currently focused. This matters on real pages where a
+ * keyboard-input-capturing widget (the xterm.js helper textarea) legitimately
+ * swallows every Tab as terminal input — "reachable from document start" is
+ * the canonical keyboard-operability contract, and is what this asserts.
  */
 export async function focusByKeyboard(
   page: Page,
@@ -136,6 +142,10 @@ export async function focusByKeyboard(
   const maxTabs = options?.maxTabs ?? 60
   const tabKey = options?.tabKey ?? 'Tab'
   await expect(locator, 'focusByKeyboard target must exist and be visible').toBeVisible()
+  await page.evaluate(() => {
+    const el = document.activeElement as HTMLElement | null
+    if (el && el !== document.body) el.blur()
+  })
   for (let i = 0; i < maxTabs; i++) {
     await page.keyboard.press(tabKey)
     const focused = await locator
@@ -144,7 +154,8 @@ export async function focusByKeyboard(
     if (focused) return
   }
   throw new Error(
-    `focusByKeyboard: target never received keyboard focus after ${maxTabs} Tab presses. ` +
+    `focusByKeyboard: target never received keyboard focus after ${maxTabs} Tab presses ` +
+      'from the top of the document tab order. ' +
       'A control that cannot be reached by keyboard is not an accessible control. ' +
       SELECTOR_ENGINE_GUIDANCE,
   )
