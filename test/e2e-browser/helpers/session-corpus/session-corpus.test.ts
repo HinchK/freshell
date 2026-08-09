@@ -14,6 +14,12 @@ import { codexDatePath, writeCodexSession } from './codex.js'
 import { writeOpencodeCorpus, type OpencodeSessionSpec } from './opencode.js'
 import { writeAmplifierSession } from './amplifier.js'
 import { parseAmplifierMetadata } from '../../../../server/coding-cli/providers/amplifier.js'
+import { createNestedGitRepos, createWorktreePair } from './git-layout.js'
+import {
+  clearRepoRootCache,
+  resolveGitCheckoutRoot,
+  resolveGitRepoRoot,
+} from '../../../../server/coding-cli/utils.js'
 import {
   runOpencodeListingQuery,
   THREE_VIEWS_MARKER_SQL_PATTERN,
@@ -474,6 +480,53 @@ describe('session-corpus amplifier writer', () => {
       lastActivityAt: updated,
       visibility: 'listed',
     })
+  })
+})
+
+describe('session-corpus git layouts', () => {
+  it('nested git repos + subdir: production resolver collapses to the innermost valid .git dir', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const { outer, inner, subdir, fixture } = await createNestedGitRepos(ctx)
+
+    // structure: outer and inner both hold a VALID .git dir (HEAD file)
+    expect(await fsp.stat(path.join(outer, '.git', 'HEAD'))).toBeTruthy()
+    expect(await fsp.stat(path.join(inner, '.git', 'HEAD'))).toBeTruthy()
+    expect(fixture.kind).toBe('nested-repo')
+    expect(fixture.expectedProjectPath).toBe(inner)
+    // every fixture-internal file is hashed and declared
+    expect(fixture.internalFiles).toContain(
+      path.relative(home, path.join(outer, '.git', 'HEAD')).split(path.sep).join('/'))
+    expect(ctx.files.some((f) => f.path.endsWith('.git/HEAD'))).toBe(true)
+
+    clearRepoRootCache()
+    // The REAL production resolvers decide whether expectations are right.
+    expect(await resolveGitRepoRoot(inner)).toBe(inner)
+    expect(await resolveGitRepoRoot(path.join(inner, 'src'))).toBe(inner)
+    expect(await resolveGitRepoRoot(subdir)).toBe(outer)
+    expect(await resolveGitCheckoutRoot(inner)).toBe(inner)
+  })
+
+  it('worktree pair: .git FILE + commondir ⇒ repo root = main repo, checkout root = worktree', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const { mainRepo, wtCheckout, fixture } = await createWorktreePair(ctx)
+
+    // real git layout: wt/.git is a FILE pointing into main/.git/worktrees/<name>
+    const gitFile = await fsp.readFile(path.join(wtCheckout, '.git'), 'utf-8')
+    expect(gitFile).toBe(`gitdir: ${path.join(mainRepo, '.git', 'worktrees', path.basename(wtCheckout))}\n`)
+    const common = await fsp.readFile(
+      path.join(mainRepo, '.git', 'worktrees', path.basename(wtCheckout), 'commondir'), 'utf-8')
+    expect(common.trim()).toBe('../..')
+    expect(fixture).toMatchObject({
+      kind: 'worktree',
+      expectedProjectPath: mainRepo,
+      expectedCheckoutPath: wtCheckout,
+    })
+
+    clearRepoRootCache()
+    expect(await resolveGitRepoRoot(wtCheckout)).toBe(mainRepo)
+    expect(await resolveGitCheckoutRoot(wtCheckout)).toBe(wtCheckout)
   })
 })
 
