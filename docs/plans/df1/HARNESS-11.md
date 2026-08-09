@@ -64,8 +64,8 @@ Options weighed: **(a) custom ESLint rule** — rejected: the repo's flat `eslin
 - `ariaNamePattern(name: string): RegExp` — exact-match RegExp escape helper for stable names (`^Hide sidebar$` style), keeping specs free of hand-rolled escapes.
 - `SELECTOR_ENGINE_GUIDANCE: string` — the shared diagnostic sentence fragments ("Use getByRole with an accessible name ... see docs/plans/df1-evidence/HARNESS-11.md") reused by helper errors, the static gate, and the spec doc comments (DRY).
 
-- [ ] Write failing unit test for: empty/too-short name guard throws with guidance; valid name passes through (mock minimal `getByRole` receiver).
-- [ ] Implement; green; commit.
+- [x] Write failing unit test for: empty/too-short name guard throws with guidance; valid name passes through (mock minimal `getByRole` receiver).
+- [x] Implement; green; commit.
 
 ### Task 2: Static gate core
 
@@ -81,35 +81,35 @@ Options weighed: **(a) custom ESLint rule** — rejected: the repo's flat `eslin
 - `readBaselineFile` / `writeBaselineFile`, `BASELINE_REL = 'a11y-gate-baseline.json'`.
 - `SCAN_DIRS = ['specs', 'helpers', 'perf']`; skip `*.test.ts`, `fixtures/`, and the gate's own three files (self-exclusion documented: the gate file names are filtered).
 
-- [ ] Failing vitest cases first (inline sources + the committed probe pair read from disk): bad probe yields the expected multi-code violation list; good probe yields `[]`; directive with reason suppresses exactly its line; reasonless directive yields `allow-without-reason`; `.xterm` / `.xterm .xterm-viewport` exempt while `.fresh-agent-layout` denies; `text=`,`:visible`,`[data-context=...]`,`button[title=...]` pass; selector string inside a `/* comment */` never flags (the AST-vs-regex proof); `evaluateScan` deny on novel signature → exitCode 1, stale-only delta → exitCode 1, clean-vs-baseline → 0.
-- [ ] Implement; green; commit.
+- [x] Failing vitest cases first (inline sources + the committed probe pair read from disk): bad probe yields the expected multi-code violation list; good probe yields `[]`; directive with reason suppresses exactly its line; reasonless directive yields `allow-without-reason`; `.xterm` / `.xterm .xterm-viewport` exempt while `.fresh-agent-layout` denies; `text=`,`:visible`,`[data-context=...]`,`button[title=...]` pass; selector string inside a `/* comment */` never flags (the AST-vs-regex proof); `evaluateScan` deny on novel signature → exitCode 1, stale-only delta → exitCode 1, clean-vs-baseline → 0.
+- [x] Implement; green; commit.
 
 ### Task 3: CLI + baseline generation + npm script
 
 **Files:** create `test/e2e-browser/helpers/a11y-selector-gate-cli.ts`; create `test/e2e-browser/a11y-gate-baseline.json` (generated); modify `package.json` (one additive `test:e2e:a11y-gate` script line).
 
-- [ ] CLI: default warn (human-readable grouped report + summary-by-code + `next steps` footer, exit 0); `--deny` (same report, exit 1 iff novel or stale vs baseline); `--write-baseline` (regenerate from current scan, print delta); `--json` (machine report). Deterministic ordering (file, line).
-- [ ] Run warn-mode over the real tree (no pw needed); run `--write-baseline`; commit baseline + CLI + script.
-- [ ] RED/GREEN bite demo at CLI level (recorded verbatim into evidence): `tsx ... --deny` on the real tree exits 1 (novel violations exist pre-baseline... post-baseline re-run exits 0); probe-only temp scan of `css-dependent.bad.ts` denies. (Full outputs → evidence file.)
+- [x] CLI: default warn (human-readable grouped report + summary-by-code + `next steps` footer, exit 0); `--deny` (same report, exit 1 iff novel or stale vs baseline); `--write-baseline` (regenerate from current scan, print delta); `--json` (machine report). Deterministic ordering (file, line).
+- [x] Run warn-mode over the real tree (no pw needed); run `--write-baseline`; commit baseline + CLI + script.
+- [x] RED/GREEN bite demo at CLI level (recorded verbatim into evidence): `tsx ... --deny` on the real tree exits 1 (novel violations exist pre-baseline... post-baseline re-run exits 0); probe-only temp scan of `css-dependent.bad.ts` denies. (Full outputs → evidence file.)
 
 ### Task 4: Playwright helper self-test — green leg (roles/labels/keyboard on real UI)
 
 **Files:** create `test/e2e-browser/specs/harness-11-a11y-gate.spec.ts` (auto-runs under `chromium` project only).
 
-- [ ] Leg A: on `freshellPage`, using ONLY `byRole`/`expectAccessible`/`focusByKeyboard` + `page.keyboard`: assert "Hide sidebar" button has role button + accessible name; activate it via keyboard (Tab-focus + Enter); assert sidebar landmark hidden and "Show sidebar" button now present with role+name; assert "New shell tab" button accessible. No `.locator(`, no CSS, no testids in the spec itself.
-- [ ] Run under pw lease `--project=chromium`; iterate to green (T9 of the audit: if `not.toHaveAccessibleName` semantics differ from expectation, adjust helper internals — helper contract stays).
+- [x] Leg A: on `freshellPage`, using ONLY `byRole`/`expectAccessible`/`focusByKeyboard` + `page.keyboard`: assert "Hide sidebar" button has role button + accessible name; activate it via keyboard (Tab-focus + Enter); assert sidebar landmark hidden and "Show sidebar" button now present with role+name; assert "New shell tab" button accessible. No `.locator(`, no CSS, no testids in the spec itself.
+- [x] Run under pw lease `--project=chromium`; iterate to green (T9 of the audit: if `not.toHaveAccessibleName` semantics differ from expectation, adjust helper internals — helper contract stays).
 
 ### Task 5: Playwright helper self-test — red leg (inaccessible fixture control)
 
 **Files:** same spec.
 
-- [ ] Leg B: `page.setContent('<div class="btn btn-primary" onclick="...">Deploy</div>')`; assert `expectAccessible(rawLocator)` rejects with the guidance diagnostic; assert `focusByKeyboard` rejects ("never received keyboard focus"); assert `byRole(page, 'button', '')` throws synchronously. Each deliberate failure is captured via `await expect(...).rejects.toThrow(...)`/`expect(() => ...).toThrow(...)` so the suite is green while proving the gate fails hard.
-- [ ] Leg C (cheap, in-spec static bite): import `scanSource`, scan the committed probe pair from disk; assert bad probe non-empty with expected codes and good probe clean.
-- [ ] Commit per leg.
+- [x] Leg B: `page.setContent('<div class="btn btn-primary" onclick="...">Deploy</div>')`; assert `expectAccessible(rawLocator)` rejects with the guidance diagnostic; assert `focusByKeyboard` rejects ("never received keyboard focus"); assert `byRole(page, 'button', '')` throws synchronously. Each deliberate failure is captured via `await expect(...).rejects.toThrow(...)`/`expect(() => ...).toThrow(...)` so the suite is green while proving the gate fails hard.
+- [x] Leg C (cheap, in-spec static bite): import `scanSource`, scan the committed probe pair from disk; assert bad probe non-empty with expected codes and good probe clean.
+- [x] Commit per leg.
 
 ### Task 6: Verify, evidence, review
 
-- [ ] Focused green x2: `npm run test:e2e:helpers` (gate + helper unit tests) and the pw spec (pw lease) each twice (flaky protocol); `npx tsc --noEmit` scope for the new files via the repo's typecheck path; `npm run lint` unchanged clean (src-only).
-- [ ] Gate report at baseline committed → counts + file list into `docs/plans/df1-evidence/HARNESS-11.md` (JAN-87-style), incl. verbatim red/green outputs, the design decision, the warn-turn-deny convention text, and GREEN COMMANDS.
-- [ ] Fresh-eyes review loop via Task subagent with review-agent skill (≤5 rounds); fix findings; record in evidence.
-- [ ] `df1ctl.py update HARNESS-11` state=review, terminal=COMPLETED.
+- [x] Focused green x2: `npm run test:e2e:helpers` (gate + helper unit tests) and the pw spec (pw lease) each twice (flaky protocol); `npx tsc --noEmit` scope for the new files via the repo's typecheck path; `npm run lint` unchanged clean (src-only).
+- [x] Gate report at baseline committed → counts + file list into `docs/plans/df1-evidence/HARNESS-11.md` (JAN-87-style), incl. verbatim red/green outputs, the design decision, the warn-turn-deny convention text, and GREEN COMMANDS.
+- [x] Fresh-eyes review loop via Task subagent with review-agent skill (≤5 rounds); fix findings; record in evidence.
+- [x] `df1ctl.py update HARNESS-11` state=review, terminal=COMPLETED.
