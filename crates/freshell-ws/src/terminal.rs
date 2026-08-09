@@ -5460,26 +5460,8 @@ mod terminals_changed_tests {
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
-            settings: Arc::new(
-                serde_json::from_value(serde_json::json!({
-                    "ai": {},
-                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-                    "editor": { "externalEditor": "auto" },
-                    "extensions": { "disabled": [] },
-                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-                    "logging": { "debug": false },
-                    "network": { "configured": true, "host": "127.0.0.1" },
-                    "panes": { "defaultNewPane": "ask" },
-                    "safety": { "autoKillIdleMinutes": 15 },
-                    "sidebar": {
-                        "autoGenerateTitles": true,
-                        "excludeFirstChatMustStart": false,
-                        "excludeFirstChatSubstrings": []
-                    },
-                    "terminal": { "scrollback": 10000 }
-                }))
-                .unwrap(),
-            ),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
@@ -5695,26 +5677,8 @@ mod terminal_meta_created_tests {
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
             boot_id: std::sync::Arc::new("boot-2222".to_string()),
-            settings: std::sync::Arc::new(
-                serde_json::from_value(serde_json::json!({
-                    "ai": {},
-                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-                    "editor": { "externalEditor": "auto" },
-                    "extensions": { "disabled": [] },
-                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-                    "logging": { "debug": false },
-                    "network": { "configured": true, "host": "127.0.0.1" },
-                    "panes": { "defaultNewPane": "ask" },
-                    "safety": { "autoKillIdleMinutes": 15 },
-                    "sidebar": {
-                        "autoGenerateTitles": true,
-                        "excludeFirstChatMustStart": false,
-                        "excludeFirstChatSubstrings": []
-                    },
-                    "terminal": { "scrollback": 10000 }
-                }))
-                .unwrap(),
-            ),
+            settings: std::sync::Arc::new(crate::test_settings()),
+            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
             broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
