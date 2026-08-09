@@ -260,3 +260,39 @@ Registration: append to MATRIX_SPECS:
 5. Both owned fixtures' `stop()` is safely callable twice.
 6. `wait-for?pattern=` works on REST-created terminal panes on both kinds
    (legacy `router.ts:959` `resolvePaneToTerminal` path; rust mirrors it).
+
+## Load-bearing audit ledger (2026-08-09, validated; method noted)
+
+1. **PTY children are /proc-ppid descendants of the server. VALIDATED (run
+   code, tier 1).** Live probe: a `setsid`-detached spawned child keeps
+   `ppid == spawner` (setsid changes PGID/SID, not PPID — same boundary
+   rust-server.ts's class doc comment documents for portable-pty children:
+   "their PPID stays the server's PID"). Legacy node-pty likewise spawns with
+   the node server as parent. Mid-loop assertion in Task 4 re-proves this
+   live on both server kinds.
+2. **`POST /api/tabs {mode:'shell'}` returns `{terminalId}` on both kinds.
+   VALIDATED (inspect, tier 2).** Legacy `server/agent-api/router.ts:791` and
+   `:816` both `res.json(ok({ tabId, paneId, terminalId }))`; Rust
+   `crates/freshell-freshagent/src/terminal_tabs.rs:2230` returns
+   `json!({ "tabId", "paneId", "terminalId" })` on the spawn path.
+3. **WS `{type:'terminal.kill'}` reaps the PTY on both kinds. VALIDATED
+   (inspect, tier 2).** Legacy `server/ws-handler.ts:3073` →
+   `registry.killAndWait(m.terminalId)`; Rust
+   `crates/freshell-ws/src/terminal.rs:4482` — "SIGKILL + reap the shared PTY
+   and remove it".
+4. **No persistent background helper processes at steady state. ACCEPTED
+   RESIDUAL RISK (medium→low).** If false, the post-settle assertion degrades
+   from absolute `processCount === 1` to baseline-relative growth (the diff
+   API already computes `processGrowth` against the captured baseline, and
+   the settle poll targets the recorded before-count, so no redesign needed);
+   confirmed or falsified at Task 4 runtime.
+5. **`stop()` is safely idempotent on both owned fixtures. VALIDATED
+   (inspect, tier 2).** TestServer: `terminateProcess()` early-returns on
+   null process, `cleanupArtifacts()` nulls `configDir`/`runtimeRoot` and
+   uses force+catch. RustServer: `killCurrentProcess()` early-returns on null
+   process; `stopProcess` skips home removal when `homeDir` is null.
+6. **`wait-for?pattern=` works for REST-created terminal panes on both kinds.
+   VALIDATED (inspect, tier 2).** Legacy `router.ts:959–1066`:
+   `resolvePaneToTerminal` → `registry.get` → regex vs
+   `renderCapture(term.buffer.snapshot())` poll, timeout via `?T=`/`?timeout=`
+   in SECONDS. Rust mirrors in `terminal_tabs.rs:2514 wait_for`.
