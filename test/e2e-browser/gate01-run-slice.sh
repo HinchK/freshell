@@ -60,7 +60,7 @@ HEAD="$(git -C "$ROOT" rev-parse HEAD)"
 BIN_SHA="$(sha256sum "$FRESHELL_E2E_RUST_SERVER_BIN" | cut -d' ' -f1)"
 
 if [ ! -f "$BASELINE" ]; then
-  (cd "$HERE" && nice -n 19 npx tsx gate01-collate.ts init --head "$HEAD" --bin-sha "$BIN_SHA")
+  (cd "$HERE" && nice -n 19 npx tsx helpers/gate01-collate.ts init --head "$HEAD" --bin-sha "$BIN_SHA")
 fi
 
 "$ACQUIRE" pw "$HOLDER" --wait 3600
@@ -77,4 +77,4 @@ kill "$HB_PID" 2>/dev/null || true
 HB_PID=""
 "$ACQUIRE" release pw "$HOLDER"
 
-(cd "$HERE" && nice -n 19 npx tsx gate01-collate.ts merge --report "$REPORT" --run "$RUN_ID" --head "$HEAD" --bin-sha "$BIN_SHA")
+(cd "$HERE" && nice -n 19 npx tsx helpers/gate01-collate.ts merge --report "$REPORT" --run "$RUN_ID" --head "$HEAD" --bin-sha "$BIN_SHA")
