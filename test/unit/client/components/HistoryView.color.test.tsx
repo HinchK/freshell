@@ -19,14 +19,30 @@ import { api } from '@/lib/api'
 
 // HistoryView calls into api helpers for refresh/rename/delete/color; keep
 // tests isolated (same convention as HistoryView.a11y.test.tsx).
-vi.mock('@/lib/api', () => ({
-  api: {
-    get: vi.fn().mockResolvedValue([]),
-    put: vi.fn().mockResolvedValue({}),
-    patch: vi.fn().mockResolvedValue({}),
-    delete: vi.fn().mockResolvedValue({}),
-  },
-}))
+// Spread the real module so pure named exports (e.g. isApiUnauthorizedError,
+// consumed by fetchSessionWindow's rejection handler) stay live; `api` stays
+// fully stubbed, and the thunk's direct network entry points are stubbed
+// benignly so no real fetch escapes.
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      get: vi.fn().mockResolvedValue([]),
+      put: vi.fn().mockResolvedValue({}),
+      patch: vi.fn().mockResolvedValue({}),
+      delete: vi.fn().mockResolvedValue({}),
+    },
+    fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    }),
+    searchSessions: vi.fn().mockResolvedValue({ results: [], hasMore: false }),
+  }
+})
 
 const COLORED_PATH = '/repo/colored'
 const PLAIN_PATH = '/repo/plain'

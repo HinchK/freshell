@@ -8,14 +8,30 @@ import sessionsReducer from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
 
 // HistoryView calls into api helpers for refresh/rename/delete; keep tests isolated.
-vi.mock('@/lib/api', () => ({
-  api: {
-    get: vi.fn().mockResolvedValue([]),
-    put: vi.fn().mockResolvedValue({}),
-    patch: vi.fn().mockResolvedValue({}),
-    delete: vi.fn().mockResolvedValue({}),
-  },
-}))
+// Spread the real module so pure named exports (e.g. isApiUnauthorizedError,
+// consumed by fetchSessionWindow's rejection handler) stay live; `api` stays
+// fully stubbed, and the thunk's direct network entry points are stubbed
+// benignly so no real fetch escapes.
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      get: vi.fn().mockResolvedValue([]),
+      put: vi.fn().mockResolvedValue({}),
+      patch: vi.fn().mockResolvedValue({}),
+      delete: vi.fn().mockResolvedValue({}),
+    },
+    fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    }),
+    searchSessions: vi.fn().mockResolvedValue({ results: [], hasMore: false }),
+  }
+})
 
 describe('HistoryView a11y', () => {
   beforeEach(() => {
