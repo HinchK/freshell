@@ -15,6 +15,7 @@ import { writeOpencodeCorpus, type OpencodeSessionSpec } from './opencode.js'
 import { writeAmplifierSession } from './amplifier.js'
 import { parseAmplifierMetadata } from '../../../../server/coding-cli/providers/amplifier.js'
 import { createNestedGitRepos, createWorktreePair } from './git-layout.js'
+import { buildSessionCorpus } from './index.js'
 import {
   clearRepoRootCache,
   resolveGitCheckoutRoot,
@@ -527,6 +528,110 @@ describe('session-corpus git layouts', () => {
     clearRepoRootCache()
     expect(await resolveGitRepoRoot(wtCheckout)).toBe(mainRepo)
     expect(await resolveGitCheckoutRoot(wtCheckout)).toBe(wtCheckout)
+  })
+})
+
+describe('session-corpus orchestrator', () => {
+  it('buildSessionCorpus: full inventory, pagination math, manifest round-trip, 100% hash coverage, markers', async () => {
+    const home = await mkHome()
+    const corpus = await buildSessionCorpus(home)
+    const m = corpus.manifest
+
+    // inventory: 67 listed / 7 absent / 4 hidden-default; >1 directory page at limit 50
+    const listed = m.sessions.filter((s) => s.visibility === 'listed')
+    const absent = m.sessions.filter((s) => s.visibility === 'absent')
+    const hidden = m.sessions.filter((s) => s.visibility === 'hidden-default')
+    expect(listed).toHaveLength(67)
+    expect(absent).toHaveLength(7)
+    expect(hidden).toHaveLength(4)
+    expect(m.pagination).toEqual({ listedCount: 67, pageLimit: 50, expectedPages: 2 })
+
+    // all four providers present among the listed sessions
+    for (const provider of ['claude', 'codex', 'opencode', 'amplifier']) {
+      expect(listed.some((s) => s.provider === provider)).toBe(true)
+    }
+
+    // all listed lastActivityAt values are distinct integers (stable cursor math)
+    const acts = listed.map((s) => s.lastActivityAt)
+    expect(new Set(acts).size).toBe(acts.length)
+    for (const a of acts) expect(Number.isInteger(a)).toBe(true)
+
+    // archived-override cohort: the 4 oldest listed sessions, flagged
+    const archived = listed.filter((s) => s.archived)
+    expect(archived.map((s) => s.role).sort()).toEqual([
+      'archived-amplifier', 'archived-claude', 'archived-codex', 'archived-opencode',
+    ])
+    const nonArchivedMax = Math.max(...listed.filter((s) => !s.archived).map((s) => s.lastActivityAt))
+    const archivedMax = Math.max(...archived.map((s) => s.lastActivityAt))
+    expect(archivedMax).toBeLessThan(nonArchivedMax)
+
+    // disk round-trip equality (the Playwright contract's core move)
+    const disk = await loadSessionCorpusManifest(home)
+    expect(disk).toEqual(m)
+    expect(corpus.manifestPath).toBe(path.join(home, '.freshell-corpus', 'manifest.json'))
+
+    // 100% hash coverage of files on disk (manifest file itself excluded)
+    const walked = await walkCoveragePaths(home)
+    const hashed = new Set(m.files.map((f) => f.path))
+    for (const rel of walked) {
+      if (rel === '.freshell-corpus/manifest.json') continue
+      expect(hashed.has(rel), `unhashed file ${rel}`).toBe(true)
+    }
+    // hashes verify against disk
+    for (const f of m.files) {
+      expect(await sha256File(path.join(home, f.path))).toBe(f.sha256)
+    }
+
+    // marker embedding: every session's cwd is inside the marker workspace;
+    // every DEFINED title carries it; non-claude session ids carry it
+    // (claude ids stay uuid-shaped for realism — claude tripwires use the
+    // cwd-derived project-slug dir name instead)
+    expect(corpus.marker).toMatch(/^h04corpus-[0-9a-z]+$/)
+    for (const s of m.sessions) {
+      expect(s.cwd, `${s.key} cwd`).toContain(corpus.marker)
+      if (s.title !== undefined) {
+        expect(s.title, `${s.key} title`).toContain(corpus.marker)
+      }
+      if (s.provider !== 'claude') {
+        expect(s.sessionId, `${s.key} sessionId`).toContain(corpus.marker)
+      }
+    }
+
+    // git fixtures recorded with expected resolutions
+    expect(m.gitFixtures.map((g) => g.kind).sort()).toEqual(['nested-repo', 'repo-subdir', 'worktree'])
+
+    // provider title sources: claude summary, opencode row title, amplifier name
+    const alpha = listed.find((s) => s.role === 'alpha')!
+    expect(alpha.title).toContain(corpus.marker)
+    expect(alpha.summary).toBe(alpha.title)
+    const delta = listed.find((s) => s.role === 'delta')!
+    expect(delta.title).toContain(corpus.marker)
+    const epsilon = listed.find((s) => s.role === 'epsilon')!
+    expect(epsilon.summary).toContain('summary')
+
+    // user-override layering on opencode echo
+    const echo = listed.find((s) => s.role === 'echo')!
+    expect(echo.title).toBe(`${corpus.marker} echo renamed`)
+    expect(echo.summary).toBe(`${corpus.marker} echo override summary`)
+
+    // freshell config on disk carries the overrides keyed by composite key
+    const cfg = JSON.parse(
+      await fsp.readFile(path.join(home, '.freshell', 'config.json'), 'utf-8'))
+    const deleted = m.sessions.find((s) => s.role === 'deleted-claude')!
+    expect(cfg.sessionOverrides[deleted.key]).toEqual({ deleted: true })
+    const archivedClaude = m.sessions.find((s) => s.role === 'archived-claude')!
+    expect(cfg.sessionOverrides[archivedClaude.key]).toEqual({ archived: true })
+    expect(cfg.settings.codingCli.enabledProviders)
+      .toEqual(['claude', 'codex', 'opencode', 'amplifier'])
+  })
+
+  it('bulkCount override scales the corpus while preserving invariants', async () => {
+    const home = await mkHome()
+    const corpus = await buildSessionCorpus(home, { bulkCount: 55, runToken: 'scaled01' })
+    expect(corpus.manifest.pagination.listedCount).toBe(70)
+    expect(corpus.marker).toBe('h04corpus-scaled01')
+    const bulk = corpus.manifest.sessions.filter((s) => s.role.startsWith('bulk-'))
+    expect(bulk).toHaveLength(55)
   })
 })
 
