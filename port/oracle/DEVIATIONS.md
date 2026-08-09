@@ -962,7 +962,7 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   (desync paths D3/D4/D7 audit: .the-usual-logs report client-title-sync.md; D8 + Overview:
   validator-A5).
 - evidence: test/e2e-browser/specs/title-sync-convergence.spec.ts (both projects, incl. the
-  Overview rename journey) + test/unit/client/store/paneSessionTitleSync.test.ts; commit <sha>.
+  Overview rename journey) + test/unit/client/store/paneSessionTitleSync.test.ts; commit 7db308811.
 - user_impact: renaming a session from the sidebar/history/terminal menus or the Overview page
   now updates the open pane header immediately on both servers, and renaming a pane whose
   coding-CLI terminal already exited still persists; previously the pane kept the stale name
