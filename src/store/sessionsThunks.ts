@@ -145,7 +145,24 @@ type VisibleResultIdentity = SessionWindowSearchContext & {
   resultVersion: number
 }
 
-function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): ProjectGroup[] {
+function mergeProjects(
+  existing: ProjectGroup[],
+  incoming: ProjectGroup[],
+  opts?: {
+    /**
+     * Which side's `color` wins when BOTH name the same project. The rule
+     * is "the later-fetched page wins" (server-authoritative) — NOT
+     * "incoming wins": the append/search-pagination callers fetch page N+1
+     * LATER than the stored window, so they use the default 'incoming',
+     * while the deep-window silent-refresh merge passes its FRESH page-1
+     * as `existing` (see the caller), so it must pass 'existing' or a
+     * stale color from the stored window would resurrect over the fetch
+     * (regression pinned by sessionsThunks.project-colors.test.ts).
+     */
+    preferColorsFrom?: 'existing' | 'incoming'
+  },
+): ProjectGroup[] {
+  const preferIncomingColors = opts?.preferColorsFrom !== 'existing'
   const projectMap = new Map<string, ProjectGroup>()
   const seenKeys = new Map<string, Set<string>>()
 
@@ -175,13 +192,15 @@ function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): Proj
       keys.add(key)
       current.sessions.push(session)
     }
-    // SESSION-05: the incoming page is server-authoritative for color.
-    // The previous additive-only adoption (`&& !current.color`) silently
-    // kept a STALE color when another browser changed it — the refetch
-    // after `sessions.changed` is the only recolor channel, so an incoming
-    // color must win. (Removal is unobservable: no server path deletes a
-    // project color, matching the legacy no-clear-UI surface.)
-    if (project.color) {
+    // SESSION-05: the later-fetched page is server-authoritative for
+    // color. The previous additive-only adoption (`&& !current.color`)
+    // silently kept a STALE color when another browser changed it — the
+    // refetch after `sessions.changed` is the only recolor channel, so a
+    // fresher fetched color must win. Which side that is depends on the
+    // caller (see the `preferColorsFrom` option doc). (Removal is
+    // unobservable: no server path deletes a project color, matching the
+    // legacy no-clear-UI surface.)
+    if (project.color && (preferIncomingColors || !current.color)) {
       current.color = project.color
     }
     seenKeys.set(project.projectPath, keys)
@@ -472,7 +491,12 @@ async function refreshVisibleSessionWindowSilently(args: {
       freshOldestTimestamp > 0 &&
       prevOldestTimestamp < freshOldestTimestamp
     const projects = hasDeeperWindow
-      ? mergeProjects(nextProjects, prevWindow?.projects ?? [])
+      // NOTE the argument-and-color-source asymmetry: `nextProjects` (the
+      // FRESH page-1 just fetched) occupies the `existing` slot so the
+      // deeper previously-loaded sessions accrete onto it — but its colors
+      // are the FRESHEST, so they must win the merge, unlike the default
+      // append/pagination direction (`mergeProjects` doc).
+      ? mergeProjects(nextProjects, prevWindow?.projects ?? [], { preferColorsFrom: 'existing' })
       : nextProjects
     commitData({
       surface,

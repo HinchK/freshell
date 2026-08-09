@@ -304,7 +304,15 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   // identical to before for the no-colors case.
   const projectColors: Record<string, string> = {}
   for (const project of input.projects) {
-    if (project.color) projectColors[project.projectPath] = project.color
+    // `typeof` guard: a junk non-string value in the hand-edited
+    // `config.json` map must not land on the page — the client parses it
+    // as `z.record(z.string(), z.string())` and a failure there would
+    // reject the whole session-window fetch. (Mirrors the store-side
+    // normalization in the Rust port and the client's own `typeof` check
+    // in `normalizeProjects`.)
+    if (typeof project.color === 'string' && project.color) {
+      projectColors[project.projectPath] = project.color
+    }
   }
   if (Object.keys(projectColors).length > 0) {
     page.projectColors = projectColors

@@ -1354,7 +1354,12 @@ fn load_terminal_overrides(home: Option<&Path>) -> serde_json::Map<String, Value
 /// (tolerant: any read/parse error or a non-object field degrades to
 /// empty — matching the original's load normalization
 /// `projectColors: existing.projectColors || {}`, `config-store.ts:358`,
-/// and `readConfigFile`'s tolerance).
+/// and `readConfigFile`'s tolerance). Entries with NON-STRING values are
+/// dropped on load (normalization, not a disk rewrite — the file keeps its
+/// junk until the next persist): the wire schema and the client both model
+/// the map as string-valued (`z.record(z.string(), z.string())` in
+/// `shared/read-models.ts`, `typeof` checks in `normalizeProjects`), so a
+/// hand-edited junk entry must not flow to the session-directory page.
 fn load_project_colors(home: Option<&Path>) -> serde_json::Map<String, Value> {
     let Some(home) = home else {
         return serde_json::Map::new();
@@ -1366,10 +1371,13 @@ fn load_project_colors(home: Option<&Path>) -> serde_json::Map<String, Value> {
     let Ok(doc) = serde_json::from_str::<Value>(&text) else {
         return serde_json::Map::new();
     };
-    doc.get("projectColors")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default()
+    let Some(obj) = doc.get("projectColors").and_then(Value::as_object) else {
+        return serde_json::Map::new();
+    };
+    obj.iter()
+        .filter(|(_, v)| v.is_string())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Load `config.sessionOverrides` from `<home>/.freshell/config.json` (tolerant:
@@ -3946,6 +3954,49 @@ mod tests {
             "a key this process touched must reflect Rust's last write"
         );
         assert_eq!(cfg["projectColors"]["/proj/cold"], json!("#222222"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// JUNK TOLERANCE: a hand-edited `projectColors` entry with a
+    /// non-string VALUE is dropped from the reader (the wire schema is
+    /// `z.record(z.string(), z.string())` and the client `typeof`-guards —
+    /// a junk value must never flow to the page or it would fail client
+    /// parse of the whole fetch). The disk file itself is left alone.
+    #[tokio::test]
+    async fn project_colors_drops_non_string_values_but_keeps_disk_asis() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {
+                    "/proj/good": "#ff0000",
+                    "/proj/junk": 42
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        let colors = store.project_colors();
+        assert_eq!(colors.get("/proj/good").and_then(Value::as_str), Some("#ff0000"));
+        assert!(
+            !colors.contains_key("/proj/junk"),
+            "a non-string color value must be normalized away, got: {colors:?}"
+        );
+
+        // The write path for a SIBLING key must not resurrect the junk
+        // into memory... and the persisted file keeps the original junk
+        // value for the untouched key only if it was never written
+        // (adopt-from-disk passes the disk map through).
+        store.set_project_color("/proj/other", "#00ff00").await.unwrap();
+        let colors = store.project_colors();
+        assert!(!colors.contains_key("/proj/junk"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

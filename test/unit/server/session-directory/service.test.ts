@@ -1087,6 +1087,19 @@ describe('querySessionDirectory file-based search', () => {
       expect(page.projectColors).toEqual({ '/repo/alpha': '#ff8800' })
     })
 
+    it('drops non-string (junk hand-edited) color values so the page keeps parsing client-side', async () => {
+      const page = await querySessionDirectory({
+        projects: [
+          { ...makeProject('/repo/alpha', [makeSession({ sessionId: 'a1', projectPath: '/repo/alpha', lastActivityAt: 100 })]), color: '#ff8800' },
+          { ...makeProject('/repo/junk', [makeSession({ sessionId: 'j1', projectPath: '/repo/junk', lastActivityAt: 90 })]), color: 42 as any },
+        ],
+        terminalMeta: [],
+        query: { priority: 'visible' },
+      })
+
+      expect(page.projectColors).toEqual({ '/repo/alpha': '#ff8800' })
+    })
+
     it('omits projectColors when no project has a color', async () => {
       const page = await querySessionDirectory({
         projects: [

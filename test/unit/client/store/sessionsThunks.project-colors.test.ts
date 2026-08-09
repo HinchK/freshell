@@ -131,6 +131,53 @@ describe('sessionsThunks project color merge (SESSION-05)', () => {
     expect(merged.color).toBe('#333333')
   })
 
+  it('cross-context recolor survives the deep-window silent refresh merge (fresh color wins)', async () => {
+    // Browser B has paginated PAST page 1 while holding color '#111111'.
+    // Browser A changes it to '#222222'; sessions.changed arrives; the
+    // silent refresh's deeper-window merge merges the STALE window over the
+    // FRESH page-1 — colors must still come from the fresh page.
+    const stalePageOneProject = projectGroup('/tmp/project-alpha', [session('alpha-new', '/tmp/project-alpha', 2_000)], '#111111')
+    const deepProject = projectGroup('/tmp/project-deep', [session('deep-old', '/tmp/project-deep', 1_000)], '#00dd00')
+
+    const store = createStore({
+      activeSurface: 'sidebar',
+      projects: [stalePageOneProject, deepProject],
+      lastLoadedAt: 2_000,
+      windows: {
+        sidebar: {
+          projects: [stalePageOneProject, deepProject],
+          lastLoadedAt: 2_000,
+          query: '',
+          searchTier: 'title',
+          appliedQuery: '',
+          appliedSearchTier: 'title',
+          loading: false,
+          hasMore: false,
+          oldestLoadedTimestamp: 1_000,
+          oldestLoadedSessionId: 'claude:deep-old',
+        },
+      },
+    })
+
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [projectGroup('/tmp/project-alpha', [session('alpha-new', '/tmp/project-alpha', 2_500)], '#222222')],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 2_500,
+      oldestIncludedSessionId: 'claude:alpha-new',
+      hasMore: true,
+    })
+
+    const { queueActiveSessionWindowRefresh } = await import('@/store/sessionsThunks')
+    await store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    const projects = store.getState().sessions.windows.sidebar.projects
+    const alpha = projects.find((p: any) => p.projectPath === '/tmp/project-alpha')
+    const deep = projects.find((p: any) => p.projectPath === '/tmp/project-deep')
+    expect(alpha.color).toBe('#222222')
+    expect(deep?.color).toBe('#00dd00')
+    expect(deep?.sessions.some((s: any) => s.sessionId === 'deep-old')).toBe(true)
+  })
+
   it('search windows carry the page colors through buildSearchPayload', async () => {
     searchSessions.mockResolvedValueOnce({
       results: [

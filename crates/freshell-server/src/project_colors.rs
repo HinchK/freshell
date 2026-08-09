@@ -87,10 +87,15 @@ fn received_word(v: &Value) -> &'static str {
 /// missing/null/wrong-type, `too_small`/`too_big` for the string bounds.
 /// `None` = valid.
 fn validate_project_color_body(body: &Value) -> Option<Value> {
-    // `req.body || {}`: a falsy JSON body (null/false/0/"") means the
-    // original validates `{}` and reports BOTH fields missing.
+    // `req.body || {}` (`project-colors-router.ts:19`): a falsy JSON body
+    // (null / false / 0 / "") means the original validates `{}` and
+    // reports BOTH fields missing.
+    static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let empty = || EMPTY.get_or_init(|| json!({}));
     let body = match body {
-        Value::Null | Value::Bool(false) => &json!({}),
+        Value::Null | Value::Bool(false) => empty(),
+        Value::String(s) if s.is_empty() => empty(),
+        Value::Number(n) if n.as_i64() == Some(0) || n.as_f64() == Some(0.0) => empty(),
         other => other,
     };
     let Value::Object(map) = body else {
@@ -296,9 +301,15 @@ mod tests {
         let (state, _rx) = state_at(&dir);
         let app = router(state);
 
-        for (label, body) in
-            [("empty object", json!({})), ("json null", Value::Null)]
-        {
+        for (label, body) in [
+            ("empty object", json!({})),
+            ("json null", Value::Null),
+            // `req.body || {}` — falsy scalars validate as `{}` in the
+            // original.
+            ("json false", json!(false)),
+            ("json zero", json!(0)),
+            ("json empty string", json!("")),
+        ] {
             let (status, resp) = put_json(&app, Some("tok"), &body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
             assert_eq!(resp["error"], json!("Invalid request"), "{label}");
