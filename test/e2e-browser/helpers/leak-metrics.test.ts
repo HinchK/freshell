@@ -1,4 +1,6 @@
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -304,5 +306,57 @@ describe('captureHostListeningPorts (fixture /proc)', () => {
       ['00000000000000000000000001000000:2328', '0A', '00000000', '00000000', '3'], // 9000
     ])
     expect(captureHostListeningPorts({ procRoot: tmpRoot })).toEqual([8080, 9000])
+  })
+})
+
+describe('real-wiring proofs (own processes only; reads only self-spawned trees)', () => {
+  it('snapshots this very test process with positive RSS, threads, and fds', () => {
+    const snap = captureResourceSnapshot([process.pid])
+    const self = snap.processes.find((p) => p.pid === process.pid)
+    expect(self).toBeDefined()
+    expect(self!.rssBytes).toBeGreaterThan(0)
+    expect(self!.threads).toBeGreaterThanOrEqual(1)
+    expect(self!.fdCount).toBeGreaterThan(0)
+    expect(snap.processCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('sees a real in-process TCP listener while bound and its port gone after close', async () => {
+    const server = net.createServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as net.AddressInfo).port
+
+    const snap = captureResourceSnapshot([process.pid])
+    expect(snap.listeningPorts).toContain(port)
+    const self = snap.processes.find((p) => p.pid === process.pid)!
+    expect(self.listeningPorts).toContain(port)
+    // A freshly-accepted LISTEN socket's accept backlog queue is zero.
+    expect(self.socketQueue.rxBytes).toBe(0)
+    expect(self.socketQueue.txBytes).toBe(0)
+
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    expect(captureHostListeningPorts()).not.toContain(port)
+  })
+
+  it('discovers a spawned own child and observes its disappearance after exact-PID kill', async () => {
+    const child = spawn('sleep', ['30'])
+    expect(child.pid).toBeDefined()
+
+    const during = captureResourceSnapshot([process.pid])
+    expect(during.processes.some((p) => p.pid === child.pid && p.ppid === process.pid)).toBe(true)
+
+    child.kill('SIGKILL')
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()))
+
+    // Poll briefly: /proc entry removal is prompt once reaped by us.
+    const deadline = Date.now() + 5000
+    let gone = false
+    while (Date.now() < deadline) {
+      if (!captureResourceSnapshot([process.pid]).processes.some((p) => p.pid === child.pid)) {
+        gone = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    expect(gone).toBe(true)
   })
 })
