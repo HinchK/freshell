@@ -82,6 +82,67 @@ Windows-desktop campaign per the kickoff decisions). A Windows backend
 (Handle-count/PDH + Get-NetTCPConnection) would slot behind the same
 `ResourceSnapshot` schema. No fake Tauri code was written.
 
+## Gate B003 → fix1 (2026-08-09)
+
+**Rejection:** gate batch B003 merged the branch (squash `e2f15a207` onto H11's merge),
+then found `leak-metrics.spec.ts:201` deterministically RED (3/3) on the plain
+**chromium** project — the proc-tree settle poll timed out at 15s with "expected 2 live
+processes, got 1" — and reverted the merge (`3dbba43c2`). The verifier had only covered
+the legacy-chromium + rust-chromium legs, so the chromium leg was never proven.
+
+**Root cause (empirically pinned, not inferred):** the plain `chromium` project boots the
+same legacy Node server as `legacy-chromium` (`e2eServerKind` fixture default `'legacy'`),
+and on this WSL2 host that server spawns transient Windows-interop children around the
+health-ok line: `ipconfig.exe` (`bootstrap.ts` `getWindowsHostIpsAsync`, via the awaited
+pre-listen `NetworkManager.initializeFromStartup` → `detectLanIpsAsync`) and `netsh.exe`
+(`firewall.ts` `detectFirewall`, via the fire-and-forget startup `getStatus()` banner).
+A 40ms child-process sampler against a fixture-shaped boot measured them alive in
+S-state at ~0.8–1.0s post-spawn, straddling the healthy moment. The spec captured its
+baseline at the first instant with `zombies == 0` — a gate a still-RUNNING transient
+passes trivially — freezing `node + transient = 2` into `before`; the transient then
+exited, and the equality settle poll demanded a population the steady state (1) never
+regains: the gate's exact 15s timeout signature. Whether the capture lands inside the
+~1s transient window is a scheduler race, which under gate-time multi-agent load landed
+red 3/3 while idle verifier hosts were green every time (the same failure was present at
+the pre-merge base for the same reason — "branch-inherent" but load-armed).
+
+**What changed (`367aba289`, TDD):**
+- Collector: new `captureStableBaseline(rootPids, opts)` — returns a snapshot only at a
+  **fixed point**: identical live (non-Z) pid set across N consecutive zombie-free
+  samples (default 3 × 250ms; a zombie mid-streak resets it; the 20s timeout error names
+  the still-changing live set as `comm:pid(ppid, state)`). Unit-pinned fixture-driven ×4
+  (B003-shaped live-transient ride-out, zombie streak reset, oscillation timeout
+  diagnostics, `stableSamples` validation) — suite now 21/21.
+- Spec: baseline uses `captureStableBaseline` (a baseline-drain failure now also retains
+  the process-tree artifact with the drain error); the settle assertion becomes the exact
+  checklist semantics — **no surviving live pid outside the baseline population** (strays
+  reported as `comm:pid(ppid)` so any future red is self-diagnosing) and zero lingering
+  zombies. Strict subset, not equality: a *baseline* pid draining out mid-loop is cleanup,
+  not a leak; leak growth stays gated by the stray set plus the unchanged
+  `diffSnapshots` bounds.
+- Branch surgery for re-gateability: `4d1fcc9d4` merges the post-revert integration tip
+  into the branch and restores the 6-file deliverable set on top (the revert would
+  otherwise produce modify/delete conflicts on the gatekeeper's next `--no-ff` merge;
+  verified clean via `git merge-tree`).
+
+**Incident note (not a spec defect):** the FIRST rust-chromium run on the merged tree
+lost its first test to a cold-cache `cargo build --release` (H14's crate changes made the
+binary stale; `target/release/freshell-server` mtime 10:52:49 sits inside that run) —
+`ensureRustServerBinary` builds inside the first test's 60s Playwright timeout on any
+cold rust change, a pre-existing repo-wide fixture property. Warm-cache runs: 3/3 ×3
+consecutive (21.0s, —, 20.7s).
+
+**Per-leg proof at `367aba289` (pw lease held per run, `nice -n 19`, each
+`npx playwright test --config test/e2e-browser/playwright.config.ts specs/leak-metrics.spec.ts --project=<P> --reporter=line`):**
+
+| project | run 1 | run 2 | consecutive |
+| --- | --- | --- | --- |
+| chromium | 3/3 (23.2s) | 3/3 (21.5s) | 3 (+25.6s pre-commit smoke) |
+| legacy-chromium | 3/3 (21.9s) | 3/3 (23.0s) | 2 |
+| rust-chromium | 3/3 (21.0s) | 3/3 (20.7s) | 3 (after the cold-build run above) |
+
+Also green: `npx vitest run test/e2e-browser/helpers/leak-metrics.test.ts --config test/e2e-browser/vitest.config.ts` → 21/21 ×2 (18.53s, 18.75s); `npm run typecheck` clean.
+
 ## Review loop (round 1 of ≤5 — converged)
 
 Independent fresh-eyes review (gpt-family reviewer, repo-zero-context, defect-first
