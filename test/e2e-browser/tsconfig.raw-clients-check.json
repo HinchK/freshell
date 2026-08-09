@@ -1,0 +1,15 @@
+{
+  "//": "HARNESS-05 item-scoped typecheck gate. The repo-owned typecheck configs (tsconfig.json / tsconfig.server.json) deliberately exclude test/, so this config gives the raw-clients helper+spec an EXECUTABLE, file-attributed gate: run tsc -p on this file, then require zero error lines attributed to the HARNESS-05 files. Errors in pre-existing dependency files (e.g. helpers/fixtures.ts's worker-scope tuple typing) are reproduced identically on the base commit and are out of scope. See docs/plans/df1-evidence/HARNESS-05.md for the verbatim gate command.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": [
+    "helpers/raw-clients.ts",
+    "helpers/raw-clients.test.ts",
+    "helpers/echo-ws-fixture.ts",
+    "specs/harness-05-raw-clients.spec.ts"
+  ]
+}

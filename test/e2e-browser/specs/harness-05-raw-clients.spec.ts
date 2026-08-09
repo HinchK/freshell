@@ -223,41 +223,71 @@ test.describe.serial('Group B: raw-client capability legs against the real serve
     expect(health.bytesReceived).toBeGreaterThan(0)
 
     const tabName = `harness-05-${Date.now()}`
-    const created = await rawHttpRequest(serverInfo.baseUrl, {
-      method: 'POST',
-      path: '/api/tabs',
-      headers: { 'x-auth-token': serverInfo.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: tabName, browser: 'https://example.com' }),
-    })
-    expect(created.status).toBe(200)
-    const createdBody = created.json() as { status?: string; data?: { tabId?: string } }
-    expect(createdBody.status).toBe('ok')
-    const tabId = createdBody.data?.tabId
-    expect(typeof tabId).toBe('string')
+    let tabId: string | undefined
+    let deleteStatus: number | null = null
+    let createdStatus: number | null = null
+    let noTokenStatus: number | null = null
+    try {
+      const created = await rawHttpRequest(serverInfo.baseUrl, {
+        method: 'POST',
+        path: '/api/tabs',
+        headers: { 'x-auth-token': serverInfo.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: tabName, browser: 'https://example.com' }),
+      })
+      createdStatus = created.status
+      expect(created.status).toBe(200)
+      const createdBody = created.json() as { status?: string; data?: { tabId?: string } }
+      expect(createdBody.status).toBe('ok')
+      tabId = createdBody.data?.tabId
+      expect(typeof tabId).toBe('string')
 
-    const list = await rawHttpRequest(serverInfo.baseUrl, {
-      path: '/api/tabs',
-      headers: { 'x-auth-token': serverInfo.token },
-    })
-    expect(list.status).toBe(200)
-    expect(list.body.toString('utf8')).toContain(tabId!)
+      const list = await rawHttpRequest(serverInfo.baseUrl, {
+        path: '/api/tabs',
+        headers: { 'x-auth-token': serverInfo.token },
+      })
+      expect(list.status).toBe(200)
+      expect(list.body.toString('utf8')).toContain(tabId!)
 
-    const rejected = await rawHttpRequest(serverInfo.baseUrl, {
-      method: 'POST',
-      path: '/api/tabs',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'should-be-rejected' }),
-    })
-    expect([401, 403]).toContain(rejected.status)
+      const rejected = await rawHttpRequest(serverInfo.baseUrl, {
+        method: 'POST',
+        path: '/api/tabs',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'should-be-rejected' }),
+      })
+      noTokenStatus = rejected.status
+      expect([401, 403]).toContain(rejected.status)
+    } finally {
+      // R5 (review round 1): the testServer fixture is worker-scoped and a
+      // browser tab persists in its layout store until deleted; a retry of
+      // this test must not inherit the previous attempt's tab. Both servers
+      // expose DELETE /api/tabs/:id. Cleanup is best-effort so it never
+      // masks an assertion failure in the try block.
+      if (tabId) {
+        const deleted = await rawHttpRequest(serverInfo.baseUrl, {
+          method: 'DELETE',
+          path: `/api/tabs/${tabId}`,
+          headers: { 'x-auth-token': serverInfo.token },
+        }).catch(() => null)
+        deleteStatus = deleted?.status ?? null
+        if (deleted) {
+          const remaining = await rawHttpRequest(serverInfo.baseUrl, {
+            path: '/api/tabs',
+            headers: { 'x-auth-token': serverInfo.token },
+          }).catch(() => null)
+          expect(remaining?.body.toString('utf8') ?? '').not.toContain(tabId)
+        }
+      }
+    }
 
     recordLeg(testInfo.project.name, 'B4', {
       healthStatus: health.status,
-      createStatus: created.status,
+      createStatus: createdStatus,
       tabId,
       listContainsTab: true,
-      noTokenStatus: rejected.status,
+      noTokenStatus,
       healthBytesSent: health.bytesSent,
       healthBytesReceived: health.bytesReceived,
+      deleteStatus,
     })
   })
 })

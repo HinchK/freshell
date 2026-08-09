@@ -476,3 +476,142 @@ describe('rawHttpRequest — byte-accounted orchestration HTTP client', () => {
     await expect(rawHttpRequest('http://127.0.0.1:1', { timeoutMs: 2000 })).rejects.toThrow(/127\.0\.0\.1:1/)
   })
 })
+
+describe('RawWsClient — review-round-1 fixes', () => {
+  const clients: RawWsClient[] = []
+  let fixture: EchoWsFixture | undefined
+
+  afterEach(async () => {
+    while (clients.length) await clients.pop()!.dispose()
+    if (fixture) {
+      await fixture.stop()
+      fixture = undefined
+    }
+  })
+
+  it('R1: autoRead:false + a coalesced upgrade+frame records nothing until resume', async () => {
+    // Bare net server: write the 101 head AND one WS text frame in ONE write,
+    // so the frame bytes are already in userland when the client constructor
+    // sees them. The contract: autoRead:false means NOTHING is recorded
+    // until resumeReads(), even for bytes delivered with the handshake rest.
+    const crypto = await import('node:crypto')
+    const net = await import('node:net')
+    const server = net.createServer((sock) => {
+      sock.once('data', (req) => {
+        const key = String(req).match(/Sec-WebSocket-Key: (.+)\r\n/)![1]
+        const accept = crypto.createHash('sha1')
+          .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+        const head = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
+        // unmasked server TEXT frame 'coalesced' (9 bytes): 0x81 0x09 + payload
+        const frame = Buffer.concat([Buffer.from([0x81, 0x09]), Buffer.from('coalesced')])
+        sock.write(head + frame.toString('latin1'), 'latin1')
+      })
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const { port } = server.address() as import('node:net').AddressInfo
+    try {
+      const client = await RawWsClient.connect(`ws://127.0.0.1:${port}/`, { autoRead: false })
+      clients.push(client)
+      expect(client.receivedFrames.length).toBe(0)
+      await new Promise((r) => setTimeout(r, 300))
+      expect(client.receivedFrames.length).toBe(0)
+      client.resumeReads()
+      const frame = await client.waitForFrame((f) => f.opcode === WS_OPCODE.TEXT, 5000, 'deferred coalesced frame')
+      expect(RawWsClient.text(frame)).toBe('coalesced')
+    } finally {
+      server.close()
+    }
+  })
+
+  it('R1: pauseReads(); resumeReads() is repeatable and drains deferred bytes each time', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await RawWsClient.connect(fixture.wsUrl)
+    clients.push(client)
+    client.sendText('one')
+    await client.waitForFrame(() => client.receivedFrames.length === 1, 5000, 'first echo')
+
+    client.pauseReads()
+    client.sendText('two')
+    await client.collectFramesDuring(300)
+    expect(client.receivedFrames.length).toBe(1)
+    client.resumeReads()
+    await client.waitForFrame(() => client.receivedFrames.length === 2, 5000, 'second echo after resume')
+
+    client.pauseReads()
+    client.sendText('three')
+    await client.collectFramesDuring(300)
+    expect(client.receivedFrames.length).toBe(2)
+    client.resumeReads()
+    await client.waitForFrame(() => client.receivedFrames.length === 3, 5000, 'third echo after resume')
+  })
+
+  it('R2: nextJsonMessage only matches frames received after the call', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await RawWsClient.connect(fixture.wsUrl)
+    clients.push(client)
+    client.sendJson({ type: 'dup', n: 1 })
+    const first = await client.nextJsonMessage<{ type: string; n: number }>('dup', 5000)
+    expect(first.n).toBe(1)
+
+    client.sendJson({ type: 'dup', n: 2 })
+    const second = await client.nextJsonMessage<{ type: string; n: number }>('dup', 5000)
+    expect(second.n).toBe(2)
+  })
+
+  it('R3: an empty peer close frame is answered with an EMPTY close frame (never 1005 on the wire)', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await RawWsClient.connect(fixture.wsUrl)
+    clients.push(client)
+    client.sendText('emptyclose')
+    await client.waitForTerminalEvent(5000)
+    // The 1005 sentinel is RECORDED for the spec, but must never be a
+    // transmitted code. If it were, the fixture's ws receiver would flag a
+    // WS_ERR_INVALID_CLOSE_CODE protocol error against us.
+    expect(client.peerClose!.code).toBe(1005)
+    const ourReply = client.sentFrames.find((f) => f.opcode === WS_OPCODE.CLOSE)
+    expect(ourReply).toBeTruthy()
+    expect(ourReply!.payloadBytes).toBe(0)
+    await expect.poll(() => fixture!.connections[0]?.closedAt, { timeout: 5000 }).not.toBeNull()
+    expect(fixture.connections[0].errors).toEqual([])
+  })
+})
+
+describe('rawHttpRequest — review-round-1 fixes', () => {
+  async function withAbortingStub(
+    mode: 'rst' | 'fin',
+    run: (baseUrl: string) => Promise<void>,
+  ): Promise<void> {
+    const srv = (await import('node:http')).createServer((_req, res) => {
+      res.writeHead(200, { 'content-length': '64' })
+      res.write('{"partial":')
+      if (mode === 'rst') {
+        res.socket!.destroy() // abrupt reset before body completes
+      } else {
+        res.socket!.end()    // graceful FIN mid-body (no RST)
+      }
+    })
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r))
+    const { port } = srv.address() as import('node:net').AddressInfo
+    try {
+      await run(`http://127.0.0.1:${port}`)
+    } finally {
+      srv.close()
+    }
+  }
+
+  it('R4: rejects promptly (not at the 3s timeout) on mid-response RST', async () => {
+    await withAbortingStub('rst', async (baseUrl) => {
+      const started = Date.now()
+      await expect(rawHttpRequest(baseUrl, { timeoutMs: 3000 })).rejects.toThrow(/rawHttpRequest:/)
+      expect(Date.now() - started).toBeLessThan(2500)
+    })
+  })
+
+  it('R4: rejects promptly (not hanging to timeout) on mid-response FIN (partial body)', async () => {
+    await withAbortingStub('fin', async (baseUrl) => {
+      const started = Date.now()
+      await expect(rawHttpRequest(baseUrl, { timeoutMs: 3000 })).rejects.toThrow(/rawHttpRequest:/)
+      expect(Date.now() - started).toBeLessThan(2500)
+    })
+  })
+})

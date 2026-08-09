@@ -235,8 +235,17 @@ export class RawWsClient {
       }
     })
 
-    if (rest.length > 0) this.handleData(rest)
-    if (options.autoRead === false) this.socket.pause()
+    if (options.autoRead === false) {
+      // R1 (review round 1): pause BEFORE touching anything. Bytes that
+      // arrived coalesced with the 101 head cannot be un-read, so when
+      // paused-at-start they are DEFERRED: buffered unparsed, parsed only on
+      // the first resumeReads(). "autoRead:false" must mean no frames are
+      // recorded before the first resume, however the peer timed its writes.
+      this.socket.pause()
+      if (rest.length > 0) this.recvBuffer = Buffer.from(rest)
+    } else if (rest.length > 0) {
+      this.handleData(rest)
+    }
   }
 
   /**
@@ -436,6 +445,9 @@ export class RawWsClient {
 
   resumeReads(): void {
     this.socket.resume()
+    // R1: drain anything buffered-but-unparsed (autoRead:false handshake
+    // rest, or defensively any backlog) before live data resumes.
+    this.drainParser()
   }
 
   // ----------------------------------------------------------------- sends
@@ -526,8 +538,13 @@ export class RawWsClient {
    * Wait for a TEXT frame whose JSON body has `.type === type` and resolve
    * with the parsed object. (Freshell server frames are JSON text frames.)
    */
+  // R2 (review round 1): only frames received AFTER the call may match.
+  // Scanning the full ledger would let a second request/response pair
+  // resolve with the FIRST pair's stale message and pass vacuously.
   async nextJsonMessage<T = any>(type: string, timeoutMs: number): Promise<T> {
+    const fromIndex = this.received.length
     const frame = await this.waitForFrame((f) => {
+      if (this.received.indexOf(f) < fromIndex) return false
       if (f.opcode !== WS_OPCODE.TEXT) return false
       try {
         return (JSON.parse(f.payload.toString('utf8')) as { type?: unknown })?.type === type
@@ -605,6 +622,13 @@ export class RawWsClient {
   private handleData(chunk: Buffer): void {
     if (this._destroyed) return
     this.recvBuffer = this.recvBuffer.length === 0 ? chunk : Buffer.concat([this.recvBuffer, chunk])
+    this.drainParser()
+  }
+
+  /** Parse every complete frame currently in recvBuffer (no-op when paused
+   *  with a deferred backlog is NOT enforced here — callers gate that; this
+   *  just drains). */
+  private drainParser(): void {
     for (;;) {
       const parsed = this.tryParseFrame()
       if (!parsed) return
@@ -617,12 +641,20 @@ export class RawWsClient {
 
   private handleControlFrame(frame: ReceivedFrameRecord): void {
     if (frame.opcode === WS_OPCODE.CLOSE && !this._peerClose) {
-      const code = frame.payloadBytes >= 2 ? frame.payload.readUInt16BE(0) : 1005
+      const hasCode = frame.payloadBytes >= 2
+      // RFC 6455 §7.1.5: 1005 is a LOCAL sentinel (no status received) and
+      // MUST NOT be transmitted. It is recorded here for spec assertions,
+      // but an empty peer close frame is answered with an EMPTY close frame.
+      const code = hasCode ? frame.payload.readUInt16BE(0) : 1005
       const reason = frame.payloadBytes > 2 ? frame.payload.subarray(2).toString('utf8') : ''
       this._peerClose = { code, reason, at: frame.at }
       if (this.options.autoReplyClose && !this._sentClose && !this._destroyed) {
         try {
-          this.sendClose(code)
+          if (hasCode) {
+            this.sendClose(code)
+          } else {
+            this.sendFrame({ opcode: WS_OPCODE.CLOSE, payload: Buffer.alloc(0) })
+          }
         } catch {
           // peer may already have ended the socket; close-reply is best-effort
         }
@@ -788,6 +820,21 @@ export function rawHttpRequest(baseUrl: string, options: RawHttpRequestOptions =
     req.on('response', (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      // R4 (review round 1): a response can DIE mid-body in ways that never
+      // emit 'end' (RST, graceful FIN with a short body, peer aborts). All
+      // of those must reject promptly and labeled, never hang to the outer
+      // timeout or surface as an unhandled response error.
+      res.on('aborted', () => {
+        fail(new Error(`rawHttpRequest: response aborted by the server after ${chunks.length} chunk(s) (${target})`))
+      })
+      res.on('error', (err) => {
+        fail(new Error(`rawHttpRequest: response error: ${err.message} (${target})`))
+      })
+      res.on('close', () => {
+        if (!res.complete) {
+          fail(new Error(`rawHttpRequest: response socket closed before the body completed (${target})`))
+        }
+      })
       res.on('end', () => {
         if (settled) return
         settled = true

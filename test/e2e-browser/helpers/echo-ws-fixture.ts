@@ -16,6 +16,8 @@
  *     tests always use comfortably larger sizes)
  *   - text `drop` → the underlying TCP connection is destroyed abruptly
  *     (`ws.terminate()`), with NO close frame
+ *   - text `emptyclose` → server initiates a close with an EMPTY close frame
+ *     (no code)
  *
  * The fixture NEVER sends a frame unprompted, so every inbound frame a test
  * observes is attributable to a command the test sent.
@@ -109,6 +111,14 @@ export class EchoWsFixture {
       const closeMatch = text.match(/^close:(\d+):([\s\S]*)$/)
       if (closeMatch) {
         ws.close(Number(closeMatch[1]), closeMatch[2])
+        return
+      }
+
+      if (text === 'emptyclose') {
+        // Close with NO body: exercises the client's must-never-send-reserved-
+        // codes behavior (RFC 6455 §7.1.5) -- the correct reply is an empty
+        // close frame, not a frame carrying the local 1005 sentinel.
+        ws.close()
         return
       }
 

@@ -56,22 +56,53 @@ load-bearing audit ledger, all rows VERIFIED).
 
 No shared-file edits other than the one-line MATRIX registration.
 
-## Green runs (all at final SHA, filled in below)
+## Green runs (final SHA, after review-round-1 fixes)
 
 Unit (helper config): `npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`
-→ 28/28 passed (multiple runs incl. final at HEAD).
+→ **34/34 passed**.
 
 Playwright (pw lease held for each run):
 - `--project=legacy-chromium specs/harness-05-raw-clients.spec.ts`:
-  **10 passed (17.3s)** then **10 passed (21.8s)** — 2 consecutive green.
+  **10 passed (17.3s)** then **10 passed (18.4s)** — 2 consecutive green.
 - `--project=rust-chromium specs/harness-05-raw-clients.spec.ts`:
-  **10 passed (21.9s)** then **10 passed (20.4s)** — 2 consecutive green.
+  **10 passed (37.6s)** then **10 passed (17.9s)** — 2 consecutive green.
 
-Scoped typecheck (repo root config extended over only the new files +
-deps): zero errors attributable to the new files (remaining errors are the
-pre-existing dep-graph/lint-known quirks in `src/lib/*` and
-`helpers/fixtures.ts`'s worker-scope tuple typing, reproduced identically
-without this change).
+Scoped typecheck — EXECUTABLE gate (the repo-owned typecheck configs
+deliberately exclude `test/`; this item ships
+`test/e2e-browser/tsconfig.raw-clients-check.json`, extending the root
+config, so the gate is runnable as written):
+
+```
+npx tsc -p test/e2e-browser/tsconfig.raw-clients-check.json > /tmp/h05-tsc.log 2>&1; \
+  if grep -qE "^(test/e2e-browser/)?(helpers/raw-clients|helpers/echo-ws-fixture|specs/harness-05-raw-clients)" /tmp/h05-tsc.log; then \
+    echo "HARNESS-05 TYPECHECK GATE: FAIL"; exit 1; \
+  else echo "HARNESS-05 TYPECHECK GATE: PASS"; fi
+```
+
+Result: **PASS** — 0 errors attributed to the HARNESS-05 files; the 8 total
+errors in the log are pre-existing dependency-file issues reproduced
+identically without this change (`src/lib/client-logger.ts`/`perf-logger.ts`/
+`settingsSlice.ts` lack-vite-types attribute errors and
+`helpers/fixtures.ts`'s worker-scope tuple typing; all exist on the base).
+
+## Review loop
+
+**Round 1** — independent fresheyes review (GPT family, FRESHPID 2977522,
+`git diff origin/df1/integration...HEAD` at 7af7e65a3): verdict FAILED,
+6 majors. All confirmed real; all fixed with RED-first tests
+(`raw-clients.test.ts` review-round-1 describes) and re-verified:
+
+| # | Finding | Disposition |
+|---|---------|-------------|
+| R1 | `autoRead:false` parsed coalesced rest bytes before pausing (raw-clients.ts:238) | FIXED: constructor pauses first; rest bytes are deferred unparsed and drained by `resumeReads()`; regression test with a literally coalesced upgrade+frame write. |
+| R2 | `nextJsonMessage` could return a stale (earlier-ledger) message (raw-clients.ts:529) | FIXED: only frames received after the call match; stale-pong regression test. |
+| R3 | auto close-reply could transmit reserved code 1005 (raw-clients.ts:620) | FIXED: empty peer close frames get an EMPTY close reply (RFC 6455 §7.1.5); 1005 stays a record-only sentinel; regression test asserts the wire frame is empty and the fixture observes zero protocol errors. New fixture command `emptyclose`. |
+| R4 | `rawHttpRequest` only settled on `res.end` (raw-clients.ts:788) — mid-body abort could hang to the outer timeout (demonstrated RED: 60s hang on graceful FIN) | FIXED: `aborted`/`error`/`close(!complete)` response handlers reject promptly + labeled; RST + FIN red-green tests. |
+| R5 | B4 created a real browser tab and never deleted it (spec:225) — leaks into worker-scoped server state on retries | FIXED: try/finally `DELETE /api/tabs/:id` (both stacks expose it), delete verified + post-delete list assertion; `deleteStatus` added to the leg record (observed 200 both stacks). |
+| R6 | evidence typecheck wording not an executable PASS gate | FIXED: committed item-scoped `tsconfig.raw-clients-check.json` + the verbatim gate command above; current result PASS. |
+
+Post-fix re-verification: unit 34/34; legacy-chromium 10/10 ×2 runs;
+rust-chromium 10/10 ×2 runs (all listed above at the post-fix SHA).
 
 ## Per-leg recorded observations (HARNESS-05-LEG lines)
 
