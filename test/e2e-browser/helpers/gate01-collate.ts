@@ -56,14 +56,28 @@ export interface Gate01Attribution {
   note?: string
 }
 
-export interface Gate01LegResult {
-  verdict: Gate01Verdict
+export interface Gate01RunTally {
+  run: string
   passed: number
   failed: number
   skipped: number
   expectedFail: number
   durationMs: number
+}
+
+export interface Gate01LegResult {
+  verdict: Gate01Verdict
+  /** Counters of the LATEST run touching this leg (replaced per run, never summed). */
+  passed: number
+  failed: number
+  skipped: number
+  expectedFail: number
+  durationMs: number
+  /** Run ids in order, one entry per run that touched this leg. */
   runs: string[]
+  /** Per-run tallies, so re-runs (flake reproofs, isolated re-readings) keep history. */
+  runHistory: Gate01RunTally[]
+  /** Failure details of the LATEST run that had failures (emptied by a clean re-run). */
   failures: Gate01Failure[]
   attribution: Gate01Attribution | null
 }
@@ -134,6 +148,7 @@ function emptyLeg(): Gate01LegResult {
     expectedFail: 0,
     durationMs: 0,
     runs: [],
+    runHistory: [],
     failures: [],
     attribution: null,
   }
@@ -189,19 +204,24 @@ export function mergeReport(
         `report contains spec file ${file} which is outside the GATE-01 suite definition`,
       )
     }
+    // Pass 1: compute THIS run's tally per leg from the report.
+    const tally: Record<Gate01Leg, Gate01RunTally> = {
+      legacy: { run: runId, passed: 0, failed: 0, skipped: 0, expectedFail: 0, durationMs: 0 },
+      rust: { run: runId, passed: 0, failed: 0, skipped: 0, expectedFail: 0, durationMs: 0 },
+    }
+    const failures: Record<Gate01Leg, Gate01Failure[]> = { legacy: [], rust: [] }
     for (const spec of walkSpecs(fileSuite)) {
       for (const t of spec.tests) {
         const legKey: Gate01Leg = t.projectName === 'gate01-rust' ? 'rust' : 'legacy'
-        const leg = entry.legs[legKey]
+        const leg = tally[legKey]
         const isExpectedFail = (t.annotations ?? []).some((a) => a.type === 'fail')
-        const duration = (t.results ?? []).reduce((n, r) => n + (r.duration || 0), 0)
-        leg.durationMs += duration
+        leg.durationMs += (t.results ?? []).reduce((n, r) => n + (r.duration || 0), 0)
         if (t.status === 'skipped') {
           leg.skipped += 1
         } else if (t.status === 'unexpected') {
           leg.failed += 1
           const err = t.results?.flatMap((r) => r.errors ?? []).find((e) => e.message)?.message ?? ''
-          leg.failures.push({
+          failures[legKey].push({
             title: spec.title,
             line: spec.line,
             error: String(err).split('\n').slice(0, 12).join('\n').slice(0, 1200),
@@ -214,21 +234,29 @@ export function mergeReport(
           // 'flaky' (should not occur with retries=0) — count as failed so it
           // can never hide; attribution must resolve it.
           leg.failed += 1
-          leg.failures.push({ title: spec.title, line: spec.line, error: `flaky status reported: ${t.status}` })
+          failures[legKey].push({ title: spec.title, line: spec.line, error: `flaky status reported: ${t.status}` })
         }
       }
     }
+    // Pass 2: replace per-leg counters with this run's tally (idempotent
+    // re-runs), append history, recompute the mechanical verdict, and never
+    // clobber an existing attribution.
     for (const legKey of ['legacy', 'rust'] as const) {
+      const t = tally[legKey]
+      const exercised = t.passed + t.failed + t.skipped + t.expectedFail > 0
+      if (!exercised) continue
       const leg = entry.legs[legKey]
-      // Only touch legs this report actually exercised.
-      const exercised = leg.passed + leg.failed + leg.skipped + leg.expectedFail > 0
-      if (exercised) {
-        if (!leg.runs.includes(runId)) leg.runs.push(runId)
-        // Mechanical verdict; never downgrade an attributed verdict.
-        if (!leg.attribution) leg.verdict = verdictFor(leg)
-        else if (leg.attribution.kind === 'gap' || leg.attribution.kind === 'gap-unscoped') leg.verdict = 'fail'
-        else if (leg.attribution.kind === 'flake') leg.verdict = 'flaky-reproven'
-      }
+      leg.passed = t.passed
+      leg.failed = t.failed
+      leg.skipped = t.skipped
+      leg.expectedFail = t.expectedFail
+      leg.durationMs = t.durationMs
+      if (!leg.runs.includes(runId)) leg.runs.push(runId)
+      leg.runHistory.push(t)
+      leg.failures = failures[legKey]
+      if (!leg.attribution) leg.verdict = verdictFor(leg)
+      else if (leg.attribution.kind === 'gap' || leg.attribution.kind === 'gap-unscoped') leg.verdict = 'fail'
+      else if (leg.attribution.kind === 'flake') leg.verdict = 'flaky-reproven'
     }
   }
   return baseline

@@ -116,7 +116,7 @@ describe('gate01-collate', () => {
     expect(b.specs['n.spec.ts'].legs.legacy.verdict).toBe('pass')
   })
 
-  it('mergeReport is additive across slices and never clobbers attribution', () => {
+  it('mergeReport is additive across specs, replaces per-leg counters on re-run, keeps run history, never clobbers attribution', () => {
     let b = emptyBaseline('abc', { 'x.spec.ts': 'product', 'y.spec.ts': 'product' }, 'bin')
     b = mergeReport(b, pwReport([
       { title: 'x.spec.ts', file: 'x.spec.ts', specs: [pwSpec('p', 1, [pwTest('gate01-rust', 'unexpected', { error: 'boom' })])], suites: [] },
@@ -129,6 +129,21 @@ describe('gate01-collate', () => {
     expect(b.specs['x.spec.ts'].legs.rust.verdict).toBe('flaky-reproven')
     expect(b.specs['x.spec.ts'].legs.rust.attribution).toMatchObject({ kind: 'flake', reproof: ['r1', 'r2'] })
     expect(b.specs['y.spec.ts'].legs.legacy.verdict).toBe('pass')
+
+    // Re-run of the SAME spec leg: counters replaced (not doubled), history kept.
+    b = mergeReport(b, pwReport([
+      { title: 'x.spec.ts', file: 'x.spec.ts', specs: [pwSpec('p', 1, [pwTest('gate01-rust', 'expected')]), pwSpec('p2', 2, [pwTest('gate01-rust', 'expected')])], suites: [] },
+    ]), 'reproof-1')
+    const rust = b.specs['x.spec.ts'].legs.rust
+    expect(rust.passed).toBe(2)
+    expect(rust.failed).toBe(0)
+    expect(rust.runs).toEqual(['slice-1', 'reproof-1'])
+    expect(rust.runHistory).toEqual([
+      expect.objectContaining({ run: 'slice-1', failed: 1 }),
+      expect.objectContaining({ run: 'reproof-1', passed: 2, failed: 0 }),
+    ])
+    expect(rust.attribution).toMatchObject({ kind: 'flake' })
+    expect(rust.failures).toEqual([])
   })
 
   it('a spec skipped on every test reports skip-all', () => {
