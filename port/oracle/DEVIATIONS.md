@@ -651,6 +651,65 @@ path itself is intact).
   unanimous. Implementer: restart #16 orchestrator (distinct from adjudicating panel).
 - status: accepted (terminals.changed parity CLOSED; terminal.meta.updated open gap, tracked for
   closure with DEV-0006)
+- closure_update (2026-08-09, naming-persistence-sweep Task 18, commit ed1bd71a6): the
+  `terminal.meta.updated` producer + `TerminalMetadataService` equivalent is now PORTED —
+  `crates/freshell-ws/src/terminal_meta.rs` (`TerminalMetaRegistry`: commit-if-changed with
+  updatedAt-ignoring equality, retire with git-field strip + 1h retired TTL, list/get;
+  `enrich_from_cwd` over the Task 17 `freshell_platform::git_meta` helpers) — and wired into
+  every producer: the `terminal.create` path (seedFromTerminal parity for EVERY terminal,
+  enrichment run async after `terminal.created`), the amplifier/opencode association drains
+  (enrich + commit through the shared registry), PTY exit + `terminal.kill` (retire →
+  `{remove:[terminalId]}`), the connect handshake (`terminal.inventory.terminalMeta` now ships
+  `list()` instead of the hardcoded `[]`), and the auto-title sweep's per-session metadata
+  refresh (Node's `applySessionMetadata` analog; its TRIGGER is a KEPT divergence — see
+  DEV-0009). The user_facing_disclosure sentence above NO LONGER APPLIES: git branch/dirty
+  badges populate live on the Rust server. Pinning coverage:
+  `crates/freshell-ws/src/terminal_meta.rs` inline tests +
+  `crates/freshell-ws/tests/session_identity_frames.rs` (inventory `terminalMeta` row
+  assertions) + the Task 23 Playwright git-badge spec.
+
+### DEV-0009 — terminal-metadata git enrichment runs on a throttled per-unique-cwd poll (Node: indexer-event-driven, per-terminal, uncached)
+
+- objective_defect: none — KEPT port-side TRIGGER divergence (naming-persistence-sweep Task 18,
+  commit ed1bd71a6), the one redesigned piece of the DEV-0008 closure above. Node runs its
+  terminal-metadata pass ONLY on indexer update events (`server/index.ts:873` onUpdate; debounce
+  2 s, `session-indexer.ts:436`) — an idle Node spawns ZERO git processes — and its pass is
+  per-terminal and uncached (`server/coding-cli/utils.ts:93-116`, with only repo roots cached
+  `:24-26`). The Rust port has no indexer event bus (the session index is poll-based,
+  `freshell_sessions::directory_index`), so per-tick trigger equivalence was FALSIFIED at
+  planning time (validator-A7): a naive per-tick, per-terminal port would spawn unthrottled git
+  processes forever on an idle server.
+- original_behavior: indexer `onUpdate` (2 s debounce) → per matched terminal,
+  `applySessionMetadata` → `enrichFromCwd` runs three PLAIN git probes (`symbolic-ref`,
+  `rev-parse` fallback, `status --porcelain`) with no optional-locks suppression and no
+  branch/dirty caching; zero git activity between indexer events.
+- port_behavior: the refresh rides the auto-title sweep tick
+  (`crates/freshell-server/src/auto_title_sweep.rs`, `GitMetaCache` + `refresh_terminal_meta`),
+  gated per UNIQUE resolved cwd (NOT per terminal): git runs for a cwd only when (a) that cwd's
+  terminal-set signature changed since its last run, or (b) the last run is >=
+  `GIT_ENRICH_MIN_INTERVAL_MS` (30 s) old — throttled refresh so dirty-status drift still
+  surfaces. EVERY spawned git suppresses optional locks (`GIT_OPTIONAL_LOCKS=0` env on every
+  `freshell_platform::git_meta` invocation, equivalent to `--no-optional-locks`): a 0.5 Hz poll
+  without it would continually rewrite `.git/index`.
+- fingerprint: trigger schedule + git invocation shape only — the port spawns throttled
+  `GIT_OPTIONAL_LOCKS=0` git probes on the sweep cadence where Node spawns plain-git probes only
+  on indexer updates; the `terminal.meta.updated` wire VALUES are unaffected (same record
+  fields, same commit-if-changed change gate, so an unchanged repo produces zero frames on both
+  backends).
+- cost_and_residual: measured local cost 0.01 s per `git --no-optional-locks status --porcelain`
+  on this repo (validator-A7). Residual: /mnt/c DrvFs cwds are 10-100x slower; the >= 30 s
+  throttle bounds the worst case to delayed badges (never a git storm).
+- pinning_test: Task 18 —
+  `auto_title_sweep::tests::sweep_refreshes_terminal_meta_change_gated_and_broadcasts_once`
+  (change-gated commit, single upsert batch per pass, unchanged pass fully suppressed) plus the
+  `crates/freshell-ws/src/terminal_meta.rs` inline tests (enrichment field derivation); Task 23's
+  Playwright git-badge spec pins the user-visible badge behavior end-to-end.
+- adjudicated_by: validator-A7 (antagonist), planning-stage adjudication for the
+  naming-persistence-sweep — it falsified per-tick trigger equivalence and produced the 0.01 s
+  measurement and the /mnt/c DrvFs residual; the throttled per-unique-cwd + optional-locks
+  design implemented here is that adjudication's remedy (implementer distinct from adjudicator;
+  NOT self-approved). Task 24 references this entry.
+- status: accepted (KEPT divergence)
 
 ## E2E-discovered intentional divergences (EDEV-xx)
 
