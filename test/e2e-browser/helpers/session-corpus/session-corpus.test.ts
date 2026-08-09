@@ -9,6 +9,8 @@ import {
   walkCoveragePaths,
   type CorpusManifest,
 } from './manifest.js'
+import { claudeProjectSlug, writeClaudeSession } from './claude.js'
+import type { CorpusContext } from './types.js'
 
 /**
  * HARNESS-04 unit tests: the corpus manifest/hashing core.
@@ -110,5 +112,165 @@ describe('session-corpus manifest core', () => {
       '.codex/sessions/2026/08/r.jsonl',
       'solo.txt',
     ])
+  })
+})
+
+function mkCtx(homeDir: string): CorpusContext {
+  return {
+    homeDir,
+    runToken: 'testtoken',
+    marker: 'h04corpus-testtoken',
+    workspace: path.join(homeDir, 'h04corpus-testtoken'),
+    files: [],
+    sessions: [],
+    gitFixtures: [],
+  }
+}
+
+describe('session-corpus claude writer', () => {
+  it('encodes project dirs with the real Claude slug rule (non-alphanumerics → -)', () => {
+    expect(claudeProjectSlug('/tmp/h04corpus-abc12/my-project'))
+      .toBe('-tmp-h04corpus-abc12-my-project')
+  })
+
+  it('writes init + turns + trailing summary, registers hash + listed expectation', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const cwd = path.join(ctx.workspace, 'projects', 'alpha-project')
+    const createdAt = Date.parse('2026-08-04T09:00:00.000Z')
+    const lastActivityAt = createdAt + 4 // init=+0, user1=+1, asst1=+2, user2=+3, asst2=+4
+    const exp = await writeClaudeSession(ctx, {
+      role: 'alpha',
+      sessionId: '00000000-0000-4000-8000-0000000000a1',
+      cwd,
+      titleText: 'h04corpus-testtoken alpha',
+      turns: 2,
+      withSummary: true,
+      createdAt,
+      lastActivityAt,
+    })
+
+    const file = path.join(home, '.claude', 'projects', claudeProjectSlug(cwd),
+      '00000000-0000-4000-8000-0000000000a1.jsonl')
+    const raw = await fsp.readFile(file, 'utf-8')
+    const lines = raw.trim().split('\n').map((l) => JSON.parse(l))
+
+    // init line: cwd + session id + createdAt timestamp
+    expect(lines[0].type).toBe('system')
+    expect(lines[0].subtype).toBe('init')
+    expect(lines[0].cwd).toBe(cwd)
+    expect(lines[0].session_id).toBe('00000000-0000-4000-8000-0000000000a1')
+    expect(lines[0].timestamp).toBe('2026-08-04T09:00:00.000Z')
+    // two user + two assistant turns, parentUuid chain
+    const roles = lines.slice(1, 5).map((l) => l.type)
+    expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
+    expect(lines[2].parentUuid).toBe(lines[1].uuid)
+    expect(lines[3].parentUuid).toBe(lines[2].uuid)
+    // tail = summary line WITHOUT timestamp (drives title, not recency)
+    const tail = lines[5]
+    expect(tail.type).toBe('summary')
+    expect(tail.summary).toBe('h04corpus-testtoken alpha')
+    expect(tail.timestamp).toBeUndefined()
+    // last timestamped line = lastActivityAt (the server's tail-walk lands here)
+    expect(lines[4].timestamp).toBe('2026-08-04T09:00:00.004Z')
+
+    // registered file hash + expectation
+    expect(ctx.files).toHaveLength(1)
+    expect(ctx.files[0].path.startsWith('.claude/projects/')).toBe(true)
+    expect(ctx.files[0].path.endsWith('/00000000-0000-4000-8000-0000000000a1.jsonl')).toBe(true)
+    await expect(fsp.readFile(path.join(home, ctx.files[0].path), 'utf-8')).resolves.toBe(raw)
+    expect(exp).toMatchObject({
+      provider: 'claude',
+      role: 'alpha',
+      title: 'h04corpus-testtoken alpha',
+      summary: 'h04corpus-testtoken alpha',
+      projectPath: cwd,
+      cwd,
+      createdAt,
+      lastActivityAt,
+      visibility: 'listed',
+    })
+    expect(ctx.sessions[0].key).toBe('claude:00000000-0000-4000-8000-0000000000a1')
+  })
+
+  it('one-message session: no reply, no summary → title from first message, hidden-default(noninteractive)', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const cwd = path.join(ctx.workspace, 'projects', 'solo')
+    const exp = await writeClaudeSession(ctx, {
+      role: 'noninteractive',
+      sessionId: '00000000-0000-4000-8000-0000000000b1',
+      cwd,
+      titleText: 'h04corpus-testtoken noninteractive',
+      turns: 0,
+      userMessages: 1,
+      withSummary: false,
+      createdAt: Date.parse('2026-07-10T10:00:00.000Z'),
+      lastActivityAt: Date.parse('2026-07-10T10:00:00.001Z'),
+    })
+    const raw = await fsp.readFile(path.join(home, ctx.files[0].path), 'utf-8')
+    const lines = raw.trim().split('\n').map((l) => JSON.parse(l))
+    expect(lines.map((l) => l.type)).toEqual(['system', 'user'])
+    expect(lines[1].message.content).toContain('h04corpus-testtoken noninteractive')
+    expect(exp.title).toBe('h04corpus-testtoken noninteractive')
+    expect(exp.summary).toBeUndefined()
+    expect(exp.visibility).toBe('hidden-default')
+    expect(exp.visibleWith).toEqual({ includeNonInteractive: true })
+  })
+
+  it('init-only session: no title at all → hidden-default(empty + noninteractive)', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const exp = await writeClaudeSession(ctx, {
+      role: 'untitled-empty',
+      sessionId: '00000000-0000-4000-8000-0000000000c1',
+      cwd: path.join(ctx.workspace, 'projects', 'empty'),
+      turns: 0,
+      withSummary: false,
+      createdAt: Date.parse('2026-07-05T10:00:00.000Z'),
+      lastActivityAt: Date.parse('2026-07-05T10:00:00.000Z'),
+    })
+    const raw = await fsp.readFile(path.join(home, ctx.files[0].path), 'utf-8')
+    expect(raw.trim().split('\n')).toHaveLength(1)
+    expect(exp.title).toBeUndefined()
+    expect(exp.visibility).toBe('hidden-default')
+    expect(exp.visibleWith).toEqual({ includeNonInteractive: true, includeEmpty: true })
+  })
+
+  it('subagent sessions land under projects/<slug>/subagents/', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const cwd = path.join(ctx.workspace, 'projects', 'alpha-project')
+    const exp = await writeClaudeSession(ctx, {
+      role: 'subagent',
+      sessionId: '00000000-0000-4000-8000-0000000000d1',
+      cwd,
+      titleText: 'h04corpus-testtoken subagent',
+      turns: 2,
+      withSummary: false,
+      subagent: true,
+      createdAt: Date.parse('2026-07-08T10:00:00.000Z'),
+      lastActivityAt: Date.parse('2026-07-08T10:00:00.004Z'),
+    })
+    expect(ctx.files[0].path).toContain('/subagents/')
+    expect(exp.visibility).toBe('hidden-default')
+    expect(exp.visibleWith).toEqual({ includeSubagents: true })
+    // title still derivable from the first user message when no summary line
+    expect(exp.title).toContain('subagent')
+  })
+
+  it('rejects a turns>0 spec whose lastActivityAt does not match the turn schedule', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    await expect(writeClaudeSession(ctx, {
+      role: 'bad',
+      sessionId: '00000000-0000-4000-8000-0000000000e1',
+      cwd: path.join(ctx.workspace, 'projects', 'bad'),
+      titleText: 'bad',
+      turns: 2,
+      withSummary: true,
+      createdAt: 1000,
+      lastActivityAt: 9999, // schedule demands createdAt + 4
+    })).rejects.toThrow(/lastActivityAt/)
   })
 })
