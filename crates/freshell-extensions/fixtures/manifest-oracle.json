@@ -2186,6 +2186,47 @@
       }
     },
     {
+      "name": "nested-block-definition-order-pin",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"env\":{\"X\":1},\"command\":\"\",\"supportsModel\":\"x\",\"bogus\":2}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "cli",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "env",
+              "X"
+            ],
+            "message": "Invalid input: expected string, received number"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "supportsModel"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          },
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "cli"
+            ],
+            "message": "Unrecognized key: \"bogus\""
+          }
+        ]
+      }
+    },
+    {
       "name": "bundled-amplifier",
       "rawText": "{\n  \"name\": \"amplifier\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Amplifier\",\n  \"description\": \"Microsoft's Amplifier CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"amplifier\",\n    \"envVar\": \"AMPLIFIER_CMD\",\n    \"resumeArgs\": [\"session\", \"resume\", \"--full-history\", \"{{sessionId}}\"],\n    \"env\": { \"PROMPT_TOOLKIT_NO_CPR\": \"1\" }\n  },\n  \"picker\": {\n    \"shortcut\": \"A\",\n    \"group\": \"agents\"\n  }\n}\n",
       "expected": {
