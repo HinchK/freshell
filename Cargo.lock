@@ -1310,6 +1310,7 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

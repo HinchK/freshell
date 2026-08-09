@@ -40,6 +40,7 @@ pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
 pub mod identity_sink;
+pub mod layout_store;
 pub mod opencode_ws;
 pub mod pane_ops;
 pub mod session_lease;
