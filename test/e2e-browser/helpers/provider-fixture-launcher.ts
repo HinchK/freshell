@@ -193,9 +193,12 @@ export async function launchProviderFixture(opts: ProviderLaunchOptions): Promis
   fs.mkdirSync(cwd, { recursive: true })
   fs.mkdirSync(home, { recursive: true })
 
+  // HOME is ALWAYS the per-launch isolated dir (never the user's real home),
+  // so fixture side effects (rollout files, session stubs, …) stay
+  // hermetic-by-default; `scrub` additionally hides PATH and inherited env.
   const env: Record<string, string> = opts.scrub
     ? { PATH: '/nonexistent', HOME: home }
-    : { ...process.env, HOME: process.env.HOME ?? home }
+    : { ...process.env, HOME: home }
   for (const [key, value] of Object.entries(opts.env ?? {})) env[key] = value
   env.FRESHELL_FAKE_LEDGER = path.join(root, 'ledger.jsonl')
   env.FRESHELL_FAKE_EVENTS = path.join(root, 'events.jsonl')

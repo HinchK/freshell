@@ -21,6 +21,8 @@
  * assertions against the fixtures — that sameness IS the fixture-only proof.
  */
 import { test, expect } from '@playwright/test'
+import path from 'node:path'
+import { WebSocket } from 'ws'
 import {
   launchProviderFixture,
   type LaunchedFixture,
@@ -301,3 +303,197 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
     })
   })
 }
+
+// ── Codex app-server fixture ────────────────────────────────────────────────
+// WebSocket JSON-RPC, mirroring test/fixtures/coding-cli/codex-app-server/'s
+// wire surface: initialize-gated RPCs, thread/start + rollout session_meta,
+// turn/started + turn/completed notifications. Approval/question are rendered
+// as fixture-namespaced notifications — freshcodex advertises
+// `approvals:false, questions:false` (codex.rs) so no real bridge exists to
+// mirror; the controllable surface is the point.
+
+class CodexRpcClient {
+  private ws: WebSocket
+  private nextId = 1
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>()
+  readonly notifications: any[] = []
+  readonly closed: Promise<void>
+
+  constructor(url: string) {
+    this.ws = new WebSocket(url)
+    this.closed = new Promise((resolve) => this.ws.on('close', () => resolve()))
+    this.ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw))
+      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const entry = this.pending.get(Number(msg.id))
+        if (entry) {
+          this.pending.delete(Number(msg.id))
+          if (msg.error) entry.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)))
+          else entry.resolve(msg.result)
+        }
+      } else if (msg.method) {
+        this.notifications.push(msg)
+      }
+    })
+  }
+
+  ready(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.ws.once('open', () => resolve())
+      this.ws.once('error', reject)
+    })
+  }
+
+  call(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    const id = this.nextId++
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+      this.ws.send(JSON.stringify({ id, method, params }))
+    })
+  }
+
+  async waitNotification(method: string, timeoutMs = 10_000): Promise<any> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const match = this.notifications.find((n) => n.method === method)
+      if (match) return match
+      if (Date.now() > deadline) {
+        throw new Error(`codex fixture: timed out waiting for notification ${method}; saw ${JSON.stringify(this.notifications.map((n) => n.method))}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+
+  close(): void {
+    this.ws.close()
+  }
+}
+
+async function freePort(): Promise<number> {
+  const net = await import('node:net')
+  return new Promise((resolve) => {
+    const server = net.createServer()
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 0
+      server.close(() => resolve(port))
+    })
+  })
+}
+
+test.describe('codex app-server fixture', () => {
+  let fixture: LaunchedFixture
+  let client: CodexRpcClient | undefined
+  test.afterEach(async () => {
+    client?.close()
+    await fixture?.stop()
+  })
+
+  test('records argv/env, gates on initialize, and turns emit approval/question/completion', async () => {
+    const port = await freePort()
+    const listen = `ws://127.0.0.1:${port}`
+    fixture = await launchProviderFixture({
+      fixture: 'fake-codex-app-server.mjs',
+      args: ['--listen', listen],
+      program: {
+        rules: [
+          {
+            on: 'rpc:turn/start',
+            emit: [
+              { kind: 'approval', data: { id: 'ap-c1', tool: 'shell', input: 'make test' } },
+              { kind: 'question', data: { id: 'q-c1', text: 'pick a target' } },
+            ],
+          },
+        ],
+      },
+      env: {
+        ...PROBE_ENV,
+        HARNESS03_PROBE: 'probe-codex-app-server',
+      },
+    })
+    await fixture.waitOutput('listening on')
+
+    // Gating first: anything before initialize is rejected.
+    client = new CodexRpcClient(listen)
+    await client.ready()
+    await expect(client.call('thread/start', {})).rejects.toThrow(/initialize must complete/)
+
+    const init = await client.call('initialize', { clientInfo: { name: 'harness-03' } })
+    expect(init.userAgent).toContain('freshell')
+
+    const started = await client.call('thread/start', { cwd: fixture.cwd })
+    const threadId = started.thread.id as string
+    expect(threadId).toBeTruthy()
+    expect(started.approvalPolicy).toBe('never')
+    const sessionEvent = await fixture.waitEvent('session')
+    expect(sessionEvent.data.id).toBe(threadId)
+    expectLedgerRow(fixture, 'codex-app-server', ['--listen', listen])
+
+    // Durable realism: the rollout file's first line is the session_meta
+    // record the Rust indexer parses.
+    const rolloutPath = started.thread.path as string
+    expect(rolloutPath).toContain('rollout-')
+    await expect
+      .poll(async () => {
+        try {
+          const first = (await import('node:fs')).readFileSync(rolloutPath, 'utf8').split('\n')[0]
+          return JSON.parse(first).payload?.id ?? null
+        } catch {
+          return null
+        }
+      })
+      .toBe(threadId)
+
+    const turn = await client.call('turn/start', { threadId })
+    expect(turn.turn.id).toBeTruthy()
+    await client.waitNotification('turn/started')
+    const approval = await client.waitNotification('freshell.fixture/approval')
+    expect(approval.params).toMatchObject({ id: 'ap-c1', tool: 'shell' })
+    const question = await client.waitNotification('freshell.fixture/question')
+    expect(question.params).toMatchObject({ id: 'q-c1' })
+    const completed = await client.waitNotification('turn/completed')
+    expect(completed.params.turn.status).toBe('completed')
+
+    const kinds = fixture.readEvents().map((event) => event.kind)
+    expect(kinds).toEqual(['session', 'activity', 'approval', 'question', 'completion'])
+  })
+
+  test('thread/resume yields a resume event and keeps the durable id', async () => {
+    const port = await freePort()
+    const listen = `ws://127.0.0.1:${port}`
+    fixture = await launchProviderFixture({
+      fixture: 'fake-codex-app-server.mjs',
+      args: ['--listen', listen],
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-codex-app-server' },
+    })
+    await fixture.waitOutput('listening on')
+    client = new CodexRpcClient(listen)
+    await client.ready()
+    await client.call('initialize', {})
+    const resumed = await client.call('thread/resume', { threadId: 'thread-old-7' })
+    expect(resumed.thread.id).toBe('thread-old-7')
+    const resume = await fixture.waitEvent('resume')
+    expect(resume.data.id).toBe('thread-old-7')
+  })
+
+  test('a scripted crash kills the process mid-RPC and is recorded first', async () => {
+    const port = await freePort()
+    const listen = `ws://127.0.0.1:${port}`
+    fixture = await launchProviderFixture({
+      fixture: 'fake-codex-app-server.mjs',
+      args: ['--listen', listen],
+      program: {
+        rules: [{ on: 'rpc:turn/start', emit: [{ kind: 'crash', data: { code: 9 }, delayMs: 10 }] }],
+      },
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-codex-app-server' },
+    })
+    await fixture.waitOutput('listening on')
+    client = new CodexRpcClient(listen)
+    await client.ready()
+    await client.call('initialize', {})
+    await client.call('thread/start', {})
+    void client.call('turn/start', {}).catch(() => {})
+    expect(await fixture.exited()).toBe(9)
+    expect(fixture.readEvents().map((event) => event.kind).at(-1)).toBe('crash')
+  })
+})
