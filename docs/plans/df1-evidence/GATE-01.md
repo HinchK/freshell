@@ -248,6 +248,14 @@ Exemplar style: conditional `test.fail(e2eServerKind === 'rust',
 2. `codex-terminal-bounce-rust.spec.ts` — TERM-22 (re-resume terminalId null).
 3. `sidebar-click-resume.spec.ts` — TERM-22 (click-resume terminalId null).
 
+Pin mechanics VERIFIED post-hoc: run `postpin-verify` (gate01-rust, the 3
+pinned files) consumed each pin as expected-fail (baseline `runHistory`
+shows e=1 for `postpin-verify` on all three; the amplifier leg of
+sidebar-click-resume genuinely passed p1 in the same run). Baseline leg
+verdicts remain `fail` by design — the gate records the UNPINNED truth; the
+pins exist so the `rust-chromium` lane keeps fail-before/pass-after
+semantics for the owner items.
+
 Pre-existing pin honored (not added by this gate):
 `settings-persistence-split.spec.ts` CFG-12 — recorded green-with-pin on
 rust (e1), legacy clean.

@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "74fe71b17cbcccc766ff232b30e7d905373b55b6",
+  "head": "47b3b5dce5ae8bf3b43e68567b0cf45bf3cf67f9",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -186,13 +186,14 @@
         "rust": {
           "verdict": "fail",
           "passed": 0,
-          "failed": 1,
+          "failed": 0,
           "skipped": 0,
-          "expectedFail": 0,
-          "durationMs": 32660,
+          "expectedFail": 1,
+          "durationMs": 33232,
           "runs": [
             "slice-3",
-            "reproof-s3-amplifier-rust"
+            "reproof-s3-amplifier-rust",
+            "postpin-verify"
           ],
           "runHistory": [
             {
@@ -210,15 +211,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 32660
-            }
-          ],
-          "failures": [
+            },
             {
-              "title": "amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included",
-              "line": 158,
-              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoContain\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // indexOf\u001b[22m\n\nExpected substring: \u001b[32m\"amplifier: resumed session 50118639-d15c-4412-be96-96cfa0cd8388\"\u001b[39m\nReceived string:    \u001b[31m\"Saved amplifier session 50118639-d15c-4412-be96-96cfa0cd8388 could not be found on disk — started a fresh session instead.amplifier: resumed session efdc696f-1894-4506-91ef-049024f085c2amplifier> \"\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  369 |             .not.toBeNull()\n  370 |             .then(async () => (await findLeafById(tabId!, paneId))!.content.terminalId)\n> 371 |           await expect.poll(async () =>\n      |           ^"
+              "run": "postpin-verify",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 33232
             }
           ],
+          "failures": [],
           "attribution": {
             "kind": "gap",
             "owner": "TERM-27",
@@ -548,13 +551,14 @@
         "rust": {
           "verdict": "fail",
           "passed": 0,
-          "failed": 1,
+          "failed": 0,
           "skipped": 0,
-          "expectedFail": 0,
-          "durationMs": 28699,
+          "expectedFail": 1,
+          "durationMs": 28016,
           "runs": [
             "slice-5",
-            "reproof-s5-codexbounce"
+            "reproof-s5-codexbounce",
+            "postpin-verify"
           ],
           "runHistory": [
             {
@@ -572,15 +576,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 28699
-            }
-          ],
-          "failures": [
+            },
             {
-              "title": "a sidebar-resumed codex pane re-resumes (argv `resume <id>`) across a server restart without a page reload",
-              "line": 101,
-              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  193 |         expect(newTabId).toBeTruthy()\n  194 |\n> 195 |         const terminalIdBefore: string = await expect.poll(async () => {\n      |                                          ^\n  196 |           return (await harness.getPaneLayout(newTabId!))?.content?.terminalId ?? null"
+              "run": "postpin-verify",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 28016
             }
           ],
+          "failures": [],
           "attribution": {
             "kind": "gap",
             "owner": "TERM-22",
@@ -3447,13 +3453,14 @@
         "rust": {
           "verdict": "fail",
           "passed": 1,
-          "failed": 1,
+          "failed": 0,
           "skipped": 0,
-          "expectedFail": 0,
-          "durationMs": 36562,
+          "expectedFail": 1,
+          "durationMs": 36955,
           "runs": [
             "slice-7",
-            "reproof-s7-sideclick"
+            "reproof-s7-sideclick",
+            "postpin-verify"
           ],
           "runHistory": [
             {
@@ -3471,15 +3478,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 36562
-            }
-          ],
-          "failures": [
+            },
             {
-              "title": "clicking a seeded Codex session in the sidebar spawns it via `codex resume <id>`",
-              "line": 117,
-              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  242 |         // rather than reading `getPaneLayout` a single time immediately after\n  243 |         // the (possibly-just-a-placeholder) `.xterm` container appears.\n> 244 |         const terminalId: string = await expect.poll(async () => {\n      |                                    ^\n  245 |           return (await harness.getPaneLayout(newTabId!))?.content?.terminalId ?? null"
+              "run": "postpin-verify",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 36955
             }
           ],
+          "failures": [],
           "attribution": {
             "kind": "gap",
             "owner": "TERM-22",

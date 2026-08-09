@@ -211,12 +211,12 @@ GATE01 spot: harness-02 + screenshot-baselines both legs (slice 0 command)
 | ID | Assumption | Cost if false | Method | Status |
 |----|-----------|---------------|--------|--------|
 | A1 | chromium lane == specs−RUST_ONLY (69) defines "legacy suite" | high (wrong deliverable) | inspect config (done: 69 files enumerated) | verified |
-| A2 | Importing base config into gate config has no side effects and `--list` enumerates 69×2 | high (mechanism dead) | run `playwright --list --config gate01…` | pending slice 0 |
-| A3 | snapshotPathTemplate `-chromium-` pin hits committed baselines on both legs | high (false visual failures) | run screenshot-baselines + editor-pane both legs | pending slice 0 |
-| A4 | FRESHELL_E2E_RUST_SERVER_BIN suppresses ALL implicit cargo builds; binary override is what tests boot | medium | code-inspected (rust-server.ts:110-138); slice 0 records bin sha | verified-by-code, empirical pending |
-| A5 | Conditional `test.fail(e2eServerKind==='rust')` is project-name independent | medium | code-inspected (fixtures.ts option plumbing) | verified |
-| A6 | JSON reporter carries expected-fail + skipped + per-test status | medium | inspect slice-0 JSON | pending slice 0 |
-| A7 | Box can run 2 workers × both legs under lease guards without systemic flake-out | medium | observe slice 0/1; isolate-reprove any red | pending |
-| A8 | No spec outside RUST_ONLY hard-fails on legacy BY DESIGN (clang legacy red = real signal, not design) | high (attribution inversion) | any legacy-red gets root-caused, not assumed (protocol step 5) | procedural |
-| A9 | `playwright --list` / config import works under worktree path (spaces/symlinks absent) | low | slice 0 | pending |
-| A10 | Existing conditional pins (6 files, 16 test.fail sites) behave identically under gate project names | medium | slice containing settings-persistence-split: confirm expected-fail recorded | pending |
+| A2 | Importing base config into gate config has no side effects and `--list` enumerates 69×2 | high (mechanism dead) | run `playwright --list --config gate01…` | verified (280+280=560) |
+| A3 | snapshotPathTemplate `-chromium-` pin hits committed baselines on both legs | high (false visual failures) | run screenshot-baselines + editor-pane both legs | verified (legacy 6/6 visual green vs committed baselines; FIRST attempt with `{testFileDir}/{testFileName}` falsified the naive template — EACCES mkdir at fs root; fixed to `{snapshotDir}/{testFilePath}`) |
+| A4 | FRESHELL_E2E_RUST_SERVER_BIN suppresses ALL implicit cargo builds; binary override is what tests boot | medium | code-inspected (rust-server.ts:110-138); logs print the bin sha per worker | verified (all rust runs logged sha256=8728247…) |
+| A5 | Conditional `test.fail(e2eServerKind==='rust')` is project-name independent | medium | code-inspected (fixtures.ts option plumbing) | verified (CFG-12 pin consumed as e1 under gate01-rust; my 3 pins verified post-hoc run `postpin-verify`) |
+| A6 | JSON reporter carries expected-fail + skipped + per-test status | medium | inspect slice-0 JSON + all merges | verified |
+| A7 | Box can run 2 workers × both legs under lease guards without systemic flake-out | medium | observe all slices | verified (legacy legs stable; rust reds explained by F1/gaps, not environment) |
+| A8 | No spec outside RUST_ONLY hard-fails on legacy BY DESIGN | high (attribution inversion) | any legacy-red root-caused | FALSIFIED-but-contained: 6 files DO hard-fail on legacy by design (expect-guards) yet missing RUST_ONLY_SPECS — recorded as design-guard errata class, not product gaps |
+| A9 | `playwright --list` / config import works under worktree path | low | slice 0 | verified |
+| A10 | Existing conditional pins behave identically under gate project names | medium | settings-persistence-split e1 confirmed in slice-2 | verified |
