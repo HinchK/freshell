@@ -13,6 +13,10 @@ import { defineConfig, devices } from '@playwright/test'
 const MATRIX_SPECS = [
   /server-restart-recovery\.spec\.ts$/,
   /settings-persistence-split\.spec\.ts$/,
+  // HARNESS-03 — deterministic provider-fixture contract (fixture-only:
+  // boots NO server; both matrix legs run the identical assertions, which is
+  // itself the proof the fixtures are server-kind-independent).
+  /harness-03-provider-fixtures\.spec\.ts$/,
   // CFG-04 — legacy browser-preference seeding (one-shot consume + marker).
   // Authored under the df1 deferred-Playwright policy (worker-authored,
   // close-out-campaign-executed); see docs/plans/df1-evidence/CFG-04.md.

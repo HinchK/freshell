@@ -21,6 +21,7 @@
  * assertions against the fixtures — that sameness IS the fixture-only proof.
  */
 import { test, expect } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 import { WebSocket } from 'ws'
 import {
@@ -674,5 +675,150 @@ test.describe('opencode server fixture', () => {
     expect(await fixture.exited()).toBe(4)
     expect(fixture.readEvents().map((event) => event.kind).at(-1)).toBe('crash')
     await expect(fetch(`${base}/session/status`).then((r) => r.status)).rejects.toThrow()
+  })
+})
+
+// ── Hermeticity ─────────────────────────────────────────────────────────────
+// The dispatch hard rule: fake executables must be hermetic — they must not
+// invoke the real claude/codex/opencode binaries. Scrub mode proves the
+// whole contract works with PATH=/nonexistent (a real-binary fallback would
+// be unresolvable) and the fixture spawns ZERO child processes; the
+// decoy-secret control proves the ledger can never exfiltrate credentials.
+
+function childPidsOf(pid: number): number[] {
+  if (process.platform !== 'linux') return []
+  const out = execFileSync('ps', ['-o', 'pid=', '--ppid', String(pid)], { encoding: 'utf8' })
+  return out
+    .split('\n')
+    .map((line) => Number(line.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0)
+}
+
+test.describe('provider fixtures are hermetic', () => {
+  for (const provider of ['claude', 'gemini', 'kimi', 'amplifier'] as const) {
+    test(`${provider}: full turn contract with scrubbed PATH, no children`, async () => {
+      const fixture = await launchProviderFixture({
+        fixture: provider === 'amplifier' ? 'fake-amplifier.mjs' : `fake-${provider}.mjs`,
+        args: [],
+        program: TURN_PROGRAM,
+        env: { ...PROBE_ENV, HARNESS03_PROBE: `probe-${provider}` },
+        scrub: true,
+      })
+      try {
+        await fixture.waitOutput(`${provider}> `)
+        fixture.sendLine('do work')
+        await fixture.waitEvent('completion')
+        fixture.sendLine('explode')
+        expect(await fixture.exited()).toBe(3)
+        expect(fixture.readEvents().map((event) => event.kind)).toEqual([
+          'session',
+          'activity',
+          'approval',
+          'question',
+          'completion',
+          'crash',
+        ])
+        if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      } finally {
+        await fixture.stop()
+      }
+    })
+  }
+
+  test('kilroy sidecar: create+turn with scrubbed PATH, no children', async () => {
+    const fixture = await launchProviderFixture({
+      fixture: 'fake-claude-sdk-sidecar.mjs',
+      program: SIDECAR_PROGRAM,
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-kilroy', FRESHELL_FAKE_PROVIDER: 'kilroy' },
+      scrub: true,
+    })
+    try {
+      await sendSidecar(fixture, { type: 'create', requestId: 'scrub-req', cwd: fixture.cwd })
+      const created = await readSidecarLine(fixture, (o) => o.type === 'created', 'created')
+      fixture.proc.stdin?.write(
+        `${JSON.stringify({ type: 'send', sessionId: created.sessionId, text: 'please approve' })}\n`,
+      )
+      await fixture.waitEvent('completion')
+      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+    } finally {
+      await fixture.stop()
+    }
+  })
+
+  test('codex app-server: RPC contract with scrubbed PATH, no children', async () => {
+    const port = await freePort()
+    const listen = `ws://127.0.0.1:${port}`
+    const fixture = await launchProviderFixture({
+      fixture: 'fake-codex-app-server.mjs',
+      args: ['--listen', listen],
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-codex-app-server' },
+      scrub: true,
+    })
+    const client = new CodexRpcClient(listen)
+    try {
+      await fixture.waitOutput('listening on')
+      await client.ready()
+      await client.call('initialize', {})
+      const started = await client.call('thread/start', {})
+      await client.call('turn/start', { threadId: started.thread.id })
+      await client.waitNotification('turn/completed')
+      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      client.close()
+    } finally {
+      await fixture.stop()
+    }
+  })
+
+  test('opencode server: REST+SSE contract with scrubbed PATH, no children', async () => {
+    const port = await freePort()
+    const base = `http://127.0.0.1:${port}`
+    const fixture = await launchProviderFixture({
+      fixture: 'fake-opencode-server.mjs',
+      args: ['serve', '--port', String(port), '--hostname', '127.0.0.1'],
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-opencode-server' },
+      scrub: true,
+    })
+    const sse = new SseClient(`${base}/event`)
+    try {
+      await fixture.waitOutput('listening on')
+      await sse.waitEvent('server.connected')
+      const created = await fetch(`${base}/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }).then((r) => r.json())
+      await fetch(`${base}/session/${created.id}/message`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      })
+      await sse.waitEvent('session.idle')
+      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      sse.close()
+    } finally {
+      await fixture.stop()
+    }
+  })
+
+  test('the launch ledger can never record secrets outside the allowlist', async () => {
+    const fixture = await launchProviderFixture({
+      fixture: 'fake-claude.mjs',
+      args: [],
+      env: {
+        ...PROBE_ENV,
+        HARNESS03_PROBE: 'probe-claude',
+        ANTHROPIC_API_KEY: 'definitely-a-secret',
+        OPENAI_API_KEY: 'also-secret',
+      },
+    })
+    try {
+      await fixture.waitOutput('claude> ')
+      const [row] = fixture.readLedger()
+      expect(row.env.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(row.env.OPENAI_API_KEY).toBeUndefined()
+      expect(row.env.HARNESS03_PROBE).toBe('probe-claude')
+    } finally {
+      await fixture.stop()
+    }
   })
 })
