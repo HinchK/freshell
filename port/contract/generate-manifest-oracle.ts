@@ -611,6 +611,13 @@ const cases: { name: string; rawText: string }[] = [
     zz: 2,
     cli: { command: 'x' },
   }),
+  // Nested block: member issues emit in SCHEMA-DEFINITION order (command,
+  // args, …, supportsModel), then that block's unrecognized_keys — not the
+  // input's key order.
+  synth('nested-block-definition-order-pin', {
+    ...validCliManifest,
+    cli: { env: { X: 1 }, command: '', supportsModel: 'x', bogus: 2 },
+  }),
 ] as const
 
 // ── O. Bundled manifests (rawText = exact file bytes, so whitespace/ordering
