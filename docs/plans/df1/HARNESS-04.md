@@ -137,13 +137,14 @@ oldest timestamps** so the archived-last comparator order equals natural time or
 | repo-subdir | claude | cwd `outer-repo/src/pkg` | summary line | projectPath = outer-repo |
 | archived-claude | claude | plain dir, oldest ts | summary + override `archived:true` | listed, `archived:true`, tail |
 | deleted-claude | claude | plain dir | override `deleted:true` | ABSENT everywhere |
-| subagent | claude | `…/subagents/<id>.jsonl` | (title from user msg) | hidden by default; visible w/ includeSubagents=1 |
+| subagent | claude | `…/<parentSessionId>/subagents/agent-*.jsonl` (real per-session-dir layout) | first-message title | hidden by default; visible w/ includeSubagents=1 |
 | noninteractive | claude | plain dir, ONE user message | first-message title | hidden by default; visible w/ includeNonInteractive=1 |
 | untitled-empty | claude | init line only | none | hidden by default; visible w/ includeEmpty=1 + includeNonInteractive=1 |
 | gamma | codex | `sessions/2026/08/03/rollout-….jsonl` | first user message | listed |
 | archived-codex | codex | sessions/…, oldest ts | first msg + override archived | listed archived tail |
 | deleted-codex | codex | sessions/… | override deleted | ABSENT |
 | provider-archived-codex | codex | `archived_sessions/2026/08/02/rollout-…` | first msg | ABSENT (glob never covers it) |
+| codex-exec | codex | sessions/…, `source:'exec'` | first msg | hidden by default; visible w/ includeNonInteractive=1 |
 | delta | opencode | `project`+`session` rows | row `title` (provider title) | listed |
 | echo | opencode | 2nd row | row title + `titleOverride`/`summaryOverride` | listed, overrides win |
 | archived-opencode-override | opencode | oldest ts | override archived | listed archived tail |
@@ -155,7 +156,8 @@ oldest timestamps** so the archived-last comparator order equals natural time or
 | deleted-amplifier | amplifier | dir | override deleted | ABSENT |
 
 Listed total = 52+1+3+3+1 (claude) + 2 (codex) + 3 (opencode) + 2 (amplifier) = **67** →
-page 1 = 50, page 2 = 17 at limit 50. Marked-absent = 7; default-hidden = 3.
+page 1 = 50, page 2 = 17 at limit 50. Marked-absent = 7; default-hidden = 4 (claude subagent,
+claude noninteractive, claude init-only/untitled-empty, codex exec).
 
 Config seeded at `<home>/.freshell/config.json`: `version:1`, minimal settings incl.
 `codingCli.enabledProviders: [claude, codex, opencode, amplifier]` (TestServer merges its
