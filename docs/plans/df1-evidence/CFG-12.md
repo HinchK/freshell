@@ -89,7 +89,8 @@ At the fix commit with the spec un-pinned in-tree (pre-commit worktree state of 
 - `--project=legacy-chromium` run 1: **2 passed** (20.5s).
 - `--project=legacy-chromium` run 2: **2 passed** (43.4s).
 
-At the FINAL SHA `cf3764707` (after the comment-only clippy fix; binary rebuilt, 45.2s):
+At the code-final SHA `cf3764707` (after the comment-only clippy fix; binary rebuilt, 45.2s —
+HEAD at report time is `91beabfeb`, a docs-only evidence commit on top of `cf3764707`):
 
 - `--project=rust-chromium` run 1: **2 passed** (16.7s).
 - `--project=rust-chromium` run 2: **2 passed** (17.9s).
@@ -101,6 +102,33 @@ Focused cargo rerun at final SHA (same PTY chain as the build): ws lib **431/431
 `cargo clippy -p freshell-ws -p freshell-server --all-targets -- -D warnings` clean (round 2,
 after rewording one doc-comment line that tripped `doc_lazy_continuation`); `npm run typecheck`
 clean.
+
+## Review record
+
+Structured fresh-eyes self-review per the review-agent protocol (no `Task` tool in this
+environment → the orchestrator's sanctioned fallback), over `git diff 3dbba43c2..cf3764707`
+(the full change, incl. all 37 files):
+
+- Verified no missed `WsState` construction sites: compiler-checked (`cargo check --all-targets`)
+  + full green suites; 5 src + 8 common/mod.rs + 26 per-file integration literals all carry the
+  new field.
+- Verified no torn/interleaved read is possible through the handshake lock: `SettingsStore::patch`
+  holds the write guard only for in-memory merge, drops it BEFORE disk `persist()`, commits the
+  fully-merged tree with a second short write (`settings_store.rs:377-416`), so a handshake read
+  sees a complete old-or-new tree and never waits on disk IO.
+- Verified clean-boot byte parity claim by test, not inspection alone: all 5 pre-existing
+  handshake-shape/transcript tests re-run green under the async builder; oracle fixture test
+  (`default_plus_network_overlay_matches_captured_fixture`) green (610-pass bin suite).
+- Verified the CFG-06 boundary is pinned behaviorally (frozen view must NOT follow the live lock —
+  explicit assertion inside the new ws lib test).
+- Spec edit: `e2eServerKind` removed from the second test's destructure (no remaining use);
+  typecheck clean; both pw legs green ×2 after the edit.
+
+**Findings: none.** Residual risks (accepted, owned elsewhere): create-time consumers still read
+the boot-frozen view — deliberately deferred to CFG-06 (its PW validation asserts exactly that);
+the checklist sentence's rust-restart leg is proven at store level
+(`patched_default_cwd_survives_reload_from_disk`) plus the spec's on-disk `config.settings
+.defaultCwd` assertion, matching the campaign acceptance, which names the exact split-spec legs.
 
 ## Commands (verbatim, at final SHA)
 
