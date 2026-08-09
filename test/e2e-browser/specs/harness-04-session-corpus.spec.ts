@@ -35,7 +35,7 @@ import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { test as base, expect } from '../helpers/fixtures.js'
-import { createE2eServerHandle } from '../helpers/external-target.js'
+import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import {
   buildSessionCorpus,
   loadSessionCorpusManifest,
@@ -135,7 +135,13 @@ async function assertRealHomeUntouched(marker: string, before: RealHomeState): P
 
 const corpusHolder: { value?: SessionCorpus } = {}
 
-const test = base.extend<Record<string, never>, { corpusWorker: SessionCorpus }>({
+// The override + dependent are worker-scoped, and fixtures.ts declares its
+// worker-scope fixtures in the test-fixture type param, so re-declare
+// testServer here at the correct (worker) scope for typed dependencies.
+const test = base.extend<Record<string, never>, {
+  corpusWorker: SessionCorpus
+  testServer: E2eServerHandle
+}>({
   // Worker-scoped corpus built ONCE inside the legacy server's isolated home.
   testServer: [async ({}, use) => {
     corpusHolder.value = undefined
@@ -152,12 +158,10 @@ const test = base.extend<Record<string, never>, { corpusWorker: SessionCorpus }>
     await server.stop()
   }, { scope: 'worker' }],
 
-  corpusWorker: [async (fixtures, use) => {
-    // Depend on testServer for ORDERING (corpus is built inside its
-    // setupHome); destructured loosely because this project's typed-declare
-    // pattern (fixtures.ts declares worker fixtures as test fixtures) makes
-    // strict typing of the dependency noisy without adding value.
-    void (fixtures as unknown as { testServer: unknown }).testServer
+  corpusWorker: [async ({ testServer }, use) => {
+    // Ordering dependency only: the corpus is built inside testServer's
+    // setupHome hook; referencing the fixture guarantees it booted first.
+    void testServer
     if (!corpusHolder.value) throw new Error('corpus was not built by setupHome')
     await use(corpusHolder.value)
   }, { scope: 'worker' }],
