@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "601d60b5078b13b0e8aa6b03d2f184c560dcbd92",
+  "head": "e14bc54983c0d43f9f3c71d9f265e7b970c81676",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -858,28 +858,74 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 9,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 80378,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 9,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 80378
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 4,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 213821,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 5,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 213821
+            }
+          ],
+          "failures": [
+            {
+              "title": "fresh-agent header keeps identity visible in a narrow split pane",
+              "line": 132,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "freshclaude settings use FreshAgent model defaults and create payload",
+              "line": 183,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "freshclaude banners render through the fresh-agent pane surface and answer over WS",
+              "line": 649,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "renders the fresh-agent transcript at the terminal font size without clipping the composer",
+              "line": 776,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 4/4 ctx dialog (.xterm waits behind the modal); legacy 9/9 green"
+          }
         }
       }
     },
@@ -1104,26 +1150,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7224,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7224
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7345,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7345
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2567,26 +2635,57 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 136,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 136
+            }
+          ],
+          "failures": [
+            {
+              "title": "a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef",
+              "line": 107,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  109 |     // assert the precondition explicitly so an accidental matrix inclusion\n  110 |     // fails loudly instead of silently no-op'ing on legacy.\n> 111 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  112 |\n  113 |     const SEEDED_SESSION_ID = 'amp-remote-linkage-0001'\n  114 |     const SESSION_TITLE = 'remote-tab-linkage seeded session'"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :111; registration-errata class; rust leg green"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 11903,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11903
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2809,26 +2908,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 42752,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42752
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 26705,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 26705
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2889,26 +3010,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 83,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 83
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 63,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 63
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -3201,28 +3344,74 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 8,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 68312,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 68312
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 4,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 272141,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 4,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 272141
+            }
+          ],
+          "failures": [
+            {
+              "title": "terminal font size input changes setting",
+              "line": 35,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "terminal color scheme selection",
+              "line": 60,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "scrollback lines slider changes setting",
+              "line": 130,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "debug logging toggle",
+              "line": 148,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 4/4 ctx dialog; legacy 8/8 green same run"
+          }
         }
       }
     },
@@ -3763,27 +3952,55 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 19173,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 19173
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
+          "durationMs": 35680,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 35680
+            }
+          ],
+          "failures": [
+            {
+              "title": "a LARGE scrollback cap retains the earliest needle/search match, byte-perfect and Unicode-clean",
+              "line": 280,
+              "error": "Error: No shell option available for the active tab\n\n  94 |       }\n  95 |     }\n> 96 |     throw new Error('No shell option available for the active tab')\n     |           ^\n  97 |   }\n  98 |\n  99 |   async function patchScrollback(page: any, serverInfo: any, lines: number): Promise<void> {\n    at selectShell (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:96:11)\n    at runScrollbackScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:199:5)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/term13-scrollback-boundary.spec.ts:287:61"
+            }
+          ],
           "attribution": null
         }
       }
