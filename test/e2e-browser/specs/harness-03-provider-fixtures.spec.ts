@@ -497,3 +497,182 @@ test.describe('codex app-server fixture', () => {
     expect(fixture.readEvents().map((event) => event.kind).at(-1)).toBe('crash')
   })
 })
+
+// ── OpenCode server fixture ─────────────────────────────────────────────────
+// HTTP REST + SSE `serve --port N --hostname H`, mirroring the consumer
+// contract in server/fresh-agent/adapters/opencode/serve-events.ts (flat
+// `data: {"type","properties"}\n\n` frames; server.connected on connect;
+// session.status busy/idle + session.idle) and the resume probe in
+// opencode_ws.rs (GET /session/:id).
+
+class SseClient {
+  readonly events: any[] = []
+  private buffer = ''
+  readonly closed: Promise<void>
+  private controller = new AbortController()
+
+  constructor(private url: string) {
+    this.closed = this.pump().catch(() => undefined)
+  }
+
+  private async pump() {
+    const response = await fetch(this.url, { signal: this.controller.signal })
+    if (!response.ok || !response.body) throw new Error(`SSE connect failed: ${response.status}`)
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      this.buffer += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = this.buffer.indexOf('\n\n')) !== -1) {
+        const frame = this.buffer.slice(0, idx)
+        this.buffer = this.buffer.slice(idx + 2)
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data:')) {
+            try {
+              this.events.push(JSON.parse(line.slice('data:'.length).trim()))
+            } catch {
+              // non-JSON frame; ignore
+            }
+          }
+        }
+      }
+    }
+  }
+
+  async waitEvent(type: string, timeoutMs = 10_000): Promise<any> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const match = this.events.find((event) => event.type === type)
+      if (match) return match
+      if (Date.now() > deadline) {
+        throw new Error(`opencode fixture: timed out waiting for SSE ${type}; saw ${JSON.stringify(this.events.map((e) => e.type))}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+
+  close(): void {
+    this.controller.abort()
+  }
+}
+
+test.describe('opencode server fixture', () => {
+  let fixture: LaunchedFixture
+  let sse: SseClient | undefined
+  let base = ''
+  test.afterEach(async () => {
+    sse?.close()
+    await fixture?.stop()
+  })
+
+  async function boot(program?: unknown): Promise<void> {
+    const port = await freePort()
+    base = `http://127.0.0.1:${port}`
+    fixture = await launchProviderFixture({
+      fixture: 'fake-opencode-server.mjs',
+      args: ['serve', '--port', String(port), '--hostname', '127.0.0.1'],
+      program,
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-opencode-server' },
+    })
+    await fixture.waitOutput('listening on')
+  }
+
+  test('records argv/env and flows session/activity/approval/question/completion over REST+SSE', async () => {
+    await boot({
+      rules: [
+        {
+          on: 'http:POST /session/[^/]+/message',
+          emit: [
+            { kind: 'approval', data: { id: 'perm-o1', permission: 'bash', patterns: ['rm *'] } },
+            { kind: 'question', data: { id: 'q-o1', text: 'which directory?' } },
+          ],
+        },
+      ],
+    })
+    sse = new SseClient(`${base}/event`)
+    await sse.waitEvent('server.connected')
+
+    const created = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ directory: fixture.cwd }),
+    }).then((r) => r.json())
+    const sessionId = created.id as string
+    expect(sessionId).toBeTruthy()
+    const sessionEvent = await fixture.waitEvent('session')
+    expect(sessionEvent.data.id).toBe(sessionId)
+    expectLedgerRow(fixture, 'opencode-server', [
+      'serve',
+      '--port',
+      base.split(':').at(-1) as string,
+      '--hostname',
+      '127.0.0.1',
+    ])
+
+    const reply = await fetch(`${base}/session/${sessionId}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parts: [{ type: 'text', text: 'do work' }] }),
+    })
+    expect(reply.ok).toBe(true)
+
+    const busy = await sse.waitEvent('session.status')
+    expect(busy.properties.status.type).toBe('busy')
+    const approval = await sse.waitEvent('permission.asked')
+    expect(approval.properties).toMatchObject({ id: 'perm-o1', sessionID: sessionId })
+    const question = await sse.waitEvent('question.asked')
+    expect(question.properties).toMatchObject({ id: 'q-o1', sessionID: sessionId })
+    await sse.waitEvent('session.idle')
+
+    const kinds = fixture.readEvents().map((event) => event.kind)
+    expect(kinds).toEqual(['session', 'activity', 'approval', 'question', 'completion'])
+  })
+
+  test('GET /session/:id on an existing session is the resume probe', async () => {
+    await boot()
+    const created = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then((r) => r.json())
+    const found = await fetch(`${base}/session/${created.id}`)
+    expect(found.status).toBe(200)
+    expect((await found.json()).id).toBe(created.id)
+    const resume = await fixture.waitEvent('resume')
+    expect(resume.data.id).toBe(created.id)
+
+    const missing = await fetch(`${base}/session/does-not-exist`)
+    expect(missing.status).toBe(404)
+  })
+
+  test('a scripted crash drops the listener and records the event first', async () => {
+    const port = await freePort()
+    base = `http://127.0.0.1:${port}`
+    fixture = await launchProviderFixture({
+      fixture: 'fake-opencode-server.mjs',
+      args: ['serve', '--port', String(port), '--hostname', '127.0.0.1'],
+      program: {
+        rules: [
+          { on: 'http:POST /session/[^/]+/message', emit: [{ kind: 'crash', data: { code: 4 }, delayMs: 10 }] },
+        ],
+      },
+      env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-opencode-server' },
+    })
+    await fixture.waitOutput('listening on')
+    const created = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then((r) => r.json())
+    await fetch(`${base}/session/${created.id}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parts: [{ type: 'text', text: 'explode' }] }),
+    })
+    expect(await fixture.exited()).toBe(4)
+    expect(fixture.readEvents().map((event) => event.kind).at(-1)).toBe('crash')
+    await expect(fetch(`${base}/session/status`).then((r) => r.status)).rejects.toThrow()
+  })
+})
