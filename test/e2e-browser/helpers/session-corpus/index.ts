@@ -201,14 +201,15 @@ export async function buildSessionCorpus(
   const subCreated = T('2026-07-08T10:00:00.000Z')
   await writeClaudeSession(ctx, {
     role: 'subagent',
-    sessionId: claudeId(),
+    sessionId: 'a6d3f0c4d5ab',
     cwd: path.join(projectsRoot, 'alpha-project'),
     titleText: `${marker} subagent`,
     turns: 2,
     withSummary: false,
-    subagent: true,
+    subagent: { parentSessionId: alpha.sessionId },
+    // sidechain schedule: no init line → last = createdAt + 2*turns - 1
     createdAt: subCreated,
-    lastActivityAt: subCreated + 4,
+    lastActivityAt: subCreated + 3,
   })
 
   const niCreated = T('2026-07-10T10:00:00.000Z')

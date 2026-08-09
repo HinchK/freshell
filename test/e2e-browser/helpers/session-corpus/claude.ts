@@ -2,7 +2,7 @@
  * HARNESS-04 — Claude Code session writer.
  *
  * Writes real-layout `$CLAUDE_HOME/projects/<slug>/<sessionId>.jsonl` files
- * (plus `projects/<slug>/subagents/` for subagent sessions), matching what
+ * (plus `projects/<slug>/<parentId>/subagents/agent-<id>.jsonl` for subagents), matching what
  * `server/coding-cli/providers/claude.ts` + `session-indexer.ts` parse:
  *  - `system`/`init` line first (session_id, cwd, createdAt timestamp)
  *  - user/assistant turn pairs (parentUuid-chained, `message.role`/`content`)
@@ -41,7 +41,14 @@ export interface ClaudeSessionSpec {
   withSummary: boolean
   createdAt: number
   lastActivityAt: number
-  subagent?: boolean
+  /**
+   * Subagent transcript: written at the REAL claude layout
+   * `projects/<slug>/<parentSessionId>/subagents/agent-<id>.jsonl` with
+   * sidechain lines (`isSidechain: true`, promptId, agentId, no sessionId —
+   * the indexed session id is the filename stem, matching
+   * `claude.extractSessionId`).
+   */
+  subagent?: { parentSessionId: string }
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString()
@@ -57,7 +64,17 @@ export async function writeClaudeSession(
     // the two; refuse rather than emit a misordered transcript.
     throw new Error(`writeClaudeSession(${spec.role}): userMessages override requires turns === 0`)
   }
-  if (spec.turns > 0 || userMsgCount > 0) {
+  if (spec.subagent) {
+    // Sidechain transcripts have NO init line: turn i stamps are
+    // user=createdAt+2(i-1), assistant=createdAt+2i-1.
+    const wantsLast = spec.createdAt + 2 * spec.turns - 1
+    if (spec.turns < 1 || spec.lastActivityAt !== wantsLast) {
+      throw new Error(
+        `writeClaudeSession(${spec.role}): subagent transcripts need turns>=1 and ` +
+        `lastActivityAt === createdAt+2*turns-1 (${wantsLast}), got ${spec.lastActivityAt}`,
+      )
+    }
+  } else if (spec.turns > 0 || userMsgCount > 0) {
     const expectedLast = spec.createdAt + 2 * spec.turns
     const soloTs = spec.createdAt + 1
     if (spec.turns > 0 && spec.lastActivityAt !== expectedLast) {
@@ -75,32 +92,47 @@ export async function writeClaudeSession(
   }
 
   const projectDir = path.join(ctx.homeDir, '.claude', 'projects', claudeProjectSlug(spec.cwd))
-  const dir = spec.subagent ? path.join(projectDir, 'subagents') : projectDir
+  const dir = spec.subagent
+    ? path.join(projectDir, spec.subagent.parentSessionId, 'subagents')
+    : projectDir
   await fsp.mkdir(dir, { recursive: true })
-  const file = path.join(dir, `${spec.sessionId}.jsonl`)
+  // Indexed id = filename stem (`extractSessionId` falls back to basename).
+  // Subagent transcripts carry NO sessionId field (real layout: isSidechain
+  // lines with agentId/promptId), so their stem IS the id — `agent-<id>`.
+  const indexedId = spec.subagent ? `agent-${spec.sessionId}` : spec.sessionId
+  const file = path.join(dir, `${indexedId}.jsonl`)
+
+  const lineBase = (schedTs: number) => ({
+    cwd: spec.cwd,
+    version: '2.1.23' as const,
+    gitBranch: 'main',
+    timestamp: iso(schedTs),
+    ...(spec.subagent
+      ? { isSidechain: true, promptId: `${spec.sessionId}-prompt`, agentId: spec.sessionId }
+      : { sessionId: spec.sessionId }),
+  })
 
   const lines: string[] = []
   const initUuid = `${spec.sessionId}-sys`
-  lines.push(JSON.stringify({
-    type: 'system',
-    subtype: 'init',
-    session_id: spec.sessionId,
-    uuid: initUuid,
-    timestamp: iso(spec.createdAt),
-    cwd: spec.cwd,
-    git: { branch: 'main', dirty: false },
-  }))
+  if (!spec.subagent) {
+    lines.push(JSON.stringify({
+      ...lineBase(spec.createdAt),
+      type: 'system',
+      subtype: 'init',
+      session_id: spec.sessionId,
+      uuid: initUuid,
+    }))
+  }
 
-  let previousUuid = initUuid
+  let previousUuid: string | null = spec.subagent ? null : initUuid
   for (let i = 1; i <= spec.turns; i += 1) {
     const userUuid = `${spec.sessionId}-u${i}`
     const asstUuid = `${spec.sessionId}-a${i}`
+    const userTs = spec.subagent ? spec.createdAt + 2 * (i - 1) : spec.createdAt + 2 * i - 1
+    const asstTs = spec.subagent ? spec.createdAt + 2 * i - 1 : spec.createdAt + 2 * i
     lines.push(JSON.stringify({
+      ...lineBase(userTs),
       parentUuid: previousUuid,
-      cwd: spec.cwd,
-      sessionId: spec.sessionId,
-      version: '2.1.23',
-      gitBranch: 'main',
       type: 'user',
       message: {
         role: 'user',
@@ -109,14 +141,10 @@ export async function writeClaudeSession(
           : `${spec.titleText ?? spec.role} request ${i} followup`,
       },
       uuid: userUuid,
-      timestamp: iso(spec.createdAt + 2 * i - 1),
     }))
     lines.push(JSON.stringify({
+      ...lineBase(asstTs),
       parentUuid: userUuid,
-      cwd: spec.cwd,
-      sessionId: spec.sessionId,
-      version: '2.1.23',
-      gitBranch: 'main',
       type: 'assistant',
       message: {
         role: 'assistant',
@@ -130,7 +158,6 @@ export async function writeClaudeSession(
         },
       },
       uuid: asstUuid,
-      timestamp: iso(spec.createdAt + 2 * i),
     }))
     previousUuid = asstUuid
   }
@@ -139,15 +166,11 @@ export async function writeClaudeSession(
   for (let i = spec.turns + 1; i <= spec.turns + (userMsgCount - spec.turns); i += 1) {
     const userUuid = `${spec.sessionId}-u${i}`
     lines.push(JSON.stringify({
+      ...lineBase(spec.createdAt + 1),
       parentUuid: previousUuid,
-      cwd: spec.cwd,
-      sessionId: spec.sessionId,
-      version: '2.1.23',
-      gitBranch: 'main',
       type: 'user',
       message: { role: 'user', content: `${spec.titleText ?? spec.role} request ${i}` },
       uuid: userUuid,
-      timestamp: iso(spec.createdAt + 1),
     }))
     previousUuid = userUuid
   }
@@ -164,12 +187,19 @@ export async function writeClaudeSession(
   await recordFile(ctx.files, ctx.homeDir, file, `claude-session:${spec.role}`)
 
   const interactive = userMsgCount > 1
+  // Wire title mirrors the server's derivation: summary line when present,
+  // else the FULL first user message text (extractTitleFromMessage), else none.
+  const wireTitle = spec.withSummary
+    ? spec.titleText
+    : userMsgCount > 0 && spec.titleText
+      ? `${spec.titleText} request 1`
+      : undefined
   const expectation: CorpusSessionExpectation = {
-    key: `claude:${spec.sessionId}`,
+    key: `claude:${indexedId}`,
     provider: 'claude',
-    sessionId: spec.sessionId,
+    sessionId: indexedId,
     role: spec.role,
-    title: spec.titleText,
+    title: wireTitle,
     summary: spec.withSummary ? (spec.titleText ?? spec.role) : undefined,
     projectPath: spec.cwd,
     cwd: spec.cwd,

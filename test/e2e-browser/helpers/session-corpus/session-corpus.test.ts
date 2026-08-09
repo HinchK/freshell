@@ -227,7 +227,8 @@ describe('session-corpus claude writer', () => {
     const lines = raw.trim().split('\n').map((l) => JSON.parse(l))
     expect(lines.map((l) => l.type)).toEqual(['system', 'user'])
     expect(lines[1].message.content).toContain('h04corpus-testtoken noninteractive')
-    expect(exp.title).toBe('h04corpus-testtoken noninteractive')
+    // wire title mirrors the server derivation: FULL first user message text
+    expect(exp.title).toBe('h04corpus-testtoken noninteractive request 1')
     expect(exp.summary).toBeUndefined()
     expect(exp.visibility).toBe('hidden-default')
     expect(exp.visibleWith).toEqual({ includeNonInteractive: true })
@@ -252,26 +253,38 @@ describe('session-corpus claude writer', () => {
     expect(exp.visibleWith).toEqual({ includeNonInteractive: true, includeEmpty: true })
   })
 
-  it('subagent sessions land under projects/<slug>/subagents/', async () => {
+  it('subagent sessions land at the real layout <slug>/<parent>/subagents/agent-<id>.jsonl', async () => {
     const home = await mkHome()
     const ctx = mkCtx(home)
     const cwd = path.join(ctx.workspace, 'projects', 'alpha-project')
+    const createdAt = Date.parse('2026-07-08T10:00:00.000Z')
     const exp = await writeClaudeSession(ctx, {
       role: 'subagent',
-      sessionId: '00000000-0000-4000-8000-0000000000d1',
+      sessionId: 'a0076913f8bb3baa',
       cwd,
       titleText: 'h04corpus-testtoken subagent',
       turns: 2,
       withSummary: false,
-      subagent: true,
-      createdAt: Date.parse('2026-07-08T10:00:00.000Z'),
-      lastActivityAt: Date.parse('2026-07-08T10:00:00.004Z'),
+      subagent: { parentSessionId: '10000000-0000-4000-8000-000000000101' },
+      // sidechain schedule: no init line → last = createdAt + 2*turns - 1
+      createdAt,
+      lastActivityAt: createdAt + 3,
     })
-    expect(ctx.files[0].path).toContain('/subagents/')
+    expect(ctx.files[0].path).toContain(
+      '/10000000-0000-4000-8000-000000000101/subagents/agent-a0076913f8bb3baa.jsonl')
+    // indexed id is the filename stem (no sessionId field in sidechain lines)
+    expect(exp.sessionId).toBe('agent-a0076913f8bb3baa')
+    const lines = (await fsp.readFile(path.join(home, ctx.files[0].path), 'utf-8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    expect(lines[0].type).toBe('user') // no init line in sidechain transcripts
+    expect(lines[0].isSidechain).toBe(true)
+    expect(lines[0]).not.toHaveProperty('sessionId')
+    expect(lines[0].timestamp).toBe('2026-07-08T10:00:00.000Z')
+    expect(lines[3].timestamp).toBe('2026-07-08T10:00:00.003Z')
     expect(exp.visibility).toBe('hidden-default')
     expect(exp.visibleWith).toEqual({ includeSubagents: true })
     // title still derivable from the first user message when no summary line
-    expect(exp.title).toContain('subagent')
+    expect(exp.title).toBe('h04corpus-testtoken subagent request 1')
   })
 })
 
