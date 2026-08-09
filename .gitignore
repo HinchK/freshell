@@ -64,3 +64,6 @@ port/vm-bridge/outbound/
 .ai/
 .amp-council/
 .verify-vantages.env
+
+# GATE-01 per-slice Playwright JSON reports (working state; committed artifact is gate01-baseline.json)
+test/e2e-browser/gate01-reports/
