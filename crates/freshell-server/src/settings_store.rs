@@ -518,10 +518,7 @@ impl SettingsStore {
             .cloned()
             .unwrap_or_default();
         let merged_project_colors = {
-            let memory = self
-                .project_colors
-                .lock()
-                .expect("project colors lock");
+            let memory = self.project_colors.lock().expect("project colors lock");
             let dirty = self
                 .project_colors_dirty
                 .lock()
@@ -629,10 +626,7 @@ impl SettingsStore {
 
         let disk_colors = load_project_colors(Some(home));
         {
-            let mut memory = self
-                .project_colors
-                .lock()
-                .expect("project colors lock");
+            let mut memory = self.project_colors.lock().expect("project colors lock");
             let dirty = self
                 .project_colors_dirty
                 .lock()
@@ -870,10 +864,7 @@ impl SettingsStore {
     /// concurrent-writer race loss: a later successful persist lands it.
     pub async fn set_project_color(&self, path: &str, color: &str) -> std::io::Result<()> {
         {
-            let mut all = self
-                .project_colors
-                .lock()
-                .expect("project colors lock");
+            let mut all = self.project_colors.lock().expect("project colors lock");
             all.insert(path.to_string(), json!(color));
             self.project_colors_dirty
                 .lock()
@@ -3787,8 +3778,14 @@ mod tests {
 
         // The in-memory reader reflects the write immediately.
         let colors = store.project_colors();
-        assert_eq!(colors.get("/proj/beta").and_then(Value::as_str), Some("#00ff00"));
-        assert_eq!(colors.get("/proj/alpha").and_then(Value::as_str), Some("#ff0000"));
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#00ff00")
+        );
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000")
+        );
 
         // On disk: both colors plus every unrelated key.
         let cfg: Value =
@@ -3810,8 +3807,14 @@ mod tests {
         // A fresh process (another load) sees both colors.
         let reloaded = store_at(&dir);
         let colors = reloaded.project_colors();
-        assert_eq!(colors.get("/proj/alpha").and_then(Value::as_str), Some("#ff0000"));
-        assert_eq!(colors.get("/proj/beta").and_then(Value::as_str), Some("#00ff00"));
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000")
+        );
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#00ff00")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3829,8 +3832,14 @@ mod tests {
         store.set_project_color("/proj/a", "#333333").await.unwrap();
 
         let colors = store.project_colors();
-        assert_eq!(colors.get("/proj/a").and_then(Value::as_str), Some("#333333"));
-        assert_eq!(colors.get("/proj/b").and_then(Value::as_str), Some("#222222"));
+        assert_eq!(
+            colors.get("/proj/a").and_then(Value::as_str),
+            Some("#333333")
+        );
+        assert_eq!(
+            colors.get("/proj/b").and_then(Value::as_str),
+            Some("#222222")
+        );
         assert_eq!(colors.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3846,12 +3855,18 @@ mod tests {
         std::fs::create_dir_all(&freshell).unwrap();
         let store = store_at(&dir);
 
-        store.set_project_color("/proj/only", "#abcdef").await.unwrap();
+        store
+            .set_project_color("/proj/only", "#abcdef")
+            .await
+            .unwrap();
 
         let cfg: Value =
             serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
                 .unwrap();
-        assert!(cfg["projectColors"].is_object(), "projectColors must be an object");
+        assert!(
+            cfg["projectColors"].is_object(),
+            "projectColors must be an object"
+        );
         assert_eq!(cfg["projectColors"]["/proj/only"], json!("#abcdef"));
         assert!(
             cfg["sessionOverrides"].is_object(),
@@ -3899,7 +3914,10 @@ mod tests {
         .unwrap();
 
         // Rust colors a DIFFERENT project -- triggers a persist.
-        store.set_project_color("/proj/ours", "#dddddd").await.unwrap();
+        store
+            .set_project_color("/proj/ours", "#dddddd")
+            .await
+            .unwrap();
 
         let cfg: Value =
             serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
@@ -3929,7 +3947,10 @@ mod tests {
         let freshell = dir.join(".freshell");
         let store = store_at(&dir);
 
-        store.set_project_color("/proj/hot", "#111111").await.unwrap();
+        store
+            .set_project_color("/proj/hot", "#111111")
+            .await
+            .unwrap();
 
         // External writer overwrites the SAME path.
         let mut cfg: Value =
@@ -3943,7 +3964,10 @@ mod tests {
         .unwrap();
 
         // A persist for ANY other reason (here: another color write).
-        store.set_project_color("/proj/cold", "#222222").await.unwrap();
+        store
+            .set_project_color("/proj/cold", "#222222")
+            .await
+            .unwrap();
 
         let cfg: Value =
             serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
@@ -3984,7 +4008,10 @@ mod tests {
         let store = store_at(&dir);
 
         let colors = store.project_colors();
-        assert_eq!(colors.get("/proj/good").and_then(Value::as_str), Some("#ff0000"));
+        assert_eq!(
+            colors.get("/proj/good").and_then(Value::as_str),
+            Some("#ff0000")
+        );
         assert!(
             !colors.contains_key("/proj/junk"),
             "a non-string color value must be normalized away, got: {colors:?}"
@@ -3994,7 +4021,10 @@ mod tests {
         // into memory... and the persisted file keeps the original junk
         // value for the untouched key only if it was never written
         // (adopt-from-disk passes the disk map through).
-        store.set_project_color("/proj/other", "#00ff00").await.unwrap();
+        store
+            .set_project_color("/proj/other", "#00ff00")
+            .await
+            .unwrap();
         let colors = store.project_colors();
         assert!(!colors.contains_key("/proj/junk"));
 

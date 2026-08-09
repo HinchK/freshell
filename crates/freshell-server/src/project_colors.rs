@@ -113,7 +113,11 @@ fn validate_project_color_body(body: &Value) -> Option<Value> {
     for (key, max) in [("projectPath", PROJECT_PATH_MAX), ("color", COLOR_MAX)] {
         match map.get(key) {
             Some(Value::String(s)) => {
-                if s.len() < 1 {
+                // zod's `.min(1)`/`.max(N)` operate on JS `string.length`
+                // (UTF-16 code units), NOT bytes/codepoints — count UTF-16
+                // units so near-limit non-ASCII paths validate identically.
+                let js_len = s.encode_utf16().count();
+                if js_len < 1 {
                     issues.push(json!({
                         "code": "too_small",
                         "minimum": 1,
@@ -122,7 +126,7 @@ fn validate_project_color_body(body: &Value) -> Option<Value> {
                         "path": [key],
                         "message": "Too small: expected string to have >=1 characters",
                     }));
-                } else if s.len() > max {
+                } else if js_len > max {
                     issues.push(json!({
                         "code": "too_big",
                         "maximum": max,
@@ -214,15 +218,14 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn state_at(dir: &std::path::Path) -> (ProjectColorsState, tokio::sync::broadcast::Receiver<String>) {
+    fn state_at(
+        dir: &std::path::Path,
+    ) -> (ProjectColorsState, tokio::sync::broadcast::Receiver<String>) {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(16);
         (
             ProjectColorsState {
                 auth_token: Arc::new("tok".to_string()),
-                settings: SettingsStore::load(
-                    Some(dir),
-                    vec!["claude".into(), "codex".into()],
-                ),
+                settings: SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into()]),
                 broadcast_tx: Arc::new(tx),
                 sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
@@ -230,11 +233,7 @@ mod tests {
         )
     }
 
-    async fn put_json(
-        app: &Router,
-        token: Option<&str>,
-        body: &Value,
-    ) -> (StatusCode, Value) {
+    async fn put_json(app: &Router, token: Option<&str>, body: &Value) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method("PUT")
             .uri("/api/project-colors")
@@ -387,6 +386,30 @@ mod tests {
         let (status, resp) = put_json(&app, Some("tok"), &json!([])).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "array body");
         assert_eq!(resp["details"][0]["expected"], json!("object"));
+
+        // UTF-16 LENGTH PARITY: zod measures string lengths in JS
+        // `string.length` (UTF-16 units). A 64-unit / 192-byte non-ASCII
+        // color must ACCEPT (byte-counting would wrongly 400)...
+        let (status, _) = put_json(
+            &app,
+            Some("tok"),
+            &json!({ "projectPath": "/proj/a", "color": "€".repeat(64) }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "64 UTF-16 units (192 bytes) is at the limit"
+        );
+        // ...and 65 units must still reject.
+        let (status, resp) = put_json(
+            &app,
+            Some("tok"),
+            &json!({ "projectPath": "/proj/a", "color": "€".repeat(65) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "65 UTF-16 units exceeds");
+        assert_eq!(resp["details"][0]["code"], json!("too_big"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
