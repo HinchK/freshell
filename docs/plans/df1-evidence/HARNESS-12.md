@@ -82,6 +82,20 @@ Windows-desktop campaign per the kickoff decisions). A Windows backend
 (Handle-count/PDH + Get-NetTCPConnection) would slot behind the same
 `ResourceSnapshot` schema. No fake Tauri code was written.
 
+## Review loop (round 1 of ≤5 — converged)
+
+Independent fresh-eyes review (gpt-family reviewer, repo-zero-context, defect-first
+rubric per the review-agent skill; FRESHPID=3030442, run against
+`git diff $(git merge-base HEAD origin/df1/integration)..HEAD`): **PASSED — "No
+findings."** The reviewer independently confirmed the last-`)` stat parse, the
+`/proc/net/tcp{,6}` column handling, the fd↔inode ownership attribution, the
+external-target skip safety, and the legacy/rust attach-before-kill flow against
+the real call sites (`server/terminal-registry.ts:1542`,
+`crates/freshell-ws/src/terminal.rs`, `terminal_tabs.rs`, `pane_ops.rs`). (Note:
+an MCP-pane subagent dispatch was attempted first and abandoned — the MCP caller
+context couldn't resolve the pane it had just created; the fresheyes detached
+reviewer replaced it per the dispatch's recorded-fallback allowance.)
+
 ## Consumer guidance (stress project, TERM-22/PW-RUST follow-ons)
 
 ```ts
