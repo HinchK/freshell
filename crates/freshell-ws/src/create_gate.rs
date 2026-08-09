@@ -4,6 +4,7 @@
 
 use freshell_protocol::ServerMessage;
 use freshell_terminal::FrameSink;
+use tracing::Instrument;
 
 /// Where a `terminal.create` reply goes.
 pub(crate) enum CreateOutput<'a> {
@@ -70,6 +71,9 @@ pub(crate) fn spawn_gated_restore_create(
 ) {
     let state = state.clone();
     let sink = std::sync::Arc::clone(conn_sink);
+    // DIAG-01: this fn is called from within the connection loop's `ws_conn`
+    // span context; carry it into the detached task so the restore create's
+    // events (prepare/gate/spawn) keep the serving connection's `connection_id`.
     tokio::spawn(async move {
         // P1 (graceful restore/resume S1): prepare — resume-identity
         // derivation + the codex managed plan — runs BEFORE the gate, so
@@ -209,6 +213,8 @@ pub(crate) fn spawn_gated_restore_create(
                     "spawn_gate_permit_hold_slow"
                 );
             }
+            // DIAG-01: keep the connection context on the watchdog event too.
+            .instrument(tracing::Span::current())
         });
         hold_permit_across(permit, async {
             let mut out = CreateOutput::Channel(&sink);
@@ -256,7 +262,8 @@ pub(crate) fn spawn_gated_restore_create(
         .await;
         // Hold settled (fast path): silence the slow-hold watchdog.
         hold_watchdog.abort();
-    });
+    }
+    .instrument(tracing::Span::current()));
 }
 
 #[cfg(test)]

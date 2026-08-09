@@ -19,8 +19,10 @@ const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 // ── capturing tracing layer (dev-only test facility) ──────────────────────
 
 use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 #[derive(Debug, Clone, Default)]
@@ -74,16 +76,48 @@ struct CaptureLayer {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
-impl<S: Subscriber> Layer<S> for CaptureLayer {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+/// Span-local storage mirroring the production `JsonLayer`'s `SpanFields`:
+/// fields recorded at span creation are merged into every event captured
+/// while that span is in the scope chain (root -> leaf; event fields win on
+/// collision) -- exactly how `freshell-server`'s JSONL writer produces
+/// `connection_id` on in-connection events.
+struct SpanFields(BTreeMap<String, String>);
+
+impl<S> Layer<S> for CaptureLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        attrs.record(&mut visitor);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanFields(visitor.fields));
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
+        let mut fields = BTreeMap::new();
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope.from_root() {
+                let extensions = span.extensions();
+                if let Some(SpanFields(span_fields)) = extensions.get::<SpanFields>() {
+                    for (k, v) in span_fields {
+                        fields.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        for (k, v) in visitor.fields {
+            fields.insert(k, v);
+        }
         self.events
             .lock()
             .expect("capture lock")
             .push(CapturedEvent {
                 message: visitor.message,
-                fields: visitor.fields,
+                fields,
             });
     }
 }
@@ -92,6 +126,11 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
 /// guard. `#[tokio::test]` defaults to a CURRENT-THREAD runtime, so the
 /// spawned server task (via `tokio::spawn` inside `spawn_server`) is polled
 /// on this SAME OS thread and observes the thread-local default too.
+///
+/// NOTE: events emitted on `spawn_blocking` pool threads (e.g. the
+/// registry's `terminal.created`, fired from `handle_create`'s blocking PTY
+/// spawn) do NOT observe this thread-local guard -- capture of those goes
+/// through the process-`GLOBAL` subscriber below.
 fn capture() -> (
     Arc<Mutex<Vec<CapturedEvent>>>,
     tracing::subscriber::DefaultGuard,
@@ -103,6 +142,37 @@ fn capture() -> (
     let subscriber = tracing_subscriber::registry().with(layer);
     let guard = tracing::subscriber::set_default(subscriber);
     (events, guard)
+}
+
+/// Process-global capture for events emitted OFF the test's own thread --
+/// the `spawn_blocking` pool (registry.create's `terminal.created`) has no
+/// thread-local dispatcher, so only a global default observes them. Same
+/// OnceLock-install semantics as `freshell-freshagent`'s diag01 capture
+/// (c62385ab4): first caller installs; `get_or_init` is the synchronization;
+/// every later call is a cheap no-op. Events from ALL tests in this binary
+/// land in the shared vec, so reads MUST filter by a per-test-unique field
+/// (the freshly minted `terminal_id`), never by "ever seen".
+static GLOBAL_EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> =
+    std::sync::OnceLock::new();
+
+fn global_capture() -> (Arc<Mutex<Vec<CapturedEvent>>>, usize) {
+    let events = GLOBAL_EVENTS
+        .get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            // This binary installs no other global subscriber; `.expect()`
+            // turns any future second-installer regression into an immediate
+            // diagnosable panic instead of a silently-empty capture.
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("this test binary installs exactly one global subscriber");
+            events
+        })
+        .clone();
+    let start_index = events.lock().expect("capture lock").len();
+    (events, start_index)
 }
 
 // ── server harness (duplicated from keepalive.rs's convention) ────────────
@@ -333,4 +403,113 @@ async fn diag01_ws_lifecycle_events_fire_with_expected_fields_and_never_leak_the
         closed.fields.contains_key("connection_id"),
         "connection.closed must carry connection_id"
     );
+}
+
+/// Proves DIAG-01's "connection ownership" clause holds for events emitted
+/// while *serving* a connection: the registry's `terminal.created` (fired
+/// from `handle_create`'s `spawn_blocking` PTY spawn on a pool thread) must
+/// carry the serving connection's `connection_id` -- via the `ws_conn` span
+/// wrapping `run_loop` + the `spawn_blocking_in_span` context hop, observed
+/// here exactly the way the production `JsonLayer` flattens span fields
+/// into the JSONL line.
+#[tokio::test]
+async fn diag01_in_connection_events_carry_the_connection_id() {
+    let (events, start_index) = global_capture();
+    let url = spawn_server(30_000).await;
+    let mut ws = connect_and_complete_handshake(&url).await;
+
+    let request_id = format!("diag01-conn-span-{}", uuid::Uuid::new_v4());
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "shell",
+            "shell": "system",
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    // Await the terminal.created reply frame and capture the minted id -- the
+    // airtight filter key for the global event vec below.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut wire_terminal_id: Option<String> = None;
+    while tokio::time::Instant::now() < deadline && wire_terminal_id.is_none() {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value.get("type").and_then(|v| v.as_str()) == Some("terminal.created")
+                    && value.get("requestId").and_then(|v| v.as_str())
+                        == Some(request_id.as_str())
+                {
+                    wire_terminal_id = value
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("unexpected frame awaiting terminal.created: {other:?}"),
+        }
+    }
+    let terminal_id = wire_terminal_id.expect("never received terminal.created frame");
+    ws.close(None).await.ok();
+
+    // Poll for OUR captured tracing events to settle (bounded): the created
+    // event keyed by our terminal_id, then a beat for the close-path events.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let present = {
+            let captured = events.lock().unwrap();
+            captured[start_index..]
+                .iter()
+                .any(|e| e.message == "terminal.created"
+                    && e.fields.get("terminal_id").map(String::as_str)
+                        == Some(terminal_id.as_str()))
+        };
+        if present {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let captured = events.lock().unwrap().clone();
+
+    // Key everything off OUR terminal's uniquely-identified created event
+    // (other tests in this binary share the global vec; never match on just
+    // an event name here).
+    let created = captured[start_index..]
+        .iter()
+        .find(|e| e.message == "terminal.created"
+            && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str()))
+        .expect("expected a terminal.created tracing event for our terminal_id");
+    let conn_id = created
+        .fields
+        .get("connection_id")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "terminal.created must inherit the serving connection's id via the \
+                 ws_conn span; got fields: {:?}",
+                created.fields
+            )
+        });
+
+    // Coherence: the same connection_id appears on this connection's
+    // established AND closed lifecycle events, so the whole lifecycle of a
+    // connection (and the work it performed) is attributable to one id.
+    for name in ["ws.connection.established", "ws.connection.closed"] {
+        let matching = captured[start_index..]
+            .iter()
+            .any(|e| e.message == name
+                && e.fields.get("connection_id") == Some(&conn_id));
+        assert!(
+            matching,
+            "expected a {name} event with connection_id {conn_id}"
+        );
+    }
 }

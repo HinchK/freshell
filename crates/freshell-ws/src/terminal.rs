@@ -46,6 +46,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
@@ -98,6 +99,27 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// `tokio::task::spawn_blocking` does NOT propagate the caller's tracing
+/// span context across the thread hop (spans are thread-local), which would
+/// silently strip `connection_id` (and any future request-scoped context)
+/// from every event emitted inside the closure -- e.g. the registry's
+/// `terminal.created`, fired from `handle_create`'s blocking PTY spawn
+/// (DIAG-01 connection ownership). This helper carries the CURRENT span
+/// into the blocking closure and enters it for the closure's duration --
+/// the canonical correct use of `Span::enter` (a synchronous guard, never
+/// held across an `.await`).
+fn spawn_blocking_in_span<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        f()
+    })
+}
+
 /// The modes that get a spawn-time pending marker: EXACTLY the modes with a
 /// registered post-spawn identity resolver (codex candidate adoption, the
 /// opencode locator sweep; amplifier's post-spawn locator was deleted —
@@ -130,14 +152,14 @@ fn map_shell(shell: Shell) -> ShellType {
 pub async fn run(
     socket: WebSocket,
     state: &WsState,
-    mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+    bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
 ) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, ws_rx) = socket.split();
 
     // Identify this connection so the registry can key its terminal subscriptions
     // (and sweep them on close).
@@ -152,6 +174,51 @@ pub async fn run(
         origin_kind = origin_kind,
         "ws.connection.established"
     );
+
+    // DIAG-01 connection ownership: run the whole serve loop inside a
+    // per-connection span, so EVERY event emitted while serving this
+    // connection (same-task or, via the `.instrument(Span::current())` /
+    // `spawn_blocking_in_span` hop sites below, spawned-task and
+    // blocking-pool work) carries `connection_id` + `origin_kind` when the
+    // server-side JsonLayer flattens span fields into the JSONL line. A bare
+    // `span.enter()` held across `.await`s would instead leak the span into
+    // unrelated tasks parked on the same OS thread -- hence `.instrument()`
+    // on the loop future and explicit context hops at thread boundaries.
+    let span = tracing::info_span!(
+        "ws_conn",
+        connection_id = conn_id,
+        origin_kind = origin_kind,
+    );
+    run_loop(
+        ws_tx,
+        ws_rx,
+        state,
+        bcast_rx,
+        terminal_output_batch_v1,
+        ui_screenshot_v1,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        conn_id,
+    )
+    .instrument(span)
+    .await;
+}
+
+/// The body of one connection's serve loop (`run` minus the connection-id
+/// mint, the established event, and the span shell above). Everything in
+/// here polls with the `ws_conn` span as the current context.
+#[allow(clippy::too_many_arguments)] // Same connection-scoped plumbing as run().
+async fn run_loop(
+    mut ws_tx: WsSink,
+    mut ws_rx: futures_util::stream::SplitStream<WebSocket>,
+    state: &WsState,
+    mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+    terminal_output_batch_v1: bool,
+    ui_screenshot_v1: bool,
+    pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
+    conn_id: u64,
+) {
 
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
@@ -724,16 +791,16 @@ async fn handle_client_text(
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
-                        tokio::spawn(async move { fresh_codex.handle_create(create).await });
+                        tokio::spawn(async move { fresh_codex.handle_create(create).await }.instrument(tracing::Span::current()));
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
-                        tokio::spawn(async move { fresh_claude.handle_create(create).await });
+                        tokio::spawn(async move { fresh_claude.handle_create(create).await }.instrument(tracing::Span::current()));
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
-                        tokio::spawn(async move { fresh_opencode.handle_create(create).await });
+                        tokio::spawn(async move { fresh_opencode.handle_create(create).await }.instrument(tracing::Span::current()));
                     }
                     _ => {}
                 }
@@ -753,15 +820,15 @@ async fn handle_client_text(
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_attach(attach).await });
+                    tokio::spawn(async move { fresh_codex.handle_attach(attach).await }.instrument(tracing::Span::current()));
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await });
+                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await }.instrument(tracing::Span::current()));
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_attach(attach).await });
+                    tokio::spawn(async move { fresh_opencode.handle_attach(attach).await }.instrument(tracing::Span::current()));
                 }
                 _ => {}
             }
@@ -771,16 +838,16 @@ async fn handle_client_text(
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_send(send).await });
+                    tokio::spawn(async move { fresh_codex.handle_send(send).await }.instrument(tracing::Span::current()));
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_send(send).await });
+                    tokio::spawn(async move { fresh_claude.handle_send(send).await }.instrument(tracing::Span::current()));
                 }
                 // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_send(send).await });
+                    tokio::spawn(async move { fresh_opencode.handle_send(send).await }.instrument(tracing::Span::current()));
                 }
                 // `amplifier` exists on AgentProvider for the TERM-16
                 // terminal.turn.complete broadcast only — there is no
@@ -806,26 +873,26 @@ async fn handle_client_text(
         ClientMessage::FreshAgentInterrupt(interrupt) => {
             if is_codex_provider(interrupt.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await });
+                tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
             } else if interrupt.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_interrupt(interrupt).await });
+                tokio::spawn(async move { fresh_claude.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
             } else if interrupt.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await });
+                tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await }.instrument(tracing::Span::current()));
             }
             true
         }
         ClientMessage::FreshAgentKill(kill) => {
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_kill(kill).await });
+                tokio::spawn(async move { fresh_codex.handle_kill(kill).await }.instrument(tracing::Span::current()));
             } else if kill.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_kill(kill).await });
+                tokio::spawn(async move { fresh_claude.handle_kill(kill).await }.instrument(tracing::Span::current()));
             } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_kill(kill).await });
+                tokio::spawn(async move { fresh_opencode.handle_kill(kill).await }.instrument(tracing::Span::current()));
             }
             true
         }
@@ -1699,7 +1766,7 @@ async fn gate_wire_resume(
         let mode_for_gate = mode.to_string();
         let rid = resume_session_id.take();
         let intent = *launch_intent;
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_in_span(move || {
             crate::resume_validation::validate_wire_resume(
                 &mode_for_gate,
                 rid,
@@ -1727,7 +1794,7 @@ async fn gate_wire_resume(
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let retire_mode = mode.to_string();
         let stale_id = stale.to_string();
-        let _ = tokio::task::spawn_blocking(move || ledger.retire_missing(&retire_mode, &stale_id))
+        let _ = spawn_blocking_in_span(move || ledger.retire_missing(&retire_mode, &stale_id))
             .await;
     }
     ResumeGateCarry {
@@ -2654,7 +2721,7 @@ pub(crate) async fn handle_create(
             let write_cwd = spec.cwd.clone();
             let write_request_id = create.request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: "claude",
                     session_id: &write_session_id,
@@ -2683,7 +2750,7 @@ pub(crate) async fn handle_create(
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = create.request_id.clone();
     // PIN2_PTY_SPAWN_ANCHOR: the spawn makes preallocated identity observable.
-    let create_result = match tokio::task::spawn_blocking(move || {
+    let create_result = match spawn_blocking_in_span(move || {
         registry.create(
             &spawn_spec,
             &child_env,
@@ -2719,7 +2786,7 @@ pub(crate) async fn handle_create(
             if let Some(session_id) = resume_session_id.as_deref() {
                 let ledger = std::sync::Arc::clone(&state.pane_ledger);
                 let delete_session_id = session_id.to_string();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = spawn_blocking_in_span(move || {
                     ledger.delete_binding("claude", &delete_session_id)
                 })
                 .await
@@ -2879,7 +2946,7 @@ pub(crate) async fn handle_create(
         // stream, so the locator never ARMS for them (suppressed inside
         // `maybe_arm` -- never via `locator.disarm`).
         let managed_codex = codex_remote_ws_url.is_some();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             crate::codex_association::maybe_arm(
                 &state,
                 &terminal_id,
@@ -2965,7 +3032,7 @@ pub(crate) async fn handle_create(
             let write_cwd = record.cwd.clone();
             let write_request_id = create.request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
@@ -2989,7 +3056,7 @@ pub(crate) async fn handle_create(
         let write_mode = mode.clone();
         let write_cwd = spec.cwd.clone();
         let now = now_ms();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_in_span(move || {
             ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
         })
         .await
@@ -3185,7 +3252,7 @@ pub async fn respawn_agent_terminal(
         let probe = state.session_existence.clone();
         let gate_mode = mode.clone();
         let sid = Some(req.session_id.clone());
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_in_span(move || {
             crate::resume_validation::validate_wire_resume(
                 &gate_mode,
                 sid,
@@ -3210,7 +3277,7 @@ pub async fn respawn_agent_terminal(
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
             let retire_provider = req.provider.clone();
             let stale_id = stale.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
+            let _ = spawn_blocking_in_span(move || {
                 ledger.retire_missing(&retire_provider, &stale_id)
             })
             .await;
@@ -3478,7 +3545,7 @@ pub async fn respawn_agent_terminal(
     let spawn_mode = mode.clone();
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = req.create_request_id.clone();
-    let create_result = match tokio::task::spawn_blocking(move || {
+    let create_result = match spawn_blocking_in_span(move || {
         registry.create(
             &spawn_spec,
             &child_env,
@@ -3573,7 +3640,7 @@ pub async fn respawn_agent_terminal(
         // stream, so the locator never ARMS for them (suppressed inside
         // `maybe_arm` -- never via `locator.disarm`).
         let managed_codex = codex_remote_ws_url.is_some();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             crate::codex_association::maybe_arm(
                 &state,
                 &terminal_id,
@@ -3616,7 +3683,7 @@ pub async fn respawn_agent_terminal(
             let write_cwd = record.cwd.clone();
             let write_request_id = req.create_request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
@@ -4553,7 +4620,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let tid = kill.terminal_id.clone();
         let now = now_ms();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             if let Some(sref) = sref {
                 if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
                     tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
@@ -4675,7 +4742,7 @@ async fn process_tabs_push(
     // the small `&str` args as `String`s and move the whole call into
     // `spawn_blocking` (`TabsRegistry` is `Clone`/`Arc`-backed; `records` is
     // already owned).
-    let joined = tokio::task::spawn_blocking(move || {
+    let joined = spawn_blocking_in_span(move || {
         reg.replace_client_snapshot(
             &server_instance_id,
             &device_id,
