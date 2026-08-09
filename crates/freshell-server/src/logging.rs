@@ -92,6 +92,13 @@ pub struct LoggingConfig {
     /// every log line. Never logged itself, including here (this struct is
     /// never `Debug`-derived/printed).
     pub secret: String,
+    /// The app version stamped onto EVERY line as `app_version` (DIAG-01's
+    /// "app version" field): any arbitrary log tail is then attributable to
+    /// the release that produced it without cross-referencing boot lines.
+    /// Resolved by the caller (`main.rs`: `FRESHELL_APP_VERSION` env ->
+    /// `APP_VERSION` const) so this module stays env-free about versioning
+    /// and tests can inject a known value.
+    pub app_version: String,
 }
 
 /// Resolve [`LoggingConfig`] from the environment, mirroring the legacy
@@ -99,7 +106,7 @@ pub struct LoggingConfig {
 /// `resolveDebugLogPath`) and adding two new, narrowly-scoped overrides
 /// (`FRESHELL_LOG_MAX_BYTES`/`FRESHELL_LOG_MAX_BACKUPS`) so the rotation
 /// bound is testable without waiting to actually accumulate 10 MiB.
-pub fn resolve_config(home: Option<&Path>, secret: String) -> LoggingConfig {
+pub fn resolve_config(home: Option<&Path>, secret: String, app_version: String) -> LoggingConfig {
     let log_dir = std::env::var("FRESHELL_LOG_DIR")
         .ok()
         .filter(|v| !v.is_empty())
@@ -121,6 +128,7 @@ pub fn resolve_config(home: Option<&Path>, secret: String) -> LoggingConfig {
         max_bytes,
         max_backups,
         secret,
+        app_version,
     }
 }
 
@@ -139,7 +147,11 @@ pub fn init(config: LoggingConfig) -> std::io::Result<()> {
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let json_layer = JsonLayer { writer };
+    let json_layer = JsonLayer {
+        writer,
+        app_version: config.app_version,
+        server_pid: std::process::id() as u64,
+    };
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
         .with(json_layer);
@@ -361,12 +373,24 @@ impl Visit for JsonVisitor {
 /// `route`, `status`, `duration_ms`), and writes it through a
 /// [`RotatingWriter`] (which redacts before any byte reaches disk).
 ///
+/// Every line is additionally stamped with `app_version` (the release that
+/// produced it) and `server_pid` (the process that wrote it) -- DIAG-01's
+/// app-version and process-ownership requirements at per-line granularity,
+/// so ANY arbitrary log tail is self-attributing (which build, which
+/// process) without cross-referencing a boot line that may have rotated
+/// away. Both are inserted into the base field map BEFORE span/event fields
+/// merge, so an event that legitimately carries its own `pid` (e.g. a
+/// spawned child's pid on `terminal.created`) keeps its own meaning --
+/// `server_pid` never collides with it.
+///
 /// Hand-rolled rather than `tracing_subscriber::fmt`'s JSON formatter
 /// because `fmt` hardcodes different field names (`timestamp`/`message`,
 /// nested `fields`/`span` objects) with no rename hook -- reimplementing the
 /// ~80 lines below is simpler than fighting that shape.
 struct JsonLayer {
     writer: RotatingWriter,
+    app_version: String,
+    server_pid: u64,
 }
 
 /// Span-local storage for this layer: the JSON fields recorded when the
@@ -412,6 +436,18 @@ where
         map.insert(
             "target".to_string(),
             Value::String(event.metadata().target().to_string()),
+        );
+        // DIAG-01 per-line identity: the emitting build + process, before
+        // any span/event fields merge (event-level fields would win a
+        // collision; no call site uses either name -- verified by rg across
+        // all server-side crates when this was added).
+        map.insert(
+            "app_version".to_string(),
+            Value::String(self.app_version.clone()),
+        );
+        map.insert(
+            "server_pid".to_string(),
+            Value::from(self.server_pid),
         );
 
         // Merge span-chain fields root -> leaf, so the innermost span's
@@ -526,6 +562,38 @@ pub async fn request_logging_middleware(req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_line_stamps_app_version_and_server_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-logging-stamp-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rust-server.jsonl");
+        let writer = RotatingWriter::create(path.clone(), 1 << 20, 1, String::new()).unwrap();
+        let layer = JsonLayer {
+            writer,
+            app_version: "9.9.9-test".to_string(),
+            server_pid: 424242,
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(route = "/api/health", "http_request");
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(line["app_version"], serde_json::json!("9.9.9-test"));
+        assert_eq!(line["server_pid"], serde_json::json!(424242u64));
+        // The pre-existing envelope fields must still be there.
+        assert!(line["ts"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(line["level"], serde_json::json!("INFO"));
+        assert_eq!(line["msg"], serde_json::json!("http_request"));
+        assert_eq!(line["route"], serde_json::json!("/api/health"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn scrub_redacts_the_exact_secret_value_wherever_it_appears() {

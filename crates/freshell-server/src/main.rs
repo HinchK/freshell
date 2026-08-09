@@ -112,13 +112,28 @@ async fn main() -> ExitCode {
     let port = resolve_port();
     let home = resolve_home();
 
+    // The app version string, resolved ONCE here (before logging init, which
+    // stamps it onto every line) and shared (Arc::clone) into BOTH
+    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`),
+    // so the two endpoints can never disagree. Overridable via
+    // `FRESHELL_APP_VERSION`. Pure env read + constant -- no dependency on
+    // anything built later, so it is safe to resolve this early.
+    let app_version =
+        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
+
     // DIAG-01/DIAG-03: structured JSONL logging to
     // `<home>/.freshell/logs/rust-server.jsonl`, redacted from the first
     // byte (the live AUTH_TOKEN is the ONE secret this process itself
-    // knows verbatim). A failure here (e.g. an unwritable log dir) must
-    // never prevent boot -- the pre-existing stderr "listening on" line
-    // below still gets the operator to a running server either way.
-    let logging_config = logging::resolve_config(home.as_deref(), auth_token.as_str().to_string());
+    // knows verbatim) and stamped per-line with the app version + server
+    // pid (DIAG-01's app-version / process-ownership fields). A failure
+    // here (e.g. an unwritable log dir) must never prevent boot -- the
+    // pre-existing stderr "listening on" line below still gets the
+    // operator to a running server either way.
+    let logging_config = logging::resolve_config(
+        home.as_deref(),
+        auth_token.as_str().to_string(),
+        app_version.as_str().to_string(),
+    );
     if let Err(err) = logging::init(logging_config) {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
@@ -168,12 +183,6 @@ async fn main() -> ExitCode {
     // changed `bootId` on reconnect means the server restarted), never by
     // `server_instance_id`.
     let boot_id = Arc::new(format!("boot-{}", Uuid::new_v4()));
-
-    // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
-    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`), so
-    // the two endpoints can never disagree. Overridable via `FRESHELL_APP_VERSION`.
-    let app_version =
-        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
 
     // The server-start timestamp, captured once here as an ISO-8601 string
     // (millisecond precision + `Z`, matching JS `Date.toISOString()` in
