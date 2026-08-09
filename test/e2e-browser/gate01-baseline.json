@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "0db5782c192f4d3542c94ff46f534ce40a5650cb",
+  "head": "2efdb61cd0e00a716e9b91d1fd12ed8f0bc4ad3e",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -716,26 +716,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7574,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7574
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7224,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7224
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1204,26 +1226,48 @@
       "bucket": "harness",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 10,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 1530,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1530
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 10,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 1414,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1414
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1552,28 +1596,64 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 17137,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 17137
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 98447,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 98447
+            }
+          ],
+          "failures": [
+            {
+              "title": "terminal output appears in both clients",
+              "line": 191,
+              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
+            },
+            {
+              "title": "reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output",
+              "line": 217,
+              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 2/2 rust failure ctx show Restore dialog; legacy 6/7->6/6 green; NOTE multi-client:217 class known both-server flake (B002) remains latent, not observed here"
+          }
         }
       }
     },
@@ -1646,28 +1726,59 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7893,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7893
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 56574,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 56574
+            }
+          ],
+          "failures": [
+            {
+              "title": "submits barrier-heavy replay to real xterm in bounded writes",
+              "line": 26,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n   at ../helpers/terminal-helpers.ts:102\n\n  100 |     const { timeout = 15_000, terminalId } = options\n  101 |\n> 102 |     await this.page.waitForFunction(\n      |                     ^\n  103 |       (id) => {\n  104 |         const harness = window.__FRESHELL_TEST_HARNESS__\n  105 |         if (!harness) return false\n    at TerminalHelper.waitForPrompt (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/helpers/terminal-helpers.ts:102:21)"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy green"
+          }
         }
       }
     },
@@ -2074,26 +2185,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 9217,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9217
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 8714,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8714
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2235,26 +2368,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 66917,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 66917
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 50679,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 50679
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2913,28 +3068,59 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 5,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 40262,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 40262
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 129546,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 4,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 129546
+            }
+          ],
+          "failures": [
+            {
+              "title": "defaults to 3 visible rows and drags to reveal more",
+              "line": 4,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy green"
+          }
         }
       }
     },
@@ -3314,28 +3500,77 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 14594,
+          "runs": [
+            "slice-6",
+            "reproof-s6-idle-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 13324
+            },
+            {
+              "run": "reproof-s6-idle-legacy",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 14594
+            }
+          ],
+          "failures": [
+            {
+              "title": "claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade",
+              "line": 76,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveClass\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: locator('[data-context=\"tab\"][data-tab-id=\"S_dMZjOWYmf4y1VNRxWB7\"]').locator('svg').first()\nExpected pattern: \u001b[32m/text-blue-500/\u001b[39m\nReceived string:  \u001b[31m\"shrink-0 h-3 w-3 shrink-0\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toHaveClass\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('[data-context=\"tab\"][data-tab-id=\"S_dMZjOWYmf4y1VNRxWB7\"]').locator('svg').first()\u001b[22m\n\u001b[2m    14 × locator resolved to <svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" class=\"shrink-0 h-3 w-3 shrink-0\">…</svg>\u001b[22m\n\u001b[2m       - unexpected value \"shrink-0 h-3 w-3 shrink-0\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s6-idle-legacy: tab icon never gains text-blue-500 (busy) though resolved 14x; identical on rust -> pre-existing both-server redness (client/spec drift; TERM-15/TERM-16 lane) not rust-specific"
+          }
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 13032,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 13032
+            }
+          ],
+          "failures": [
+            {
+              "title": "claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade",
+              "line": 76,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveClass\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: locator('[data-context=\"tab\"][data-tab-id=\"SiD4Q_063yGrbdKMyVGmw\"]').locator('svg').first()\nExpected pattern: \u001b[32m/text-blue-500/\u001b[39m\nReceived string:  \u001b[31m\"shrink-0 h-3 w-3 shrink-0\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toHaveClass\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('[data-context=\"tab\"][data-tab-id=\"SiD4Q_063yGrbdKMyVGmw\"]').locator('svg').first()\u001b[22m\n\u001b[2m    14 × locator resolved to <svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" class=\"shrink-0 h-3 w-3 shrink-0\">…</svg>\u001b[22m\n\u001b[2m       - unexpected value \"shrink-0 h-3 w-3 shrink-0\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical assertion red as legacy (blue class missing); pre-existing both-server"
+          }
         }
       }
     },
