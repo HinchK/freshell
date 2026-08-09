@@ -152,8 +152,12 @@ const test = base.extend<Record<string, never>, { corpusWorker: SessionCorpus }>
     await server.stop()
   }, { scope: 'worker' }],
 
-  corpusWorker: [async ({ testServer }, use) => {
-    void testServer
+  corpusWorker: [async (fixtures, use) => {
+    // Depend on testServer for ORDERING (corpus is built inside its
+    // setupHome); destructured loosely because this project's typed-declare
+    // pattern (fixtures.ts declares worker fixtures as test fixtures) makes
+    // strict typing of the dependency noisy without adding value.
+    void (fixtures as unknown as { testServer: unknown }).testServer
     if (!corpusHolder.value) throw new Error('corpus was not built by setupHome')
     await use(corpusHolder.value)
   }, { scope: 'worker' }],
@@ -327,12 +331,11 @@ test.describe('HARNESS-04: session corpus builder', () => {
     )
     const tail = all.slice(-4)
     expect(tail.every((i) => i.archived)).toBe(true)
-    expect(tail.map((i) => i.title)).toEqual([
-      `${corpusWorker.marker} archived-claude`,
-      `${corpusWorker.marker} archived-codex`,
-      `${corpusWorker.marker} archived-opencode`,
-      `${corpusWorker.marker} archived-amplifier`,
-    ])
+    // tail order fixed by seeded timestamps: claude > codex > opencode > amplifier
+    const archivedOrder = ['archived-claude', 'archived-codex', 'archived-opencode', 'archived-amplifier']
+      .map((r) => manifest.sessions.find((x) => x.role === r)!)
+    expect(tail.map((i) => `${i.provider}:${i.sessionId}`)).toEqual(archivedOrder.map((s) => s.key))
+    expect(tail.map((i) => i.title)).toEqual(archivedOrder.map((s) => s.title))
 
     // ── deleted / provider-archived / child cohorts: never appear ────
     const absent = manifest.sessions.filter((s) => s.visibility === 'absent')
@@ -390,9 +393,24 @@ test.describe('HARNESS-04: session corpus builder', () => {
     await expect(sessionList).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText('No sessions yet')).not.toBeVisible()
 
-    await expect(page.getByText(`${marker} alpha`).first()).toBeVisible({ timeout: 15_000 })
-    await expect(page.getByText(`${marker} gamma request 1`).first()).toBeVisible({ timeout: 15_000 })
-    await expect(page.getByText(`${marker} delta`).first()).toBeVisible({ timeout: 15_000 })
-    await expect(page.getByText(`${marker} epsilon`).first()).toBeVisible({ timeout: 15_000 })
+    // First window: the newest page (the 52-session bulk cohort tops the
+    // recency sort) proves live browsing of the corpus at page scale.
+    await expect(page.getByText(`${marker} bulk 001`)).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByText(`${marker} bulk 050`)).toBeVisible({ timeout: 15_000 })
+
+    // Deep-corpus headline sessions live past the first window; the sidebar
+    // search (title tier → server query over the FULL index) must find each.
+    const searchBox = page.getByPlaceholder('Search...')
+    for (const title of [
+      `${marker} alpha`,
+      `${marker} gamma request 1`,
+      `${marker} delta`,
+      `${marker} epsilon`,
+    ]) {
+      await searchBox.fill(title)
+      await expect(page.getByText(title).first()).toBeVisible({ timeout: 15_000 })
+    }
+    await page.getByLabel('Clear search').click()
+    await expect(page.getByText(`${marker} bulk 001`)).toBeVisible({ timeout: 15_000 })
   })
 })
