@@ -61,6 +61,29 @@ Run 1/2 on `rust-chromium` failed only the live-addition leg with `element(s) no
 
 The Rust sweep signature `(len, max lastActivityAt, identity digest)` is structurally blind to changes that alter FILTER VISIBILITY without altering the index summary: e.g. a hidden non-interactive session gaining its second user message (becoming visible) with stale timestamps moves neither `len` nor max-`lastActivityAt`, so no broadcast — the browser only converges at the next unrelated broadcast. Legacy's `hasSessionDirectorySnapshotChange` (content/mtime or full comparable diff) broadcasts there. Not hit by the corrected spec (its completion is a true count+1 addition); recorded as campaign-discovered context for SESSION-09's "modified" leg.
 
+## Review loop
+
+Round 1 (2026-08-09): the dispatch's primary path (Task subagent) is unavailable in this
+environment, and a genuine fresh-eyes reviewer via the live freshell MCP
+(`new-tab agent=opencode` ×2 against the self-hosted :3001 server, health-checked) timed
+out on tab creation — so the sanctioned fallback ran: **structured fresh-eyes self-review**
+per the review-agent skill rubric (merge-base diff `3dbba43c2..HEAD`, each changed file read
+in full, each pinned production seam re-read: `refresh_snapshot`/`parse_*` exclusion
+mechanics, `fold_activity_mtime` constancy, opencode token/health arms,
+`sessions_sweep_signature`/`spawn_sessions_sweep`, legacy `readLightweightMeta` +
+watcher→dirty→incremental channel + R10b gates). Specifically hunted: mtime/size reliance
+of every become-valid transition (all grow `size`, so re-parse cannot be missed at any
+filesystem granularity), poll-vs-stale-while-revalidate windows, temp-dir/env hermeticity
+(persistence disabled via `None`, no env mutation, TmpDir drop-cleanup), legacy-control
+membership semantics (indexer `getProjects()` has no non-interactive hiding — deliberate;
+PW-visible seeds are all two-turn), evidence-doc claim accuracy ("zero production-code
+changes" verified by diff). **Result: No findings.** Residual risks (accepted, recorded):
+(a) the spec's opencode leg covers row-level quarantine only (db-level corruption is
+crate-tested — documented why in "Deliberate scoping"); (b) the PW spec asserts, not
+verifies exhaustively, per-provider malformed shapes at the browser tier — the crate
+matrix + legacy control carry that depth; (c) boot-race windows in `poll_until`-style
+tests are poll-bounded (5s) and passed on a load-15–25 box twice.
+
 ## Green commands (re-runnable at final SHA)
 
 ```
