@@ -1066,4 +1066,73 @@ describe('querySessionDirectory file-based search', () => {
     expect(page.items.length).toBeGreaterThan(0)
     expect(parseEvent).not.toHaveBeenCalled()
   })
+
+  // SESSION-05 (project colors, read half): the page carries the resolved
+  // per-project colors so the client's refetch-after-`sessions.changed`
+  // can overlay each History project group's header color. The colors come
+  // from the indexer's project groups (already overlaid from
+  // `configStore.getProjectColors()` on every refresh) and the key is
+  // omitted entirely when no color is configured anywhere.
+  describe('project colors on the page (SESSION-05)', () => {
+    it('embeds the resolved project colors when any project has one', async () => {
+      const page = await querySessionDirectory({
+        projects: [
+          { ...makeProject('/repo/alpha', [makeSession({ sessionId: 'a1', projectPath: '/repo/alpha', lastActivityAt: 100 })]), color: '#ff8800' },
+          makeProject('/repo/beta', [makeSession({ sessionId: 'b1', projectPath: '/repo/beta', lastActivityAt: 90 })]),
+        ],
+        terminalMeta: [],
+        query: { priority: 'visible' },
+      })
+
+      expect(page.projectColors).toEqual({ '/repo/alpha': '#ff8800' })
+    })
+
+    it('omits projectColors when no project has a color', async () => {
+      const page = await querySessionDirectory({
+        projects: [
+          makeProject('/repo/alpha', [makeSession({ sessionId: 'a1', projectPath: '/repo/alpha', lastActivityAt: 100 })]),
+        ],
+        terminalMeta: [],
+        query: { priority: 'visible' },
+      })
+
+      expect('projectColors' in page).toBe(false)
+    })
+
+    it('keeps emitting colors on later pages (pagination is how deep projects ship theirs)', async () => {
+      const sessions = Array.from({ length: 60 }, (_, i) => makeSession({
+        sessionId: `session-${i}`,
+        projectPath: '/repo/many',
+        lastActivityAt: 10_000 - i,
+        title: `Session ${i}`,
+      }))
+      const first = await querySessionDirectory({
+        projects: [
+          { ...makeProject('/repo/many', sessions), color: '#123456' },
+          { ...makeProject('/repo/colorful', [makeSession({ sessionId: 'old', projectPath: '/repo/colorful', lastActivityAt: 5, title: 'Old' })]), color: '#654321' },
+        ],
+        terminalMeta: [],
+        query: { priority: 'visible', limit: 50 },
+      })
+      expect(first.nextCursor).not.toBeNull()
+      expect(first.projectColors).toEqual({
+        '/repo/many': '#123456',
+        '/repo/colorful': '#654321',
+      })
+
+      const second = await querySessionDirectory({
+        projects: [
+          { ...makeProject('/repo/many', sessions), color: '#123456' },
+          { ...makeProject('/repo/colorful', [makeSession({ sessionId: 'old', projectPath: '/repo/colorful', lastActivityAt: 5, title: 'Old' })]), color: '#654321' },
+        ],
+        terminalMeta: [],
+        query: { priority: 'visible', limit: 50, cursor: first.nextCursor! },
+      })
+      expect(second.items.some((item) => item.projectPath === '/repo/colorful')).toBe(true)
+      expect(second.projectColors).toEqual({
+        '/repo/many': '#123456',
+        '/repo/colorful': '#654321',
+      })
+    })
+  })
 })
