@@ -69,8 +69,8 @@ violation.
 
 | Leg | Command suffix | Outcome | Notes |
 |---|---|---|---|
-| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | TBD | |
-| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | TBD | |
+| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 passed (1.3m)** | THE PW-RUST proof leg. First probe run had one spec-shaping flaw (RawWsClient R2 anti-stale rule violation in test B's interleaved hello/ready — a spec bug, not a server bug); fixed (`3ef9b7e4c`) and rerun green. |
+| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 passed (43.6s)** | True parity control: the contract is legacy-native, and the legacy server passes the identical spec unmodified (global settled cache + sentinel semantics replay one terminalId across abort/reconnect/two-clients). |
 
 ## File map for the spec
 
@@ -112,8 +112,8 @@ matrix-proven `CLAUDE_CMD` seam + `FRESHELL_FAKE_LEDGER` launch ledger):
 > WS integration tests; THIS branch adds the non-restore WS integration legs
 > (`crates/freshell-ws/tests/create_dedupe.rs`, mutation-gate proven) and the checklist's
 > PW validation `terminal-create-dedupe.spec.ts` (registered in `MATRIX_SPECS`, both
-> server kinds; probe-run outcomes: rust <TBD>, legacy <TBD>). Remaining: close-out
-> campaign's full-matrix execution.
+> server kinds; probe-run outcomes: rust-chromium 3/3 GREEN, legacy-chromium 3/3 GREEN).
+> Remaining: close-out campaign's full-matrix execution.
 
 ## Residual notes for close-out
 
