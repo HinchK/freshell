@@ -89,6 +89,11 @@ const RUST_ONLY_SPECS = [
   // run under the rust-chromium project.
   /auto-title-rust\.spec\.ts$/,
   /settings-split-rust\.spec\.ts$/,
+  // Task 22 -- durable tabs registry (CFG-08/AUTO-15): raw-WS revision-guard
+  // journeys + restart survival + corruption self-heal against per-test owned
+  // RustServers (the durable `~/.freshell/tabs-registry/v1/` store is a
+  // Rust-only feature of this sweep; legacy has no durable tabs store).
+  /tabs-registry-persistence-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -203,6 +208,14 @@ export default defineConfig({
         // `legacyLocalSettingsSeed` (CFG-04/SESSION-13, unimplemented in
         // Rust) and is `test.fail`-annotated on this project.
         /settings-split-rust\.spec\.ts$/,
+        // Task 22 -- durable tabs registry across restart (CFG-08/AUTO-15):
+        // cross-device restart survival, idempotent-retry/content-conflict/
+        // stale/retire watermark semantics, and missing-object corruption
+        // self-heal (manifest.json.invalid-* archive => empty). Rust-only:
+        // the durable content-addressed store under
+        // `<home>/.freshell/tabs-registry/v1/` exists only in the Rust
+        // server on this branch.
+        /tabs-registry-persistence-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
