@@ -238,8 +238,10 @@ test.describe('HARNESS-04: session corpus builder', () => {
 
     // It deletes the temporary home…
     expect(fs.existsSync(home)).toBe(false)
-    // …and proves the real home was untouched.
-    await assertRealHomeUntouched(marker, before)
+    // …and proves the real home was untouched. The '' guard keeps a failed
+    // build (marker never assigned) from scanning "contains('')" — true for
+    // every filename — against the real home.
+    if (marker) await assertRealHomeUntouched(marker, before)
   })
 
   /* ---------------------------------------------------------------- */
@@ -249,9 +251,10 @@ test.describe('HARNESS-04: session corpus builder', () => {
   test('leg B: legacy server pages the corpus with exact manifest semantics', async ({ page, corpusWorker, serverInfo }) => {
     const manifest = corpusWorker.manifest
     const listed = listedSessions(manifest)
+    const pageLimit = manifest.pagination.pageLimit
 
     const fetchPage = async (cursor?: string, extra?: string) => {
-      const url = `${serverInfo.baseUrl}/api/session-directory?priority=visible&limit=50`
+      const url = `${serverInfo.baseUrl}/api/session-directory?priority=visible&limit=${pageLimit}`
         + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
         + (extra ?? '')
       const response = await page.request.get(url, {
@@ -268,15 +271,15 @@ test.describe('HARNESS-04: session corpus builder', () => {
     // Wait for the indexer to see every listed corpus session.
     await expect(async () => {
       const page1 = await fetchPage()
-      expect(page1.items.length).toBe(manifest.pagination.pageLimit)
+      expect(page1.items.length).toBe(pageLimit)
     }).toPass({ timeout: 30_000, intervals: [250, 500, 1000, 2000] })
 
     // ── pagination: page 1 of 50, then the remainder via nextCursor ──
     const page1 = await fetchPage()
-    expect(page1.items).toHaveLength(50)
+    expect(page1.items).toHaveLength(pageLimit)
     expect(page1.nextCursor).toBeTruthy()
     const page2 = await fetchPage(page1.nextCursor!)
-    expect(page2.items).toHaveLength(listed.length - 50)
+    expect(page2.items).toHaveLength(listed.length - pageLimit)
     expect(page2.nextCursor).toBeNull()
     const all = [...page1.items, ...page2.items]
 
