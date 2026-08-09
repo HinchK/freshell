@@ -189,9 +189,6 @@ pub struct FreshAgentState {
     /// kinds -- no process, just the content the client folds via
     /// `ui.command{tab.create}`).
     pub(crate) content_panes: Arc<Mutex<HashMap<String, Value>>>,
-    /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
-    /// tab-creating path (fresh-agent, terminal, browser, editor).
-    pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
     /// Slice 3b-1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
     /// \u00a72.2 pane routes): paneId -> owning tabId, the reverse index
     /// `pane_ops`'s split/close/select handlers need to resolve a pane's tab
@@ -306,16 +303,6 @@ pub struct RestoreKeyEntry {
     pub delivered_to: HashSet<u64>,
 }
 
-/// A `GET /api/tabs` row (Slice 1's reduced shape -- see `terminal_tabs::list_tabs`
-/// doc comment for the deviation from legacy's full layout-tree row).
-#[derive(Clone)]
-pub(crate) struct TabRecord {
-    pub(crate) id: String,
-    pub(crate) title: Option<String>,
-    pub(crate) pane_id: String,
-    pub(crate) kind: String,
-}
-
 impl FreshAgentState {
     /// Build the state around the shared broadcast bus the WS connections fan out.
     pub fn new(
@@ -333,7 +320,6 @@ impl FreshAgentState {
             pane_identity: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
-            tabs: Arc::new(Mutex::new(HashMap::new())),
             pane_tabs: Arc::new(Mutex::new(HashMap::new())),
             restore_keys: Arc::new(Mutex::new(HashMap::new())),
             cli_commands: Arc::new(Vec::new()),
@@ -441,7 +427,9 @@ impl FreshAgentState {
             .lock()
             .expect("pane_tabs mutex")
             .remove(&entry.pane_id);
-        self.tabs.lock().expect("tabs mutex").remove(&entry.tab_id);
+        // AUTO-01 write-through: a retired content tab also leaves the
+        // authoritative layout store.
+        self.layout_store.close_tab(&entry.tab_id);
         Some(entry)
     }
 
@@ -1576,16 +1564,25 @@ async fn create_tab(
         },
     );
     // Slice 3b-1: every pane-minting path records its owning tab in the
-    // shared `pane_tabs` reverse index (see the field's doc comment) so
-    // `pane_ops`'s split/close/select handlers can resolve this pane's tab
-    // even though this crate keeps no fresh-agent `TabRecord` (the
-    // fresh-agent path never touches `state.tabs` -- see `terminal_tabs`'s
-    // module doc for why that's an intentional, separately-scoped gap).
+    // shared `pane_tabs` reverse index (see the field's doc comment) so the
+    // mutation routes' pre-AUTO-01 resolution keeps working for dispatch
+    // paths; tab membership for READS lives in the layout store (AUTO-01).
     state
         .pane_tabs
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+
+    // AUTO-01 write-through (legacy `createFreshAgentPane`:
+    // `layoutStore.createTab({title})` + `attachPaneContent(..., paneContent)`,
+    // `router.ts:546-585`): the pane content is already final here, so the
+    // legacy two-step lands as one create with the full fresh-agent content.
+    state.layout_store().create_tab(
+        &tab_id,
+        &pane_id,
+        name.clone(),
+        pane_content.clone(),
+    );
 
     ok_json(
         json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),

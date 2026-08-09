@@ -44,7 +44,7 @@ use freshell_protocol::{ServerMessage, UiCommand};
 
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
 use crate::{
-    approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState, TabRecord,
+    approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState,
 };
 
 /// Mount the pane + tab lifecycle routes onto an existing router. Split out of
@@ -168,6 +168,36 @@ pub(crate) async fn split_pane(
         .expect("pane_tabs mutex")
         .insert(new_pane_id.clone(), tab_id.clone());
 
+    // AUTO-01 write-through, legacy's exact two-step (`router.ts:1305-1371`):
+    // `layoutStore.splitPane({paneId, direction, browser?, editor?})` — the
+    // PLACEHOLDER content (`buildContent`: the full cheap content for
+    // browser/editor, bare `{kind:'terminal'}` for a terminal that does not
+    // exist yet) — then `attachPaneContent` with the full spawned content.
+    let placeholder_content = match new_content.get("kind").and_then(Value::as_str) {
+        Some("browser") | Some("editor") => new_content.clone(),
+        _ => json!({ "kind": "terminal" }),
+    };
+    if state
+        .layout_store()
+        .split_pane(&pane_id, &direction, &new_pane_id, placeholder_content)
+        .is_none()
+    {
+        // The store never contained the source pane (a pre-AUTO-01 shadow-only
+        // pane with no mirror): keep the pre-AUTO-01 response behavior; the
+        // client fold + next mirror will rebuild the real tree into the store.
+        tracing::debug!(
+            pane_id = %pane_id,
+            "split_pane: source pane absent from the layout store mirror; \
+             write-through skipped (store self-heals on the next ui.layout.sync)"
+        );
+    } else {
+        state.layout_store().attach_pane_content(
+            &tab_id,
+            &new_pane_id,
+            new_content.clone(),
+        );
+    }
+
     let terminal_id = new_content.get("terminalId").cloned();
 
     // `ui.command{pane.split}` payload (`router.ts:1373-1382`): tabId, paneId
@@ -216,51 +246,37 @@ pub(crate) async fn close_pane(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let tab_id = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned();
-
-    let (broadcast_tab_id, message, data) = match &tab_id {
-        None => (
+    // AUTO-01: resolution + the last-pane guard come from the authoritative
+    // layout store now (legacy `layoutStore.closePane` semantics exactly);
+    // a REAL UI pane can be closed over REST once its mirror has landed.
+    let (broadcast_tab_id, message, data) = match state.layout_store().close_pane(&pane_id) {
+        crate::layout_store::ClosePaneOutcome::NotFound => (
             None,
             "pane not found",
             json!({ "message": "pane not found" }),
         ),
-        Some(tid) => {
-            let siblings = state
+        crate::layout_store::ClosePaneOutcome::LastPane => (
+            None,
+            "cannot close only pane",
+            json!({ "message": "cannot close only pane" }),
+        ),
+        crate::layout_store::ClosePaneOutcome::Closed(tid) => {
+            state
+                .terminal_panes
+                .lock()
+                .expect("terminal_panes mutex")
+                .remove(&pane_id);
+            state
+                .content_panes
+                .lock()
+                .expect("content_panes mutex")
+                .remove(&pane_id);
+            state
                 .pane_tabs
                 .lock()
                 .expect("pane_tabs mutex")
-                .values()
-                .filter(|t| *t == tid)
-                .count();
-            if siblings <= 1 {
-                (
-                    None,
-                    "cannot close only pane",
-                    json!({ "message": "cannot close only pane" }),
-                )
-            } else {
-                state
-                    .terminal_panes
-                    .lock()
-                    .expect("terminal_panes mutex")
-                    .remove(&pane_id);
-                state
-                    .content_panes
-                    .lock()
-                    .expect("content_panes mutex")
-                    .remove(&pane_id);
-                state
-                    .pane_tabs
-                    .lock()
-                    .expect("pane_tabs mutex")
-                    .remove(&pane_id);
-                (Some(tid.clone()), "pane closed", json!({ "tabId": tid }))
-            }
+                .remove(&pane_id);
+            (Some(tid.clone()), "pane closed", json!({ "tabId": tid }))
         }
     };
 
@@ -294,31 +310,22 @@ pub(crate) async fn select_pane(
         .get("tabId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let tabs = state.tabs.lock().expect("tabs mutex");
-    let tab_id = requested_tab_id
-        .filter(|t| tabs.contains_key(t))
-        .or_else(|| drop_and_lookup_pane_tab(&state, &pane_id));
-    drop(tabs);
-
-    match tab_id {
-        Some(tid) => {
+    // AUTO-01: `selectPane` parity against the authoritative layout store —
+    // explicit valid tabId wins, else the owning tab is found from the real
+    // (possibly UI-created, mirror-fed) tree.
+    match state
+        .layout_store()
+        .select_pane(requested_tab_id.as_deref(), &pane_id)
+    {
+        Some((tid, pid)) => {
             state.broadcast(&ServerMessage::UiCommand(UiCommand {
                 command: "pane.select".to_string(),
-                payload: Some(json!({ "tabId": tid, "paneId": pane_id })),
+                payload: Some(json!({ "tabId": tid, "paneId": pid })),
             }));
-            ok_json(json!({ "tabId": tid, "paneId": pane_id }), "pane selected")
+            ok_json(json!({ "tabId": tid, "paneId": pid }), "pane selected")
         }
         None => ok_json(json!({ "message": "pane not found" }), "pane not found"),
     }
-}
-
-fn drop_and_lookup_pane_tab(state: &FreshAgentState, pane_id: &str) -> Option<String> {
-    state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(pane_id)
-        .cloned()
 }
 
 // ── POST /api/tabs/:id/select ───────────────────────────────────────────────
@@ -336,7 +343,9 @@ pub(crate) async fn select_tab(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let exists = state.tabs.lock().expect("tabs mutex").contains_key(&tab_id);
+    // AUTO-01: authoritative layout store (`selectTab` also ACTIVATES the tab
+    // when found — the unconditional broadcast below mirrors legacy).
+    let exists = state.layout_store().select_tab(&tab_id);
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.select".to_string(),
@@ -369,13 +378,11 @@ pub(crate) async fn rename_tab(
         return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
     };
 
-    let mut tabs = state.tabs.lock().expect("tabs mutex");
-    let Some(record) = tabs.get_mut(&tab_id) else {
-        drop(tabs);
+    // AUTO-01: rename through the authoritative layout store (incl. legacy's
+    // single-pane tab ⇒ pane title cascade) instead of the shadow `tabs` map.
+    if !state.layout_store().rename_tab(&tab_id, Some(name.clone())) {
         return ok_json(json!({ "message": "tab not found" }), "tab not found");
-    };
-    record.title = Some(name.clone());
-    drop(tabs);
+    }
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.rename".to_string(),
@@ -403,9 +410,12 @@ pub(crate) async fn delete_tab(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let removed: Option<TabRecord> = state.tabs.lock().expect("tabs mutex").remove(&tab_id);
+    // AUTO-01: the tab/its layout come out of the authoritative store; the
+    // shadow per-kind maps keep their existing cleanup (dispatch bookkeeping
+    // for REST-created panes — AUTO-09 owns re-pointing that at the store).
+    let store_removed = state.layout_store().close_tab(&tab_id);
 
-    let (message, data) = if removed.is_some() {
+    let (message, data) = if store_removed {
         let owned_panes: Vec<String> = state
             .pane_tabs
             .lock()
@@ -446,13 +456,11 @@ pub(crate) async fn delete_tab(
 
 // ── GET /api/tabs/has ───────────────────────────────────────────────────
 
-/// `GET /api/tabs/has?target=` (`router.ts:857-861`): `{ exists }`. Legacy's
-/// `layoutStore.hasTab` matches by id OR title (ambiguous-title resolution);
-/// this port has no title-based lookup anywhere (the established precedent
-/// across every route in this module -- `select_pane`/`rename_tab`/etc. all
-/// resolve strictly by id via [`FreshAgentState::tabs`]/[`FreshAgentState::pane_tabs`]),
-/// so `target` is matched against tab id ONLY. A missing/empty `target`
-/// mirrors the original's `target ? ... : false` short-circuit.
+/// `GET /api/tabs/has?target=` (`router.ts:857-861`): `{ exists }`. Mirrors
+/// legacy exactly: an empty/missing `target` is `false` (the `target ? ... :
+/// false` short-circuit), and `layoutStore.hasTab` matches by id OR title --
+/// AUTO-01 restores that title arm via the authoritative layout store (the
+/// pre-AUTO-01 id-only check was a shadow-bookkeeping limitation).
 pub(crate) async fn tabs_has(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -462,29 +470,23 @@ pub(crate) async fn tabs_has(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let target = params.get("target").map(String::as_str).unwrap_or("");
-    let exists = !target.is_empty() && state.tabs.lock().expect("tabs mutex").contains_key(target);
+    let exists = !target.is_empty() && state.layout_store().has_tab(target);
     ok_json(json!({ "exists": exists }), "")
 }
 
 // ── POST /api/tabs/next, POST /api/tabs/prev (honest deferral) ─────────
 
 /// `POST /api/tabs/next` / `POST /api/tabs/prev` (`router.ts:863-877`): cycle
-/// the active tab through an ORDERED tab list. Deferred: this port's
-/// [`FreshAgentState::tabs`] is an unordered `HashMap` with no active-tab-id
-/// concept at all -- `terminal_tabs::list_tabs` already hard-codes
-/// `"activeTabId": Value::Null` for `GET /api/tabs` (an established Slice 1
-/// reduced-fidelity precedent this route would need to break). Implementing
-/// real cycling needs an ordered tab sequence + an active-tab pointer added
-/// to the shared `FreshAgentState` struct in `lib.rs` -- out of this slice's
-/// owned-file scope (`pane_ops.rs` + route registration + `terminal_tabs.rs`
-/// only) while five other agents work concurrently in this same crate.
-/// Returns an honest 400 naming exactly this gap rather than silently
-/// no-op-ing or fabricating an ordering.
+/// the active tab through the ORDERED tab list. AUTO-01 update: the layout
+/// store now HAS the ordered tab sequence + real `activeTabId` (the
+/// `ui.layout.sync` mirror), so the state gap this deferral originally named
+/// is closed -- what remains is the ROUTE contract (the cycling math, the
+/// `tab.select` ui.command broadcast, and the response shape), owned by
+/// AUTO-03. Returns an honest 400 until that item lands.
 const TAB_CYCLE_DEFERRAL_MESSAGE: &str = "tab cycling (next/prev) is not implemented on this \
-     server: it requires an ordered tab sequence + an active-tab id that FreshAgentState does \
-     not model (GET /api/tabs already reports activeTabId: null, an established Slice 1 \
-     precedent). Adding that state means extending FreshAgentState in lib.rs, which is out of \
-     this slice's owned-file scope. Deferred pending tab-ordering/active-tab state landing.";
+     server: the ordered tab sequence + active-tab id now exist in the AUTO-01 layout \
+     store (ui.layout.sync is consumed), but the cycling route contract (select math + \
+     tab.select broadcast) is owned by AUTO-03. Deferred to that item.";
 
 pub(crate) async fn tabs_next(
     State(state): State<FreshAgentState>,
@@ -513,23 +515,16 @@ pub(crate) async fn tabs_prev(
 }
 
 // ── GET /api/layout/snapshot ────────────────────────────────────────────
-
 /// `GET /api/layout/snapshot?tabId=` (`router.ts:885-896`): the normalized
 /// `{tabs, activeTabId, layouts, activePane, paneTitles, paneTitleSetByUser}`
-/// read model. Legacy's `layouts[tabId]` is a REAL binary split tree (nested
-/// `{type:'split', direction, sizes, children}` nodes) -- this port keeps no
-/// such tree (see this module's top doc comment and `rename_pane`'s doc
-/// comment in `lib.rs` for the established precedent: no server-side layout
-/// store at all). Rather than fabricate split geometry (direction/sizes)
-/// this port never tracked, `layouts[tabId]` is built HONESTLY from what
-/// bookkeeping actually exists: a single-pane tab (the common case, and the
-/// only case any OTHER route in this module can meaningfully mutate) gets a
-/// real `{type:'leaf', id, content}` node; a tab with more than one owned
-/// pane (post-split, geometry unknown) gets a self-describing
-/// `{type:'unknown', paneIds:[...]}` marker instead of a lying `'split'`
-/// node with invented direction/sizes. `activeTabId`/`paneTitles`/
-/// `paneTitleSetByUser` mirror `terminal_tabs::list_tabs`'s existing
-/// reduced-fidelity choices (`null`/`{}`) since this port tracks neither.
+/// read model. AUTO-01: answered from [`FreshAgentState::layout_store`] — the
+/// authoritative `ui.layout.sync` mirror of the REAL connected UI layout
+/// (plus write-through from this crate's own mutation routes), replacing the
+/// pre-AUTO-01 shadow-bookkeeping fabrication (leaf nodes from `pane_tabs`
+/// and the honest `{type:'unknown', paneIds}` marker for multi-pane tabs).
+/// Legacy shapes exactly: real binary split trees with client-minted split
+/// ids + real ratios, `activeTabId`, tab-filter narrowing, and `timestamp`
+/// only when a sync has fed the store.
 pub(crate) async fn layout_snapshot(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -539,75 +534,10 @@ pub(crate) async fn layout_snapshot(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let tab_filter = params.get("tabId").cloned();
-
-    let tabs_map = state.tabs.lock().expect("tabs mutex").clone();
-    let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex").clone();
-    let terminal_panes = state
-        .terminal_panes
-        .lock()
-        .expect("terminal_panes mutex")
-        .clone();
-    let content_panes = state
-        .content_panes
-        .lock()
-        .expect("content_panes mutex")
-        .clone();
-
-    let mut panes_by_tab: HashMap<String, Vec<String>> = HashMap::new();
-    for (pane_id, tab_id) in pane_tabs.iter() {
-        if tab_filter.as_ref().is_some_and(|f| f != tab_id) {
-            continue;
-        }
-        panes_by_tab
-            .entry(tab_id.clone())
-            .or_default()
-            .push(pane_id.clone());
-    }
-
-    let tabs_list: Vec<Value> = tabs_map
-        .values()
-        .filter(|t| tab_filter.as_ref().is_none_or(|f| f == &t.id))
-        .map(|t| json!({ "id": t.id, "title": t.title }))
-        .collect();
-
-    let mut layouts = serde_json::Map::new();
-    for (tab_id, mut pane_ids) in panes_by_tab {
-        pane_ids.sort();
-        let value = if pane_ids.len() == 1 {
-            let pane_id = &pane_ids[0];
-            let (kind, terminal_id) = if let Some(tp) = terminal_panes.get(pane_id) {
-                ("terminal", Some(tp.terminal_id.clone()))
-            } else if let Some(content) = content_panes.get(pane_id) {
-                (
-                    content
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    None,
-                )
-            } else {
-                ("fresh-agent", None)
-            };
-            json!({
-                "type": "leaf",
-                "id": pane_id,
-                "content": { "kind": kind, "terminalId": terminal_id },
-            })
-        } else {
-            json!({ "type": "unknown", "paneIds": pane_ids })
-        };
-        layouts.insert(tab_id, value);
-    }
-
     ok_json(
-        json!({
-            "tabs": tabs_list,
-            "activeTabId": Value::Null,
-            "layouts": Value::Object(layouts),
-            "activePane": {},
-            "paneTitles": {},
-            "paneTitleSetByUser": {},
-        }),
+        state
+            .layout_store()
+            .get_normalized_snapshot(tab_filter.as_deref()),
         "",
     )
 }
@@ -661,6 +591,11 @@ pub(crate) async fn navigate_pane(
         .lock()
         .expect("terminal_panes mutex")
         .remove(&pane_id);
+    // AUTO-01 write-through (legacy `layoutStore.attachPaneContent`,
+    // `router.ts:1664`): the real layout's pane content becomes browser too.
+    state
+        .layout_store()
+        .attach_pane_content(&tab_id, &pane_id, content.clone());
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.attach".to_string(),
@@ -732,6 +667,11 @@ pub(crate) async fn respawn_pane(
         .lock()
         .expect("content_panes mutex")
         .remove(&pane_id);
+    // AUTO-01 write-through: the respawned terminal content replaces the
+    // pane's content in the authoritative layout store as well.
+    state
+        .layout_store()
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.attach".to_string(),
@@ -806,13 +746,13 @@ pub(crate) async fn resize_pane(
     }
     fail_json(
         StatusCode::BAD_REQUEST,
-        "pane resize is not implemented on this server: legacy targets a server-tracked \
-         split-tree node id (splitId) that this port never learns -- it is minted \
-         client-side only (splitPane's reducer calls its own nanoid()) and the one channel \
-         that could report it back (ui.layout.sync, the client->server layout mirror) is not \
-         yet consumed anywhere in this port. A server-issued resize would target a splitId \
-         the connected client has never seen and silently no-op. Deferred pending \
-         ui.layout.sync ingestion (AUTO-01)."
+        "pane resize is not implemented on this server: it targets a server-side \
+         splitId and mutates through the shared layout store, which AUTO-01 has now \
+         landed (the ui.layout.sync mirror IS consumed and split ids are tracked), \
+         but the resize ROUTE contract -- ratio normalization, the `pane.resize` \
+         ui.command broadcast, and legacy's resolveResizeTarget pane-id shorthand -- \
+         is owned by AUTO-06. Returning 400 keeps this honest until that item lands \
+         it."
             .to_string(),
     )
 }
@@ -924,6 +864,13 @@ pub(crate) async fn swap_pane(
         }
     }
 
+    // AUTO-01: the authoritative store swaps content (+titles) too. Kept a
+    // write-through (never a resolution source) so the pre-AUTO-01 response
+    // contract is unchanged; a mirror-absent pane pair no-ops in the store.
+    state
+        .layout_store()
+        .swap_pane(Some(&tab_a), &pane_id, &other_id);
+
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.swap".to_string(),
         payload: Some(json!({ "tabId": tab_a, "paneId": pane_id, "otherId": other_id })),
@@ -1004,6 +951,123 @@ mod tests {
 
     /// Create a real shell tab via the existing Slice-1 create route, returning
     /// (tabId, paneId, terminalId).
+    /// Feed the store the way an ingested `ui.layout.sync` frame feeds it
+    /// (the WS-side feed is integration-tested in freshell-ws'
+    /// `ui_layout_sync.rs`; here we write the shared store directly to pin the
+    /// REST read routes against mirror-fed content).
+    fn feed_store(state: &FreshAgentState) {
+        state.layout_store().update_from_ui(
+            &freshell_protocol::UiLayoutSync {
+                tabs: serde_json::from_value(json!([
+                    { "id": "ui_tab_a", "title": "Alpha UI" },
+                    { "id": "ui_tab_b", "title": "Beta UI" },
+                ]))
+                .expect("tabs"),
+                layouts: json!({
+                    "ui_tab_a": {
+                        "type": "split",
+                        "id": "ui_split_1",
+                        "direction": "vertical",
+                        "sizes": [30, 70],
+                        "children": [
+                            { "type": "leaf", "id": "ui_pane_a1", "content": { "kind": "terminal", "terminalId": "term_a1", "mode": "codex" } },
+                            { "type": "leaf", "id": "ui_pane_a2", "content": { "kind": "editor", "filePath": "/tmp/notes.md" } },
+                        ],
+                    },
+                    "ui_tab_b": {
+                        "type": "leaf",
+                        "id": "ui_pane_b1",
+                        "content": { "kind": "browser", "url": "https://docs.example.com/x", "devToolsOpen": false },
+                    },
+                }),
+                active_pane: serde_json::from_value(json!({
+                    "ui_tab_a": "ui_pane_a2",
+                    "ui_tab_b": "ui_pane_b1",
+                }))
+                .expect("active_pane"),
+                timestamp: 1_720_000_000_123_i64,
+                active_tab_id: Some(Some("ui_tab_b".to_string())),
+                pane_title_set_by_user: Some(json!({ "ui_tab_a": { "ui_pane_a1": true } })),
+                pane_titles: Some(json!({ "ui_tab_a": { "ui_pane_a1": "Ops codex" } })),
+            },
+            "conn-test",
+        );
+    }
+
+    #[tokio::test]
+    async fn layout_snapshot_serves_a_mirror_fed_real_ui_tree() {
+        let state = state_with_registry();
+        feed_store(&state);
+        let (status, body) = get(app(state), "/api/layout/snapshot?tabId=ui_tab_a", true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"],
+            json!({
+                "tabs": [{ "id": "ui_tab_a", "title": "Alpha UI" }],
+                "activeTabId": "ui_tab_a",
+                "layouts": {
+                    "ui_tab_a": {
+                        "type": "split",
+                        "id": "ui_split_1",
+                        "direction": "vertical",
+                        "sizes": [30, 70],
+                        "children": [
+                            { "type": "leaf", "id": "ui_pane_a1", "content": { "kind": "terminal", "terminalId": "term_a1", "mode": "codex" } },
+                            { "type": "leaf", "id": "ui_pane_a2", "content": { "kind": "editor", "filePath": "/tmp/notes.md" } },
+                        ],
+                    },
+                },
+                "activePane": { "ui_tab_a": "ui_pane_a2" },
+                "paneTitles": { "ui_tab_a": { "ui_pane_a1": "Ops codex", "ui_pane_a2": "notes.md" } },
+                "paneTitleSetByUser": { "ui_tab_a": { "ui_pane_a1": true } },
+                "timestamp": 1_720_000_000_123_i64,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn tabs_has_matches_by_title_after_auto01() {
+        let state = state_with_registry();
+        feed_store(&state);
+        let router = app(state);
+        let (status, body) = get(router.clone(), "/api/tabs/has?target=Alpha%20UI", true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["exists"], json!(true));
+        let (_, body) = get(router, "/api/tabs/has?target=No%20Such%20Tab", true).await;
+        assert_eq!(body["data"]["exists"], json!(false));
+    }
+
+    /// AUTO-01: a pane that exists ONLY in the mirror (never REST-created
+    /// here, no shadow bookkeeping) can be closed over REST — this is the
+    /// "real connected UI layout shared with REST/CLI/MCP" behavior the item
+    /// exists for. The last-pane guard is read from the real tree.
+    #[tokio::test]
+    async fn close_pane_acts_on_mirror_only_panes() {
+        let state = state_with_registry();
+        feed_store(&state);
+        let router = app(state.clone());
+        let (status, body) = post(
+            router.clone(),
+            "/api/panes/ui_pane_a1/close",
+            json!({}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "tabId": "ui_tab_a" }));
+        // The store rebuilt the tree to the single remaining leaf (legacy
+        // buildGridLayout(1) semantics) and made it active.
+        let (status, snap) = get(router.clone(), "/api/layout/snapshot?tabId=ui_tab_a", true).await;
+        assert_eq!(status, StatusCode::OK, "{snap}");
+        let node = &snap["data"]["layouts"]["ui_tab_a"];
+        assert_eq!(node["type"], json!("leaf"));
+        assert_eq!(node["id"], json!("ui_pane_a2"));
+        assert_eq!(snap["data"]["activePane"]["ui_tab_a"], json!("ui_pane_a2"));
+        // ...and the surviving pane is now the tab's LAST pane: guarded.
+        let (_, body) = post(router, "/api/panes/ui_pane_a2/close", json!({}), true).await;
+        assert_eq!(body["message"], json!("cannot close only pane"));
+    }
+
     async fn create_shell_tab(router: Router) -> (String, String, String) {
         let tmp = std::env::temp_dir();
         let (status, body) = post(
@@ -1442,7 +1506,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["data"]["tabId"], json!(tab_id));
 
-        assert!(!state.tabs.lock().unwrap().contains_key(&tab_id));
+        assert!(!state.layout_store().has_tab(&tab_id));
         assert!(!state.pane_tabs.lock().unwrap().contains_key(&first_pane_id));
         assert!(!state
             .pane_tabs
@@ -1589,8 +1653,12 @@ mod tests {
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
     }
 
+    /// AUTO-01: post-split the snapshot exposes the REAL binary tree (legacy
+    /// `layoutStore.splitPane` shape: `{type:'split', id:<minted>, direction,
+    /// sizes:[50,50], children:[source, new]}`) — the pre-AUTO-01 fabricated
+    /// `{type:'unknown', paneIds}` marker is gone.
     #[tokio::test]
-    async fn layout_snapshot_multi_pane_tab_is_an_honest_unknown_marker_not_a_fabricated_split() {
+    async fn layout_snapshot_multi_pane_tab_is_a_real_split_tree() {
         let state = state_with_registry();
         let router = app(state.clone());
         let (tab_id, first_pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
@@ -1612,18 +1680,34 @@ mod tests {
 
         let (status, body) = get(router, "/api/layout/snapshot", true).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let node = &body["data"]["layouts"][&tab_id];
-        assert_eq!(node["type"], json!("unknown"));
-        let mut ids: Vec<String> = node["paneIds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        ids.sort();
-        let mut expected = vec![first_pane_id.clone(), second_pane_id.clone()];
-        expected.sort();
-        assert_eq!(ids, expected);
+        let data = &body["data"];
+        let node = &data["layouts"][&tab_id];
+        assert_eq!(node["type"], json!("split"));
+        assert_eq!(node["direction"], json!("horizontal"));
+        assert_eq!(node["sizes"], json!([50.0, 50.0]));
+        assert!(node["id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(node["children"][0]["type"], json!("leaf"));
+        assert_eq!(node["children"][0]["id"], json!(first_pane_id));
+        assert_eq!(
+            node["children"][0]["content"]["terminalId"],
+            json!(first_terminal_id)
+        );
+        assert_eq!(node["children"][1]["id"], json!(second_pane_id));
+        assert_eq!(
+            node["children"][1]["content"]["terminalId"],
+            json!(second_terminal_id)
+        );
+        // Legacy splitPane makes the NEW pane the tab's active pane.
+        assert_eq!(data["activePane"][&tab_id], json!(second_pane_id));
+        // Derived titles seeded ("Shell" for both modeless shell panes).
+        assert_eq!(
+            data["paneTitles"][&tab_id][&first_pane_id],
+            json!("Shell")
+        );
+        assert_eq!(
+            data["paneTitles"][&tab_id][&second_pane_id],
+            json!("Shell")
+        );
 
         let registry = state.terminal_registry.clone().unwrap();
         registry.kill(&first_terminal_id);

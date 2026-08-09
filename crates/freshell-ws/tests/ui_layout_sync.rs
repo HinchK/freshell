@@ -161,3 +161,98 @@ async fn ui_layout_sync_ingest_never_replies() {
     let pong = common::next_frame_of_type(&mut ws, "pong").await;
     assert_eq!(pong["type"], json!("pong"));
 }
+
+#[tokio::test]
+async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
+    let (url, _registry, state) = spawn_server_with_specs_and_state(vec![]).await;
+    // Mount the fresh-agent REST router against the SAME FreshAgentState the
+    // WS dispatch feeds — the shape freshell-server's main.rs production
+    // composition has (one store per process).
+    let rest_router =
+        freshell_freshagent::router(state.fresh_opencode.fresh_agent().clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, rest_router).await;
+    });
+
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+    send_json(
+        &mut ws,
+        layout_sync_frame(
+            json!([{ "id": "tab_ws", "title": "WS-fed tab" }]),
+            json!({
+                "tab_ws": {
+                    "type": "split",
+                    "id": "split_ws",
+                    "direction": "horizontal",
+                    "sizes": [33, 67],
+                    "children": [
+                        { "type": "leaf", "id": "pane_1", "content": { "kind": "terminal", "terminalId": "term_ws", "mode": "shell" } },
+                        { "type": "leaf", "id": "pane_2", "content": { "kind": "editor", "filePath": "/tmp/ws.md" } },
+                    ],
+                }
+            }),
+        ),
+    )
+    .await;
+    send_json(&mut ws, json!({ "type": "ping" })).await;
+    let _ = common::next_frame_of_type(&mut ws, "pong").await;
+
+    // The authoritative layout is now observable over REST — browser, CLI,
+    // and MCP all read THIS (AUTO-01's whole point).
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/layout/snapshot"))
+        .header("x-auth-token", common::AUTH_TOKEN)
+        .send()
+        .await
+        .expect("GET /api/layout/snapshot");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
+    let data = &body["data"];
+    assert_eq!(data["tabs"], json!([{ "id": "tab_ws", "title": "WS-fed tab" }]));
+    assert_eq!(data["activeTabId"], json!("tab_ws"));
+    let tree = &data["layouts"]["tab_ws"];
+    assert_eq!(tree["type"], json!("split"));
+    assert_eq!(tree["id"], json!("split_ws"));
+    assert_eq!(tree["sizes"], json!([33, 67]));
+    assert_eq!(data["activePane"]["tab_ws"], json!("pane_1"));
+    assert_eq!(data["paneTitles"]["tab_ws"]["pane_1"], json!("Shell"));
+    assert_eq!(data["paneTitles"]["tab_ws"]["pane_2"], json!("ws.md"));
+
+    let resp = client
+        .get(format!("http://{addr}/api/panes?tabId=tab_ws"))
+        .header("x-auth-token", common::AUTH_TOKEN)
+        .send()
+        .await
+        .expect("GET /api/panes");
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
+    assert_eq!(
+        body["data"]["panes"],
+        json!([
+            { "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_ws", "title": "Shell", "tabId": "tab_ws" },
+            { "id": "pane_2", "index": 1, "kind": "editor", "terminalId": null, "title": "ws.md", "tabId": "tab_ws" },
+        ])
+    );
+
+    let resp = client
+        .get(format!("http://{addr}/api/tabs"))
+        .header("x-auth-token", common::AUTH_TOKEN)
+        .send()
+        .await
+        .expect("GET /api/tabs");
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
+    assert_eq!(
+        body["data"],
+        json!({
+            "tabs": [{ "id": "tab_ws", "title": "WS-fed tab", "activePaneId": "pane_1" }],
+            "activeTabId": "tab_ws",
+        })
+    );
+}
