@@ -80,6 +80,23 @@ untouched; six sibling HARNESS workers run concurrently and share those):
   server-kind-independent by construction, which is exactly the checklist's "without requiring
   Rust provider parity".
 
+## Review loop
+
+No Task/subagent tool exists in this worker environment, so the mandated fresh review subagent
+was replaced by the dispatch's sanctioned fallback: structured fresh-eyes full-diff review with
+the review-agent checklist (findings ordered, demonstrable-from-code, introduced-by-this-change).
+Three rounds:
+
+- **Round 1 (3 findings, fixed):** HTTP-driven ledger rows recorded the misleading trigger
+  `argv` (now truthful per-call-site labels); opencode `POST /session` ignored the
+  default-suppression convention (now skips the canned `session` when a rule covered it);
+  dead `lines` var / unused `render` param removed.
+- **Round 2 (1 finding, fixed):** dead `path` import in the spec.
+- **Round 3 (1 realism note, fixed):** `sdk.turn.complete` documents its `subtype` field as a
+  fixture EXTENSION (the real protocol is `{sessionId, at}` only).
+- Gates re-run after every round; final full run green at the
+  review-clean tip.
+
 ## Decisions / notes for later items (TERM-*/AGENT-*)
 
 - Rule semantics: a matching rule OWNS the response shape; canned defaults fire only when no
