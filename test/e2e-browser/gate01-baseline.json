@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "10dfb849f6a4c08e687b8db38aa260854fed61b9",
+  "head": "0db5782c192f4d3542c94ff46f534ce40a5650cb",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -540,7 +540,10 @@
               "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  100 |\n  101 |   test('a sidebar-resumed codex pane re-resumes (argv `resume <id>`) across a server restart without a page reload', async ({ page, e2eServerKind }) => {\n> 102 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  103 |\n  104 |     const CODEX_SESSION_ID = 'codex-bounce-resume-0001'\n  105 |     const SESSION_TITLE = 'codex-terminal-bounce seeded session'"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :102; registration-errata class (term28/amplifier-restore/opencode-terminal-restore)"
+          }
         },
         "rust": {
           "verdict": "fail",
@@ -548,9 +551,10 @@
           "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 28010,
+          "durationMs": 28699,
           "runs": [
-            "slice-5"
+            "slice-5",
+            "reproof-s5-codexbounce"
           ],
           "runHistory": [
             {
@@ -560,6 +564,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 28010
+            },
+            {
+              "run": "reproof-s5-codexbounce",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 28699
             }
           ],
           "failures": [
@@ -569,7 +581,11 @@
               "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  193 |         expect(newTabId).toBeTruthy()\n  194 |\n> 195 |         const terminalIdBefore: string = await expect.poll(async () => {\n      |                                          ^\n  196 |           return (await harness.getPaneLayout(newTabId!))?.content?.terminalId ?? null"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-22",
+            "note": "deterministic red incl reproof-s5-codexbounce; terminalId null after restart re-resume; pinned in-spec"
+          }
         }
       }
     },
