@@ -97,6 +97,70 @@ Three rounds:
 - Gates re-run after every round; final full run green at the
   review-clean tip.
 
+## Verifier round 1 → fix (2026-08-09, df1 fix-up worker)
+
+The independent Verifier ran the claimed command at the claimed SHA (`801e95f45`) twice and got
+an identical **21 failed / 57 passed** signature both times. The fix-up worker reproduced it
+byte-for-signature at the same SHA (same command, clean env). Three observable symptoms, two root
+causes — all seven `provider fixtures are hermetic` scrub legs (7 × 3 projects = 21) were the only
+failures:
+
+1. **`childPidsOf` threw `Command failed: ps -o pid= --ppid <pid>`** (5 legs × 3 projects = 15
+   failures: the four terminal-CLI legs + the kilroy sidecar leg). Root cause: procps-ng `ps -o
+   pid= --ppid <pid>` **exits 1 with empty output when the match set is empty** — i.e. for a
+   childless process or an already-exited pid, which is exactly the hermeticity success path.
+   `execFileSync` treats any nonzero exit as an error and throws. (Reproduced deterministically:
+   `ps -o pid= --ppid <childless-or-dead pid>`; procps-ng 4.0.4 on the verify machine.) Fix: the
+   helper moved into `provider-fixture-launcher.ts` and now reads `/proc` directly instead of
+   exec'ing `ps` at all — no exit-code semantics to get wrong, race-tolerant against processes
+   exiting mid-scan, and busybox-proof (busybox `ps` lacks `-o`/`--ppid` entirely but always has
+   `/proc`). `/proc/<pid>/stat` parsing anchors on the *last* `)` because `comm` may contain
+   spaces/parens. Additionally, the four terminal-CLI legs asserted no-children *after* the
+   scripted crash had already exited the fixture — a dead pid trivially has no children, so those
+   asserts could never fail again once the throw was fixed. The assertion now runs while the
+   fixture is **alive** (after `waitEvent('completion')`, before `sendLine('explode')`), restoring
+   the leg's teeth.
+2. **Codex scrub leg: `ECONNREFUSED`** (3 failures), and **opencode scrub leg: SSE
+   `server.connected` timeout** (3 failures — one root cause, two surfaces). Both scrub legs
+   constructed the client (`new CodexRpcClient(listen)` / `new SseClient(url)`) *before* awaiting
+   the fixture's `listening on` stdout marker, then awaited the marker. The fixture prints the
+   marker only inside its `wss.on('listening')` / listen callback, i.e. after the bind; a client
+   built earlier connects to an unbound port. The WS surface failed loudly (`'error'` with no
+   listener yet attached → uncaught ECONNREFUSED); the SSE surface failed silently
+   (`pump().catch(() => undefined)` swallows the refused connect, then the 10 s
+   `waitEvent('server.connected')` deadline expired). Fix: in both legs the client is constructed
+   only **after** `await fixture.waitOutput('listening on')` — the same construction order the
+   non-scrub twins already used. No leg was skipped; readiness is the fixture's own
+   bind-then-print marker, which `fake-codex-app-server.mjs`/`fake-opencode-server.mjs` emit from
+   their listen callbacks.
+
+**Why the original worker's run read green (determined):** no env gate exists — checked both the
+spec and `playwright.config.ts` at every commit on the branch; the hermeticity describe has matched
+all three matrix projects unconditionally since it was added (`b089bba89`). The proof is the count
+arithmetic: the spec has contained **26 tests (78 runs)** since `b089bba89`, and the evidence
+commit `dedeb095c` (a direct child) claims "57 passed (19 tests × 3 projects)". 19 is *exactly* the
+number of tests whose titles do **not** contain "scrubbed PATH"; the verifier's 57 passing runs are
+exactly those same 19 × 3. So the claimed command at the claimed tree could not have produced 57 —
+any faithful full run yields 78 outcomes, 57 pass + 21 fail deterministically on Linux (the `ps`
+exit semantics are machine-independent procps-ng behavior; the loopback connect-before-bind race is
+deterministic-by-construction). The recorded green is therefore a pre-hermeticity run pasted
+forward into the evidence commit, or a grep-filtered subset (e.g. `--grep-invert "scrubbed PATH"`)
+recorded as full-suite green — the scrub legs were never actually exercised in the worker's
+"verification" runs.
+
+**Fix proof (this round, clean env, pw lease per run):**
+
+- `nice -n 19 npx playwright test --config test/e2e-browser/playwright.config.ts specs/harness-03-provider-fixtures.spec.ts --project=chromium --project=legacy-chromium --project=rust-chromium`
+  → **78 passed, twice consecutively** (exit 0 both runs).
+- `nice -n 19 npm run test:e2e:helpers -- provider-fixture` → **30/30** (25 core + 5 new launcher
+  tests).
+- TDD: `test/e2e-browser/helpers/provider-fixture-launcher.test.ts` was red-first against the
+  extracted `ps`-based `childPidsOf` (zero-child live pid, dead pid, and the live-children pin all
+  threw `Command failed: ps …` — the verifier failure class at unit level), then green after the
+  `/proc` rewrite. The same file pins the readiness-marker contract the scrub-leg fix relies on
+  (codex WS connectable and opencode `/event` answering immediately after the `listening on`
+  marker, under `scrub: true`).
+
 ## Decisions / notes for later items (TERM-*/AGENT-*)
 
 - Rule semantics: a matching rule OWNS the response shape; canned defaults fire only when no

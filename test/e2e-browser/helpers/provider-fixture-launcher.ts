@@ -212,3 +212,41 @@ export async function launchProviderFixture(opts: ProviderLaunchOptions): Promis
   })
   return new LaunchedFixture(proc, { root, cwd, home })
 }
+
+/**
+ * Pids of the direct children of `pid` (Linux only; [] on other platforms).
+ * Hermeticity checks assert this equals [] — a fixture that exec'd a real
+ * provider binary (or any subprocess) shows up here.
+ *
+ * Implemented by reading /proc directly rather than shelling out to `ps`:
+ * procps-ng `ps -o pid= --ppid <pid>` EXITS 1 when the match set is empty
+ * (a childless or already-dead pid — i.e. exactly the hermeticity success
+ * path), so every exec-based call must special-case that; busybox `ps`
+ * lacks --ppid/-o entirely. /proc parsing has no exit-code semantics to get
+ * wrong and is race-tolerant: a process exiting mid-scan is simply skipped.
+ */
+export function childPidsOf(pid: number): number[] {
+  if (process.platform !== 'linux') return []
+  let entries: string[]
+  try {
+    entries = fs.readdirSync('/proc')
+  } catch {
+    return [] // no /proc (container seccomp etc.) — cannot inspect; treat as none
+  }
+  const children: number[] = []
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue
+    try {
+      // /proc/<pid>/stat is "pid (comm) state ppid …" and comm may itself
+      // contain spaces and parens, so anchor on the LAST ')'.
+      const stat = fs.readFileSync(path.join('/proc', entry, 'stat'), 'utf8')
+      const closeParen = stat.lastIndexOf(')')
+      if (closeParen === -1) continue
+      const fields = stat.slice(closeParen + 1).trim().split(/\s+/)
+      if (Number(fields[1]) === pid) children.push(Number(entry))
+    } catch {
+      // Exited between readdir and read — not a live child either way.
+    }
+  }
+  return children.sort((a, b) => a - b)
+}

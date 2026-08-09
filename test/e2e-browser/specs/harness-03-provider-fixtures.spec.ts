@@ -21,9 +21,9 @@
  * assertions against the fixtures — that sameness IS the fixture-only proof.
  */
 import { test, expect } from '@playwright/test'
-import { execFileSync } from 'node:child_process'
 import { WebSocket } from 'ws'
 import {
+  childPidsOf,
   launchProviderFixture,
   type LaunchedFixture,
 } from '../helpers/provider-fixture-launcher.js'
@@ -682,15 +682,6 @@ test.describe('opencode server fixture', () => {
 // be unresolvable) and the fixture spawns ZERO child processes; the
 // decoy-secret control proves the ledger can never exfiltrate credentials.
 
-function childPidsOf(pid: number): number[] {
-  if (process.platform !== 'linux') return []
-  const out = execFileSync('ps', ['-o', 'pid=', '--ppid', String(pid)], { encoding: 'utf8' })
-  return out
-    .split('\n')
-    .map((line) => Number(line.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0)
-}
-
 test.describe('provider fixtures are hermetic', () => {
   for (const provider of ['claude', 'gemini', 'kimi', 'amplifier'] as const) {
     test(`${provider}: full turn contract with scrubbed PATH, no children`, async () => {
@@ -705,6 +696,9 @@ test.describe('provider fixtures are hermetic', () => {
         await fixture.waitOutput(`${provider}> `)
         fixture.sendLine('do work')
         await fixture.waitEvent('completion')
+        // No-child assertion runs while the fixture is ALIVE: after a dead
+        // pid the answer is trivially [] and the assert proves nothing.
+        expect(childPidsOf(fixture.pid)).toEqual([])
         fixture.sendLine('explode')
         expect(await fixture.exited()).toBe(3)
         expect(fixture.readEvents().map((event) => event.kind)).toEqual([
@@ -715,7 +709,6 @@ test.describe('provider fixtures are hermetic', () => {
           'completion',
           'crash',
         ])
-        if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
       } finally {
         await fixture.stop()
       }
@@ -736,7 +729,7 @@ test.describe('provider fixtures are hermetic', () => {
         `${JSON.stringify({ type: 'send', sessionId: created.sessionId, text: 'please approve' })}\n`,
       )
       await fixture.waitEvent('completion')
-      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      expect(childPidsOf(fixture.pid)).toEqual([])
     } finally {
       await fixture.stop()
     }
@@ -751,15 +744,17 @@ test.describe('provider fixtures are hermetic', () => {
       env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-codex-app-server' },
       scrub: true,
     })
+    // Connect only AFTER the fixture's listen marker — building the client
+    // first races the bind (ECONNREFUSED on an un-listened port).
+    await fixture.waitOutput('listening on')
     const client = new CodexRpcClient(listen)
     try {
-      await fixture.waitOutput('listening on')
       await client.ready()
       await client.call('initialize', {})
       const started = await client.call('thread/start', {})
       await client.call('turn/start', { threadId: started.thread.id })
       await client.waitNotification('turn/completed')
-      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      expect(childPidsOf(fixture.pid)).toEqual([])
       client.close()
     } finally {
       await fixture.stop()
@@ -775,9 +770,12 @@ test.describe('provider fixtures are hermetic', () => {
       env: { ...PROBE_ENV, HARNESS03_PROBE: 'probe-opencode-server' },
       scrub: true,
     })
+    // Connect only AFTER the fixture's listen marker — the SSE pump does not
+    // retry, so a pre-listen connect never recovers (server.connected never
+    // arrives).
+    await fixture.waitOutput('listening on')
     const sse = new SseClient(`${base}/event`)
     try {
-      await fixture.waitOutput('listening on')
       await sse.waitEvent('server.connected')
       const created = await fetch(`${base}/session`, {
         method: 'POST',
@@ -790,7 +788,7 @@ test.describe('provider fixtures are hermetic', () => {
         body: '{}',
       })
       await sse.waitEvent('session.idle')
-      if (process.platform === 'linux') expect(childPidsOf(fixture.pid)).toEqual([])
+      expect(childPidsOf(fixture.pid)).toEqual([])
       sse.close()
     } finally {
       await fixture.stop()
