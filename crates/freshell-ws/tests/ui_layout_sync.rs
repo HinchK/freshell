@@ -239,9 +239,10 @@ async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
         serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
     assert_eq!(
         body["data"]["panes"],
+        // Legacy-exact rows: absent fields are OMITTED (never null keys).
         json!([
             { "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_ws", "title": "Shell", "tabId": "tab_ws" },
-            { "id": "pane_2", "index": 1, "kind": "editor", "terminalId": null, "title": "ws.md", "tabId": "tab_ws" },
+            { "id": "pane_2", "index": 1, "kind": "editor", "title": "ws.md", "tabId": "tab_ws" },
         ])
     );
 

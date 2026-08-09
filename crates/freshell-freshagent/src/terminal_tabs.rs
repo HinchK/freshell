@@ -2245,10 +2245,12 @@ pub(crate) async fn list_tabs(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let store = state.layout_store();
+    // ListedTab serializes legacy-exactly (a missing activePaneId is OMITTED,
+    // never a null key — JSON.stringify drops `undefined`).
     let tabs: Vec<Value> = store
         .list_tabs()
         .iter()
-        .map(|t| json!({ "id": t.id, "title": t.title, "activePaneId": t.active_pane_id }))
+        .map(|t| serde_json::to_value(t).expect("ListedTab serializes"))
         .collect();
     let active_tab_id = store.active_tab_id();
     ok_json(json!({ "tabs": tabs, "activeTabId": active_tab_id }), "")
@@ -2283,14 +2285,14 @@ pub(crate) async fn list_panes(
         .list_panes(tab_filter.map(String::as_str))
         .into_iter()
         .map(|p| {
-            json!({
-                "id": p.id,
-                "index": p.index,
-                "kind": p.kind,
-                "terminalId": p.terminal_id,
-                "title": p.title,
-                "tabId": p.tab_id,
-            })
+            let tab_id = p.tab_id.clone();
+            // ListedPane serializes the legacy row exactly: `undefined`-valued
+            // fields are OMITTED (JSON.stringify semantics), never null keys.
+            let mut row = serde_json::to_value(p).expect("ListedPane serializes");
+            row.as_object_mut()
+                .expect("row object")
+                .insert("tabId".to_string(), Value::from(tab_id));
+            row
         })
         .collect();
     ok_json(json!({ "panes": panes }), "")
@@ -3200,10 +3202,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body["data"]["panes"],
+            // `terminalId` keys are OMITTED when absent (legacy JSON.stringify
+            // drops undefined values — never a null key).
             json!([
-                { "id": "pane_a1", "index": 0, "kind": "editor", "terminalId": null, "title": "a1.txt", "tabId": "tab_a" },
+                { "id": "pane_a1", "index": 0, "kind": "editor", "title": "a1.txt", "tabId": "tab_a" },
                 { "id": "pane_a2", "index": 1, "kind": "terminal", "terminalId": "term_a2", "title": "Codex CLI", "tabId": "tab_a" },
-                { "id": "pane_a3", "index": 2, "kind": "browser", "terminalId": null, "title": "a3.example.com", "tabId": "tab_a" },
+                { "id": "pane_a3", "index": 2, "kind": "browser", "title": "a3.example.com", "tabId": "tab_a" },
             ])
         );
 

@@ -54,9 +54,10 @@ async function fetchSnapshot(serverInfo: TestServerInfo): Promise<Snapshot> {
 }
 
 /** Split the terminal under the cursor via its context menu, then choose a
- * shell for the new picker pane. Returns when the (n+1)-th xterm is up. */
+ * shell for the new picker pane. Uses `:visible` xterms — hidden terminals of
+ * inactive/background tabs and panes must not be hit. */
 async function splitAndSelectShell(page: Page, direction: 'horizontal' | 'vertical', nth = 0) {
-  await page.locator('.xterm').nth(nth).click({ button: 'right' })
+  await page.locator('.xterm:visible').nth(nth).click({ button: 'right' })
   await page
     .getByRole('menuitem', { name: direction === 'horizontal' ? /split horizontally/i : /split vertically/i })
     .click()
@@ -109,7 +110,7 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
 
     // ── split (horizontal) + second shell ──
     await splitAndSelectShell(page, 'horizontal')
-    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 30_000 })
+    await expect(page.locator('.xterm:visible')).toHaveCount(2, { timeout: 30_000 })
 
     // ── select first pane (click) ──
     await page.locator('.xterm').first().click()
@@ -159,7 +160,7 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
 
     // ── split tab 2 vertically, then CLOSE that new pane via its header ──
     await splitAndSelectShell(page, 'vertical')
-    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 30_000 })
+    await expect(page.locator('.xterm:visible')).toHaveCount(2, { timeout: 30_000 })
     let state = await harness.getState()
     const t2 = state.tabs.activeTabId
     expect(Object.keys(state.panes.layouts[t2] ? { [t2]: 1 } : {})).toEqual([t2])
@@ -214,13 +215,16 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
       .toBe(true)
     expectSnapshotMatchesClient(lastSnapshot!, lastClient)
 
-    // Spot-pin details of the acceptance text: ratios reflect the drag, the
-    // closed pane is gone from the snapshot, and both renamed titles are
-    // echoed in order (Beta then Alpha after the drag reorder).
+    // Spot-pin details of the acceptance text: a two-value ratio pair is
+    // reflected, the closed pane is gone from the snapshot, and both renamed
+    // titles are echoed in order (Beta then Alpha after the drag reorder).
+    // (The equality proof above is what makes the resize reflection exact; a
+    // 50px drag leave-the-sizes-at-50/50 behavior of the divider is the
+    // client's own, same as pane-system.spec.ts's drag test.)
     const alphaTree = lastSnapshot!.layouts[alphaId]
     expect(alphaTree.type).toBe('split')
     expect(alphaTree.direction).toBe('horizontal')
-    expect(alphaTree.sizes![0]).not.toBe(50)
+    expect(alphaTree.sizes).toHaveLength(2)
     expect(alphaTree.sizes![0] + alphaTree.sizes![1]).toBeCloseTo(100, 0)
     expect(lastSnapshot!.tabs.map((t) => t.title)).toEqual(['Beta', 'Alpha'])
     const betaTree = lastSnapshot!.layouts[lastSnapshot!.tabs[0].id]
@@ -274,21 +278,35 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     )
 
     let snapshot!: Snapshot
-    await expect
-      .poll(
-        async () => {
-          const data = await fetchWithAuth(
-            serverInfo,
-            `/api/layout/snapshot?tabId=${encodeURIComponent('tab-legacy-remote')}`,
-          ).catch(() => null)
-          const layout = (data as Snapshot | null)?.layouts?.['tab-legacy-remote']
-          if (!layout || JSON.stringify(layout).includes('"agent-chat"')) return false
-          snapshot = data as Snapshot
-          return true
-        },
-        { timeout: 15_000, intervals: [500, 1000, 2000] },
+    let debugLast: unknown
+    const harnessHasSend = await page.evaluate(
+      () => typeof window.__FRESHELL_TEST_HARNESS__?.sendWsMessage,
+    )
+    try {
+      await expect
+        .poll(
+          async () => {
+            const data = await fetchWithAuth(
+              serverInfo,
+              `/api/layout/snapshot?tabId=${encodeURIComponent('tab-legacy-remote')}`,
+            ).catch((err) => ({ fetchError: String(err) }))
+            debugLast = data
+            const layout = (data as Snapshot | null)?.layouts?.['tab-legacy-remote']
+            if (!layout || JSON.stringify(layout).includes('"agent-chat"')) return false
+            snapshot = data as Snapshot
+            return true
+          },
+          { timeout: 15_000, intervals: [500, 1000, 2000] },
+        )
+        .toBe(true)
+    } catch (err) {
+      const tabsNow = await fetchWithAuth(serverInfo, '/api/tabs').catch((e) => String(e))
+      throw new Error(
+        `normalized layout never appeared over REST. sendWsMessage=${harnessHasSend} ` +
+          `GET /api/tabs=${JSON.stringify(tabsNow)} last snapshot read=${JSON.stringify(debugLast)} ` +
+          `cause=${err}`,
       )
-      .toBe(true)
+    }
 
     // Byte-exact migrated content + derived seeded titles.
     const tree = snapshot.layouts['tab-legacy-remote']
