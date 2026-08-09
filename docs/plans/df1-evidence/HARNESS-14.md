@@ -125,4 +125,54 @@ identity passthrough and every control verb is inert (Rust: `Err(Disabled)`; leg
 
 ## Review
 
-Structured fresh-eyes review loop — see "REVIEW LOOP" below (this file, appended).
+**REVIEW LOOP (round 1, 2026-08-09).** Dispatch preference was a fresh review subagent
+(Task tool); this worker has no Task tool, and two attempts to spawn an independent fresh
+reviewer via the in-app freshell MCP (`new-tab agent=opencode`) timed out at the MCP layer
+with an empty tab list (live-server agent lane unresponsive). Documented fallback applied:
+structured fresh-eyes self-review against the review-agent skill's bar
+(`/home/dan/.claude/skills/.system/review-agent/SKILL.md`), performed over the full merge-base
+diff `git diff 4edd8d10e..HEAD` (25 files, +2600/−49), six targeted hunts:
+
+1. **Gate-off production identity** — Rust `clock::now_ms()` gate-off returns
+   `system_now_ms()` unconditionally before any lock; legacy `testClockNowMs()` same shape;
+   sweep cadence, limiter construction, and router behavior all branch only on
+   `enabled()`/module-const env, which production never sets. Absence proven BEHAVIORALLY on
+   both matrix legs (ungated fixture: all five verbs 404; `/api/health` 200). **No finding.**
+2. **Backwards-time/monotonicity** — advance is non-negative and capped on both sides;
+   freeze idempotent; resume continues from held (no catch-up); the only backwards step is
+   `reset` by design (documented, and excluded from the monotonicity unit test with the
+   reason recorded). Saturating adds in the Rust core. The detach path's
+   `last_meaningful_activity_at.max(now_ms())` is freeze-safe. **No finding.**
+3. **Cross-test pollution residual** — per-crate audit: `freshell-platform` (only clock.rs
+   tests touch the override; in-file lock), `freshell-terminal`/`freshell-ws` (no override
+   users remain in unit binaries — moved to integration binaries; the one observed collision
+   is the incident above), `freshell-server` (router + gate-aware tests serialize via
+   `test_clock_gate`; no other in-binary consumer of the routed clock exists — audited by
+   grepping every `clock::` call site; two full 614-pass suite runs green). Legacy vitest:
+   per-file isolation + afterEach state normalization (the suite runs `sequence.shuffle`).
+   Probe spawns an own gated server per test; the ungated worker fixture drives absence.
+   **No finding.**
+4. **Legacy/Rust surface parity** — paths, success envelopes
+   (`{ok,enabled,mode,nowMs,offsetMs}`), 400 `invalid_advance` envelope, 404 `Not found`,
+   401 shape (`unauthorized()` is byte-shape-equal to legacy's reject per boot.rs), 31-day cap
+   inclusive on both. One cosmetic dead-path divergence: legacy's freeze/advance POST handler
+   would answer 200 `{ok:false,error:'disabled'}` vs Rust's 404 if the clock were somehow
+   disabled between the router-level gate and the handler — unreachable in both runtimes
+   (no await between; single-threaded tick / pre-check inside the handler). Recorded, not a
+   finding.
+5. **Probe flakiness** — create-on-live + quiesce (stable `lastLine` across 600ms) BEFORE
+   freeze, threshold margins ≥1 virtual minute at every crossing, 15s poll budgets against a
+   250ms gated sweep, serial describe, per-test owned servers, clock reset + server stop in
+   `finally`. Empirical: 8/8 consecutive full-file legs green (4 per project).
+   **No finding.**
+6. **Wrongly-swapped `Date.now()` sites** — all 29 swap sites in `terminal-registry.ts` are
+   time-semantic (stamps + elapsed math); the codex-rollout `watchId` uniqueness stamp kept
+   `Date.now()` (verified in diff); `tabs-registry/store.ts` tmp-pathname `Date.now()` (row
+   987) untouched; only the two `options.now` DEFAULT providers rerouted (explicit caller
+   injection still wins). **No finding.**
+
+**Outcome: zero qualifying findings.** Overall assessment: ship. Material known test gaps
+(recorded under "Deliberately NOT done"): the Rust API token bucket's clock-draining and the
+Rust create-rate window are proven at crate level only (no dedicated e2e assertion yet —
+SAFE-02/TERM-11 future specs own those); closed-tab retention routing covered by the provider
+swap + crate TTL proof but not by a dedicated e2e.
