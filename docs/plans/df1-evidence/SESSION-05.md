@@ -22,7 +22,8 @@ On main, the feature was end-to-end DEAD, on both servers:
 - **Legacy broadcast fix (deliberate, documented):** `SessionsSyncService.flush` now ALSO compares the resolved per-project color map (`server/sessions-sync/service.ts`), so the legacy `refresh()`→`publish()` path broadcasts on a color-only change. `projection.ts`'s pinned color-blind contract is untouched.
 - **Legacy read:** `server/session-directory/service.ts` embeds `projectColors` from the indexer-resolved project groups on every page (including pagination continuation pages).
 - **Shared schema:** `shared/read-models.ts` `SessionDirectoryPageSchema.projectColors` (optional).
-- **Client:** `groupDirectoryItemsAsProjects` and `searchResultsToProjects` overlay the page map (the two group-construction sites); `SearchResponse` threads it; `mergeProjects` in `sessionsThunks` is now **server-authoritative incoming-color-wins** (previously additive-only, which silently kept stale colors on cross-context recolor). No history-view render change needed.
+- **Client:** `groupDirectoryItemsAsProjects` and `searchResultsToProjects` overlay the page map (the two group-construction sites); `SearchResponse` threads it; `mergeProjects` in `sessionsThunks` is now **server-authoritative later-fetched-color-wins** (previously additive-only, which silently kept stale colors on cross-context recolor) via an explicit `preferColorsFrom` option — the reverse-argument deep-window silent-refresh merge passes `'existing'` so its fresh page wins too (regression pinned RED in `sessionsThunks.project-colors.test.ts`). No history-view render change needed.
+- **Validation parity details:** falsy-body (`null/false/0/""`) validated as `{}` like `req.body || {}`; zod string limits measured in UTF-16 units like JS `length` (not bytes); non-string (junk hand-edited) color values are normalized away on both servers so the string-valued page record never fails client parse.
 
 ## Deliberate legacy-behavior changes (DoD disclosure)
 
@@ -34,7 +35,7 @@ Not changes: color removal is never observable anywhere — legacy has no "clear
 
 ## Test evidence
 
-- Rust crate (`cargo test -p freshell-server`): 576 passed (incl. 6 new settings_store + 6 new route + 2 new session-directory tests) + all integration binaries; run green twice. Mutation-run RED proofs: disabling route broadcast fails 2 tests; bypassing validation fails 2; skipping the page attach fails 1.
+- Rust crate (`cargo test -p freshell-server`): 577 passed (incl. 7 new settings_store + 6 new route + 2 new session-directory tests) + all integration binaries. Mutation-run RED proofs: disabling route broadcast fails 2 tests; bypassing validation fails 2; skipping the page attach fails 1; dropping the junk filter fails 1. Review rounds: 3 (fresh-eyes, review-agent checklist, fallback mode — no subagent-spawn tool in session). Round 1 found+fixed F2 (deep-merge stale color, P1), F5 (falsy-body parity, P3), C1 (junk-value filter, P2); round 2 found+fixed UTF-16 length parity (P3); round 3: no findings.
 - Vitest (server): `test/unit/server/sessions-sync/`+`session-directory/` → 253 green (incl. 1 new sync test, 3 new page tests); `test/integration/server/api-edge-cases.test.ts` → 87 green (legacy route contract).
 - Vitest (client): api.test.ts + api.project-colors (new, 4) → 43; sessionsThunks + sessionsThunks.project-colors (new, 3) + sessionsSlice + sidebarSelectors → 136; HistoryView a11y/mobile/color (new, 4) → 8.
 - Typecheck (`npm run typecheck`) clean; `npm run lint` 0 errors (touched files warning-clean; 11 pre-existing src warnings unrelated).
