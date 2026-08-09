@@ -72,6 +72,21 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// HARNESS-14: a `Clock` reading the shared, env-gated test clock
+/// (`freshell_platform::clock`). Only ever installed when the clock is
+/// gate-ON (a `FRESHELL_TEST_CLOCK=1` test boot — see `main.rs`'s limiter
+/// construction), so a spec can advance past the refill window without
+/// wall-clock sleeps (SAFE-02 window tests). Epoch ms as `u64` — only
+/// deltas matter to the limiter, so the absolute base is irrelevant.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalTestClock;
+
+impl Clock for GlobalTestClock {
+    fn now_ms(&self) -> u64 {
+        freshell_platform::clock::now_ms().max(0) as u64
+    }
+}
+
 /// Production clock: wraps a monotonic [`std::time::Instant`] captured at
 /// construction, so `now_ms()` is `elapsed()` since boot of this limiter --
 /// immune to system-clock adjustments (NTP steps, DST), matching the
@@ -203,6 +218,17 @@ impl RateLimiter {
     /// SAFE-02 default config, ready to share via `Arc`.
     pub fn new_system(config: RateLimitConfig) -> Arc<Self> {
         Arc::new(Self::new(Box::new(SystemClock::new()), config))
+    }
+
+    /// HARNESS-14 gate-aware constructor: the shared test clock when a
+    /// `FRESHELL_TEST_CLOCK=1` test boot enabled it, otherwise the exact
+    /// [`SystemClock`] production has always used (never default-on).
+    pub fn new_gate_aware(config: RateLimitConfig) -> Arc<Self> {
+        if freshell_platform::clock::enabled() {
+            Arc::new(Self::new(Box::new(GlobalTestClock), config))
+        } else {
+            Self::new_system(config)
+        }
     }
 
     /// Attempt to consume one token. `Ok(())` means the caller may proceed;
@@ -432,6 +458,48 @@ mod tests {
         assert_eq!(
             successes, 10,
             "exactly `capacity` requests should succeed under concurrent hammering with a frozen clock"
+        );
+    }
+
+    /// HARNESS-14: `new_gate_aware` binds the shared test clock when the
+    /// env gate is on (test override stands in for `FRESHELL_TEST_CLOCK=1`),
+    /// so refill math follows virtual `advance_ms` instead of wall sleeps.
+    #[test]
+    fn new_gate_aware_refills_on_the_shared_test_clock_when_enabled() {
+        let _guard = crate::test_clock_gate::TestClockGate::enable();
+        freshell_platform::clock::freeze().unwrap();
+        let limiter = RateLimiter::new_gate_aware(RateLimitConfig {
+            capacity: 1.0,
+            refill_per_sec: 1.0,
+        });
+        assert!(limiter.try_acquire().is_ok(), "bucket starts full");
+        assert!(
+            limiter.try_acquire().is_err(),
+            "frozen time: the emptied bucket never refills on real time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(limiter.try_acquire().is_err(), "still frozen — no refill");
+        freshell_platform::clock::advance_ms(1_001).unwrap();
+        assert!(
+            limiter.try_acquire().is_ok(),
+            "a virtual step past 1/refill_per_sec must refill one token"
+        );
+    }
+
+    /// The gate-off half: without the gate, `new_gate_aware` is exactly the
+    /// production `SystemClock` construction (real elapsed time refills).
+    #[test]
+    fn new_gate_aware_without_the_gate_uses_system_time() {
+        let _guard = crate::test_clock_gate::TestClockGate::locked(false);
+        let limiter = RateLimiter::new_gate_aware(RateLimitConfig {
+            capacity: 1.0,
+            refill_per_sec: 1_000.0,
+        });
+        assert!(limiter.try_acquire().is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(
+            limiter.try_acquire().is_ok(),
+            "at 1000 tokens/sec, a few real milliseconds refill the bucket"
         );
     }
 
