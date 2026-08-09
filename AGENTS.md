@@ -36,6 +36,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
 - See `docs/development/test-sandbox.md` for the safety guarantees, the `--corpus` read-only real-data flag, and cache-volume management.
 
+## Amplifier Skills Deployment (machine note)
+- Never symlink a git repo (or anything containing `.git`) into `~/.amplifier/skills/`. Amplifier's skill discovery walks that tree, refuses symlinks that resolve outside it, and spams "Skipping symlink that escapes repository boundary" warnings at every launch. Deploy a skill as a plain copy of its `SKILL.md` into `~/.amplifier/skills/<name>/`; keep the canonical skill in its own repo (e.g. `~/code/skill-parallel-development`) and re-copy on update.
+
 ## Kata
 - `.kata.toml` is committed project configuration. Always commit it after modifying it.
 
