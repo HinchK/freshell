@@ -21,6 +21,8 @@
 #   DF1_HOLDER   lease holder id (default: df1-gate-01-unchanged-suite-both)
 #   DF1_ACQUIRE  path to acquire.sh (default: the df1-control worktree copy)
 #   GATE01_WORKERS  playwright workers (default: 2)
+#   GATE01_PROJECTS comma list of gate projects to run (default: both legs,
+#                 e.g. "gate01-rust" for an isolated rust-leg reproof)
 #
 # Lease discipline: acquire pw --wait 3600; heartbeat every 300s during the
 # run; release in all exits. Retry/timeout policy: playwright config defaults
@@ -30,9 +32,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-# Reports go under the repo-root test-results/ tree: already gitignored (the
-# committed artifact is gate01-baseline.json; per-slice JSON is working state).
-REPORTS="$ROOT/test-results/gate01-reports"
+# Reports live in test/e2e-browser/gate01-reports/ (gitignored). Do NOT put
+# them under test-results/: that is Playwright's outputDir, which is CLEANED
+# at the start of every run and would delete earlier slices' reports.
+REPORTS="$ROOT/test/e2e-browser/gate01-reports"
 BASELINE="$ROOT/test/e2e-browser/gate01-baseline.json"
 HOLDER="${DF1_HOLDER:-df1-gate-01-unchanged-suite-both}"
 ACQUIRE="${DF1_ACQUIRE:-/home/dan/code/freshell/.worktrees/df1-control/df1-control/scripts/acquire.sh}"
@@ -70,10 +73,20 @@ fi
 HB_PID=$!
 
 cd "$ROOT/test/e2e-browser"
+PROJECT_ARGS=()
+if [ -n "${GATE01_PROJECTS:-}" ]; then
+  IFS=',' read -ra PROJS <<< "$GATE01_PROJECTS"
+  for p in "${PROJS[@]}"; do PROJECT_ARGS+=(--project="$p"); done
+fi
+# Red legs are DATA for this gate — playwright exits nonzero when tests fail,
+# which must NOT abort the script before collation. Record the exit code.
+PW_EXIT=0
 GATE01_JSON_OUTPUT="$REPORT" nice -n 19 npx playwright test \
   --config playwright.gate01.config.ts \
   --workers="$WORKERS" \
-  "${SPECS[@]/#/specs/}"
+  "${PROJECT_ARGS[@]}" \
+  "${SPECS[@]/#/specs/}" || PW_EXIT=$?
+echo "$PW_EXIT" > "$REPORT.exit"
 
 kill "$HB_PID" 2>/dev/null || true
 HB_PID=""
