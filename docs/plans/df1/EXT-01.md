@@ -4,7 +4,7 @@
 
 **Goal:** Port the legacy `server/extension-manifest.ts` zod-4 strict validator — every category requirement, default, timeout, capability flag, content schema, icon, command, create/resume identity, models, sandbox, permission field, and unknown-key rejection — to Rust, with pinned behavioral parity, and wire it into the live scan path so `freshell-server` rejects/accepts exactly what legacy does.
 
-**Parity source:** `server/extension-manifest.ts` (zod 4.4.3, vendored in `node_modules`). Behavioral spec: `test/unit/server/extension-manifest.test.ts` (540 lines, 35 cases) plus a generated differential oracle (this plan's Task 1).
+**Parity source:** `server/extension-manifest.ts` (zod **4.3.6** — the `package-lock.json` pin; the main checkout's `node_modules` carries a dirty 4.4.3 install that `npm ci` does NOT reproduce. All probes and the oracle are pinned to the LOCK version). Behavioral spec: `test/unit/server/extension-manifest.test.ts` (540 lines, 35 cases) plus the generated differential oracle (`port/contract/generate-manifest-oracle.ts` → `crates/freshell-extensions/fixtures/manifest-oracle.json`, 120 cases: 38 valid / 81 invalid-verdict / 1 invalid-JSON, hermetic byte-identical regeneration verified 2026-08-09).
 
 **Tech stack:** Rust 1.96 / edition 2021, serde + serde_json (preserve_order), indexmap, tracing; oracle generator in TS run with repo `node_modules` zod.
 
@@ -63,7 +63,10 @@ Pinned zod 4.4.3 messages (probed empirically against vendored zod 4.4.3 on 2026
 | int lower bound | `too_small` | `Too small: expected int to be >=-9007199254740991` |
 | enum (≥2 opts) | `invalid_value` | `Invalid option: expected one of "client"|"server"|"cli"` |
 | enum (1 opt) | `invalid_value` | `Invalid input: expected "canvas"` |
-| type mismatch | `invalid_type` | `Invalid input: expected object, received null` (…string/number/boolean/array/undefined/int/record variants) |
+| type mismatch | `invalid_type` | `Invalid input: expected object, received null` (…string/number/boolean/array/undefined/record variants) |
+| int field, non-number input | `invalid_type` | `Invalid input: expected number, received string` (base-type name for non-numbers) |
+| int field, non-integral number | `invalid_type` | `Invalid input: expected int, received number` |
+| category/enum missing or wrong primitive | `invalid_value` | same `Invalid option: …` form (zod-4 enum treats missing/wrong-type as invalid_value, NOT invalid_type) |
 | union fail | `invalid_union` | `Invalid input` |
 | refine fail | `custom` | the refine's message (2 exist, verbatim) |
 
