@@ -5,6 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   captureHostListeningPorts,
   captureResourceSnapshot,
+  diffSnapshots,
+  type ProcessSnapshot,
+  type ResourceSnapshot,
 } from './leak-metrics.js'
 
 /**
@@ -182,6 +185,112 @@ describe('captureResourceSnapshot (fixture /proc)', () => {
 
     // A root pid that does not exist at all snapshots to an empty tree.
     expect(captureResourceSnapshot([424242], { procRoot: tmpRoot }).processCount).toBe(0)
+  })
+})
+
+function proc(partial: Partial<ProcessSnapshot> & { pid: number; listeningPorts?: number[] }): ProcessSnapshot {
+  return {
+    ppid: 1,
+    comm: `p${partial.pid}`,
+    state: 'S',
+    rssBytes: 1024,
+    threads: 1,
+    fdCount: 3,
+    socketQueue: { rxBytes: 0, txBytes: 0 },
+    listeningPorts: [],
+    ...partial,
+  }
+}
+
+function snap(partial: Partial<ResourceSnapshot> & { processes: ProcessSnapshot[] }): ResourceSnapshot {
+  const ports = [...new Set(partial.processes.flatMap((p) => p.listeningPorts))].sort((a, b) => a - b)
+  const base: ResourceSnapshot = {
+    capturedAt: '2026-08-09T00:00:00.000Z',
+    rootPids: [1000],
+    processCount: partial.processes.length,
+    totalRssBytes: partial.processes.reduce((n, p) => n + (p.rssBytes ?? 0), 0),
+    totalFdCount: partial.processes.reduce((n, p) => n + (p.fdCount ?? 0), 0),
+    totalThreads: partial.processes.reduce((n, p) => n + (p.threads ?? 0), 0),
+    totalSocketQueue: {
+      rxBytes: partial.processes.reduce((n, p) => n + p.socketQueue.rxBytes, 0),
+      txBytes: partial.processes.reduce((n, p) => n + p.socketQueue.txBytes, 0),
+    },
+    listeningPorts: ports,
+    processes: partial.processes,
+  }
+  return { ...base, ...partial }
+}
+
+describe('diffSnapshots', () => {
+  it('passes an unchanged baseline', () => {
+    const before = snap({ processes: [proc({ pid: 1000, listeningPorts: [8080] })] })
+    const after = snap({ processes: [proc({ pid: 1000, listeningPorts: [8080] })] })
+    const diff = diffSnapshots(before, after)
+    expect(diff.failures).toEqual([])
+    expect(diff.newListeningPorts).toEqual([])
+    expect(diff.lostListeningPorts).toEqual([])
+    expect(diff.rssGrowthBytes).toBe(0)
+  })
+
+  it('flags a new listening port unless it is explicitly allowed', () => {
+    const before = snap({ processes: [proc({ pid: 1000, listeningPorts: [8080] })] })
+    const after = snap({ processes: [proc({ pid: 1000, listeningPorts: [8080, 9090] })] })
+
+    const flagged = diffSnapshots(before, after)
+    expect(flagged.newListeningPorts).toEqual([9090])
+    expect(flagged.failures).toHaveLength(1)
+    expect(flagged.failures[0]).toContain('9090')
+
+    const allowed = diffSnapshots(before, after, { allowedNewListeningPorts: [9090] })
+    expect(allowed.failures).toEqual([])
+  })
+
+  it('records lost ports without failing (per-scenario assert, not mechanical)', () => {
+    const before = snap({ processes: [proc({ pid: 1000, listeningPorts: [8080] })] })
+    const after = snap({ processes: [proc({ pid: 1000, listeningPorts: [] })] })
+    const diff = diffSnapshots(before, after)
+    expect(diff.lostListeningPorts).toEqual([8080])
+    expect(diff.failures).toEqual([])
+  })
+
+  it('fails RSS growth past the bound and passes both under-bound and negative growth', () => {
+    const before = snap({ processes: [proc({ pid: 1000, rssBytes: 1000 })] })
+    const over = snap({ processes: [proc({ pid: 1000, rssBytes: 1000 + 300 * 1024 * 1024 })] })
+    expect(diffSnapshots(before, over).failures[0]).toMatch(/RSS grew/)
+    expect(diffSnapshots(before, over, { maxRssGrowthBytes: 512 * 1024 * 1024 }).failures).toEqual([])
+    const under = snap({ processes: [proc({ pid: 1000, rssBytes: 500 })] })
+    expect(diffSnapshots(before, under).failures).toEqual([])
+    expect(diffSnapshots(before, under).rssGrowthBytes).toBe(-500)
+  })
+
+  it('fails fd-handle growth past the default bound', () => {
+    const before = snap({ processes: [proc({ pid: 1000, fdCount: 10 })] })
+    const after = snap({ processes: [proc({ pid: 1000, fdCount: 30 })] })
+    const diff = diffSnapshots(before, after)
+    expect(diff.fdGrowth).toBe(20)
+    expect(diff.failures[0]).toMatch(/open-fd/)
+    expect(diffSnapshots(before, after, { maxFdGrowth: 25 }).failures).toEqual([])
+  })
+
+  it('fails process growth at the default bound and names the offending pids', () => {
+    const before = snap({ processes: [proc({ pid: 1000 })] })
+    const after = snap({ processes: [proc({ pid: 1000 }), proc({ pid: 1001, ppid: 1000 })] })
+    const diff = diffSnapshots(before, after)
+    expect(diff.processGrowth).toBe(1)
+    expect(diff.processGrowthPids).toEqual([1001])
+    expect(diff.failures[0]).toContain('1001')
+    expect(diffSnapshots(before, after, { maxProcessGrowth: 1 }).failures).toEqual([])
+  })
+
+  it('fails when post-settle socket queue bytes exceed the bound', () => {
+    const before = snap({ processes: [proc({ pid: 1000 })] })
+    const after = snap({
+      processes: [proc({ pid: 1000, socketQueue: { rxBytes: 2 * 1024 * 1024, txBytes: 0 } })],
+    })
+    expect(diffSnapshots(before, after).failures[0]).toMatch(/socket queue/)
+    expect(
+      diffSnapshots(before, after, { maxTotalSocketQueueBytes: 4 * 1024 * 1024 }).failures,
+    ).toEqual([])
   })
 })
 
