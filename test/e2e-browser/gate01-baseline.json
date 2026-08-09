@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "0e04c326ad4e5fca55a104b2643d2598028d3f9d",
+  "head": "601d60b5078b13b0e8aa6b03d2f184c560dcbd92",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -593,26 +593,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 4094,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4094
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 4395,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4395
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1004,28 +1026,77 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 18969,
+          "runs": [
+            "slice-8",
+            "reproof-s8-fomp"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 19541
+            },
+            {
+              "run": "reproof-s8-fomp",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 18969
+            }
+          ],
+          "failures": [
+            {
+              "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+              "line": 41,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s8-fomp: Freshopencode model-picker group never renders; identical on rust; UI/spec drift (pre-existing, both-server)"
+          }
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 18979,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 18979
+            }
+          ],
+          "failures": [
+            {
+              "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+              "line": 41,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical assertion red as legacy; pre-existing both-server"
+          }
         }
       }
     },
@@ -2240,28 +2311,79 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 10,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 90604,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 90604
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 5,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 253030,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 5,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 253030
+            }
+          ],
+          "failures": [
+            {
+              "title": "split pane horizontally",
+              "line": 48,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "close pane returns to single pane",
+              "line": 75,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "pane picker allows choosing pane type",
+              "line": 107,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "pane focus switches correctly",
+              "line": 153,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "nested splits create complex layouts",
+              "line": 204,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 5/5 ctx dialog; legacy 10/10 green"
+          }
         }
       }
     },
@@ -2269,26 +2391,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 9137,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9137
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 6486,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 6486
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2452,26 +2596,57 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 234,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 234
+            }
+          ],
+          "failures": [
+            {
+              "title": "creating a tab via REST with an out-of-enum mode materializes it in the tab strip and persists to localStorage, but the tab strip goes empty on reload while localStorage still holds the data",
+              "line": 136,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  139 |     // explicitly so an accidental `MATRIX_SPECS` inclusion fails loudly\n  140 |     // instead of silently no-op'ing on legacy.\n> 141 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  142 |\n  143 |     const { baseUrl, token } = serverInfo\n  144 |     const cwd = (testServer as any).__cwd as string"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :141; registration-errata class; rust leg green"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 2552,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 2552
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -3179,28 +3354,69 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 8,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 64118,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 64118
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 3,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 237695,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 5,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 237695
+            }
+          ],
+          "failures": [
+            {
+              "title": "sidebar collapse toggle works",
+              "line": 11,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar search input is functional",
+              "line": 99,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar view switches: settings and back",
+              "line": 127,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 3/3 ctx dialog; legacy 8/8 green"
+          }
         }
       }
     },
@@ -3642,28 +3858,59 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7657,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7657
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 180246,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 180246
+            }
+          ],
+          "failures": [
+            {
+              "title": "process suspend catches up terminal output without silent gaps or quarantine",
+              "line": 351,
+              "error": "\u001b[31mTest timeout of 180000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog (180s test timeout with dialog intercepting); legacy green"
+          }
         }
       }
     },
