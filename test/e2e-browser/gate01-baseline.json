@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "d17f1d61a82724e9ee28091ee83d5f1f066b493d",
+  "head": "e40de41035cdd37c38956a3a767c0478c67d409f",
   "rustServerBinSha256": "872824734088926517036282ffe275bb354066788c06b9f200041317fdc446be",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -46,28 +46,54 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 27588,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 27588
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
           "failed": 0,
-          "skipped": 0,
+          "skipped": 1,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 170,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 1,
+              "expectedFail": 0,
+              "durationMs": 170
+            }
+          ],
           "failures": [],
-          "attribution": null
+          "attribution": {
+            "kind": "gap",
+            "owner": "AGENT-14",
+            "note": "spec's own test.skip(e2eServerKind==='rust') KNOWN DIVERGENCE: rust-only skip of a user-visible feature (Rewind UI gesture). GATE-01 bar requires this be empty or explicitly approved; surface in skipped-test report; checkpoint routes proven by 41 rust unit/integration tests per the skip comment"
+          }
         }
       }
     },
@@ -390,7 +416,10 @@
               "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): waitForTerminal .xterm timeouts float between runs (slice-0: :120/:133; isolated: :83/:133/:193); dialog verified in contexts"
+          }
         }
       }
     },
@@ -485,28 +514,87 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 60741,
+          "runs": [
+            "slice-1",
+            "reproof-s1-fophx-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 51898
+            },
+            {
+              "run": "reproof-s1-fophx-legacy",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 60741
+            }
+          ],
+          "failures": [
+            {
+              "title": "restores Freshopencode turns from DB history when export is truncated",
+              "line": 245,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Persist this Freshopencode DB turn')\nExpected: visible\nError: strict mode violation: getByText('Persist this Freshopencode DB turn') resolved to 3 elements:\n    1) <span class=\"flex-1 min-w-0 whitespace-nowrap truncate text-sm\">Persist this Freshopencode DB turn</span> aka getByTestId('tab-strip').getByLabel('Persist this Freshopencode DB')\n    2) <span title=\"Persist this Freshopencode DB turn\" class=\"pane-header-fresh-agent-detail block min-w-0 truncate\">Persist this Freshopencode DB turn</span> aka getByTitle('Persist this Freshopencode DB')\n    3) <p class=\"whitespace-pre-wrap break-words leading-[inherit]\">Persist this Freshopencode DB turn</p> aka getByLabel('You transcript turn').getByText('Persist this Freshopencode DB')\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 30000ms\u001b[22m\n\u001b[2m  - waiting for getByText('Persist this Freshopencode DB turn')\u001b[22m"
+            },
+            {
+              "title": "does not materialize Freshopencode from DB rows without top-level run sessionID",
+              "line": 324,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoMatchObject\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\n\u001b[1mMatcher error\u001b[22m: \u001b[31mreceived\u001b[39m value must be a non-null object\n\nReceived has value: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate\n\n  354 |       await sendFreshAgentPrompt(page, prompt)\n  355 |\n> 356 |       await expect.poll(async () => {"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "red deterministically in isolation (reproof-s1-fophx-legacy): spec drift vs current UI (strict-mode getByText resolved to 3 elements; expect.poll 30s null). Red identically on rust leg of slice-1 -> not a rust parity gap; pre-existing suite redness on this branch"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 41407,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 41407
+            }
+          ],
+          "failures": [
+            {
+              "title": "restores Freshopencode turns from DB history when export is truncated",
+              "line": 245,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Persist this Freshopencode DB turn')\nExpected: visible\nError: strict mode violation: getByText('Persist this Freshopencode DB turn') resolved to 4 elements:\n    1) <span class=\"text-sm truncate font-medium\">Persist this Freshopencode DB turn</span> aka getByTestId('sidebar-session-list').getByRole('button', { name: 'Persist this Freshopencode DB' })\n    2) <span class=\"flex-1 min-w-0 whitespace-nowrap truncate text-sm\">Persist this Freshopencode DB turn</span> aka getByTestId('tab-strip').getByLabel('Persist this Freshopencode DB')\n    3) <span title=\"Persist this Freshopencode DB turn\" class=\"pane-header-fresh-agent-detail block min-w-0 truncate\">Persist this Freshopencode DB turn</span> aka getByTitle('Persist this Freshopencode DB')\n    4) <p class=\"whitespace-pre-wrap break-words leading-[inherit]\">Persist this Freshopencode DB turn</p> aka getByLabel('You transcript turn').getByText('Persist this Freshopencode DB')\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 30000ms\u001b[22m"
+            },
+            {
+              "title": "does not materialize Freshopencode from DB rows without top-level run sessionID",
+              "line": 324,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoMatchObject\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\n\u001b[1mMatcher error\u001b[22m: \u001b[31mreceived\u001b[39m value must be a non-null object\n\nReceived has value: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate\n\n  354 |       await sendFreshAgentPrompt(page, prompt)\n  355 |\n> 356 |       await expect.poll(async () => {"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical failures as legacy (same assertions); pre-existing spec drift, not rust-specific"
+          }
         }
       }
     },
@@ -681,26 +769,48 @@
       "bucket": "harness",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 26,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 4777,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4777
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 26,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 3507,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 3507
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1261,28 +1371,73 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 63613,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 63613
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 150728,
+          "runs": [
+            "slice-1",
+            "reproof-s1-reconnect-rust"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 3,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 146181
+            },
+            {
+              "run": "reproof-s1-reconnect-rust",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 150728
+            }
+          ],
+          "failures": [
+            {
+              "title": "multiple rapid disconnects handled gracefully",
+              "line": 61,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: locator('.xterm').first()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('.xterm').first()\u001b[22m\n\n"
+            },
+            {
+              "title": "tabs and panes preserved across reconnect",
+              "line": 83,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): isolated rust rerun reproof-s1-reconnect-rust 4p/2f with failure set shifted vs slice-1 (whack-a-mole); Restore dialog present in 2/2 error-contexts"
+          }
         }
       }
     },
@@ -1581,7 +1736,10 @@
               "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): click-intercept by the Restore dialog overlay; victim tests float (slice-0: :4/:16/:52; isolated: :16/:52)"
+          }
         }
       }
     },
@@ -1589,26 +1747,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 84559,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 84559
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 67506,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 67506
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1995,26 +2175,63 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 185,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 0,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 185
+            }
+          ],
+          "failures": [
+            {
+              "title": "a same-named directory in the launch cwd never shadows the real $PATH CLI",
+              "line": 150,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  149 |\n  150 |   test('a same-named directory in the launch cwd never shadows the real $PATH CLI', async ({ page, e2eServerKind }) => {\n> 151 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  152 |\n  153 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-term28-shadow-'))\n  154 |     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')"
+            },
+            {
+              "title": "a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)",
+              "line": 236,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  235 |\n  236 |   test('a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)', async ({ e2eServerKind }) => {\n> 237 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  238 |\n  239 |     // This scenario is driven over a RAW WebSocket connection\n  240 |     // (`terminal.create`), not the browser UI/PanePicker: the picker only"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "fail-by-design guard: expect(e2eServerKind).toBe('rust') at spec lines 151/237; spec asserts the Rust TERM-28 fix and is registered in rust-chromium testMatch; it is ALSO picked up by the match-all chromium lane (missing RUST_ONLY_SPECS entry) -- suite-registration errata, deterministically red on legacy. Not a product gap on either server",
+            "note": "candidate config fix: add to RUST_ONLY_SPECS (left to consolidation to avoid churning the union-hot config mid-campaign)"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 10891,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10891
+            }
+          ],
           "failures": [],
           "attribution": null
         }
