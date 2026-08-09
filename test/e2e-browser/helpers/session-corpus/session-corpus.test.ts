@@ -12,6 +12,8 @@ import {
 import { claudeProjectSlug, writeClaudeSession } from './claude.js'
 import { codexDatePath, writeCodexSession } from './codex.js'
 import { writeOpencodeCorpus, type OpencodeSessionSpec } from './opencode.js'
+import { writeAmplifierSession } from './amplifier.js'
+import { parseAmplifierMetadata } from '../../../../server/coding-cli/providers/amplifier.js'
 import {
   runOpencodeListingQuery,
   THREE_VIEWS_MARKER_SQL_PATTERN,
@@ -407,6 +409,71 @@ describe('session-corpus opencode writer', () => {
     expect(byRole('archived').visibility).toBe('absent')
     expect(byRole('archived').title).toBeUndefined()
     expect(byRole('child').visibility).toBe('absent')
+  })
+})
+
+describe('session-corpus amplifier writer', () => {
+  it('writes metadata.json + sidecars, pins mtimes, floors fractional numeric timestamps', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const cwd = path.join(ctx.workspace, 'projects', 'epsilon-project')
+    const created = Date.parse('2026-07-22T09:00:00.000Z') + 0.5 // fractional numeric
+    const updated = Date.parse('2026-07-22T09:00:02.000Z')
+    const exp = await writeAmplifierSession(ctx, {
+      role: 'epsilon',
+      sessionId: 'h04corpus-testtoken-amp-epsilon',
+      cwd,
+      name: 'h04corpus-testtoken epsilon',
+      description: 'h04corpus-testtoken epsilon summary text',
+      created,
+      descriptionUpdatedAt: updated,
+      firstUserMessage: 'h04corpus-testtoken epsilon request 1',
+      withEventsSidecar: true,
+    })
+
+    const dir = path.join(home, '.amplifier', 'projects', 'epsilon-project',
+      'sessions', 'h04corpus-testtoken-amp-epsilon')
+    const metaRaw = await fsp.readFile(path.join(dir, 'metadata.json'), 'utf-8')
+    // three hashed files
+    expect(ctx.files.map((f) => f.path).sort()).toEqual([
+      '.amplifier/projects/epsilon-project/sessions/h04corpus-testtoken-amp-epsilon/events.jsonl',
+      '.amplifier/projects/epsilon-project/sessions/h04corpus-testtoken-amp-epsilon/metadata.json',
+      '.amplifier/projects/epsilon-project/sessions/h04corpus-testtoken-amp-epsilon/transcript.jsonl',
+    ])
+
+    // the production parser is the reader under test
+    const parsed = parseAmplifierMetadata(metaRaw)
+    expect(parsed).toMatchObject({
+      sessionId: 'h04corpus-testtoken-amp-epsilon',
+      cwd,
+      createdAt: Math.floor(created), // fractional floored
+      lastActivityAt: updated,
+      title: 'h04corpus-testtoken epsilon',
+      titleSource: 'provider-generated',
+      summary: 'h04corpus-testtoken epsilon summary text',
+    })
+
+    // mtimes pinned to the seeded activity instant (recency fold must not
+    // see build-time "now" dominating the seeded timestamps)
+    for (const f of ['metadata.json', 'transcript.jsonl', 'events.jsonl']) {
+      const stat = await fsp.stat(path.join(dir, f))
+      expect(Math.floor(stat.mtimeMs)).toBe(updated)
+    }
+
+    // first user message is transcript-visible
+    const transcript = await fsp.readFile(path.join(dir, 'transcript.jsonl'), 'utf-8')
+    expect(transcript).toContain('"role":"user"')
+    expect(transcript).toContain('h04corpus-testtoken epsilon request 1')
+
+    expect(exp).toMatchObject({
+      provider: 'amplifier',
+      title: 'h04corpus-testtoken epsilon',
+      summary: 'h04corpus-testtoken epsilon summary text',
+      projectPath: cwd,
+      createdAt: Math.floor(created),
+      lastActivityAt: updated,
+      visibility: 'listed',
+    })
   })
 })
 
