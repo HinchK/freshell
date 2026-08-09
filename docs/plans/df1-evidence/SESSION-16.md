@@ -43,10 +43,23 @@ Frozen legacy `server/` indexer behavior at the base SHA:
 
 ## Playwright probe classification (deferred policy: ONE run per leg)
 
-- `legacy-chromium` (control): PENDING
-- `rust-chromium` (target): PENDING
+- `legacy-chromium` (control): **green 2/2, 25.5s** (final run on the corrected seed; an earlier run on the defective seed also passed, 44.8s — legacy's watcher makes the live leg insensitive to the seed defect).
+- `rust-chromium` (target): **green 2/2, 43.0s** (final run on the corrected seed). Two prior runs against the defective seed failed the live-addition leg at the 15s UI timeout; root-cause trail below.
 
-(Updated after the probe runs; outcomes classified `green` / `expected-gap-red` with reasons.)
+### The seed defect and the root-cause trail (fully mechanized, instrumented)
+
+Run 1/2 on `rust-chromium` failed only the live-addition leg with `element(s) not found` at the 15s UI timeout — yet the failure-time page snapshot SHOWED the completed record in the sidebar (it arrived just past the timeout). Instrumentation journey (release binary + isolated home + raw WS/HTTP clients):
+
+1. Direct API probe (no browser): completed record became API-visible **1574ms** after the completing append; `sessions.changed` at **+2426ms**. Server-side delivery healthy.
+2. Corpus bisect + per-tick sweep-signature dump (temporary `eprintln!` in `spawn_sessions_sweep`, reverted after): every tick reported `len=3` **from the first tick** — the "partial" seed was in the index from boot.
+3. Why both could be true: the 2/3-of-bytes cut left the init + first-turn lines COMPLETE (cwd present → indexed) but with ONE user message → `is_non_interactive` → HIDDEN by the default browse projection (`priority=visible`). So the record was indexed-but-invisible: API browse (test 1's negative assertion) correctly excluded it, while the index included it. The completion then changed NEITHER the index count NOR (with a newer codex seed above it) the corpus max-`lastActivityAt`: the sweep signature `(len, maxTs, identityDigest)` never moved → **no `sessions.changed` broadcast** → the broadcast-driven browser never refetched within 15s. Legacy passed the identical spec because its watcher/sync broadcasts on content diffs regardless of projection-visibility classes.
+4. Fix: the seed's cut now lands WITHIN LINE 1 (zero complete lines) — a genuine never-indexed partial; the completing append is a true count+1 index addition → sweep broadcasts → both legs should render live.
+
+**Control for environment attribution (df1 README B002 discipline):** on the same box/branch/load, the July-proven rust live-create test (`session-directory-matrix.spec.ts` "a session written mid-test appears in the sidebar without a reload") was rerun: **green (32.1s)** — the environment is not the differentiator; the seed was.
+
+### Adjacent discovery (documented, out of scope here — belongs to SESSION-09's differ semantics)
+
+The Rust sweep signature `(len, max lastActivityAt, identity digest)` is structurally blind to changes that alter FILTER VISIBILITY without altering the index summary: e.g. a hidden non-interactive session gaining its second user message (becoming visible) with stale timestamps moves neither `len` nor max-`lastActivityAt`, so no broadcast — the browser only converges at the next unrelated broadcast. Legacy's `hasSessionDirectorySnapshotChange` (content/mtime or full comparable diff) broadcasts there. Not hit by the corrected spec (its completion is a true count+1 addition); recorded as campaign-discovered context for SESSION-09's "modified" leg.
 
 ## Green commands (re-runnable at final SHA)
 
