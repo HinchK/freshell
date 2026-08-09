@@ -13,11 +13,25 @@ import { defineConfig, devices } from '@playwright/test'
 const MATRIX_SPECS = [
   /server-restart-recovery\.spec\.ts$/,
   /settings-persistence-split\.spec\.ts$/,
+  // HARNESS-03 — deterministic provider-fixture contract (fixture-only:
+  // boots NO server; both matrix legs run the identical assertions, which is
+  // itself the proof the fixtures are server-kind-independent).
+  /harness-03-provider-fixtures\.spec\.ts$/,
   // CFG-04 — legacy browser-preference seeding (one-shot consume + marker).
   // Authored under the df1 deferred-Playwright policy (worker-authored,
   // close-out-campaign-executed); see docs/plans/df1-evidence/CFG-04.md.
   /cfg04-legacy-browser-seed\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
+  // HARNESS-14 — controllable server clock: advance/freeze/resume/reset the
+  // shared server clock from one serial spec, deterministic fixture-timer
+  // ordering (idle cleanup) with zero wall sleeps, and the normal-build
+  // absence proof. Legacy is a true parity control (identical surface).
+  /harness-14-server-clock\.spec\.ts$/,
+  // HARNESS-04 — multi-provider session corpus builder contract: fixture-only
+  // manifest/hash proof + legacy-open session-directory semantics + sidebar
+  // spot-check. The server leg pins kind:'legacy' under both projects (Rust
+  // indexing of this corpus is owed by later SESSION-* items).
+  /harness-04-session-corpus\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
   // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
   // categories (settings, session, terminal, browser-pane, multi-client).
@@ -89,6 +103,18 @@ const MATRIX_SPECS = [
   // true parity control (same additive page `projectColors` channel on
   // both servers). See project-colors-matrix.spec.ts.
   /project-colors-matrix\.spec\.ts$/,
+  // HARNESS-05 — raw HTTP/WS clients self-verify: deterministic echo/error
+  // fixture legs + capability legs (delayed hello, malformed-frame
+  // termination, slow-consumer pause, raw orchestration REST) against BOTH
+  // server kinds. See docs/plans/df1/HARNESS-05.md.
+  /harness-05-raw-clients\.spec\.ts$/,
+  // HARNESS-06 -- deterministic misc-fixture smoke (HTTP/WS/hot-reload
+  // target, file/SMB trees, fake editor, fake Gemini, fake Kilroy runtime,
+  // signed update feed, trusted HTTPS). Server-kind-agnostic: the spec
+  // requests only Playwright base fixtures (the worker-lazy `testServer`
+  // never boots), so it runs identically under all three projects. See
+  // harness-06-misc-fixtures.spec.ts + docs/plans/df1-evidence/HARNESS-06.md.
+  /harness-06-misc-fixtures\.spec\.ts$/,
   // HARNESS-12 — leak/resource measurement gate: a bounded create/send/close
   // loop + restart + stop must return to a bounded baseline (no listening-port,
   // fd-handle, process, RSS, or socket-queue leaks) on BOTH server kinds; the

@@ -8,6 +8,7 @@ import fs from 'fs'
 import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
+import { testClockEnabled, testClockNowMs } from './test-clock.js'
 import type { ServerSettings } from '../shared/settings.js'
 import type { SessionLocator } from '../shared/ws-protocol.js'
 import {
@@ -1375,16 +1376,19 @@ export class TerminalRegistry extends EventEmitter {
 
   private startIdleMonitor() {
     if (this.idleTimer) clearInterval(this.idleTimer)
+    // HARNESS-14: under the env-gated test clock, sweep at 250ms so tests
+    // observe an advanced clock promptly (production keeps 30s exactly).
+    const sweepMs = testClockEnabled() ? 250 : 30_000
     this.idleTimer = setInterval(() => {
       this.enforceIdleKills().catch((err) => logger.warn({ err }, 'Idle monitor error'))
-    }, 30_000)
+    }, sweepMs)
   }
 
   private startPerfMonitor() {
     if (!perfConfig.enabled) return
     if (this.perfTimer) clearInterval(this.perfTimer)
     this.perfTimer = setInterval(() => {
-      const now = Date.now()
+      const now = testClockNowMs()
       for (const term of this.terminals.values()) {
         if (!term.perf) continue
         if (term.perf.outBytes > 0 || term.perf.droppedMessages > 0) {
@@ -1449,7 +1453,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!settings) return
     const killMinutes = settings.safety.autoKillIdleMinutes
     if (!killMinutes || killMinutes <= 0) return
-    const now = Date.now()
+    const now = testClockNowMs()
 
     for (const term of this.terminals.values()) {
       if (term.status !== 'running') continue
@@ -1496,7 +1500,7 @@ export class TerminalRegistry extends EventEmitter {
       terminalId: record.terminalId,
       mode: record.mode,
       exitCode: exitCode ?? 0,
-      ageMs: Math.max(0, Date.now() - record.createdAt),
+      ageMs: Math.max(0, testClockNowMs() - record.createdAt),
       reason,
       ...(ptyPid ? { ptyPid } : {}),
     })
@@ -1532,7 +1536,7 @@ export class TerminalRegistry extends EventEmitter {
     this.clearCodexInputGate(record)
     record.status = 'exited'
     record.exitCode = event.exitCode
-    const now = Date.now()
+    const now = testClockNowMs()
     record.lastActivityAt = now
     record.exitedAt = now
     cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
@@ -1609,7 +1613,7 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     const terminalId = nanoid()
-    const createdAt = Date.now()
+    const createdAt = testClockNowMs()
     const cols = opts.cols || 120
     const rows = opts.rows || 30
 
@@ -1746,7 +1750,7 @@ export class TerminalRegistry extends EventEmitter {
 
     ptyProc.onData((data) => {
       if (record.pty !== ptyProc) return
-      const now = Date.now()
+      const now = testClockNowMs()
       record.lastActivityAt = now
       record.buffer.append(data)
       observeCodexStartupOutput(record, data)
@@ -1965,7 +1969,7 @@ export class TerminalRegistry extends EventEmitter {
         terminalId: record.terminalId,
         threadId: event.threadId,
         ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
-        at: Date.now(),
+        at: testClockNowMs(),
       } satisfies CodexTurnStartedEvent)
       void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to update Codex turn-start durability state')
@@ -1981,7 +1985,7 @@ export class TerminalRegistry extends EventEmitter {
         threadId: event.threadId,
         ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
         ...(status !== undefined ? { status } : {}),
-        at: Date.now(),
+        at: testClockNowMs(),
       } satisfies CodexTurnCompletedEvent)
       void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to proof Codex rollout after turn completion')
@@ -1995,7 +1999,7 @@ export class TerminalRegistry extends EventEmitter {
         terminalId: record.terminalId,
         ...(event.threadId !== undefined ? { threadId: event.threadId } : {}),
         requestId: event.requestId,
-        at: Date.now(),
+        at: testClockNowMs(),
       } satisfies CodexApprovalRequestedEvent)
     })
     if (approvalRequestedUnsubscribe) unsubscribers.push(approvalRequestedUnsubscribe)
@@ -2005,7 +2009,7 @@ export class TerminalRegistry extends EventEmitter {
       this.emit('codex.approval.resolved', {
         terminalId: record.terminalId,
         requestId: event.requestId,
-        at: Date.now(),
+        at: testClockNowMs(),
       } satisfies CodexApprovalResolvedEvent)
     })
     if (approvalResolvedUnsubscribe) unsubscribers.push(approvalResolvedUnsubscribe)
@@ -2129,7 +2133,7 @@ export class TerminalRegistry extends EventEmitter {
     }
     record.codexForkHandoffPending = {
       state: 'pending',
-      startedAt: Date.now(),
+      startedAt: testClockNowMs(),
     }
   }
 
@@ -2175,7 +2179,7 @@ export class TerminalRegistry extends EventEmitter {
     ) {
       return
     }
-    const startedAt = Date.now()
+    const startedAt = testClockNowMs()
     record.codexForkHandoffPending = {
       state: 'failed',
       startedAt,
@@ -2300,7 +2304,7 @@ export class TerminalRegistry extends EventEmitter {
     logger.info({ terminalId, reason }, 'Deleted Codex durability store record')
   }
 
-  private async writeCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
+  private async writeCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = testClockNowMs()): Promise<CodexDurabilityRef> {
     const stored = await this.codexDurabilityStore.write({
       ...durability,
       terminalId: record.terminalId,
@@ -2314,7 +2318,7 @@ export class TerminalRegistry extends EventEmitter {
     return storedDurability
   }
 
-  private async writeCodexForkCommitDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
+  private async writeCodexForkCommitDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = testClockNowMs()): Promise<CodexDurabilityRef> {
     const stored = await this.codexDurabilityStore.writeReplacingCandidate({
       ...durability,
       terminalId: record.terminalId,
@@ -2330,7 +2334,7 @@ export class TerminalRegistry extends EventEmitter {
   private buildCodexDurabilityStoreRecord(
     record: TerminalRecord,
     durability: CodexDurabilityRef,
-    updatedAt = Date.now(),
+    updatedAt = testClockNowMs(),
   ): CodexDurabilityStoreRecord {
     return {
       ...durability,
@@ -2378,7 +2382,7 @@ export class TerminalRegistry extends EventEmitter {
   private async writeCodexDurabilityForRunningRecord(
     record: TerminalRecord,
     durability: CodexDurabilityRef,
-    updatedAt = Date.now(),
+    updatedAt = testClockNowMs(),
   ): Promise<CodexDurabilityRef | undefined> {
     if (!this.isCurrentRunningTerminalRecord(record)) return undefined
     const stored = await this.writeCodexDurability(record, durability, updatedAt)
@@ -2400,7 +2404,7 @@ export class TerminalRegistry extends EventEmitter {
     return undefined
   }
 
-  private async replaceCodexDurabilityStoreRecord(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
+  private async replaceCodexDurabilityStoreRecord(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = testClockNowMs()): Promise<CodexDurabilityRef> {
     await this.codexDurabilityStore.delete(record.terminalId)
     return this.writeCodexDurability(record, durability, updatedAt)
   }
@@ -2496,7 +2500,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!record || record.status !== 'running') return
     if (record.mode !== 'codex') return
 
-    const capturedAt = Date.now()
+    const capturedAt = testClockNowMs()
     if (candidate.source === 'thread_fork_response') {
       await this.stageCodexForkHandoffCandidate(record, candidate, capturedAt)
       return
@@ -2664,7 +2668,7 @@ export class TerminalRegistry extends EventEmitter {
       record.codexUnconfirmedInputSource = undefined
     }
     if (this.isCodexForkThread(record, event.threadId)) {
-      const completedAt = Date.now()
+      const completedAt = testClockNowMs()
       const handoff = record.codexForkHandoff!
       handoff.state = 'fork_proof_checking'
       handoff.turnCompletedAt = completedAt
@@ -2679,7 +2683,7 @@ export class TerminalRegistry extends EventEmitter {
     }
     if (!record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
 
-    const completedAt = Date.now()
+    const completedAt = testClockNowMs()
     const durability: CodexDurabilityRef = {
       ...record.codexDurability,
       state: 'proof_checking',
@@ -2911,14 +2915,14 @@ export class TerminalRegistry extends EventEmitter {
     if (handoff.turnCompletedAt === undefined) return
     const candidate = handoff.candidate
     handoff.state = 'fork_proof_checking'
-    handoff.proofStartedAt = Date.now()
+    handoff.proofStartedAt = testClockNowMs()
 
     const proof = await proofCodexRollout({
       rolloutPath: candidate.rolloutPath,
       candidateThreadId: candidate.candidateThreadId,
     })
     if (!this.isCurrentRunningTerminalRecord(record) || record.codexForkHandoff !== handoff) return
-    const checkedAt = Date.now()
+    const checkedAt = testClockNowMs()
     if (proof.ok) {
       await this.commitCodexForkHandoff(record, handoff, proof.rolloutProofId, checkedAt, trigger)
       return
@@ -2968,7 +2972,7 @@ export class TerminalRegistry extends EventEmitter {
       candidateThreadId: candidate.candidateThreadId,
     })
     if (!this.isCurrentRunningTerminalRecord(record)) return
-    const checkedAt = Date.now()
+    const checkedAt = testClockNowMs()
     if (proof.ok) {
       const bound = this.bindSession(terminalId, 'codex', proof.rolloutProofId, 'association')
       if (!bound.ok) {
@@ -3046,7 +3050,7 @@ export class TerminalRegistry extends EventEmitter {
   async promoteCodexDurabilityFromCreateProof(
     terminalId: string,
     durableThreadId: string,
-    checkedAt = Date.now(),
+    checkedAt = testClockNowMs(),
   ): Promise<BindSessionResult> {
     const record = this.terminals.get(terminalId)
     if (!record) return { ok: false, reason: 'terminal_missing' }
@@ -3453,7 +3457,7 @@ export class TerminalRegistry extends EventEmitter {
   private async waitForRecentCodexInputVisibility(record: TerminalRecord): Promise<{ turn?: CodexTurnEvent; reliable: boolean }> {
     if (record.codexUnconfirmedInputAt === undefined) return { reliable: true }
     if (!record.codexSidecar?.listThreadTurns) return { reliable: true }
-    const elapsedMs = Date.now() - record.codexUnconfirmedInputAt
+    const elapsedMs = testClockNowMs() - record.codexUnconfirmedInputAt
     const remainingMs = CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS - elapsedMs
     if (remainingMs <= 0) return { reliable: record.codexUnconfirmedInputSource !== 'input' }
 
@@ -3724,7 +3728,7 @@ export class TerminalRegistry extends EventEmitter {
       this.emit('terminal.stream.replaced', {
         terminalId: record.terminalId,
         reason: 'codex_pty_recovery',
-        at: Date.now(),
+        at: testClockNowMs(),
       })
       record.mcpCwd = candidate.mcpCwd
       record.codexSidecar = plan.sidecar
@@ -3820,7 +3824,7 @@ export class TerminalRegistry extends EventEmitter {
   ): void {
     ptyProc.onData((data) => {
       if (record.pty !== ptyProc || record.status !== 'running') return
-      const now = Date.now()
+      const now = testClockNowMs()
       record.lastActivityAt = now
       record.buffer.append(data)
       observeCodexStartupOutput(record, data)
@@ -3982,7 +3986,7 @@ export class TerminalRegistry extends EventEmitter {
     data: string,
     options: { markCodexUnconfirmedInput?: boolean } = {},
   ): void {
-    const now = Date.now()
+    const now = testClockNowMs()
     record.lastActivityAt = now
     if (record.perf) {
       record.perf.inBytes += data.length
@@ -4124,7 +4128,7 @@ export class TerminalRegistry extends EventEmitter {
     }
     term.status = 'exited'
     term.exitCode = term.exitCode ?? 0
-    const now = Date.now()
+    const now = testClockNowMs()
     term.lastActivityAt = now
     term.exitedAt = now
     for (const client of term.clients) {

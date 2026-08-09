@@ -107,11 +107,13 @@ impl CreateRateLimiter {
 }
 
 /// Wall-clock epoch milliseconds for limiter stamping.
+///
+/// HARNESS-14: routed through the shared, env-gated test clock
+/// (`freshell_platform::clock`; gate-off identity passthrough), so a
+/// `FRESHELL_TEST_CLOCK=1` test boot can advance past the create-rate
+/// window without wall-clock sleeps.
 pub fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    freshell_platform::clock::now_ms().max(0) as u64
 }
 
 #[cfg(test)]

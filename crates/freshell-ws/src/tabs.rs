@@ -28,7 +28,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -547,10 +546,11 @@ fn touch_device(state: &mut State, device_id: &str, now: i64) {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    // HARNESS-14: routed through the shared, env-gated test clock
+    // (`freshell_platform::clock`; gate-off identity passthrough), so the
+    // 7-day device-display TTL cutoff and the push-time `capturedAt`
+    // retention stamps all follow the one clock a spec controls.
+    freshell_platform::clock::now_ms()
 }
 
 /// Extract the `records` array from a `tabs.sync.push` envelope (empty if absent).

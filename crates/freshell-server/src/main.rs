@@ -48,6 +48,9 @@ mod settings_store;
 mod shutdown_forensics;
 mod tabs_snapshots;
 mod terminals;
+#[cfg(test)]
+pub(crate) mod test_clock_gate;
+mod test_clock_router;
 mod updater;
 
 use std::net::IpAddr;
@@ -350,7 +353,16 @@ async fn main() -> ExitCode {
     // or lowered it from the default had no effect). See
     // `freshell_ws::spawn_idle_monitor` for the periodic sweep this feeds.
     registry.set_auto_kill_idle_minutes(settings.safety.auto_kill_idle_minutes);
-    freshell_ws::spawn_idle_monitor(registry.clone(), std::time::Duration::from_secs(30));
+    // HARNESS-14: under the env-gated test clock the sweep cadence shrinks
+    // to 250ms so tests observe an advanced clock promptly (the sweep still
+    // ticks on real time; only the threshold math follows the virtual one).
+    // Production (gate off) keeps the legacy 30s cadence exactly.
+    let idle_sweep_interval = if freshell_platform::clock::enabled() {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_secs(30)
+    };
+    freshell_ws::spawn_idle_monitor(registry.clone(), idle_sweep_interval);
     // e2e knob (kata znhn item 2): sub-second flap cycles would trip the
     // registry generation cap (3 per 30s liveness window) before the hub's
     // circuit breaker can ever fire. Production default unchanged.
@@ -1196,7 +1208,7 @@ async fn main() -> ExitCode {
     // derivation of these defaults and the deliberate global-vs-per-IP scope
     // decision).
     let rate_limiter =
-        rate_limit::RateLimiter::new_system(rate_limit::RateLimitConfig::default_api());
+        rate_limit::RateLimiter::new_gate_aware(rate_limit::RateLimitConfig::default_api());
 
     // DIAG-05: `/api/server-info`, `/api/debug`, `/api/perf` -- shares the
     // live settings store, terminal registry, tabs registry, and session
@@ -1384,6 +1396,15 @@ async fn main() -> ExitCode {
         .merge(terminals::router(terminals_state))
         .merge(proxy::router(proxy_state))
         .merge(screenshots::router(screenshots_state))
+        // HARNESS-14: the test-clock control surface exists ONLY when
+        // `FRESHELL_TEST_CLOCK` enabled the clock at boot (and its handlers
+        // re-check the gate, so even a misplaced merge could never expose
+        // it). A normal build answers 404 like any unmatched `/api/*`.
+        .merge(test_clock_router::router(
+            test_clock_router::TestClockState {
+                auth_token: Arc::clone(&auth_token),
+            },
+        ))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
             move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
