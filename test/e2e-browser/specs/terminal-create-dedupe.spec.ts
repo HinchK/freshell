@@ -171,6 +171,13 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     asking.hello(info.token)
     await asking.nextJsonMessage('ready', 10_000)
     asking.sendJson(plainCreateFrame(requestId, cwdDir))
+    // Prove the first create WAS processed server-side (spawn begun) before
+    // the connection dies — otherwise the resend below would be a fresh
+    // create and the test would pass without exercising dedupe at all.
+    await waitForLedgerRows(ledgerPath, 1)
+    // NOW kill the asker: the terminal.created reply is either already on
+    // the wire to a socket that never reads it, or not yet sent — exactly
+    // the intercepted/delayed-then-lost response shape.
     asking.abort()
     await asking.dispose()
 
@@ -202,23 +209,27 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
   test('B: two clients issue the same create concurrently — both answered, one PTY', async () => {
     const requestId = `term04-b-${Date.now()}`
 
+    // Sequential connect+hello+ready per client: RawWsClient.nextJsonMessage
+    // deliberately matches only frames received AFTER the call (HARNESS-05's
+    // R2 anti-stale rule), so interleaving hello/ready across the two clients
+    // would permanently miss the first client's ready frame.
     const c1 = await RawWsClient.connect(info.wsUrl)
-    const c2 = await RawWsClient.connect(info.wsUrl)
     c1.hello(info.token)
-    c2.hello(info.token)
     await c1.nextJsonMessage('ready', 10_000)
+    const c2 = await RawWsClient.connect(info.wsUrl)
+    c2.hello(info.token)
     await c2.nextJsonMessage('ready', 10_000)
 
     // Back-to-back: deliberately unawaited pair — whichever window the first
     // create is in (in-flight waiter vs settled replay), the contract is
-    // "both answered with the same terminalId, one spawn".
+    // "both answered with the same terminalId, one spawn". The reply waiters
+    // attach in the same synchronous block as the sends (no event-loop yield
+    // between, so no reply frame can be missed under the R2 rule).
     c1.sendJson(plainCreateFrame(requestId, cwdDir))
+    const created1 = c1.nextJsonMessage<any>('terminal.created', 15_000)
     c2.sendJson(plainCreateFrame(requestId, cwdDir))
-
-    const [r1, r2] = await Promise.all([
-      c1.nextJsonMessage<any>('terminal.created', 15_000),
-      c2.nextJsonMessage<any>('terminal.created', 15_000),
-    ])
+    const created2 = c2.nextJsonMessage<any>('terminal.created', 15_000)
+    const [r1, r2] = await Promise.all([created1, created2])
     expect(r1.requestId).toBe(requestId)
     expect(r2.requestId).toBe(requestId)
     expect(r2.terminalId).toBe(r1.terminalId)
