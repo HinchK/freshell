@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "2efdb61cd0e00a716e9b91d1fd12ed8f0bc4ad3e",
+  "head": "b47d515160c947ffa9b780d4a47210ce6626094e",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -687,27 +687,71 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
+          "durationMs": 42309,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42309
+            }
+          ],
+          "failures": [
+            {
+              "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+              "line": 402,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m422\u001b[39m\nReceived: \u001b[31m500\u001b[39m\n\n  418 |\n  419 |     const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')\n> 420 |     expect(capture.status).toBe(422)\n      |                            ^\n  421 |     expect(await capture.json()).toMatchObject({\n  422 |       status: 'error',\n  423 |       message: expect.stringContaining('pane kind \"fresh-agent\"'),"
+            },
+            {
+              "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+              "line": 448,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Fresh agent')\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByText('Fresh agent')\u001b[22m\n\n"
+            }
+          ],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
+          "durationMs": 91534,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 91534
+            }
+          ],
+          "failures": [
+            {
+              "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+              "line": 402,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32mArrayContaining [ObjectContaining {\"id\": \"pane-legacy-agent\", \"kind\": \"fresh-agent\"}]\u001b[39m\nReceived: \u001b[31m[]\u001b[39m\n\nCall Log:\n- Timeout 10000ms exceeded while waiting on the predicate\n\n  406 |     await sendLegacyLayoutSync(page)\n  407 |\n> 408 |     await expect.poll(async () => {\n      |     ^"
+            },
+            {
+              "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+              "line": 448,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: not \u001b[32m404\u001b[39m\n\n  468 |\n  469 |     const modelCapabilities = await fetchWithAuth(serverInfo, '/api/fresh-agent/model-capabilities/freshclaude')\n> 470 |     expect(modelCapabilities.status).not.toBe(404)\n      |                                          ^\n  471 |     const thread = await fetchWithAuth(serverInfo, `/api/fresh-agent/threads/freshclaude/claude/${CANONICAL_CLAUDE_SESSION_ID}`)\n  472 |     expect(thread.headers.get('content-type')).toContain('application/json')\n  473 |     if (thread.status === 404) {\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:470:42"
+            }
+          ],
           "attribution": null
         }
       }
@@ -884,26 +928,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 5369,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5369
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 4780,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4780
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2047,26 +2113,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 8439,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8439
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 8601,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8601
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2470,26 +2558,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 46124,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 46124
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 26857,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 26857
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2729,28 +2839,59 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 7,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 67121,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 7,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 67121
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 190562,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 6,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 190562
+            }
+          ],
+          "failures": [
+            {
+              "title": "typing into the sidebar search box filters the session list to matching titles only",
+              "line": 617,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy 7/7 green"
+          }
         }
       }
     },
@@ -2889,28 +3030,72 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "skip-all",
           "passed": 0,
           "failed": 0,
-          "skipped": 0,
+          "skipped": 2,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 283,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 2,
+              "expectedFail": 0,
+              "durationMs": 283
+            }
+          ],
           "failures": [],
-          "attribution": null
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "by-design: codex leg test.fixme (frozen server/) + amplifier leg test.skip KNOWN DIVERGENCE (no legacy amplifier provider) -- both documented in-spec"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 36562,
+          "runs": [
+            "slice-7",
+            "reproof-s7-sideclick"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36718
+            },
+            {
+              "run": "reproof-s7-sideclick",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36562
+            }
+          ],
+          "failures": [
+            {
+              "title": "clicking a seeded Codex session in the sidebar spawns it via `codex resume <id>`",
+              "line": 117,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBeNull\u001b[2m()\u001b[22m\n\nReceived: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  242 |         // rather than reading `getPaneLayout` a single time immediately after\n  243 |         // the (possibly-just-a-placeholder) `.xterm` container appears.\n> 244 |         const terminalId: string = await expect.poll(async () => {\n      |                                    ^\n  245 |           return (await harness.getPaneLayout(newTabId!))?.content?.terminalId ?? null"
+            }
+          ],
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-22",
+            "note": "deterministic rust red incl reproof-s7-sideclick (codex leg terminalId null 20s); amplifier leg green on rust; pinned in-spec TERM-22; same family as codex-terminal-bounce"
+          }
         }
       }
     },
@@ -3128,28 +3313,79 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 11,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 99942,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 11,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 99942
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 5,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 367143,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 6,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 367143
+            }
+          ],
+          "failures": [
+            {
+              "title": "clicking tab switches to it",
+              "line": 46,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "close tab removes it",
+              "line": 61,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "restored top tabs stay hot across page reload and still switch without replay",
+              "line": 111,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "tab overflow shows scroll controls",
+              "line": 172,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "Ctrl+Shift+brackets follow reordered tab order from a focused terminal",
+              "line": 219,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 5/5 ctx dialog; legacy 11/11 green"
+          }
         }
       }
     },
