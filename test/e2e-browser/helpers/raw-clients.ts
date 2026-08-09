@@ -77,7 +77,13 @@ export interface SentFrameRecord {
   payloadBytes: number
   /** Total bytes placed on the wire for this frame (header + key + payload). */
   wireBytes: number
+  /** WIRE TRUTH: the MASK bit as transmitted. */
   masked: boolean
+  /** WIRE TRUTH: whether masking-key bytes followed the header. False only
+   *  for the deliberate `omitMaskKey` malformation (MASK bit set, no key). */
+  maskKeyPresent: boolean
+  /** For CLOSE frames with a 2+ byte payload: the transmitted close code. */
+  closeCode?: number
   at: number
 }
 
@@ -110,7 +116,7 @@ export class RawWsHandshakeError extends Error {
   readonly bodyPrefix: string
 
   constructor(status: number, statusMessage: string, headers: Record<string, string>, bodyPrefix: string) {
-    super(`RawWsClient: handshake rejected with HTTP ${status} ${statusMessage}`)
+    super(`RawWsClient: handshake rejected with HTTP ${status} ${statusMessage}${bodyPrefix ? ` (${bodyPrefix})` : ''}`)
     this.name = 'RawWsHandshakeError'
     this.status = status
     this.headers = headers
@@ -122,9 +128,8 @@ export interface RawWsClientOptions {
   /** Extra handshake headers (e.g. `Origin`). Case-insensitively REPLACE the
    *  computed defaults (`Host`, `Upgrade`, `Connection`,
    *  `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) when the same name is
-   *  supplied — a raw client means what it says. (Replacing
-   *  Sec-WebSocket-Key makes `validateAccept` fail against honest servers,
-   *  by design.) */
+   *  supplied — a raw client means what it says. A replaced
+   *  `Sec-WebSocket-Key` IS what `validateAccept` then checks against. */
   headers?: Record<string, string>
   /** Verify the Sec-WebSocket-Accept digest (default true). */
   validateAccept?: boolean
@@ -191,9 +196,22 @@ function encodeFrame(options: RawFrameOptions): { wire: Buffer; record: Omit<Sen
       fin, rsv1, rsv2, rsv3, opcode,
       payloadBytes: payload.length,
       wireBytes: wire.length,
-      masked: useMask && !omitMaskKey,
+      masked: useMask,
+      maskKeyPresent: useMask && !omitMaskKey,
+      ...(opcode === WS_OPCODE.CLOSE && payload.length >= 2
+        ? { closeCode: payload.readUInt16BE(0) }
+        : {}),
     },
   }
+}
+
+/**
+ * RFC 6455 §7.4 close codes that may be TRANSMITTED: 1000-1003, 1007-1014,
+ * or the 3000-4999 application range (mirrors the `ws` receiver's validity
+ * set; 1004/1005/1006/1015/1016+ and <1000 must never go on the wire).
+ */
+function isTransmittableCloseCode(code: number): boolean {
+  return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)
 }
 
 interface ParsedHandshake {
@@ -291,9 +309,7 @@ export class RawWsClient {
     const key = crypto.randomBytes(16).toString('base64')
     // Case-insensitive replace semantics (round-2 review): caller headers
     // REPLACE computed defaults with the same name instead of duplicating
-    // them. `key` stays the expected-accept verifier value regardless of a
-    // caller-supplied Sec-WebSocket-Key — which will then fail validation
-    // against honest servers (as documented on RawWsClientOptions.headers).
+    // them.
     const mergedHeaders = new Map<string, [string, string]>()
     const setHeader = (name: string, value: string) => {
       mergedHeaders.set(name.toLowerCase(), [name, value])
@@ -322,8 +338,21 @@ export class RawWsClient {
 
     const { record } = parsed
     if (record.status === 101) {
+      // RFC 6455 §4.2.2: a valid upgrade MUST carry Upgrade: websocket and
+      // Connection: Upgrade — a bare "101" with no upgrade semantics is not
+      // a WebSocket handshake, no matter how the status line reads.
+      const upgradeOk = (record.headers['upgrade'] ?? '').toLowerCase().includes('websocket')
+      const connectionOk = (record.headers['connection'] ?? '').toLowerCase().includes('upgrade')
+      if (!upgradeOk || !connectionOk) {
+        socket.destroy()
+        throw new RawWsHandshakeError(record.status, record.statusMessage, record.headers,
+          `101 response missing required Upgrade: websocket / Connection: Upgrade headers`)
+      }
       if (options.validateAccept !== false) {
-        const expected = sha1Base64(key + WS_ACCEPT_GUID)
+        // R9 (round-3 review): validate against the key ACTUALLY SENT — a
+        // caller-supplied Sec-WebSocket-Key replaced the computed default.
+        const effectiveKey = mergedHeaders.get('sec-websocket-key')![1]
+        const expected = sha1Base64(effectiveKey + WS_ACCEPT_GUID)
         if (record.headers['sec-websocket-accept'] !== expected) {
           socket.destroy()
           throw new RawWsHandshakeError(record.status, record.statusMessage, record.headers,
@@ -665,10 +694,16 @@ export class RawWsClient {
       this._peerClose = { code, reason, at: frame.at }
       if (this.options.autoReplyClose && !this._sentClose && !this._destroyed) {
         try {
-          if (hasCode) {
+          if (!hasCode) {
+            this.sendFrame({ opcode: WS_OPCODE.CLOSE, payload: Buffer.alloc(0) })
+          } else if (isTransmittableCloseCode(code)) {
             this.sendClose(code)
           } else {
-            this.sendFrame({ opcode: WS_OPCODE.CLOSE, payload: Buffer.alloc(0) })
+            // NEVER echo a reserved/invalid code onto the wire (R10): mirror
+            // the ws/tungstenite reference behavior of answering with a
+            // protocol error. Deliberate malformed sends remain available
+            // via explicit sendClose(...)/sendFrame(...) calls.
+            this.sendClose(1002)
           }
         } catch {
           // peer may already have ended the socket; close-reply is best-effort

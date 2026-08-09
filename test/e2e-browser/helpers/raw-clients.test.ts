@@ -651,3 +651,122 @@ describe('RawWsClient — review-round-2 fixes', () => {
     }
   })
 })
+
+describe('RawWsClient — review-round-3 fixes', () => {
+  const clients: RawWsClient[] = []
+  let fixture: EchoWsFixture | undefined
+
+  afterEach(async () => {
+    while (clients.length) await clients.pop()!.dispose()
+    if (fixture) {
+      await fixture.stop()
+      fixture = undefined
+    }
+  })
+
+  /** Bare hand-rolled WS server for wire-level cases the `ws` fixture cannot produce. */
+  async function rawServer(
+    handler: (sock: import('node:net').Socket, requestHead: string) => void,
+  ): Promise<{ port: number; close: () => void }> {
+    const net = await import('node:net')
+    const server = net.createServer((sock) => {
+      let head = ''
+      const onData = (chunk: Buffer) => {
+        head += chunk.toString('latin1')
+        if (head.includes('\r\n\r\n')) {
+          sock.off('data', onData)
+          handler(sock, head)
+        }
+      }
+      sock.on('data', onData)
+      sock.on('error', () => {})
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    return { port: (server.address() as import('node:net').AddressInfo).port, close: () => server.close() }
+  }
+
+  it('R9: a caller-supplied Sec-WebSocket-Key is validated against the key ACTUALLY SENT', async () => {
+    // RFC 6455 §1.3 vector: key dGhlIHNhbXBsZSBub25jZQ== -> accept s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+    const srv = await rawServer((sock, head) => {
+      const key = head.match(/Sec-WebSocket-Key: (.+)\r\n/)![1]
+      expect(key).toBe('dGhlIHNhbXBsZSBub25jZQ==')
+      sock.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+        + 'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n',
+      )
+      sock.on('data', () => {})
+    })
+    try {
+      const client = await RawWsClient.connect(`ws://127.0.0.1:${srv.port}/`, {
+        headers: { 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' },
+      })
+      clients.push(client)
+      expect(client.handshake.status).toBe(101)
+    } finally {
+      srv.close()
+    }
+  })
+
+  it('R9b: a 101 response missing required Upgrade/Connection headers is rejected', async () => {
+    const crypto = await import('node:crypto')
+    const srv = await rawServer((sock, head) => {
+      const key = head.match(/Sec-WebSocket-Key: (.+)\r\n/)![1]
+      const accept = crypto.createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+      // Malformed 101: correct accept digest, but NO Upgrade/Connection headers.
+      sock.write(`HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      sock.on('data', () => {})
+    })
+    try {
+      await expect(RawWsClient.connect(`ws://127.0.0.1:${srv.port}/`)).rejects.toThrow(/Upgrade/)
+    } finally {
+      srv.close()
+    }
+  })
+
+  it('R10: a peer close frame carrying reserved code 1005 is recorded but NEVER echoed on the wire', async () => {
+    let repliedCloseWireCode: number | null = null
+    const srv = await rawServer((sock) => {
+      sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: invalid-on-purpose\r\n\r\n')
+      // Close frame with the INVALID (reserved) code 1005 (0x03ED).
+      sock.write(Buffer.from([0x88, 0x02, 0x03, 0xed]))
+      sock.on('data', (chunk: Buffer) => {
+        // Parse the client's (masked) close reply at the WIRE level.
+        if (chunk.length < 6 || (chunk[0]! & 0x0f) !== 0x8) return
+        const len = chunk[1]! & 0x7f
+        const key = chunk.subarray(2, 6)
+        if (chunk.length < 6 + len || len < 2) return
+        const codeBytes = [chunk[6]! ^ key[0]!, chunk[7]! ^ key[1]!]
+        repliedCloseWireCode = (codeBytes[0]! << 8) | codeBytes[1]!
+      })
+    })
+    try {
+      const client = await RawWsClient.connect(`ws://127.0.0.1:${srv.port}/`, { validateAccept: false })
+      clients.push(client)
+      await client.waitForTerminalEvent(5000)
+      expect(client.peerClose!.code).toBe(1005) // recorded (sentinel semantics)
+      // The auto-reply must not transmit 1005. Reference clients/servers
+      // (ws, tungstenite) answer an invalid close code with 1002.
+      await expect.poll(() => repliedCloseWireCode, { timeout: 2000 }).not.toBeNull()
+      expect(repliedCloseWireCode).toBe(1002)
+      // ...and the sent ledger exposes the transmitted close code directly.
+      const reply = client.sentFrames.find((f) => f.opcode === WS_OPCODE.CLOSE)
+      expect(reply!.closeCode).toBe(1002)
+    } finally {
+      srv.close()
+    }
+  })
+
+  it('R11: the sent-ledger mask bit is WIRE-truth (omitMaskKey => masked bit set, key absent)', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await RawWsClient.connect(fixture.wsUrl)
+    clients.push(client)
+    const sent = client.sendFrame({ opcode: WS_OPCODE.TEXT, payload: 'x', mask: true, omitMaskKey: true })
+    expect(sent.masked).toBe(true)          // MASK bit IS on the wire (that's the malformation)
+    expect(sent.maskKeyPresent).toBe(false) // ...but no key bytes were written
+    // NOTE: no terminal-event assertion here. MASK-set-with-no-key
+    // desynchronizes the fixture's parser into consuming our payload as the
+    // key and then waiting for the promised payload byte -- a legitimate
+    // stall pattern this knob exists to create, not an immediate 1002.
+  })
+})

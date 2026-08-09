@@ -37,7 +37,7 @@ load-bearing audit ledger, all rows VERIFIED).
   ledger (open/close/code/reason/frames/errors); never sends unprompted
   frames; per-connection `error` handlers so intentionally-malformed clients
   never crash the process (load-bearing probe lesson).
-- `test/e2e-browser/helpers/raw-clients.test.ts` — 28 unit/integration
+- `test/e2e-browser/helpers/raw-clients.test.ts` — 39 unit/integration
   tests of helper + fixture (runs under `test/e2e-browser/vitest.config.ts`,
   the dedicated E2E-helper vitest config).
 - `test/e2e-browser/specs/harness-05-raw-clients.spec.ts` — committed probe
@@ -117,6 +117,23 @@ diff at 85534f268): verdict FAILED, 2 majors + 2 minors. Dispositions:
 Final verification at HEAD (post-round-2): unit **35/35**; typecheck gate
 **PASS**; legacy-chromium **10 passed (18.3s)** + **10 passed (16.9s)**;
 rust-chromium **10 passed (30.7s)** + **10 passed (18.1s)** — 2 consecutive
+green per leg at the final SHA.
+
+**Round 3** — independent fresheyes review (GPT family, FRESHPID 480597,
+diff at d22e78a..): verdict FAILED, 3 majors + 1 minor + 1 nit.
+Dispositions (all RED-first):
+
+| # | Finding | Disposition |
+|---|---------|-------------|
+| R9 | caller-replaced `Sec-WebSocket-Key` was still validated against the discarded RANDOM key → honest servers spuriously rejected | FIXED: expected digest computed from the effective merged wire key; RFC 6455 §1.3 vector regression test (RED→green). |
+| R9b | 101 path validated only `Sec-WebSocket-Accept`, not required `Upgrade`/`Connection` response headers | FIXED: RFC 6455 §4.2.2 header validation; rejection detail now included in `RawWsHandshakeError.message`; regression test (RED→green). |
+| R10 | auto close-reply could still transmit reserved 1005 when the PEER's close frame itself carried 1005 | FIXED: auto-reply echoes only transmittable codes (RFC 6455 §7.4 / ws receiver set), else answers 1002 (ws/tungstenite reference behavior); deliberate malformed sends remain possible via explicit `sendClose`/`sendFrame`. Wire-level regression test parses the actual reply bytes (RED→green). `SentFrameRecord.closeCode` added so ledgers expose transmitted close codes. |
+| R11 | `SentFrameRecord.masked` lied for `omitMaskKey` (recorded false while the MASK bit went on the wire) | FIXED: `masked`/`maskKeyPresent` are wire-truth (bit vs key bytes); regression test; the omit-key malformation's honest peer behavior (parser desync → stall, not 1002) documented in the test. |
+| nit | evidence said "28 tests" (now 39) | FIXED above. |
+
+Final verification at HEAD (post-round-3): unit **39/39**; typecheck gate
+**PASS**; legacy-chromium **10 passed (16.1s)** + **10 passed (16.9s)**;
+rust-chromium **10 passed (31.9s)** + **10 passed (17.4s)** — 2 consecutive
 green per leg at the final SHA.
 
 ## Per-leg recorded observations (HARNESS-05-LEG lines)
