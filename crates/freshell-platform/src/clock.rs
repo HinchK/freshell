@@ -201,19 +201,28 @@ pub fn now_ms() -> i64 {
     CORE.lock().expect("test clock poisoned").effective_now(real)
 }
 
-/// Current clock state. Honest gate-off answer: `enabled: false`,
-/// wall-clock `now_ms`, zero offset, live.
+/// Current clock state. The gate-off answer is deliberately INERT (live,
+/// zero offset, wall-clock now) so disabled-state callers can never observe
+/// leftover virtual state.
 pub fn snapshot() -> ClockSnapshot {
     let real = system_now_ms();
     let core = *CORE.lock().expect("test clock poisoned");
+    if !enabled() {
+        return ClockSnapshot {
+            enabled: false,
+            mode: ClockMode::Live,
+            now_ms: real,
+            offset_ms: 0,
+        };
+    }
     ClockSnapshot {
-        enabled: enabled(),
+        enabled: true,
         mode: if core.frozen_at.is_some() {
             ClockMode::Frozen
         } else {
             ClockMode::Live
         },
-        now_ms: if enabled() { core.effective_now(real) } else { real },
+        now_ms: core.effective_now(real),
         offset_ms: core.offset_ms,
     }
 }
