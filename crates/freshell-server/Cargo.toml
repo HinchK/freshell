@@ -22,6 +22,9 @@ path = "src/main.rs"
 freshell-protocol = { path = "../freshell-protocol" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
+# The STRICT extension-manifest schema (df1 EXT-01) — the scan path validates
+# every freshell.json against it (lenient subset removed).
+freshell-extensions = { path = "../freshell-extensions" }
 # The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.
 freshell-freshagent = { path = "../freshell-freshagent" }
 # DEV-0006 S4 inc.2: the codex managed-launch lifecycle manager — main.rs calls its

@@ -1,18 +1,24 @@
-//! Extension registry + coding-CLI availability detection (Follow-up 3.19).
+//! Extension registry + coding-CLI availability detection (Follow-up 3.19;
+//! STRICT schema port: df1 EXT-01).
 //!
 //! **FAITHFUL-PORT + unit-proven, NOT differential-oracle-proven.** There is no
 //! captured original transcript for these boot reads; correctness is argued by a
 //! faithful port with file:line citations, a response-SHAPE match to the frozen
 //! client contract, and the unit tests below (+ curl smokes in the report).
+//! (The manifest schema itself IS differential-oracle-proven — see below.)
 //!
 //! Ports, additively (no `server/` or `shared/` source touched):
 //! * `server/extension-manager.ts` `scan()` (62-131) and `toClientRegistry()`
 //!   (144-191) — discover `freshell.json` manifests under the extension dirs and
 //!   serialize the client registry the SPA fetches at `GET /api/extensions`
 //!   (`src/hooks/useEnsureExtensionsRegistry.ts`).
-//! * `server/extension-manifest.ts` (81-103) — the manifest schema subset used by
-//!   the registry + CLI detection (lenient: unknown keys ignored rather than the
-//!   original's strict reject, since the bundled manifests are trusted).
+//! * `server/extension-manifest.ts` — the manifest schema. Since EXT-01 the
+//!   FULL STRICT schema (strict unknown-key rejection, category↔block refine,
+//!   defaults, JS-safe-int timeouts, per-field capability validation) lives in
+//!   the `freshell-extensions` crate, pinned by a generated differential
+//!   oracle against the unmodified legacy zod schema
+//!   (`crates/freshell-extensions/fixtures/manifest-oracle.json`). This module
+//!   consumes it; the old lenient subset is gone.
 //! * `server/platform.ts` `detectAvailableClis()` (107-118),
 //!   `DEFAULT_CLI_DETECTION_SPECS` (97-103), `isCommandAvailable()` (84-91) — run
 //!   `which`/`where.exe` per CLI (env-var override) to populate the
@@ -27,82 +33,22 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use freshell_extensions::{parse_manifest, Category, ExtensionManifest, ManifestError};
 use freshell_platform::detect::{host_os_live, is_windows, HostOs};
 use freshell_platform::{CommandRunner, StdCommandRunner};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 const MANIFEST_FILE: &str = "freshell.json";
 
-// ── Manifest schema (subset of server/extension-manifest.ts) ────────────────
-
-/// The terminal-behavior block (`extension-manifest.ts:45-48`).
-#[derive(Debug, Clone, Deserialize)]
-struct TerminalBehavior {
-    #[serde(rename = "preferredRenderer", skip_serializing_if = "Option::is_none")]
-    preferred_renderer: Option<String>,
-    #[serde(rename = "scrollInputPolicy", skip_serializing_if = "Option::is_none")]
-    scroll_input_policy: Option<String>,
-}
-
-/// The CLI config block (`extension-manifest.ts:50-66`). The full arg-template
-/// fields (`args`/`env`/`modelArgs`/`sandboxArgs`/`permissionModeArgs`/
-/// `createSessionArgs`) are modeled since task-006: they feed the coding-CLI
-/// command specs (`server/index.ts:231-255` compilation), per
-/// `port/machine/specs/cli-argv-fidelity.md` §3.1.
-#[derive(Debug, Clone, Deserialize)]
-struct CliConfig {
-    command: String,
-    #[serde(rename = "envVar")]
-    env_var: Option<String>,
-    args: Option<Vec<String>>,
-    env: Option<std::collections::BTreeMap<String, String>>,
-    #[serde(rename = "resumeArgs")]
-    resume_args: Option<Vec<String>>,
-    #[serde(rename = "createSessionArgs")]
-    create_session_args: Option<Vec<String>>,
-    #[serde(rename = "modelArgs")]
-    model_args: Option<Vec<String>>,
-    #[serde(rename = "sandboxArgs")]
-    sandbox_args: Option<Vec<String>>,
-    #[serde(rename = "permissionModeArgs")]
-    permission_mode_args: Option<Vec<String>>,
-    #[serde(rename = "supportsPermissionMode")]
-    supports_permission_mode: Option<bool>,
-    #[serde(rename = "supportsModel")]
-    supports_model: Option<bool>,
-    #[serde(rename = "supportsSandbox")]
-    supports_sandbox: Option<bool>,
-    #[serde(rename = "terminalBehavior")]
-    terminal_behavior: Option<TerminalBehavior>,
-}
-
-/// The picker config block (`extension-manifest.ts:72-75`).
-#[derive(Debug, Clone, Deserialize)]
-struct PickerConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shortcut: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    group: Option<String>,
-}
-
-/// The top-level manifest (`extension-manifest.ts:81-103`). Lenient: unknown keys
-/// are ignored (the bundled manifests are trusted; the original's strict reject is
-/// a manifest-authoring guard, not a wire invariant).
-#[derive(Debug, Clone, Deserialize)]
-struct ExtensionManifest {
-    name: String,
-    version: String,
-    label: String,
-    description: String,
-    category: String,
-    icon: Option<String>,
-    url: Option<String>,
-    #[serde(rename = "contentSchema")]
-    content_schema: Option<Value>,
-    picker: Option<PickerConfig>,
-    cli: Option<CliConfig>,
-}
+// ── Manifest schema ─────────────────────────────────────────────────────────
+//
+// The strict schema now lives in the `freshell-extensions` crate (df1 EXT-01):
+// `freshell_extensions::ExtensionManifest` is obtainable ONLY through
+// validation (`parse_manifest`), so the lenient/strict split is structurally
+// impossible here. Validation failures map to the legacy scan warnings:
+// `ManifestError::InvalidJson` → 'invalid JSON in manifest';
+// `ManifestError::Invalid(issues)` → 'invalid manifest' (issues are zod-parity
+// (code, path, message) triples — see the crate docs).
 
 // ── Registry ─────────────────────────────────────────────────────────────────
 
@@ -131,7 +77,10 @@ pub struct ExtensionRegistry {
 impl ExtensionRegistry {
     /// `scan(dirs)` (`extension-manager.ts:62-131`): for each dir, read `freshell.json`
     /// from each subdirectory, parse it, and register under `manifest.name`
-    /// (first-wins on duplicate). Invalid/missing manifests are skipped.
+    /// (first-wins on duplicate). Invalid/missing manifests are skipped WITH A
+    /// WARNING (`extension-manager.ts:90-111`) — the two failure classes map to
+    /// legacy's two log lines ('invalid JSON in manifest' / 'invalid manifest',
+    /// the latter carrying the zod-parity issue list).
     ///
     /// **Determinism note:** the original iterates `fs.readdirSync` order (which is
     /// filesystem-dependent, i.e. nondeterministic); this port sorts subdirectory
@@ -161,12 +110,29 @@ impl ExtensionRegistry {
                 let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
                     continue;
                 };
-                let Ok(manifest) = serde_json::from_str::<ExtensionManifest>(&raw) else {
-                    continue;
+                let manifest = match parse_manifest(&raw) {
+                    Ok(manifest) => manifest,
+                    Err(ManifestError::InvalidJson(err)) => {
+                        // `extension-manager.ts:100` — 'invalid JSON in manifest'
+                        tracing::warn!(
+                            manifest_path = %manifest_path.display(),
+                            error = %err,
+                            "Extension scan: invalid JSON in manifest"
+                        );
+                        continue;
+                    }
+                    Err(ManifestError::Invalid(issues)) => {
+                        // `extension-manager.ts:106-109` — 'invalid manifest' with
+                        // the issue list (legacy: `result.error.format()`; here:
+                        // the same (code, path, message) content, flat).
+                        tracing::warn!(
+                            manifest_path = %manifest_path.display(),
+                            ?issues,
+                            "Extension scan: invalid manifest"
+                        );
+                        continue;
+                    }
                 };
-                if !is_valid_manifest(&manifest) {
-                    continue;
-                }
                 if seen.contains(&manifest.name) {
                     continue; // duplicate name — first wins
                 }
@@ -200,7 +166,7 @@ impl ExtensionRegistry {
     pub fn discovered_cli_names(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|e| e.manifest.category == "cli" && e.manifest.cli.is_some())
+            .filter(|e| e.manifest.category == Category::Cli && e.manifest.cli.is_some())
             .map(|e| e.manifest.name.clone())
             .collect()
     }
@@ -226,7 +192,7 @@ impl ExtensionRegistry {
     pub fn cli_command_specs(&self) -> Vec<freshell_platform::CliCommandSpec> {
         self.entries
             .iter()
-            .filter(|e| e.manifest.category == "cli")
+            .filter(|e| e.manifest.category == Category::Cli)
             .filter_map(|e| e.manifest.cli.as_ref().map(|cli| (e, cli)))
             .map(|(e, cli)| freshell_platform::CliCommandSpec {
                 name: e.manifest.name.clone(),
@@ -235,8 +201,12 @@ impl ExtensionRegistry {
                 // empty is falsy, so model it as `None`.
                 env_var: cli.env_var.clone().filter(|v| !v.is_empty()),
                 default_cmd: cli.command.clone(),
-                base_args: cli.args.clone().unwrap_or_default(),
-                base_env: cli.env.clone().unwrap_or_default(),
+                base_args: cli.args.clone(),
+                base_env: cli
+                    .env
+                    .clone()
+                    .map(|m| m.into_iter().collect())
+                    .unwrap_or_default(),
                 resume_args: cli.resume_args.clone(),
                 create_session_args: cli.create_session_args.clone(),
                 model_args: cli.model_args.clone(),
@@ -249,7 +219,7 @@ impl ExtensionRegistry {
     pub fn cli_detection_specs(&self) -> Vec<CliDetectionSpec> {
         self.entries
             .iter()
-            .filter(|e| e.manifest.category == "cli")
+            .filter(|e| e.manifest.category == Category::Cli)
             .filter_map(|e| e.manifest.cli.as_ref().map(|cli| (e, cli)))
             .map(|(e, cli)| CliDetectionSpec {
                 name: e.manifest.name.clone(),
@@ -261,19 +231,6 @@ impl ExtensionRegistry {
     }
 }
 
-/// The manifest refinement (`extension-manifest.ts:96-103`): the declared category
-/// must carry exactly its own config block. Only `cli` is modeled here; a `cli`
-/// manifest without a `cli` block (or vice-versa) is rejected. `client`/`server`
-/// manifests are accepted as-is (their blocks aren't modeled but aren't required
-/// for the registry/CLI surface).
-fn is_valid_manifest(m: &ExtensionManifest) -> bool {
-    match m.category.as_str() {
-        "cli" => m.cli.is_some(),
-        "client" | "server" => true,
-        _ => false,
-    }
-}
-
 /// Build one `ClientExtensionEntry` (`extension-manager.ts:145-190`). Optional
 /// fields are omitted when absent, matching `JSON.stringify`'s `undefined` elision.
 fn client_entry(m: &ExtensionManifest) -> Value {
@@ -282,12 +239,14 @@ fn client_entry(m: &ExtensionManifest) -> Value {
     obj.insert("version".into(), json!(m.version));
     obj.insert("label".into(), json!(m.label));
     obj.insert("description".into(), json!(m.description));
-    obj.insert("category".into(), json!(m.category));
+    obj.insert("category".into(), json!(m.category.as_str()));
     // `serverRunning` is always present; this read-only port never runs server
     // extensions, so it is always false (and `serverPort` is omitted).
     obj.insert("serverRunning".into(), json!(false));
 
-    if m.icon.is_some() {
+    // Legacy gates on TRUTHINESS (`if (manifest.icon)`): an empty-string icon
+    // is schema-valid but must not produce an iconUrl.
+    if m.icon.as_ref().is_some_and(|icon| !icon.is_empty()) {
         obj.insert(
             "iconUrl".into(),
             json!(format!(
@@ -300,7 +259,12 @@ fn client_entry(m: &ExtensionManifest) -> Value {
         obj.insert("url".into(), json!(url));
     }
     if let Some(cs) = &m.content_schema {
-        obj.insert("contentSchema".into(), cs.clone());
+        // Typed content schema re-serializes exactly (validated input keys
+        // only, optionals elided, insertion order preserved).
+        obj.insert(
+            "contentSchema".into(),
+            serde_json::to_value(cs).unwrap_or(Value::Null),
+        );
     }
     if let Some(p) = &m.picker {
         obj.insert(
@@ -308,7 +272,7 @@ fn client_entry(m: &ExtensionManifest) -> Value {
             serde_json::to_value(p).unwrap_or(Value::Null),
         );
     }
-    if m.category == "cli" {
+    if m.category == Category::Cli {
         if let Some(cli) = &m.cli {
             let mut c = Map::new();
             if let Some(v) = cli.supports_permission_mode {
@@ -337,32 +301,6 @@ fn client_entry(m: &ExtensionManifest) -> Value {
     }
 
     Value::Object(obj)
-}
-
-impl serde::Serialize for TerminalBehavior {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = Map::new();
-        if let Some(v) = &self.preferred_renderer {
-            m.insert("preferredRenderer".into(), json!(v));
-        }
-        if let Some(v) = &self.scroll_input_policy {
-            m.insert("scrollInputPolicy".into(), json!(v));
-        }
-        Value::Object(m).serialize(s)
-    }
-}
-
-impl serde::Serialize for PickerConfig {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = Map::new();
-        if let Some(v) = &self.shortcut {
-            m.insert("shortcut".into(), json!(v));
-        }
-        if let Some(v) = &self.group {
-            m.insert("group".into(), json!(v));
-        }
-        Value::Object(m).serialize(s)
-    }
 }
 
 // ── availableClis detection ─────────────────────────────────────────────────
@@ -503,6 +441,142 @@ mod tests {
         "terminalBehavior": { "preferredRenderer": "canvas", "scrollInputPolicy": "native" } },
       "picker": { "group": "agents" }
     }"#;
+
+    // ── df1 EXT-01: the scan path consumes the STRICT manifest schema ──────
+    //
+    // Legacy `extension-manager.ts` validates every `freshell.json` against
+    // the strict zod schema and skips-with-warning on ANY failure; the
+    // previous Rust port ran a lenient subset (unknown keys ignored,
+    // client/server manifests accepted without their config blocks). These
+    // tests pin the strict behavior through the real scan path.
+
+    #[test]
+    fn scan_skips_manifest_with_unknown_key_but_keeps_valid_sibling() {
+        // Strict-mode core rule: an unknown key rejects the WHOLE manifest
+        // (`unrecognized_keys`), like a typo'd legacy manifest.
+        const BAD: &str = r#"{
+          "name": "typo-ext", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "cli",
+          "cli": { "command": "x" }, "clii": { "command": "y" }
+        }"#;
+        let root = tmp();
+        write_manifest(&root, "claude-code", CLAUDE_MANIFEST);
+        write_manifest(&root, "typo-ext", BAD);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert_eq!(
+            reg.discovered_cli_names(),
+            vec!["claude"],
+            "typo manifest skipped, valid sibling kept"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_skips_category_block_mismatch_and_missing_blocks() {
+        // The category refine: exactly one block, matching `category`.
+        const MISSING_BLOCK: &str = r#"{
+          "name": "no-block", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "cli"
+        }"#;
+        const WRONG_BLOCK: &str = r#"{
+          "name": "wrong-block", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "cli",
+          "server": { "command": "node" }
+        }"#;
+        let root = tmp();
+        write_manifest(&root, "no-block", MISSING_BLOCK);
+        write_manifest(&root, "wrong-block", WRONG_BLOCK);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert!(
+            reg.to_client_registry().is_empty(),
+            "category/block mismatches must not register"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_skips_client_and_server_manifests_without_their_blocks() {
+        // The lenient subset accepted category=client/server unconditionally;
+        // the strict schema requires the matching block (client.entry /
+        // server.command).
+        const CLIENT_NO_BLOCK: &str = r#"{
+          "name": "client-no-block", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "client"
+        }"#;
+        const SERVER_NO_BLOCK: &str = r#"{
+          "name": "server-no-block", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "server"
+        }"#;
+        const CLIENT_OK: &str = r#"{
+          "name": "client-ok", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "client",
+          "client": { "entry": "./index.html" }
+        }"#;
+        let root = tmp();
+        write_manifest(&root, "client-no-block", CLIENT_NO_BLOCK);
+        write_manifest(&root, "server-no-block", SERVER_NO_BLOCK);
+        write_manifest(&root, "client-ok", CLIENT_OK);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        let entries = reg.to_client_registry();
+        assert_eq!(entries.len(), 1, "only the well-formed client manifest");
+        assert_eq!(entries[0]["name"], json!("client-ok"));
+        assert_eq!(entries[0]["category"], json!("client"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_skips_invalid_json_manifest_text() {
+        let root = tmp();
+        let bad = root.join("not-json");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join(MANIFEST_FILE), "{ not json").unwrap();
+        write_manifest(&root, "claude-code", CLAUDE_MANIFEST);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert_eq!(reg.discovered_cli_names(), vec!["claude"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn empty_string_icon_produces_no_icon_url() {
+        // `icon` is a bare z.string() in the legacy schema — "" is VALID —
+        // but the legacy registry gates iconUrl on TRUTHINESS
+        // (`if (manifest.icon)`), so "" must not emit one.
+        const EMPTY_ICON: &str = r#"{
+          "name": "empty-icon", "version": "1.0.0", "label": "L",
+          "description": "D", "category": "cli",
+          "cli": { "command": "x" }, "icon": ""
+        }"#;
+        let root = tmp();
+        write_manifest(&root, "empty-icon", EMPTY_ICON);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        let entries = reg.to_client_registry();
+        assert_eq!(
+            entries.len(),
+            1,
+            "empty-icon manifest is VALID under strict"
+        );
+        assert!(
+            entries[0].get("iconUrl").is_none(),
+            "empty icon must not produce iconUrl (legacy truthiness gate)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn all_bundled_manifests_validate_and_register_through_scan() {
+        // Boot-path regression: the repo's extensions/ tree must survive the
+        // strict schema (all six are CLI-category today). Read-only: the
+        // dir is only scanned, never written.
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions"));
+        let reg = ExtensionRegistry::scan(&[dir]);
+        let mut names = reg.discovered_cli_names();
+        names.sort();
+        assert_eq!(
+            names,
+            ["amplifier", "claude", "codex", "gemini", "kimi", "opencode"],
+            "every bundled extension must validate under the strict schema"
+        );
+    }
 
     #[test]
     fn scan_discovers_cli_manifests_and_dedups_first_wins() {
