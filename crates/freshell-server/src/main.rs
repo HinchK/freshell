@@ -1400,9 +1400,11 @@ async fn main() -> ExitCode {
         // `FRESHELL_TEST_CLOCK` enabled the clock at boot (and its handlers
         // re-check the gate, so even a misplaced merge could never expose
         // it). A normal build answers 404 like any unmatched `/api/*`.
-        .merge(test_clock_router::router(test_clock_router::TestClockState {
-            auth_token: Arc::clone(&auth_token),
-        }))
+        .merge(test_clock_router::router(
+            test_clock_router::TestClockState {
+                auth_token: Arc::clone(&auth_token),
+            },
+        ))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
             move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {

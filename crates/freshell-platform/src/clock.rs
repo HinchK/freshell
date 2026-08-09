@@ -198,7 +198,9 @@ pub fn now_ms() -> i64 {
         return system_now_ms();
     }
     let real = system_now_ms();
-    CORE.lock().expect("test clock poisoned").effective_now(real)
+    CORE.lock()
+        .expect("test clock poisoned")
+        .effective_now(real)
 }
 
 /// Current clock state. The gate-off answer is deliberately INERT (live,

@@ -13,7 +13,9 @@ use freshell_platform::clock;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-pub struct TestClockGate(MutexGuard<'static, ()>);
+pub struct TestClockGate {
+    _guard: MutexGuard<'static, ()>,
+}
 
 impl TestClockGate {
     pub fn enable() -> Self {
@@ -26,7 +28,7 @@ impl TestClockGate {
         if enabled_state {
             clock::reset().expect("override just enabled");
         }
-        Self(guard)
+        Self { _guard: guard }
     }
 }
 

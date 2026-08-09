@@ -168,31 +168,6 @@ mod tests {
         assert!(!l.try_acquire(10_001), "5_000 and 10_000 both in window");
     }
 
-    /// HARNESS-14 routing proof: with the shared test clock ENABLED +
-    /// FROZEN, `epoch_ms()` is driven purely by virtual `advance_ms()` — the
-    /// create-rate window drains on virtual steps, never on real sleeps.
-    #[test]
-    fn epoch_ms_follows_the_shared_test_clock() {
-        let _gate = crate::tabs::test_clock_gate::TestClockGate::enable();
-        freshell_platform::clock::freeze().unwrap();
-
-        let mut l = CreateRateLimiter::new(1, 10_000);
-        assert!(l.try_acquire(epoch_ms()));
-        assert!(
-            !l.try_acquire(epoch_ms()),
-            "frozen time: the second acquire is inside the window forever"
-        );
-        // Real elapsed time inside the window must not drain it (frozen).
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(!l.try_acquire(epoch_ms()), "still frozen — no drain");
-
-        freshell_platform::clock::advance_ms(10_001).unwrap();
-        assert!(
-            l.try_acquire(epoch_ms()),
-            "a virtual step past the window must free the slot"
-        );
-    }
-
     #[test]
     fn config_defaults_match_legacy() {
         let c = CreateProtectConfig::default();

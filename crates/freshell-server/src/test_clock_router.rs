@@ -72,11 +72,7 @@ fn snapshot_json(snap: ClockSnapshot) -> Value {
 /// SPA-fallback "no such route" body, so an off-gate deployment is
 /// indistinguishable from one where the surface was never compiled in.
 fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": "Not found" })),
-    )
-        .into_response()
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response()
 }
 
 /// Uniform pre-handler gate: auth first (401 mirrors every other `/api/*`
@@ -103,10 +99,7 @@ fn invalid_advance(message: &str) -> Response {
         .into_response()
 }
 
-async fn get_clock(
-    State(state): State<TestClockState>,
-    headers: HeaderMap,
-) -> Response {
+async fn get_clock(State(state): State<TestClockState>, headers: HeaderMap) -> Response {
     if let Some(reject) = gate(&headers, &state) {
         return reject;
     }
@@ -129,9 +122,7 @@ async fn post_advance(
         // strings, and missing keys uniformly.
         .filter(|ms| (0..=clock::MAX_ADVANCE_MS).contains(ms));
     let Some(ms) = ms else {
-        return invalid_advance(
-            "body.ms must be an integer in [0, MAX_ADVANCE_MS] (31 days)",
-        );
+        return invalid_advance("body.ms must be an integer in [0, MAX_ADVANCE_MS] (31 days)");
     };
     match clock::advance_ms(ms) {
         Ok(snap) => Json(snapshot_json(snap)).into_response(),
@@ -141,10 +132,7 @@ async fn post_advance(
     }
 }
 
-async fn post_freeze(
-    State(state): State<TestClockState>,
-    headers: HeaderMap,
-) -> Response {
+async fn post_freeze(State(state): State<TestClockState>, headers: HeaderMap) -> Response {
     if let Some(reject) = gate(&headers, &state) {
         return reject;
     }
@@ -154,10 +142,7 @@ async fn post_freeze(
     }
 }
 
-async fn post_resume(
-    State(state): State<TestClockState>,
-    headers: HeaderMap,
-) -> Response {
+async fn post_resume(State(state): State<TestClockState>, headers: HeaderMap) -> Response {
     if let Some(reject) = gate(&headers, &state) {
         return reject;
     }
@@ -167,10 +152,7 @@ async fn post_resume(
     }
 }
 
-async fn post_reset(
-    State(state): State<TestClockState>,
-    headers: HeaderMap,
-) -> Response {
+async fn post_reset(State(state): State<TestClockState>, headers: HeaderMap) -> Response {
     if let Some(reject) = gate(&headers, &state) {
         return reject;
     }
@@ -308,11 +290,18 @@ mod tests {
         let held = b["nowMs"].as_i64().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let (_, b2) = call("GET", "/api/test-clock", Some("tok"), None).await;
-        assert_eq!(b2["nowMs"].as_i64(), Some(held), "frozen time must not move");
+        assert_eq!(
+            b2["nowMs"].as_i64(),
+            Some(held),
+            "frozen time must not move"
+        );
 
         let (s, b) = call("POST", "/api/test-clock/resume", Some("tok"), None).await;
         assert_eq!((s, b["mode"].as_str()), (StatusCode::OK, Some("live")));
-        assert!((b["nowMs"].as_i64().unwrap() - held).abs() < 1_000, "no jump on resume");
+        assert!(
+            (b["nowMs"].as_i64().unwrap() - held).abs() < 1_000,
+            "no jump on resume"
+        );
 
         let (s, b) = call("POST", "/api/test-clock/reset", Some("tok"), None).await;
         assert_eq!(s, StatusCode::OK);

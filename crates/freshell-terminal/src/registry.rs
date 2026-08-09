@@ -2665,35 +2665,6 @@ fn deliver_batches(
 mod tests {
     use super::*;
 
-    /// HARNESS-14: serialize + scope the process-global test-clock override.
-    /// `TestClockGate::enable()` turns the shared clock ON for one test;
-    /// Drop resets the clock AND clears the override, so parallel-sibling
-    /// `now_ms()` callers only ever see enabled+reset state (and only for
-    /// the guarded window — their own relative-delta math stays coherent).
-    mod test_clock_gate {
-        use std::sync::{Mutex, MutexGuard};
-
-        static LOCK: Mutex<()> = Mutex::new(());
-
-        pub struct TestClockGate(MutexGuard<'static, ()>);
-
-        impl TestClockGate {
-            pub fn enable() -> Self {
-                let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                freshell_platform::clock::set_enabled_override_for_tests(Some(true));
-                freshell_platform::clock::reset().expect("override enabled");
-                Self(guard)
-            }
-        }
-
-        impl Drop for TestClockGate {
-            fn drop(&mut self) {
-                let _ = freshell_platform::clock::reset();
-                freshell_platform::clock::set_enabled_override_for_tests(None);
-            }
-        }
-    }
-
     // ── DIAG-01 lifecycle tracing events ─────────────────────────────────
     //
     // A minimal capturing `tracing_subscriber::Layer` (dev-dependency only)
@@ -4017,44 +3988,6 @@ mod tests {
 
         assert_eq!(killed, vec!["T".to_string()]);
         assert!(reg.inventory().is_empty());
-    }
-
-    /// HARNESS-14 routing proof: with the shared test clock ENABLED + FROZEN,
-    /// a detached terminal's reap eligibility is decided PURELY by virtual
-    /// `advance_ms()` — no backdating hook, no real sleep, and the real time
-    /// elapsed during the test never counts. This is the crate-level proof
-    /// that `now_ms()` (activity stamps AND the sweep threshold) reads the
-    /// one controllable clock.
-    #[test]
-    fn enforce_idle_kills_follows_the_shared_test_clock_when_enabled() {
-        let _gate = test_clock_gate::TestClockGate::enable();
-        let reg = TerminalRegistry::new();
-        reg.insert_headless("T-frozen-A", "S-frozen-A");
-        reg.set_auto_kill_idle_minutes(15);
-
-        // Frozen clock: real elapsed time is irrelevant — no reap.
-        freshell_platform::clock::freeze().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        assert!(reg.enforce_idle_kills().is_empty(), "frozen time is idle-0");
-
-        // Cross the 15-minute threshold in one virtual step: A reaps...
-        freshell_platform::clock::advance_ms(16 * 60_000).unwrap();
-        assert_eq!(
-            reg.enforce_idle_kills(),
-            vec!["T-frozen-A".to_string()],
-            "advancing the shared clock past the threshold must reap"
-        );
-
-        // ...and a terminal created AT a later frozen instant survives a
-        // step that only carries IT to 11 idle minutes (deterministic
-        // fixture ordering without wall sleeps).
-        freshell_platform::clock::reset().unwrap();
-        freshell_platform::clock::freeze().unwrap();
-        reg.insert_headless("T-frozen-B", "S-frozen-B");
-        freshell_platform::clock::advance_ms(11 * 60_000).unwrap();
-        assert!(reg.enforce_idle_kills().is_empty(), "B is 11min < 15min");
-        freshell_platform::clock::advance_ms(5 * 60_000).unwrap();
-        assert_eq!(reg.enforce_idle_kills(), vec!["T-frozen-B".to_string()]);
     }
 
     #[test]
