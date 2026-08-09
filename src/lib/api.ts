@@ -577,6 +577,8 @@ export type SearchResponse = {
   hasMore: boolean
   partial?: boolean
   partialReason?: 'budget' | 'io_error'
+  /** SESSION-05: the page's per-project color map (only present when the server emitted one). */
+  projectColors?: Record<string, string>
 }
 
 export type SearchOptions = {
@@ -598,7 +600,10 @@ function encodeSessionCursor(before: number | undefined, beforeId: string | unde
   return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
+function groupDirectoryItemsAsProjects(
+  items: ReadModelSessionDirectoryItem[],
+  projectColors?: Record<string, string>,
+) {
   const groups = new Map<string, Array<ReadModelSessionDirectoryItem>>()
   for (const item of items) {
     const bucket = groups.get(item.projectPath) ?? []
@@ -608,6 +613,13 @@ function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
 
   return Array.from(groups.entries()).map(([projectPath, sessions]) => ({
     projectPath,
+    // SESSION-05: items carry no color field — the page-level
+    // `projectColors` map (shared/read-models.ts) is the channel. Overlay
+    // it here, the single construction site for session-window project
+    // groups, so History's header swatch (`project.color`) and the sidebar
+    // selectors see it. Absent map (older server) → no color, exactly the
+    // pre-SESSION-05 behavior.
+    ...(projectColors?.[projectPath] ? { color: projectColors[projectPath] } : {}),
     sessions: sessions.map((item) => ({
       provider: item.provider,
       sessionId: item.sessionId,
@@ -678,7 +690,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     signal,
   })) as ReadModelSessionDirectoryPage
 
-  const projects = groupDirectoryItemsAsProjects(page.items)
+  const projects = groupDirectoryItemsAsProjects(page.items, page.projectColors)
   const oldest = page.items.at(-1)
 
   return {
@@ -731,6 +743,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     totalScanned: page.items.length,
     nextCursor: page.nextCursor,
     hasMore: page.nextCursor !== null,
+    ...(page.projectColors ? { projectColors: page.projectColors } : {}),
   }
 
   if (page.partial) {

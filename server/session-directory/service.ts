@@ -295,6 +295,29 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     revision,
   }
 
+  // SESSION-05: embed the resolved project colors. They come from the
+  // indexer's project groups (already overlaid from
+  // `configStore.getProjectColors()` by `performRefresh`,
+  // `coding-cli/session-indexer.ts`), so a color write is visible on the
+  // very next refetch — and the key stays absent when nothing is
+  // configured (optional in `shared/read-models.ts`), keeping the wire
+  // identical to before for the no-colors case.
+  const projectColors: Record<string, string> = {}
+  for (const project of input.projects) {
+    // `typeof` guard: a junk non-string value in the hand-edited
+    // `config.json` map must not land on the page — the client parses it
+    // as `z.record(z.string(), z.string())` and a failure there would
+    // reject the whole session-window fetch. (Mirrors the store-side
+    // normalization in the Rust port and the client's own `typeof` check
+    // in `normalizeProjects`.)
+    if (typeof project.color === 'string' && project.color) {
+      projectColors[project.projectPath] = project.color
+    }
+  }
+  if (Object.keys(projectColors).length > 0) {
+    page.projectColors = projectColors
+  }
+
   if (partial) {
     page.partial = partial
     page.partialReason = partialReason

@@ -30,6 +30,7 @@ mod logging;
 mod managed_ports;
 mod net_bind;
 mod network;
+mod project_colors;
 mod proxy;
 mod rate_limit;
 mod recovery_inventory;
@@ -1273,6 +1274,16 @@ async fn main() -> ExitCode {
             // override write (rename/archive/delete) broadcasts on the ONE
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
+            sessions_revision: Arc::clone(&sessions_revision),
+        }))
+        .merge(project_colors::router(project_colors::ProjectColorsState {
+            auth_token: Arc::clone(&auth_token),
+            settings: settings_store.clone(),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            // SESSION-05: a project-color write broadcasts `sessions.changed`
+            // on the SAME unified revision sequence as the override-write/
+            // sweep producers (the sweep is structurally blind to this
+            // config-only change; see `sessions::SessionsState::sessions_revision`).
             sessions_revision: Arc::clone(&sessions_revision),
         }))
         .merge(resolve::router(resolve::ResolveState {

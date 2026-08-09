@@ -194,7 +194,11 @@ describe('SessionsSyncService', () => {
           totalTokens: 27,
         },
         sourceFile: '/tmp/other.jsonl',
-      }, '#0f0'),
+        // SESSION-05: same color as the baseline publish — project colors
+        // ARE directory-visible now (see the color-only test below), so
+        // this leg must hold color constant to keep asserting that only
+        // tokenUsage/sourceFile metadata is invisible.
+      }, '#f00'),
     ])
     svc.publish([
       createDetailedProject('/repo', {
@@ -220,5 +224,51 @@ describe('SessionsSyncService', () => {
       [2],
       [3],
     ])
+  })
+
+  // SESSION-05 (project colors): the session-directory page is the ONLY
+  // channel that delivers a project color to the client, and it is
+  // re-fetched in response to `sessions.changed` — so a color-only change
+  // (no session field moves) MUST still broadcast, or other browser
+  // contexts never re-render a recolored History project header. The
+  // comparable-items differ alone is color-blind by design (its pinned
+  // contract, see projection.test.ts); the sync service therefore ALSO
+  // compares the resolved per-project color map.
+  it('broadcasts on a color-only change and does not rebroadcast an unchanged color', () => {
+    vi.useFakeTimers()
+    const ws = createWsMocks()
+    const svc = new SessionsSyncService(ws as any, { coalesceMs: 150 })
+
+    const uncolored = [createDetailedProject('/repo', {})]
+    const colored = [createDetailedProject('/repo', {}, '#ff8800')]
+    const recolored = [createDetailedProject('/repo', {}, '#00ff11')]
+    const recoloredAgain = [createDetailedProject('/repo', {}, '#00ff11')]
+
+    // Baseline publish (first publish always flushes immediately).
+    svc.publish(uncolored)
+    expect(ws.broadcastSessionsChanged.mock.calls).toEqual([[1]])
+
+    // Color-only change inside the coalesce window → trailing broadcast.
+    svc.publish(colored)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(151)
+    expect(ws.broadcastSessionsChanged.mock.calls).toEqual([[1], [2]])
+
+    // Let the post-trailing window close, then change between two SET
+    // colors → immediate broadcast (no pending window).
+    vi.advanceTimersByTime(151)
+    svc.publish(recolored)
+    expect(ws.broadcastSessionsChanged.mock.calls).toEqual([[1], [2], [3]])
+
+    // Same color published again → no extra broadcast.
+    svc.publish(recoloredAgain)
+    vi.advanceTimersByTime(151)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(3)
+
+    // Color REMOVED from every project (config restore / sibling-server
+    // edit adopting state without colors) → broadcast as well.
+    svc.publish(uncolored)
+    vi.advanceTimersByTime(151)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(4)
   })
 })

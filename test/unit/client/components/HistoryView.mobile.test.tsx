@@ -7,14 +7,30 @@ import sessionsReducer from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 
-vi.mock('@/lib/api', () => ({
-  api: {
-    get: vi.fn().mockResolvedValue([]),
-    put: vi.fn().mockResolvedValue({}),
-    patch: vi.fn().mockResolvedValue({}),
-    delete: vi.fn().mockResolvedValue({}),
-  },
-}))
+// Keep api helpers stubbed; spread the real module so pure named exports
+// (e.g. isApiUnauthorizedError, consumed by fetchSessionWindow's rejection
+// handler) stay live, and stub the thunk's direct network entry points
+// benignly so no real fetch escapes.
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      get: vi.fn().mockResolvedValue([]),
+      put: vi.fn().mockResolvedValue({}),
+      patch: vi.fn().mockResolvedValue({}),
+      delete: vi.fn().mockResolvedValue({}),
+    },
+    fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    }),
+    searchSessions: vi.fn().mockResolvedValue({ results: [], hasMore: false }),
+  }
+})
 
 function renderHistoryView(onOpenSession = vi.fn()) {
   const projectPath = '/test/project'

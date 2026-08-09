@@ -5,6 +5,28 @@ type SessionsSyncWs = {
   broadcastSessionsChanged: (revision: number) => void
 }
 
+/**
+ * The session-directory-visible color of each project (a project with no
+ * color configured is indistinguishable from a run where it never existed
+ * — canonicalized the same way as `sessions-sync/diff.ts`'s
+ * `(a.color || '') !== (b.color || '')`).
+ */
+function projectColorMap(projects: ProjectGroup[]): Map<string, string> {
+  const colors = new Map<string, string>()
+  for (const project of projects) {
+    if (project.color) colors.set(project.projectPath, project.color)
+  }
+  return colors
+}
+
+function projectColorMapsEqual(a: Map<string, string>, b: Map<string, string>): boolean {
+  if (a.size !== b.size) return false
+  for (const [projectPath, color] of a) {
+    if (b.get(projectPath) !== color) return false
+  }
+  return true
+}
+
 type SessionsSyncOptions = { coalesceMs?: number }
 
 function parseCoalesceMs(value: unknown): number {
@@ -50,7 +72,16 @@ export class SessionsSyncService {
 
   private flush(next: ProjectGroup[]): void {
     const prev = this.hasLast ? this.last : []
+    // SESSION-05 (project colors): `hasSessionDirectorySnapshotChange` is
+    // deliberately color-blind at the comparable-item level (pinned in
+    // projection.test.ts) — but the session-directory page this broadcast
+    // triggers the client to refetch is the ONLY channel that delivers
+    // project colors, so a color-only change must count as a change here
+    // (otherwise a recolor put through `PUT /api/project-colors` →
+    // `codingCliIndexer.refresh()` publishes a snapshot this service then
+    // silently dedupes away, and no other browser context re-renders).
     const changed = hasSessionDirectorySnapshotChange(prev, next)
+      || !projectColorMapsEqual(projectColorMap(prev), projectColorMap(next))
 
     this.last = next
     this.hasLast = true
