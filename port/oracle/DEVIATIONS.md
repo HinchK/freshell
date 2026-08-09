@@ -946,6 +946,28 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   directory entry too (survives restart/reindex), instead of silently updating
   only the terminal override.
 
+### EDEV-09 — client title-convergence fixes (sidebar/history/terminal-menu/Overview renames now mirror into pane titles; exited-terminal renames persist)
+- what_differs: `src/store/titleSync.ts` gains `applySessionRenameCascade` and replaces the
+  exited-terminal bail (titleSync.ts:35) with a `sessionRef` fallback PATCH; `src/store/panesSlice.ts`
+  gains `updatePaneTitleBySessionRef`; `ContextMenuProvider.renameSession`/`renameTerminal` and
+  `HistoryView.renameSession` dispatch pane mirrors with `setByUser: true`;
+  `src/components/OverviewView.tsx` TerminalCard inline rename is re-routed through the shared
+  rename helper so `paneTitles` updates too. Applies identically to BOTH backends (shared client).
+- why_intentional: explicit user directive in the naming-persistence-sweep task: "for the same
+  underlying session/terminal, the sidebar item title and the pane title must never disagree";
+  the pre-fix client dropped `cascadedTerminalId` (ContextMenuProvider.tsx:483-487), never
+  mirrored session renames into SDK panes, silently dropped pane renames on exited coding-CLI
+  terminals (titleSync.ts:35 / TerminalView.tsx:3841), and left Overview renames invisible to
+  paneTitles while the sweep is structurally blind post-PATCH — defects on the original too
+  (desync paths D3/D4/D7 audit: .the-usual-logs report client-title-sync.md; D8 + Overview:
+  validator-A5).
+- evidence: test/e2e-browser/specs/title-sync-convergence.spec.ts (both projects, incl. the
+  Overview rename journey) + test/unit/client/store/paneSessionTitleSync.test.ts; commit <sha>.
+- user_impact: renaming a session from the sidebar/history/terminal menus or the Overview page
+  now updates the open pane header immediately on both servers, and renaming a pane whose
+  coding-CLI terminal already exited still persists; previously the pane kept the stale name
+  until a sidebar click (or the rename was silently lost).
+
 <!--
 Template:
 
