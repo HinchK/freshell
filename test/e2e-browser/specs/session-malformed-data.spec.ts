@@ -224,15 +224,27 @@ const test = base.extend({
               ]),
             ]),
           )
-          // Partial (completed mid-test in test 3): strict prefix of the final doc.
+          // Partial (completed mid-test in test 3): strict prefix of the final doc —
+          // cut WITHIN LINE 1 (the init record), so the seed has ZERO complete lines and
+          // is genuinely UNINDEXED at boot (a real "partially written" record). A naive
+          // fraction-of-total-bytes cut would leave the init + first-turn lines COMPLETE
+          // — a valid prefix (cwd present) means the record is indexed at boot with one
+          // user message, i.e. non-interactive and HIDDEN by the default browse
+          // projection: the completion then changes neither the index count nor (with a
+          // newer codex seed present) the corpus max-lastActivityAt, so the Rust sweep
+          // signature never moves and no `sessions.changed` ever fires (legacy's
+          // watcher still fires on content diffs). Verified by direct instrumentation:
+          // `spawn_sessions_sweep` ticks showed len already including the seed from the
+          // first tick while the API browse projection correctly hid it.
           const partialFinal = buildClaudeDoc({
             sessionId: CLAUDE_PARTIAL_ID,
             cwd: '/tmp/freshell-s16/partial',
             userTexts: [T.claudePartial, 's16-campaign partial second turn'],
           })
+          const initLineEnd = partialFinal.indexOf('\n')
           await fs.writeFile(
             path.join(claudeDir, `${CLAUDE_PARTIAL_ID}.jsonl`),
-            partialFinal.slice(0, Math.floor(partialFinal.length * 2 / 3)),
+            partialFinal.slice(0, Math.floor(initLineEnd / 2)),
           )
 
           // ── Codex corpus (`<home>/.codex/sessions/*.jsonl`) ──
