@@ -357,6 +357,18 @@ const cases: { name: string; rawText: string }[] = [
     description: 'D',
     category: 'cli',
   }),
+  // ...and the refine consumes BEST-EFFORT block presence: a block whose own
+  // parse produced only check-failures (too_small on command) still counts as
+  // PRESENT, so a matching category passes the refine — only the inner
+  // too_small is reported.
+  synth('refine-passes-when-matching-block-has-only-check-failures', {
+    name: 'x',
+    version: '1.0.0',
+    label: 'L',
+    description: 'D',
+    category: 'server',
+    server: { command: '' },
+  }),
   // Two refine levels fire together, deeper path first.
   synth('both-refine-levels-fire-deeper-first', {
     name: 'x',
@@ -526,6 +538,12 @@ const cases: { name: string; rawText: string }[] = [
   synth('contentschema-field-missing-label', {
     ...validClientManifest,
     contentSchema: { f: { type: 'string' } },
+  }),
+  // label is a bare z.string() — EMPTY STRING IS VALID (contrast with the
+  // min(1) fields like name/version/label at the top level).
+  synth('contentschema-label-empty-string-valid', {
+    ...validClientManifest,
+    contentSchema: { f: { type: 'string', label: '' } },
   }),
   synth('contentschema-number-field-string-default-mismatch', {
     ...validClientManifest,

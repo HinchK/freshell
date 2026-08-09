@@ -1074,6 +1074,23 @@
       }
     },
     {
+      "name": "refine-passes-when-matching-block-has-only-check-failures",
+      "rawText": "{\"name\":\"x\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"server\",\"server\":{\"command\":\"\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
       "name": "both-refine-levels-fire-deeper-first",
       "rawText": "{\"name\":\"x\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"server\",\"cli\":{\"command\":\"c\"},\"contentSchema\":{\"f\":{\"type\":\"number\",\"label\":\"L\",\"default\":\"s\"}}}",
       "expected": {
@@ -1781,6 +1798,29 @@
             "message": "Invalid input: expected string, received undefined"
           }
         ]
+      }
+    },
+    {
+      "name": "contentschema-label-empty-string-valid",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\",\"label\":\"\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "string",
+              "label": ""
+            }
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
       }
     },
     {
