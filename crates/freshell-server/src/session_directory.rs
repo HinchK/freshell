@@ -404,7 +404,21 @@ async fn session_directory(
     let identities = state.identity.list();
     let items = join_live_terminals(items, &identities);
     match apply_query(items, &query, &identities) {
-        Ok(page) => Json(page).into_response(),
+        Ok(mut page) => {
+            // SESSION-05 (project colors, read half): embed the config's
+            // `projectColors` map on the page when non-empty — the channel
+            // the shared client's refetch-after-`sessions.changed` reads to
+            // overlay each project group's header color
+            // (`shared/read-models.ts`
+            // `SessionDirectoryPageSchema.projectColors`; legacy mirror:
+            // `server/session-directory/service.ts`). Omitted entirely when
+            // empty, matching the legacy service's conditional assignment.
+            let colors = state.settings.project_colors();
+            if !colors.is_empty() {
+                page["projectColors"] = Value::Object(colors);
+            }
+            Json(page).into_response()
+        }
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
         Err(msg) => (
             axum::http::StatusCode::BAD_REQUEST,
@@ -2179,6 +2193,132 @@ mod tests {
         assert_eq!(items[0]["archived"], json!(false));
         assert_eq!(page["nextCursor"], Value::Null);
         assert_eq!(page["revision"], json!(1_769_753_759_234i64));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// SESSION-05 (project colors, read half): the session-directory PAGE
+    /// embeds the config's `projectColors` map verbatim (only when
+    /// non-empty) so the shared client's refetch-after-`sessions.changed`
+    /// can overlay each project group's color
+    /// (`shared/read-models.ts` `SessionDirectoryPageSchema.projectColors`;
+    /// legacy mirror: `server/session-directory/service.ts`).
+    #[tokio::test]
+    async fn session_directory_page_embeds_config_project_colors() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        // The fixture's every session carries
+        // `cwd: D:\Users\Dan\GoogleDrivePersonal\code\freshell`, which is
+        // also its projectPath (see b_t7 above).
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        std::fs::write(
+            home.join(".freshell").join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": {},
+                "terminalOverrides": {},
+                "projectColors": {
+                    "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell": "#ff8800",
+                    "/some/unrelated/path": "#112233"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index =
+            std::sync::Arc::new(SessionIndex::new(vec![
+                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                    as std::sync::Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        // The WHOLE map rides the page (unrelated path included): the
+        // client overlays per-project, and a color for a project not in
+        // THIS page is needed by the page it does appear on.
+        assert_eq!(
+            page["projectColors"]["D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell"],
+            json!("#ff8800"),
+            "the fetched page must carry the project color for header rendering"
+        );
+        assert_eq!(
+            page["projectColors"]["/some/unrelated/path"],
+            json!("#112233"),
+            "unrelated colors are carried verbatim (unchanged by this fetch)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// SESSION-05: with NO configured colors the page must NOT gain a
+    /// `projectColors` key — the field is optional in the wire schema and
+    /// stays absent (matching the legacy service, which omits an empty
+    /// map).
+    #[tokio::test]
+    async fn session_directory_page_omits_project_colors_key_when_empty() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index =
+            std::sync::Arc::new(SessionIndex::new(vec![
+                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                    as std::sync::Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            page.get("projectColors").is_none(),
+            "an empty colors map must not appear on the wire: {page:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
