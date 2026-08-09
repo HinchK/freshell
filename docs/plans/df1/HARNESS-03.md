@@ -134,9 +134,9 @@ prompt, resumeDetect overrides})`) so the four CLIs are ~15-line wrappers.
 | # | Assumption | Method | Status |
 |---|---|---|---|
 | A1 | A Playwright spec that uses bare `@playwright/test` (no `testServer`, no `page`) boots no server and no browser; identical under legacy/rust projects | run (probe in execute phase) + fixtures.ts laziness inspection ✓(read) | pending-run |
-| A2 | `import { WebSocketServer } from 'ws'` resolves from `test/e2e-browser/fixtures/providers/` when spawned as a plain node child | run: `node -e` spawn probe | pending |
-| A3 | `npm run build` (playwright/vitest global setup) works in this worktree and the build guard does not trip | run first spec | pending |
-| A4 | pw lease script path/flags | run `acquire.sh pw` | pending |
+| A2 | `import { WebSocketServer } from 'ws'` resolves from `test/e2e-browser/fixtures/providers/` when spawned as a plain node child | spawn probe w/ `PATH=/nonexistent` → `WS_OK 41009`, exit 0 | ✅ verified |
+| A3 | `npm run build` (playwright/vitest global setup) works in this worktree and the build guard does not trip | run first spec | pending-first-run |
+| A4 | pw lease script path/flags | `acquire.sh pw … --wait` granted (1/4) + released | ✅ verified |
 | A5 | Sidecar protocol invariants (created-first, numeric `at`, content array, UUID) | read `fake-claude-sidecar.mjs` header | ✅ verified (phase 1) |
 | A6 | SSE frame shape consumers expect: `data: {"type":…,"properties":…}\n\n` flat | read `serve-events.ts:61-72` | ✅ verified |
 | A7 | Codex wire: initialize gating + thread/start result shape + rollout session_meta | read `fake-app-server.mjs` | ✅ verified |
