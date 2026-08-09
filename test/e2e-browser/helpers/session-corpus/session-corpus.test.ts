@@ -10,6 +10,7 @@ import {
   type CorpusManifest,
 } from './manifest.js'
 import { claudeProjectSlug, writeClaudeSession } from './claude.js'
+import { codexDatePath, writeCodexSession } from './codex.js'
 import type { CorpusContext } from './types.js'
 
 /**
@@ -258,7 +259,94 @@ describe('session-corpus claude writer', () => {
     // title still derivable from the first user message when no summary line
     expect(exp.title).toContain('subagent')
   })
+})
 
+describe('session-corpus codex writer', () => {
+  it('writes a real rollout file under sessions/YYYY/MM/DD with session_meta + turn records', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const cwd = path.join(ctx.workspace, 'projects', 'gamma-project')
+    const createdAt = Date.parse('2026-08-03T10:00:00.000Z')
+    const lastActivityAt = Date.parse('2026-08-03T10:00:00.002Z')
+    const exp = await writeCodexSession(ctx, {
+      role: 'gamma',
+      sessionId: 'h04corpus-testtoken-codex-gamma',
+      cwd,
+      titleText: 'h04corpus-testtoken gamma',
+      createdAt,
+      lastActivityAt,
+    })
+
+    // real codex layout: sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<id>.jsonl
+    expect(exp.key).toBe('codex:h04corpus-testtoken-codex-gamma')
+    const rel = ctx.files[0].path
+    expect(rel).toBe(path.posix.join('.codex', 'sessions', codexDatePath(createdAt),
+      `rollout-2026-08-03T10-00-00-h04corpus-testtoken-codex-gamma.jsonl`))
+
+    const lines = (await fsp.readFile(path.join(home, rel), 'utf-8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    expect(lines[0].type).toBe('session_meta')
+    expect(lines[0].payload.id).toBe('h04corpus-testtoken-codex-gamma')
+    expect(lines[0].payload.cwd).toBe(cwd)
+    expect(lines[0].timestamp).toBe('2026-08-03T10:00:00.000Z')
+    expect(lines[1].type).toBe('response_item')
+    expect(lines[1].payload).toMatchObject({
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: 'h04corpus-testtoken gamma request 1' }],
+    })
+    expect(lines[1].timestamp).toBe('2026-08-03T10:00:00.001Z')
+    expect(lines[2].payload.role).toBe('assistant')
+    expect(lines[2].timestamp).toBe('2026-08-03T10:00:00.002Z')
+
+    expect(exp).toMatchObject({
+      provider: 'codex',
+      title: 'h04corpus-testtoken gamma request 1',
+      // codex parse: first ASSISTANT text becomes the wire summary (240 cap)
+      summary: 'h04corpus-testtoken gamma reply 1',
+      projectPath: cwd,
+      createdAt,
+      lastActivityAt,
+      visibility: 'listed',
+    })
+  })
+
+  it('exec-source sessions are marked hidden-default (noninteractive)', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const exp = await writeCodexSession(ctx, {
+      role: 'exec',
+      sessionId: 'h04corpus-testtoken-codex-exec',
+      cwd: path.join(ctx.workspace, 'projects', 'exec-project'),
+      titleText: 'h04corpus-testtoken exec',
+      createdAt: Date.parse('2026-07-11T10:00:00.000Z'),
+      lastActivityAt: Date.parse('2026-07-11T10:00:00.002Z'),
+      source: 'exec',
+    })
+    expect(exp.visibility).toBe('hidden-default')
+    expect(exp.visibleWith).toEqual({ includeNonInteractive: true })
+  })
+
+  it('provider-archived rollouts write under archived_sessions/ and expect absence', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const exp = await writeCodexSession(ctx, {
+      role: 'provider-archived',
+      sessionId: 'h04corpus-testtoken-codex-archived',
+      cwd: path.join(ctx.workspace, 'projects', 'gamma-project'),
+      titleText: 'h04corpus-testtoken provider archived',
+      createdAt: Date.parse('2026-08-02T10:00:00.000Z'),
+      lastActivityAt: Date.parse('2026-08-02T10:00:00.002Z'),
+      archivedByProvider: true,
+    })
+    // NOT under sessions/** — the legacy glob never sees it, on purpose.
+    expect(ctx.files[0].path.startsWith('.codex/archived_sessions/2026/08/02/')).toBe(true)
+    expect(exp.visibility).toBe('absent')
+    expect(exp.title).toBeUndefined() // never indexed: no wire semantics
+    expect(exp.summary).toBeUndefined()
+  })
+})
+
+describe('session-corpus claude writer validation', () => {
   it('rejects a turns>0 spec whose lastActivityAt does not match the turn schedule', async () => {
     const home = await mkHome()
     const ctx = mkCtx(home)
