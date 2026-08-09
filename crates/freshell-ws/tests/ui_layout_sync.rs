@@ -28,7 +28,9 @@ fn layout_sync_frame(tabs: serde_json::Value, layouts: serde_json::Value) -> ser
 }
 
 async fn send_json(ws: &mut TestWs, frame: serde_json::Value) {
-    ws.send(WsMessage::Text(frame.to_string())).await.expect("send");
+    ws.send(WsMessage::Text(frame.to_string()))
+        .await
+        .expect("send");
 }
 
 #[tokio::test]
@@ -84,17 +86,18 @@ async fn ui_layout_sync_updates_the_shared_layout_store() {
     let tree = &snap["layouts"]["tab_r"];
     assert_eq!(tree["type"], json!("split"));
     assert_eq!(tree["sizes"], json!([60, 40]));
-    assert!(serde_json::to_string(tree).expect("serialize").contains("\"fresh-agent\""));
-    assert!(!serde_json::to_string(tree).expect("serialize").contains("\"agent-chat\""));
+    assert!(serde_json::to_string(tree)
+        .expect("serialize")
+        .contains("\"fresh-agent\""));
+    assert!(!serde_json::to_string(tree)
+        .expect("serialize")
+        .contains("\"agent-chat\""));
     assert_eq!(
         tree["children"][0]["content"]["sessionRef"],
         json!({ "provider": "claude", "sessionId": "11111111-1111-4111-8111-111111111111" })
     );
     // Derived titles seeded on ingest ("Shell" for the modeless terminal).
-    assert_eq!(
-        snap["paneTitles"]["tab_r"]["pane_2"],
-        json!("Shell")
-    );
+    assert_eq!(snap["paneTitles"]["tab_r"]["pane_2"], json!("Shell"));
     assert_eq!(snap["timestamp"], json!(1_720_000_000_000_i64));
     assert!(store.source_connection_id().is_some());
 }
@@ -168,8 +171,7 @@ async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
     // Mount the fresh-agent REST router against the SAME FreshAgentState the
     // WS dispatch feeds — the shape freshell-server's main.rs production
     // composition has (one store per process).
-    let rest_router =
-        freshell_freshagent::router(state.fresh_opencode.fresh_agent().clone());
+    let rest_router = freshell_freshagent::router(state.fresh_opencode.fresh_agent().clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -214,7 +216,10 @@ async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
     let body: serde_json::Value =
         serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
     let data = &body["data"];
-    assert_eq!(data["tabs"], json!([{ "id": "tab_ws", "title": "WS-fed tab" }]));
+    assert_eq!(
+        data["tabs"],
+        json!([{ "id": "tab_ws", "title": "WS-fed tab" }])
+    );
     assert_eq!(data["activeTabId"], json!("tab_ws"));
     let tree = &data["layouts"]["tab_ws"];
     assert_eq!(tree["type"], json!("split"));

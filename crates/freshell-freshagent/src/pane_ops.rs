@@ -26,8 +26,9 @@
 //! terminal registry's own routes (`/api/terminals/*`) until it exits or is
 //! explicitly killed there, or reaped by the registry's own idle-timeout policy.
 //! **This module mirrors that exactly: `close_pane`/`delete_tab` remove ONLY this
-//! crate's local bookkeeping (`terminal_panes`/`content_panes`/`pane_tabs`/`tabs`
-//! entries) and never call `registry.kill`/`killAndWait`.** No PTY leak results:
+//! crate's local bookkeeping (`terminal_panes`/`content_panes`/`pane_tabs`
+//! entries + the AUTO-01 layout store rows) and never call
+//! `registry.kill`/`killAndWait`.** No PTY leak results:
 //! the terminal remains tracked by the SAME shared registry every other surface
 //! uses, not orphaned outside any registry's view.
 
@@ -43,9 +44,7 @@ use uuid::Uuid;
 use freshell_protocol::{ServerMessage, UiCommand};
 
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
-use crate::{
-    approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState,
-};
+use crate::{approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState};
 
 /// Mount the pane + tab lifecycle routes onto an existing router. Split out of
 /// [`crate::router`] so `lib.rs`'s route table stays a single glance-able list;
@@ -76,12 +75,15 @@ pub fn router(state: FreshAgentState) -> Router {
 
 // ── POST /api/panes/:id/split ──────────────────────────────────────────────
 
-/// `POST /api/panes/:id/split` (`router.ts:1250-1394`). This port keeps no
-/// server-side layout tree (see `lib.rs::rename_pane`'s doc comment for the
-/// established precedent), so the source pane is resolved via
-/// [`FreshAgentState::pane_tabs`] rather than `resolvePaneTarget`'s ambiguous-title
-/// matching -- an unknown `paneId` is an honest 404, not the original's
-/// title-resolution 409. `agent`-based fresh-agent splits (`router.ts:1258-1285`)
+/// `POST /api/panes/:id/split` (`router.ts:1250-1394`). AUTO-01 note: the
+/// shared layout store now exists and learns the real split-tree ids from the
+/// `ui.layout.sync` mirror (and write-through from this handler); this route
+/// still resolves the SOURCE pane via [`FreshAgentState::pane_tabs`]
+/// (pre-AUTO-01 resolution kept — re-pointing the mutation routes at the
+/// store is AUTO-05/06's work) rather than `resolvePaneTarget`'s
+/// ambiguous-title matching, so an unknown `paneId` remains an honest 404,
+/// not the original's title-resolution 409. `agent`-based fresh-agent splits
+/// (`router.ts:1258-1285`)
 /// are an explicit, documented deferral (honest 400) -- out of this slice's
 /// bounded scope (reusing the create/send-keys/capture agent machinery for a
 /// split target is a separate, larger unit of work); browser/editor/terminal
@@ -191,11 +193,9 @@ pub(crate) async fn split_pane(
              write-through skipped (store self-heals on the next ui.layout.sync)"
         );
     } else {
-        state.layout_store().attach_pane_content(
-            &tab_id,
-            &new_pane_id,
-            new_content.clone(),
-        );
+        state
+            .layout_store()
+            .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
     }
 
     let terminal_id = new_content.get("terminalId").cloned();
@@ -753,7 +753,7 @@ pub(crate) async fn resize_pane(
          ui.command broadcast, and legacy's resolveResizeTarget pane-id shorthand -- \
          is owned by AUTO-06. Returning 400 keeps this honest until that item lands \
          it."
-            .to_string(),
+        .to_string(),
     )
 }
 
@@ -1700,14 +1700,8 @@ mod tests {
         // Legacy splitPane makes the NEW pane the tab's active pane.
         assert_eq!(data["activePane"][&tab_id], json!(second_pane_id));
         // Derived titles seeded ("Shell" for both modeless shell panes).
-        assert_eq!(
-            data["paneTitles"][&tab_id][&first_pane_id],
-            json!("Shell")
-        );
-        assert_eq!(
-            data["paneTitles"][&tab_id][&second_pane_id],
-            json!("Shell")
-        );
+        assert_eq!(data["paneTitles"][&tab_id][&first_pane_id], json!("Shell"));
+        assert_eq!(data["paneTitles"][&tab_id][&second_pane_id], json!("Shell"));
 
         let registry = state.terminal_registry.clone().unwrap();
         registry.kill(&first_terminal_id);

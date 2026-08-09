@@ -52,8 +52,7 @@ use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
-    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState,
-    TerminalPaneEntry,
+    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TerminalPaneEntry,
 };
 
 /// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
@@ -292,12 +291,9 @@ fn create_content_tab(
     // editor})`, `router.ts:740/793`): the cheap content kinds are complete at
     // this point, so the legacy create-THEN-attach two-step lands as one
     // create with the final content.
-    state.layout_store().create_tab(
-        &tab_id,
-        &pane_id,
-        name.clone(),
-        pane_content.clone(),
-    );
+    state
+        .layout_store()
+        .create_tab(&tab_id, &pane_id, name.clone(), pane_content.clone());
     let command = ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(json!({
@@ -2149,12 +2145,9 @@ async fn create_terminal_tab(
     // row — no rollback needed, unlike legacy's create-first shape whose
     // `catch` must `closeTab` (`router.ts:822-824`, the documented
     // mid-spawn read-window difference).
-    state.layout_store().create_tab(
-        &tab_id,
-        &pane_id,
-        name.clone(),
-        pane_content.clone(),
-    );
+    state
+        .layout_store()
+        .create_tab(&tab_id, &pane_id, name.clone(), pane_content.clone());
     // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
     // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
     // `sessionRef` (whichever `paneContent` carries -- mutually exclusive,
@@ -2255,9 +2248,7 @@ pub(crate) async fn list_tabs(
     let tabs: Vec<Value> = store
         .list_tabs()
         .iter()
-        .map(|t| {
-            json!({ "id": t.id, "title": t.title, "activePaneId": t.active_pane_id })
-        })
+        .map(|t| json!({ "id": t.id, "title": t.title, "activePaneId": t.active_pane_id }))
         .collect();
     let active_tab_id = store.active_tab_id();
     ok_json(json!({ "tabs": tabs, "activeTabId": active_tab_id }), "")

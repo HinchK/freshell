@@ -205,7 +205,8 @@ impl LayoutStore {
     /// `listPanes(tabId?)` (`layout-store.ts:341-355`): resolves
     /// `tabId || activeTabId || tabs[0].id` (an empty filter string is no
     /// filter — legacy truthiness), leaves in tree order.
-    pub fn list_panes(&self, tab_id: Option<&str>) -> Vec<ListedPane> {        let g = self.guard();
+    pub fn list_panes(&self, tab_id: Option<&str>) -> Vec<ListedPane> {
+        let g = self.guard();
         if !g.fed {
             return Vec::new();
         }
@@ -257,13 +258,7 @@ impl LayoutStore {
     /// minting for their `ui.command` payloads — legacy mints them inside
     /// `createTab` with nanoid, the Rust surface mints uuid4 upstream); the
     /// tab becomes active and its pane the active pane, exactly like legacy.
-    pub fn create_tab(
-        &self,
-        tab_id: &str,
-        pane_id: &str,
-        title: Option<String>,
-        content: Value,
-    ) {
+    pub fn create_tab(&self, tab_id: &str, pane_id: &str, title: Option<String>, content: Value) {
         let mut g = self.guard();
         g.fed = true;
         g.tabs.push(freshell_protocol::UiLayoutTab {
@@ -276,7 +271,8 @@ impl LayoutStore {
             serde_json::json!({ "type": "leaf", "id": pane_id, "content": content }),
         );
         g.active_tab_id = Some(tab_id.to_string());
-        g.active_pane.insert(tab_id.to_string(), pane_id.to_string());
+        g.active_pane
+            .insert(tab_id.to_string(), pane_id.to_string());
         if let Some(node) = g.layouts.get(tab_id) {
             if let Some(content) = node.get("content").cloned() {
                 g.seed_pane_title(tab_id, pane_id, &content);
@@ -318,7 +314,8 @@ impl LayoutStore {
             });
             let replaced = find_and_replace(root, pane_id, &split)?;
             g.layouts.insert(tab.id.clone(), replaced);
-            g.active_pane.insert(tab.id.clone(), new_pane_id.to_string());
+            g.active_pane
+                .insert(tab.id.clone(), new_pane_id.to_string());
             g.seed_pane_title(&tab.id, new_pane_id, &new_content);
             return Some(tab.id.clone());
         }
@@ -371,23 +368,17 @@ impl LayoutStore {
 
     /// `selectPane` (`layout-store.ts:526-540`): an explicit valid tabId wins;
     /// otherwise the first tab containing the pane. Also activates the tab.
-    pub fn select_pane(
-        &self,
-        tab_id: Option<&str>,
-        pane_id: &str,
-    ) -> Option<(String, String)> {
+    pub fn select_pane(&self, tab_id: Option<&str>, pane_id: &str) -> Option<(String, String)> {
         let mut g = self.guard();
         let explicit = tab_id.filter(|t| g.tabs.iter().any(|tab| &tab.id == t));
-        let target = explicit
-            .map(str::to_string)
-            .or_else(|| {
-                g.tabs.iter().find_map(|tab| {
-                    g.layouts
-                        .get(&tab.id)
-                        .filter(|root| collect_leaves(root).iter().any(|l| l.id == pane_id))
-                        .map(|_| tab.id.clone())
-                })
-            })?;
+        let target = explicit.map(str::to_string).or_else(|| {
+            g.tabs.iter().find_map(|tab| {
+                g.layouts
+                    .get(&tab.id)
+                    .filter(|root| collect_leaves(root).iter().any(|l| l.id == pane_id))
+                    .map(|_| tab.id.clone())
+            })
+        })?;
         g.active_pane.insert(target.clone(), pane_id.to_string());
         g.active_tab_id = Some(target.clone());
         Some((target, pane_id.to_string()))
@@ -424,7 +415,11 @@ impl LayoutStore {
         let tab_id = self.get_pane_snapshot(pane_id)?.tab_id;
         let mut g = self.guard();
         g.ensure_pane_title_maps(&tab_id);
-        if let Some(m) = g.pane_titles.get_mut(&tab_id).and_then(Value::as_object_mut) {
+        if let Some(m) = g
+            .pane_titles
+            .get_mut(&tab_id)
+            .and_then(Value::as_object_mut)
+        {
             m.insert(pane_id.to_string(), Value::from(title));
         }
         if let Some(m) = g
@@ -447,12 +442,8 @@ impl LayoutStore {
     /// to the first remaining tab (or null).
     pub fn close_tab(&self, tab_id: &str) -> bool {
         let mut g = self.guard();
-        let next_tabs: Vec<freshell_protocol::UiLayoutTab> = g
-            .tabs
-            .iter()
-            .filter(|t| t.id != tab_id)
-            .cloned()
-            .collect();
+        let next_tabs: Vec<freshell_protocol::UiLayoutTab> =
+            g.tabs.iter().filter(|t| t.id != tab_id).cloned().collect();
         if next_tabs.len() == g.tabs.len() {
             return false;
         }
@@ -468,24 +459,17 @@ impl LayoutStore {
     /// `swapPane` (`layout-store.ts:609-654`): exchange the CONTENT of two
     /// panes in one tab (tree position untouched), titles + setByUser flags
     /// traveling WITH the content. `None` when no single tab holds both.
-    pub fn swap_pane(
-        &self,
-        tab_id: Option<&str>,
-        a_id: &str,
-        b_id: &str,
-    ) -> Option<String> {
+    pub fn swap_pane(&self, tab_id: Option<&str>, a_id: &str, b_id: &str) -> Option<String> {
         let mut g = self.guard();
-        let target = tab_id
-            .map(str::to_string)
-            .or_else(|| {
-                g.tabs.iter().find_map(|tab| {
-                    g.layouts.get(&tab.id).and_then(|root| {
-                        let leaves = collect_leaves(root);
-                        (leaves.iter().any(|l| l.id == a_id) && leaves.iter().any(|l| l.id == b_id))
-                            .then(|| tab.id.clone())
-                    })
+        let target = tab_id.map(str::to_string).or_else(|| {
+            g.tabs.iter().find_map(|tab| {
+                g.layouts.get(&tab.id).and_then(|root| {
+                    let leaves = collect_leaves(root);
+                    (leaves.iter().any(|l| l.id == a_id) && leaves.iter().any(|l| l.id == b_id))
+                        .then(|| tab.id.clone())
                 })
-            })?;
+            })
+        })?;
         let root = g.layouts.get(&target)?;
         let leaves = collect_leaves(root);
         let a_content = leaves.iter().find(|l| l.id == a_id)?.content.clone();
@@ -510,14 +494,12 @@ impl LayoutStore {
         sizes: [f64; 2],
     ) -> Option<String> {
         let mut g = self.guard();
-        let target = tab_id
-            .map(str::to_string)
-            .or_else(|| {
-                g.tabs.iter().find_map(|tab| {
-                    let root = g.layouts.get(&tab.id)?;
-                    contains_node_id(root, split_id).then(|| tab.id.clone())
-                })
-            })?;
+        let target = tab_id.map(str::to_string).or_else(|| {
+            g.tabs.iter().find_map(|tab| {
+                let root = g.layouts.get(&tab.id)?;
+                contains_node_id(root, split_id).then(|| tab.id.clone())
+            })
+        })?;
         if let Some(root) = g.layouts.get(&target) {
             let resized = set_split_sizes(root, split_id, sizes);
             g.layouts.insert(target.clone(), resized);
@@ -539,11 +521,7 @@ impl LayoutStore {
         if let Some(updated) = updated {
             g.layouts.insert(tab_id.to_string(), updated);
         }
-        g.seed_pane_title(
-            tab_id,
-            pane_id,
-            leaf.get("content").unwrap_or(&Value::Null),
-        );
+        g.seed_pane_title(tab_id, pane_id, leaf.get("content").unwrap_or(&Value::Null));
         true
     }
 
@@ -758,15 +736,16 @@ fn find_parent_split_id(node: &Value, pane_id: &str) -> Option<String> {
             && child.get("id").and_then(Value::as_str) == Some(pane_id)
     });
     if direct {
-        return obj
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        return obj.get("id").and_then(Value::as_str).map(str::to_string);
     }
     children
         .first()
         .and_then(|c| find_parent_split_id(c, pane_id))
-        .or_else(|| children.get(1).and_then(|c| find_parent_split_id(c, pane_id)))
+        .or_else(|| {
+            children
+                .get(1)
+                .and_then(|c| find_parent_split_id(c, pane_id))
+        })
 }
 
 /// `setSplitSizes` — legacy's `update` walk inside `resizePane`
@@ -804,7 +783,9 @@ fn set_split_sizes(node: &Value, split_id: &str, sizes: [f64; 2]) -> Value {
 fn contains_node_id(node: &Value, id: &str) -> bool {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
-        let Some(obj) = node.as_object() else { continue };
+        let Some(obj) = node.as_object() else {
+            continue;
+        };
         if obj.get("id").and_then(Value::as_str) == Some(id) {
             return true;
         }
@@ -926,7 +907,9 @@ where
         return out;
     };
     for (tab_id, panes) in tabs {
-        let Value::Object(panes) = panes else { continue };
+        let Value::Object(panes) = panes else {
+            continue;
+        };
         let mut inner = Map::new();
         for (pane_id, value) in panes {
             if let Some(v) = pick(value) {
@@ -984,7 +967,10 @@ fn is_canonical_claude_session_id(value: &str) -> bool {
     segs[..].iter().all(|s| hex(s))
         && segs[2].as_bytes()[0].is_ascii_digit()
         && (b'1'..=b'5').contains(&segs[2].as_bytes()[0])
-        && matches!(segs[3].as_bytes()[0].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+        && matches!(
+            segs[3].as_bytes()[0].to_ascii_lowercase(),
+            b'8' | b'9' | b'a' | b'b'
+        )
 }
 
 /// Session types legacy recognizes (`FRESH_AGENT_DESCRIPTORS`).
@@ -1037,7 +1023,9 @@ fn read_restore_error(value: Option<&Value>) -> Option<Value> {
         "provider_runtime_failed",
         "durable_artifact_missing",
     ];
-    REASONS.contains(&reason).then(|| build_restore_error(reason))
+    REASONS
+        .contains(&reason)
+        .then(|| build_restore_error(reason))
 }
 
 /// The restored identity a migration derived: either a usable `sessionRef`
@@ -1165,11 +1153,8 @@ fn migrate_content(content: &Value) -> Value {
         if let Some(existing) = read_restore_error(obj.get("restoreError")) {
             return finish(session_type, provider, None, Some(existing));
         }
-        let durable = migrate_durable_state(
-            Some(provider),
-            obj.get("sessionRef"),
-            resume_id_of(obj),
-        );
+        let durable =
+            migrate_durable_state(Some(provider), obj.get("sessionRef"), resume_id_of(obj));
         return finish(session_type, provider, Some(durable), None);
     }
 
@@ -1178,8 +1163,9 @@ fn migrate_content(content: &Value) -> Value {
     }
 
     let raw_provider = obj.get("provider").and_then(Value::as_str);
-    let session_type = normalize_session_type(obj.get("provider"))
-        .or(raw_provider.filter(|p| *p == "claude").map(|_| "freshclaude"));
+    let session_type = normalize_session_type(obj.get("provider")).or(raw_provider
+        .filter(|p| *p == "claude")
+        .map(|_| "freshclaude"));
     let provider = runtime_provider(session_type)
         .or(raw_provider.filter(|p| *p == "claude").map(|_| "claude"));
     let durable = migrate_durable_state(provider, obj.get("sessionRef"), resume_id_of(obj));
@@ -1237,7 +1223,11 @@ impl LayoutState {
         if user_set {
             return;
         }
-        if let Some(m) = self.pane_titles.get_mut(tab_id).and_then(Value::as_object_mut) {
+        if let Some(m) = self
+            .pane_titles
+            .get_mut(tab_id)
+            .and_then(Value::as_object_mut)
+        {
             m.insert(pane_id.to_string(), Value::from(title));
         }
     }
@@ -1265,9 +1255,7 @@ impl LayoutState {
         if root.get("type").and_then(Value::as_str) != Some("leaf") {
             return None;
         }
-        root.get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        root.get("id").and_then(Value::as_str).map(str::to_string)
     }
 
     /// The title-map side of `swapPane` (`layout-store.ts:625-652`): titles
@@ -1346,7 +1334,11 @@ fn derive_pane_title(content: &Value) -> Option<String> {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            Some(if last.is_empty() { "Editor".to_string() } else { last })
+            Some(if last.is_empty() {
+                "Editor".to_string()
+            } else {
+                last
+            })
         }
         Some("browser") => {
             let url = obj.get("url").and_then(Value::as_str).unwrap_or("");
@@ -1409,10 +1401,7 @@ fn url_hostname(raw: &str) -> Option<String> {
         return None;
     }
     let authority = &raw[scheme_end + 3..];
-    let authority = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(authority);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
     let no_userinfo = authority.rsplit('@').next().unwrap_or(authority);
     if no_userinfo.is_empty() {
         return None;

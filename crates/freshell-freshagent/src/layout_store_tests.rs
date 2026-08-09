@@ -625,7 +625,9 @@ fn derive_pane_title_terminal_modes_shells_and_fallbacks() {
         Some("docs.example.com".to_string())
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "browser", "url": "https://user:pw@host.example:8443/x" })),
+        derive_pane_title(
+            &json!({ "kind": "browser", "url": "https://user:pw@host.example:8443/x" })
+        ),
         Some("host.example".to_string())
     );
     assert_eq!(
@@ -673,7 +675,12 @@ fn sync_seeds_titles_for_unnamed_panes_only() {
 #[test]
 fn create_tab_records_and_seeds_title() {
     let store = LayoutStore::new();
-    store.create_tab("tab_1", "pane_1", Some("alpha".to_string()), json!({ "kind": "terminal" }));
+    store.create_tab(
+        "tab_1",
+        "pane_1",
+        Some("alpha".to_string()),
+        json!({ "kind": "terminal" }),
+    );
     assert_eq!(
         store.get_normalized_snapshot(None),
         json!({
@@ -692,7 +699,12 @@ fn create_tab_records_and_seeds_title() {
 #[test]
 fn split_pane_replaces_leaf_in_place_and_seeds_new_pane() {
     let store = LayoutStore::new();
-    store.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal", "terminalId": "term_1" }));
+    store.create_tab(
+        "tab_1",
+        "pane_1",
+        None,
+        json!({ "kind": "terminal", "terminalId": "term_1" }),
+    );
     let tab = store
         .split_pane(
             "pane_1",
@@ -725,7 +737,10 @@ fn split_pane_replaces_leaf_in_place_and_seeds_new_pane() {
 fn split_of_unknown_pane_is_not_found() {
     let store = LayoutStore::new();
     store.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal" }));
-    assert_eq!(store.split_pane("nope", "vertical", "p2", json!({"kind":"terminal"})), None);
+    assert_eq!(
+        store.split_pane("nope", "vertical", "p2", json!({"kind":"terminal"})),
+        None
+    );
 }
 
 #[test]
@@ -733,10 +748,22 @@ fn close_pane_guards_last_pane_then_rebuilds_grid() {
     let store = LayoutStore::new();
     store.create_tab("tab_1", "p1", None, json!({ "kind": "terminal" }));
     assert_eq!(store.close_pane("p1"), ClosePaneOutcome::LastPane);
-    store.split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" })).unwrap();
-    store.split_pane("p2", "vertical", "p3", json!({ "kind": "editor", "filePath": "/x" })).unwrap();
+    store
+        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
+        .unwrap();
+    store
+        .split_pane(
+            "p2",
+            "vertical",
+            "p3",
+            json!({ "kind": "editor", "filePath": "/x" }),
+        )
+        .unwrap();
     assert_eq!(store.close_pane("nope"), ClosePaneOutcome::NotFound);
-    assert_eq!(store.close_pane("p1"), ClosePaneOutcome::Closed("tab_1".to_string()));
+    assert_eq!(
+        store.close_pane("p1"),
+        ClosePaneOutcome::Closed("tab_1".to_string())
+    );
     // Legacy buildGridLayout(2) = horizontal 50/50 split of the remaining two.
     let snap = store.get_normalized_snapshot(Some("tab_1"));
     let node = &snap["layouts"]["tab_1"];
@@ -756,27 +783,49 @@ fn close_pane_guards_last_pane_then_rebuilds_grid() {
 fn close_pane_three_remaining_builds_two_row_grid() {
     let store = LayoutStore::new();
     store.create_tab("t", "p1", None, json!({ "kind": "terminal" }));
-    store.split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" })).unwrap();
-    store.split_pane("p2", "horizontal", "p3", json!({ "kind": "terminal" })).unwrap();
-    store.split_pane("p3", "horizontal", "p4", json!({ "kind": "terminal" })).unwrap();
-    assert_eq!(store.close_pane("p1"), ClosePaneOutcome::Closed("t".to_string()));
+    store
+        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
+        .unwrap();
+    store
+        .split_pane("p2", "horizontal", "p3", json!({ "kind": "terminal" }))
+        .unwrap();
+    store
+        .split_pane("p3", "horizontal", "p4", json!({ "kind": "terminal" }))
+        .unwrap();
+    assert_eq!(
+        store.close_pane("p1"),
+        ClosePaneOutcome::Closed("t".to_string())
+    );
     let node = store.get_normalized_snapshot(Some("t"))["layouts"]["t"].clone();
     // buildGridLayout(3): vertical split; top row = buildHorizontalRow(ceil(3/2)=2).
     assert_eq!(node["direction"], json!("vertical"));
     assert_eq!(node["children"][0]["direction"], json!("horizontal"));
     assert_eq!(node["children"][0]["children"][0]["id"], json!("p2"));
     assert_eq!(node["children"][0]["children"][1]["id"], json!("p3"));
-    assert_eq!(node["children"][1], json!({ "type": "leaf", "id": "p4", "content": { "kind": "terminal" } }));
+    assert_eq!(
+        node["children"][1],
+        json!({ "type": "leaf", "id": "p4", "content": { "kind": "terminal" } })
+    );
 }
 
 #[test]
 fn select_pane_with_invalid_tab_id_falls_back_to_owning_tab() {
     let store = LayoutStore::new();
-    store.create_tab("tab_1", "pane_1", Some("alpha".to_string()), json!({ "kind": "terminal" }));
-    let (tab, pane) = store.select_pane(Some("missing_tab"), "pane_1").expect("resolved");
+    store.create_tab(
+        "tab_1",
+        "pane_1",
+        Some("alpha".to_string()),
+        json!({ "kind": "terminal" }),
+    );
+    let (tab, pane) = store
+        .select_pane(Some("missing_tab"), "pane_1")
+        .expect("resolved");
     assert_eq!((tab.as_str(), pane.as_str()), ("tab_1", "pane_1"));
     assert_eq!(store.active_tab_id().as_deref(), Some("tab_1"));
-    assert_eq!(store.list_tabs()[0].active_pane_id.as_deref(), Some("pane_1"));
+    assert_eq!(
+        store.list_tabs()[0].active_pane_id.as_deref(),
+        Some("pane_1")
+    );
 }
 
 #[test]
@@ -839,8 +888,15 @@ fn attach_replaces_content_and_reseeds_only_untouched_titles() {
     // Untouched title: reseeds from the NEW content.
     let store2 = LayoutStore::new();
     store2.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal" }));
-    assert!(store2.attach_pane_content("tab_1", "pane_1", json!({ "kind": "terminal", "terminalId": "term_2", "mode": "codex" })));
-    assert_eq!(store2.list_panes(Some("tab_1"))[0].title.as_deref(), Some("Codex CLI"));
+    assert!(store2.attach_pane_content(
+        "tab_1",
+        "pane_1",
+        json!({ "kind": "terminal", "terminalId": "term_2", "mode": "codex" })
+    ));
+    assert_eq!(
+        store2.list_panes(Some("tab_1"))[0].title.as_deref(),
+        Some("Codex CLI")
+    );
     assert!(!store2.attach_pane_content("missing_tab", "pane_1", json!({"kind":"terminal"})));
 }
 
@@ -870,7 +926,10 @@ fn swap_pane_swaps_content_and_titles() {
         ),
         "conn1",
     );
-    assert_eq!(store.swap_pane(Some("tab_a"), "pane_1", "pane_2"), Some("tab_a".to_string()));
+    assert_eq!(
+        store.swap_pane(Some("tab_a"), "pane_1", "pane_2"),
+        Some("tab_a".to_string())
+    );
     let panes = store.list_panes(Some("tab_a"));
     assert_eq!(panes[0].kind.as_deref(), Some("editor"));
     assert_eq!(panes[0].title.as_deref(), Some("Editor"));
@@ -884,7 +943,12 @@ fn swap_pane_swaps_content_and_titles() {
 fn close_tab_falls_forward_active_and_clears_metadata() {
     let store = LayoutStore::new();
     store.create_tab("tab_1", "p1", None, json!({ "kind": "terminal" }));
-    store.create_tab("tab_2", "p2", None, json!({ "kind": "browser", "url": "https://x.io", "devToolsOpen": false }));
+    store.create_tab(
+        "tab_2",
+        "p2",
+        None,
+        json!({ "kind": "browser", "url": "https://x.io", "devToolsOpen": false }),
+    );
     assert_eq!(store.active_tab_id().as_deref(), Some("tab_2"));
     assert!(store.close_tab("tab_2"));
     assert!(!store.close_tab("tab_2"));
@@ -902,7 +966,12 @@ fn close_tab_falls_forward_active_and_clears_metadata() {
 fn has_tab_matches_id_or_title() {
     let store = LayoutStore::new();
     assert!(!store.has_tab("anything"));
-    store.create_tab("tab_1", "p1", Some("Alpha".to_string()), json!({ "kind": "terminal" }));
+    store.create_tab(
+        "tab_1",
+        "p1",
+        Some("Alpha".to_string()),
+        json!({ "kind": "terminal" }),
+    );
     assert!(store.has_tab("tab_1"));
     assert!(store.has_tab("Alpha"));
     assert!(!store.has_tab("nope"));
@@ -912,14 +981,22 @@ fn has_tab_matches_id_or_title() {
 fn resize_pane_sets_split_sizes() {
     let store = LayoutStore::new();
     store.create_tab("t", "p1", None, json!({ "kind": "terminal" }));
-    store.split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" })).unwrap();
+    store
+        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
+        .unwrap();
     let split_id = store.get_normalized_snapshot(None)["layouts"]["t"]["id"]
         .as_str()
         .expect("split id")
         .to_string();
     // No-tab filter resolution + sizes write.
-    assert_eq!(store.resize_pane(None, &split_id, [30.0, 70.0]), Some("t".to_string()));
-    assert_eq!(store.get_split_sizes(Some("t"), &split_id), Some((30.0, 70.0)));
+    assert_eq!(
+        store.resize_pane(None, &split_id, [30.0, 70.0]),
+        Some("t".to_string())
+    );
+    assert_eq!(
+        store.get_split_sizes(Some("t"), &split_id),
+        Some((30.0, 70.0))
+    );
     // Unknown split / wrong-length sizes.
     assert_eq!(store.get_split_sizes(None, "missing"), None);
     assert_eq!(store.resize_pane(None, "missing", [1.0, 2.0]), None);
@@ -938,7 +1015,10 @@ fn helper_lookups_find_panes_and_terminal_ids() {
         json!("term_1")
     );
     assert_eq!(store.get_pane_snapshot("nope"), None);
-    assert_eq!(store.resolve_pane_to_terminal("pane_1").as_deref(), Some("term_1"));
+    assert_eq!(
+        store.resolve_pane_to_terminal("pane_1").as_deref(),
+        Some("term_1")
+    );
     assert_eq!(store.resolve_pane_to_terminal("nope"), None);
     assert_eq!(
         store.find_pane_by_terminal_id("term_1"),
@@ -946,9 +1026,14 @@ fn helper_lookups_find_panes_and_terminal_ids() {
     );
     // After a split, the parent split is findable.
     store.create_tab("tab_b", "p1", None, json!({ "kind": "terminal" }));
-    store.split_pane("p1", "vertical", "p2", json!({ "kind": "terminal" })).unwrap();
+    store
+        .split_pane("p1", "vertical", "p2", json!({ "kind": "terminal" }))
+        .unwrap();
     let (tab, split_id) = store.find_split_for_pane("p2").expect("parent split");
     assert_eq!(tab, "tab_b");
-    assert_eq!(store.get_split_sizes(Some("tab_b"), &split_id), Some((50.0, 50.0)));
+    assert_eq!(
+        store.get_split_sizes(Some("tab_b"), &split_id),
+        Some((50.0, 50.0))
+    );
     assert_eq!(store.find_split_for_pane("pane_1"), None);
 }
