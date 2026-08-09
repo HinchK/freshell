@@ -23,6 +23,11 @@ const MATRIX_SPECS = [
   // ordering (idle cleanup) with zero wall sleeps, and the normal-build
   // absence proof. Legacy is a true parity control (identical surface).
   /harness-14-server-clock\.spec\.ts$/,
+  // HARNESS-04 — multi-provider session corpus builder contract: fixture-only
+  // manifest/hash proof + legacy-open session-directory semantics + sidebar
+  // spot-check. The server leg pins kind:'legacy' under both projects (Rust
+  // indexing of this corpus is owed by later SESSION-* items).
+  /harness-04-session-corpus\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
   // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
   // categories (settings, session, terminal, browser-pane, multi-client).
