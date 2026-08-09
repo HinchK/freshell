@@ -7,6 +7,7 @@ import { externalTargetConfigured } from '../helpers/external-target.js'
 import {
   captureHostListeningPorts,
   captureResourceSnapshot,
+  captureStableBaseline,
   diffSnapshots,
   type ResourceSnapshot,
   type SnapshotDiff,
@@ -33,11 +34,12 @@ import {
  *  2. A bounded create→send→close×6 loop, followed by a WS `terminal.kill`
  *     per tab (the canonical server-side reap path on both servers —
  *     `DELETE /api/tabs/:id` deliberately only drops layout bookkeeping),
- *     returns the server to its bounded baseline: no new listening ports, no
- *     fd-handle/process growth, RSS within a leak-gate bound, and socket
- *     queues drained. Every run retains a process-tree artifact attachment;
- *     on bound violation the failure also lands as
- *     `leak-metrics-process-tree.json` in the Playwright output dir.
+ *     leaves NO process behind that was not already in the steady-state
+ *     baseline: no new listening ports, no survivor outside the baseline
+ *     live-pid set, no lingering zombie, no fd-handle/process growth, RSS
+ *     within a leak-gate bound, and socket queues drained. Every run retains
+ *     a process-tree artifact attachment; on bound violation the failure also
+ *     lands as `leak-metrics-process-tree.json` in the Playwright output dir.
  *  3. Restart boots back to exactly one listener with no inherited children;
  *     stop leaves no owned process alive and the port freed host-wide.
  *
@@ -204,20 +206,37 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
     const pid = testServer.info.pid
     expect(pid).toBeGreaterThan(0)
 
-    // Baseline must be captured AFTER any boot/create probe transients (e.g.
-    // the legacy server's short-lived `git` child, which reaps through a Z
-    // window) have drained — otherwise the growth/settle baselines are
-    // poisoned by a process that was never part of the steady state.
-    await expect
-      .poll(
-        () => {
-          const s = captureResourceSnapshot([pid])
-          return s.processes.length - liveProcesses(s).length // zombie count
-        },
-        { timeout: 15_000, intervals: [100, 250, 500] },
+    // Baseline must be the server's STEADY STATE, captured at a fixed point
+    // of the live-pid set — NOT the first moment no zombie exists. Gate B003
+    // (2026-08-09) proved the zombies==0-only gate unsound on the plain
+    // chromium project: the legacy server's WSL2 startup children
+    // (`ipconfig.exe` from bootstrap.ts LAN-IP detection, awaited pre-listen;
+    // `netsh.exe` from firewall.ts detectFirewall via the fire-and-forget
+    // startup getStatus() banner — measured alive in S-state at ~0.8-1.0s
+    // post-spawn, straddling the health-ok line) can still be RUNNING at
+    // capture time. Frozen into `before`, the transient then exits and the
+    // settle poll demands a population the steady state never reaches again
+    // (observed: "expected 2 live processes, got 1", 15s timeout). Under
+    // gate-time host load the race landed red 3/3; idle hosts green it.
+    // captureStableBaseline (unit-pinned in leak-metrics.test.ts) rides out
+    // BOTH live transients and zombie reap windows.
+    let before: ResourceSnapshot
+    try {
+      before = await captureStableBaseline([pid])
+    } catch (baselineError) {
+      // Retained process-tree artifact on baseline-drain failure too — the
+      // drain error message names the still-changing live set, and this pins
+      // the full tree at the moment of giving up.
+      const failureSnap = captureResourceSnapshot([pid])
+      await attachArtifact(testInfo, 'leak-metrics-baseline-failure', null, failureSnap, null)
+      const artifactPath = testInfo.outputPath('leak-metrics-process-tree.json')
+      await fs.mkdir(path.dirname(artifactPath), { recursive: true })
+      await fs.writeFile(
+        artifactPath,
+        JSON.stringify({ phase: 'baseline', error: String(baselineError), onFailure: failureSnap }, null, 2),
       )
-      .toBe(0)
-    const before = captureResourceSnapshot([pid])
+      throw baselineError
+    }
 
     // Exactly one listener: the server's own port. No pre-existing extras.
     expect(before.listeningPorts).toEqual([port])
@@ -250,14 +269,30 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
         await deleteTab(baseUrl, token, created.tabId)
       }
 
-      // Settle: the live tree returns to its baseline population (all PTYs
-      // reaped) and no zombie is left lingering.
+      // Settle — the exact checklist semantics ("leaves no owned process
+      // behind"): every still-live pid must ALREADY be in the baseline's
+      // fixed-point population (any loop-era process — PTY shell, git probe —
+      // that survives is a stray and fails), and no zombie is left lingering.
+      // Strict subset, not equality: a BASELINE pid MAY drain out during the
+      // loop — a baseline extra exiting is cleanup, not a leak; leak growth
+      // is gated by the stray set here and the diff bounds below. Strays are
+      // reported with comm:pid(ppid) so a future red is self-diagnosing.
+      const baselineLivePids = new Set(liveProcesses(before).map((p) => p.pid))
       await expect
-        .poll(() => liveProcesses(captureResourceSnapshot([pid])).length, { timeout: 15_000, intervals: [250, 500] })
-        .toBe(liveProcesses(before).length)
-      await expect
-        .poll(() => captureResourceSnapshot([pid]).processes.length - liveProcesses(captureResourceSnapshot([pid])).length, { timeout: 15_000, intervals: [250, 500] })
-        .toBe(0)
+        .poll(
+          () => {
+            const s = captureResourceSnapshot([pid])
+            const live = liveProcesses(s)
+            return {
+              strays: live
+                .filter((p) => !baselineLivePids.has(p.pid))
+                .map((p) => `${p.comm}:${p.pid}(ppid ${p.ppid})`),
+              zombies: s.processes.length - live.length,
+            }
+          },
+          { timeout: 15_000, intervals: [250, 500] },
+        )
+        .toEqual({ strays: [], zombies: 0 })
     } catch (loopError) {
       // Retained process-tree artifact on ANY mid-loop failure (checklist:
       // "fails with a retained process-tree artifact if the bound is

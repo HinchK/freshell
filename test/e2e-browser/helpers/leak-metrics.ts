@@ -328,6 +328,95 @@ export function captureResourceSnapshot(rootPids: number[], opts: CaptureOptions
   }
 }
 
+export interface StableBaselineOptions {
+  /**
+   * Consecutive qualifying samples required before the tree is declared
+   * steady. A sample qualifies iff it is zombie-free AND its live (non-Z)
+   * pid set equals the previous qualifying sample's. Default 3, minimum 2
+   * (a single sample can never be a fixed point).
+   */
+  stableSamples?: number
+  /** Wait between samples. Default 250ms (a fixed point then spans ≥500ms). */
+  intervalMs?: number
+  /** Give up after this long; the error names the still-changing live set. Default 20s. */
+  timeoutMs?: number
+  /** Injectable for tests; default `captureResourceSnapshot`. */
+  capture?: (rootPids: number[]) => ResourceSnapshot
+  /** Injectable for tests; default setTimeout-based. */
+  sleep?: (ms: number) => Promise<void>
+  /** Injectable for tests; default Date.now. */
+  nowMs?: () => number
+}
+
+/**
+ * Capture a baseline ONLY at a fixed point of the process tree: the live
+ * (non-zombie) pid set must be identical across `stableSamples` consecutive
+ * zombie-free samples.
+ *
+ * Why not merely wait for zombies == 0 (gate B003, 2026-08-09): a baseline
+ * captured the instant no zombie exists can still freeze a still-RUNNING
+ * transient child into `before` — measured live on WSL2: the legacy server's
+ * startup spawns `ipconfig.exe` (bootstrap.ts LAN-IP detection, awaited
+ * pre-listen) and `netsh.exe` (firewall.ts detectFirewall via the
+ * fire-and-forget startup getStatus() banner) in S-state around the
+ * health-ok line. Such a transient holds no leak (it exits on its own), but
+ * an equality-settle assertion calibrated to a baseline that contains it can
+ * then never be satisfied ("expected 2 live, got 1", 15s timeout). The
+ * fixed-point protocol derives the baseline from the server's ACTUAL steady
+ * state on any host and any load — a zombie appearing mid-streak resets it,
+ * so a zombie that never reaps still yields a (loud) timeout, never a
+ * silently-unstable baseline.
+ */
+export async function captureStableBaseline(
+  rootPids: number[],
+  opts: StableBaselineOptions = {},
+): Promise<ResourceSnapshot> {
+  const stableSamples = opts.stableSamples ?? 3
+  const intervalMs = opts.intervalMs ?? 250
+  const timeoutMs = opts.timeoutMs ?? 20_000
+  const capture = opts.capture ?? ((pids: number[]) => captureResourceSnapshot(pids))
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const nowMs = opts.nowMs ?? (() => Date.now())
+
+  if (!Number.isInteger(stableSamples) || stableSamples < 2) {
+    throw new RangeError(`captureStableBaseline: stableSamples must be an integer >= 2 (got ${stableSamples})`)
+  }
+
+  const start = nowMs()
+  let streak = 0
+  let prevLiveKey: string | null = null
+
+  for (;;) {
+    const snap = capture(rootPids)
+    const live = snap.processes.filter((p) => p.state !== 'Z')
+    const liveKey = live.map((p) => p.pid).sort((a, b) => a - b).join(',')
+    const zombies = snap.processes.length - live.length
+
+    if (zombies === 0 && liveKey === prevLiveKey) {
+      streak += 1
+    } else if (zombies === 0) {
+      streak = 1
+      prevLiveKey = liveKey
+    } else {
+      // A zombie window discards all earlier clean samples.
+      streak = 0
+      prevLiveKey = null
+    }
+
+    if (streak >= stableSamples) return snap
+
+    if (nowMs() - start >= timeoutMs) {
+      const describe = (p: ProcessSnapshot) => `${p.comm}:${p.pid}(ppid ${p.ppid}, ${p.state})`
+      throw new Error(
+        `captureStableBaseline: tree rooted at [${rootPids.join(', ')}] never reached a fixed point ` +
+        `within ${timeoutMs}ms (last live set: ${live.map(describe).join(', ') || '(empty)'}; zombies: ${zombies})`,
+      )
+    }
+
+    await sleep(intervalMs)
+  }
+}
+
 /**
  * Every TCP LISTEN port on the (net-namespace) host, regardless of which
  * process owns it — used by teardown assertions of the form "the owned

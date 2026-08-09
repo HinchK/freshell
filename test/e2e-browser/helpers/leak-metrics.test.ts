@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   captureHostListeningPorts,
   captureResourceSnapshot,
+  captureStableBaseline,
   diffSnapshots,
   type ProcessSnapshot,
   type ResourceSnapshot,
@@ -293,6 +294,83 @@ describe('diffSnapshots', () => {
     expect(
       diffSnapshots(before, after, { maxTotalSocketQueueBytes: 4 * 1024 * 1024 }).failures,
     ).toEqual([])
+  })
+})
+
+describe('captureStableBaseline (fixture capture sequences)', () => {
+  const serverProc = () => proc({ pid: 1000, comm: 'node' })
+  const noSleep = () => Promise.resolve()
+
+  /** Capture fn replaying `snaps` forever (last element repeats) with a call counter. */
+  function sequenceCapture(snaps: ResourceSnapshot[]) {
+    let calls = 0
+    return {
+      calls: () => calls,
+      capture: (): ResourceSnapshot => snaps[Math.min(calls++, snaps.length - 1)],
+    }
+  }
+
+  it('waits out a LIVE (non-zombie) transient instead of freezing it into the baseline (gate B003 shape)', async () => {
+    // The B003 chromium-leg defect: zombies == 0 at every sample, but a
+    // transient child (the WSL2 netsh.exe/ipconfig.exe class startup probe)
+    // is still RUNNING at capture time. A zombies==0-only gate would freeze
+    // it into `before` and then demand the tree return to the poisoned
+    // population at settle ("expected 2 live, got 1"). The stable baseline
+    // must ride the transient out and return the steady state.
+    const transient = snap({ processes: [serverProc(), proc({ pid: 1002, ppid: 1000, comm: 'netsh.exe' })] })
+    const steady = snap({ processes: [serverProc()] })
+    const seq = sequenceCapture([transient, transient, steady])
+
+    const base = await captureStableBaseline([1000], { capture: seq.capture, sleep: noSleep, intervalMs: 0 })
+
+    expect(base.processes.map((p) => p.pid)).toEqual([1000])
+    // T streak=1, T streak=2, S reset→1, S streak=2, S streak=3 → stable at the 5th capture.
+    expect(seq.calls()).toBe(5)
+  })
+
+  it('restarts the stability streak when a zombie passes through mid-sequence', async () => {
+    const steady = snap({ processes: [serverProc()] })
+    const zombieWindow = snap({ processes: [serverProc(), proc({ pid: 1003, ppid: 1000, comm: 'git', state: 'Z', rssBytes: 0 })] })
+    const seq = sequenceCapture([steady, steady, zombieWindow, steady])
+
+    const base = await captureStableBaseline([1000], { capture: seq.capture, sleep: noSleep, intervalMs: 0 })
+
+    expect(base.processes.map((p) => p.pid)).toEqual([1000])
+    // S streak=1, S streak=2, Z resets to 0 (a zombie window MUST discard
+    // earlier clean samples), then S×3 → stable at the 6th capture.
+    expect(seq.calls()).toBe(6)
+  })
+
+  it('throws a self-diagnosing error naming the still-changing live set when no fixed point is reached', async () => {
+    const withTransient = snap({ processes: [serverProc(), proc({ pid: 1002, ppid: 1000, comm: 'netsh.exe' })] })
+    const steady = snap({ processes: [serverProc()] })
+    // Oscillates forever; fake clock jumps past the timeout on the third sleep.
+    let t = 0
+    let calls = 0
+    const seq = [withTransient, steady, withTransient]
+
+    await expect(
+      captureStableBaseline([1000], {
+        capture: () => seq[Math.min(calls++, seq.length - 1)],
+        sleep: async () => { t += 600 },
+        nowMs: () => t,
+        intervalMs: 600,
+        timeoutMs: 1000,
+      }),
+    ).rejects.toThrow(/never reached a fixed point.*netsh\.exe:1002/s)
+  })
+
+  it('rejects stableSamples < 2 without ever capturing', async () => {
+    let captured = 0
+    await expect(
+      captureStableBaseline([1000], {
+        stableSamples: 1,
+        capture: () => { captured++; return snap({ processes: [serverProc()] }) },
+        sleep: noSleep,
+        intervalMs: 0,
+      }),
+    ).rejects.toThrow(RangeError)
+    expect(captured).toBe(0)
   })
 })
 
