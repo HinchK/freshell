@@ -28,6 +28,29 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { EchoWsFixture } from '../helpers/echo-ws-fixture.js'
 import { RawWsClient, WS_OPCODE, rawHttpRequest } from '../helpers/raw-clients.js'
+import { externalTargetConfigured, resolveExternalTarget } from '../helpers/external-target.js'
+
+/**
+ * Round-4 review: the raw clients are loopback `ws://`/`http://`-only by
+ * design — TLS needs a trusted test-certificate fixture, which is
+ * HARNESS-06's deliverable ("Include ... trusted HTTPS"), not this item's.
+ * When the suite is pointed at a SECURE external target
+ * (`FRESHELL_E2E_TARGET_URL=https://...` ⇒ derived `wss://`), Group B would
+ * otherwise fail on the protocol guard before exercising anything, so it
+ * skips with an explicit, recorded reason. Group A is target-independent
+ * (it owns its fixture server) and always runs.
+ */
+const SECURE_EXTERNAL_TARGET = (() => {
+  if (!externalTargetConfigured(process.env)) return false
+  try {
+    const target = resolveExternalTarget(process.env)
+    return target.wsUrl.startsWith('wss:') || target.baseUrl.startsWith('https:')
+  } catch {
+    return false
+  }
+})()
+const SECURE_EXTERNAL_SKIP_REASON =
+  'HARNESS-05 raw clients are loopback ws://http:// only; TLS targets await HARNESS-06 (trusted HTTPS fixture)'
 
 /** Structured per-leg evidence line, harvested from Playwright output into
  *  docs/plans/df1-evidence/HARNESS-05.md. */
@@ -140,6 +163,8 @@ test.describe.serial('Group A: raw-client acceptance vs deterministic echo/error
 })
 
 test.describe.serial('Group B: raw-client capability legs against the real server', () => {
+  test.skip(SECURE_EXTERNAL_TARGET, SECURE_EXTERNAL_SKIP_REASON)
+
   const clients: RawWsClient[] = []
 
   async function connect(wsUrl: string): Promise<RawWsClient> {

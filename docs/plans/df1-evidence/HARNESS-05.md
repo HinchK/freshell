@@ -56,10 +56,17 @@ load-bearing audit ledger, all rows VERIFIED).
 
 No shared-file edits other than the one-line MATRIX registration.
 
-## Green runs (final SHA, after review-round-1 fixes)
+## Green runs (final SHA)
 
-Unit (helper config): `npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`
-→ **34/34 passed**.
+Unit (helper config), repo-owned direct-vitest path — VERIFIED WORKING at
+final SHA (result **40/40 passed**):
+```
+FRESHELL_TEST_SUMMARY="HARNESS-05 scoped e2e-helper vitest" npm run test:vitest -- run --config test/e2e-browser/vitest.config.ts raw-clients
+```
+(The e2e-helper vitest config is deliberately outside `npm test`; this
+coordinated passthrough runs exactly it. Development-loop runs used raw
+`npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`;
+round-4 review replaced the recorded command with the repo-owned path.)
 
 Playwright (pw lease held for each run):
 - `--project=legacy-chromium specs/harness-05-raw-clients.spec.ts`:
@@ -134,6 +141,21 @@ Dispositions (all RED-first):
 Final verification at HEAD (post-round-3): unit **39/39**; typecheck gate
 **PASS**; legacy-chromium **10 passed (16.1s)** + **10 passed (16.9s)**;
 rust-chromium **10 passed (31.9s)** + **10 passed (17.4s)** — 2 consecutive
+green per leg at the final SHA.
+
+**Round 4** — independent fresheyes review (GPT family, FRESHPID 1235693,
+diff at 168670b15): verdict FAILED, 3 majors. Dispositions:
+
+| # | Finding | Disposition |
+|---|---------|-------------|
+| R12 | 101-header validation used substring checks — `Upgrade: notwebsocket` / `Connection: notupgrade` waved through | FIXED: RFC 7230 comma-token parsing with exact case-insensitive tokens; `notwebsocket`-rejection regression test (RED→green). |
+| R13 | matrix spec would break SECURE external-target runs (`FRESHELL_E2E_TARGET_URL=https://…` → derived `wss://`), which the raw clients deliberately reject | FIXED with an explicit scope call, not silence: TLS needs a trusted test-certificate fixture — that is HARNESS-06's own deliverable ("Include … trusted HTTPS"). Group B now `test.skip`s with a recorded reason when the external target is secure; Group A (target-independent) always runs; the `wss:` guard error names the deferral. Verified still-10/10 on both normal legs after the change. |
+| R14 | runbook/evidence used raw `npx vitest` — not a repo-coordinated workflow per AGENTS.md | FIXED: verified the repo-owned passthrough `FRESHELL_TEST_SUMMARY="HARNESS-05 scoped e2e-helper vitest" npm run test:vitest -- run --config test/e2e-browser/vitest.config.ts raw-clients` (40/40 at the verify SHA) and replaced every recorded command. |
+
+Final verification at HEAD (post-round-4): unit **40/40** via the
+repo-owned path; typecheck gate **PASS**;
+legacy-chromium **10 passed (16.4s)** + **10 passed (15.8s)**;
+rust-chromium **10 passed (28.0s)** + **10 passed (15.7s)** — 2 consecutive
 green per leg at the final SHA.
 
 ## Per-leg recorded observations (HARNESS-05-LEG lines)

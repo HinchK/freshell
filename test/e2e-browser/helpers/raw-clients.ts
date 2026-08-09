@@ -283,7 +283,10 @@ export class RawWsClient {
       throw new Error(`RawWsClient: only ws:// URLs are supported (got ${url.protocol})`)
     }
     if (url.protocol === 'wss:') {
-      throw new Error('RawWsClient: wss:// is not supported by the raw client (loopback tests use ws://)')
+      throw new Error(
+        'RawWsClient: wss:// is out of scope for this loopback helper — TLS support awaits ' +
+        'HARNESS-06\'s trusted-HTTPS fixture (specs must test.skip secure external targets)',
+      )
     }
     const host = url.hostname
     const port = url.port ? Number(url.port) : 80
@@ -338,11 +341,14 @@ export class RawWsClient {
 
     const { record } = parsed
     if (record.status === 101) {
-      // RFC 6455 §4.2.2: a valid upgrade MUST carry Upgrade: websocket and
-      // Connection: Upgrade — a bare "101" with no upgrade semantics is not
-      // a WebSocket handshake, no matter how the status line reads.
-      const upgradeOk = (record.headers['upgrade'] ?? '').toLowerCase().includes('websocket')
-      const connectionOk = (record.headers['connection'] ?? '').toLowerCase().includes('upgrade')
+      // RFC 6455 §4.2.2 + RFC 7230 token lists (round-4 review): a valid
+      // upgrade MUST carry Upgrade: websocket and Connection: Upgrade, with
+      // EXACT case-insensitive tokens — substring checks would wave through
+      // "Upgrade: notwebsocket" / "Connection: notupgrade".
+      const upgradeOk = (record.headers['upgrade'] ?? '')
+        .split(',').map((t) => t.trim().toLowerCase()).includes('websocket')
+      const connectionOk = (record.headers['connection'] ?? '')
+        .split(',').map((t) => t.trim().toLowerCase()).includes('upgrade')
       if (!upgradeOk || !connectionOk) {
         socket.destroy()
         throw new RawWsHandshakeError(record.status, record.statusMessage, record.headers,

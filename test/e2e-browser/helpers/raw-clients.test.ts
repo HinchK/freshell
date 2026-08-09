@@ -724,6 +724,25 @@ describe('RawWsClient — review-round-3 fixes', () => {
     }
   })
 
+  it('R12: substring lookalikes (Upgrade: notwebsocket / Connection: notupgrade) are rejected', async () => {
+    const crypto = await import('node:crypto')
+    const srv = await rawServer((sock, head) => {
+      const key = head.match(/Sec-WebSocket-Key: (.+)\r\n/)![1]
+      const accept = crypto.createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+      sock.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: notwebsocket\r\nConnection: notupgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      )
+      sock.on('data', () => {})
+    })
+    try {
+      await expect(RawWsClient.connect(`ws://127.0.0.1:${srv.port}/`)).rejects.toThrow(/Upgrade/)
+    } finally {
+      srv.close()
+    }
+  })
+
   it('R10: a peer close frame carrying reserved code 1005 is recorded but NEVER echoed on the wire', async () => {
     let repliedCloseWireCode: number | null = null
     const srv = await rawServer((sock) => {

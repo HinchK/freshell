@@ -127,7 +127,7 @@ completion; falsified ones change the plan inline.
   (4000, 'fixture-bye'); `drop` yields client-side socket end without close
   frame; ledger entry has closeCode/framesReceived; stop() idempotent.
 - [ ] **Step 2: run RED** —
-  `npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`
+  `FRESHELL_TEST_SUMMARY="HARNESS-05 scoped e2e-helper vitest" npm run test:vitest -- run --config test/e2e-browser/vitest.config.ts raw-clients`
   → fails (module not found).
 - [ ] **Step 3: implement** `echo-ws-fixture.ts`.
 - [ ] **Step 4: run GREEN** (same command).
@@ -364,7 +364,10 @@ recorded):
   (learned the hard way, Playwright 1.52): positional filters must be
   testDir-relative PATHS (`specs/harness-05-raw-clients.spec.ts`) — a bare
   file-name substring does NOT filter and silently runs the whole matrix.
-  - `npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`
+  - `FRESHELL_TEST_SUMMARY="HARNESS-05 scoped e2e-helper vitest" npm run test:vitest -- run --config test/e2e-browser/vitest.config.ts raw-clients`
+    (repo-owned direct-vitest path per AGENTS.md; raw `npx vitest` is not a
+    coordinated workflow — round-4 review. The e2e-helper vitest config is
+    deliberately outside `npm test`; this passthrough runs exactly it.)
   - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=legacy-chromium "specs/harness-05-raw-clients.spec.ts"` ×2
   - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium "specs/harness-05-raw-clients.spec.ts"` ×2
   (pw lease held across each run; flaky-prone → the runs ARE the x2.)
