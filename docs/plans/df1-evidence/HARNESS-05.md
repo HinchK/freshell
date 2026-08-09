@@ -37,7 +37,7 @@ load-bearing audit ledger, all rows VERIFIED).
   ledger (open/close/code/reason/frames/errors); never sends unprompted
   frames; per-connection `error` handlers so intentionally-malformed clients
   never crash the process (load-bearing probe lesson).
-- `test/e2e-browser/helpers/raw-clients.test.ts` — 39 unit/integration
+- `test/e2e-browser/helpers/raw-clients.test.ts` — 40 unit/integration
   tests of helper + fixture (runs under `test/e2e-browser/vitest.config.ts`,
   the dedicated E2E-helper vitest config).
 - `test/e2e-browser/specs/harness-05-raw-clients.spec.ts` — committed probe
@@ -157,6 +157,13 @@ repo-owned path; typecheck gate **PASS**;
 legacy-chromium **10 passed (16.4s)** + **10 passed (15.8s)**;
 rust-chromium **10 passed (28.0s)** + **10 passed (15.7s)** — 2 consecutive
 green per leg at the final SHA.
+
+**Round 5 (final)** — independent fresheyes review (GPT family, FRESHPID
+1819823, diff at 6c5790e1e): **INDEPENDENT CODE REVIEW PASSED** — "no
+blocking issues … all prior round fixes are present". One nit (stale
+test-count "39" → 40 in this evidence) fixed in the same commit as this
+record. Review loop closed: 5 rounds (≤5 budget), 15 findings raised across
+rounds 1–4, all fixed with tests and re-verified; round 5 clean.
 
 ## Per-leg recorded observations (HARNESS-05-LEG lines)
 
