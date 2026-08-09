@@ -11,6 +11,11 @@ import {
 } from './manifest.js'
 import { claudeProjectSlug, writeClaudeSession } from './claude.js'
 import { codexDatePath, writeCodexSession } from './codex.js'
+import { writeOpencodeCorpus, type OpencodeSessionSpec } from './opencode.js'
+import {
+  runOpencodeListingQuery,
+  THREE_VIEWS_MARKER_SQL_PATTERN,
+} from '../../../../server/coding-cli/providers/opencode-listing-query.js'
 import type { CorpusContext } from './types.js'
 
 /**
@@ -343,6 +348,65 @@ describe('session-corpus codex writer', () => {
     expect(exp.visibility).toBe('absent')
     expect(exp.title).toBeUndefined() // never indexed: no wire semantics
     expect(exp.summary).toBeUndefined()
+  })
+})
+
+describe('session-corpus opencode writer', () => {
+  function ocSpec(home: string, over: Partial<OpencodeSessionSpec> & Pick<OpencodeSessionSpec, 'role'>): OpencodeSessionSpec {
+    return {
+      sessionId: `h04corpus-oc-${over.role}`,
+      title: `h04corpus-testtoken ${over.role}`,
+      directory: path.join(home, 'h04corpus-testtoken', 'projects', `${over.role}-project`),
+      projectId: `proj-${over.role}`,
+      projectWorktree: path.join(home, 'h04corpus-testtoken', 'projects', `${over.role}-project`),
+      timeCreated: Date.parse('2026-07-20T08:00:00.000Z'),
+      timeUpdated: Date.parse('2026-07-20T08:00:00.001Z'),
+      ...over,
+    }
+  }
+
+  it('creates the DB under XDG data home; production listing query sees only root non-archived rows', async () => {
+    const home = await mkHome()
+    const ctx = mkCtx(home)
+    const specs = [
+      ocSpec(home, { role: 'delta' }),
+      ocSpec(home, { role: 'echo', timeUpdated: Date.parse('2026-07-19T08:00:00.001Z') }),
+      ocSpec(home, { role: 'archived', timeArchived: Date.parse('2026-07-21T00:00:00.000Z') }),
+      ocSpec(home, { role: 'child', parentId: 'h04corpus-oc-delta' }),
+    ]
+    const exps = await writeOpencodeCorpus(ctx, specs)
+
+    // one hashed db file at the XDG data location
+    expect(ctx.files).toHaveLength(1)
+    expect(ctx.files[0].path).toBe('.local/share/opencode/opencode.db')
+
+    // THE production listing query (opencode-listing-query.ts) is the reader
+    // under test here: archived and child rows must not come back.
+    const dbPath = path.join(home, '.local', 'share', 'opencode', 'opencode.db')
+    const { rows } = await runOpencodeListingQuery(dbPath, THREE_VIEWS_MARKER_SQL_PATTERN)
+    const ids = rows.map((r) => r.sessionId).sort()
+    expect(ids).toEqual(['h04corpus-oc-delta', 'h04corpus-oc-echo'])
+
+    const delta = rows.find((r) => r.sessionId === 'h04corpus-oc-delta')!
+    expect(delta).toMatchObject({
+      cwd: specs[0].directory,
+      title: 'h04corpus-testtoken delta',
+      createdAt: specs[0].timeCreated,
+      lastActivityAt: specs[0].timeUpdated,
+      projectPath: specs[0].projectWorktree,
+    })
+
+    // expectations
+    const byRole = (role: string) => exps.find((e) => e.role === role)!
+    expect(byRole('delta')).toMatchObject({
+      provider: 'opencode', visibility: 'listed',
+      title: 'h04corpus-testtoken delta',
+      projectPath: specs[0].projectWorktree,
+      lastActivityAt: specs[0].timeUpdated, createdAt: specs[0].timeCreated,
+    })
+    expect(byRole('archived').visibility).toBe('absent')
+    expect(byRole('archived').title).toBeUndefined()
+    expect(byRole('child').visibility).toBe('absent')
   })
 })
 
