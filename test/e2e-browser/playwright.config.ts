@@ -70,6 +70,12 @@ const MATRIX_SPECS = [
   // checkpoint routes and the fresh-agent checkpoint UI are shared code
   // paths, not a Rust-only feature. See agent-checkpoint-rewind.spec.ts.
   /agent-checkpoint-rewind\.spec\.ts$/,
+  // Task 21 (naming-persistence sweep) -- cross-surface title convergence
+  // (pane header / sidebar / History / Overview / automation PATCH renames
+  // must converge on both surfaces). Pins EDEV-09; the client fixes are
+  // shared code, so legacy is a true regression control proving they didn't
+  // regress Node behavior. See title-sync-convergence.spec.ts.
+  /title-sync-convergence\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
@@ -78,6 +84,11 @@ const RUST_ONLY_SPECS = [
   /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
+  // Task 21 -- auto-title pipeline + settings split boot OWNED RustServers
+  // directly (per-test fake-Gemini seams / restart legs), so they only ever
+  // run under the rust-chromium project.
+  /auto-title-rust\.spec\.ts$/,
+  /settings-split-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -179,6 +190,19 @@ export default defineConfig({
         // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
         // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
         /deploy-tab-diff-rust\.spec\.ts$/,
+        // Task 21 -- auto-title pipeline (background sweep dir ->
+        // first-message -> Gemini AI ladder, generate-title route, terminal
+        // summary route) against per-test owned RustServers with a local
+        // fake Gemini on the Rust-only `FRESHELL_GEMINI_BASE_URL` seam
+        // (validator-A1 documented superset; no legacy equivalent).
+        /auto-title-rust\.spec\.ts$/,
+        // Task 21 -- settings split (CFG-12): browser-local appearance vs
+        // server-backed settings across two contexts + the RustServer
+        // restart durability leg. Rust-only: the matrix sibling
+        // (`settings-persistence-split.spec.ts`) depends on
+        // `legacyLocalSettingsSeed` (CFG-04/SESSION-13, unimplemented in
+        // Rust) and is `test.fail`-annotated on this project.
+        /settings-split-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
