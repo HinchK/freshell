@@ -405,16 +405,6 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
             }
         }
     }
-    // Task 18: the pass-level meta refresh — ONE `terminal.meta.updated`
-    // upsert batch per pass when anything changed (`server/index.ts:854-866`).
-    // Deliberately does NOT count toward `changed`: Node's metadata sync never
-    // publishes `sessions.changed` (only title/override changes do).
-    let meta_upserts = refresh_terminal_meta(state, &meta_work).await;
-    freshell_ws::terminal_meta::broadcast_terminal_meta_updated(
-        &state.broadcast_tx,
-        meta_upserts,
-        Vec::new(),
-    );
     if changed {
         broadcast_sessions_changed(state);
     }
