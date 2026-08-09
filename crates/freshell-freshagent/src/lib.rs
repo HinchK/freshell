@@ -266,6 +266,13 @@ pub struct FreshAgentState {
     /// Door 3: arm 2 of the in-gate liveness precondition (see
     /// [`SidecarLivenessProbe`]). `None` = arm contributes false.
     pub(crate) sidecar_liveness: Option<SidecarLivenessProbe>,
+    /// AUTO-01: the authoritative connected-UI layout store (the
+    /// `ui.layout.sync` mirror — [`layout_store::LayoutStore`], the port of
+    /// legacy `server/agent-api/layout-store.ts`). Shared with the WS
+    /// dispatch (which feeds it) simply because the WS slice wraps THIS same
+    /// `FreshAgentState` (`freshell-ws`'s `FreshOpencodeState::new`) — one
+    /// store per server process, like legacy's `WsHandler`-owned store.
+    layout_store: std::sync::Arc<layout_store::LayoutStore>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -337,7 +344,13 @@ impl FreshAgentState {
             resume_probe: None,
             on_stale_resume: None,
             sidecar_liveness: None,
+            layout_store: std::sync::Arc::new(layout_store::LayoutStore::new()),
         }
+    }
+
+    /// AUTO-01: the shared connected-UI layout store (see the field's doc).
+    pub fn layout_store(&self) -> &std::sync::Arc<layout_store::LayoutStore> {
+        &self.layout_store
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).

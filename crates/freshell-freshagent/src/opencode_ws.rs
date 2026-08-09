@@ -221,6 +221,13 @@ impl FreshOpencodeState {
         self.terminal_liveness = probe;
     }
 
+    /// The shared `FreshAgentState` this slice wraps. Surfaced for AUTO-01:
+    /// the freshell-ws client-message dispatch feeds this state's
+    /// [`crate::layout_store::LayoutStore`] from `ui.layout.sync` frames.
+    pub fn fresh_agent(&self) -> &FreshAgentState {
+        &self.fresh_agent
+    }
+
     /// Replace the default lease map with the ONE server-wide shared map (Task 13;
     /// called by `main.rs` before this state is cloned into the router).
     pub fn set_session_leases(
