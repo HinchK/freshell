@@ -206,6 +206,7 @@ describe('harness-06 target-server: hot-reload surface', () => {
     // Open the SSE stream, then bump; the stream must carry the new build.
     const sse = await fetch(`${s.baseUrl}/hot/stream`, { headers: { accept: 'text/event-stream' } })
     expect(sse.headers.get('content-type')).toContain('text/event-stream')
+    expect(s.sseClientCount()).toBe(1)
     const reader = sse.body!.getReader()
     const bumpResult = s.bumpBuild()
     expect(bumpResult).toBe(2)

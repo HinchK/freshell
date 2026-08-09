@@ -89,6 +89,13 @@ const MATRIX_SPECS = [
   // true parity control (same additive page `projectColors` channel on
   // both servers). See project-colors-matrix.spec.ts.
   /project-colors-matrix\.spec\.ts$/,
+  // HARNESS-06 -- deterministic misc-fixture smoke (HTTP/WS/hot-reload
+  // target, file/SMB trees, fake editor, fake Gemini, fake Kilroy runtime,
+  // signed update feed, trusted HTTPS). Server-kind-agnostic: the spec
+  // requests only Playwright base fixtures (the worker-lazy `testServer`
+  // never boots), so it runs identically under all three projects. See
+  // harness-06-misc-fixtures.spec.ts + docs/plans/df1-evidence/HARNESS-06.md.
+  /harness-06-misc-fixtures\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project

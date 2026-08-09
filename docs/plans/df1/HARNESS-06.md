@@ -105,9 +105,9 @@ test/e2e-browser/playwright.config.ts                     # +1 MATRIX_SPECS line
 
 **target-server.ts** — one Node process, ephemeral port (`127.0.0.1:0`), optional TLS.
 - `startTargetServer(opts?: { port?: number; tls?: TlsKeyPair }): Promise<TargetServer>`
-- `TargetServer`: `{ port, baseUrl, wsUrl, stop(), ledger(): readonly TargetLedgerEntry[], clearLedger(), bumpBuild(): number, build(): number, closeWebSockets(code?: number, reason?: string) }`
+- `TargetServer`: `{ port, baseUrl, wsUrl, stop(), ledger(): readonly TargetLedgerEntry[], clearLedger(), bumpBuild(): number, build(): number, sseClientCount(): number, closeWebSockets(code?: number, reason?: string) }` (`sseClientCount` added in task 7 — deterministic "EventSource connected" gate before bumping in browser legs.)
 - HTTP surfaces:
-  - `GET /page` — marker page: `<div id="fixture-marker" data-build="…">`; query `csp=<policy>`, `xfo=deny|sameorigin`, `title=<t>`.
+  - `GET /page` — marker page: `<div id="fixture-marker" data-fixture="harness-06">`; query `csp=<policy>`, `xfo=deny|sameorigin`, `title=<t>`. (The build index lives on `/hot`'s `#build-marker`.)
   - `ALL /echo` — records `{method,path,query,headers,bodyBase64}`; responds the same as JSON (exact upstream inputs).
   - `GET /stream?chunks=N&delayMs=D` — N sequential `chunk-i/N` lines, `Transfer-Encoding: chunked`.
   - `GET /hot` — page with `#build-marker` + EventSource(`/hot/stream`) that reloads on a bump event; `POST /__admin/bump` increments the build deterministically.

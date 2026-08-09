@@ -200,6 +200,8 @@ export class TargetServer {
   ledger(): readonly TargetLedgerEntry[] { return this.entries }
   clearLedger(): void { this.entries = [] }
   build(): number { return this.currentBuild }
+  /** Live /hot/stream (SSE) subscribers — lets callers await "page connected" before bumping. */
+  sseClientCount(): number { return this.sseClients.size }
 
   bumpBuild(): number {
     this.currentBuild += 1
