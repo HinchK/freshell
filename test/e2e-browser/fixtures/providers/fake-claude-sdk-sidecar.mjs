@@ -108,6 +108,9 @@ async function render(event) {
       emit({
         type: 'sdk.turn.complete',
         sessionId,
+        // Real protocol shape is {sessionId, at} only (index.mjs:22);
+        // `subtype` is a fixture EXTENSION (server ignores unknown fields)
+        // so specs can pin scripted success/error completions.
         subtype: data.subtype ?? 'success',
         at: Date.now(),
       })
