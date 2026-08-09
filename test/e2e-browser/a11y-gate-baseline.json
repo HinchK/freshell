@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "files": {
+    "specs/fresh-agent.spec.ts": [
+      "locator:css-class:0e44c00d",
+      "locator:css-class:6490d881",
+      "locator:css-class:873b0760",
+      "locator:css-class:9c6c0afa",
+      "locator:css-class:a6fba88f",
+      "locator:css-class:aeaefa42",
+      "locator:css-class:b749d820",
+      "locator:css-class:ecedd257",
+      "locator:css-class:fc64788b"
+    ],
+    "specs/freshopencode-model-picker.spec.ts": [
+      "locator:css-class:7fc814ea",
+      "locator:xpath:63f0dbb6"
+    ],
+    "specs/multirow-tabs.spec.ts": [
+      "locator:structural-combinator:f5301b8f",
+      "locator:structural-combinator:f5301b8f",
+      "locator:structural-combinator:f5301b8f"
+    ],
+    "specs/project-colors-matrix.spec.ts": [
+      "locator:css-class:f69b700e"
+    ],
+    "specs/restore-contract-wall-rust.spec.ts": [
+      "locator:css-class:a314e77b"
+    ],
+    "specs/restore-matrix.spec.ts": [
+      "locator:css-class:2bbd6ce4"
+    ],
+    "specs/settings.spec.ts": [
+      "locator:parent-traversal:9d891e73",
+      "locator:parent-traversal:9d891e73",
+      "locator:parent-traversal:9d891e73",
+      "locator:parent-traversal:9d891e73",
+      "locator:parent-traversal:9d891e73"
+    ],
+    "specs/sidebar.spec.ts": [
+      "locator:css-class:58f8d779"
+    ]
+  }
+}
