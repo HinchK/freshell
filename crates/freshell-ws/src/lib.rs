@@ -37,6 +37,7 @@ pub mod tabs_store;
 pub(crate) mod tabs_store_migrate;
 pub mod tabs_store_model;
 pub mod terminal;
+pub mod terminal_meta;
 
 use std::sync::Arc;
 
@@ -140,6 +141,16 @@ pub struct WsState {
     /// `SessionDirectoryState`) that read it for the rename cascades and the
     /// session-directory live-terminal join.
     pub identity: crate::identity::TerminalIdentityRegistry,
+    /// The shared terminal-metadata registry (DEV-0008 closure, Task 18 -- the
+    /// port of `server/terminal-metadata-service.ts`, see
+    /// [`crate::terminal_meta`]): the git-enriched per-terminal records behind
+    /// `terminal.inventory.terminalMeta` and the `terminal.meta.updated`
+    /// broadcasts. Seeded (async-enriched) by the `terminal.create` path,
+    /// updated by the amplifier/opencode association drains and by
+    /// `freshell-server`'s auto-title sweep, retired on kill/exit. Distinct
+    /// from `identity` above: identity is the narrow provider/sessionId slice
+    /// the rename cascades consume; this is the full wire-record store.
+    pub terminal_meta: crate::terminal_meta::TerminalMetaRegistry,
     /// The shared UI-screenshot broker (`ws-handler.ts#requestUiScreenshot`). A
     /// connection that advertised `capabilities.uiScreenshotV1` is counted here so
     /// `POST /api/screenshots` knows a capable UI exists, and its inbound
@@ -395,7 +406,11 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
     messages.push(ServerMessage::TerminalInventory(TerminalInventory {
         boot_id,
         terminals,
-        terminal_meta: Vec::new(),
+        // DEV-0008 closure (Task 18): ship the live (non-retired) metadata
+        // records, `ws-handler.ts:1737-1745`'s `terminalMeta:
+        // this.terminalMetadata.list()` -- a reconnecting client's pane
+        // headers re-hydrate their git/session badges from this snapshot.
+        terminal_meta: state.terminal_meta.list(crate::terminal::now_ms()),
     }));
     messages
 }
@@ -674,6 +689,7 @@ mod tests {
         WsState {
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),

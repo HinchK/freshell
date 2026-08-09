@@ -314,6 +314,7 @@ fn indexed_from_meta(
         last_activity_at,
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
+        git_branch: meta.git_branch.clone(),
         is_subagent: meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         // SESSION-07: amplifier session-file content search is not ported

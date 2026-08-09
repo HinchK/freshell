@@ -14,9 +14,12 @@
 //! `settings.sidebar.autoGenerateTitles` — the REST generate-title route
 //! (Task 6) does not.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
+
+use freshell_protocol::common::TerminalMetaRecord;
+use freshell_ws::identity::TerminalIdentity;
 
 /// Everything one pass needs, shaped so tests can construct it without a
 /// real server (fake Gemini transport, tempdir-backed settings, throwaway
@@ -32,6 +35,111 @@ pub struct AutoTitleSweepState {
     /// Node's module-level `pendingAiTitles` set (`server/index.ts:866`):
     /// at most ONE in-flight Gemini call per `provider:sessionId` key.
     pub pending_ai_titles: Arc<Mutex<HashSet<String>>>,
+    /// Task 18 (DEV-0008 closure): the shared terminal-metadata registry --
+    /// the SAME instance `WsState.terminal_meta` holds -- so this sweep's
+    /// per-session meta refresh (Node's `applySessionMetadata` analog,
+    /// `server/index.ts:854-866`) commits into the store the handshake's
+    /// `terminal.inventory.terminalMeta` reads.
+    pub terminal_meta: freshell_ws::terminal_meta::TerminalMetaRegistry,
+    /// Task 18: the per-unique-cwd git-enrichment cache backing the
+    /// change-gated/throttled refresh -- see [`GitMetaCache`] for the
+    /// validator-A7 trigger-divergence rationale.
+    pub git_meta_cache: GitMetaCache,
+}
+
+/// Minimum age before a cwd's git enrichment is re-run when its terminal-set
+/// signature is unchanged (throttled refresh so dirty-status drift still
+/// surfaces without a git storm).
+pub const GIT_ENRICH_MIN_INTERVAL_MS: i64 = 30_000;
+
+/// Per-unique-normalized-cwd git-enrichment cache (Task 18, KEPT trigger
+/// divergence -- validator-A7, ledgered in `port/oracle/DEVIATIONS.md`).
+///
+/// Node runs its terminal-metadata pass ONLY on indexer update events
+/// (`server/index.ts:813` onUpdate, debounce 2 s `session-indexer.ts:436`),
+/// per terminal and uncached (`utils.ts:93-116`; only repo roots cached,
+/// `:24-26`) -- an idle Node spawns ZERO git processes. This port has no
+/// indexer event bus (the session index is poll-based), so the refresh rides
+/// the auto-title sweep's tick instead, gated per unique resolved cwd: git
+/// runs for a cwd only when (a) the cwd's terminal-set signature changed
+/// since its last run, or (b) the last run is >=
+/// [`GIT_ENRICH_MIN_INTERVAL_MS`] old. Every spawned git suppresses optional
+/// locks (`GIT_OPTIONAL_LOCKS=0`, `freshell_platform::git_meta`) so the poll
+/// can never keep rewriting `.git/index`. Measured local cost: 0.01 s per
+/// `git --no-optional-locks status --porcelain` (validator-A7); /mnt/c DrvFs
+/// cwds are 10-100x slower -- the throttle bounds that to delayed badges.
+#[derive(Clone, Default)]
+pub struct GitMetaCache {
+    inner: Arc<Mutex<HashMap<String, CwdGitEntry>>>,
+}
+
+struct CwdGitEntry {
+    terminal_signature: String,
+    last_run_ms: i64,
+    enrichment: CwdEnrichment,
+}
+
+/// The five derived fields one cwd's enrichment yields (`enrichFromCwd`'s
+/// output slice, `terminal-metadata-service.ts:277-285`).
+#[derive(Clone, Default)]
+struct CwdEnrichment {
+    checkout_root: Option<String>,
+    repo_root: Option<String>,
+    display_subdir: Option<String>,
+    branch: Option<String>,
+    is_dirty: Option<bool>,
+}
+
+impl GitMetaCache {
+    /// The cached enrichment for `cwd`, re-running git only per the gate in
+    /// the struct doc. `terminal_signature` is the sorted, newline-joined set
+    /// of terminal ids currently resolving to this cwd.
+    async fn enrichment_for(&self, cwd: &str, terminal_signature: &str, now: i64) -> CwdEnrichment {
+        let cached = {
+            let map = self.inner.lock().expect("git meta cache lock");
+            map.get(cwd).and_then(|entry| {
+                (entry.terminal_signature == terminal_signature
+                    && now - entry.last_run_ms < GIT_ENRICH_MIN_INTERVAL_MS)
+                    .then(|| entry.enrichment.clone())
+            })
+        };
+        if let Some(hit) = cached {
+            return hit;
+        }
+        // Probe record: reuse the ONE enrichment implementation
+        // (`freshell_ws::terminal_meta::enrich_from_cwd`, spawn_blocking git
+        // inside) rather than duplicating the git plumbing here.
+        let mut probe = TerminalMetaRecord {
+            terminal_id: String::new(),
+            updated_at: 0,
+            branch: None,
+            checkout_root: None,
+            cwd: Some(cwd.to_string()),
+            display_subdir: None,
+            is_dirty: None,
+            provider: None,
+            repo_root: None,
+            session_id: None,
+            token_usage: None,
+        };
+        freshell_ws::terminal_meta::enrich_from_cwd(&mut probe).await;
+        let enrichment = CwdEnrichment {
+            checkout_root: probe.checkout_root,
+            repo_root: probe.repo_root,
+            display_subdir: probe.display_subdir,
+            branch: probe.branch,
+            is_dirty: probe.is_dirty,
+        };
+        self.inner.lock().expect("git meta cache lock").insert(
+            cwd.to_string(),
+            CwdGitEntry {
+                terminal_signature: terminal_signature.to_string(),
+                last_run_ms: now,
+                enrichment: enrichment.clone(),
+            },
+        );
+        enrichment
+    }
 }
 
 /// One session as the pass consumes it — decoupled from `IndexedSession` so
@@ -47,6 +155,13 @@ pub struct SweepSession {
     /// The PARSED (pre-override) title source — only compared against
     /// `"provider-generated"` (`server/auto-title.ts:88`).
     pub title_source: Option<String>,
+    /// Task 18: the transcript-parsed git branch
+    /// (`IndexedSession::git_branch` <- `ParsedSessionMeta::git_branch`,
+    /// `freshell-sessions/src/meta.rs`) — the meta refresh folds it as the
+    /// FALLBACK under the live-git branch (Node's `applySessionMetadata`:
+    /// `session.gitBranch ?? current.branch`, `terminal-metadata-service.ts:195`,
+    /// then live git wins in `enrichFromCwd`, `:283`).
+    pub git_branch: Option<String>,
 }
 
 /// One of Node's two `terminal.title.updated` emit sites (the sweep push and
@@ -78,6 +193,105 @@ fn broadcast_sessions_changed(state: &AutoTitleSweepState) {
         .send(serde_json::json!({"type": "sessions.changed", "revision": rev}).to_string());
 }
 
+/// Milliseconds since the Unix epoch (the sweep's `Date.now()` analog).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Task 18: the sweep-time terminal-metadata refresh — Node's
+/// `applySessionMetadata` pass (`server/index.ts:854-866` ->
+/// `terminal-metadata-service.ts:183-201`), redesigned per validator-A7 (see
+/// [`GitMetaCache`]): git enrichment runs once per UNIQUE resolved cwd across
+/// the whole pass (change-gated + throttled), then each matched terminal's
+/// record is rebuilt and committed change-gated.
+///
+/// Per (session, matched identity):
+/// * `cwd` = [`freshell_ws::terminal_meta::select_more_specific_cwd`]
+///   (identity.cwd, session.cwd) — the "deeper path wins" chooser
+///   (`terminal-metadata-service.ts:63-76`);
+/// * `branch` = live git > parsed-session `git_branch` > the record's current
+///   value (`applySessionMetadata` `:195` + `enrichFromCwd` `:283`);
+/// * a terminal the create path never seeded is skipped (Node: `if (!current)
+///   return undefined`, `:184-185`).
+///
+/// Returns the changed records; the caller broadcasts ONE
+/// `terminal.meta.updated` upsert batch per pass (`server/index.ts:861-863`).
+async fn refresh_terminal_meta(
+    state: &AutoTitleSweepState,
+    work: &[(&SweepSession, Vec<TerminalIdentity>)],
+) -> Vec<TerminalMetaRecord> {
+    let now = now_ms();
+    // Resolve each matched terminal's cwd, and collect the pass-wide
+    // terminal-set per unique cwd (the git-run change gate's signature).
+    let mut resolved: Vec<(&SweepSession, &TerminalIdentity, Option<String>)> = Vec::new();
+    let mut cwd_terminals: HashMap<String, Vec<String>> = HashMap::new();
+    for (session, matching) in work {
+        for identity in matching {
+            let cwd = freshell_ws::terminal_meta::select_more_specific_cwd(
+                identity.cwd.as_deref(),
+                session.cwd.as_deref(),
+            );
+            if let Some(cwd) = &cwd {
+                cwd_terminals
+                    .entry(cwd.clone())
+                    .or_default()
+                    .push(identity.terminal_id.clone());
+            }
+            resolved.push((session, identity, cwd));
+        }
+    }
+    // One (gated) git enrichment per unique cwd.
+    let mut enrichments: HashMap<String, CwdEnrichment> = HashMap::new();
+    for (cwd, mut terminal_ids) in cwd_terminals {
+        terminal_ids.sort();
+        terminal_ids.dedup();
+        let signature = terminal_ids.join("\n");
+        let enrichment = state
+            .git_meta_cache
+            .enrichment_for(&cwd, &signature, now)
+            .await;
+        enrichments.insert(cwd, enrichment);
+    }
+    // Rebuild + commit each matched terminal's record, change-gated.
+    let mut upserts = Vec::new();
+    for (session, identity, cwd) in resolved {
+        // Node applySessionMetadata:184-185 — no seeded record, no refresh.
+        let Some(current) = state.terminal_meta.get(&identity.terminal_id) else {
+            continue;
+        };
+        // A cwd-less terminal gets the falsy-cwd clear (enrichFromCwd :262-269).
+        let enrichment = cwd
+            .as_deref()
+            .and_then(|c| enrichments.get(c))
+            .cloned()
+            .unwrap_or_default();
+        let next = TerminalMetaRecord {
+            terminal_id: current.terminal_id.clone(),
+            updated_at: current.updated_at,
+            provider: Some(session.provider.clone()),
+            session_id: Some(session.session_id.clone()),
+            cwd,
+            branch: enrichment
+                .branch
+                .clone()
+                .or_else(|| session.git_branch.clone())
+                .or(current.branch),
+            is_dirty: enrichment.is_dirty.or(current.is_dirty),
+            checkout_root: enrichment.checkout_root.clone(),
+            repo_root: enrichment.repo_root.clone(),
+            display_subdir: enrichment.display_subdir.clone(),
+            token_usage: current.token_usage,
+        };
+        if let Some(record) = state.terminal_meta.commit_if_changed(next, now_ms()) {
+            upserts.push(record);
+        }
+    }
+    upserts
+}
+
 /// One auto-name pass over `sessions` (`server/index.ts:877-950`). Returns
 /// "anything changed" (an override write or a terminal push happened).
 /// Every per-session failure is non-fatal: persistence errors are
@@ -90,16 +304,38 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
     let overrides = state.settings.session_overrides(); // freshness-reloading read
     let mut changed = false;
 
-    for s in sessions {
-        // BOUNDED to live terminals only (server/index.ts:885); Node passes
-        // session.cwd for the cwd-scoped claude match (index.ts:884, Task 3).
-        let matching =
-            state
-                .identity
-                .find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref());
-        if matching.is_empty() {
-            continue;
-        }
+    // Match sessions to live terminals ONCE — both the meta refresh and the
+    // title pass consume the same fan-out. BOUNDED to live terminals only
+    // (server/index.ts:885); Node passes session.cwd for the cwd-scoped
+    // claude match (index.ts:884, Task 3).
+    let meta_work: Vec<(&SweepSession, Vec<TerminalIdentity>)> = sessions
+        .iter()
+        .filter_map(|s| {
+            let matching =
+                state
+                    .identity
+                    .find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref());
+            (!matching.is_empty()).then_some((s, matching))
+        })
+        .collect();
+
+    // Task 18: the pass-level meta refresh — BEFORE the title pass, matching
+    // Node's source order (`server/index.ts:854` metadata sync kicks off
+    // before the auto-name pass at `:877`), with ONE `terminal.meta.updated`
+    // upsert batch per pass when anything changed (`:861-863`). Deliberately
+    // does NOT count toward `changed`: Node's metadata sync never publishes
+    // `sessions.changed` (only title/override changes do). Ordering also
+    // keeps the tail of this function await-free after the AI one-shot
+    // spawns, so a pass's persisted title state is deterministic when it
+    // returns.
+    let meta_upserts = refresh_terminal_meta(state, &meta_work).await;
+    freshell_ws::terminal_meta::broadcast_terminal_meta_updated(
+        &state.broadcast_tx,
+        meta_upserts,
+        Vec::new(),
+    );
+
+    for (s, matching) in &meta_work {
         let key = format!("{}:{}", s.provider, s.session_id);
         let row = overrides.get(&key).and_then(|v| v.as_object());
         let override_title = row
@@ -169,6 +405,16 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
             }
         }
     }
+    // Task 18: the pass-level meta refresh — ONE `terminal.meta.updated`
+    // upsert batch per pass when anything changed (`server/index.ts:854-866`).
+    // Deliberately does NOT count toward `changed`: Node's metadata sync never
+    // publishes `sessions.changed` (only title/override changes do).
+    let meta_upserts = refresh_terminal_meta(state, &meta_work).await;
+    freshell_ws::terminal_meta::broadcast_terminal_meta_updated(
+        &state.broadcast_tx,
+        meta_upserts,
+        Vec::new(),
+    );
     if changed {
         broadcast_sessions_changed(state);
     }
@@ -267,6 +513,7 @@ pub fn spawn_auto_title_sweep(
                         title,
                         first_user_message: s.first_user_message.clone(),
                         title_source: s.title_source.clone(),
+                        git_branch: s.git_branch.clone(),
                     }
                 })
                 .collect();
@@ -331,6 +578,8 @@ mod tests {
             ai_key: crate::ai_title::AiKeyCell::init(ai_key.map(str::to_string), None),
             gemini: std::sync::Arc::new(FakeGemini(Ok("AI Title".into()))),
             pending_ai_titles: Default::default(),
+            terminal_meta: Default::default(),
+            git_meta_cache: Default::default(),
         };
         (state, rx)
     }
@@ -353,6 +602,7 @@ mod tests {
             title: None,
             first_user_message: first.map(str::to_string),
             title_source: None,
+            git_branch: None,
         }
     }
 
@@ -489,6 +739,89 @@ mod tests {
         assert!(frames
             .iter()
             .any(|f| f.contains("terminal.title.updated") && f.contains("My Name")));
+    }
+
+    /// Task 18: the sweep-time meta refresh (Node's `applySessionMetadata`
+    /// analog) commits a git-enriched, session-folded record and broadcasts
+    /// ONE `terminal.meta.updated` upsert — and a second, unchanged pass is
+    /// fully suppressed (change-gated commit + cached cwd enrichment).
+    #[tokio::test]
+    async fn sweep_refreshes_terminal_meta_change_gated_and_broadcasts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) = sweep_state(dir.path(), None);
+        let cwd_dir = tempfile::tempdir().unwrap(); // non-repo cwd
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let tid = "term-meta-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("codex"), Some("s1"), Some(&cwd), 1);
+        // The create path's seeded record (the refresh skips unseeded
+        // terminals — applySessionMetadata :184-185).
+        state
+            .terminal_meta
+            .commit_if_changed(
+                freshell_protocol::common::TerminalMetaRecord {
+                    terminal_id: tid.to_string(),
+                    updated_at: 0,
+                    branch: None,
+                    checkout_root: None,
+                    cwd: Some(cwd.clone()),
+                    display_subdir: None,
+                    is_dirty: None,
+                    provider: Some("codex".to_string()),
+                    repo_root: None,
+                    session_id: None,
+                    token_usage: None,
+                },
+                1,
+            )
+            .expect("seed commit");
+
+        let mut s = session("codex", "s1", &cwd, Some("hi"));
+        s.git_branch = Some("parsed-branch".to_string());
+        run_auto_title_pass(&state, std::slice::from_ref(&s)).await;
+
+        // Pass 1: exactly one terminal.meta.updated upsert, enriched +
+        // session-folded. Live git yields nothing for a non-repo dir, so the
+        // parsed-session branch fallback lands; the roots resolve to the cwd
+        // itself and displaySubdir to its basename.
+        let mut meta_frames: Vec<serde_json::Value> = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if v["type"] == "terminal.meta.updated" {
+                meta_frames.push(v);
+            }
+        }
+        assert_eq!(
+            meta_frames.len(),
+            1,
+            "one upsert batch per pass: {meta_frames:?}"
+        );
+        let upsert = &meta_frames[0]["upsert"][0];
+        assert_eq!(upsert["terminalId"], serde_json::json!(tid));
+        assert_eq!(upsert["sessionId"], serde_json::json!("s1"));
+        assert_eq!(upsert["provider"], serde_json::json!("codex"));
+        assert_eq!(upsert["branch"], serde_json::json!("parsed-branch"));
+        assert_eq!(upsert["checkoutRoot"], serde_json::json!(cwd));
+        assert_eq!(upsert["repoRoot"], serde_json::json!(cwd));
+        assert_eq!(
+            upsert["displaySubdir"],
+            serde_json::json!(cwd_dir.path().file_name().unwrap().to_string_lossy())
+        );
+        assert_eq!(meta_frames[0]["remove"], serde_json::json!([]));
+
+        // Pass 2 with identical inputs: the commit gate suppresses the record
+        // and NO terminal.meta.updated frame goes out.
+        run_auto_title_pass(&state, std::slice::from_ref(&s)).await;
+        while let Ok(frame) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_ne!(
+                v["type"],
+                serde_json::json!("terminal.meta.updated"),
+                "an unchanged pass must not re-broadcast: {v}"
+            );
+        }
     }
 
     #[tokio::test]

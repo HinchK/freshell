@@ -76,6 +76,15 @@ pub struct IndexedSession {
     pub last_activity_at: i64,
     pub created_at: Option<i64>,
     pub cwd: Option<String>,
+    /// Task 18: the transcript-parsed git branch (`ParsedSessionMeta::git_branch`,
+    /// `meta.rs` -- claude/codex record it; opencode's direct lister does not).
+    /// Consumed by `freshell-server`'s auto-title sweep as the FALLBACK under
+    /// the live-git branch when refreshing terminal metadata (Node's
+    /// `applySessionMetadata`: `session.gitBranch ?? current.branch`,
+    /// `terminal-metadata-service.ts:195`). `#[serde(default)]` so any
+    /// pre-Task-18 serialized snapshot still deserializes.
+    #[serde(default)]
+    pub git_branch: Option<String>,
     pub is_subagent: bool,
     pub is_non_interactive: bool,
     /// SESSION-07: the on-disk transcript this session was parsed from, when
@@ -330,6 +339,7 @@ fn item_from_meta(
         last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
+        git_branch: meta.git_branch.clone(),
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         source_file,
@@ -538,6 +548,9 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         // `OpencodeSession::cwd` is always present (`list_sessions` already
         // skips rows without one) — R10b is a structural non-issue here.
         cwd: Some(s.cwd),
+        // The opencode direct-lister reads no git facts from the db -- None,
+        // faithful to `listSessionsDirect`.
+        git_branch: None,
         is_subagent: s.is_subagent.unwrap_or(false),
         is_non_interactive: s.is_non_interactive.unwrap_or(false),
         // SESSION-07: opencode is direct-listed from one sqlite db, not a
@@ -1402,6 +1415,7 @@ mod tests {
             last_activity_at,
             created_at: None,
             cwd: Some("/p".to_string()),
+            git_branch: None,
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,

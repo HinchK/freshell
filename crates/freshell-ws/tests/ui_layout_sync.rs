@@ -58,6 +58,7 @@ async fn spawn_server() -> (String, LayoutStore) {
     let state = WsState {
         layout: layout.clone(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),

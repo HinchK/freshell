@@ -353,6 +353,13 @@ async fn main() -> ExitCode {
     // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
     // session-directory live-terminal join (`session_directory_state`).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    // Task 18 (DEV-0008 closure): the shared terminal-metadata registry (the
+    // port of `server/terminal-metadata-service.ts`, `freshell_ws::terminal_meta`).
+    // Written by the WS create/kill/exit paths and the association drains
+    // (`ws_state`, below); ALSO written by the auto-title sweep's per-session
+    // meta refresh (`AutoTitleSweepState.terminal_meta`, below); read by every
+    // connection's handshake (`terminal.inventory.terminalMeta`).
+    let terminal_meta = freshell_ws::terminal_meta::TerminalMetaRegistry::default();
     // The shared tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
@@ -475,6 +482,7 @@ async fn main() -> ExitCode {
     let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ws_state = WsState {
         identity: terminal_identity.clone(),
+        terminal_meta: terminal_meta.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
         auth_token: Arc::clone(&auth_token),
@@ -632,6 +640,10 @@ async fn main() -> ExitCode {
                 ai_key: ai_key.clone(),
                 gemini: gemini.clone(),
                 pending_ai_titles: Default::default(),
+                // Task 18: the SAME registry `ws_state.terminal_meta` holds,
+                // so the sweep's meta refresh feeds the handshake + broadcasts.
+                terminal_meta: terminal_meta.clone(),
+                git_meta_cache: Default::default(),
             },
             Arc::clone(index),
             SESSIONS_SWEEP_INTERVAL,
@@ -1464,6 +1476,7 @@ mod sessions_sweep_tests {
             last_activity_at,
             created_at: None,
             cwd: Some("/tmp".to_string()),
+            git_branch: None,
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
