@@ -25,16 +25,68 @@ Machine-readable artifact: `test/e2e-browser/gate01-baseline.json`
 (per-spec × per-leg verdicts, counts, failure details, attributions; schema
 documented in the collator header, `test/e2e-browser/helpers/gate01-collate.ts`).
 
+## Headline finding F1 — RecoveryOfferPanel interference (rust leg, designed behavior, no owner)
+
+**Signature:** on `gate01-rust` only, tests after the first on a worker-shared
+server intermittently fail with either `.xterm` visibility timeouts
+(`TerminalHelper.waitForTerminal`, 15 s) or Playwright click retries ending in
+"`<div role="presentation" class="fixed inset-0 … bg-black/50 …">` intercepts
+pointer events". `test-results/**/error-context.md` shows the open dialog:
+**`Restore N pane(s) from server memory?`** with list items like
+`Tab 1 (exit 0): shell — /tmp/freshell-e2e-rust-…` and even
+`New Tab: picker` (a pane-picker pane).
+
+**Mechanism (fully traced, citations in-repo):** `RecoveryOfferPanel`
+(`src/components/RecoveryOfferPanel.tsx:67-106`) fetches
+`GET /api/recovery/inventory` on every boot whose localStorage had NO
+persisted layout (that is EVERY fresh Playwright page/context by
+construction) and shows a modal when the inventory is recoverable. The rust
+server's pane-identity ledger (durable across tests on the worker-scoped
+server) still holds prior tests' pane rows — including picker panes and
+teardown-killed terminals — so every subsequent fresh page gets the modal.
+The legacy Node server has no such endpoint; the fetch fails and the panel
+stays quiet (`.catch(() => {})`), so the legacy leg is unaffected.
+`docs/plans/2026-07-26-recover-my-panes.md` D1/D2/D3 shows this is the
+DESIGNED new-browser flow; the interruption of unchanged legacy specs is an
+unintended interaction, owned by NO current checklist item.
+
+**Evidence runs:** slice-0 attempt 2 (workers=2): rust legs of
+editor-pane:120/:133 + screenshot-baselines:4/:16/:52 red with this
+signature, legacy all-green 13/13. Isolated rust-only rerun
+(`--workers=1`, editor-pane+screenshot-baselines): 5 red, same signature,
+failures float between tests (editor-pane :83/:133/:193 this time) —
+whack-a-mole → interference, not assertion-level parity gaps. Discrimination
+run (screenshot-baselines + terminal-lifecycle, one worker each, rust-only):
+terminal-lifecycle red on `:48` with the dialog offering a prior boot's
+`New Tab: picker` pane. NOTE on scheduling: the config runs
+`fullyParallel: true`, so one file's tests distribute across workers, each
+worker booting its own worker-scoped server; any test that is not the first
+to land on its worker's server can inherit that server's ledger/snapshot
+records (auto-shell tabs and picker panes push tabs-snapshot generations
+within seconds of each boot). Pollution is therefore per-worker-subset and
+the victim set floats run to run — whack-a-mole, never a stable single
+assertion.
+
+**Draft follow-up item (unscoped → propose for the checklist's restore lane
+or CFG-08 adjacency):** *"RESTORE-XX — Make the recover-my-panes offer
+inert against e2e fresh-context boots (or make the pane-identity ledger stop
+recording picker panes / teardown-killed terminals as recoverable) so the
+unchanged legacy browser suite can run dialog-free on rust; alternatively
+bless a per-spec dismissal step."* Until an owner lands, affected rust legs
+are attributed `gap-unscoped` with note `recovery-offer interference (F1)`
+and individual tests are NOT pinned (the interference floats; a per-test
+`test.fail` would pin the wrong test and mask real assertions).
+
 ## Results table (per spec × leg)
 
-Updated per slice; the baseline JSON is authoritative, this table summarizes.
+Updated per slice; `test/e2e-browser/gate01-baseline.json` is authoritative
+(per-spec × per-leg verdicts, latest-run counters, per-run history, failure
+excerpts, attributions). This table summarizes per slice.
 
-| slice | specs | legacy verdict | rust verdict | notes |
+| slice | specs (files) | legacy verdict | rust verdict | notes |
 |---|---|---|---|---|
-| 0 | harness-02-matrix-bite, screenshot-baselines, editor-pane | | | validation slice |
+| 0 | harness-02-matrix-bite, screenshot-baselines, editor-pane | | | validation slice (interference F1 found here) |
 
-(Filled in as slices complete; final table enumerates all 69 specs with
-leg verdicts pass/fail/skip-all/flaky-reproven + attribution.)
 
 ## Attribution log
 
