@@ -264,3 +264,130 @@ describe('RawWsClient — codec + handshake', () => {
     expect(client.receivedFrames.map((f) => RawWsClient.text(f))).toEqual(['one', 'two', 'three'])
   })
 })
+
+describe('RawWsClient — behaviors (pause / malformed / close codes / abort)', () => {
+  const clients: RawWsClient[] = []
+  let fixture: EchoWsFixture | undefined
+
+  async function connect(options?: Parameters<typeof RawWsClient.connect>[1]): Promise<RawWsClient> {
+    const client = await RawWsClient.connect(fixture!.wsUrl, options)
+    clients.push(client)
+    return client
+  }
+
+  afterEach(async () => {
+    while (clients.length) await clients.pop()!.dispose()
+    if (fixture) {
+      await fixture.stop()
+      fixture = undefined
+    }
+  })
+
+  it('pauseReads() truly stops socket draining; resumeReads() is lossless and ordered', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.pauseReads()
+    expect(client.reading).toBe(false)
+
+    client.sendText('flood:120:1843')
+    const during = await client.collectFramesDuring(900)
+    expect(during).toEqual([])
+    expect(client.receivedFrames.length).toBe(0)
+    const frozen = client.bytesReceived
+    await new Promise((r) => setTimeout(r, 250))
+    expect(client.bytesReceived).toBe(frozen)
+
+    client.resumeReads()
+    expect(client.reading).toBe(true)
+    await client.waitForFrame(() => client.receivedFrames.length === 120, 10_000, 'full flood after resume')
+    const seqs = client.receivedFrames.map((f) => Number(RawWsClient.text(f).split(':')[1]))
+    expect(seqs).toEqual(Array.from({ length: 120 }, (_, i) => i))
+  })
+
+  it('connect({ autoRead: false }) starts paused (slow consumers from the first byte)', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect({ autoRead: false })
+    expect(client.reading).toBe(false)
+    client.sendText('flood:4:64')
+    const during = await client.collectFramesDuring(400)
+    expect(during).toEqual([])
+    client.resumeReads()
+    await client.waitForFrame(() => client.receivedFrames.length === 4, 5000, 'post-resume flood')
+  })
+
+  it('sending an RSV1-violating frame is recorded and the peer close (1002) is observed', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const sent = client.sendFrame({ rsv1: true, opcode: WS_OPCODE.TEXT, payload: 'x' })
+    expect(sent.rsv1).toBe(true)
+    const terminal = await client.waitForTerminalEvent(5000)
+    expect(terminal).toBe('peer-close')
+    expect(client.peerClose!.code).toBe(1002)
+    // The fixture recorded (not crashed on) the protocol error.
+    await expect.poll(() => fixture!.connections[0]?.errors.length, { timeout: 5000 }).toBeGreaterThan(0)
+  })
+
+  it('sending an unmasked client frame (mask:false) is recorded and rejected (1002)', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const sent = client.sendFrame({ mask: false, opcode: WS_OPCODE.TEXT, payload: 'x' })
+    expect(sent.masked).toBe(false)
+    const terminal = await client.waitForTerminalEvent(5000)
+    expect(terminal).toBe('peer-close')
+    expect(client.peerClose!.code).toBe(1002)
+  })
+
+  it('close:<code>:<reason> from the peer is captured with exact code and reason', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendText('close:4000:fixture-bye')
+    await client.waitForTerminalEvent(5000)
+    expect(client.peerClose).toMatchObject({ code: 4000, reason: 'fixture-bye' })
+  })
+
+  it('closeGracefully completes the handshake and the fixture sees our 1000', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const outcome = await client.closeGracefully(1000, 'client-done')
+    expect(['peer-close', 'tcp-end']).toContain(outcome)
+    expect(client.peerClose!.code).toBe(1000)
+    await expect.poll(() => fixture!.connections[0]?.closeCode, { timeout: 5000 }).toBe(1000)
+    expect(fixture.connections[0].closeReason).toBe('client-done')
+  })
+
+  it('abort() tears the connection down instantly and no further frames are recorded', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendText('flood:50:256')
+    client.abort()
+    await expect.poll(() => client.destroyed, { timeout: 5000 }).toBe(true)
+    const framesAtAbort = client.receivedFrames.length
+    await new Promise((r) => setTimeout(r, 400))
+    expect(client.receivedFrames.length).toBe(framesAtAbort)
+    await expect.poll(() => fixture!.connections[0]?.closedAt, { timeout: 5000 }).not.toBeNull()
+  })
+
+  it('a second normal socket stays usable while the first was sabotaged', async () => {
+    fixture = await EchoWsFixture.start()
+    const a = await connect()
+    a.sendFrame({ rsv1: true, opcode: WS_OPCODE.TEXT, payload: 'x' })
+    await a.waitForTerminalEvent(5000)
+    expect(a.peerClose!.code).toBe(1002)
+
+    const b = await connect()
+    b.sendText('still-works')
+    const echo = await b.waitForFrame((f) => f.opcode === WS_OPCODE.TEXT, 5000, 'second socket echo')
+    expect(RawWsClient.text(echo)).toBe('still-works')
+  })
+
+  it('hello() sends the Freshell handshake frame shape', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.hello('test-token-123')
+    const echo = await client.waitForFrame((f) => f.opcode === WS_OPCODE.TEXT, 5000, 'hello echo')
+    const parsed = RawWsClient.json<{ type: string; token: string; protocolVersion: number }>(echo)
+    expect(parsed.type).toBe('hello')
+    expect(parsed.token).toBe('test-token-123')
+    expect(typeof parsed.protocolVersion).toBe('number')
+  })
+})

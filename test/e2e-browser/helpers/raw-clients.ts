@@ -26,6 +26,7 @@
 import net from 'node:net'
 import http from 'node:http'
 import crypto from 'node:crypto'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /** RFC 6455 §5.2 opcodes. */
 export const WS_OPCODE = {
@@ -480,6 +481,26 @@ export class RawWsClient {
     payload.writeUInt16BE(code, 0)
     reasonBuf.copy(payload, 2)
     return this.sendFrame({ opcode: WS_OPCODE.CLOSE, payload })
+  }
+
+  /**
+   * Initiate and await a graceful close handshake. Timing the hello/read
+   * delays is the caller's job; this is just sendClose + bounded wait for
+   * the peer's terminal response.
+   */
+  async closeGracefully(
+    code = 1000,
+    reason = '',
+    timeoutMs = 5000,
+  ): Promise<'peer-close' | 'tcp-end' | 'local-abort' | 'error'> {
+    this.sendClose(code, reason)
+    return this.waitForTerminalEvent(timeoutMs)
+  }
+
+  /** Send the Freshell `hello` handshake frame (deliberately NOT automatic,
+   *  so delayed-hello tests control exactly when it goes out). */
+  hello(token: string, protocolVersion: number = WS_PROTOCOL_VERSION): SentFrameRecord {
+    return this.sendJson({ type: 'hello', token, protocolVersion })
   }
 
   // ----------------------------------------------------------------- waits
