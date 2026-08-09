@@ -24,18 +24,19 @@ static REPO_ROOT_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
 static CHECKOUT_ROOT_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// `normalizeGitPathInput` (utils.ts:138-149): `~` -> $HOME-resolved; absolute
+/// `normalizeGitPathInput` (utils.ts:138-149): `~` -> home-resolved; absolute
 /// -> resolved; RELATIVE -> None (resolving against the server cwd would lie).
+/// Node's `os.homedir()` and `path.isAbsolute` are PLATFORM-AWARE — see
+/// [`node_home_dir`] and [`node_is_absolute`].
 pub fn normalize_git_path_input(cwd: &str) -> Option<PathBuf> {
     if let Some(stripped) = cwd.strip_prefix('~') {
         // Node: path.resolve(os.homedir(), cwd.slice(cwd.startsWith('~/') ? 2 : 1))
-        let home = std::env::var("HOME").ok()?;
+        let home = node_home_dir()?;
         let rest = stripped.strip_prefix('/').unwrap_or(stripped);
         return Some(lexical_resolve(&Path::new(&home).join(rest)));
     }
-    let path = Path::new(cwd);
-    if path.is_absolute() {
-        return Some(lexical_resolve(path));
+    if node_is_absolute(cwd) {
+        return Some(lexical_resolve(Path::new(cwd)));
     }
     None
 }
@@ -64,7 +65,8 @@ pub struct BranchAndDirty {
     pub is_dirty: Option<bool>,
 }
 
-/// BLOCKING (spawns `git` twice) — call via tokio spawn_blocking.
+/// BLOCKING (spawns `git` up to three times: symbolic-ref, the rev-parse
+/// fallback, status) — call via tokio spawn_blocking.
 /// `git -C <checkoutRoot> symbolic-ref --short HEAD` -> fallback
 /// `rev-parse --abbrev-ref HEAD`;
 /// `git -C <checkoutRoot> --no-optional-locks status --porcelain`.
@@ -107,13 +109,14 @@ pub fn resolve_git_branch_and_dirty(cwd: &str) -> BranchAndDirty {
 }
 
 /// basename(checkoutRoot || cwd) after stripping trailing separators
-/// (terminal-metadata-service.ts:43-53).
+/// (terminal-metadata-service.ts:43-53). Node `path.basename` is
+/// platform-dependent — see [`node_basename_split`].
 pub fn derive_display_subdir(cwd: Option<&str>, checkout_root: Option<&str>) -> Option<String> {
     // JS `||`: an empty (fully-stripped) checkoutRoot falls through to cwd.
     let source = normalize_path_for_display(checkout_root)
         .filter(|s| !s.is_empty())
         .or_else(|| normalize_path_for_display(cwd).filter(|s| !s.is_empty()))?;
-    let base = source.rsplit('/').next().unwrap_or("").to_string();
+    let base = node_basename_split(&source, cfg!(windows)).to_string();
     // `base || source` (terminal-metadata-service.ts:52).
     if base.is_empty() {
         Some(source)
@@ -160,9 +163,11 @@ fn resolve_root_cached(
     Some(result)
 }
 
-/// `walkForGitRoot` (utils.ts:169-214). Errors reading the `.git` file bubble
-/// up (caught by the caller like Node's outer try/catch); a missing `.git`
-/// entry at a level just keeps walking up.
+/// `walkForGitRoot` (utils.ts:169-214). EVERY per-level fs error — the lstat
+/// AND the `.git`-FILE read (utils.ts:194) — is inside Node's per-level
+/// try/catch (utils.ts:203-205), so the walk keeps going up to the parent;
+/// an enclosing repo root above can still be found. The caller's
+/// normalized-cwd fallback remains only for genuinely unrecoverable cases.
 fn walk_for_git_root(start_dir: &Path, mode: Mode) -> std::io::Result<PathBuf> {
     let mut current = start_dir.to_path_buf();
 
@@ -184,16 +189,25 @@ fn walk_for_git_root(start_dir: &Path, mode: Mode) -> std::io::Result<PathBuf> {
                     // Checkout-root semantics: the dir containing the .git file.
                     return Ok(current);
                 }
-                let content = std::fs::read_to_string(&git_path)?;
-                if let Some(gitdir_raw) = parse_gitdir_line(&content) {
-                    // path.resolve(path.dirname(gitPath), match[1].trim())
-                    let gitdir = lexical_resolve(&current.join(gitdir_raw));
-                    return Ok(resolve_from_git_file(&current, &gitdir));
+                // Node's fsp.readFile sits INSIDE the per-level try/catch
+                // (utils.ts:194, caught at :203-205): a read ERROR is treated
+                // like "no .git here" — fall through and keep walking up.
+                // Decoding is lossy, matching Node's readFile(…, 'utf-8').
+                if let Ok(bytes) = std::fs::read(&git_path) {
+                    let content = String::from_utf8_lossy(&bytes);
+                    if let Some(gitdir_raw) = parse_gitdir_line(&content) {
+                        // path.resolve(path.dirname(gitPath), match[1].trim())
+                        let gitdir = lexical_resolve(&current.join(gitdir_raw));
+                        return Ok(resolve_from_git_file(&current, &gitdir));
+                    }
+                    // Readable but gitdir-less/malformed .git file — treat
+                    // this directory as the root (utils.ts:196-201): the walk
+                    // does NOT continue past it.
+                    return Ok(current);
                 }
-                // Malformed .git file — treat this directory as the root.
-                return Ok(current);
             }
-            // Neither dir nor file (e.g. symlink): fall through and keep walking.
+            // Neither dir nor file (e.g. symlink), or unreadable .git file:
+            // fall through and keep walking (utils.ts:203-205).
         }
 
         match current.parent() {
@@ -320,6 +334,37 @@ fn run_git(dir: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Node `path.basename` final-component split — PLATFORM-DEPENDENT in Node:
+/// posix splits on '/' ONLY (a backslash is an ordinary character); win32
+/// splits on BOTH '/' and '\\'. Parameterized on the win32 flag so both
+/// variants are unit-testable on any host; callers select with `cfg!(windows)`.
+fn node_basename_split(source: &str, windows_semantics: bool) -> &str {
+    if windows_semantics {
+        source.rsplit(['/', '\\']).next().unwrap_or("")
+    } else {
+        source.rsplit('/').next().unwrap_or("")
+    }
+}
+
+/// Node `os.homedir()` is PLATFORM-AWARE: POSIX reads `$HOME`; win32 reads
+/// `%USERPROFILE%` (libuv `uv_os_homedir`). Try HOME first, then — Windows
+/// builds only — fall back to USERPROFILE.
+fn node_home_dir() -> Option<String> {
+    let home = std::env::var("HOME").ok();
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var("USERPROFILE").ok());
+    home
+}
+
+/// Node `path.isAbsolute` is PLATFORM-AWARE: win32 also treats a bare leading
+/// '/' or '\\' as absolute (e.g. `path.isAbsolute('/x') === true` on win32,
+/// drive-relative), which Rust's `Path::is_absolute` on Windows rejects
+/// (it requires a drive/UNC prefix). POSIX behavior is unchanged.
+fn node_is_absolute(cwd: &str) -> bool {
+    Path::new(cwd).is_absolute()
+        || (cfg!(windows) && (cwd.starts_with('/') || cwd.starts_with('\\')))
+}
+
 /// Node `path.resolve` for an already-absolute base: purely lexical — collapses
 /// `.` / `..` and trailing separators without touching the filesystem.
 fn lexical_resolve(path: &Path) -> PathBuf {
@@ -428,6 +473,65 @@ mod tests {
     fn relative_paths_are_refused() {
         assert_eq!(normalize_git_path_input("relative/dir"), None);
         assert_eq!(resolve_git_repo_root("relative/dir"), None);
+    }
+    /// Node parity (utils.ts:194 + :203-205): `fsp.readFile(gitPath)` sits
+    /// INSIDE the per-level try/catch, so an unreadable `.git` FILE makes the
+    /// walk CONTINUE to the parent — an enclosing repo root above must still
+    /// be found.
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_git_file_keeps_walking_to_enclosing_repo_root() {
+        use std::os::unix::fs::PermissionsExt;
+        clear_git_meta_caches();
+        let t = tempfile::tempdir().unwrap();
+        init_repo(t.path());
+        let sub = t.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let git_file = sub.join(".git");
+        std::fs::write(&git_file, "gitdir: /nonexistent\n").unwrap();
+        std::fs::set_permissions(&git_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&git_file).is_ok() {
+            // Running with CAP_DAC_OVERRIDE (root/CI): permission bits don't
+            // deny reads, so the unreadable fixture can't be constructed.
+            eprintln!("skipping: .git file still readable despite mode 000");
+            return;
+        }
+        assert_eq!(
+            resolve_git_repo_root(sub.to_str().unwrap()).as_deref(),
+            t.path().canonicalize().unwrap().to_str()
+        );
+    }
+    /// Node parity (utils.ts:196-201): a READABLE `.git` file with no
+    /// `gitdir:` line returns the dir holding it — the walk does NOT continue
+    /// past it. Only read ERRORS continue (utils.ts:203-205).
+    #[test]
+    fn gitdir_less_git_file_is_the_root_itself_not_walked_past() {
+        clear_git_meta_caches();
+        let t = tempfile::tempdir().unwrap();
+        init_repo(t.path());
+        let sub = t.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "not a gitdir pointer\n").unwrap();
+        assert_eq!(
+            resolve_git_repo_root(sub.to_str().unwrap()).as_deref(),
+            sub.canonicalize().unwrap().to_str()
+        );
+    }
+    /// Node `path.basename` is platform-dependent: posix splits on '/' ONLY
+    /// (backslash is an ordinary character); win32 splits on BOTH '/' and
+    /// '\\'. Both variants are exercised here on any host via the flag.
+    #[test]
+    fn basename_split_matches_node_platform_semantics() {
+        // posix semantics (windows_semantics = false)
+        assert_eq!(node_basename_split("/a/b/sub", false), "sub");
+        assert_eq!(node_basename_split("a/b\\c", false), "b\\c");
+        assert_eq!(node_basename_split("C:\\repo\\sub", false), "C:\\repo\\sub");
+        assert_eq!(node_basename_split("plain", false), "plain");
+        // win32 semantics (windows_semantics = true)
+        assert_eq!(node_basename_split("/a/b/sub", true), "sub");
+        assert_eq!(node_basename_split("a/b\\c", true), "c");
+        assert_eq!(node_basename_split("C:\\repo\\sub", true), "sub");
+        assert_eq!(node_basename_split("plain", true), "plain");
     }
     #[test]
     fn display_subdir_prefers_checkout_root_basename() {
