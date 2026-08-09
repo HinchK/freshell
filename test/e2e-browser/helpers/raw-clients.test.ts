@@ -9,6 +9,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import WebSocket from 'ws'
 import { EchoWsFixture } from './echo-ws-fixture.js'
+import { RawWsClient, WS_OPCODE } from './raw-clients.js'
 
 /** Connect a vendored ws client and resolve once open. */
 async function connectVendorWs(wsUrl: string): Promise<WebSocket> {
@@ -147,5 +148,119 @@ describe('EchoWsFixture', () => {
     const fixtureRef = fixture
     fixture = undefined // already stopped
     await fixtureRef.stop()
+  })
+})
+
+describe('RawWsClient — codec + handshake', () => {
+  const clients: RawWsClient[] = []
+  let fixture: EchoWsFixture | undefined
+
+  async function connect(): Promise<RawWsClient> {
+    const client = await RawWsClient.connect(fixture!.wsUrl)
+    clients.push(client)
+    return client
+  }
+
+  afterEach(async () => {
+    while (clients.length) await clients.pop()!.dispose()
+    if (fixture) {
+      await fixture.stop()
+      fixture = undefined
+    }
+  })
+
+  it('performs the RFC6455 handshake manually and records it', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    expect(client.handshake.status).toBe(101)
+    expect(client.handshake.headers['sec-websocket-accept']).toBeTruthy()
+    expect(client.handshake.rawHead).toContain('HTTP/1.1 101')
+    expect(client.reading).toBe(true)
+    expect(client.destroyed).toBe(false)
+  })
+
+  it('echo roundtrips text with correct wire accounting on both directions', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendText('hello-harness-05') // 16 bytes payload
+    const echo = await client.waitForFrame((f) => f.opcode === WS_OPCODE.TEXT, 5000, 'text echo')
+    expect(RawWsClient.text(echo)).toBe('hello-harness-05')
+
+    // Client->server: 2 header + 4 mask key + 16 payload = 22 wire bytes.
+    const sent = client.sentFrames[0]
+    expect(sent.masked).toBe(true)
+    expect(sent.opcode).toBe(WS_OPCODE.TEXT)
+    expect(sent.fin).toBe(true)
+    expect(sent.payloadBytes).toBe(16)
+    expect(sent.wireBytes).toBe(22)
+
+    // Server->client frames are unmasked: 2 header + 16 payload = 18.
+    expect(echo.wireBytes).toBe(18)
+    expect(echo.masked).toBe(false)
+
+    // Socket-truth counters cover at least the observed frame bytes.
+    expect(client.bytesSent).toBeGreaterThanOrEqual(22)
+    expect(client.bytesReceived).toBeGreaterThanOrEqual(18)
+  })
+
+  it('echo roundtrips binary and preserves exact bytes', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const payload = Buffer.from([0x00, 0xff, 0x10, 0x80, 0x7f, 0x42])
+    client.sendBinary(payload)
+    const echo = await client.waitForFrame((f) => f.opcode === WS_OPCODE.BINARY, 5000, 'binary echo')
+    expect(echo.payload.equals(payload)).toBe(true)
+  })
+
+  it('encodes 64-bit payload lengths (>64KiB) correctly (echo proof)', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const big = Buffer.alloc(70_000)
+    for (let i = 0; i < big.length; i++) big[i] = i % 251
+    client.sendBinary(big)
+    const echo = await client.waitForFrame((f) => f.opcode === WS_OPCODE.BINARY, 10_000, 'big echo')
+    expect(echo.payloadBytes).toBe(70_000)
+    expect(echo.payload.equals(big)).toBe(true)
+    // 2 (type/len7=127) + 8 (u64 length) + 4 (mask key) + 70000 = 70014 sent.
+    expect(client.sentFrames.at(-1)!.wireBytes).toBe(70_014)
+  })
+
+  it('sendPing produces a fixture pong carrying the payload; auto-reply knobs default on', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendPing('probe-7')
+    const pong = await client.waitForFrame((f) => f.opcode === WS_OPCODE.PONG, 5000, 'pong')
+    expect(RawWsClient.text(pong)).toBe('probe-7')
+  })
+
+  it('waitForFrame times out with the supplied label when no frame matches', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    await expect(
+      client.waitForFrame((f) => f.opcode === 0x3, 300, 'never-arrives'),
+    ).rejects.toThrow(/never-arrives/)
+  })
+
+  it('sendJson + static json/text helpers round-trip structured data', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendJson({ type: 'probe', nested: { n: 42 } })
+    const echo = await client.waitForFrame((f) => f.opcode === WS_OPCODE.TEXT, 5000, 'json echo')
+    expect(RawWsClient.json<{ type: string; nested: { n: number } }>(echo)).toEqual({
+      type: 'probe', nested: { n: 42 },
+    })
+  })
+
+  it('records every sent and received frame in order in the ledgers', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    client.sendText('one')
+    client.sendText('two')
+    client.sendText('three')
+    await client.waitForFrame(
+      () => client.receivedFrames.length === 3, 5000, 'three echoes',
+    )
+    expect(client.sentFrames.map((f) => f.payloadBytes)).toEqual([3, 3, 5])
+    expect(client.receivedFrames.map((f) => RawWsClient.text(f))).toEqual(['one', 'two', 'three'])
   })
 })
