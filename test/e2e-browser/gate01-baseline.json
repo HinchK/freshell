@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "b47d515160c947ffa9b780d4a47210ce6626094e",
+  "head": "0e04c326ad4e5fca55a104b2643d2598028d3f9d",
   "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -692,9 +692,10 @@
           "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 42309,
+          "durationMs": 42564,
           "runs": [
-            "slice-7"
+            "slice-7",
+            "reproof-s7-facent"
           ],
           "runHistory": [
             {
@@ -704,6 +705,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 42309
+            },
+            {
+              "run": "reproof-s7-facent",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42564
             }
           ],
           "failures": [
@@ -718,7 +727,10 @@
               "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Fresh agent')\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByText('Fresh agent')\u001b[22m\n\n"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s7-facent (500-vs-422 on /api/panes/:id/capture for fresh-agent panes; missing 'Fresh agent' UI text); spec vs frozen-legacy drift"
+          }
         },
         "rust": {
           "verdict": "fail",
@@ -726,9 +738,10 @@
           "failed": 2,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 91534,
+          "durationMs": 107700,
           "runs": [
-            "slice-7"
+            "slice-7",
+            "reproof-s7-facent"
           ],
           "runHistory": [
             {
@@ -738,6 +751,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 91534
+            },
+            {
+              "run": "reproof-s7-facent",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 107700
             }
           ],
           "failures": [
@@ -752,7 +773,11 @@
               "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: not \u001b[32m404\u001b[39m\n\n  468 |\n  469 |     const modelCapabilities = await fetchWithAuth(serverInfo, '/api/fresh-agent/model-capabilities/freshclaude')\n> 470 |     expect(modelCapabilities.status).not.toBe(404)\n      |                                          ^\n  471 |     const thread = await fetchWithAuth(serverInfo, `/api/fresh-agent/threads/freshclaude/claude/${CANONICAL_CLAUDE_SESSION_ID}`)\n  472 |     expect(thread.headers.get('content-type')).toContain('application/json')\n  473 |     if (thread.status === 404) {\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:470:42"
             }
           ],
-          "attribution": null
+          "attribution": {
+            "kind": "gap",
+            "owner": "AGENT-10",
+            "note": "rust 404 on GET /api/fresh-agent/model-capabilities/freshclaude (AGENT-10 scope: model capabilities + refresh); SECOND divergence in same file: legacy-layout-sync normalization yields [] fresh-agent panes (candidate AUTO-12/AGENT-16 -- owner adjudication needed). deterministic incl reproof-s7-facent"
+          }
         }
       }
     },
