@@ -101,6 +101,11 @@ const MATRIX_SPECS = [
   // helpers/leak-metrics.test.ts. See leak-metrics.spec.ts and
   // docs/plans/df1-evidence/HARNESS-12.md.
   /leak-metrics\.spec\.ts$/,
+  // HARNESS-05 — raw HTTP/WS clients self-verify: deterministic echo/error
+  // fixture legs + capability legs (delayed hello, malformed-frame
+  // termination, slow-consumer pause, raw orchestration REST) against BOTH
+  // server kinds. See docs/plans/df1/HARNESS-05.md.
+  /harness-05-raw-clients\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
