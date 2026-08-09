@@ -28,10 +28,10 @@
 //! * **title-tier search only.** The `userMessages`/`fullText` file-content tiers
 //!   (`applyFileSearch`) are deferred; a search query matches title/summary/
 //!   firstUserMessage metadata (the `title` tier), never wrong results.
-//! * **no live terminal join / metadata-store flavor.** `isRunning` is always
-//!   `false` here (the terminal registry join + session-flavor overrides are the
-//!   original's live wiring); `sessionType` is omitted. Faithful for a browse of
-//!   persisted transcripts.
+//! * **live terminal join + metadata-store flavor: since added.** `isRunning`/
+//!   `runningTerminalId` come from the live-terminal join ([`join_live_terminals`],
+//!   Fix Spec: Session Naming Cluster) and `sessionType` is read-joined from the
+//!   SESSION-06 metadata store ([`apply_session_metadata`], Task 20).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,6 +81,12 @@ pub struct SessionDirectoryState {
     /// `buildLiveTerminalSessionItem`, `service.ts:77-151`). `O(terminals)` per
     /// request, no new I/O — reads the already-in-memory registry snapshot.
     pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// Task 20 (read-join): the SESSION-06 metadata store
+    /// (`session-metadata.json`, same `.freshell` home dir as the POST route)
+    /// whose `sessionType` tags [`apply_session_metadata`] overlays onto
+    /// matching items per request (`session-indexer.ts:1144-1148`, key =
+    /// `provider:sessionId`).
+    pub metadata: crate::session_metadata::SessionMetadataStore,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -116,8 +122,8 @@ struct DirItem {
     /// (`buildLiveTerminalSessionItem`, `service.ts:128`, `!meta.sessionId`) —
     /// never set on a real session-file item.
     live_terminal_only: bool,
-    /// `SessionDirectoryItem.sessionType` (`shared/read-models.ts:53`): only
-    /// populated on a synthesized live-terminal item (`service.ts:125`,
+    /// `SessionDirectoryItem.sessionType` (`shared/read-models.ts:53`): set on a
+    /// synthesized live-terminal item (`service.ts:125`,
     /// `sessionType: meta.provider`) — a real session-file item never sets this
     /// in this port (the original's parsed items don't set it either, see
     /// `toItems`/`joinRunningState`, `service.ts:132-151`).
@@ -395,6 +401,15 @@ async fn session_directory(
         None => Vec::new(),
     };
     let items = apply_session_overrides(items, &state.settings.session_overrides());
+    // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
+    // ONE `get_all()` per request (a cached read; disk is touched at most
+    // once per store lifetime), mirroring the original indexer reading the
+    // store snapshot while building items (`session-indexer.ts:1109,
+    // :1144-1148`). Ordered after the overrides overlay (the original applies
+    // `applyOverride` first, then the metadata `sessionType`) and BEFORE the
+    // live-terminal join (the original's indexer output already carries
+    // `sessionType` when `toItems` runs).
+    let items = apply_session_metadata(items, &state.metadata.get_all().await);
     // Fix Spec: Session Naming Cluster (SYMPTOM 1) -- join the LIVE terminal
     // identity set against the parsed session items (`toItems`, `service.ts:132-151`).
     // `.list()` (live-only, excludes retired terminals): an exited terminal is not
@@ -666,6 +681,32 @@ fn apply_session_overrides(
                 item.archived = ov.get("archived").and_then(Value::as_bool).unwrap_or(false);
             }
             Some(item)
+        })
+        .collect()
+}
+
+/// Task 20 (read-join): overlay `sessionType` from the SESSION-06 metadata
+/// store onto matching items, keyed by `provider:sessionId` -- ports the
+/// original indexer's read-join (`session-indexer.ts:1144-1148`: `const meta
+/// = sessionMetadata[metaKey]; if (meta?.sessionType) merged.sessionType =
+/// meta.sessionType`). The JS truthiness gate means an absent, non-string, or
+/// EMPTY `sessionType` never applies.
+fn apply_session_metadata(
+    items: Vec<DirItem>,
+    metadata: &std::collections::HashMap<String, Value>,
+) -> Vec<DirItem> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(session_type) = metadata
+                .get(&item.key())
+                .and_then(|entry| entry.get("sessionType"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                item.session_type = Some(session_type.to_string());
+            }
+            item
         })
         .collect()
 }
@@ -1928,6 +1969,7 @@ mod tests {
             settings,
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
         let resp = app
@@ -1956,6 +1998,83 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Task 20 (read-join): a `sessionType` tag persisted through the
+    /// SESSION-06 `SessionMetadataStore` (`session-metadata.json`) is
+    /// overlaid onto the matching served `/api/session-directory` item,
+    /// keyed `provider:sessionId` -- mirroring the original indexer's
+    /// read-join (`session-indexer.ts:1144-1148`, `const meta =
+    /// sessionMetadata[metaKey]; if (meta?.sessionType) merged.sessionType
+    /// = meta.sessionType`). Mirrors the harness of
+    /// `patch_override_is_visible_through_session_directory_overlay`
+    /// (`sessions_tests.rs`): write through the REAL store, assert on the
+    /// REAL served JSON.
+    #[tokio::test]
+    async fn session_metadata_session_type_is_joined_onto_directory_items() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        // Same `.freshell` dir the POST /api/session-metadata route persists
+        // to -- the read side must discover the SAME file.
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set(
+                "claude",
+                "b7936c10-4935-441c-837c-c1f33cafec2d",
+                "kilroy",
+                Some("explicit"),
+            )
+            .await
+            .unwrap();
+
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index =
+            std::sync::Arc::new(SessionIndex::new(vec![
+                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                    as std::sync::Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            // A FRESH store instance over the same dir (not the writer above):
+            // proves the join reads the persisted file, not shared memory.
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|i| i["sessionId"] == json!("b7936c10-4935-441c-837c-c1f33cafec2d"))
+            .expect("tagged session present in directory");
+        assert_eq!(
+            item["sessionType"],
+            json!("kilroy"),
+            "sessionType from the metadata store must be joined onto the served item"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// B-T8: no home (`session_index: None`) still yields an empty page --
     /// the prior "no home resolvable" behavior, now expressed as an absent
     /// index instead of an absent `home: Option<PathBuf>`.
@@ -1971,6 +2090,9 @@ mod tests {
             settings,
             session_index: None,
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            // No home: a unique, nonexistent dir -- the store tolerates a
+            // missing file (empty metadata), matching the no-home page.
+            metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
         };
         let app = router(state);
         let resp = app
@@ -2052,6 +2174,7 @@ mod tests {
             settings: settings.clone(),
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2156,6 +2279,7 @@ mod tests {
             settings,
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2252,6 +2376,7 @@ mod tests {
             settings: settings.clone(),
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 

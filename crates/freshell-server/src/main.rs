@@ -677,11 +677,26 @@ async fn main() -> ExitCode {
     // Task 6: the sessions router's provider-generated short-circuit reads
     // the SAME session index (another clone before the move below).
     let sessions_state_index = session_index.clone();
+    // SESSION-06 store (`session-metadata.json`), created here (before the
+    // directory state) because BOTH the `POST /api/session-metadata` write
+    // route below and Task 20's session-directory read-join share it. Same
+    // isolated-home `.freshell` directory the settings store resolves
+    // (`settings_store.rs:246`), so a real deployment's existing
+    // `session-metadata.json` is discovered exactly like the legacy server
+    // discovers it.
+    let session_metadata_dir = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .unwrap_or_else(|| PathBuf::from(".freshell"));
+    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
         session_index,
         identity: terminal_identity.clone(),
+        // Task 20: the SAME store the POST route writes through -- the
+        // directory read-join must see every persisted `sessionType` tag.
+        metadata: session_metadata_store.clone(),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -739,14 +754,8 @@ async fn main() -> ExitCode {
 
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
-    // `<home>/.freshell/session-metadata.json`. Same isolated-home directory the settings
-    // store resolves (`settings_store.rs:246`), so a real deployment's existing
-    // `session-metadata.json` is discovered exactly like the legacy server discovers it.
-    let session_metadata_dir = home
-        .as_deref()
-        .map(|h| h.join(".freshell"))
-        .unwrap_or_else(|| PathBuf::from(".freshell"));
-    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+    // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
+    // session-directory read-join reads (created above, before the directory state).
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
         store: session_metadata_store,

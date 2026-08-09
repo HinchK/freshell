@@ -19,10 +19,11 @@
 //! { "version": 1, "sessions": { "<provider>": { "<sessionId>": { "sessionType": "...", "sessionTypeSource": "explicit" } } } }
 //! ```
 //!
-//! `get_all()`/`get()` are provided for future read-surfaces (the sidebar directory listing
-//! embeds `sessionType` inline via `codingCliIndexer` server-side in the reference; this
-//! port's `crates/freshell-sessions` directory index is a SEPARATE crate this module does
-//! not reach into — wiring metadata into the directory listing is out of THIS module's
+//! `get_all()` is read by `session_directory`'s per-request `sessionType` overlay
+//! (`apply_session_metadata`, Task 20, mirroring the reference embedding `sessionType`
+//! inline via `codingCliIndexer`, `session-indexer.ts:1144-1148`); `get()` remains for
+//! future read-surfaces. (This port's `crates/freshell-sessions` directory index is a
+//! SEPARATE crate this module does not reach into — wiring metadata into the directory listing is out of THIS module's
 //! scope and tracked separately) but are not (yet) exposed over HTTP: the reference has no
 //! `GET /api/session-metadata` route either (confirmed by exhaustive grep of
 //! `server/sessions-router.ts` and `server/index.ts` — only the `POST` exists).
