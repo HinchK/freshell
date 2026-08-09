@@ -64,6 +64,7 @@ import { PortForwardManager } from './port-forward.js'
 import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { createTabsSyncRouter } from './tabs-registry/client-retire-router.js'
+import { createTestClockRouter } from './test-clock-router.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
@@ -808,6 +809,13 @@ async function main() {
     codingCliIndexer,
     terminalViewService: createTerminalViewService({ configStore, registry }),
   }))
+
+  // --- API: test clock (HARNESS-14) ---
+  // Mounted here (after httpAuthMiddleware) so auth matches every other
+  // /api/* route. Every handler ALSO re-checks the FRESHELL_TEST_CLOCK gate
+  // and answers an indistinguishable 404 when off — the surface cannot
+  // exist in a normal build (the env var is never set by any launcher).
+  app.use('/api', createTestClockRouter())
 
   // --- API: fresh-agent extras (attachments, exec, diffs) ---
   app.use('/api/fresh-agent', createFreshAgentExtrasRouter({ freshAgentRuntimeManager }))

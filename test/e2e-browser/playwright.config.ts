@@ -18,6 +18,11 @@ const MATRIX_SPECS = [
   // close-out-campaign-executed); see docs/plans/df1-evidence/CFG-04.md.
   /cfg04-legacy-browser-seed\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
+  // HARNESS-14 — controllable server clock: advance/freeze/resume/reset the
+  // shared server clock from one serial spec, deterministic fixture-timer
+  // ordering (idle cleanup) with zero wall sleeps, and the normal-build
+  // absence proof. Legacy is a true parity control (identical surface).
+  /harness-14-server-clock\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
   // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
   // categories (settings, session, terminal, browser-pane, multi-client).

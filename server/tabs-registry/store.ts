@@ -4,6 +4,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { z } from 'zod'
 import { getFreshellConfigDir } from '../freshell-home.js'
+import { testClockNowMs } from '../test-clock.js'
 import { TabRegistryRecordSchema, normalizeRegistryTabRecord, type RegistryTabRecord } from './types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -661,14 +662,17 @@ export class TabsRegistryStore {
     this.state = state
     this.manifestRevision = manifestRevision
     this.manifestObjectRefs = manifestObjectRefs
-    this.now = options.now ?? (() => Date.now())
+    // HARNESS-14: the default clock is the shared, env-gated test clock
+    // (identity passthrough to Date.now() when FRESHELL_TEST_CLOCK is off);
+    // an explicit `options.now` still wins when a caller supplies one.
+    this.now = options.now ?? (() => testClockNowMs())
     this.caps = { ...DEFAULT_CAPS, ...(options.caps ?? {}) }
   }
 
   static async open(rootDir: string, options: TabsRegistryStoreOptions = {}): Promise<TabsRegistryStore> {
     const resolvedRoot = resolveStoreDir(rootDir)
     const caps = { ...DEFAULT_CAPS, ...(options.caps ?? {}) }
-    const now = options.now ?? (() => Date.now())
+    const now = options.now ?? (() => testClockNowMs())
     await fsp.mkdir(path.join(resolvedRoot, 'v1', 'objects'), { recursive: true })
     await fsp.mkdir(path.join(resolvedRoot, 'v1', 'tmp'), { recursive: true })
 

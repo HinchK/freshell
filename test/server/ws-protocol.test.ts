@@ -1815,6 +1815,62 @@ describe('ws protocol', () => {
     ws.close()
   })
 
+  it('HARNESS-14: the create-rate window follows the shared test clock', async () => {
+    // With FRESHELL_TEST_CLOCK enabled (override stands in for the env gate
+    // in-process) and FROZEN, a burst at one virtual instant fills the
+    // window and it never drains on real time; a single virtual
+    // advanceTestClockMs step past the window frees it. No wall sleeps.
+    const testClock = await import('../../server/test-clock.js')
+    testClock.__setTestClockEnabledOverrideForTests(true)
+    testClock.resetTestClock()
+    testClock.freezeTestClock()
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await new Promise<void>((resolve) => {
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type === 'ready') resolve()
+        })
+      })
+
+      const messages: any[] = []
+      ws.on('message', (data) => {
+        messages.push(JSON.parse(data.toString()))
+      })
+
+      // Fill the 10-per-10s window at one FROZEN virtual instant.
+      for (let i = 0; i < 11; i++) {
+        ws.send(JSON.stringify({ type: 'terminal.create', requestId: `clock-test-${i}`, mode: 'shell' }))
+      }
+      await waitForCreateResponses(messages, 11, 'clock-test-')
+      const created = messages.filter((m) =>
+        m.type === 'terminal.created' && typeof m.requestId === 'string' && m.requestId.startsWith('clock-test-')
+      )
+      expect(created).toHaveLength(10)
+
+      // Real elapsed time alone must never drain a frozen window.
+      await new Promise((r) => setTimeout(r, 50))
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'clock-frozen-probe', mode: 'shell' }))
+      await waitForCreateResponses(messages, 1, 'clock-frozen-probe')
+      const frozenProbe = messages.find((m) => m.requestId === 'clock-frozen-probe')
+      expect(frozenProbe).toMatchObject({ type: 'error', code: 'RATE_LIMITED' })
+
+      // One virtual step past the window frees it instantly.
+      testClock.advanceTestClockMs(10_001)
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'clock-after-advance', mode: 'shell' }))
+      await waitForCreateResponses(messages, 1, 'clock-after-advance')
+      const afterAdvance = messages.find((m) => m.requestId === 'clock-after-advance')
+      expect(afterAdvance?.type).toBe('terminal.created')
+
+      ws.close()
+    } finally {
+      testClock.resetTestClock()
+      testClock.__setTestClockEnabledOverrideForTests(null)
+    }
+  })
+
   it('does not rate limit restored terminal.create requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
