@@ -263,39 +263,20 @@ only blocking flaws, do NOT iterate to full pw green.
 - [ ] Final verification pass: both Task-1 carges twice, spec probe outcomes recorded,
   `git log --oneline` tidy. Update status `"state":"review","terminal":"COMPLETED"`.
 
-## Load-bearing audit (to be validated before Task 1 starts — filled in after Skill 2 run)
+## Load-bearing audit — VALIDATED 2026-08-09 (ledger; all checks cheap/local/run-or-inspect)
 
-Claims the plan depends on, each with a falsifiable check:
+| # | Assumption (falsifiable) | Cost if false | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| 1 | Dedupe `begin()` runs before the rate limiter and covers BOTH restore and non-restore frames on rust | high (plan premise) | inspect + Task-1 tests | **verified** | `terminal.rs:564-624` — `match state.create_dedupe.begin(...)` is the first statement of the `TerminalCreate` arm; `restore==Some(true)` forks to the gate only AFTER it; `clear_if_in_flight` at :622 |
+| 2 | `fake-claude.mjs` idles without input and records a `FRESHELL_FAKE_LEDGER` row (pid/argv/env) — usable as the one-launch oracle through `CLAUDE_CMD` | high (spec design) | run + existing-matrix-green | **verified** | `FRESHELL_FAKE_LEDGER=/tmp/… node fake-claude.mjs --session-id …` under `timeout 3` → exit 124 (ALIVE at 3s, idles even on stdin EOF; under a PTY stdin never EOFs) and one ledger row `{pid,argv:--session-id …}`. CLAUDE_CMD seam green matrix-wide: `truly-idle-alerting.spec.ts` (MATRIX_SPECS) |
+| 3 | `registry.kill_all()` == "count of live tracked PTYs" oracle | medium | inspect | **verified** | `crates/freshell-terminal/src/registry.rs:1620-1628` filters to kill-confirmed terminals; the oracle convention is load-bearing in every `restore_spawn_gate.rs` test already |
+| 4 | Plain frame (no restore/sessionRef, mode claude) spawns cleanly on BOTH servers (no restore-guard rejection) | medium (frame shape) | inspect + existing-green | **verified** | rust: `auto_resume_e2e.rs:86-97` `create_claude_terminal` sends exactly this frame. legacy: plain claude create → `shouldPreallocateFreshClaudeSession` path (`ws-handler.ts:2138-2160`); the picker legs of `truly-idle-alerting.spec.ts` drive it on both matrix projects |
+| 5 | RawWsClient abort+reconnect absorbs which window (in-flight vs settled) the first create is in | low | reasoning + existing coverage | **verified** | `DuplicateSettled` replay and InFlight waiter-forward both terminate in "answered once, one PTY"; both shapes pinned green in `restore_spawn_gate.rs` (`resend_on_new_connection_*`) |
+| 6 | Legacy Node implements the same wire contract and is a valid parity control | high (matrix legitimacy) | inspect | **verified** | anchors in the parity table above (settled cache :575/:891-936, sentinel :2329-:2704, create lock :2218); reconciliation row names only the rust leg missing |
 
-1. **The dedupe guard is actually wired before the rate limiter and reached by BOTH
-   restore and non-restore frames** — read-check `terminal.rs:564-624` (done) + the
-   Task-1 tests themselves prove the non-restore path end-to-end.
-2. **`fake-claude.mjs` under `CLAUDE_CMD` idles without input and inherits
-   `FRESHELL_FAKE_*` env through the server's PTY spawn on BOTH server kinds** —
-   validate by running the fixture spawnily-first (HARNESS-03 spec already green on
-   both legs: `harness-03-provider-fixtures.spec.ts` is in `MATRIX_SPECS`) and by the
-   truly-idle pattern proving the CLAUDE_CMD seam matrix-wide; the Test-A probe is the
-   decisive check (ledger row appears ⇒ env + spawn both flow).
-3. **`registry.kill_all()` returns the count of RUNNING terminals the registry tracks**
-   (used as the one-PTY oracle in every `restore_spawn_gate.rs` test) — read-check
-   `crates/freshell-terminal/src/registry.rs` `kill_all`.
-4. **The plain-frame create (no `restore`, no `sessionRef`, mode claude) spawns the fake
-   CLI without tripping restore/identity guards on both servers** — decisive check is
-   the Test-A/B probe; fallback if legacy rejects: add `cwd` and/or switch raw legs to
-   `mode:"shell","shell":"system"` (shell *also* rides the same dedupe dispatch arm —
-   the acceptance semantics are mode-agnostic — and the checklist's "fixture launch
-   record" then reads via the fake-shell ledger instead: same mechanism, `SHELL` env
-   seam; both servers honor `$SHELL` for `shell:"system"`).
-5. **RawWsClient `abort()` + re-`connect` + identical frame reliably exercises the
-   settled-replay path even though settle may race the abort** — by construction: if
-   settle won the race, r2 gets `DuplicateSettled` replay; if not, r2 is the InFlight
-   waiter and `settle()` forwards the frame. Both are "answered once, one PTY".
-   Non-determinism of the window is thus absorbed; the assertions (one ledger row, two
-   answers with the same id) hold in both outcomes.
-6. **MATRIX registration is one additive regex line and legacy IS a valid parity
-   control for this contract** — legacy anchors cited above prove the legacy server
-   implements the same wire contract; the TERM-04 reconciliation row only names the
-   rust leg missing, not a legacy divergence.
+No falsified assumptions; no residual risks beyond the probe-run mechanics noted in Task 2
+(inventory surface pick inside Test A; rate-limiter quiescence of two back-to-back plain
+creates, asserted in-test via an `error`-frame silence guard).
 
 ## Boundaries (df1 worker contract)
 
