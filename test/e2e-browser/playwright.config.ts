@@ -13,6 +13,10 @@ import { defineConfig, devices } from '@playwright/test'
 const MATRIX_SPECS = [
   /server-restart-recovery\.spec\.ts$/,
   /settings-persistence-split\.spec\.ts$/,
+  // CFG-04 — legacy browser-preference seeding (one-shot consume + marker).
+  // Authored under the df1 deferred-Playwright policy (worker-authored,
+  // close-out-campaign-executed); see docs/plans/df1-evidence/CFG-04.md.
+  /cfg04-legacy-browser-seed\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
   // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
