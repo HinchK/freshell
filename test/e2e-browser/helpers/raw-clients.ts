@@ -119,7 +119,12 @@ export class RawWsHandshakeError extends Error {
 }
 
 export interface RawWsClientOptions {
-  /** Extra handshake headers (e.g. `Origin`). Wins over computed defaults. */
+  /** Extra handshake headers (e.g. `Origin`). Case-insensitively REPLACE the
+   *  computed defaults (`Host`, `Upgrade`, `Connection`,
+   *  `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) when the same name is
+   *  supplied — a raw client means what it says. (Replacing
+   *  Sec-WebSocket-Key makes `validateAccept` fail against honest servers,
+   *  by design.) */
   headers?: Record<string, string>
   /** Verify the Sec-WebSocket-Accept digest (default true). */
   validateAccept?: boolean
@@ -284,18 +289,28 @@ export class RawWsClient {
     })
 
     const key = crypto.randomBytes(16).toString('base64')
-    const headerLines = [
-      `GET ${path} HTTP/1.1`,
-      `Host: ${host}:${port}`,
-      'Upgrade: websocket',
-      'Connection: Upgrade',
-      `Sec-WebSocket-Key: ${key}`,
-      'Sec-WebSocket-Version: 13',
-    ]
-    for (const [name, value] of Object.entries(options.headers ?? {})) {
-      headerLines.push(`${name}: ${value}`)
+    // Case-insensitive replace semantics (round-2 review): caller headers
+    // REPLACE computed defaults with the same name instead of duplicating
+    // them. `key` stays the expected-accept verifier value regardless of a
+    // caller-supplied Sec-WebSocket-Key — which will then fail validation
+    // against honest servers (as documented on RawWsClientOptions.headers).
+    const mergedHeaders = new Map<string, [string, string]>()
+    const setHeader = (name: string, value: string) => {
+      mergedHeaders.set(name.toLowerCase(), [name, value])
     }
-    socket.write(headerLines.join('\r\n') + '\r\n\r\n')
+    setHeader('Host', `${host}:${port}`)
+    setHeader('Upgrade', 'websocket')
+    setHeader('Connection', 'Upgrade')
+    setHeader('Sec-WebSocket-Key', key)
+    setHeader('Sec-WebSocket-Version', '13')
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
+      setHeader(name, value)
+    }
+    socket.write(
+      `GET ${path} HTTP/1.1\r\n`
+      + [...mergedHeaders.values()].map(([name, value]) => `${name}: ${value}`).join('\r\n')
+      + '\r\n\r\n',
+    )
 
     let parsed: ParsedHandshake
     try {
@@ -757,9 +772,16 @@ export interface RawHttpResponse {
 /**
  * Byte-accounted raw HTTP/1.1 request for calling orchestration routes
  * (`/api/tabs`, `/api/panes/:id/...`) from specs, without a browser page.
- * Full method/header/body control (nothing is ever added implicitly except
- * `Content-Length` when a body is supplied and the caller didn't set one),
- * and socket-truth byte counters via per-request `agent: false` sockets.
+ *
+ * "Raw" scoped precisely (round-2 review): full APPLICATION-header control
+ * — any header name/value may be supplied, and omission is honored (nothing
+ * auth/origin-related is ever added for you; `Content-Length` is computed
+ * when a body is supplied without one). Hop-by-hop framing is Node's
+ * HTTP/1.1 stack (`http.request`, `agent: false` so byte counters are
+ * per-request socket truth): `Host` is filled from the URL when not
+ * supplied, and Node owns connection framing/keep-alive details. Truly
+ * malformed HTTP byte streams are out of scope for this helper (the raw WS
+ * client above exists for wire-level control).
  */
 export function rawHttpRequest(baseUrl: string, options: RawHttpRequestOptions = {}): Promise<RawHttpResponse> {
   const url = new URL(baseUrl)

@@ -349,12 +349,24 @@ recorded):
 
 - [ ] **Step 1:** refactor pass (DRY within helper, doc comments matching
   repo doc-comment culture).
-- [ ] **Step 2:** scoped typecheck:
-  `npx tsc --noEmit --strict --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck test/e2e-browser/helpers/raw-clients.ts test/e2e-browser/helpers/echo-ws-fixture.ts test/e2e-browser/specs/harness-05-raw-clients.spec.ts test/e2e-browser/playwright.config.ts`
-- [ ] **Step 3:** verify matrix — each leg ≥2 consecutive green:
+- [ ] **Step 2:** scoped typecheck gate (executable, file-attributed; the
+  config is committed at `test/e2e-browser/tsconfig.raw-clients-check.json`):
+  ```
+  npx tsc -p test/e2e-browser/tsconfig.raw-clients-check.json > /tmp/h05-tsc.log 2>&1; \
+    if grep -qE "^(test/e2e-browser/)?(helpers/raw-clients|helpers/echo-ws-fixture|specs/harness-05-raw-clients)" /tmp/h05-tsc.log; then \
+      echo "HARNESS-05 TYPECHECK GATE: FAIL"; exit 1; \
+    else echo "HARNESS-05 TYPECHECK GATE: PASS"; fi
+  ```
+  (The repo-owned typecheck configs exclude `test/`; remaining errors in the
+  log belong to pre-existing dependency files and must not be attributed to
+  the three HARNESS-05 files.)
+- [ ] **Step 3:** verify matrix — each leg ≥2 consecutive green. NOTE
+  (learned the hard way, Playwright 1.52): positional filters must be
+  testDir-relative PATHS (`specs/harness-05-raw-clients.spec.ts`) — a bare
+  file-name substring does NOT filter and silently runs the whole matrix.
   - `npx vitest run --config test/e2e-browser/vitest.config.ts raw-clients`
-  - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=legacy-chromium harness-05-raw-clients` ×2
-  - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium harness-05-raw-clients` ×2
+  - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=legacy-chromium "specs/harness-05-raw-clients.spec.ts"` ×2
+  - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium "specs/harness-05-raw-clients.spec.ts"` ×2
   (pw lease held across each run; flaky-prone → the runs ARE the x2.)
 - [ ] **Step 4:** write `docs/plans/df1-evidence/HARNESS-05.md` (per-leg
   results, commands, SHAs); commit.

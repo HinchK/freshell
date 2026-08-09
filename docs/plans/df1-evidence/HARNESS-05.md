@@ -104,6 +104,21 @@ identically without this change (`src/lib/client-logger.ts`/`perf-logger.ts`/
 Post-fix re-verification: unit 34/34; legacy-chromium 10/10 ×2 runs;
 rust-chromium 10/10 ×2 runs (all listed above at the post-fix SHA).
 
+**Round 2** — independent fresheyes review (GPT family, FRESHPID 4005182,
+diff at 85534f268): verdict FAILED, 2 majors + 2 minors. Dispositions:
+
+| # | Finding | Disposition |
+|---|---------|-------------|
+| R6a | plan Task-6 step still cited the stale one-off tsc file-list command (predated the committed gate config) | FIXED: plan now has the verbatim executable gate (`tsconfig.raw-clients-check.json` + attribution grep). |
+| R6b | plan Task-6 pw commands still used the bare positional filter that Playwright 1.52 does NOT filter on | FIXED: plan + this evidence use the working testDir-relative path form `specs/harness-05-raw-clients.spec.ts`, with the pitfall documented inline. |
+| R7 | handshake `headers` doc claimed "wins over computed defaults" but implementation appended → duplicate `Host`/`Sec-WebSocket-Key` | FIXED: case-insensitive replace semantics in `connect()`; `Sec-WebSocket-Key` validation expectations documented; regression test asserts exactly-one overridden `Host` line + `Origin` presence (impl and test landed together this round — the RED degenerated; behavior is what's asserted). |
+| R8 | `rawHttpRequest` contract overpromised "raw" HTTP (Node owns hop-by-hop framing) | FIXED: doc comment now scopes "raw" precisely — full application-header control, Node HTTP/1.1 framing (`Host` from URL when absent), malformed-HTTP byte streams explicitly out of scope (the raw WS client is the wire-level tool). |
+
+Final verification at HEAD (post-round-2): unit **35/35**; typecheck gate
+**PASS**; legacy-chromium **10 passed (18.3s)** + **10 passed (16.9s)**;
+rust-chromium **10 passed (30.7s)** + **10 passed (18.1s)** — 2 consecutive
+green per leg at the final SHA.
+
 ## Per-leg recorded observations (HARNESS-05-LEG lines)
 
 legacy-chromium: B1 `framesDuringDelay:0, ready:true`; B2

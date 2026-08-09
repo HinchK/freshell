@@ -615,3 +615,39 @@ describe('rawHttpRequest — review-round-1 fixes', () => {
     })
   })
 })
+
+describe('RawWsClient — review-round-2 fixes', () => {
+  it('R7: caller handshake headers case-insensitively REPLACE computed defaults (no duplicates)', async () => {
+    // Bare TCP server capturing the exact request head.
+    const net = await import('node:net')
+    const crypto = await import('node:crypto')
+    let rawHead = ''
+    const server = net.createServer((sock) => {
+      sock.once('data', (req) => {
+        rawHead = String(req)
+        const key = rawHead.match(/Sec-WebSocket-Key: (.+)\r\n/)![1]
+        const accept = crypto.createHash('sha1')
+          .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+        sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+        sock.on('data', () => {})
+      })
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const { port } = server.address() as import('node:net').AddressInfo
+    let client: RawWsClient | undefined
+    try {
+      client = await RawWsClient.connect(`ws://127.0.0.1:${port}/`, {
+        headers: { host: 'custom-host.example', Origin: 'https://origin.example' },
+      })
+      const hostLines = rawHead.split('\r\n').filter((l) => /^host:/i.test(l))
+      expect(hostLines).toEqual(['host: custom-host.example'])
+      expect(rawHead).toContain('Origin: https://origin.example\r\n')
+      expect(rawHead.split('\r\n').filter((l) => /^upgrade:/i.test(l))).toEqual(['Upgrade: websocket'])
+      expect(rawHead.split('\r\n').filter((l) => /^sec-websocket-version:/i.test(l)))
+        .toEqual(['Sec-WebSocket-Version: 13'])
+    } finally {
+      await client?.dispose()
+      server.close()
+    }
+  })
+})
