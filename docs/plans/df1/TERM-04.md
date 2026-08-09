@@ -50,8 +50,8 @@ What is genuinely missing (the item's remaining work):
 | Create-lock serialization around the whole decision | `withTerminalCreateLock`/`terminalCreateLockKey` :1002-1033, call :2218 | the dedupe mutex makes begin atomic; restore creates additionally serialize on the spawn gate FIFO |
 | Duplicate answered with the SAME `terminal.created` (`reused:true` lifecycle event) | `attachReusedTerminal` :2260-2319 (`reuseSource: 'request_id_cache'`) | `DedupeDecision::DuplicateSettled(created)` replays the exact stored frame (`terminal.rs:575-580`) |
 | Sentinel cleanup on failure / RATE_LIMITED so the client retry ladder (same requestId) proceeds fresh | catch arm :2704-2706 | `clear_if_in_flight` at `terminal.rs:622` + all `create_gate.rs` exits; fail-loud `error{PTY_SPAWN_FAILED, requestId}` forwarded to waiters |
-| Eager eviction at terminal exit + lazy eviction on registry miss | `onTerminalExitBound`→`forgetCreatedRequestIdsForTerminal` :594; lazy :929-931 | liveness-anchored prune: `begin()` probes `registry.is_pty_running` (helper at `registry.rs` `is_pty_running`) and replays only while running; `settle()` prunes dead settled entries |
-| expectedSessionKey-mismatch falls through to the normal path | `createdRequestBindingMatchesExpectedSession` :912-916 | restore-flag-mismatch falls through (documented divergence in `Entry::Settled.restore`; reachable skew needs same requestId + same restore flag + DIFFERENT sessionRef, which no client path produces — a pane never changes its create payload identity fields, only its restore latch) |
+| Eager eviction at terminal exit + lazy eviction on registry miss | eager at exit (`onTerminalExitBound` call site :593 → `forgetCreatedRequestIdsForTerminal` :906-910); lazy on registry miss :929-931 | liveness-anchored prune: `begin()` probes `registry.is_pty_running` (helper at `registry.rs` `is_pty_running`) and replays only while running; `settle()` prunes dead settled entries |
+| expectedSessionKey-mismatch falls through to the normal path | `createdRequestBindingMatchesExpectedSession` :914-919 | restore-flag-mismatch falls through (documented divergence in `Entry::Settled.restore`; reachable skew needs same requestId + same restore flag + DIFFERENT sessionRef, which no client path produces — a pane never changes its create payload identity fields, only its restore latch) |
 
 Two connection-scoped behaviors worth restating: same-socket duplicates during the
 in-flight window are silent in BOTH implementations (the original create's reply is the
@@ -71,12 +71,15 @@ divergence (see `create_dedupe.rs` header).
 **Files:**
 - Create: `crates/freshell-ws/tests/create_dedupe.rs`
 
-**Harness convention (copied from `restore_spawn_gate.rs`, DRY-verified):** real axum
-server on `127.0.0.1:0` (`spawn_server(cfg, SpawnGate::new(4, 64))` shape — 4 permits,
-no restore storm needed), `connect_and_hello` drains the 4 handshake frames, `create_frame(id, false)`
-is `{"type":"terminal.create","requestId":id,"mode":"shell","shell":"system"}` (shell spawn
-works in this harness: `restore_spawn_gate.rs` uses exactly it), replies read with
-`next_json_of_type(_, "terminal.created")`, PTY count asserted via `registry.kill_all()`.
+**Harness convention:** real axum server on `127.0.0.1:0` via the SHARED harness
+`crates/freshell-ws/tests/common/mod.rs` (`mod common;`): `spawn_server_with_create_protect_probes(CreateProtectConfig::default())`
+returns `(ws_url, registry, gate)` (default limits: 10 creates/10s per connection —
+no test exceeds 3 sends, so the limiter cannot fire); `connect_and_capture_inventory(url)`
+drains the 4 handshake frames (`config_fallback: None` ⇒ exactly 4);
+`create_shell_terminal(&mut ws, request_id)` sends the plain frame
+`{"type":"terminal.create","requestId":id,"mode":"shell","shell":"system"}` and returns the
+terminalId (shell spawn works in this harness); `next_frame_of_type(&mut ws, "terminal.created")`
+reads replies; PTY count asserted via `registry.kill_all()`.
 
 - [ ] **Step 1 (RED first):** author the file with both tests, run:
 
@@ -95,14 +98,16 @@ Test 1 — same-connection settled replay (retry leg, non-restore):
 ```rust
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_resend_same_connection_replays_settled_terminal() {
-    let (ws_url, registry, ..) = spawn_server_default().await;
-    let mut c = connect_and_hello(&ws_url).await;
-    send_text(&mut c, &create_frame("d-plain", false)).await;
-    let first = next_json_of_type(&mut c, "terminal.created").await;
-    send_text(&mut c, &create_frame("d-plain", false)).await;
-    let second = next_json_of_type(&mut c, "terminal.created").await;
+    let (ws_url, registry, _gate) =
+        spawn_server_with_create_protect_probes(CreateProtectConfig::default()).await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&ws_url).await;
+    let tid = create_shell_terminal(&mut ws, "d-plain").await;
+    // liveness precondition: replay is owed only while the terminal runs.
+    assert!(registry.is_pty_running(&tid));
+    send_plain_create(&mut ws, "d-plain").await; // local helper: sends the plain frame above
+    let second = next_frame_of_type(&mut ws, "terminal.created").await;
     assert_eq!(second["requestId"], "d-plain");
-    assert_eq!(second["terminalId"], first["terminalId"]);
+    assert_eq!(second["terminalId"], tid);
     assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
 }
 ```
@@ -112,20 +117,25 @@ Test 2 — cross-connection + lost-response replay (reconnect + two-client leg, 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_resend_on_new_connection_replays_settled_terminal() {
-    let (ws_url, registry, ..) = spawn_server_default().await;
-    let mut c1 = connect_and_hello(&ws_url).await;
-    send_text(&mut c1, &create_frame("d-xconn", false)).await;
-    let first = next_json_of_type(&mut c1, "terminal.created").await;
+    let (ws_url, registry, _gate) =
+        spawn_server_with_create_protect_probes(CreateProtectConfig::default()).await;
+    let (mut c1, _i1) = connect_and_capture_inventory(&ws_url).await;
+    let tid = create_shell_terminal(&mut c1, "d-xconn").await;
     drop(c1); // response landed but the pane is gone — the lost-response shape
-    let mut c2 = connect_and_hello(&ws_url).await;
-    send_text(&mut c2, &create_frame("d-xconn", false)).await;
-    let second = next_json_of_type(&mut c2, "terminal.created").await;
-    assert_eq!(second["requestId"], "d-xconn");
-    assert_eq!(second["terminalId"], first["terminalId"],
+    assert!(registry.is_pty_running(&tid));
+    let (mut c2, _i2) = connect_and_capture_inventory(&ws_url).await;
+    let tid2 = create_shell_terminal(&mut c2, "d-xconn").await;
+    assert_eq!(tid2, tid,
         "a settled non-restore create must replay its terminal.created on a new connection");
+    send_plain_create(&mut c2, "d-xconn").await;
+    let third = next_frame_of_type(&mut c2, "terminal.created").await;
+    assert_eq!(third["terminalId"], tid);
     assert_eq!(registry.kill_all(), 1, "exactly one PTY across reconnect + second client");
 }
 ```
+
+(The delivered file — including its `different_requestids_spawn_distinct_terminals`
+over-dedupe guard — IS the authority; these blocks are kept structurally truthful to it.)
 
 - [ ] **Step 2 (GREEN x2):** run the file twice (flake check), plus the pre-existing
   sibling suite once to prove no interference:
@@ -188,8 +198,9 @@ canonical owner isn't found... — INVALID: legacy requires sessionRef for resto
 So raw legs use the PLAIN non-restore frame `{"type":"terminal.create","requestId":"K","mode":"claude"}`
 (the Task-1 legs land it on rust first; ACCEPT THE RISK the rate limiter is irrelevant),
 which also matches what the frozen client actually sends first. Confirm in the probe run
-that no `RESTORE_UNAVAILABLE`/rate-limit frame appears; `RawWsClient.nextJsonMessage('error', …)`
-guard asserts silence.
+that no `RESTORE_UNAVAILABLE`/rate-limit frame appears — an unexpected `error` frame
+fails the reply await (timeouts are loud), and each test sends at most 3 creates against
+the 10/10s limiter budget so the limiter cannot fire regardless.
 
 **Test A — delayed/lost first `terminal.created`, force reconnect, resend: one PTY.**
 1. `r1 = RawWsClient.connect(wsUrl)`; `r1.hello(token)`; await `ready`.
@@ -269,14 +280,30 @@ only blocking flaws, do NOT iterate to full pw green.
 |---|---|---|---|---|---|
 | 1 | Dedupe `begin()` runs before the rate limiter and covers BOTH restore and non-restore frames on rust | high (plan premise) | inspect + Task-1 tests | **verified** | `terminal.rs:564-624` — `match state.create_dedupe.begin(...)` is the first statement of the `TerminalCreate` arm; `restore==Some(true)` forks to the gate only AFTER it; `clear_if_in_flight` at :622 |
 | 2 | `fake-claude.mjs` idles without input and records a `FRESHELL_FAKE_LEDGER` row (pid/argv/env) — usable as the one-launch oracle through `CLAUDE_CMD` | high (spec design) | run + existing-matrix-green | **verified** | `FRESHELL_FAKE_LEDGER=/tmp/… node fake-claude.mjs --session-id …` under `timeout 3` → exit 124 (ALIVE at 3s, idles even on stdin EOF; under a PTY stdin never EOFs) and one ledger row `{pid,argv:--session-id …}`. CLAUDE_CMD seam green matrix-wide: `truly-idle-alerting.spec.ts` (MATRIX_SPECS) |
-| 3 | `registry.kill_all()` == "count of live tracked PTYs" oracle | medium | inspect | **verified** | `crates/freshell-terminal/src/registry.rs:1620-1628` filters to kill-confirmed terminals; the oracle convention is load-bearing in every `restore_spawn_gate.rs` test already |
+| 3 | `registry.kill_all()` is a sound one-PTY oracle for these tests | medium | inspect | **verified (scoped)** | `crates/freshell-terminal/src/registry.rs:1620-1628` returns the number of RECORDS the sweep removed (`kill_internal` true on removal, running-or-not — its doc says the sweep walks every tracked id including retained-exited). In these tests zero terminals exit, so records == live PTYs; with a dead shell the assertion would catch a different problem entirely. Same convention as every `restore_spawn_gate.rs` test |
 | 4 | Plain frame (no restore/sessionRef, mode claude) spawns cleanly on BOTH servers (no restore-guard rejection) | medium (frame shape) | inspect + existing-green | **verified** | rust: `auto_resume_e2e.rs:86-97` `create_claude_terminal` sends exactly this frame. legacy: plain claude create → `shouldPreallocateFreshClaudeSession` path (`ws-handler.ts:2138-2160`); the picker legs of `truly-idle-alerting.spec.ts` drive it on both matrix projects |
 | 5 | RawWsClient abort+reconnect absorbs which window (in-flight vs settled) the first create is in | low | reasoning + existing coverage | **verified** | `DuplicateSettled` replay and InFlight waiter-forward both terminate in "answered once, one PTY"; both shapes pinned green in `restore_spawn_gate.rs` (`resend_on_new_connection_*`) |
 | 6 | Legacy Node implements the same wire contract and is a valid parity control | high (matrix legitimacy) | inspect | **verified** | anchors in the parity table above (settled cache :575/:891-936, sentinel :2329-:2704, create lock :2218); reconciliation row names only the rust leg missing |
 
-No falsified assumptions; no residual risks beyond the probe-run mechanics noted in Task 2
-(inventory surface pick inside Test A; rate-limiter quiescence of two back-to-back plain
-creates, asserted in-test via an `error`-frame silence guard).
+No falsified assumptions.
+
+Residual risks (recorded honestly — first one surfaced by review round 1):
+1. **Legacy leg B is microtask-order sensitive.** On LEGACY, a plain claude create's lock
+   key is `session:claude:<per-connection-fresh-uuid>` (`ws-handler.ts:1007-1010`, minted
+   per ClientState via `reserveClaudeFreshSessionId` :2146), so two connections sharing a
+   requestId do NOT serialize on `withTerminalCreateLock`, and legacy has no
+   cross-connection in-flight sentinel — the settled cache only answers AFTER the first
+   create's `registry.create` + `rememberCreatedRequestId` (:2653). Leg B passes on legacy
+   because the first create resolves off the warm config cache before the second socket's
+   message macrotask runs. Under extreme load (cold `configStore.cache`, or any NEW await
+   added before `registry.create` on the legacy claude path) legacy leg B could
+   double-spawn — a PRE-EXISTING legacy design gap relative to rust's strict superset
+   (rust's waiter path makes B deterministic), NOT a behavior this branch introduces.
+   If close-out ever sees that flake, the honest fix is a legacy cross-connection
+   sentinel, out of this item's scope; the RUST legs (the item's actual proof) are immune.
+2. The `error`-frame silence claim is structural, not explicitly asserted: any `error`
+   frame on a create leg fails the reply await by timeout (loud), and budgets (≤3 sends vs
+   10/10s) keep the limiter unreachable.
 
 ## Boundaries (df1 worker contract)
 

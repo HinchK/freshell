@@ -43,7 +43,7 @@ import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external
 import type { TestServerInfo } from '../helpers/test-server.js'
 import { RawWsClient, rawHttpRequest } from '../helpers/raw-clients.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { PROVIDER_FIXTURE_DIR } from '../helpers/provider-fixture-launcher.js'
+import { PROVIDER_FIXTURE_DIR, childPidsOf } from '../helpers/provider-fixture-launcher.js'
 
 type LedgerRow = { t: number; pid: number; provider: string; argv: string[]; cwd: string }
 
@@ -159,6 +159,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
   test.afterEach(async () => {
     await server?.stop()
     server = undefined
+    await fs.rm(root, { recursive: true, force: true })
   })
 
   test('A: lost first terminal.created, reconnect resends the same create — one launch, one terminal', async () => {
@@ -193,10 +194,12 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     expect(typeof created.terminalId).toBe('string')
     expect(created.terminalId.length).toBeGreaterThan(0)
 
-    // One fixture launch record — its pid is the one PTY PID.
+    // One fixture launch record — whose pid is a REAL child process of the
+    // server under test (the checklist's "one PTY PID": one launch, owned by
+    // this server, nothing else spawned).
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    expect(rows[0].pid).toBeGreaterThan(0)
+    expect(childPidsOf(info.pid)).toContain(rows[0].pid)
 
     // One terminal ID in the server inventory, and it is the replied one.
     await expect
@@ -236,6 +239,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
 
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
+    expect(childPidsOf(info.pid)).toContain(rows[0].pid)
 
     await expect
       .poll(() => runningTerminalIds(info), { timeout: 10_000 })
@@ -260,7 +264,8 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     await cwdBox.fill(cwdDir)
     await cwdBox.press('Enter')
 
-    // The fake CLI banner proves the PTY is up (its text arrives over WS).
+    // Pane bound: poll the Redux layout for the terminalId the create
+    // settled into (TerminalView folds terminal.created into pane content).
     await expect
       .poll(async () => {
         const tabId = await harnessA.getActiveTabId()
@@ -296,26 +301,64 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     expect(await readLedger(ledgerPath)).toHaveLength(1)
 
     // Second real page: issue the SAME create request over its own real WS
-    // connection (sendWsMessage goes out the app's live socket).
+    // connection (sendWsMessage goes out the app's live socket). Both
+    // directions are OBSERVED, never assumed:
+    //  - delivery: ws-client.fire `outboundMessageObserver` only from
+    //    `sendNow` (ws-client.ts:784-787) — i.e. only for frames that really
+    //    hit the socket, never for reconcile-held or pre-ready-queued ones;
+    //  - the server's answer: Playwright's own WS tap on page B sees the
+    //    `terminal.created` frame the dedupe guard replays/forwards.
     const contextB = await browser.newContext()
     const pageB = await contextB.newPage()
     const harnessB = new TestHarness(pageB)
+    // Attach the tap BEFORE navigation creates the socket.
+    const wsEventPromise = pageB.waitForEvent('websocket', { timeout: 15_000 })
     await pageB.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const pageBWs = await wsEventPromise
+    const receivedByB: any[] = []
+    pageBWs.on('framereceived', ({ payload }) => {
+      try {
+        receivedByB.push(JSON.parse(String(payload)))
+      } catch {
+        // non-JSON frame — irrelevant to this contract
+      }
+    })
     await harnessB.waitForHarness()
     await harnessB.waitForConnection()
+    const duplicateFrame = plainCreateFrame(requestId, cwdDir)
     await pageB.evaluate((frame) => {
       window.__FRESHELL_TEST_HARNESS__?.sendWsMessage(frame)
-    }, plainCreateFrame(requestId, cwdDir))
+    }, duplicateFrame)
 
-    // Give the duplicate a real window to do damage, then assert the
-    // checklist invariants: one PTY PID, one terminal ID, one pane owner.
-    await pageB.waitForTimeout(1_000)
+    // Proof page B's app actually TRANSMITTED the duplicate (sent_messages are
+    // recorded only from the real socket send path).
+    await expect
+      .poll(async () => pageB.evaluate((rid) =>
+        (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as any[] | undefined)
+          ?.some((m) => m?.type === 'terminal.create' && m?.requestId === rid) ?? false,
+      requestId), { timeout: 10_000 })
+      .toBe(true)
+
+    // Proof the server ANSWERED page B — with the SAME terminalId (settled
+    // replay; the in-flight waiter shape is covered by test B). This ordered
+    // pair (duplicate out, replayed answer back, same id) IS the dedupe edge
+    // the "two pages" phrase of the checklist names.
+    await expect
+      .poll(() => receivedByB.find(
+        (f) => f?.type === 'terminal.created' && f?.requestId === requestId,
+      )?.terminalId ?? null, { timeout: 15_000 })
+      .toBe(terminalId)
+
+    // The checklist invariants, AFTER the answered duplicate (no sleep-based
+    // window: a wrongful second spawn would answer page B with a DIFFERENT
+    // terminalId and/or append a second ledger row before its reply — the
+    // poll ordering above already excludes both).
     expect(await readLedger(ledgerPath)).toHaveLength(1)
     expect(await runningTerminalIds(info)).toEqual([terminalId])
     const leafAfter = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))
     expect(leafAfter.content.terminalId).toBe(terminalId)
     expect(leafAfter.content.createRequestId).toBe(requestId)
-    // Page B stays healthy (its ignored unicast reply must not wedge it).
+    // Page B stays healthy (its unicast reply must not wedge its app).
     expect(await harnessB.getConnectionStatus()).toBe('ready')
 
     await contextB.close()

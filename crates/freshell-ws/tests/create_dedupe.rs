@@ -12,8 +12,9 @@
 //! delayed responses, two clients):
 //!
 //! - `plain_resend_same_connection_replays_settled_terminal` — retry on the
-//!   same socket after settlement: replay, no respawn (and, because dedupe
-//!   `begin()` precedes the rate limiter, no RATE_LIMITED edge).
+//!   same socket after settlement: replay, no respawn (the reply is a
+//!   `terminal.created`, so an RATE_LIMITED error frame would fail the await —
+//!   dedupe preceding the limiter is what makes this leg deterministic).
 //! - `plain_resend_on_new_connection_replays_settled_terminal` — the lost
 //!   response: the first client's `terminal.created` arrived but its pane is
 //!   gone (socket dropped); the reconnect + second-client resend of the same
@@ -25,8 +26,9 @@
 //! Contract note (legacy parity, `create_dedupe.rs` header): the replay
 //! obligation holds while the first terminal is RUNNING; after an exit, a
 //! re-sent requestId is indistinguishable from a fresh create and spawns a
-//! new terminal. Tests therefore assert the liveness precondition explicitly
-//! so a dead-shell flake can never masquerade as a dedupe violation.
+//! new terminal. Both resend tests therefore assert the liveness
+//! precondition explicitly so a dead-shell flake can never masquerade as a
+//! dedupe violation.
 
 mod common;
 
@@ -61,6 +63,13 @@ async fn plain_resend_same_connection_replays_settled_terminal() {
     let (mut ws, _inventory) = connect_and_capture_inventory(&ws_url).await;
 
     let tid = create_shell_terminal(&mut ws, "d-plain").await;
+
+    // Explicit liveness precondition (see the module contract note): replay
+    // is owed only while the original terminal runs.
+    assert!(
+        registry.is_pty_running(&tid),
+        "test precondition: the original terminal must still be running"
+    );
 
     // Blind resend on the same socket (the frozen client's retry ladder
     // fires the identical frame until answered). Must replay the settled

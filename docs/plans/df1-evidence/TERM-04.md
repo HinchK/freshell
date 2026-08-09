@@ -24,8 +24,8 @@ violation.
 | In-flight duplicate on same socket: silent (the in-flight reply IS the duplicate's reply) | `REPAIR_PENDING_SENTINEL` checks :2329/:2416, set :2495, clear :2704 | `Entry::InFlight` + `DuplicateInFlight` (dispatch `terminal.rs:581-588`) |
 | In-flight duplicate on NEW socket: silent in legacy (a late-reply wedge risk); | same anchors | **Strictly better:** cross-connection sink registered as waiter; `settle()` forwards the stored frame; non-settled exit forwards fail-loud `error{PTY_SPAWN_FAILED, requestId}` — never silence |
 | Sentinel dropped on failure/RATE_LIMITED so the client retry ladder (same requestId) proceeds fresh | catch arm :2704 | `clear_if_in_flight` at `terminal.rs:622` + every `create_gate.rs` exit |
-| Eviction on terminal exit (eager at exit + lazy on registry miss) | `forgetCreatedRequestIdsForTerminal` :594, lazy :929-931 | liveness-anchored: `begin()` probes `registry.is_pty_running` and replays only while Running; `settle()` prunes dead entries (no background task) |
-| Session-key mismatch falls through to normal create handling | `createdRequestBindingMatchesExpectedSession` :912-916 | restore-flag mismatch falls through with a fresh InFlight sentinel (documented divergence; equivalent reachable behavior — a pane never changes create-identity fields under one requestId) |
+| Eviction on terminal exit (eager at exit + lazy on registry miss) | `onTerminalExitBound` call :593 → `forgetCreatedRequestIdsForTerminal` :906-910; lazy on registry miss :929-931 | liveness-anchored: `begin()` probes `registry.is_pty_running` and replays only while Running; `settle()` prunes dead entries (no background task) |
+| Session-key mismatch falls through to normal create handling | `createdRequestBindingMatchesExpectedSession` :914-919 | restore-flag mismatch falls through with a fresh InFlight sentinel (documented divergence; equivalent reachable behavior — a pane never changes create-identity fields under one requestId) |
 
 ## What this branch lands
 
@@ -122,3 +122,42 @@ matrix-proven `CLAUDE_CMD` seam + `FRESHELL_FAKE_LEDGER` launch ledger):
   timing-sensitive step and uses Playwright retrying matchers (10–20s).
 - The `/api/terminals` inventory assertion tolerates exactly one running row per test
   server (per-test isolated server guarantees).
+- **Legacy leg B microtask sensitivity (registered by review round 1):** on the legacy
+  server, a plain claude create's create-lock key is a per-CONNECTION fresh claude uuid
+  (`ws-handler.ts:1007-1010` + `reserveClaudeFreshSessionId` :2146), so two connections
+  sharing one requestId never serialize on `withTerminalCreateLock`; legacy also has no
+  cross-connection in-flight sentinel. Leg B's legacy pass rests on the first create
+  completing (warm `configStore.cache`) before the second socket's frame is processed —
+  solid in practice, but not a legacy guarantee. Rust's waiter path makes the same leg
+  fully deterministic, which is why rust remains the proof leg. If close-out ever
+  observes a legacy double-spawn flake in leg B, the fix is a legacy-side cross-connection
+  sentinel (pre-existing gap, deliberately out of TERM-04 scope — legacy is the parity
+  source here, and the checklist's target is the rust port).
+
+## Review round 1 → fixes (fresheyes independent review, claude provider, verdict FAILED→fixed)
+
+Substantive findings, all reproduced and fixed:
+
+- **[P1] Test C vacuity** — the "two pages" duplicate had zero delivery/answer proof
+  (page B's app has three lawful silent-swallow paths for create frames, and asserts ran
+  after a fixed 1 s sleep). Fixed: delivery asserted via the app's own outbound
+  `recordSentWsMessages` observer (fires only on a real socket send,
+  ws-client.ts:784-787 + App.tsx:229-231), and the server's answer is observed through
+  Playwright's own WS tap on page B (`page.waitForEvent('websocket')` +
+  `framereceived`), requiring a `terminal.created` with the SAME requestId and the SAME
+  terminalId; the fixed sleep is gone (reply-ordered asserts).
+- **[P2] Liveness precondition missing from test 1** (claimed for "tests", present in
+  one) — added `is_pty_running` assert to the same-connection leg; header now truthful.
+- **[P3] Phantom `error`-frame guard in plan/test-header** — never existed; docs now say
+  precisely why the limiter can't participate (timeouts are loud; ≤3 sends vs 10/10s).
+- **[P4] `kill_all()` overclaim in the audit ledger** — it counts removed records, not
+  live PTYs; row rewritten with the scoped truth (zero exits in these tests).
+- **[P6] Tautological pid assert** — now `childPidsOf(info.pid)` must contain the ledger
+  pid (HARNESS-03's `/proc`-based child-of check) in legs A and B: the launch-record pid
+  is proven to belong to the server under test.
+- **[P5] Legacy leg-B microtask race** — registered above in Residual notes (documented
+  legacy pre-existing gap; rust legs deterministic).
+- **[P7-P11 nits]** — legacy anchors corrected (:593/:906-910/:914-919); MATRIX comment
+  now names the server-global cache; stale "fake CLI banner" comment rewritten to match
+  the Redux-layout poll; per-test `mkdtemp` trees now removed in afterEach; plan Task-1
+  snippets updated to the real shared-harness helpers.
