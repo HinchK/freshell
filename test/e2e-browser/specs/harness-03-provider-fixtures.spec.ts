@@ -22,7 +22,6 @@
  */
 import { test, expect } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
-import path from 'node:path'
 import { WebSocket } from 'ws'
 import {
   launchProviderFixture,
@@ -225,9 +224,7 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
         },
       })
       await sendSidecar(fixture, { type: 'create', requestId: 'req-1', cwd: fixture.cwd, model: 'fixture-model' })
-      const lines: any[] = []
       const created = await readSidecarLine(fixture, (o) => o.type === 'created', 'created')
-      lines.push(created)
       expect(created.requestId).toBe('req-1')
       const sessionId = created.sessionId as string
       expect(sessionId).toBeTruthy()

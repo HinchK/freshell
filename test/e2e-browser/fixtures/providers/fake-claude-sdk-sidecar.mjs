@@ -53,7 +53,7 @@ function waitingEdgeIfFirstPending(sessionId) {
   st.pending += 1
 }
 
-async function render(engine, event) {
+async function render(event) {
   const { kind, data } = event
   const sessionId = data.sessionId ?? activeSessionId
   switch (kind) {
@@ -131,7 +131,7 @@ const engine = new FixtureEngine({
   provider,
   program,
   env,
-  write: (event) => render(engine, event),
+  write: (event) => render(event),
 })
 
 const rl = readline.createInterface({ input: process.stdin })

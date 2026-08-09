@@ -204,7 +204,7 @@ wss.on('connection', (socket) => {
         const threadId = message.params?.threadId ?? `thread-${randomUUID()}`
         activeThreadId = threadId
         const rolloutPath = writeRollout(threadId)
-        await engine.emitResume(threadId)
+        await engine.emitResume(threadId, 'rpc:thread/resume')
         respond(threadResult(threadId, rolloutPath))
         break
       }

@@ -306,6 +306,16 @@ describe('FixtureEngine crash + resume', () => {
     await engine.emitResume('thread-99')
     expect(readJsonl(eventsPath)).toMatchObject([{ kind: 'resume', data: { id: 'thread-99' }, trigger: 'argv' }])
   })
+
+  it('emitResume/emitSession let adapters override the recorded trigger', async () => {
+    const { engine, eventsPath } = makeEngine({})
+    await engine.emitResume('sess-1', 'http:GET /session/:id')
+    await engine.emitSession('sess-2', 'http:POST /session')
+    expect(readJsonl(eventsPath)).toMatchObject([
+      { kind: 'resume', trigger: 'http:GET /session/:id' },
+      { kind: 'session', trigger: 'http:POST /session' },
+    ])
+  })
 })
 
 describe('FixtureEngine emittedKinds + defaults cooperation', () => {

@@ -139,8 +139,11 @@ async function route(req, res) {
       time: { created: now, updated: now },
     })
     activeSessionId = id
-    await engine.handleHttp(method, url.pathname, body)
-    await engine.emitSession(id)
+    const emitted = await engine.handleHttp(method, url.pathname, body)
+    if (emitted.has('crash')) return
+    if (!emitted.has('session')) {
+      await engine.emitSession(id, 'http:POST /session')
+    }
     json(res, 200, sessions.get(id))
     return
   }
@@ -155,7 +158,7 @@ async function route(req, res) {
         return
       }
       // The durable-resume probe (opencode_ws.rs resume_durable_session).
-      await engine.emitResume(sessionId)
+      await engine.emitResume(sessionId, 'http:GET /session/:id')
       json(res, 200, row)
       return
     }

@@ -239,14 +239,14 @@ export class FixtureEngine {
     return event
   }
 
-  /** The argv-driven resume edge (a launch shaped like a real provider resume). */
-  async emitResume(id) {
-    return this.emitEvent('resume', { id }, 'argv')
+  /** The resume edge (argv-shaped resume launch, or an HTTP resume probe). */
+  async emitResume(id, trigger = 'argv') {
+    return this.emitEvent('resume', { id }, trigger)
   }
 
-  /** The argv-driven session edge. */
-  async emitSession(id) {
-    return this.emitEvent('session', { id }, 'argv')
+  /** The session-identity edge (argv-shaped launch, or an RPC/HTTP create). */
+  async emitSession(id, trigger = 'argv') {
+    return this.emitEvent('session', { id }, trigger)
   }
 
   /** Fire every matching rule for a trigger. Returns the Set of emitted kinds. */
