@@ -1,0 +1,2140 @@
+{
+  "schema": 1,
+  "item": "GATE-01",
+  "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
+  "head": "d17f1d61a82724e9ee28091ee83d5f1f066b493d",
+  "rustServerBinSha256": "872824734088926517036282ffe275bb354066788c06b9f200041317fdc446be",
+  "suiteDefinition": {
+    "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
+    "specCount": 69,
+    "rustOnlyExcluded": [
+      "agent-crash-autoresume-rust.spec.ts",
+      "amplifier-lane-resilience-rust.spec.ts",
+      "codex-status-completeness-rust.spec.ts",
+      "codex-terminal-restore-rust.spec.ts",
+      "compound-restart-rust.spec.ts",
+      "continuity-smoke.spec.ts",
+      "create-protection-isolation-rust.spec.ts",
+      "create-protection-restore-storm-rust.spec.ts",
+      "create-rate-limit-ladder-rust.spec.ts",
+      "createrequestid-stabilization-rust.spec.ts",
+      "deploy-tab-diff-rust.spec.ts",
+      "double-restart-terminal-restore-rust.spec.ts",
+      "freshagent-settings-resume-rust.spec.ts",
+      "freshclaude-identity-persistence-rust.spec.ts",
+      "freshclaude-restart-parity-rust.spec.ts",
+      "freshclaude-zero-turn-restart-rust.spec.ts",
+      "hidden-pane-rebind-rust.spec.ts",
+      "idle-gate-semantics-rust.spec.ts",
+      "launch-retry-restart-rust.spec.ts",
+      "opencode-rebind-rust.spec.ts",
+      "pane-ledger-restart-rust.spec.ts",
+      "reconcile-client-adoption-rust.spec.ts",
+      "reconcile-completion-rust.spec.ts",
+      "recover-my-panes-rust.spec.ts",
+      "rest-spawn-gate-rust.spec.ts",
+      "restore-contract-wall-rust.spec.ts",
+      "sidebar-registry-sync-rust.spec.ts",
+      "silent-input-loss-rust.spec.ts",
+      "terminal-activity-rust.spec.ts",
+      "turn-complete-restart-resume-rust.spec.ts",
+      "wavea-interactions-rust.spec.ts"
+    ]
+  },
+  "specs": {
+    "agent-checkpoint-rewind.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "agent-continuity-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "amplifier-restore-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "auth.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "browser-pane-screenshot.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "browser-pane.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "cfg03-backup-restore.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "cfg04-legacy-browser-seed.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "codex-terminal-bounce-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "diag03-rotation-redaction-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "editor-pane.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 58679,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 58679
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 119308,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 119308
+            }
+          ],
+          "failures": [
+            {
+              "title": "editor pane has path input and open button",
+              "line": 120,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "editor pane shows empty state with Open File button",
+              "line": 133,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": null
+        }
+      }
+    },
+    "fresh-agent-centralization-smoke.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "fresh-agent-mobile.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "fresh-agent.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "freshopencode-db-history.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "freshopencode-first-send-reload-repro.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "freshopencode-model-picker.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "freshopencode-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-01-rust-server.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-02-matrix-bite.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1145,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1145
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1120,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1120
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-03-provider-fixtures.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-04-session-corpus.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-05-raw-clients.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-06-misc-fixtures.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-11-a11y-gate.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-14-server-clock.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "mcp-bridge-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "mcp-qa-smoke-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "mobile-viewport.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "multi-client.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "multirow-tabs.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "opencode-replay-write-progression.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "opencode-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "opencode-terminal-restore-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-activity-indicator.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-picker-layout.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-picker.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-system.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "project-colors-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "reconcile-handshake-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "reconnection.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "remote-tab-linkage-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "rest-tab-persistence.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-double-restart.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-sync05.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "resume-button.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "safe01-auth-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "safe03-origin-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "screenshot-baselines.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 36201,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36201
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 3,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 173123,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 3,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 173123
+            }
+          ],
+          "failures": [
+            {
+              "title": "default app layout",
+              "line": 4,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "settings view",
+              "line": 16,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar collapsed",
+              "line": 52,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": null
+        }
+      }
+    },
+    "server-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "session-directory-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "settings-live-reload.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "settings-persistence-split.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "settings.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "sidebar-click-resume.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "sidebar-opencode-rail.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "sidebar.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "stress.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "tab-bar-resize.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "tab-management.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "tab-recency-sync.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "tabs-client-retire.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "term13-scrollback-boundary.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "term28-path-shadow-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "terminal-background-freeze-catchup.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "terminal-lifecycle.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "truly-idle-alerting.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "ws-ping-pong-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pending",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 0,
+          "runs": [],
+          "runHistory": [],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    }
+  }
+}
