@@ -75,11 +75,32 @@ value `/api/bootstrap` (already live: `boot.rs:104` reads `store.get().await`) h
   recorded below.)
 - `cargo fmt --check` clean.
 
-### Playwright (pw lease; spec un-pinned at the same commit)
+### Playwright (pw lease; spec un-pinned)
 
-Post-fix binary: `cargo build --release -p freshell-server` (fixture rebuilds in place).
+Post-fix binary: `cargo build --release -p freshell-server` in-worktree (the rust-chromium
+fixture's `ensureRustServerBuilt` no-op rebuild check then runs against a warm target dir).
 
-(To be filled: rust ×2, legacy ×2 run results.)
+At the fix commit with the spec un-pinned in-tree (pre-commit worktree state of `cf3764707`):
+
+- `--project=rust-chromium` run 1: **2 passed** (19.3s) — defaultCwd test now passes
+  un-annotated (its Playwright annotation list is EMPTY; the deleted pin would have hard-failed
+  an unexpected pass, so green here is direct proof the pin was correctly removed).
+- `--project=rust-chromium` run 2: **2 passed** (21.1s).
+- `--project=legacy-chromium` run 1: **2 passed** (20.5s).
+- `--project=legacy-chromium` run 2: **2 passed** (43.4s).
+
+At the FINAL SHA `cf3764707` (after the comment-only clippy fix; binary rebuilt, 45.2s):
+
+- `--project=rust-chromium` run 1: **2 passed** (16.7s).
+- `--project=rust-chromium` run 2: **2 passed** (17.9s).
+- `--project=legacy-chromium` run 1: **2 passed** (19.3s).
+- `--project=legacy-chromium` run 2: **2 passed** (26.3s).
+
+Focused cargo rerun at final SHA (same PTY chain as the build): ws lib **431/431**,
+`--test handshake_live_settings` **1/1**, server bin **610/610**. `cargo fmt --check` clean;
+`cargo clippy -p freshell-ws -p freshell-server --all-targets -- -D warnings` clean (round 2,
+after rewording one doc-comment line that tripped `doc_lazy_continuation`); `npm run typecheck`
+clean.
 
 ## Commands (verbatim, at final SHA)
 
