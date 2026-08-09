@@ -13,7 +13,7 @@
 | Runtime helpers | `test/e2e-browser/helpers/accessible-interactions.ts` | `byRole`/`byLabel`/`byTitle` (name REQUIRED — empty name throws synchronously), `expectAccessible(locator, {role, name})` over Playwright 1.58's native `toHaveRole`/`toHaveAccessibleName`, `focusByKeyboard` (Tab from document top), `ariaNamePattern` exact-match escaper, shared `SELECTOR_ENGINE_GUIDANCE`. |
 | Static gate core | `test/e2e-browser/helpers/a11y-selector-gate.ts` | TypeScript-AST scan of `locator`/`frameLocator` string args; deny-set: `.class`, `xpath=`, `..`, `:nth-child`-family, `>` combinators; silent on `[data-*]`, `[aria-label=]`/`[title=]`, `text=`, `:has-text()`, `:visible`; widget-root exemptions `.xterm`, `.monaco-editor`; `// a11y-gate: allow -- <reason≥8ch>` directive (reasonless directive = own violation, suppresses nothing); warn-turn-deny ratchet vs a committed baseline (`signatureOf` is line-independent). **Fail-closed**: deny + missing baseline = every violation novel. |
 | CLI | `test/e2e-browser/helpers/a11y-selector-gate-cli.ts` | `--warn` (default, exit 0) / `--deny` / `--write-baseline` / `--json`. Pure static — no server, no browser, no pw/cargo lease. npm scripts: `test:e2e:a11y-gate`, `test:e2e:a11y-gate:deny`. |
-| Baseline | `test/e2e-browser/a11y-gate-baseline.json` | 23 violation signatures across 8 files (see below). The ratchet floor. |
+| Baseline | `test/e2e-browser/a11y-gate-baseline.json` | 23 violation SITES across 8 files, stored deduped as 17 distinct per-file violation SHAPE signatures (see below). The ratchet floor. |
 | Probes (committed) | `test/e2e-browser/fixtures/a11y-gate/css-dependent.bad.ts`, `role-name.good.ts` | The red/green bite demonstration, scanned by both the vitest suite and leg C of the pw self-test. `fixtures/` is excluded from the tree scan; probes are never executed. |
 | Unit tests | `helpers/accessible-interactions.unit.test.ts` (12), `helpers/a11y-selector-gate.test.ts` (38) | Run by the EXISTING `npm run test:e2e:helpers` config (`include: helpers/**/*.test.ts`) — zero config churn. |
 | Playwright self-test | `test/e2e-browser/specs/harness-11-a11y-gate.spec.ts` | Auto-matched by the default `chromium` project — zero `playwright.config.ts` edits (important: six sibling workers concurrently edit that file). |
@@ -25,7 +25,7 @@ Rejected custom-ESLint-rule route: the repo's flat `eslint.config.js` lints only
 
 ## The gate BITES (red/green demonstrations, verbatim)
 
-**Unit level (committed fixtures read from disk):** `a11y-selector-gate.test.ts` — bad probe → exactly 6 violations with codes `[structural-combinator, css-class, xpath, parent-traversal, structural-pseudo, css-class]`; good probe → `[]`. 38/38 tests pass (`31ms` of test execution).
+**Unit level (committed fixtures read from disk):** `a11y-selector-gate.test.ts` — bad probe → exactly 6 violations with codes `[structural-combinator, css-class, xpath, parent-traversal, structural-pseudo, css-class]`; good probe → `[]`. 40/40 gate tests pass (<100ms of test execution).
 
 **CLI level (real tree, observed):**
 
@@ -36,8 +36,11 @@ NO BASELINE FILE — fail-closed: every violation below is treated as novel. Cre
 NOVEL violations (not in baseline): 23                          exit=1
 
 ### --write-baseline, then deny -> clean, exit 0
-baseline rewritten at test/e2e-browser/a11y-gate-baseline.json: 0 -> 23 violation signature(s)
+baseline rewritten at test/e2e-browser/a11y-gate-baseline.json: 0 -> 17 violation signature(s)
 deny: scan matches baseline — no novel violations, no stale entries.   exit=0
+(23 sites dedupe to 17 stored signatures — identical selector sites in one
+file, e.g. settings.spec.ts's five `locator('..')`, collapse to one shape;
+the deny report counts SITES (23), the baseline stores SHAPES (17).)
 
 ### temporary spec with page.locator('.definitely-not-a-real-stable-selector') -> gate BITES
   specs/zz-h11-gate-bite-demo.spec.ts -> locator:css-class:8b836a7b
@@ -79,6 +82,8 @@ Nine assumptions enumerated pre-implementation in `docs/plans/df1/HARNESS-11.md`
 Dispatch asked for a fresh review subagent via the Task tool; this runtime exposes no Task/subagent tool, so the recorded fallback was used: a structured fresh-eyes self-review against `review-agent`'s checklist read as code (see below), plus two *independent runtime verifications* standing in for a second pair of eyes: (1) the CLI byte-level outputs re-generated and diffed against this evidence; (2) the full `test:e2e:helpers` suite (6 files / 81 tests) green — cross-file regression proof. Findings from the self-review round: fail-closed baseline bug (fixed, tested), `evaluateScan` API returning file-prefixed vs bare signatures (normalized to bare, tested), dead escape-branch in `blankAttributeValues` (removed), tsc excess-property error in the ratchet test (fixed). No serious findings remain.
 
 **Review-rubric pass (recorded):** scope discipline (test-infra only, zero `playwright.config.ts`/shared-helper edits; package.json gained exactly 2 additive script lines); determinism (no real clocks/sleeps; gate is pure AST; pw legs use auto-retrying assertions); security/eval surface (no `eval`, no new deps, baseline JSON validated with version check); escape-hatch hygiene (directives require auditable reasons); docs parity (plan, module docs, this evidence agree; root `AGENTS.md` a11y section untouched — the gate ENFORCES it for tests, it does not amend it).
+
+**Review-late find (fresh-eyes round 2, review-agent rubric on the full merge-base diff):** `writeBaseline` originally stored one signature per SITE, so five identical `locator('..')` calls produced five identical entries — misleading the ratchet count and weakening stale detection. Fixed: per-file signature dedupe (site-count vs shape-count distinction documented in the module and above), regression tests `writeBaseline dedupes…` and `…never baselines allow-without-reason` added (40/40 vitest).
 
 ## GREEN COMMANDS (verbatim, from this worktree)
 

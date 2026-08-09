@@ -350,7 +350,12 @@ export function writeBaseline(rootDir: string, violations: Violation[]): Baselin
     if (v.code === 'allow-without-reason') continue // directives must be fixed, never baselined
     ;(files[v.file] ??= []).push(signatureOf(v))
   }
-  for (const sigs of Object.values(files)) sigs.sort()
+  // Dedupe per file: N identical selector SITES (e.g. five `locator('..')` in
+  // one spec) collapse to ONE stored signature — the baseline tracks distinct
+  // violation SHAPES per file, and the deny report above still counts sites.
+  // Consequence (documented): removing SOME-but-not-all identical sites does
+  // not ratchet; the shape goes stale only when its last site disappears.
+  for (const key of Object.keys(files)) files[key] = [...new Set(files[key])].sort()
   const baseline: Baseline = {
     version: 1,
     files: Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b))),

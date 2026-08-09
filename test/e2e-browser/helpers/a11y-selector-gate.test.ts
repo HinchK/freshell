@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   classifySelector,
   evaluateScan,
+  readBaseline,
   scanSource,
   signatureOf,
+  writeBaseline,
   type Baseline,
   type Violation,
+  type ViolationCode,
 } from './a11y-selector-gate.js'
 
 /**
@@ -160,7 +164,7 @@ describe('scanSource — scanning rules', () => {
 })
 
 describe('signatureOf / evaluateScan — the warn-turn-deny ratchet', () => {
-  const v = (selector: string, code = 'css-class' as const): Violation => ({
+  const v = (selector: string, code: ViolationCode = 'css-class'): Violation => ({
     file: 'specs/x.spec.ts',
     line: 10,
     column: 9,
@@ -229,5 +233,30 @@ describe('signatureOf / evaluateScan — the warn-turn-deny ratchet', () => {
     expect(r.exitCode).toBe(1)
     expect(r.novel.length).toBe(1)
     expect(r.stale).toEqual(['locator:css-class:deadbeef'])
+  })
+
+  it('writeBaseline dedupes identical selector sites to one signature per file', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'h11-baseline-'))
+    try {
+      const site = (line: number): Violation => ({ ...v('..', 'parent-traversal'), line })
+      const written = writeBaseline(dir, [site(10), site(20), site(30), v('.unique')])
+      expect(written.files['specs/x.spec.ts'].length).toBe(2)
+      // ...and the round trip through disk preserves the dedupe.
+      const reloaded = readBaseline(dir)
+      expect(reloaded).not.toBeNull()
+      expect(reloaded!.files['specs/x.spec.ts']).toEqual(written.files['specs/x.spec.ts'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('writeBaseline never baselines allow-without-reason (directives must be fixed, not carried)', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'h11-baseline-'))
+    try {
+      const written = writeBaseline(dir, [v('.a'), { ...v('', 'allow-without-reason'), method: 'directive' }])
+      expect(written.files['specs/x.spec.ts']).toEqual([signatureOf(v('.a'))])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

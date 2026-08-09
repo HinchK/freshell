@@ -17,8 +17,6 @@
       "locator:xpath:63f0dbb6"
     ],
     "specs/multirow-tabs.spec.ts": [
-      "locator:structural-combinator:f5301b8f",
-      "locator:structural-combinator:f5301b8f",
       "locator:structural-combinator:f5301b8f"
     ],
     "specs/project-colors-matrix.spec.ts": [
@@ -31,10 +29,6 @@
       "locator:css-class:2bbd6ce4"
     ],
     "specs/settings.spec.ts": [
-      "locator:parent-traversal:9d891e73",
-      "locator:parent-traversal:9d891e73",
-      "locator:parent-traversal:9d891e73",
-      "locator:parent-traversal:9d891e73",
       "locator:parent-traversal:9d891e73"
     ],
     "specs/sidebar.spec.ts": [
