@@ -42,7 +42,7 @@ Not changes: color removal is never observable anywhere — legacy has no "clear
 
 ## Suggested checklist annotation (for the consolidation pass)
 
-> PARTIAL (2026-08-09, df1 aa9a0e5..): save+broadcast+render implemented on BOTH servers (Rust: new PUT + config store + page embed + write-site `sessions.changed`; legacy: sync-service color-sensitivity fix + page embed; client: page-map overlay + incoming-wins merge). Crate tests x2 green; focused vitest green; matrix spec `project-colors-matrix.spec.ts` authored+registered. MISSING: executed PW-RUST run of that spec (close-out).
+> PARTIAL (2026-08-09, df1 `session-05-project-colors` branch): save+broadcast+render implemented on BOTH servers (Rust: new PUT + config store + page embed + write-site `sessions.changed`; legacy: sync-service color-sensitivity fix + page embed; client: page-map overlay + incoming-wins merge). Crate tests x2 green; focused vitest green; matrix spec `project-colors-matrix.spec.ts` authored+registered. MISSING: executed PW-RUST run of that spec (close-out).
 
 ## Residual notes for close-out
 
