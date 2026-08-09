@@ -2,7 +2,7 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "45eb3adfba19517a1c9fae1478a4a7dbf9e1e114",
+  "head": "5335ba967d7e5226986471291d73cd72b3db61d3",
   "rustServerBinSha256": "872824734088926517036282ffe275bb354066788c06b9f200041317fdc446be",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
@@ -152,28 +152,78 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 205,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 205
+            }
+          ],
+          "failures": [
+            {
+              "title": "amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included",
+              "line": 158,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  161 |     // future accidental `MATRIX_SPECS` inclusion fails loudly instead of\n  162 |     // silently no-op'ing on legacy.\n> 163 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  164 |\n  165 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amplifier-restore-'))\n  166 |     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deliberate loud guard expect(e2eServerKind).toBe('rust') at :163 (fail-by-design on legacy; same registration-errata class as term28)"
+          }
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 32660,
+          "runs": [
+            "slice-3",
+            "reproof-s3-amplifier-rust"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 35643
+            },
+            {
+              "run": "reproof-s3-amplifier-rust",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 32660
+            }
+          ],
+          "failures": [
+            {
+              "title": "amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included",
+              "line": 158,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoContain\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // indexOf\u001b[22m\n\nExpected substring: \u001b[32m\"amplifier: resumed session 50118639-d15c-4412-be96-96cfa0cd8388\"\u001b[39m\nReceived string:    \u001b[31m\"Saved amplifier session 50118639-d15c-4412-be96-96cfa0cd8388 could not be found on disk — started a fresh session instead.amplifier: resumed session efdc696f-1894-4506-91ef-049024f085c2amplifier> \"\u001b[39m\n\nCall Log:\n- Timeout 20000ms exceeded while waiting on the predicate\n\n  369 |             .not.toBeNull()\n  370 |             .then(async () => (await findLeafById(tabId!, paneId))!.content.terminalId)\n> 371 |           await expect.poll(async () =>\n      |           ^"
+            }
+          ],
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-27",
+            "note": "deterministic red incl isolated rerun reproof-s3-amplifier-rust; resume after restart reports session not found on disk. sibling SESSION-01 noted; pinned test.fail(rust, TERM-27) in-spec"
+          }
         }
       }
     },
@@ -181,26 +231,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 16563,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16563
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 6,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 10264,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10264
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -210,28 +282,59 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 24491,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 24491
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 49918,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 49918
+            }
+          ],
+          "failures": [
+            {
+              "title": "proxied localhost URL with iframe-blocking headers renders actual content, not placeholder",
+              "line": 56,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): dialog in context; legacy green"
+          }
         }
       }
     },
@@ -239,28 +342,69 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 5,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 59354,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 59354
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
-          "failed": 0,
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 3,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 141173,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 2,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 141173
+            }
+          ],
+          "failures": [
+            {
+              "title": "browser pane has URL input and navigation buttons",
+              "line": 22,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "browser pane URL bar updates on navigation",
+              "line": 57,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "browser pane preserves URL across tab switches",
+              "line": 90,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 3/3 contexts show Restore dialog; legacy green 5/5"
+          }
         }
       }
     },
@@ -711,26 +855,48 @@
       "bucket": "harness",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 12979,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 12979
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 11963,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11963
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -951,26 +1117,48 @@
       "bucket": "harness",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 14092,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 14092
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 11071,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11071
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1612,26 +1800,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 10,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 178833,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 178833
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 10,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 118235,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 118235
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2067,26 +2277,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 7017,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7017
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 6934,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 6934
+            }
+          ],
           "failures": [],
           "attribution": null
         }
