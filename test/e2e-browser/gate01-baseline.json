@@ -2,8 +2,8 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "5335ba967d7e5226986471291d73cd72b3db61d3",
-  "rustServerBinSha256": "872824734088926517036282ffe275bb354066788c06b9f200041317fdc446be",
+  "head": "33208684d03f3e4621d159f7355c34ac2506e5bc",
+  "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
     "specCount": 69,
@@ -412,26 +412,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 2,
           "failed": 0,
-          "skipped": 0,
+          "skipped": 2,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 2405,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 2,
+              "expectedFail": 0,
+              "durationMs": 2405
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 4,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 29511,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 4,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 29511
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -441,26 +463,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 3791,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 3791
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 2611,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 2611
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1168,26 +1212,48 @@
       "bucket": "harness",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 9259,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9259
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 10896,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10896
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1197,26 +1263,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 5204,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5204
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 5211,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5211
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1407,28 +1495,117 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 5,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 197648,
+          "runs": [
+            "slice-4",
+            "reproof-s4-opencode-restart"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 207233
+            },
+            {
+              "run": "reproof-s4-opencode-restart",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 197648
+            }
+          ],
+          "failures": [
+            {
+              "title": "reattaches a UI-created OpenCode pane across browser refresh",
+              "line": 628,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:664:37"
+            },
+            {
+              "title": "recovers a hidden OpenCode sessionRef when association lands while the browser is closed",
+              "line": 713,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32m{\"provider\": \"opencode\", \"sessionId\": \"ses_root_35121\"}\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n\n  810 |       await fsp.writeFile(sessionEventGatePath, 'release\\n', 'utf8')\n  811 |       await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)\n> 812 |       await expect.poll(async () => {\n      |       ^"
+            },
+            {
+              "title": "preserves an associated OpenCode pane across browser refresh",
+              "line": 901,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:945:37"
+            },
+            {
+              "title": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed",
+              "line": 1042,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1043:5"
+            },
+            {
+              "title": "restores multiple OpenCode panes after hard server kill",
+              "line": 1051,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1052:5"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic 5/5 red incl isolated legacy rerun reproof-s4-opencode-restart; assertion-level (sessionId never materializes, waitForOpenCodeSessions 30s timeouts). Identical on rust -> not a rust parity gap; legacy suite redness on this branch"
+          }
         },
         "rust": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 5,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 201438,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 201438
+            }
+          ],
+          "failures": [
+            {
+              "title": "reattaches a UI-created OpenCode pane across browser refresh",
+              "line": 628,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:664:37"
+            },
+            {
+              "title": "recovers a hidden OpenCode sessionRef when association lands while the browser is closed",
+              "line": 713,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32m{\"provider\": \"opencode\", \"sessionId\": \"ses_root_36693\"}\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n\n  810 |       await fsp.writeFile(sessionEventGatePath, 'release\\n', 'utf8')\n  811 |       await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)\n> 812 |       await expect.poll(async () => {\n      |       ^"
+            },
+            {
+              "title": "preserves an associated OpenCode pane across browser refresh",
+              "line": 901,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:945:37"
+            },
+            {
+              "title": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed",
+              "line": 1042,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1043:5"
+            },
+            {
+              "title": "restores multiple OpenCode panes after hard server kill",
+              "line": 1051,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1052:5"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical failures to legacy leg (same assertions); pre-existing, not rust-specific"
+          }
         }
       }
     },
@@ -1436,26 +1613,57 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
+          "verdict": "fail",
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
-          "failures": [],
-          "attribution": null
+          "durationMs": 331,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 331
+            }
+          ],
+          "failures": [
+            {
+              "title": "an opencode terminal pane restores across a server restart via `opencode --session <id>`, and a never-submitted pane restores fresh",
+              "line": 151,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  154 |     // future accidental `MATRIX_SPECS` inclusion fails loudly instead of\n  155 |     // silently no-op'ing on legacy.\n> 156 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  157 |\n  158 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-terminal-restore-'))\n  159 |     const argLogPath = path.join(sharedRoot, 'fake-opencode-terminal-argv.jsonl')"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "fail-by-design guard expect(e2eServerKind).toBe('rust') (~:154); same registration-errata class as term28/amplifier-restore (in rust-chromium testMatch + match-all chromium lane, not in RUST_ONLY_SPECS). rust leg GREEN"
+          }
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 22961,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 22961
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -1909,26 +2117,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 12,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 20219,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 12,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 20219
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 12,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 4159,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 12,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4159
+            }
+          ],
           "failures": [],
           "attribution": null
         }
@@ -2444,26 +2674,48 @@
       "bucket": "product",
       "legs": {
         "legacy": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 10108,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10108
+            }
+          ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "pending",
-          "passed": 0,
+          "verdict": "pass",
+          "passed": 1,
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 0,
-          "runs": [],
-          "runHistory": [],
+          "durationMs": 10842,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10842
+            }
+          ],
           "failures": [],
           "attribution": null
         }
