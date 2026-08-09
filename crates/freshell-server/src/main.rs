@@ -800,7 +800,9 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
-        boot_id,
+        // Shared (not moved) so the DIAG-01 `server.started` lifecycle event
+        // (emitted after the listener binds, below) can log the SAME boot id.
+        boot_id: Arc::clone(&boot_id),
         settings: Arc::clone(&settings),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
@@ -1481,6 +1483,22 @@ async fn main() -> ExitCode {
             &diag::iso8601_utc(now_secs),
         )
     );
+    // DIAG-01 lifecycle context: the ONE authoritative STRUCTURED boot
+    // record (the stderr line above is for terminal tails; this event is
+    // what log parses key on). `app_version`/`server_pid` are stamped on
+    // every line by the logging layer, so the boot record carries the
+    // per-installation identity (`instance_id`, CFG-07), the per-boot
+    // restart signal (`boot_id`), and build provenance (`commit`/`dirty`,
+    // the same values `GET /api/server-info` reports).
+    tracing::info!(
+        bind = %boot_ip,
+        port,
+        boot_id = %boot_id.as_str(),
+        instance_id = %server_instance_id.as_str(),
+        commit = diag::build_commit(),
+        dirty = diag::build_dirty_str(),
+        "server.started"
+    );
 
     // Block until SIGTERM/SIGINT (the same graceful-shutdown trigger the old
     // `axum::serve(...).with_graceful_shutdown(...)` used), then drain the
@@ -1540,6 +1558,13 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    // DIAG-01 lifecycle context: the terminal "we are done" marker. Every
+    // owner above has run (WS drain, registry kill_all, all three fresh-agent
+    // sidecar reapers, the codex launch manager); the logging writer flushes
+    // synchronously per line, so this line is guaranteed on disk before the
+    // process exits -- the DIAG-03 "final shutdown event is flushed" clause
+    // holds by construction here.
+    tracing::info!("server.stopped");
     ExitCode::SUCCESS
 }
 
@@ -1596,6 +1621,11 @@ async fn shutdown_signal(
         _ = terminate => "SIGTERM",
         _ = hangup => "SIGHUP",
     };
+
+    // DIAG-01 lifecycle context: the clean "we are going down" marker, FIRST
+    // (before the drain below), so a log tail always answers "did this
+    // server stop intentionally, and on which signal".
+    tracing::info!(signal = signal_name, "server.stopping");
 
     // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
     // creates consult this flag around registry.create.

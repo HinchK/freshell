@@ -1,13 +1,53 @@
-//! Structured JSONL logging (DIAG-01 slice) with size-based rotation and
-//! from-the-first-byte secret redaction (DIAG-03 slice).
+//! Structured JSONL logging (DIAG-01) with size-based rotation and
+//! from-the-first-byte secret redaction (DIAG-03).
 //!
-//! ## Scope (deliberately shrunk, per the validated plan)
+//! ## Canonical line schema (the Tauri-ready contract)
 //!
-//! `tracing`-based JSONL logs written to `<home>/.freshell/logs/rust-server.jsonl`:
+//! Every line written to `<home>/.freshell/logs/rust-server.jsonl` is one
+//! self-describing JSON object. Fields every line ALWAYS carries:
 //!
-//!   - **Structured fields**: `ts`, `level`, `target`, `msg`, plus a per-HTTP-
-//!     request correlation id (`request_id`) and route/method/status/duration
-//!     for every request ([`request_logging_middleware`]).
+//!   - `ts`          RFC3339-millis `Z` UTC timestamp (tracing event time)
+//!   - `level`       severity: `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR`
+//!   - `target`      component: the emitting crate's module path (e.g.
+//!     `freshell_ws::terminal`, `freshell_terminal::registry`)
+//!   - `msg`         human summary or dotted event name (`terminal.created`,
+//!     `ws.connection.closed`, `server.started`); events that prefer prose in
+//!     `msg` additionally carry an `event` field with the dotted
+//!     machine-readable name
+//!   - `app_version` the release that wrote the line (DIAG-01 "app version";
+//!     resolved once at boot from `FRESHELL_APP_VERSION`/the build constant,
+//!     so any arbitrary log tail is attributable)
+//!   - `server_pid`  the server process that wrote the line (DIAG-01 process
+//!     ownership of the WRITER; child processes an event spawns report their
+//!     own `pid` field alongside)
+//!
+//! Context fields, flattened into the same object when applicable (span
+//! fields merge root->leaf, then the event's own fields win collisions):
+//!
+//!   - HTTP requests: `request_id`, `route`, `method`, `status`,
+//!     `duration_ms` (one `http_request` event per response; see
+//!     [`request_logging_middleware`])
+//!   - WS connections: `connection_id`, `origin_kind` -- carried on the
+//!     `ws.connection.established`/`closed` lifecycle events AND, via the
+//!     per-connection `ws_conn` span in `freshell-ws`, on every event
+//!     emitted while serving that connection
+//!   - Terminals: `terminal_id` plus spawn-mode/cwd/pid on
+//!     `terminal.created`, `exit_code` on `terminal.exited`, the kill actor
+//!     (`by`: api/idle/shutdown) on `terminal.killed`
+//!   - Fresh agents: `provider`, `session_id`, plus sidecar `pid` on
+//!     `freshagent.sidecar.spawned`
+//!   - Server lifecycle: `server.started` (`bind`, `port`, `boot_id`,
+//!     `instance_id`, `commit`, `dirty`) -> `server.stopping` (`signal`)
+//!     -> `server.stopped` (plus the `shutdown_forensics` diagnostic record)
+//!
+//! A Tauri host-side producer (or any other Rust component of the desktop
+//! app) emitting THIS EXACT SHAPE -- with its own `app_version` and its
+//! process's pid -- produces a coherent, combinable diagnostic stream; the
+//! schema is deliberately free of server-only assumptions so that producer
+//! can be layered on without a contract change.
+//!
+//! ## Rotation + redaction (DIAG-03)
+//!
 //!   - **Size-based rotation**, bounded total: [`DEFAULT_MAX_BYTES`] per file
 //!     (10 MiB) x [`DEFAULT_MAX_BACKUPS`] backups (2) = 3 files total,
 //!     overridable via `FRESHELL_LOG_MAX_BYTES`/`FRESHELL_LOG_MAX_BACKUPS`.
@@ -31,22 +71,15 @@
 //!   - The pre-existing single stdout ("`freshell-server listening on
 //!     ...`") line is left untouched for compat -- this module is additive.
 //!
-//! ## NOT in scope (see the DIAG-01/DIAG-03 checklist text for the full
-//! acceptance criteria this slice does not attempt)
+//! ## NOT in scope
 //!
 //!   - OTLP/telemetry export, remote log shipping.
-//!   - Full WS connect/disconnect+reason and terminal spawn/exit event
-//!     wiring: those lifecycles live inside `freshell-ws`/`freshell-terminal`
-//!     (crates this slice's ownership boundary does not touch to avoid
-//!     colliding with concurrent work on those crates). The global request
-//!     middleware below DOES log the initial `/ws` upgrade request (route,
-//!     status, duration), which is partial coverage.
-//!   - `settings_store.rs` persistence events (that file is explicitly
-//!     frozen for this slice).
 //!   - Client-log ingestion (`DIAG-02`), live debug/perf toggles (`DIAG-04`).
 //!
-//! See `crates/freshell-server/tests/diag01_diag03_logging.rs` for the
-//! outer, black-box, operator-experience proof of this slice.
+//! See `crates/freshell-server/tests/diag01_diag03_logging.rs` (rotation/
+//! redaction) and `crates/freshell-server/tests/diag01_lifecycle_logging.rs`
+//! (full-flow schema + correlation + restart) for the outer, black-box,
+//! operator-experience proof of this contract.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -445,10 +478,7 @@ where
             "app_version".to_string(),
             Value::String(self.app_version.clone()),
         );
-        map.insert(
-            "server_pid".to_string(),
-            Value::from(self.server_pid),
-        );
+        map.insert("server_pid".to_string(), Value::from(self.server_pid));
 
         // Merge span-chain fields root -> leaf, so the innermost span's
         // fields win on any (unexpected) key collision.
