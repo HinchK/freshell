@@ -19,6 +19,7 @@ coverage/
 .codex/
 .discovery/
 .the-usual-logs/
+.worktrees/
 
 # Application directories not needed for e2e tests
 # Note: docs/ is NOT excluded wholesale — docs/skills/testing.md is needed

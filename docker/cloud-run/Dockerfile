@@ -102,6 +102,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Playwright chromium browser and its system dependencies.
 # Must match the @playwright/test version in package.json (1.58.2).
+# PLAYWRIGHT_BROWSERS_PATH places browsers in a shared system path so the
+# node user can access them (default ~/.cache/ms-playwright would be root's home).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx --yes playwright@1.58.2 install --with-deps chromium
 
 WORKDIR /app
@@ -126,6 +129,14 @@ ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 # a stale copy in the source tree).
 COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
 RUN chmod +x /usr/local/bin/e2e-entrypoint.sh
+
+# Switch to non-root user for runtime (node:22-bookworm provides UID 1000).
+# This is required by server-side tests that verify permission errors
+# propagate (claude-transcript-locator.test.ts chmod 0o000 tests) — root
+# would bypass those mode bits. Must be AFTER the entrypoint COPY+chmod above
+# which write to root-owned /usr/local/bin/.
+RUN chown -R node:node /app
+USER node
 
 # Basic healthcheck: verify the Node.js runtime and key artifacts are present.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
