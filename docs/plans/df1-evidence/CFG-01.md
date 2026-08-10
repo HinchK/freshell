@@ -110,6 +110,21 @@ TERM-04/HARNESS-05): `npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json` →
   deep-compare, both boot-writer triggers.
 - Run 4 (confirmation, final spec SHA `1ce0e7528`): **2 passed (47.7s)** — two consecutive
   greens; earlier failures were deterministic assertion-semantics fixes, not flakes.
+- Post-review-fix runs at the FINAL code SHA `b5d40236e` (after the P2/P3 spawn-hardness
+  fixes): **2 passed (39.3s)**, then two fresh runs at that SHA **2 passed (1.0m)** and
+  **2 passed (52.4s)**. Three consecutive greens at final SHA.
+
+## Final verification gate (verbatim, at `b5d40236e`)
+
+- `cargo test -p freshell-server --bin freshell-server settings_store::` → **60 passed, 0 failed**
+- `cargo test -p freshell-server --test net09_config_preservation` → **1 passed, 0 failed**
+- `cargo test -p freshell-server --bin freshell-server` (full scoped gate, x2: first run hit the
+  pre-existing `NET-FLAKY-01` flake [see below]; retry → **641 passed, 0 failed**)
+- `cargo fmt --check` → clean
+- `cargo clippy -p freshell-server --all-targets -- -D warnings` → clean
+- `npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json` → zero errors attributed to the spec
+- `npx eslint test/e2e-browser/specs/cfg01-lossless-writes.spec.ts test/e2e-browser/playwright.config.ts` → 0 errors (files outside eslint's configured scope, as with sibling e2e specs)
+- `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium cfg01-lossless-writes` → **2 passed x3 consecutive**
 
 No product bug found by the probe (the writer was already lossless on base); the probe's
 value-add was hardening the spec's own assertion semantics into non-vacuous form
