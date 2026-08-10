@@ -108,9 +108,11 @@ check "--config=server sets correct config" grep -q 'vitest.server.config.ts' "$
 rm -f "${FAKE_GCLOUD_LOG}.envvars"
 bash "$SCRIPT" run --cloud --config=default test/unit/lib/pane-utils.test.ts 2>&1 > /dev/null || true
 if [ -f "${FAKE_GCLOUD_LOG}.envvars" ]; then
-  VITEST_ARGS_VAL=$(grep 'VITEST_ARGS_JSON' "${FAKE_GCLOUD_LOG}.envvars" | sed "s/^VITEST_ARGS_JSON: '//;s/'\$//" || true)
+  # Extract the YAML double-quoted value and unescape it to get the raw JSON
+  VITEST_ARGS_VAL=$(grep 'VITEST_ARGS_JSON' "${FAKE_GCLOUD_LOG}.envvars" | sed 's/^VITEST_ARGS_JSON: //' || true)
   if [ -n "$VITEST_ARGS_VAL" ]; then
-    check "VITEST_ARGS_JSON is valid JSON" bash -c "echo '$VITEST_ARGS_VAL' | jq -e '.' > /dev/null 2>&1"
+    # Use jq to parse the YAML double-quoted string back to raw JSON, then validate
+    check "VITEST_ARGS_JSON is valid JSON" bash -c "echo '$VITEST_ARGS_VAL' | jq -r . | jq -e '.' > /dev/null 2>&1"
   else
     echo "FAIL: VITEST_ARGS_JSON not found in env-vars file"
     FAILURES=$((FAILURES + 1))

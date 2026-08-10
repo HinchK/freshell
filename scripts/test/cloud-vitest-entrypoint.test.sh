@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Test: cloud-vitest-entrypoint — verify TEST_MODE=vitest branch, .dockerignore exceptions,
 # and Dockerfile USER node + PLAYWRIGHT_BROWSERS_PATH changes.
+#
+# Note: This test uses string-grep checks for fast feedback. Execution-level
+# verification (running vitest in a Docker container with TEST_MODE=vitest)
+# was performed in Task 5's end-to-end validation and is not repeated here.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

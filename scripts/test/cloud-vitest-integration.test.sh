@@ -61,14 +61,22 @@ touch "$FAKE_CLOUD_LOG"
 # Run with FRESHELL_VITEST_BACKEND=cloud and the fake script.
 # Use a timeout — after the fake exits 0, the code runs the electron suite
 # locally (which takes minutes). We only need to verify the fake was invoked.
+# Capture stdout to also verify the electron fallback was attempted.
+CLOUD_STDOUT=$(mktemp /tmp/cloud-stdout.XXXXXX)
 timeout 10s bash -c "
 FRESHELL_VITEST_BACKEND=cloud \
 FRESHELL_VITEST_CLOUD_SCRIPT='$FAKE_SCRIPT' \
 npx tsx scripts/run-standard-tests.ts --mode desktop
-" > /dev/null 2>&1 || true
+" > "$CLOUD_STDOUT" 2>&1 || true
 
 check "fake vitest-cloud.sh was invoked" grep -q 'FAKE_VITEST_CLOUD' "$FAKE_CLOUD_LOG"
 check "fake was called with 'run'" grep -q 'run' "$FAKE_CLOUD_LOG"
+
+# Check 7b: Electron fallback was attempted after cloud dispatch
+# The run-standard-tests.ts logs "Running electron suite locally after cloud dispatch"
+check "electron fallback attempted after cloud dispatch" \
+  grep -q 'electron' "$CLOUD_STDOUT"
+rm -f "$CLOUD_STDOUT"
 
 # Check 8: FRESHELL_VITEST_BACKEND=local does NOT invoke vitest-cloud.sh
 # Use a timeout — the local path runs the full test suite which takes minutes.

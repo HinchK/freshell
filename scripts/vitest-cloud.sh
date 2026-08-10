@@ -120,11 +120,26 @@ cmd_build() {
         local_build=true
         shift
         ;;
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
       *)
         shift
         ;;
     esac
   done
+
+  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
+  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
 
   if $local_build; then
     echo "[vitest-cloud] Building Docker image locally..."
@@ -173,6 +188,7 @@ cmd_run() {
   local local_mode=false
   local cloud_mode=false
   local force_build=false
+  local local_build_flag=false
   local shards=4
   local timeout="30m"
   local config_selector="all"
@@ -190,6 +206,10 @@ cmd_run() {
         ;;
       --build)
         force_build=true
+        shift
+        ;;
+      --local-build)
+        local_build_flag=true
         shift
         ;;
       --shards=*)
@@ -268,7 +288,11 @@ cmd_run() {
 
   # Cloud mode
   if $force_build; then
-    cmd_build
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
   fi
 
   # Ensure image exists in remote registry
@@ -293,13 +317,16 @@ cmd_run() {
   fi
 
   # Build a YAML env-vars file for the Cloud Run Job.
-  # Single-quote JSON values to avoid YAML double-quote escaping issues.
+  # Use double-quoted YAML with proper escaping for the JSON value.
+  # jq -Rs produces a YAML-safe double-quoted string with all special chars escaped.
+  local vitest_args_yaml
+  vitest_args_yaml=$(echo "$vitest_args_json" | jq -Rs .)
   local env_file
   env_file=$(mktemp /tmp/vitest-env-vars.XXXXXX.yaml)
   cat > "$env_file" <<ENVEOF
 TEST_MODE: "vitest"
 VITEST_CONFIGS: "$configs"
-VITEST_ARGS_JSON: '$vitest_args_json'
+VITEST_ARGS_JSON: $vitest_args_yaml
 ENVEOF
 
   # Create or update the Cloud Run Job (create fails if it already exists,
@@ -324,17 +351,26 @@ ENVEOF
 
   rm -f "$env_file"
 
-  # Execute the job and wait for completion
+  # Execute the job and wait for completion.
+  # Capture the execution ID from the execute output to avoid a race with
+  # concurrent agents updating/executing the same shared job.
   echo "[vitest-cloud] Executing Cloud Run Job..."
-  gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait
+  local execute_output
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait 2>&1) || true
+  echo "$execute_output"
 
-  # Get the latest execution name
+  # Extract the execution ID from the execute output (format: "Execution NAME")
   local execution_id
-  execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
-    --job="$GCP_JOB" \
-    --sort-by="~metadata.creationTimestamp" \
-    --format="value(name)" \
-    --limit=1)
+  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1)
+  if [ -z "$execution_id" ]; then
+    # Fallback: query the latest execution (may race with concurrent agents)
+    echo "[vitest-cloud] WARNING: could not capture execution ID, falling back to latest"
+    execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
+      --job="$GCP_JOB" \
+      --sort-by="~metadata.creationTimestamp" \
+      --format="value(name)" \
+      --limit=1)
+  fi
 
   # Fetch logs
   echo "[vitest-cloud] Fetching logs..."
