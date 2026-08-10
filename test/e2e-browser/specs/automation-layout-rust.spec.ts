@@ -257,13 +257,16 @@ test.describe('Automation layout parity (Rust only)', () => {
 
       // GET /api/panes -> index-ordered rows mirroring the leaves
       // (depth-first leaf order, Node-exact row shape `{id,index,kind,terminalId}`).
-      // Poll until BOTH rows are terminal-kind: the client syncs the split
+      // Poll until BOTH rows are terminal-kind AND have terminalId: the client syncs the split
       // twice (first with the new pane still a picker, then with the spawned
       // terminal attached), and only the second sync carries the terminal row.
       await expect.poll(async () => {
         const panes = (await rest.get(`/api/panes?tabId=${tabId}`)).data.panes
-        return panes.map((row: any) => row.kind)
-      }, { timeout: 20_000 }).toEqual(['terminal', 'terminal'])
+        return {
+          kinds: panes.map((row: any) => row.kind),
+          terminalIds: panes.map((row: any) => row.terminalId)
+        }
+      }, { timeout: 20_000 }).toEqual({ kinds: ['terminal', 'terminal'], terminalIds: [expect.any(String), expect.any(String)] })
       const panesBody = await rest.get(`/api/panes?tabId=${tabId}`)
       expect(panesBody.status).toBe('ok')
       const rows = panesBody.data.panes
