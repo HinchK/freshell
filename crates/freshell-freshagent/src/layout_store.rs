@@ -196,7 +196,13 @@ impl LayoutStore {
             .iter()
             .map(|t| ListedTab {
                 id: t.id.clone(),
-                title: t.title.clone().unwrap_or_else(|| t.id.clone()),
+                // Legacy `t.title || t.id` — an EMPTY string title also falls
+                // back to the id (JS falsiness), not just an absent one.
+                title: t
+                    .title
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| t.id.clone()),
                 active_pane_id: g.active_pane.get(&t.id).cloned(),
             })
             .collect()

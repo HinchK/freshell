@@ -94,8 +94,38 @@ resize/close, then `/api/layout/snapshot` must equal the client's real layout
 (2) raw legacy `agent-chat` sync frame → normalized server-side snapshot +
 pane rows (legacy = true parity control).
 
-- `legacy-chromium`: **PROBED** — see status note below.
-- `rust-chromium`: **PROBED** — see status note below.
+Per-leg outcomes (probe rule: run once per relevant leg; classified):
+
+- `legacy-chromium`: **GREEN**.
+  - v1/v2 (2-worker): spec-side defects found by the probe and fixed —
+    (a) `.xterm` locator matched HIDDEN terminals of the inactive tab
+    (fixed with `:visible`); (b) an over-pinned resize assertion
+    (`sizes[0] != 50`) — a 50px drag leaves the divider at 50/50 on this
+    surface (same as pane-system.spec.ts's own drag test, which never
+    asserts sizes); the resize reflection stays covered by the exact
+    client↔REST equality poll.
+  - v3 (test 2 solo under `-g`, debugging a 2-worker timeout): PASS (40s).
+    The v1/v2 test-2 timeout was load/parallelism, not a defect.
+  - v4 (both tests, 2 workers, final spec): **PASS 2/2 (33.7s)**.
+- `rust-chromium`: **GREEN — PASS 2/2 (1.6m incl. the harness's release
+  rebuild)**, first attempt, against the final code at the time (post
+  serde-row fix `4d7dac7c5`). This leg is the proof the checklist item is
+  about: UI-only mutations read back exactly from the Rust server.
+- Probe logs: `/tmp/auto01-pw-legacy4.log`, `/tmp/auto01-pw-rust.log`
+  (ephemeral; the MATRIX registration makes both legs re-runnable any time).
+
+Review loop (fresheyes, independent GPT review, pid 3154216) — round 1
+verdict FAILED with 3 findings, all fixed and verified:
+1. (major) `ui_layout_sync_ingest_never_replies` asserted via
+   `next_frame_of_type` which SKIPS interleaved frames — could pass vacuously.
+   Fixed: the test now reads the VERY NEXT raw frame and asserts it IS the
+   pong (any ack/error would arrive first).
+2. (major) this evidence file claimed probes without the per-leg
+   classification — this section is that fix.
+3. (minor) `list_tabs` title fallback was `None`-only; legacy `t.title ||
+   t.id` also falls back on `""`. Fixed + regression test.
+
+Round 2: (pending — rerun after round-1 fixes)
 
 ## Verifier-facing GREEN commands (at final SHA)
 

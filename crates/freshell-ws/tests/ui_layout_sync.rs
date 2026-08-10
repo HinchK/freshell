@@ -9,8 +9,9 @@
 mod common;
 
 use common::{connect_and_capture_inventory, spawn_server_with_specs_and_state, TestWs};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 fn layout_sync_frame(tabs: serde_json::Value, layouts: serde_json::Value) -> serde_json::Value {
@@ -159,10 +160,24 @@ async fn ui_layout_sync_ingest_never_replies() {
     )
     .await;
     // No frame may arrive until we provoke one (ping -> pong): legacy's
-    // ui.layout.sync case `return`s without sending anything.
+    // ui.layout.sync case `return`s without sending anything. The VERY NEXT
+    // frame must be the pong — reading raw (not `next_frame_of_type`, which
+    // would hide an interleaved ack/error) is what proves silence.
     send_json(&mut ws, json!({ "type": "ping" })).await;
-    let pong = common::next_frame_of_type(&mut ws, "pong").await;
-    assert_eq!(pong["type"], json!("pong"));
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("next frame within timeout")
+        .expect("stream not ended")
+        .expect("no ws error");
+    let WsMessage::Text(text) = msg else {
+        panic!("expected the pong TEXT frame as the very next frame, got {msg:?}")
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+    assert_eq!(
+        value["type"],
+        json!("pong"),
+        "the first post-sync frame must be the pong (any ack/error would arrive first)"
+    );
 }
 
 #[tokio::test]

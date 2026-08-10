@@ -1037,3 +1037,23 @@ fn helper_lookups_find_panes_and_terminal_ids() {
     );
     assert_eq!(store.find_split_for_pane("pane_1"), None);
 }
+
+#[test]
+fn list_tabs_empty_string_title_falls_back_to_id_like_legacy() {
+    // Review finding (fresheyes #1 minor): legacy `t.title || t.id` is falsy
+    // for "" — the fallback must fire for empty strings too.
+    let store = LayoutStore::new();
+    store.update_from_ui(
+        &sync(
+            json!([{ "id": "tab_e", "title": "" }]),
+            json!({ "tab_e": { "type": "leaf", "id": "p1", "content": { "kind": "terminal" } } }),
+            json!({ "tab_e": "p1" }),
+            Some("tab_e"),
+            None,
+            None,
+            1,
+        ),
+        "c",
+    );
+    assert_eq!(store.list_tabs()[0].title, "tab_e");
+}
