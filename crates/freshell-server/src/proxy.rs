@@ -154,14 +154,17 @@ async fn forward(
     let target_url = format!("http://127.0.0.1:{target_port}/{rest}{query}");
 
     // Convert the incoming method + headers to the upstream request. `host` is set
-    // by reqwest to the target; hop-by-hop framing headers are dropped.
+    // by reqwest to the target; hop-by-hop framing headers are dropped. Repeated
+    // headers APPEND (a repeated client header must reach upstream N times, in
+    // wire order — `proxy-router.ts` passes Node's header arrays through
+    // untouched); `insert` would collapse them to last-wins.
     let mut req = state.client.request(method, &target_url);
     let mut fwd_headers = HeaderMap::new();
     for (name, value) in headers.iter() {
         if STRIPPED_REQUEST_HEADERS.contains(&name.as_str()) {
             continue;
         }
-        fwd_headers.insert(name.clone(), value.clone());
+        fwd_headers.append(name.clone(), value.clone());
     }
     req = req.headers(fwd_headers);
     if !body.is_empty() {
@@ -181,6 +184,9 @@ async fn forward(
 
     // Rebuild the response: same status, headers minus the iframe-blockers and the
     // framing headers hyper recomputes, streaming the body through unchanged.
+    // Repeated headers APPEND so multi-`Set-Cookie` survives in wire order
+    // (`proxy-router.ts:35` hands `res.writeHead` the header array verbatim —
+    // collapsing it would silently kill proxied apps' session/login flows).
     let status = upstream.status();
     let mut out_headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
@@ -194,7 +200,7 @@ async fn forward(
             HeaderName::from_bytes(name.as_ref()),
             HeaderValue::from_bytes(value.as_ref()),
         ) {
-            out_headers.insert(hn, hv);
+            out_headers.append(hn, hv);
         }
     }
 
@@ -292,22 +298,30 @@ mod tests {
 // than proxy correctness — the durable contract tests live in
 // `mod socket_contract`. Raw sockets everywhere: no framework client/server
 // on either side of the wire, so nothing normalizes the bytes being proven.
+// ── Raw-wire test support (BROWSER-01) ─────────────────────────────────
+//
+// Shared raw-TCP fixtures used by the load-bearing probes and the
+// socket-level contract tests: a verbatim upstream capture fixture, a raw
+// client with wire-order duplicate-preserving header parsing, and
+// ephemeral-loopback spawns for both the REAL proxy router and arbitrary
+// standalone axum routers. No framework client/server on either side of
+// the wire, so nothing normalizes the bytes being proven.
 #[cfg(test)]
-mod lb_probes {
+pub(crate) mod wire_support {
     use super::*;
 
-    const TEST_TOKEN: &str = "lb-probe-token-0123456789abcdef";
+    pub(crate) const TEST_TOKEN: &str = "lb-probe-token-0123456789abcdef";
 
     // ── Raw-wire helpers ────────────────────────────────────────────────────
 
     /// One side of a raw TCP conversation plus a read-ahead buffer, so a
     /// single `read()` that straddles the head/body boundary loses nothing.
-    struct Wire {
+    pub(crate) struct Wire {
         stream: tokio::net::TcpStream,
         buf: Vec<u8>,
     }
 
-    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    pub(crate) fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
         if needle.is_empty() || hay.len() < needle.len() {
             return None;
         }
@@ -316,7 +330,7 @@ mod lb_probes {
 
     /// Parse `\r\n`-terminated head bytes into (first line, ordered headers).
     /// Duplicate headers are preserved in wire order.
-    fn parse_head(raw: &[u8]) -> (String, Vec<(String, String)>) {
+    pub(crate) fn parse_head(raw: &[u8]) -> (String, Vec<(String, String)>) {
         let text = String::from_utf8_lossy(raw);
         let mut lines = text.split("\r\n");
         let first = lines.next().unwrap_or("").to_string();
@@ -330,7 +344,7 @@ mod lb_probes {
         (first, headers)
     }
 
-    fn header_values<'a>(
+    pub(crate) fn header_values<'a>(
         headers: &'a [(String, String)],
         name: &'a str,
     ) -> impl Iterator<Item = &'a str> {
@@ -341,21 +355,21 @@ mod lb_probes {
     }
 
     impl Wire {
-        fn new(stream: tokio::net::TcpStream) -> Self {
+        pub(crate) fn new(stream: tokio::net::TcpStream) -> Self {
             Self {
                 stream,
                 buf: Vec::new(),
             }
         }
 
-        async fn write_all(&mut self, bytes: &[u8]) {
+        pub(crate) async fn write_all(&mut self, bytes: &[u8]) {
             use tokio::io::AsyncWriteExt;
             self.stream.write_all(bytes).await.unwrap();
         }
 
         /// Read until `needle` (inclusive) and return it, retaining any
         /// over-read bytes in the buffer.
-        async fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
+        pub(crate) async fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
             use tokio::io::AsyncReadExt;
             loop {
                 if let Some(pos) = find_subslice(&self.buf, needle) {
@@ -371,7 +385,7 @@ mod lb_probes {
             }
         }
 
-        async fn read_n(&mut self, n: usize) -> Vec<u8> {
+        pub(crate) async fn read_n(&mut self, n: usize) -> Vec<u8> {
             use tokio::io::AsyncReadExt;
             while self.buf.len() < n {
                 let mut tmp = [0u8; 8192];
@@ -385,7 +399,7 @@ mod lb_probes {
             self.buf.drain(..take).collect()
         }
 
-        async fn read_to_eof(&mut self) -> Vec<u8> {
+        pub(crate) async fn read_to_eof(&mut self) -> Vec<u8> {
             use tokio::io::AsyncReadExt;
             let mut tmp = [0u8; 8192];
             loop {
@@ -399,7 +413,7 @@ mod lb_probes {
 
         /// Read one RFC 7230 chunked body (with optional trailer lines) and
         /// return the reassembled payload.
-        async fn read_chunked(&mut self) -> Vec<u8> {
+        pub(crate) async fn read_chunked(&mut self) -> Vec<u8> {
             let mut body = Vec::new();
             loop {
                 let size_line = self.read_until(b"\r\n").await;
@@ -430,23 +444,23 @@ mod lb_probes {
 
     /// A request as captured verbatim by the raw upstream fixture.
     #[derive(Debug, Default)]
-    struct CapturedRequest {
-        request_line: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    pub(crate) struct CapturedRequest {
+        pub(crate) request_line: String,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: Vec<u8>,
     }
 
     impl CapturedRequest {
-        fn raw_target(&self) -> &str {
+        pub(crate) fn raw_target(&self) -> &str {
             self.request_line.split(' ').nth(1).unwrap_or("")
         }
-        fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        pub(crate) fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
             header_values(&self.headers, name)
         }
     }
 
     /// Read one full request (head + framed body) from a wire.
-    async fn read_request(wire: &mut Wire) -> CapturedRequest {
+    pub(crate) async fn read_request(wire: &mut Wire) -> CapturedRequest {
         let head = wire.read_until(b"\r\n\r\n").await;
         let (request_line, headers) = parse_head(&head);
         let body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
@@ -465,27 +479,27 @@ mod lb_probes {
 
     /// A full response as captured on the client side.
     #[derive(Debug)]
-    struct RawResponse {
-        status_line: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    pub(crate) struct RawResponse {
+        pub(crate) status_line: String,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: Vec<u8>,
     }
 
     impl RawResponse {
-        fn status_code(&self) -> u16 {
+        pub(crate) fn status_code(&self) -> u16 {
             self.status_line
                 .split(' ')
                 .nth(1)
                 .and_then(|c| c.parse().ok())
                 .expect("status code")
         }
-        fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        pub(crate) fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
             header_values(&self.headers, name)
         }
     }
 
     /// Send verbatim request bytes and read the full framed response.
-    async fn raw_exchange(port: u16, request: &[u8]) -> RawResponse {
+    pub(crate) async fn raw_exchange(port: u16, request: &[u8]) -> RawResponse {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -514,7 +528,7 @@ mod lb_probes {
 
     /// Bind `127.0.0.1:0` synchronously (usable before the runtime schedules
     /// the accept loop) and spawn one task per accepted connection.
-    fn spawn_raw_listener<F, Fut>(handler: F) -> u16
+    pub(crate) fn spawn_raw_listener<F, Fut>(handler: F) -> u16
     where
         F: Fn(Wire) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -536,7 +550,7 @@ mod lb_probes {
 
     /// Spawn the REAL proxy router (production state constructor) on an
     /// ephemeral loopback port.
-    async fn spawn_proxy() -> u16 {
+    pub(crate) async fn spawn_proxy() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -549,7 +563,7 @@ mod lb_probes {
     }
 
     /// Spawn an arbitrary standalone axum router on an ephemeral port.
-    async fn spawn_app(app: Router) -> u16 {
+    pub(crate) async fn spawn_app(app: Router) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -564,7 +578,7 @@ mod lb_probes {
     /// response a deterministic EOF. Ends with the blank line that terminates
     /// the head. Callers append body bytes for body-bearing requests (with a
     /// matching `content-length` or chunked framing added to the head).
-    fn proxy_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
+    pub(crate) fn proxy_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
         format!(
             "{method} /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
              host: 127.0.0.1:{port}\r\n\
@@ -573,6 +587,13 @@ mod lb_probes {
         )
         .into_bytes()
     }
+
+}
+
+#[cfg(test)]
+mod lb_probes {
+    use super::wire_support::*;
+    use super::*;
 
     // ── L0 sanity: a plain GET passes through the proxy at all ────────────
     #[tokio::test]
@@ -793,5 +814,114 @@ mod lb_probes {
             "no chunked framing when content-length is known"
         );
         assert_eq!(got[0].body, b"hello world");
+    }
+}
+
+// ── Socket-level contract tests (BROWSER-01) ───────────────────────────────
+//
+// The durable parity contract of `proxy-router.ts`'s HTTP half, driven end
+// to end through the REAL proxy router on real loopback sockets
+// (`wire_support`). Each test name states the legacy behavior being pinned.
+#[cfg(test)]
+mod socket_contract {
+    use super::wire_support::*;
+    use super::*;
+
+    const CONTRACT_TOKEN: &str = "contract-token-0123456789abcdef";
+
+    async fn spawn_contract_proxy() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(CONTRACT_TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    fn contract_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
+        format!(
+            "{method} /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
+             host: 127.0.0.1:{port}\r\n\
+             x-auth-token: {CONTRACT_TOKEN}\r\n\
+             connection: close\r\n\r\n",
+        )
+        .into_bytes()
+    }
+
+    /// G2 response direction: multi-`Set-Cookie` (and any other repeated
+    /// header) must survive the proxy in wire order — the header copy must
+    /// APPEND, never collapse. Legacy: Node forwards header arrays verbatim
+    /// (`proxy-router.ts:35` + `res.writeHead` with a `set-cookie: string[]`).
+    /// This is what keeps proxied apps' session/login flows alive.
+    #[tokio::test]
+    async fn response_preserves_duplicate_set_cookie_headers_in_order() {
+        let upstream_port = spawn_raw_listener(move |mut wire| async move {
+            let _req = read_request(&mut wire).await;
+            wire.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  content-length: 2\r\n\
+                  set-cookie: session=abc; Path=/; HttpOnly\r\n\
+                  set-cookie: prefs=dark; Path=/\r\n\
+                  x-dupe-marker: first\r\n\
+                  x-dupe-marker: second\r\n\r\n\
+                  ok",
+            )
+            .await;
+        });
+        let proxy_port = spawn_contract_proxy().await;
+        let resp = raw_exchange(proxy_port, &contract_head(proxy_port, "GET", upstream_port, "/")).await;
+        assert_eq!(resp.status_code(), 200);
+        let cookies: Vec<_> = resp.header_values("set-cookie").collect();
+        assert_eq!(
+            cookies,
+            vec!["session=abc; Path=/; HttpOnly", "prefs=dark; Path=/"],
+            "BOTH set-cookie headers must survive in wire order (legacy forwards arrays)"
+        );
+        let dupes: Vec<_> = resp.header_values("x-dupe-marker").collect();
+        assert_eq!(dupes, vec!["first", "second"]);
+    }
+
+    /// G2 request direction: a repeated client header must reach upstream
+    /// as two headers, in wire order. Legacy passes `req.headers` arrays
+    /// through to `http.request` untouched.
+    #[tokio::test]
+    async fn request_forwards_duplicate_headers_in_order() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let proxy_port = spawn_contract_proxy().await;
+        let resp = raw_exchange(
+            proxy_port,
+            format!(
+                "GET /api/proxy/http/{upstream_port}/ HTTP/1.1\r\n\
+                 host: 127.0.0.1:{proxy_port}\r\n\
+                 x-auth-token: {CONTRACT_TOKEN}\r\n\
+                 x-dupe-request: alpha\r\n\
+                 x-dupe-request: beta\r\n\
+                 connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200);
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        let dupes: Vec<_> = got[0].header_values("x-dupe-request").collect();
+        assert_eq!(
+            dupes,
+            vec!["alpha", "beta"],
+            "a repeated client header must reach upstream twice, in wire order"
+        );
     }
 }
