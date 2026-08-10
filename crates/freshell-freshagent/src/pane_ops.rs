@@ -771,18 +771,19 @@ pub(crate) async fn resize_pane(
 /// of two panes (not their tree position -- legacy's `swapPane`/the frozen
 /// client's `swapPanes` reducer both search the tree by id and swap
 /// `.content`, no split geometry involved). Unlike resize, this needs no
-/// split-tree/splitId knowledge at all, so it is fully implementable: both
-/// `pane_id` (path) and `target`/`otherId` (body) resolve via
-/// [`FreshAgentState::pane_tabs`] (404 "pane not found" on a miss, matching
-/// `split_pane`'s established precedent); a resolved pair in DIFFERENT tabs
-/// mirrors legacy's own `{message:'panes not found'}` (200, not an error --
-/// `swapPane`'s tree search only ever finds both leaves within a SINGLE
-/// tab). The actual exchange swaps whichever bookkeeping bucket
-/// (`terminal_panes` or `content_panes`) each pane occupies; a pane
-/// resolving to NEITHER (a fresh-agent pane -- tracked in
-/// `FreshAgentState`'s private `panes` map, unreachable from this module)
-/// is out of this slice's reach and reported the same graceful
-/// `{message:'panes not found'}` way, never a hard error.
+/// split-tree/splitId knowledge at all, so it is fully implementable. AUTO-01:
+/// the AUTHORITY is the layout store, exactly legacy's call shape
+/// (`layoutStore.swapPane(req.body?.tabId, paneId, otherId)`) -- the shadow
+/// dispatch maps never gate it (a stale shadow entry cannot force a swap the
+/// layout no longer contains; a mirror-only pair swaps fine). When the store
+/// declines (unknown pane, or the two panes share no single tab) the route
+/// answers legacy's own 200-`{message:'panes not found'}` with ZERO side
+/// effects (no bookkeeping mutation, no broadcast); success swaps the
+/// dispatch bookkeeping (`terminal_panes`/`content_panes`, whichever each
+/// pane occupies) and broadcasts. Fresh-agent pane pairs are stored leaves
+/// too, so they now swap like legacy does (their dispatch binding lives in
+/// the fresh-agent `panes` map keyed by pane id -- any send-side implications
+/// of a swapped binding are AUTO-09's re-point, noted in AUTO-01 evidence).
 pub(crate) async fn swap_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -803,88 +804,46 @@ pub(crate) async fn swap_pane(
         return approx_json(Value::Null, "swap target missing");
     };
 
-    let (tab_a, tab_b) = {
-        let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex");
-        let Some(tab_a) = pane_tabs.get(&pane_id).cloned() else {
-            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
-        };
-        let Some(tab_b) = pane_tabs.get(&other_id).cloned() else {
-            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
-        };
-        (tab_a, tab_b)
+    let Some(tab_id) = state.layout_store().swap_pane(
+        body.get("tabId").and_then(Value::as_str),
+        &pane_id,
+        &other_id,
+    ) else {
+        return ok_json(json!({ "message": "panes not found" }), "panes not found");
     };
 
-    if tab_a != tab_b {
-        return ok_json(json!({ "message": "panes not found" }), "panes not found");
-    }
-
-    let (a_terminal, b_terminal, a_content, b_content) = {
-        let terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
-        let content_panes = state.content_panes.lock().expect("content_panes mutex");
-        (
-            terminal_panes.get(&pane_id).cloned(),
-            terminal_panes.get(&other_id).cloned(),
-            content_panes.get(&pane_id).cloned(),
-            content_panes.get(&other_id).cloned(),
-        )
-    };
-
-    if (a_terminal.is_none() && a_content.is_none())
-        || (b_terminal.is_none() && b_content.is_none())
-    {
-        return ok_json(json!({ "message": "panes not found" }), "panes not found");
-    }
-
+    // Dispatch bookkeeping exchange (post-AUTO-01 quality holdover for the
+    // not-yet-repointed dispatch routes): swap whichever per-kind map holds
+    // each pane, per side independently.
     {
         let mut terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
-        match (a_terminal, b_terminal) {
-            (Some(a), Some(b)) => {
-                terminal_panes.insert(pane_id.clone(), b);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                terminal_panes.remove(&pane_id);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                terminal_panes.remove(&other_id);
-                terminal_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
+        let a = terminal_panes.remove(&pane_id);
+        let b = terminal_panes.remove(&other_id);
+        if let Some(b) = b {
+            terminal_panes.insert(pane_id.clone(), b);
+        }
+        if let Some(a) = a {
+            terminal_panes.insert(other_id.clone(), a);
         }
     }
     {
         let mut content_panes = state.content_panes.lock().expect("content_panes mutex");
-        match (a_content, b_content) {
-            (Some(a), Some(b)) => {
-                content_panes.insert(pane_id.clone(), b);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                content_panes.remove(&pane_id);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                content_panes.remove(&other_id);
-                content_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
+        let a = content_panes.remove(&pane_id);
+        let b = content_panes.remove(&other_id);
+        if let Some(b) = b {
+            content_panes.insert(pane_id.clone(), b);
+        }
+        if let Some(a) = a {
+            content_panes.insert(other_id.clone(), a);
         }
     }
 
-    // AUTO-01: the authoritative store swaps content (+titles) too. Kept a
-    // write-through (never a resolution source) so the pre-AUTO-01 response
-    // contract is unchanged; a mirror-absent pane pair no-ops in the store.
-    state
-        .layout_store()
-        .swap_pane(Some(&tab_a), &pane_id, &other_id);
-
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.swap".to_string(),
-        payload: Some(json!({ "tabId": tab_a, "paneId": pane_id, "otherId": other_id })),
+        payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "otherId": other_id })),
     }));
 
-    ok_json(json!({ "tabId": tab_a }), "panes swapped")
+    ok_json(json!({ "tabId": tab_id }), "panes swapped")
 }
 
 #[cfg(test)]
@@ -2104,7 +2063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_unknown_pane_is_404() {
+    async fn swap_unknown_pane_is_200_panes_not_found() {
         let state = state_with_registry();
         let router = app(state.clone());
         let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
@@ -2116,14 +2075,16 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-        assert_eq!(body["message"], json!("pane not found"));
+        // AUTO-01: legacy's swapPane route has no 404 -- a store-declined pair
+        // is the 200-with-message shape (`layout-store.ts`).
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "message": "panes not found" }));
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
     }
 
     #[tokio::test]
-    async fn swap_unknown_other_is_404() {
+    async fn swap_unknown_other_is_200_panes_not_found() {
         let state = state_with_registry();
         let router = app(state.clone());
         let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
@@ -2135,8 +2096,10 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-        assert_eq!(body["message"], json!("pane not found"));
+        // Legacy parity (AUTO-01): `layoutStore.swapPane` declines with the
+        // 200-`{message:'panes not found'}` shape, no 404 exists on this route.
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "message": "panes not found" }));
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
     }
@@ -2161,6 +2124,92 @@ mod tests {
         let registry = state.terminal_registry.clone().unwrap();
         registry.kill(&terminal_a);
         registry.kill(&terminal_b);
+    }
+
+    /// Review-round-3 regression: swap consults the AUTHORITATIVE store; a
+    /// stale shadow entry whose pane the mirror already removed must produce
+    /// legacy's 200-"panes not found" with NO bookkeeping mutation and NO
+    /// broadcast.
+    #[tokio::test]
+    async fn swap_of_stale_shadow_pane_declines_with_zero_side_effects() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (tab_id, first_pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+        let tmp = std::env::temp_dir();
+        let (status, split_body) = post(
+            router.clone(),
+            &format!("/api/panes/{first_pane_id}/split"),
+            json!({ "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{split_body}");
+        let second_pane_id = split_body["data"]["paneId"].as_str().unwrap().to_string();
+
+        // Divergence: the mirror reports the tab closed; the shadow bookkeeping
+        // still holds both panes.
+        assert!(state.layout_store().close_tab(&tab_id));
+        assert!(state
+            .pane_tabs
+            .lock()
+            .expect("pane_tabs mutex")
+            .contains_key(&first_pane_id));
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{first_pane_id}/swap"),
+            json!({ "target": second_pane_id }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "message": "panes not found" }));
+        // terminal_panes bookkeeping untouched (first still owns ITS terminal).
+        assert_eq!(
+            state
+                .terminal_panes
+                .lock()
+                .expect("terminal_panes mutex")
+                .get(&first_pane_id)
+                .map(|e| e.terminal_id.clone())
+                .as_deref(),
+            Some(first_terminal_id.as_str())
+        );
+        let drained = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            drained.is_err(),
+            "no pane.swap broadcast on a declined swap"
+        );
+
+        let registry = state.terminal_registry.clone().unwrap();
+        for id in registry.inventory() {
+            registry.kill(&id.terminal_id);
+        }
+    }
+
+    /// The mirror-only flip side: both panes exist ONLY in the store —
+    /// the swap works (legacy layout-only parity) including title travel.
+    #[tokio::test]
+    async fn swap_of_mirror_only_panes_exchanges_content_and_titles() {
+        let state = state_with_registry();
+        feed_store(&state);
+        let router = app(state.clone());
+
+        let (status, body) = post(
+            router,
+            "/api/panes/ui_pane_a1/swap",
+            json!({ "target": "ui_pane_a2" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "tabId": "ui_tab_a" }));
+        let listed = state.layout_store().list_panes(Some("ui_tab_a"));
+        assert_eq!(listed[0].kind.as_deref(), Some("editor"));
+        assert_eq!(listed[0].title.as_deref(), Some("notes.md"));
+        assert_eq!(listed[1].kind.as_deref(), Some("terminal"));
+        assert_eq!(listed[1].title.as_deref(), Some("Ops codex"));
     }
 
     #[tokio::test]

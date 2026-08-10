@@ -1421,7 +1421,11 @@ fn url_hostname(raw: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
-    Some(host.to_string())
+    // WHATWG URL canonicalizes domain hosts to lowercase (`new
+    // URL("https://EXAMPLE.COM/").hostname === "example.com") — mirror that
+    // (punycode/percent-enc corners of `new URL` remain beyond this cheap
+    // extraction; recorded in the module doc).
+    Some(host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
