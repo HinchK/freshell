@@ -13,7 +13,9 @@ import type { TestServerInfo } from '../helpers/test-server.js'
  * background auto-name sweep (`crates/freshell-server/src/auto_title_sweep.rs`,
  * 2s tick: dir -> first-message -> Gemini AI ladder), the
  * `POST /api/sessions/:id/generate-title` route (`sessions.rs`), and the
- * `POST /api/ai/terminals/:id/summary` route (`ai_router.rs`).
+ * `POST /api/ai/terminals/:id/summary` route (`ai_router.rs`). The
+ * user-rename test also carries SESSION-04's stable-cold-restart clause:
+ * the persisted ladder winner must survive a full `RustServer.restart()`.
  *
  * NO LIVE GEMINI CALLS, EVER: every AI branch in this file talks to a local
  * fake Gemini (plain `node:http` on 127.0.0.1:0) via the Rust-only
@@ -212,12 +214,22 @@ async function bootAutoTitleServer(opts: {
       setupHome: async (homeDir) => {
         const freshellDir = path.join(homeDir, '.freshell')
         await fs.mkdir(freshellDir, { recursive: true })
-        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
-          version: 1,
-          settings: {
-            codingCli: { enabledProviders: ['claude'] },
-          },
-        }, null, 2))
+        // Seed config.json ONCE: `RustServer.restart()` re-runs `setupHome`
+        // on the same home (rust-server.ts `boot()`), so an unconditional
+        // wholesale write here would CLOBBER config state a test built up
+        // before the restart (e.g. the persisted user rename the
+        // stable-cold-restart clause asserts survives). Same trap
+        // settings-split-rust.spec.ts:32 documents.
+        const configPath = path.join(freshellDir, 'config.json')
+        const configExists = await fs.access(configPath).then(() => true, () => false)
+        if (!configExists) {
+          await fs.writeFile(configPath, JSON.stringify({
+            version: 1,
+            settings: {
+              codingCli: { enabledProviders: ['claude'] },
+            },
+          }, null, 2))
+        }
         if (opts.session) {
           // The session's cwd is a REAL directory under the isolated home so
           // the resumed PTY's spawn cwd exists.
@@ -469,6 +481,27 @@ test.describe('Auto-title pipeline (rust)', () => {
       const override = await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)
       expect(override?.titleOverride).toBe('MINE')
       expect(override?.titleSource).toBe('user')
+
+      // SESSION-04 stable-cold-restart clause: the ladder's final winner must
+      // survive a full server stop/start on the same home (`RustServer.
+      // restart()`: same home/port/token, waits for health). The directory
+      // read model must re-serve 'MINE' from the persisted override on the
+      // cold boot, and a further >=2 sweep ticks on the fresh process (the
+      // client auto-reconnects and may respawn the terminal, re-arming the
+      // live-session match) must not clobber the finalized 'user' rung.
+      if (!booted.server.restart) {
+        throw new Error('rust E2eServerHandle does not implement restart()')
+      }
+      await booted.server.restart()
+      await expect.poll(
+        () => directoryTitle(page, booted.info, SESSION_ID),
+        { timeout: 20_000 },
+      ).toBe('MINE')
+      await page.waitForTimeout(5_000)
+      expect(await directoryTitle(page, booted.info, SESSION_ID)).toBe('MINE')
+      const postRestart = await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)
+      expect(postRestart?.titleOverride).toBe('MINE')
+      expect(postRestart?.titleSource).toBe('user')
     } finally {
       await cleanup(booted)
     }
