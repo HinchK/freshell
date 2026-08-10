@@ -143,17 +143,82 @@ if ! echo "$LOCAL_ENV_OUTPUT" | grep -q "Running locally"; then
 fi
 echo "PASS: FRESHELL_E2E_BACKEND=local runs locally"
 
-# Check 11: --cloud flag overrides FRESHELL_E2E_BACKEND=local
-echo "Testing: --cloud flag is rejected without gcloud (override works)"
-# We can't actually run cloud tests here, but we can verify the flag is
-# parsed by checking that it does NOT print "Running locally"
-CLOUD_FLAG_OUTPUT=$(FRESHELL_E2E_BACKEND=local "$SCRIPT" run --cloud --project=chromium test/e2e-browser/specs/auth.spec.ts 2>&1 || true)
-if echo "$CLOUD_FLAG_OUTPUT" | grep -q "Running locally"; then
+# Check 11: --cloud overrides FRESHELL_E2E_BACKEND=local, and the cloud run
+# targets the COMMIT-ADDRESSED image for the current HEAD — never mutable
+# :latest (wrap-review r3: a stale :latest let the cloud e2e gate pass
+# against old source). Fully STUBBED gcloud/docker: this check previously
+# invoked the real toolchain, which on an authenticated machine could
+# really build, push, and execute a cloud job from a test.
+echo "Testing: --cloud targets the HEAD-addressed image (stubbed gcloud/docker)"
+STUB_DIR="$(mktemp -d /tmp/e2e-cloud-stubs.XXXXXX)"
+export STUB_CAPTURE="$STUB_DIR/capture"
+mkdir -p "$STUB_CAPTURE"
+cat > "$STUB_DIR/gcloud" <<'STUB'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  "info "*) echo "/nonexistent-sdk-root"; exit 0 ;;
+  "auth print-access-token"*) echo stub-token; exit 0 ;;
+  *"artifacts repositories describe"*) exit 1 ;;
+  *"artifacts repositories create"*) exit 0 ;;
+  *"artifacts docker images describe"*) echo "$args" >> "$STUB_CAPTURE/describe.args"; exit 1 ;;
+  *"run jobs create"*) echo "$args" >> "$STUB_CAPTURE/create.args"; exit 0 ;;
+  *"run jobs update"*) echo "$args" >> "$STUB_CAPTURE/update.args"; exit 0 ;;
+  *"run jobs execute"*) exit 0 ;;
+  *"executions list"*) echo "exec-stub"; exit 0 ;;
+  *"executions describe"*)
+    case "$args" in
+      *failedCount*) echo "0" ;;
+      *succeededCount*) echo "1" ;;
+      *) echo "1" ;;
+    esac
+    exit 0 ;;
+  *"logs read"*) echo "  6 passed (4.2s)"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+cat > "$STUB_DIR/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_CAPTURE/docker.args"
+exit 0
+STUB
+chmod +x "$STUB_DIR/gcloud" "$STUB_DIR/docker"
+EXPECTED_TAG="$(git rev-parse --short=12 HEAD)"
+if [ -n "$(git status --porcelain)" ]; then
+  EXPECTED_TAG="${EXPECTED_TAG}-dirty"
+fi
+CLOUD_STUB_OUTPUT=$(env PATH="$STUB_DIR:$PATH" FRESHELL_E2E_BACKEND=local "$SCRIPT" run --cloud --project=chromium test/e2e-browser/specs/auth.spec.ts 2>&1) || {
+  echo "FAIL: stubbed cloud run failed"
+  echo "$CLOUD_STUB_OUTPUT" | tail -20
+  rm -rf "$STUB_DIR"
+  exit 1
+}
+if echo "$CLOUD_STUB_OUTPUT" | grep -q "Running locally"; then
   echo "FAIL: --cloud flag was ignored (printed 'Running locally')"
-  echo "$CLOUD_FLAG_OUTPUT" | tail -20
+  echo "$CLOUD_STUB_OUTPUT" | tail -20
+  rm -rf "$STUB_DIR"
   exit 1
 fi
-echo "PASS: --cloud flag overrides FRESHELL_E2E_BACKEND=local"
+if ! grep -qE -- "--image=[^ ]+freshell-e2e:${EXPECTED_TAG} " "$STUB_CAPTURE/create.args" 2>/dev/null; then
+  echo "FAIL: cloud job did not target the HEAD-addressed image tag ($EXPECTED_TAG)"
+  echo "create args: $(cat "$STUB_CAPTURE/create.args" 2>/dev/null || echo '<none>')"
+  rm -rf "$STUB_DIR"
+  exit 1
+fi
+if grep -q -- "--image=[^ ]*freshell-e2e:latest" "$STUB_CAPTURE/create.args" 2>/dev/null; then
+  echo "FAIL: cloud job targeted mutable :latest (stale-image hazard)"
+  rm -rf "$STUB_DIR"
+  exit 1
+fi
+if ! grep -q "push [^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/docker.args" 2>/dev/null; then
+  echo "FAIL: the HEAD-addressed image was never pushed by the build fallback"
+  echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
+  rm -rf "$STUB_DIR"
+  exit 1
+fi
+rm -rf "$STUB_DIR"
+unset STUB_CAPTURE
+echo "PASS: --cloud targets and pushes the HEAD-addressed image tag"
 
 # Check 12: the wrapper works on machines WITHOUT gcloud for non-cloud
 # subcommands. The top-level gcloud-sdk PATH setup must not kill the script

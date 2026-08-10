@@ -47,11 +47,29 @@ GCP_REGION="${FRESHELL_GCP_REGION:-us-west1}"
 GCP_REPO="${FRESHELL_GCP_REPO:-freshell-e2e}"
 GCP_JOB="${FRESHELL_GCP_JOB:-freshell-e2e}"
 
-IMAGE_LOCAL="freshell-e2e:latest"
-IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+IMAGE_NAME="freshell-e2e"
+IMAGE_LOCAL="${IMAGE_NAME}:latest"
+IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:latest"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Commit-addressed image tag (wrap-review r3): a cloud run must execute the
+# code at the CURRENT HEAD — with only a mutable :latest tag, `run` would
+# happily execute whatever source was last pushed and the "cloud e2e gate"
+# could pass against STALE code. `:latest` is still built/pushed (human
+# convenience pointer + layer-cache anchor) but the run path never uses it.
+# A dirty tree gets a non-addressable `-dirty` tag so a build of uncommitted
+# code can never masquerade as the clean commit (untracked files count as
+# dirty — the image bakes the working tree).
+image_tag_for_head() {
+  local sha
+  sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    sha="${sha}-dirty"
+  fi
+  echo "$sha"
+}
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
 # Docker when pushing to Artifact Registry). Guarded: local runs, `help`,
@@ -119,9 +137,14 @@ EOF
 # Subcommand: build
 # ---------------------------------------------------------------------------
 cmd_build() {
-  echo "[e2e-cloud] Building Docker image..."
-  docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
-  echo "[e2e-cloud] Image built: $IMAGE_LOCAL"
+  local tag
+  tag="$(image_tag_for_head)"
+  echo "[e2e-cloud] Building Docker image (tag: $tag)..."
+  docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+    -t "$IMAGE_LOCAL" \
+    -t "${IMAGE_NAME}:${tag}" \
+    "$ROOT"
+  echo "[e2e-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
   cmd_push
 }
 
@@ -144,9 +167,19 @@ cmd_push() {
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
-  docker tag "$IMAGE_LOCAL" "$IMAGE_REMOTE"
-  docker push "$IMAGE_REMOTE"
-  echo "[e2e-cloud] Pushed: $IMAGE_REMOTE"
+  # Push BOTH refs explicitly: the commit-addressed tag (what `run`
+  # resolves) and :latest (human convenience pointer + cache anchor; `run`
+  # never consumes it). Never read the mutable $IMAGE_REMOTE global here —
+  # the standalone `push` subcommand path still has it at :latest while the
+  # run path has repointed it at the HEAD tag.
+  local tag remote_base
+  tag="$(image_tag_for_head)"
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:latest"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:${tag}"
+  docker push "${remote_base}:${tag}"
+  docker push "${remote_base}:latest"
+  echo "[e2e-cloud] Pushed: ${remote_base}:${tag} (+ ${remote_base}:latest)"
 }
 
 # ---------------------------------------------------------------------------
@@ -260,18 +293,23 @@ cmd_run() {
       "${pw_args[@]}"
   fi
 
-  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+  # Recompute the remote ref with potentially overridden GCP settings —
+  # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
+  # job must run THIS HEAD's code or fail loudly, never pass on a stale
+  # image.
+  local image_tag
+  image_tag="$(image_tag_for_head)"
+  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
 
   # Cloud mode
   if $force_build; then
     cmd_build
   fi
 
-  # Ensure image exists in remote registry
+  # Ensure the image FOR THIS HEAD exists in the remote registry
   if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
       --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
-    echo "[e2e-cloud] Remote image not found, building and pushing..."
+    echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
     cmd_build
   fi
 
