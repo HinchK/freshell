@@ -34,6 +34,35 @@ set -euo pipefail
 TASK_INDEX="${CLOUD_RUN_TASK_INDEX:-0}"
 TASK_COUNT="${CLOUD_RUN_TASK_COUNT:-1}"
 
+# TEST_MODE=vitest: run Vitest instead of Playwright.
+if [ "${TEST_MODE:-}" = "vitest" ]; then
+  SHARD_INDEX=$((TASK_INDEX + 1))
+  SHARD_COUNT="$TASK_COUNT"
+  CONFIGS="${VITEST_CONFIGS:-config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts}"
+
+  # Parse VITEST_ARGS_JSON (JSON array) into a bash array using jq.
+  # This preserves argument boundaries (spaces, metacharacters, etc.)
+  # that would be lost with space-separated serialization.
+  EXTRA_ARGS=()
+  if [ -n "${VITEST_ARGS_JSON:-}" ]; then
+    while IFS= read -r arg; do
+      EXTRA_ARGS+=("$arg")
+    done < <(jq -r '.[]' <<< "$VITEST_ARGS_JSON")
+  fi
+
+  SHARD_ARG=()
+  if [ "$SHARD_COUNT" -gt 1 ]; then
+    SHARD_ARG=(--shard="${SHARD_INDEX}/${SHARD_COUNT}")
+  fi
+
+  EXIT_CODE=0
+  for config in $CONFIGS; do
+    echo "[vitest-entrypoint] Running vitest: $config ${SHARD_ARG[*]-} ${EXTRA_ARGS[*]-}"
+    npx vitest run --passWithNoTests --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
+  done
+  exit "$EXIT_CODE"
+fi
+
 CONFIG="test/e2e-browser/playwright.cloud.config.ts"
 SPECS_DIR="test/e2e-browser/specs"
 DURATIONS_FILE="docker/cloud-run/test-durations.txt"
