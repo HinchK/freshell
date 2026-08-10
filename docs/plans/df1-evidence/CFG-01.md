@@ -123,6 +123,18 @@ agent=opencode`) timed out server-side with no tab created. **Fallback used:** f
 subagent via `opencode run` CLI (read-only review-agent rules), cwd = the worktree. Findings
 recorded below after it returns.
 
+## Foreign flake encountered (NOT this item, classified + filed)
+
+`cargo test -p freshell-server --bin freshell-server` (full scoped gate, 640 tests): one failure
+— `network::tests::concurrent_configure_and_disable_serialize_to_a_consistent_end_state`
+(`network.rs:2917`, "persisted host desynced from live bind (A-08)"). Classification:
+**pre-existing flake, unrelated to CFG-01** — (1) this item's diff contains ZERO production-code
+changes (all crate edits are inside `#[cfg(test)]`; `git diff 5521f3aba..HEAD --
+crates/freshell-server/src` outside `settings_store.rs`'s test module is empty); (2) the test
+flakes when run SOLO at this HEAD (1-in-5 repro), where zero other tests execute — nothing this
+item added can interfere (identical test + production code as base). Filed as follow-up
+`NET-FLAKY-01` in the df1 queue.
+
 ## Residual gaps / honest limits
 
 - `settings`-internal unknown subkeys: dropped by BOTH servers (typed/`mergeServerSettings`
