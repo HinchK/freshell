@@ -116,9 +116,23 @@ the 3-tier Rust test approach), cargo fmt/clippy pinned toolchain 1.96.0.
   its precedent (`session_lease.rs`, `runtime.ts:NNN`) per repo convention.
 - The fake app-server fixture needs `node` on PATH and the repo's
   `node_modules` (`ws` package) — run `npm ci` once if `node_modules` is absent.
-- Known pre-existing environmental failures (`auto_resume_e2e`, `terminal_tabs`
-  e2e in `freshell-freshagent`): baseline before/after, report
-  "baseline-identical", don't chase.
+- **Measured baseline at plan commit b3df5227f** (load-bearing validation ran
+  every gate + suite; `reports/V5.md`, logs `baseline-*.log` beside it):
+  fmt + workspace clippy + both feature clippy legs CLEAN; `freshell-codex`
+  (real-transport) 199 passed; `freshell-server` 631 passed / 1 ignored;
+  `freshell-platform` 255 passed; **`freshell-ws` 490 passed + 2 pre-existing
+  deterministic failures** in `tests/auto_resume_e2e.rs`
+  (`crashing_agent_is_resumed_twice_then_settles_exited`,
+  `reconcile_after_replacement_attaches_to_the_new_terminal` — both time out
+  waiting for a terminal.created frame; reproduced 2/2). "Baseline-identical"
+  for freshell-ws means: exactly these 2 and only these 2 fail. Do not chase
+  them. `freshell-freshagent` was not baselined (known environmental e2e
+  failures; baseline before/after only if a task must run it).
+- The worktree has NO node_modules of its own: the fixture's `ws` import
+  resolves via the PARENT checkout's `/home/dan/code/freshell/node_modules`
+  (verified working — all fixture-driven tests passed). If that resolution
+  ever breaks, running `npm ci` in the worktree requires the user's approval;
+  record it rather than installing.
 - `docs/index.html`: **N/A** — this is backend process-lifecycle work with no
   user-facing UI change.
 - Do not touch `server/` (Node lane) — see the recorded parity decision below.
@@ -152,13 +166,20 @@ the **Rust lane only**, for these recorded reasons:
    reattach parity (`kata create "Node server: codex pane restore should
    reattach to a surviving sidecar (da92 parity)" --label bug --related da92`).
 
-Scope note within Rust: the second spawn site,
-`freshell-freshagent/src/codex.rs::spawn_sidecar` (fresh-agent/freshcodex
-panes), is deliberately excluded — those sidecars have their own lease/kill
-lifecycle (`session_lease.rs::kill_and_confirm_tree_dead`, killed at shutdown by
-`fresh_codex_state.shutdown()`, `main.rs:1343`) and were not part of either
-incident. Only the terminal-pane path
-(`SpawnedCodexAppServerRuntime::ensure_ready`) changes.
+Scope note within Rust (REVISED after load-bearing validation): the second
+spawn site, `freshell-freshagent/src/codex.rs::spawn_sidecar`
+(fresh-agent/freshcodex panes), remains excluded from THIS plan — but the
+original justification ("not part of either incident") was FALSIFIED:
+validation attributed at least one live orphan (pid 44963, matched to a
+`freshagent.sidecar.spawned` log line) to the freshagent lane, and that lane
+orphans across unclean restarts by the same mechanism (leases are in-memory
+only, kill runs only at graceful shutdown, the 5s force-exit skips Drop) —
+`reports/V2.md`. The recorded decision: keep this plan terminal-pane-only
+(the freshagent lane has its own lease lifecycle needing its own TDD cycle),
+Task 11 files a follow-up kata for freshagent-lane tracking, and the ynfn
+close-out must state that this PR fixes the terminal-pane lane with the
+freshagent lane tracked in the follow-up. Only the terminal-pane path
+(`SpawnedCodexAppServerRuntime::ensure_ready`) changes here.
 
 ## File Structure
 
@@ -179,7 +200,7 @@ incident. Only the terminal-pane path
 | `crates/freshell-codex/src/launch_lifecycle.rs` | persist-on-spawn / scrub-on-teardown in `SpawnedCodexAppServerRuntime`; `kill_on_drop(false)` + `process_group(0)`; `note_session_id` trait seam; plan-aware `CodexRuntimeFactory`; manager shutdown-retention |
 | `crates/freshell-ws/src/codex_proxy_route.rs` | forward captured thread id into the sidecar record (one call beside `mark_candidate_persisted`) |
 | `crates/freshell-server/src/main.rs` | boot: construct store + reconciler, arm reap sweep; shutdown: retention before `registry.kill_all()` |
-| `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs` | adjust expectations: tracked codex sidecars are now intentionally retained at shutdown (recorded), not killed |
+| `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs` | verify unchanged-green (it has NO terminal-pane codex assertions — reports/V4.md); optionally add a terminal-pane retention scenario with a re-scoped descendants assertion |
 
 ## Background for implementers (read before Task 1)
 
@@ -232,13 +253,43 @@ committed fixture can script both sides: `overrides['thread/resume'] = { error:
 `test/integration/server/codex-session-flow.test.ts:674-684`) and
 `loadedThreadIds` for mid-turn detection (`tests-and-persistence.md` §1.5).
 
+**Validated codex behavior (load-bearing validation, `reports/V1.md` — live
+experiment on the deployed 0.147.0 binary + codex-rs source at
+`rust-v0.147.0`):**
+
+- Reattach WORKS: a surviving app-server accepts new WS connections after its
+  client disconnected (including mid-turn), and a new client's `thread/resume`
+  into the SAME process succeeds with the in-flight turn's events streaming to
+  the new client. Client disconnect does NOT abort a running turn.
+- The active-writer lock is a per-thread **file flock** under
+  `CODEX_HOME/thread-writer-locks/` (`writer_lock.rs:63-79`), held per LOADED
+  thread and released on process exit (even SIGKILL). Consequence: killing a
+  verified-unusable survivor releases the lock, so the retry's fresh spawn can
+  resume the thread — the Task 6 fallback is semantically sound, not just
+  structural.
+- **`loaded` ≠ `mid-turn`.** Idle threads stay loaded (and writer-locked)
+  indefinitely, so `thread/loaded/list` non-empty must NOT be read as
+  "mid-turn" — that would convert every unclaimed idle sidecar into a
+  permanent `Retained` row (the ynfn leak relabeled). The correct discriminator
+  is per-thread `thread/read` status (`active` vs idle); Task 9 encodes this.
+- `-32600` is codex's generic invalid-request code (writer collision, missing
+  rollout, config errors all use it) — tests must match on the message
+  ("active writer"), not the code alone. Also: a thread that never ran a turn
+  has no rollout and is un-resumable anywhere (`-32600 "no rollout found"`) —
+  fixture scenarios that script resume success must model threads with ≥1
+  recorded turn.
+
 **Why identity is `(pid, starttime, cmdline)` and not the env tag:**
 `/proc/<pid>/stat` and `/proc/<pid>/cmdline` are world-readable, but
 `/proc/<pid>/environ` requires ptrace access — under YAMA an orphan reparented
 to init is not our descendant, so a restarted server may be UNABLE to read the
 tag of the very sidecars it must verify (`session_lease.rs:162-184` doc
 comment). The env-tag sweep (`reap_owned_codex_sidecars`) remains a best-effort
-supplement only.
+supplement only. (Validation nuance, `reports/V2.md`: on THIS machine same-uid
+environ/fd reads of reparented orphans do work — YAMA is permissive here — but
+keep the identity triple as the primary check for portability; the fd-read
+ability is what makes Task 9's unreachable-sidecar writer-evidence check
+viable.)
 
 **Why sidecars survive today only accidentally:** the spawn is NOT detached —
 `cmd.kill_on_drop(true)`, no `process_group`/`setsid` anywhere in `crates/`
@@ -346,8 +397,12 @@ parent dir; tmp name `{file}.tmp-{pid}-{millis}` per `pane_ledger.rs:983-1000`)
 - [ ] **Step 3: Implement** `sidecar_store.rs` per the interface above.
   `new_locked` follows `PaneLedger::new_locked`: `flock(LOCK_EX|LOCK_NB)` via
   `libc` on `<root>/lock`; on failure log a structured `tracing::error!` and
-  come up disabled (`root: None` ⇒ every write `Ok(())` no-op). Keep the file
-  <1,000 lines.
+  come up disabled (`root: None` ⇒ every write `Ok(())` no-op). Open the lock
+  file via `std::fs::File` (O_CLOEXEC by default) and KEEP it that way — a
+  leaked lock fd inherited by a detached, retained sidecar (Task 3 removes
+  kill_on_drop) would hold the flock after the server dies and silently
+  disable the store for every future generation (reports/V6.md NA-3; add a
+  comment pinning this). Keep the file <1,000 lines.
 - [ ] **Step 4: Verify green:**
   `cargo test -p freshell-codex --features real-transport sidecar_store`
 - [ ] **Step 5: Gates:** `cargo fmt --all --check` and
@@ -661,19 +716,36 @@ EOF
 **Interfaces produced:**
 
 ```rust
-pub struct SidecarReconciler { store: Arc<CodexSidecarStore>,
-                               unclaimed: Mutex<HashMap<String /*session_id*/, CodexSidecarRecord>> }
+pub struct SidecarReconciler {
+    store: Arc<CodexSidecarStore>,
+    /// ALL held records, keyed by ownership_id — NOT by session id. Two live
+    /// records can legitimately share a session id (a mid-turn survivor
+    /// retained at sweep + a later fresh spawn enriched with the same session;
+    /// validated reachable — reports/V3.md), and Verified-without-session /
+    /// Unverifiable records must also be held for the sweep. Keying by
+    /// session_id would silently drop records (a fifth-fate ynfn violation).
+    held: Mutex<HashMap<String /*ownership_id*/, CodexSidecarRecord>>,
+    /// Secondary index for restore-time claims.
+    by_session: Mutex<HashMap<String /*session_id*/, Vec<String /*ownership_id*/>>>,
+}
 
 impl SidecarReconciler {
     /// Boot: load_all(); prune records whose identity verdict is Dead
     /// (remove) or Mismatch (remove — the pid is NOT ours, never signal);
-    /// keep Verified records with a session_id as claimable; Verified records
-    /// WITHOUT a session_id and Unverifiable records are held for the sweep
-    /// (Task 9) — they are never claimable. Returns a summary for boot logs.
+    /// hold every remaining record by ownership_id (Verified with session =
+    /// claimable via the index; Verified without session and Unverifiable =
+    /// held for the sweep only). Returns a summary for boot logs.
     pub fn boot_reconcile(store: Arc<CodexSidecarStore>) -> (Self, BootReconcileReport);
 
-    /// Restore-time claim: remove and return the record for this session,
-    /// re-verifying identity at claim time. Each record is claimable ONCE.
+    /// Restore-time claim: re-verify identity at claim time and return ONE
+    /// record for this session. With duplicates, pick the WRITER: prefer the
+    /// candidate whose live sidecar reports this session in
+    /// thread/loaded/list (a bounded probe), else newest updated_at. Losers
+    /// STAY held (they keep their sweep fate — never silently dropped).
+    /// Retained-state records ARE claimable (re-verified; adopt flips them
+    /// back to Active) — a late restore after the sweep must still reattach
+    /// a mid-turn survivor instead of reproducing the -32600 (reports/V3.md).
+    /// Only the returned record leaves `held`; each record is claimable ONCE.
     pub fn claim_for_session(&self, session_id: &str) -> Option<CodexSidecarRecord>;
 
     pub fn unclaimed_len(&self) -> usize;
@@ -689,10 +761,17 @@ pub fn codex_sidecar_reconciler() -> Option<Arc<SidecarReconciler>>;   // RwLock
     (dead pid / live-`sleep`-child pid with wrong cmdline / verified child):
     after boot, store holds only the verified one, `unclaimed_len() == 1`,
     nothing was signalled (children still alive).
+  - `boot_reconcile_holds_sessionless_records_for_the_sweep` — a verified
+    record WITHOUT a session_id: held (`unclaimed_len()` counts it), not
+    claimable by any session, not dropped.
   - `claim_for_session_returns_each_record_once` — two claims for one
     session: first `Some`, second `None`.
   - `claim_reverifies_identity_at_claim_time` — kill the test's own child
     between boot and claim → claim returns `None` and the record is removed.
+  - `duplicate_session_records_claim_one_keep_the_loser_held` — two verified
+    records sharing one session id (two live test children): claim returns
+    one, the OTHER remains held for the sweep (`unclaimed_len() == 1` after
+    the claim), and both children are still alive (nothing signalled).
 - [ ] **Step 2: Verify red:**
   `cargo test -p freshell-codex --features real-transport sidecar_reconcile`
 - [ ] **Step 3: Implement** per the interface. Removal on prune uses
@@ -748,18 +827,37 @@ pub struct ReattachedCodexAppServerRuntime {
     signal is ever sent** (this pid is not provably ours).
   - `Dead` → `store.remove(...)`, `Err`.
   - `Verified` but probe failed (dead port / handshake failure) → the
-    survivor is unusable: re-verify then `libc::kill(record.pid, SIGTERM)`,
-    poll-gone (the `wait_pid_gone` shape, 20×25ms), best-effort
-    `reap_owned_codex_sidecars(&record.ownership_id)`, `store.remove(...)`,
-    `Err`. (Spec: "Fall back … when … the surviving one is unusable (dead
-    port, identity mismatch, handshake failure)"; an unusable tracked sidecar
-    must not leak.)
+    survivor is unusable: `kill_verified_sidecar_tree(&record)` (below),
+    `store.remove(...)`, `Err`. (Spec: "Fall back … when … the surviving one
+    is unusable (dead port, identity mismatch, handshake failure)"; an
+    unusable tracked sidecar must not leak. Killing it releases codex's
+    per-thread writer-lock files on exit, so the retry's fresh spawn can
+    resume the thread — validated, reports/V1.md.)
 - `update_ownership_metadata` / `note_session_id`: rewrite the record (new
   terminal id, updated_at).
-- `shutdown()`: pane closed or plan raced shutdown — kill ONLY after
-  re-verification (`Verified` fresh at kill time), then poll-gone + best-effort
-  tag reap + `store.remove`. `Mismatch`/`Dead`/`Unverifiable` ⇒ remove record
-  only.
+- `shutdown()`: pane closed or plan raced shutdown —
+  `kill_verified_sidecar_tree(&record)` + `store.remove`.
+  `Mismatch`/`Dead`/`Unverifiable` ⇒ remove record only.
+
+**Shared tree-aware kill helper** (introduced here, reused by Task 9's sweep).
+A3 was FALSIFIED (reports/V2.md): sidecars are process TREES (14 of the 24
+live orphans have live children right now, e.g. `codex-code-mode-host`),
+children live in their OWN pgids/sessions (so neither single-pid signalling
+nor a pgid group-kill covers them), codex's SIGTERM handler is a graceful
+drain, and SIGKILL provably orphans its children (no PDEATHSIG; cleanup is
+userspace-only). "Reaped" must mean the whole tree is gone:
+
+```rust
+/// Re-verify (pid, starttime, cmdline); capture the pid's live descendant
+/// set from /proc (children recursively, each snapshotted with its own
+/// (pid, starttime, cmdline) so nothing is ever signalled on a stale pid);
+/// SIGTERM the root; poll-gone with a drain-tolerant budget (5s, not 500ms —
+/// codex drains gracefully); SIGKILL the root once if needed; then SIGTERM →
+/// poll → SIGKILL each captured descendant that survived, re-verified by its
+/// snapshot immediately before each signal. Returns what happened per pid.
+/// Never signals anything whose snapshot no longer matches.
+pub fn kill_verified_sidecar_tree(record: &CodexSidecarRecord) -> KillTreeOutcome;
+```
 
 `plan_create`'s existing cleanup-on-plan-failure (`:290-298` calls
 `sidecar.shutdown()` on `ensure_ready` error) composes with this: a failed
@@ -954,9 +1052,11 @@ binary owns process env (`CODEX_CMD`, `FAKE_CODEX_APP_SERVER_BEHAVIOR`,
     has an active writer"}}}}` (the scripted rejection the fixture already
     supports, `tests-and-persistence.md` §1.6 Route A); create the pane, dial
     the proxy as the TUI, send `thread/resume` → assert the `-32600` error
-    frame comes back (the incident's failure mode, now confined to the
-    no-survivor path; the reattach test above proves the same resume SUCCEEDS
-    when a survivor exists).
+    frame comes back AND its message contains "active writer" (codex uses
+    -32600 generically for many rejections — reports/V1.md; the code alone
+    is not the incident signature). (The incident's failure mode, now
+    confined to the no-survivor path; the reattach test above proves the
+    same resume SUCCEEDS when a survivor exists.)
   - Cleanup in every scenario: kill ONLY the pids the test spawned (survivor
     fixture child; `registry.kill(&terminal_id)` for panes), matching the
     existing suites.
@@ -1006,53 +1106,82 @@ pub const FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS_ENV: &str = "FRESHELL_CODEX_SIDEC
 pub const CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT: u64 = 30 * 60 * 1000; // incident gap was 18 min
 
 #[derive(Debug, PartialEq)]
-pub enum SweepOutcome { Reaped, RetainedMidTurn, RecordRemovedStale, RetainedUnverifiable }
+pub enum SweepOutcome { Reaped, RetainedMidTurn, RetainedWriterHeld, RecordRemovedStale, RetainedUnverifiable }
 
 impl SidecarReconciler {
-    /// For every still-unclaimed record: re-verify identity, then
+    /// For every still-held, unclaimed record: re-verify identity, then
     ///   Dead / Mismatch      -> remove record, NEVER signal        (RecordRemovedStale)
     ///   Unverifiable         -> retain, state = Retained{reason:"identity-unverifiable"}
-    ///   Verified + ws probe:
-    ///     thread/loaded/list non-empty -> retain, Retained{reason:"mid-turn-active-thread"}
-    ///     empty / unreachable          -> re-verify, SIGTERM pid, poll-gone,
-    ///                                     SIGKILL once if needed, best-effort
-    ///                                     reap_owned_codex_sidecars(tag), remove record
-    /// Every decision logged with ownership id + verdict + outcome.
+    ///   Verified + ws probe (initialize -> thread/loaded/list -> thread/read
+    ///   per loaded thread; `loaded` alone does NOT mean mid-turn — idle
+    ///   threads stay loaded forever, reports/V1.md):
+    ///     any thread/read status ACTIVE -> retain, Retained{reason:"mid-turn-active-thread"}
+    ///     reachable, no active thread   -> kill_verified_sidecar_tree, remove record (Reaped)
+    ///     ws UNREACHABLE                -> /proc/<pid>/fd writer-evidence check
+    ///                                      (open rollout .jsonl write handle or
+    ///                                      thread-writer-locks/ file — readable
+    ///                                      same-uid on this host, reports/V2.md):
+    ///        evidence held  -> retain, Retained{reason:"ws-unreachable-writer-held"}
+    ///        no evidence    -> kill_verified_sidecar_tree, remove record (Reaped)
+    /// Sweep CONSUMES only Reaped/RecordRemovedStale entries from `held`;
+    /// every Retained row STAYS held and claimable (a late restore must still
+    /// reattach a mid-turn survivor — reports/V3.md), and is re-evaluated at
+    /// next boot. Every decision logged with ownership id + verdict + outcome.
     pub async fn sweep_unclaimed(&self) -> Vec<(String, SweepOutcome)>;
 }
 ```
 
 The mid-turn probe reuses the crate's own client
 (`CodexAppServerClient` over `WsTransport`, already `real-transport`):
-connect → `initialize`/`initialized` → `thread/loaded/list` (the fixture
-implements it and its `loadedThreadIds` knob scripts the answer,
-`tests-and-persistence.md` §1.3/§1.5). Kill mechanics follow the
-`kill_and_confirm_tree_dead` escalation shape (`session_lease.rs:100-128`)
-scoped to the single recorded pid + the tag sweep supplement,
+connect → `initialize`/`initialized` → `thread/loaded/list` → `thread/read`
+per loaded thread, discriminating on its status (`active` vs idle). The
+fixture implements `thread/loaded/list` (`loadedThreadIds` knob,
+`tests-and-persistence.md` §1.3/§1.5); EXTEND it with a scriptable
+`thread/read` status knob (e.g. `threadStatuses: {"<id>": "active"|"idle"}`)
+if not already present — the fixture is repo-owned. Kill mechanics use
+Task 6's `kill_verified_sidecar_tree` (tree-aware — A3 falsified, sidecars
+have children in their own pgids) plus the tag sweep supplement,
 `reap_owned_codex_sidecars(ownership_id)` (`transport.rs:86-121`, quoted:
 "we only signal processes carrying OUR unique tag").
 
 - [ ] **Step 1: Write the failing tests** (all pids test-spawned):
   - `sweep_reaps_verified_idle_unclaimed_sidecar` — fixture with
-    `{"loadedThreadIds": []}` + verified record, unclaimed → after
-    `sweep_unclaimed`: pid gone, record removed, outcome `Reaped`.
+    `{"loadedThreadIds": ["t-1"], "threadStatuses": {"t-1": "idle"}}` +
+    verified record, unclaimed → after `sweep_unclaimed`: pid gone (whole
+    tree), record removed, outcome `Reaped`. (Deliberately loaded-but-idle:
+    pins the `loaded ≠ mid-turn` discriminator, reports/V1.md.)
   - `sweep_retains_mid_turn_sidecar_with_recorded_reason` — fixture with
-    `{"loadedThreadIds": ["t-1"]}` → pid ALIVE, record present with
+    `{"loadedThreadIds": ["t-1"], "threadStatuses": {"t-1": "active"}}` →
+    pid ALIVE, record present with
     `state == Retained{reason:"mid-turn-active-thread"}` (spec: "A sidecar
     mid-turn must end up reattached, not killed and not leaked" — unclaimed
-    mid-turn ⇒ retained + recorded, re-evaluated at next boot).
+    mid-turn ⇒ retained + recorded, STILL claimable, re-evaluated at next
+    boot).
+  - `late_restore_after_sweep_reattaches_mid_turn_survivor` — after the
+    sweep retained the mid-turn fixture above, `claim_for_session` for its
+    session STILL returns the record (re-verified) — a late restore
+    reattaches instead of fresh-spawning into the `-32600` (A5 fix,
+    reports/V3.md).
   - `sweep_never_touches_unverified_pids` — record naming a live
     test-`sleep` pid with mismatched cmdline → `RecordRemovedStale`, sleep
     child still alive.
+  - `kill_verified_sidecar_tree_reaps_descendants` (unit-level, own
+    processes only) — spawn a small tree the test owns (e.g. `bash -c
+    'sleep 300 & sleep 300 & wait'`), build a verified record for the root,
+    kill via the helper → root AND both children gone; and the negative:
+    a snapshot-mismatched descendant is never signalled.
   - `restart_reconciliation_leaves_no_sidecar_silently_orphaned` — **the
-    invariant test.** Seed four records: (a) claimable verified survivor,
-    (b) dead pid, (c) verified idle, (d) verified mid-turn. Run
-    `boot_reconcile` → `claim_for_session` for (a) →
-    `sweep_unclaimed`. Assert the exhaustive end-state: (a) claimed
-    (reattached-by-construction), (b) removed at boot, (c) reaped, (d)
-    retained with recorded reason — and `store.load_all()` contains ONLY (a)'s
-    active record and (d)'s retained record. Every sidecar is accounted for:
-    reattached, reaped, or intentionally retained with a recorded reason.
+    invariant test.** Seed five records: (a) claimable verified survivor,
+    (b) dead pid, (c) verified idle, (d) verified mid-turn, (e) a DUPLICATE
+    verified record sharing (a)'s session id (the A4 shape, reports/V3.md).
+    Run `boot_reconcile` → `claim_for_session` for (a)'s session →
+    `sweep_unclaimed`. Assert the exhaustive end-state: one of {(a),(e)}
+    claimed (reattached-by-construction), (b) removed at boot, (c) reaped,
+    (d) retained with recorded reason, and the claim LOSER of {(a),(e)}
+    swept to its own fate (reaped here — idle) — `store.load_all()` contains
+    ONLY the claimed Active record and (d)'s retained record. Every sidecar
+    is accounted for: reattached, reaped, or intentionally retained with a
+    recorded reason — never silently dropped from the books.
 - [ ] **Step 2: Verify red:**
   `cargo test -p freshell-codex --features real-transport sweep_`
 - [ ] **Step 3: Implement.** (Optional extra isolation: these tests signal only
@@ -1069,11 +1198,15 @@ git commit -m "$(cat <<'EOF'
 feat(codex): conservative reap sweep — tracked, verified, never mid-turn (ynfn)
 
 sweep_unclaimed reaps only sidecars freshell recorded AND re-verified by
-(pid, starttime, cmdline) at kill time; mid-turn survivors (thread/loaded/list
-non-empty) are retained with a recorded reason; mismatched/unverifiable pids
-are never signalled. Invariant encoded in
+(pid, starttime, cmdline) at kill time, tree-aware (descendants snapshotted
+and verified before any signal); mid-turn survivors (thread/read status
+active — loaded alone is NOT mid-turn) are retained with a recorded reason
+and stay claimable by late restores; unreachable-but-writer-holding survivors
+are retained, not killed; mismatched/unverifiable pids are never signalled.
+Invariant encoded in
 restart_reconciliation_leaves_no_sidecar_silently_orphaned: every tracked
-sidecar ends reattached, reaped, or retained-with-reason.
+sidecar (including session-id duplicates) ends reattached, reaped, or
+retained-with-reason.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -1134,6 +1267,19 @@ proxy may hold the candidate timer); adopted entries get proxy-close +
   `set_codex_sidecar_reconciler(...)`, then
   `tokio::spawn` the grace-delayed sweep
   (`sleep(reap_grace_from_env()).await; reconciler.sweep_unclaimed().await;`).
+- **Disablement must be LOUD** (A10 validation, reports/V6.md: the restart
+  script provably waits for old-process exit, so contention is not expected on
+  the normal path — but a same-HOME scratch server on another port, e.g. the
+  evidenced `--port 3499` runs, would silently disable the store with no
+  timing race at all): when `!store.is_enabled()`, emit a dedicated
+  `tracing::error!` at boot and carry `codex_sidecar_store_enabled: bool` in
+  the logged reconcile report so a disabled generation is diagnosable from
+  logs alone.
+- Supervisor caveat (recorded, no code): the in-repo systemd unit is NOT
+  installed today (restarts are script-driven). If it is ever adopted, its
+  KillMode must not be `control-group` — cgroup kill would slaughter the
+  retained sidecars that this task deliberately keeps alive
+  (`process_group(0)` detaches the pgid, not the cgroup). reports/V6.md NA-1.
 - Shutdown (`main.rs:1663-1722`): insert
   `freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global().begin_shutdown_retention();`
   immediately BEFORE `registry.kill_all();` (`:1329`), and leave the existing
@@ -1160,14 +1306,25 @@ proxy may hold the candidate timer); adopted entries get proxy-close +
 - [ ] **Step 4: Reconcile SAFE-11.** Run
   `cargo test -p freshell-server --test safe11_term22_shutdown_reaping`
   (black-box: spawns the built binary on an ephemeral port — NEVER 3001 — and
-  drives real `/ws` frames). Where it asserts codex terminal-pane sidecars die
-  at shutdown, update the expectation: a tracked codex sidecar is now
-  intentionally retained with a recorded store row — assert the RECORD exists
-  with `Retained{reason:"server-shutdown"}` and reap the pid from the test
-  (verified, test-owned `FRESHELL_HOME`). Document the deviation in the test
-  with the kata-ynfn rationale ("killing sidecars at shutdown is NOT
-  acceptable — surviving restarts is a feature"); shell-PTY reaping assertions
-  must remain untouched.
+  drives real `/ws` frames). VALIDATED (reports/V4.md): the test contains NO
+  terminal-pane codex sidecar assertions — its codex coverage is a
+  freshagent-lane sidecar (`freshAgent.create {sessionType:"freshcodex"}`)
+  plus a shell PTY, both outside this plan's retention. Expectation:
+  **the suite passes UNCHANGED** (it now doubles as a tripwire that retention
+  did not leak into the freshagent lane or shell-PTY reaping). If it is
+  cheap, ADD a terminal-pane codex retention scenario: create a codex
+  terminal pane, graceful shutdown, assert the sidecar pid is ALIVE and the
+  store row (test-owned `FRESHELL_HOME`) reads
+  `Retained{reason:"server-shutdown"}`, then reap the pid from the test
+  (verified) — and re-scope the test's generic "no live descendants"
+  assertion to exclude the intentionally retained pid. Record the documentary
+  deviation: the parity checklist's acceptance text "terminate exact
+  terminal/provider/extension trees"
+  (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:615`) is
+  deliberately inverted for tracked codex terminal-pane sidecars (kata ynfn:
+  "killing sidecars at shutdown is NOT acceptable — surviving restarts is a
+  feature") — one bullet in the test header comment and in the PR description
+  (Task 11).
 - [ ] **Step 5: Green:** `cargo test -p freshell-codex --features
   real-transport` + `cargo test -p freshell-server`; fmt + workspace clippy +
   both feature clippy legs.
@@ -1227,10 +1384,18 @@ in files this plan already touched.
   `~/.freshell/codex-sidecars/` (Node's dir) —
   `grep -rn "codex-sidecars" crates/` must show only the `rust-codex-sidecars`
   literal and comments.
-- [ ] **Step 4: Record the parity follow-up.** Add the Node-parity decision
-  (verbatim from this plan's "Recorded decision" section) to the eventual PR
-  description, and file the follow-up kata:
-  `kata create "Node server: codex pane restore should reattach to a surviving sidecar (da92 parity)" --label bug --related da92 --agent --body "<summary + pointer to this plan's decision section>"`.
+- [ ] **Step 4: Record the follow-ups and deviations.** Add to the eventual PR
+  description: the Node-parity decision (verbatim from this plan's "Recorded
+  decision" section), the freshagent-lane scope decision (revised scope note;
+  the orphan cohort is NOT all terminal-pane — reports/V2.md), and the SAFE-11
+  documentary deviation (Task 10 Step 4). File BOTH follow-up katas:
+  `kata create "Node server: codex pane restore should reattach to a surviving sidecar (da92 parity)" --label bug --related da92 --agent --body "<summary + pointer to this plan's decision section>"`
+  and
+  `kata create "freshagent-lane codex sidecars orphan across unclean restarts (ynfn residue)" --label bug --related ynfn --agent --body "<summary: in-memory leases, graceful-kill-only, 5s force-exit skips Drop; evidence pid 44963 in reports/V2.md; extend rust-codex-sidecars tracking or lease persistence>"`.
+  Known minor limitation to note in the PR (hub-side, out of scope): a
+  reattached mid-turn pane's FIRST turn completion lands in the status hub's
+  Idle arm, so its completion chime may not fire once
+  (`codex_proxy_route.rs:419-423`, reports/V4.md).
   `docs/index.html`: N/A (backend lifecycle work; no user-facing UI change).
 - [ ] **Step 5: Commit (only if fixes were needed)** — same trailer convention:
 
@@ -1256,8 +1421,8 @@ EOF
 | Reattach on restore when alive + usable, incl. mid-turn, in-flight turn intact | 5, 6, 7, 8 | `reattach_ensure_ready_returns_the_existing_listener`, `select_codex_runtime_prefers_a_claimable_survivor`, `restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn` (mid-turn `loadedThreadIds` fixture, resume served by the SURVIVOR) |
 | Fallback to fresh spawn (dead port / identity mismatch / handshake failure) | 6, 7, 8 | `reattach_reaps_verified_but_unusable_survivor`, `plan_retry_falls_back_to_fresh_spawn_after_reattach_failure`, `restore_falls_back_to_fresh_sidecar_without_tracked_survivor` |
 | Reap tracked-but-unclaimed ONLY after provable identity verification, never by name pattern; never touch non-freshell codex processes | 2, 9 | `sweep_never_touches_unverified_pids`, `sweep_reaps_verified_idle_unclaimed_sidecar`; new tracking starts EMPTY ⇒ the ~20 live orphans (incl. PID 545173) are structurally out of reach |
-| Mid-turn ⇒ reattached, not killed, not leaked | 8, 9 | reattach e2e (claimed) + `sweep_retains_mid_turn_sidecar_with_recorded_reason` (unclaimed ⇒ retained with reason) |
-| Invariant: after restart every freshell-spawned sidecar is reattached / reaped / intentionally-retained-with-reason — never silently orphaned | 9 | `restart_reconciliation_leaves_no_sidecar_silently_orphaned` (exhaustive four-fate end-state assertion) |
+| Mid-turn ⇒ reattached, not killed, not leaked | 8, 9 | reattach e2e (claimed) + `sweep_retains_mid_turn_sidecar_with_recorded_reason` (unclaimed ⇒ retained with reason, still claimable) + `late_restore_after_sweep_reattaches_mid_turn_survivor` |
+| Invariant: after restart every freshell-spawned sidecar is reattached / reaped / intentionally-retained-with-reason — never silently orphaned | 9 | `restart_reconciliation_leaves_no_sidecar_silently_orphaned` (exhaustive five-record end-state assertion, incl. the duplicate-session claim loser) |
 | Sidecars survive restarts (ynfn: shutdown kills are unacceptable) | 3, 10 | `spawned_sidecar_survives_runtime_drop_without_shutdown`, `shutdown_retention_retains_adopted_sidecars_and_records_reason`, SAFE-11 adjustment with recorded rationale |
 | da92 incident shape (`-32600` active-writer) encoded with the existing fixture | 8 | `active_writer_collision_surfaces_minus32600_only_on_the_fresh_path` (fixture Route A override) |
 | Node parity decision recorded, not silent | header + 11 | "Recorded decision" section; PR description + follow-up kata step |
@@ -1322,3 +1487,52 @@ Checks performed on the draft before finalizing, and fixes applied:
   honored — the plan never reads or writes Node's `~/.freshell/codex-sidecars/`)
   plus Task 11 Step 4 carries it into the PR description and a follow-up kata,
   satisfying "do not let the Node side rot silently without a decision".
+
+## Load-bearing validation pass (post-planning; ledger + evidence in `.worktrees/.the-usual-logs/codex-sidecar-lifecycle/`)
+
+Ten load-bearing assumptions were surfaced and validated (finder → strategist
+→ 6 parallel validators; full evidence in `reports/finder.md`,
+`reports/strategist.md`, `reports/V1.md`–`V6.md`, ledger in
+`load-bearing-ledger.md`). Plan changes applied from the verdicts:
+
+- **VERIFIED — reattach works** (V1, live experiment on the deployed 0.147.0
+  binary): new-client `thread/resume` into a surviving mid-turn app-server
+  succeeds and streams the in-flight turn; disconnect doesn't abort turns;
+  writer lock is a per-thread file flock released on process death. Recorded
+  in Background ("Validated codex behavior").
+- **FALSIFIED — `loaded` ≠ `mid-turn`** (V1): Task 9's discriminator changed
+  to per-thread `thread/read` status, with a `/proc/<pid>/fd` writer-evidence
+  arm for unreachable survivors; fixture gains a `threadStatuses` knob.
+- **FALSIFIED — single-pid kill** (V2): sidecars are process trees (children
+  in their own pgids; SIGKILL orphans them). Task 6 introduces
+  `kill_verified_sidecar_tree` (snapshot-verified, drain-tolerant, tree-wide);
+  Task 9 reuses it; "Reaped" now means the whole tree is gone.
+- **FALSIFIED — one-record-per-session** (V3): reconciler re-keyed by
+  ownership_id with a session index; writer-aware deterministic claim;
+  losers keep sweep fates; invariant test seeds the duplicate case.
+- **FALSIFIED — restores-arrive-in-grace-window** (V3): Retained rows stay
+  claimable after the sweep; `late_restore_after_sweep_reattaches_mid_turn_survivor`
+  pins it.
+- **FALSIFIED — orphans are all terminal-pane-lane** (V2): scope note revised;
+  freshagent-lane follow-up kata added to Task 11; ynfn close-out wording
+  updated.
+- **FALSIFIED (favorably) — SAFE-11 "adjust expectations"** (V4): the test has
+  no terminal-pane codex assertions; Task 10 Step 4 rewritten to
+  verify-unchanged + optional added retention scenario + recorded documentary
+  deviation.
+- **FALSIFIED — clean baseline** (V5): measured baseline recorded in Global
+  Constraints (freshell-ws has exactly 2 pre-existing deterministic failures;
+  node_modules resolves from the parent checkout).
+- **VERIFIED — proxy needs zero changes** (V4) and **restart choreography
+  releases the flock** (V6), with recorded hardening: loud store-disablement,
+  O_CLOEXEC lock fd, systemd KillMode caveat.
+
+Self-review re-run over every edited task against (a) failing-test-first
+ordering (new/changed tests remain Step-1 items with red verification),
+(b) paths/symbols grounded (all new claims cite validator reports with
+file:line evidence), (c) invariant coverage (five fates incl. duplicate
+loser; retained rows claimable), (d) process-safety (tree kills are
+snapshot-verified per pid; nothing signals unverified pids; the ~20 live
+orphans remain structurally unreachable — the store starts empty),
+(e) scope decisions recorded (Node parity + freshagent lane + SAFE-11
+deviation all carried into Task 11/PR description).
