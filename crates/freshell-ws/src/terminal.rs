@@ -60,7 +60,7 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, Shell, TerminalAttach, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord, TerminalResize,
+    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
