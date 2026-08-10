@@ -584,6 +584,126 @@ mod tests {
     }
 
     #[test]
+    fn scan_warns_with_legacys_two_log_lines_for_the_two_failure_classes() {
+        // EXT-01 diagnostics parity: legacy logs 'invalid JSON in manifest'
+        // for unparseable text and 'invalid manifest' (+ issues) for schema
+        // failures — warn and skip, never crash discovery. Assert BOTH lines
+        // actually fire (absence from the registry alone was also true of the
+        // old lenient port).
+        //
+        // Capture strategy (matching freshell-freshagent's documented
+        // investigation): a set_global_default subscriber installed EXACTLY
+        // ONCE per test binary via OnceLock. Thread-local set_default proved
+        // nondeterministic under parallel `cargo test` (callsite interest
+        // caching); the global layer observes every event, and this test
+        // filters by its unique temp manifest_path.
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Level, Subscriber};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        struct Captured {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+        #[derive(Default)]
+        struct V {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+        impl Visit for V {
+            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                let r = format!("{v:?}");
+                if f.name() == "message" {
+                    self.message = r;
+                } else {
+                    self.fields.insert(f.name().into(), r);
+                }
+            }
+            fn record_str(&mut self, f: &Field, v: &str) {
+                if f.name() == "message" {
+                    self.message = v.into();
+                } else {
+                    self.fields.insert(f.name().into(), v.into());
+                }
+            }
+        }
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<Captured>>>,
+        }
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() != Level::WARN {
+                    return;
+                }
+                let mut v = V::default();
+                event.record(&mut v);
+                self.events.lock().expect("capture lock").push(Captured {
+                    message: v.message,
+                    fields: v.fields,
+                });
+            }
+        }
+
+        static GLOBAL_EVENTS: OnceLock<Arc<Mutex<Vec<Captured>>>> = OnceLock::new();
+        let events = GLOBAL_EVENTS.get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            // Ignore the error case: some OTHER test installed a global
+            // subscriber first — then this assertion would fail noisily
+            // below, but no freshell-server test does that today.
+            let _ =
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer));
+            events
+        });
+
+        let root = tmp();
+        let bad_json = root.join("bad-json");
+        std::fs::create_dir_all(&bad_json).unwrap();
+        std::fs::write(bad_json.join(MANIFEST_FILE), "{ nope").unwrap();
+        write_manifest(
+            &root,
+            "bad-schema",
+            r#"{ "name": "x", "version": "1", "label": "l", "description": "d", "category": "cli" }"#,
+        );
+        write_manifest(&root, "claude-code", CLAUDE_MANIFEST);
+
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert_eq!(reg.discovered_cli_names(), vec!["claude"]);
+
+        let root_marker = root.display().to_string();
+        let mine: Vec<String> = events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|e| {
+                e.fields
+                    .get("manifest_path")
+                    .is_some_and(|p| p.contains(&root_marker))
+            })
+            .map(|e| e.message.clone())
+            .collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "one warn per rejected manifest, got {mine:?}"
+        );
+        assert!(
+            mine.iter().any(|m| m.contains("invalid JSON in manifest")),
+            "JSON-parse warn line present: {mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|m| m.contains("invalid manifest") && !m.contains("invalid JSON")),
+            "schema-invalid warn line present: {mine:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn scan_discovers_cli_manifests_and_dedups_first_wins() {
         let root = tmp();
         write_manifest(&root, "claude-code", CLAUDE_MANIFEST);

@@ -18,138 +18,11 @@
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
+use crate::issue::{IssueCode, ManifestError, ManifestIssue, PathSeg};
 use crate::manifest::{
     Category, CliConfig, ClientConfig, ContentSchemaField, DefaultValue, ExtensionManifest,
     FieldType, PickerConfig, PreferredRenderer, ScrollInputPolicy, ServerConfig, TerminalBehavior,
 };
-
-// ──────────────────────────────────────────────────────────────
-// Issue model (zod-parity)
-// ──────────────────────────────────────────────────────────────
-
-/// One path segment — object key or array index (the zod `PropertyKey` subset
-/// reachable from JSON).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathSeg {
-    Key(String),
-    Index(u32),
-}
-
-impl serde::Serialize for PathSeg {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            PathSeg::Key(k) => k.serialize(s),
-            PathSeg::Index(i) => i.serialize(s),
-        }
-    }
-}
-
-impl std::fmt::Display for PathSeg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PathSeg::Key(k) => write!(f, "{k}"),
-            PathSeg::Index(i) => write!(f, "{i}"),
-        }
-    }
-}
-
-/// zod 4.3.6 issue codes reachable from this schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IssueCode {
-    InvalidType,
-    TooSmall,
-    TooBig,
-    InvalidValue,
-    UnrecognizedKeys,
-    InvalidUnion,
-    Custom,
-}
-
-impl IssueCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            IssueCode::InvalidType => "invalid_type",
-            IssueCode::TooSmall => "too_small",
-            IssueCode::TooBig => "too_big",
-            IssueCode::InvalidValue => "invalid_value",
-            IssueCode::UnrecognizedKeys => "unrecognized_keys",
-            IssueCode::InvalidUnion => "invalid_union",
-            IssueCode::Custom => "custom",
-        }
-    }
-
-    /// DC-4.2: codes whose presence in a refined schema's subtree suppresses
-    /// that refine. Aborting: the base-parse failures (invalid_type,
-    /// invalid_value, invalid_union, unrecognized_keys). NON-aborting: the
-    /// accumulate-only check codes (too_small, too_big) AND custom (a
-    /// refine's own output never gates other refines — pinned by the
-    /// `both-refine-levels-fire-deeper-first` oracle row).
-    fn is_aborting(self) -> bool {
-        !matches!(
-            self,
-            IssueCode::TooSmall | IssueCode::TooBig | IssueCode::Custom
-        )
-    }
-}
-
-impl serde::Serialize for IssueCode {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-/// A flattened zod issue: `(code, path, message)` where `message` byte-
-/// matches zod 4.3.6's text.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ManifestIssue {
-    pub code: IssueCode,
-    pub path: Vec<PathSeg>,
-    pub message: String,
-}
-
-impl std::fmt::Display for ManifestIssue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}", self.code.as_str())?;
-        if !self.path.is_empty() {
-            write!(f, " ")?;
-            for (i, seg) in self.path.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ".")?;
-                }
-                write!(f, "{seg}")?;
-            }
-        }
-        write!(f, "] {}", self.message)
-    }
-}
-
-/// The two rejection classes, mirroring `extension-manager.ts`'s two scan log
-/// lines: `InvalidJson` for 'invalid JSON in manifest' (the file text is not
-/// JSON at all — legacy logs the `JSON.parse` error), `Invalid` for
-/// 'invalid manifest' (parsed JSON failed the schema — carries the zod-parity
-/// issue list legacy passes through `result.error.format()`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManifestError {
-    InvalidJson(String),
-    Invalid(Vec<ManifestIssue>),
-}
-
-impl std::fmt::Display for ManifestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ManifestError::InvalidJson(e) => write!(f, "invalid JSON in manifest: {e}"),
-            ManifestError::Invalid(issues) => {
-                write!(f, "invalid manifest ({} issue(s)):", issues.len())?;
-                for i in issues {
-                    write!(f, " {i};")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl std::error::Error for ManifestError {}
 
 /// Parse+validate manifest file TEXT — the full legacy flow
 /// (`JSON.parse(raw)` → `ExtensionManifestSchema.safeParse(json)`) in one
@@ -191,6 +64,49 @@ const MSG_CATEGORY_BLOCK: &str = "category must have exactly its own config bloc
 /// JS-safe-int bounds from zod-4 `.int()` (Number.MAX_SAFE_INTEGER).
 const SAFE_INT_MIN_F: f64 = -9007199254740991.0;
 const SAFE_INT_MAX_F: f64 = 9007199254740991.0;
+
+// ── JS object enumeration semantics (verified against zod 4.3.6 behavior) ──
+//
+// Two JS object-key behaviors are observable in zod's output and must be
+// reproduced when validating `serde_json::Value` objects:
+//
+// 1. **JS own-key enumeration order** (`for…in` / `Reflect.ownKeys` over the
+//    plain objects `JSON.parse` produces): canonical array-index keys FIRST in
+//    ascending numeric order, then the remaining string keys in insertion
+//    order. Affects the `unrecognized_keys` message member order and the
+//    iteration/output order of records (contentSchema, env,
+//    permissionModeValues).
+// 2. **`__proto__` is silently skipped in `z.record(...)` values**
+//    (`$ZodRecord` explicitly continues on it) but NOT in strict objects
+//    (there it surfaces as a normal `unrecognized_keys` member). Skipping
+//    means: never validated, never kept in output.
+
+/// A canonical JS array-index key: all ASCII digits, no leading zeros (the
+/// `ToString(ToNumber(k)) === k` canonicality rule), value < 2^32-1.
+fn js_array_index(k: &str) -> Option<u32> {
+    if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = k.parse().ok()?;
+    if n >= 4294967295 || n.to_string() != k {
+        return None;
+    }
+    Some(n as u32)
+}
+
+/// JS own-key enumeration order over a parsed JSON object.
+fn js_ordered_keys(m: &Map<String, Value>) -> Vec<&str> {
+    let mut indexed: Vec<(u32, &str)> = Vec::new();
+    let mut rest: Vec<&str> = Vec::new();
+    for k in m.keys() {
+        match js_array_index(k) {
+            Some(n) => indexed.push((n, k)),
+            None => rest.push(k),
+        }
+    }
+    indexed.sort_by_key(|(n, _)| *n);
+    indexed.into_iter().map(|(_, k)| k).chain(rest).collect()
+}
 
 // ──────────────────────────────────────────────────────────────
 // The validator
@@ -508,6 +424,8 @@ impl Validator {
 
     /// `z.record(z.string(), z.string())` — non-objects report with zod's
     /// `record` expected-type word; bad values report at `[..., key, entry]`.
+    /// Entries iterate in JS own-key order; `__proto__` is silently SKIPPED
+    /// per `$ZodRecord` (never validated, never kept).
     fn opt_str_record(
         &mut self,
         obj: &Map<String, Value>,
@@ -521,13 +439,17 @@ impl Validator {
             Value::Object(entries) => {
                 let mut acc = IndexMap::with_capacity(entries.len());
                 let mut ok = true;
-                for (k, entry) in entries {
+                for k in js_ordered_keys(entries) {
+                    if k == "__proto__" {
+                        continue;
+                    }
+                    let entry = &entries[k];
                     match entry {
                         Value::String(s) => {
-                            acc.insert(k.clone(), s.clone());
+                            acc.insert(k.to_string(), s.clone());
                         }
                         other => {
-                            self.path.push(PathSeg::Key(k.clone()));
+                            self.path.push(PathSeg::Key(k.to_string()));
                             self.push(
                                 IssueCode::InvalidType,
                                 msg_invalid_type("string", received_name(other)),
@@ -646,12 +568,14 @@ impl Validator {
     }
 
     /// strictObject tail: one `unrecognized_keys` issue listing every unknown
-    /// key IN INPUT ORDER (JSON.parse/serde preserve_order = insertion
-    /// order), singular/plural message forms.
+    /// key in JS own-key order (canonical array-index keys ascending, then
+    /// insertion order — `for…in` over a `JSON.parse` object),
+    /// singular/plural message forms. `__proto__` is NOT special here (it is
+    /// a normal unrecognized key for strict objects).
     fn unrecognized(&mut self, obj: &Map<String, Value>, known: &[&str]) {
         let mut unknown: Vec<&str> = Vec::new();
-        for k in obj.keys() {
-            if !known.contains(&k.as_str()) {
+        for k in js_ordered_keys(obj) {
+            if !known.contains(&k) {
                 unknown.push(k);
             }
         }
@@ -864,13 +788,18 @@ impl Validator {
             Value::Object(entries) => {
                 let mut acc = IndexMap::with_capacity(entries.len());
                 let mut ok = true;
-                // Record entries iterate in INPUT (manifest text) order, same
-                // as zod over a JS object.
-                for (field_key, field_val) in entries {
-                    self.path.push(PathSeg::Key(field_key.clone()));
+                // Record entries iterate in JS own-key order (array-index keys
+                // ascending first); `__proto__` is silently skipped
+                // (never validated, never kept) per `$ZodRecord`.
+                for field_key in js_ordered_keys(entries) {
+                    if field_key == "__proto__" {
+                        continue;
+                    }
+                    let field_val = &entries[field_key];
+                    self.path.push(PathSeg::Key(field_key.to_string()));
                     match self.content_schema_field(field_val) {
                         Some(field) => {
-                            acc.insert(field_key.clone(), field);
+                            acc.insert(field_key.to_string(), field);
                         }
                         None => ok = false,
                     }
@@ -1041,187 +970,4 @@ impl ScrollInputPolicy {
 }
 
 #[cfg(test)]
-mod tests {
-    //! Focused unit tests for properties the differential oracle cannot
-    //! express: error-class distinctions at the API boundary, issue Display
-    //! formatting (what scan logs), and content-schema INSERTION-ORDER
-    //! fidelity (oracle Value equality is order-insensitive).
-    //!
-    //! Verdict/message behavior is NOT unit-tested here on purpose — the
-    //! oracle fixture pins all 123 cases against the real zod schema.
-    use super::*;
-    use crate::manifest::FieldType;
-
-    /// `parse_manifest` distinguishes legacy's two scan log classes:
-    /// 'invalid JSON in manifest' (text not JSON) vs 'invalid manifest'
-    /// (schema failure).
-    #[test]
-    fn parse_manifest_splits_invalid_json_from_invalid_manifest() {
-        let err = parse_manifest("{ not json").unwrap_err();
-        assert!(matches!(err, ManifestError::InvalidJson(_)), "{err:?}");
-
-        let err = parse_manifest(r#"{"name": 5}"#).unwrap_err();
-        match err {
-            ManifestError::Invalid(issues) => {
-                // name + missing version/label/description/category; the
-                // category refine is gated by the aborting failures.
-                assert_eq!(issues.len(), 5, "{issues:?}");
-                assert_eq!(issues[0].code, IssueCode::InvalidType);
-                assert_eq!(issues[0].path, vec![PathSeg::Key("name".into())]);
-            }
-            other => panic!("expected Invalid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn issue_display_is_log_friendly() {
-        let err = parse_manifest(
-            r#"{"name":"x","version":"1","label":"l","description":"d","category":"cli","cli":{"command":"c","flags":[]}}"#,
-        )
-        .unwrap_err();
-        let ManifestError::Invalid(issues) = err else {
-            unreachable!()
-        };
-        assert_eq!(
-            issues[0].to_string(),
-            "[unrecognized_keys cli] Unrecognized key: \"flags\""
-        );
-    }
-
-    /// contentSchema preserves manifest TEXT field order (JS object insertion
-    /// order) — the client renders the form in this order. Value-equality
-    /// (used by the oracle) is order-insensitive, so this pins the text.
-    #[test]
-    fn content_schema_output_preserves_manifest_field_order() {
-        let manifest = parse_manifest(
-            r#"{
-              "name": "x", "version": "1", "label": "l", "description": "d",
-              "category": "client", "client": { "entry": "e" },
-              "contentSchema": {
-                "zebra": { "type": "string", "label": "Z" },
-                "apple": { "type": "number", "label": "A" },
-                "mango": { "type": "boolean", "label": "M" }
-              }
-            }"#,
-        )
-        .expect("valid");
-        let text = serde_json::to_string(&manifest.to_zod_output_value()).unwrap();
-        let (z, a, m) = (
-            text.find("zebra").unwrap(),
-            text.find("apple").unwrap(),
-            text.find("mango").unwrap(),
-        );
-        assert!(z < a && a < m, "insertion order must survive: {text}");
-        // And the typed model exposes the same order.
-        let keys: Vec<&String> = manifest.content_schema.as_ref().unwrap().keys().collect();
-        assert_eq!(keys, ["zebra", "apple", "mango"]);
-    }
-
-    /// env/permissionModeValues records preserve manifest text order too
-    /// (IndexMap, not BTreeMap).
-    #[test]
-    fn env_record_output_preserves_manifest_order() {
-        let manifest = parse_manifest(
-            r#"{
-              "name": "x", "version": "1", "label": "l", "description": "d",
-              "category": "cli",
-              "cli": { "command": "c", "env": { "ZED": "1", "ALPHA": "2" } }
-            }"#,
-        )
-        .expect("valid");
-        let keys: Vec<&String> = manifest
-            .cli
-            .as_ref()
-            .unwrap()
-            .env
-            .as_ref()
-            .unwrap()
-            .keys()
-            .collect();
-        assert_eq!(keys, ["ZED", "ALPHA"]);
-    }
-
-    /// The content-schema default union reports ONE invalid_union for
-    /// non-scalar defaults (not three member failures) and does NOT fire the
-    /// field refine afterwards (invalid_union is aborting → refine gated).
-    #[test]
-    fn union_default_failure_is_single_invalid_union_no_refine() {
-        let err = parse_manifest(
-            r#"{
-              "name": "x", "version": "1", "label": "l", "description": "d",
-              "category": "client", "client": { "entry": "e" },
-              "contentSchema": { "f": { "type": "string", "label": "L", "default": {} } }
-            }"#,
-        )
-        .unwrap_err();
-        let ManifestError::Invalid(issues) = err else {
-            unreachable!()
-        };
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].code, IssueCode::InvalidUnion);
-        assert_eq!(issues[0].message, "Invalid input");
-        assert_eq!(
-            issues[0].path,
-            vec![
-                PathSeg::Key("contentSchema".into()),
-                PathSeg::Key("f".into()),
-                PathSeg::Key("default".into()),
-            ]
-        );
-    }
-
-    /// Data accessibility smoke: a fully-populated CLI manifest exposes every
-    /// launch/permission/model/sandbox field through the typed model and the
-    /// zod-output shape mirrors the input key-for-key (plus materialized
-    /// args).
-    #[test]
-    fn cli_full_surface_round_trips_key_for_key() {
-        let input = r#"{
-          "name": "opencode", "version": "1.0.0", "label": "OpenCode",
-          "description": "x", "category": "cli",
-          "cli": {
-            "command": "opencode", "args": ["--ui"],
-            "env": { "A": "1" }, "envVar": "OPENCODE_CMD",
-            "resumeArgs": ["--session", "{{sessionId}}"],
-            "createSessionArgs": ["--session-id", "{{sessionId}}"],
-            "modelArgs": ["--model", "{{model}}"],
-            "sandboxArgs": ["--sandbox", "{{sandbox}}"],
-            "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
-            "permissionModeEnvVar": "AGENT_PERMISSION_MODE",
-            "permissionModeValues": { "plan": "{}" },
-            "supportsPermissionMode": true, "supportsModel": true, "supportsSandbox": false,
-            "terminalBehavior": { "preferredRenderer": "canvas", "scrollInputPolicy": "native" }
-          }
-        }"#;
-        let manifest = parse_manifest(input).expect("valid");
-        let cli = manifest.cli.as_ref().unwrap();
-        assert_eq!(cli.command, "opencode");
-        assert_eq!(cli.args, ["--ui"]);
-        assert_eq!(cli.env_var.as_deref(), Some("OPENCODE_CMD"));
-        assert_eq!(
-            cli.resume_args.as_ref().unwrap(),
-            &["--session", "{{sessionId}}"]
-        );
-        assert_eq!(
-            cli.create_session_args.as_ref().unwrap(),
-            &["--session-id", "{{sessionId}}"]
-        );
-        assert_eq!(cli.model_args.as_ref().unwrap(), &["--model", "{{model}}"]);
-        assert_eq!(cli.permission_mode_values.as_ref().unwrap()["plan"], "{}");
-        assert_eq!(cli.supports_sandbox, Some(false)); // explicit false preserved
-                                                       // input had args → no default injection anywhere else:
-        let out = manifest.to_zod_output_value();
-        assert_eq!(out["cli"]["supportsSandbox"], serde_json::json!(false));
-        assert!(out["cli"].get("serverRunning").is_none());
-    }
-
-    /// FieldType::as_str doubles as the JS typeof name — the coupling the
-    /// content-schema refine relies on. Pin it so a future rename can't
-    /// silently break the typeof comparison.
-    #[test]
-    fn field_type_as_str_matches_js_typeof_names() {
-        assert_eq!(FieldType::String.as_str(), "string");
-        assert_eq!(FieldType::Number.as_str(), "number");
-        assert_eq!(FieldType::Boolean.as_str(), "boolean");
-    }
-}
+mod tests;

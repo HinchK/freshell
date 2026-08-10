@@ -22,7 +22,7 @@
 //!   object; refines after their object's base issues)
 //!
 //! Behavior is pinned by a differential oracle:
-//! `fixtures/manifest-oracle.json` (122 cases) generated from the UNMODIFIED
+//! `fixtures/manifest-oracle.json` (124 cases) generated from the UNMODIFIED
 //! legacy schema by `port/contract/generate-manifest-oracle.ts`; iterated by
 //! `tests/oracle.rs`. Never hand-edit the fixture to match this crate —
 //! regenerate it and fix the crate instead.
@@ -30,13 +30,13 @@
 //! Locale note: JSON text in, typed manifest out. No I/O, no clocks, no
 //! randomness — hermetic by construction.
 
+mod issue;
 mod manifest;
 mod validate;
 
+pub use issue::{IssueCode, ManifestError, ManifestIssue, PathSeg};
 pub use manifest::{
     Category, CliConfig, ClientConfig, ContentSchemaField, DefaultValue, ExtensionManifest,
     FieldType, PickerConfig, PreferredRenderer, ScrollInputPolicy, ServerConfig, TerminalBehavior,
 };
-pub use validate::{
-    parse_manifest, validate_manifest, IssueCode, ManifestError, ManifestIssue, PathSeg,
-};
+pub use validate::{parse_manifest, validate_manifest};

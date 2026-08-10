@@ -2245,6 +2245,126 @@
       }
     },
     {
+      "name": "proto-in-env-skipped-even-with-invalid-value",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\", \"env\": { \"__proto__\": 5, \"x\": \"y\" } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "cli",
+          "cli": {
+            "command": "c",
+            "args": [],
+            "env": {
+              "x": "y"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "proto-in-contentschema-field-never-validated",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"__proto__\": { \"type\": \"bad\" }, \"a\": { \"type\": \"string\", \"label\": \"L\" } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "a": {
+              "type": "string",
+              "label": "L"
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
+      "name": "proto-top-level-is-unrecognized-key",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\" }, \"__proto__\": 1 }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized key: \"__proto__\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "unrecognized-numeric-keys-list-in-numeric-order",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\" }, \"10\": 1, \"2\": 1 }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized keys: \"2\", \"10\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "huge-int-default-rounds-like-js",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"f\": { \"type\": \"number\", \"label\": \"L\", \"default\": 12345678901234567890 } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "number",
+              "label": "L",
+              "default": 12345678901234567000
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
+      "name": "integral-float-text-default-2e53",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"f\": { \"type\": \"number\", \"label\": \"L\", \"default\": 9007199254740992.0 } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "number",
+              "label": "L",
+              "default": 9007199254740992
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
       "name": "bundled-amplifier",
       "rawText": "{\n  \"name\": \"amplifier\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Amplifier\",\n  \"description\": \"Microsoft's Amplifier CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"amplifier\",\n    \"envVar\": \"AMPLIFIER_CMD\",\n    \"resumeArgs\": [\"session\", \"resume\", \"--full-history\", \"{{sessionId}}\"],\n    \"env\": { \"PROMPT_TOOLKIT_NO_CPR\": \"1\" }\n  },\n  \"picker\": {\n    \"shortcut\": \"A\",\n    \"group\": \"agents\"\n  }\n}\n",
       "expected": {

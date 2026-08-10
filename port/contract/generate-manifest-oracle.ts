@@ -52,10 +52,23 @@ const ORACLE_PATH = path.join(
   'manifest-oracle.json',
 )
 
-/** zod version that produced the fixture (drift signal on bumps). */
+/** zod version that produced the fixture (drift signal on bumps), read from
+ * the INSTALLED package — but HARD-CHECKED against the package-lock pin below
+ * so a drifted node_modules can never silently re-pin the oracle. */
 const ZOD_VERSION: string = JSON.parse(
   readFileSync(path.join(REPO_ROOT, 'node_modules', 'zod', 'package.json'), 'utf8'),
 ).version
+
+const LOCK_ZOD_VERSION: string = JSON.parse(
+  readFileSync(path.join(REPO_ROOT, 'package-lock.json'), 'utf8'),
+).packages['node_modules/zod'].version
+
+if (ZOD_VERSION !== LOCK_ZOD_VERSION) {
+  throw new Error(
+    `manifest oracle REFUSES to generate: installed zod ${ZOD_VERSION} != package-lock.json pin ${LOCK_ZOD_VERSION}. ` +
+      `Run \`npm ci\` (the lock pin is the oracle authority; this exact drift produced a wrong-version fixture once).`,
+  )
+}
 
 // ──────────────────────────────────────────────────────────────
 // Case model
@@ -625,7 +638,47 @@ const cases: { name: string; rawText: string }[] = [
     ...validCliManifest,
     cli: { env: { X: 1 }, command: '', supportsModel: 'x', bogus: 2 },
   }),
-] as const
+
+  // ── N. JS object enumeration semantics (from the df1 independent review,
+  // verified against vendored zod 4.3.6 $ZodRecord/handleCatchall) ──
+  // `__proto__` inside a RECORD is silently skipped (never validated, never
+  // kept) — even with an invalid value:
+  {
+    name: 'proto-in-env-skipped-even-with-invalid-value',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "cli", "cli": { "command": "c", "env": { "__proto__": 5, "x": "y" } } }',
+  },
+  {
+    name: 'proto-in-contentschema-field-never-validated',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "client", "client": { "entry": "e" }, "contentSchema": { "__proto__": { "type": "bad" }, "a": { "type": "string", "label": "L" } } }',
+  },
+  // …but in a STRICT OBJECT `__proto__` is a normal unrecognized key:
+  {
+    name: 'proto-top-level-is-unrecognized-key',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "cli", "cli": { "command": "c" }, "__proto__": 1 }',
+  },
+  // Canonical array-index keys enumerate FIRST in ascending numeric order
+  // (for…in / Reflect.ownKeys), then insertion order — visible in the
+  // unrecognized_keys message member order:
+  {
+    name: 'unrecognized-numeric-keys-list-in-numeric-order',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "cli", "cli": { "command": "c" }, "10": 1, "2": 1 }',
+  },
+  // Number defaults match the DOUBLE JSON.parse produces, never u64-exact:
+  {
+    name: 'huge-int-default-rounds-like-js',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "client", "client": { "entry": "e" }, "contentSchema": { "f": { "type": "number", "label": "L", "default": 12345678901234567890 } } }',
+  },
+  {
+    name: 'integral-float-text-default-2e53',
+    rawText:
+      '{ "name": "x", "version": "1.0.0", "label": "L", "description": "D", "category": "client", "client": { "entry": "e" }, "contentSchema": { "f": { "type": "number", "label": "L", "default": 9007199254740992.0 } } }',
+  },
+]
 
 // ── O. Bundled manifests (rawText = exact file bytes, so whitespace/ordering
 // in the repo's extensions/ tree is part of the fixture) ──

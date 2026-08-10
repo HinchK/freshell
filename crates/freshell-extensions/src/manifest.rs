@@ -75,19 +75,20 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
-    /// Build a number default from a parsed JSON number, canonicalizing
-    /// integral f64s (e.g. text `100.0`) into integers like JS output.
+    /// Build a number default from a parsed JSON number, matching the DOUBLE
+    /// `JSON.parse` produces bit-for-bit: everything goes through f64 first
+    /// (so integer text beyond 2^53 rounds like JS instead of staying u64-
+    /// exact), then integral values in `±(2^53-1)` are stored as integers so
+    /// re-serialization matches `JSON.stringify` (which never prints a
+    /// trailing `.0`). Larger or non-integral values stay f64 — the stored
+    /// double is identical to JS's; only exponent-notation text cosmetics
+    /// differ at extremes (recorded divergence).
     pub(crate) fn number(n: &Number) -> Self {
-        if let Some(f) = n.as_f64() {
-            if n.as_i64().is_none()
-                && n.as_u64().is_none()
-                && f.fract() == 0.0
-                && f.abs() <= 9007199254740991.0
-            {
-                return DefaultValue::Number(Number::from(f as i64));
-            }
+        let f = n.as_f64().expect("serde_json::Number is always f64-able");
+        if f.fract() == 0.0 && f.abs() <= 9007199254740991.0 {
+            return DefaultValue::Number(Number::from(f as i64));
         }
-        DefaultValue::Number(n.clone())
+        DefaultValue::Number(Number::from_f64(f).expect("JSON numbers are finite"))
     }
 
     /// The JS `typeof` of this value — the operand of the content-schema
