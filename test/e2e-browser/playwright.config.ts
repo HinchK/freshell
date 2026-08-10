@@ -76,6 +76,12 @@ export const MATRIX_SPECS = [
   // kinds. See term13-scrollback-boundary.spec.ts.
   /term13-scrollback-boundary\.spec\.ts$/,
   /ws-ping-pong-matrix\.spec\.ts$/,
+  // BROWSER-01 — same-origin HTTP reverse proxy: CSP/XFO fixture renders in a
+  // Browser pane, frameLocator GET/POST/streaming, exact upstream inputs
+  // (raw path+query, urlencoded body, cookie auth) + visible responses.
+  // Legacy is a true parity control (identical contract). See
+  // specs/browser01-proxy.spec.ts and docs/plans/df1/BROWSER-01.md.
+  /browser01-proxy\.spec\.ts$/,
   // SYNC-06 -- resume-by-id parity: the pinned sidebar Resume button and the
   // paste-then-Enter resume path against BOTH servers (POST /api/sessions/resolve
   // + sessionResolve flag now exist on the Rust server too, with the hardened
