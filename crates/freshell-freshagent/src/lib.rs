@@ -1459,8 +1459,7 @@ async fn create_tab(
     // provided (JSON.stringify drops undefined, router.ts:704). Serialize
     // the same shape instead of `"title": null` -- the shared client
     // tolerates both (`payload.title ||`, tabsSlice.ts:306), but keep the
-    // broadcast Node-shaped. If an existing test pins a null-title
-    // broadcast, update it to this shape.
+    // broadcast Node-shaped.
     let mut create_payload = json!({
         "id": tab_id,
         "paneId": pane_id,

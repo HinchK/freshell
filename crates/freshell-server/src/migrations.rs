@@ -288,9 +288,15 @@ mod tests {
         let a3 = ov.get("amplifier:a3").unwrap();
         assert!(a3.get("titleOverride").is_none(), "{a3:?}");
         // Untouched: user rename, non-authoritative provider, legacy key.
-        assert_eq!(ov.get("amplifier:a2").unwrap()["titleOverride"], json!("Mine"));
+        assert_eq!(
+            ov.get("amplifier:a2").unwrap()["titleOverride"],
+            json!("Mine")
+        );
         assert_eq!(ov.get("claude:c1").unwrap()["titleOverride"], json!("Auto"));
-        assert_eq!(ov.get("legacykey").unwrap()["titleOverride"], json!("Legacy"));
+        assert_eq!(
+            ov.get("legacykey").unwrap()["titleOverride"],
+            json!("Legacy")
+        );
 
         // Marker persisted; unmanaged keys preserved on disk.
         let cfg = read_config(dir);
