@@ -46,11 +46,16 @@ All run under the df1 cargo lease (`acquire.sh cargo df1-diag-01-jsonl-logs`):
 - `cargo test -p freshell-server --test diag01_lifecycle_logging` — 2/2 passed (×3 runs)
 - `cargo test -p freshell-server --test diag01_diag03_logging` — 1/1 passed
 - `cargo test -p freshell-server` — full crate: 609 unit + all integration files green
-- `cargo test -p freshell-ws` — full crate green (430 lib + all integration files); one known-flaky file excluded from the pass/fail claim, see below
+- `cargo test -p freshell-ws --lib` — 433 passed, 0 failed (includes the new span/dedupe tests)
+- `cargo test -p freshell-ws` — every binary green EXCEPT `tests/auto_resume_e2e.rs`, which flakes on this host at 10s frame-wait timeouts; attribution-tested against virgin base (fails there at the same-or-worse rate) = PRE-EXISTING, not caused by this branch — see "Known-flaky exclusion" below
 - `cargo test -p freshell-terminal` — 175+ green
-- `cargo test -p freshell-freshagent` — 358+ green
-- `cargo clippy -p freshell-server -p freshell-ws --all-targets -- -D warnings` — clean
-- `cargo fmt --check -p freshell-server -p freshell-ws` — clean
+- `cargo test -p freshell-freshagent` — 358+ green (incl. the extended diag01 capture test)
+- `cargo clippy -p freshell-server -p freshell-ws -p freshell-freshagent --all-targets -- -D warnings` — clean
+- `cargo fmt --check -p freshell-server -p freshell-ws -p freshell-freshagent` — clean
+
+## Precise waiter-window note (review round 4 finding, dispositioned)
+
+`CreateDedupe` purposefully answers a cross-connection duplicate arriving during an *adopt* / *session-ref-attach* / *session-reserved* window with a fail-loud error (the origin settles nothing on those exits; the sentinel is dropped "on every other exit (adopt/session-reserved/sessionRef-attach/create failure, restore-gate shutdown)" — deliberate per the code's own design comments, predating this branch and untouched by it). On those windows the `ws.terminal.create.settled` event logs the ORIGIN's reply with `path="adopted"` / `"session_ref_attached"`; the waiting connection receives no `terminal.created` (by design, loud instead). Whether the adopt window should instead settle-and-forward is a create-lane semantics question, not a logging question — filed as `DIAG-FOLLOWUP-ADOPT-WAITER-SETTLE` for that lane's owner.
 
 ## Known-flaky exclusion (classified, attribution-tested)
 

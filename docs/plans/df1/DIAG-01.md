@@ -98,7 +98,7 @@ fn every_line_stamps_app_version_and_server_pid() {
 
 **Interfaces:**
 - Consumes: existing `conn_id` (`state.registry.new_connection_id()`), existing `ws.connection.established`/`closed` events.
-- Produces: a `tracing::info_span!("ws_conn", connection_id, origin_kind)` entered for the whole connection loop so every event emitted while serving the connection (same-task or spawned) carries `connection_id`.
+- Produces: a per-connection span minted by `connection_span(conn_id, origin_kind)` in `terminal.rs` (ERROR-level — **AMENDED after fresh-eyes review rounds 1-2**: never `tracing::info_span!("ws_conn", ...)`, which dies under level filters; plus the dual-carrier `log_create_settled` settle event for targeted-directive filters) entered for the whole connection loop so every event emitted while serving the connection (same-task or spawned) carries `connection_id`.
 
 - [ ] **Step 1: failing test** — upgrade the test file's `CaptureLayer` to merge span fields (walk `ctx.event_scope(event)` root→leaf reading a `SpanFields`-style extension, same technique as `JsonLayer::on_new_span`/`on_event`; the capture layer must implement `on_new_span` storing recorded fields in span extensions). New test: `terminal_create_event_carries_connection_id` — boot real axum server + real WS client (existing harness convention), `hello` → `ready`, send `terminal.create` (shell mode), await `terminal.created` frame, then assert the captured `terminal.created` event has `connection_id` equal to the one on `ws.connection.established`.
 - [ ] **Step 2: run RED** — `cargo test -p freshell-ws --test diag01_lifecycle_events` → FAIL (event lacks `connection_id`).
