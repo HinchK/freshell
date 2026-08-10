@@ -10,6 +10,18 @@
 
 **Tech Stack:** Docker multi-stage build (`rust:1-bookworm` + `node:22-bookworm`), Google Cloud Run Jobs, gcloud CLI, Playwright 1.58.2, bash wrapper script.
 
+> **Shipped deviation (wrap-review correction):** the Goal/Architecture text
+> above and R1 below describe the original REQUEST — "cloud by default."
+> What actually shipped keeps **local as the unset-default**: `npm run
+> test:e2e` resolves `"${FRESHELL_E2E_BACKEND:-local}"` in
+> `scripts/e2e-cloud.sh`, so a fresh clone runs locally; cloud is opt-in via
+> `FRESHELL_E2E_BACKEND=cloud`, the `--cloud` flag, or
+> `npm run test:e2e:cloud`. Pinned by checks 9-11 of
+> `scripts/test/cloud-run-wrapper.test.sh`. (The squash commit `ab8d6ed46`'s
+> "make cloud the default" line likewise describes the request, not the
+> shipped behavior; commit messages are immutable history and are not
+> rewritten.)
+
 ## Global Constraints
 
 - GCP account: `dan@danshapiro.com`, project: `misc-puttering-project`, region: `us-west1`
