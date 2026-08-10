@@ -80,19 +80,32 @@ enum Entry {
     Settled {
         terminal_id: String,
         created: ServerMessage,
-        /// The `restore` flag the SETTLED create carried. A later reuse of
-        /// this `requestId` only replays when its OWN `restore` flag
-        /// matches -- a genuine blind resend of the identical frame
-        /// (legacy `inFlightCreates` parity: same requestId, same
-        /// `restore`). A mismatched reuse (e.g. a plain create's id later
-        /// reused by a `restore:true` attempt while that same terminal is
-        /// still live) is a DIFFERENT request wearing the same id -- it
-        /// must fall through to its own normal path (which may legitimately
-        /// reject it, e.g. `RESTORE_UNAVAILABLE` while the lineage is still
+        /// The CANONICALIZED `restore` flag the SETTLED create carried (see
+        /// [`canonical_restore`]). A later reuse of this `requestId` only
+        /// replays when its OWN `restore` canonicalizes equal -- a genuine
+        /// blind resend of the semantically-identical frame (legacy
+        /// `inFlightCreates` parity: same requestId, same `restore`). A
+        /// mismatched reuse (e.g. a plain create's id later reused by a
+        /// `restore:true` attempt while that same terminal is still live)
+        /// is a DIFFERENT request wearing the same id -- it must fall
+        /// through to its own normal path (which may legitimately reject
+        /// it, e.g. `RESTORE_UNAVAILABLE` while the lineage is still
         /// running) rather than silently being answered with the original
         /// terminal.
-        restore: Option<bool>,
+        restore: bool,
     },
+}
+
+/// The wire protocol marks `restore` optional and the SPA OMITS it when
+/// false (`TerminalView.tsx` sends `...(restore ? { restore: true } : {})`),
+/// so on the wire `None` and `Some(false)` are the SAME request. Literal
+/// `Option<bool>` equality would treat an explicit-`restore:false` resend of
+/// an omitted-`restore` settled create as a flag mismatch — breaking the
+/// replay and letting the resend spawn a duplicate PTY (wrap-review r3).
+/// Canonicalize to the only distinction that matters: restore is in effect
+/// iff the flag is present AND true.
+fn canonical_restore(restore: Option<bool>) -> bool {
+    restore == Some(true)
 }
 
 #[allow(clippy::large_enum_variant)] // see `Entry` above
@@ -263,7 +276,7 @@ impl CreateDedupe {
                     // a sentinel leaves the in-flight window unguarded and
                     // a second duplicate inside it would also Proceed →
                     // duplicate PTY).
-                    if running && settled_restore == restore {
+                    if running && settled_restore == canonical_restore(restore) {
                         Act::Replay(created.clone())
                     } else {
                         Act::InsertSentinel
@@ -274,7 +287,7 @@ impl CreateDedupe {
                     // ago — treat it as live (evicting it on the strength
                     // of a probe against the OLD terminal would clobber the
                     // just-settled create and re-spawn a duplicate).
-                    if *now_restore == restore {
+                    if *now_restore == canonical_restore(restore) {
                         Act::Replay(created.clone())
                     } else {
                         Act::InsertSentinel
@@ -318,6 +331,7 @@ impl CreateDedupe {
         restore: Option<bool>,
         is_running: impl Fn(&str) -> bool,
     ) {
+        let restore = canonical_restore(restore);
         // Phase 1: install the settled entry, take the waiters, and SNAPSHOT
         // the prune candidates — every OTHER settled entry's (id, terminal).
         // The just-settled entry is excluded by construction: it was created
@@ -606,6 +620,52 @@ mod tests {
             "second same-requestId duplicate during the in-flight window must \
              be deduped, not spawn a second PTY"
         );
+    }
+
+    /// Wrap-review r3: the wire makes `restore` OPTIONAL and the SPA omits
+    /// it when false, so `None` and `Some(false)` are the SAME request.
+    /// Literal `Option<bool>` equality broke the replay for whichever client
+    /// spelled the flag differently (settle omitted / resend explicit, or
+    /// vice versa) — InsertSentinel + Proceed would let the resend spawn a
+    /// duplicate PTY. Both spellings must replay both spellings, while
+    /// `restore:true` still mismatches (the latch-flip arm above).
+    #[test]
+    fn omitted_restore_and_explicit_false_replay_each_other() {
+        // Settle as omitted (the SPA shape); resend with explicit false.
+        let d = CreateDedupe::default();
+        let (s1, _f1) = recording_sink();
+        let _ = d.begin("r1", &s1, None, |_| true, 9);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
+        assert!(
+            matches!(
+                d.begin("r1", &s1, Some(false), |_| true, 9),
+                DedupeDecision::DuplicateSettled(_)
+            ),
+            "explicit restore:false must replay an omitted-restore settled create"
+        );
+
+        // And the mirror: settled explicit-false, resend omitted.
+        let d = CreateDedupe::default();
+        let (s2, _f2) = recording_sink();
+        let _ = d.begin("r2", &s2, Some(false), |_| true, 9);
+        d.settle("r2", "t2", &created_frame(), Some(false), |_| true);
+        assert!(
+            matches!(
+                d.begin("r2", &s2, None, |_| true, 9),
+                DedupeDecision::DuplicateSettled(_)
+            ),
+            "omitted restore must replay an explicit-false settled create"
+        );
+
+        // restore:true still mismatches against both false spellings.
+        let d = CreateDedupe::default();
+        let (s3, _f3) = recording_sink();
+        let _ = d.begin("r3", &s3, None, |_| true, 9);
+        d.settle("r3", "t3", &created_frame(), None, |_| true);
+        assert!(matches!(
+            d.begin("r3", &s3, Some(true), |_| true, 9),
+            DedupeDecision::Proceed
+        ));
     }
 
     /// The sentinel installed by the flag-mismatch arm must behave exactly

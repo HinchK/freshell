@@ -127,6 +127,52 @@ async fn plain_resend_on_new_connection_replays_settled_terminal() {
     );
 }
 
+/// Wrap-review r3 wire pin: `restore` is optional on the wire and the SPA
+/// omits it when false, so a resend that spells it explicitly
+/// (`restore: false`) is the SAME request as the omitted-restore original.
+/// Literal Option<bool> comparison treated them as a flag mismatch and let
+/// the resend spawn a fresh PTY. The explicit-false resend on a NEW
+/// connection must replay the settled terminal and spawn nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_restore_false_resend_replays_omitted_restore_settled() {
+    let (ws_url, registry, _gate) =
+        spawn_server_with_create_protect_probes(CreateProtectConfig::default()).await;
+
+    // Original: no `restore` field at all (the SPA's actual wire shape).
+    let (mut c1, _inventory) = connect_and_capture_inventory(&ws_url).await;
+    let tid = create_shell_terminal(&mut c1, "d-rf").await;
+    assert!(
+        registry.is_pty_running(&tid),
+        "test precondition: the original terminal must still be running"
+    );
+    drop(c1);
+
+    // Resend on a new connection with the flag spelled out.
+    let (mut c2, _inventory) = connect_and_capture_inventory(&ws_url).await;
+    c2.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "d-rf",
+            "mode": "shell",
+            "shell": "system",
+            "restore": false,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send explicit restore:false resend");
+    let replay = next_frame_of_type(&mut c2, "terminal.created").await;
+    assert_eq!(
+        replay["terminalId"], tid,
+        "explicit restore:false must replay the omitted-restore settled terminal"
+    );
+    assert_eq!(
+        registry.kill_all(),
+        1,
+        "exactly one PTY — the differing spelling must not respawn"
+    );
+}
+
 /// Sanity guard for the harness wiring: an unrelated requestId is a DISTINCT
 /// create (no over-dedupe). Two different requestIds → two terminals.
 #[tokio::test(flavor = "multi_thread")]
