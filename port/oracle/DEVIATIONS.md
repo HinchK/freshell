@@ -667,6 +667,7 @@ path itself is intact).
   `crates/freshell-ws/src/terminal_meta.rs` inline tests +
   `crates/freshell-ws/tests/session_identity_frames.rs` (inventory `terminalMeta` row
   assertions) + the Task 23 Playwright git-badge spec.
+  Surfaced internal-contract divergence (Task 18, recorded 2026-08-09 / Task 24): `TerminalMetaRegistry::retire()` returns `false` for an ALREADY-retired entry (Node re-stamps `retiredAt` and returns `true`) — internal API contract only, wire behavior stays Node-equivalent (exactly one `{remove:[terminalId]}` per terminal lifetime); documented in the method's rustdoc (`terminal_meta.rs:82-93`) + inline test.
 
 ### DEV-0009 — terminal-metadata git enrichment runs on a throttled per-unique-cwd poll (Node: indexer-event-driven, per-terminal, uncached)
 
