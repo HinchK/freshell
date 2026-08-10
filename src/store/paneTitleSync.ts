@@ -9,9 +9,9 @@ import { updatePaneTitleByTerminalId } from './panesSlice'
 export const syncPaneTitleByTerminalId = createAsyncThunk(
   'panes/syncPaneTitleByTerminalId',
   async (
-    { terminalId, title }: { terminalId: string; title: string },
+    { terminalId, title, setByUser }: { terminalId: string; title: string; setByUser?: boolean },
     { dispatch }
   ) => {
-    dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: false }))
+    dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: setByUser ?? false }))
   }
 )
