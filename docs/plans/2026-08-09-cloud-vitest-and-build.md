@@ -304,7 +304,7 @@ Create `scripts/vitest-cloud.sh` with:
   - `GCP_JOB="freshell-vitest"` (not `freshell-e2e`)
   - `FRESHELL_VITEST_BACKEND` env var (not `FRESHELL_E2E_BACKEND`)
   - Local mode: `npx vitest run --passWithNoTests --config <config>` for each config (not `npx playwright test`)
-  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `printf '%s\n' "${pw_args[@]}" | jq -R . | jq -sc .`. Since the JSON array contains double quotes, write the env-vars file using a YAML-safe method: either single-quote the JSON value in YAML (`VITEST_ARGS_JSON: '<json>'`) or use `jq -Rs .` to produce a YAML-safe double-quoted string with proper escaping. The env-vars file must round-trip through `gcloud run jobs execute --env-vars-file` without corrupting JSON values.
+  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `if [ ${#pw_args[@]} -eq 0 ]; then echo '[]'; else printf '%s\n' "${pw_args[@]}" | jq -R . | jq -sc .; fi`. Since the JSON array contains double quotes, write the env-vars file using a YAML-safe method: either single-quote the JSON value in YAML (`VITEST_ARGS_JSON: '<json>'`) or use `jq -Rs .` to produce a YAML-safe double-quoted string with proper escaping. The env-vars file must round-trip through `gcloud run jobs execute --env-vars-file` without corrupting JSON values.
   - `--config=default|server|all` flag controls which configs to run
   - Log summary greps for vitest output patterns (`Test Files`, `Tests`)
   - Default `--shards=4` (not 1)
@@ -358,7 +358,7 @@ git commit -m "feat: add vitest-cloud.sh wrapper for Cloud Run Jobs"
 - When `FRESHELL_VITEST_BACKEND=cloud`, `scripts/run-standard-tests.ts` dispatches client+server stages to `scripts/vitest-cloud.sh run`, then runs the electron stage locally
 - The dispatch happens at the top of `main()`, before any local test planning
 - The cloud dispatch runs only the client and server configs; the electron config always runs locally (it needs a display and native modules not available in the container)
-- Forwarded args are passed through to the cloud wrapper
+- Forwarded args are passed through to the cloud wrapper, **except** Git-dependent selectors like `--changed` — Vitest's `--changed` requires a `.git` directory, which is excluded from the Docker image. When `--changed` is detected in forwarded args, the cloud dispatch must fall back to local execution (log a warning and run locally)
 - The cloud wrapper script path is injectable via `FRESHELL_VITEST_CLOUD_SCRIPT` env var (default: `resolve(repoRoot, 'scripts/vitest-cloud.sh')`), so tests can substitute a fake without relying on PATH interception of an absolute-path exec
 - New npm scripts: `test:cloud`, `test:cloud:build`
 - AGENTS.md updated with cloud vitest instructions
@@ -375,7 +375,7 @@ git commit -m "feat: add vitest-cloud.sh wrapper for Cloud Run Jobs"
 
 **Test cases:**
 - `FRESHELL_VITEST_BACKEND=cloud` in `run-standard-tests.ts` → dispatches to `vitest-cloud.sh` for client+server, then runs electron locally
-- The dispatch is verifiable by injecting `FRESHELL_VITEST_CLOUD_SCRIPT` pointing to a fake script that logs its invocation and exits 0 — verify the fake was invoked (the log file exists and contains "run"), AND verify the local electron suite was also invoked. This proves both the cloud-dispatch branch and the local electron fallback execute.
+- The dispatch is verifiable by injecting `FRESHELL_VITEST_CLOUD_SCRIPT` pointing to a fake script that logs its invocation and exits 0 — verify the fake was invoked (the log file exists and contains "run"), AND verify the local electron suite was also invoked. This proves both the cloud-dispatch branch and the local electron fallback execute. Note: this tests `run-standard-tests.ts` directly, not the full `test-coordinator.ts` path (which adds pre-phases and `FRESHELL_TEST_COORDINATOR_ACTIVE`). The coordinator path is a thin wrapper around `run-standard-tests.ts` — testing `run-standard-tests.ts` is sufficient for the dispatch logic.
 - `FRESHELL_VITEST_BACKEND` unset → current behavior (all three suites locally)
 - `FRESHELL_VITEST_BACKEND=local` → current behavior (all three suites locally)
 - `npm run test:cloud` script exists and dispatches to `scripts/vitest-cloud.sh run`
@@ -487,7 +487,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
   - BuildKit enabled (`DOCKER_BUILDKIT=1`) for `mode=max` registry caching, which preserves intermediate stage layers (rust-builder, node-builder) — not just the final image
   - `docker pull` of existing image for `--cache-from` layer caching
   - `docker buildx build -f docker/cloud-run/Dockerfile --cache-from type=registry,ref=<image>-cache --cache-to type=registry,ref=<image>-cache,mode=max -t <image> --push .`
-  - `images:` field for automatic push to Artifact Registry
+  - `--push` flag on `docker buildx build` for automatic push to Artifact Registry (no `images:` field — buildx --push handles the push directly)
   - `E2_HIGHCPU_32` machine type, 200GB disk
   - `timeout` at the **top level** (not under `options`), per the [Cloud Build schema](https://docs.cloud.google.com/build/docs/build-config-file-schema)
 - `.gcloudignore` excludes non-build files from Cloud Build source upload (same as `.dockerignore` plus `.worktrees/`)
@@ -529,7 +529,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
 
 Create `scripts/test/cloud-build.test.sh` with:
 - Check 1: `docker/cloud-run/cloudbuild.yaml` exists
-- Check 2: `cloudbuild.yaml` is valid YAML (parse with `python3 -c "import yaml; yaml.safe_load(open('...'))"`)
+- Check 2: `cloudbuild.yaml` is valid YAML (parse with `node -e "const yaml = require('yaml'); yaml.parse(require('fs').readFileSync('...', 'utf8'))"`)
 - Check 3: `cloudbuild.yaml` contains `docker/cloud-run/Dockerfile`
 - Check 4: `cloudbuild.yaml` uses `buildx build` with `--push`
 - Check 5: `cloudbuild.yaml` contains `E2_HIGHCPU_32` under `options:`
@@ -557,7 +557,12 @@ Expected: FAIL because `cloudbuild.yaml` and `.gcloudignore` don't exist, and `-
 Create `docker/cloud-run/cloudbuild.yaml`:
 ```yaml
 steps:
-  # Pull existing image for layer caching (exit 0 if not found yet).
+  # Create a buildx builder that supports registry cache export.
+  # The default docker driver does not support --cache-to type=registry.
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker buildx create --use --name cloud-builder --driver docker-container || docker buildx use cloud-builder']
+  # Pull existing cache image for layer caching (exit 0 if not found yet).
   - name: 'gcr.io/cloud-builders/docker'
     entrypoint: 'bash'
     args: ['-c', 'docker pull ${_IMAGE}-cache || exit 0']
