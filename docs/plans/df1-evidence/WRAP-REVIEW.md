@@ -78,4 +78,68 @@ findings only, record MINOR/rejected here.
   netsh probe; unrelated to this delta's clock change — reproduced via
   `git stash` at HEAD). Not a wrap-review finding; noted for the gate.
 
-<!-- Round 2+ records go below. -->
+## Round 2
+
+- **Fresh Eyes verdict:** FAILED (`FRESHPID=671788`, provider gpt).
+  **Polling note for future drivers:** mid-run polls falsely reported
+  `state=complete`/`verdict=passed` — the fresheyes verdict detector
+  scans the review LOG for the marker text, and the reviewer's `rg`
+  output had dumped this repo's own evidence docs (e.g. `HARNESS-05.md`),
+  which embed historical `**INDEPENDENT CODE REVIEW PASSED**` strings.
+  The false "complete" cleared as soon as the reviewer emitted its true
+  final marker (FAILED); the confirming signals at true completion were
+  `pid_state=missing` + advancing `line_count` stopping. Never trust a
+  `state=complete` whose `pid_state` is still `active` AND whose verdict
+  could be a repo-content echo.
+- **Majors found: 3 — all fixed:**
+
+  1. **`crates/freshell-ws/src/terminal.rs:2068`/`:2139` — paneReconcile
+     adoption success paths never settled `create_dedupe`.** Both the
+     §5.4 keyed-adopt and the D8 `session_ref_attached` early returns
+     sent `terminal.created` but skipped `settle`, so the caller's
+     `clear_if_in_flight` dropped the still-InFlight sentinel AND
+     answered cross-connection waiters with `PTY_SPAWN_FAILED` despite
+     the success; with no Settled entry, a later same-requestId resend on
+     a NON-negotiated (frozen) connection re-entered `handle_create` and
+     spawned a duplicate PTY. Verified the seeded states are reachable
+     (attacher's cleared requestId; REST lane stamps `create_request_id`
+     without populating the WS dedupe map).
+     **Fix:** `c00630fec` — both returns now `settle` exactly like the
+     main spawn path; new
+     `session_ref_adoption_settles_dedupe_for_later_legacy_resends`
+     integration pin (winner → attacher → frozen-connection resend
+     replays, exactly 1 PTY). RED-verified by stashing the fix (test
+     fails without it). Verified: freshell-ws lib 434/434,
+     session_ref_singleflight 4/4, create_dedupe 3/3, pane_reconcile
+     5/5, create_protection 15/15; clippy clean.
+  2. **`docker/cloud-run/entrypoint.sh:60` — split-form value flags were
+     corrupted by FLAGS/SPEC_FILTERS partitioning** (`--project chromium
+     --grep "auth modal"` reordered to `--project --grep chromium "auth
+     modal"`). The r1 newline fix preserved args verbatim but the
+     entrypoint's shape-based classification still reordered split-form
+     values behind later flags.
+     **Fix:** `d390472d0` — `cmd_run` normalizes an allowlist of
+     value-taking flags (`--grep`, `--grep-invert`, `--project`,
+     `--reporter`, `--retries`, `--workers`, `--timeout`,
+     `--global-timeout`, `--max-failures`, `--repeat-each`, `--output`)
+     to `=form` before either backend consumes `pw_args` (Playwright
+     binds =form identically; boolean switches untouched). New
+     wrapper-test check 14 pins the exact corrupted combination (3
+     passed via split-form). Full wrapper suite green (14 checks).
+  3. **`docs/plans/2026-08-09-cloud-run-jobs.md` — plan internals still
+     contradicted shipped behavior**: r1's deviation header acknowledged
+     the mismatch, but R1 and the Task-3 rationale still encoded "cloud
+     default" as the live contract.
+     **Fix:** `b8f1dad1e` — R1 annotated "NOT SHIPPED as written" with
+     the shipped local-default contract; Task-3 note records the planned
+     repurpose deliberately did not ship. (Squash commit `ab8d6ed46`'s
+     message remains immutable history, as recorded in round 1.)
+
+- **Minors: none reported.**
+- **Rejected findings: none.**
+- **Verification notes:** `nice -n 19 npm run typecheck` clean; `cargo
+  clippy -p freshell-ws --all-targets` clean; `cargo fmt` applied to
+  touched Rust files.
+
+<!-- Round 3+ records go below. -->
+
