@@ -685,6 +685,17 @@ async fn main() -> ExitCode {
             SESSIONS_SWEEP_INTERVAL,
         );
     }
+    // One-time boot migration (Node chains it onto the coding-CLI indexer's
+    // first full index, `server/index.ts:1039-1054`, fire-and-forget). The
+    // cleanup condition reads ONLY `sessionOverrides` -- never the index or
+    // live enrichment (Node's comment says exactly this) -- so a detached
+    // task here is observationally equivalent to Node's post-index timing.
+    {
+        let migration_settings = settings_store.clone();
+        tokio::spawn(async move {
+            migrations::run_ai_title_shadow_cleanup(&migration_settings).await;
+        });
+    }
     // Restore-across-restart fix: the amplifier locator's polling cycle (its
     // Enter↔session-dir correlation is entirely poll-driven -- see
     // `freshell_sessions::amplifier_locator`'s module doc for why this

@@ -53,6 +53,62 @@ pub fn override_keys_to_clear(
     keys
 }
 
+use crate::settings_store::SettingsStore;
+
+/// Port of the one-time `ai-title-shadow-cleanup` migration
+/// (`server/index.ts:1039-1054`): drop auto-written (non-user) title
+/// overrides that shadow an authoritative provider-generated title (e.g.
+/// Amplifier's own AI name). Guard -> compute -> clear -> flush -> mark, in
+/// Node's order; the marker is written even when nothing qualified, so a
+/// clean home never re-scans. Error model matches Node too: a failed
+/// override write in Node THROWS and the chain's `.catch` aborts BEFORE
+/// `markMigrationDone` (retry next boot) -- here, clears that cannot be
+/// flushed to disk leave the migration unmarked (see below). Node's
+/// trailing `codingCliIndexer.refresh()` deliberately has NO analogue here:
+/// the Rust session index is poll-based and `session_overrides()`
+/// freshness-reloads (`maybe_reload_overrides`), so the next sweep tick
+/// already sees the cleared rows.
+pub async fn run_ai_title_shadow_cleanup(settings: &SettingsStore) {
+    if settings.is_migration_done(AI_TITLE_SHADOW_CLEANUP) {
+        return;
+    }
+    let overrides = settings.session_overrides();
+    let keys = override_keys_to_clear(&overrides, &AUTHORITATIVE_TITLE_PROVIDERS);
+    for key in &keys {
+        settings
+            .patch_session_override(key, &[("titleOverride", None), ("titleSource", None)])
+            .await;
+    }
+    if !keys.is_empty() {
+        // `patch_session_override` swallows persist errors (best-effort,
+        // settings_store.rs:758-767): a marker-gated one-shot must not
+        // record completion on unknown persistence state. Re-flush and
+        // abort unmarked on failure, mirroring Node's abort-before-marker.
+        if let Err(err) = settings.flush_to_disk().await {
+            tracing::warn!(
+                event = "ai_title_shadow_cleanup_flush_failed",
+                error = %err,
+                "clears not persisted; leaving migration unmarked to retry next boot"
+            );
+            return;
+        }
+    }
+    if let Err(err) = settings.mark_migration_done(AI_TITLE_SHADOW_CLEANUP) {
+        tracing::warn!(
+            event = "ai_title_shadow_cleanup_mark_failed",
+            error = %err,
+            "failed to persist the ai-title-shadow-cleanup marker"
+        );
+    }
+    if !keys.is_empty() {
+        tracing::info!(
+            event = "ai_title_shadow_cleanup",
+            cleared = keys.len(),
+            "one-time stale AI-title cleanup complete"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +252,125 @@ mod tests {
         assert_eq!(cfg["recentDirectories"], json!(["/a", "/b"]));
         assert_eq!(cfg["zzFutureKey"], json!({ "a": 1 }));
         assert_eq!(cfg["completedMigrations"], json!([AI_TITLE_SHADOW_CLEANUP]));
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_amplifier_shadow_titles_and_marks_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(
+            dir,
+            json!({
+                "amplifier:a1": { "titleOverride": "Auto Name", "titleSource": "ai",
+                                   "summaryOverride": "keep me", "archived": true },
+                "amplifier:a2": { "titleOverride": "Mine", "titleSource": "user" },
+                "amplifier:a3": { "titleOverride": "No Source" },
+                "claude:c1":    { "titleOverride": "Auto", "titleSource": "ai" },
+                "legacykey":    { "titleOverride": "Legacy", "titleSource": "ai" }
+            }),
+            None,
+        );
+        let store = store_at(dir);
+
+        run_ai_title_shadow_cleanup(&store).await;
+
+        let ov = store.session_overrides();
+        let a1 = ov.get("amplifier:a1").unwrap();
+        // titleSource "ai" is ladder-FINALIZED: the (None, None) clear must
+        // bypass the can_upgrade_title gate, exactly like Node's
+        // {undefined, undefined} patch (config-store.ts:502-507).
+        assert!(a1.get("titleOverride").is_none(), "{a1:?}");
+        assert!(a1.get("titleSource").is_none(), "{a1:?}");
+        // Non-title fields on the row survive (Node: {...existing, ...patch}).
+        assert_eq!(a1["summaryOverride"], json!("keep me"));
+        assert_eq!(a1["archived"], json!(true));
+        // Absent titleSource also qualifies.
+        let a3 = ov.get("amplifier:a3").unwrap();
+        assert!(a3.get("titleOverride").is_none(), "{a3:?}");
+        // Untouched: user rename, non-authoritative provider, legacy key.
+        assert_eq!(ov.get("amplifier:a2").unwrap()["titleOverride"], json!("Mine"));
+        assert_eq!(ov.get("claude:c1").unwrap()["titleOverride"], json!("Auto"));
+        assert_eq!(ov.get("legacykey").unwrap()["titleOverride"], json!("Legacy"));
+
+        // Marker persisted; unmanaged keys preserved on disk.
+        let cfg = read_config(dir);
+        assert_eq!(cfg["completedMigrations"], json!([AI_TITLE_SHADOW_CLEANUP]));
+        assert_eq!(cfg["recentDirectories"], json!(["/a", "/b"]));
+        assert_eq!(cfg["zzFutureKey"], json!({ "a": 1 }));
+        assert!(store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_reruns_once_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(
+            dir,
+            json!({ "amplifier:a1": { "titleOverride": "Would Qualify", "titleSource": "ai" } }),
+            Some(json!([AI_TITLE_SHADOW_CLEANUP])),
+        );
+        let store = store_at(dir);
+        run_ai_title_shadow_cleanup(&store).await;
+        let ov = store.session_overrides();
+        assert_eq!(
+            ov.get("amplifier:a1").unwrap()["titleOverride"],
+            json!("Would Qualify"),
+            "marker present => migration must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_marks_done_even_when_nothing_qualifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(dir, json!({}), None);
+        let store = store_at(dir);
+        run_ai_title_shadow_cleanup(&store).await;
+        assert!(store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+        // Second run: guard short-circuits, marker not duplicated.
+        run_ai_title_shadow_cleanup(&store).await;
+        assert_eq!(
+            read_config(dir)["completedMigrations"],
+            json!([AI_TITLE_SHADOW_CLEANUP])
+        );
+    }
+
+    /// Error-model pin (validated divergence): a clear that cannot reach
+    /// disk must NOT be recorded as complete -- Node aborts before
+    /// markMigrationDone and retries next boot. Self-skips when the process
+    /// can write through a read-only dir (e.g. root/CAP_DAC_OVERRIDE).
+    #[tokio::test]
+    async fn cleanup_skips_marker_when_clears_cannot_persist() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(
+            dir,
+            json!({ "amplifier:a1": { "titleOverride": "Auto", "titleSource": "ai" } }),
+            None,
+        );
+        let store = store_at(dir);
+        let fdir = dir.join(".freshell");
+        let mut ro = std::fs::metadata(&fdir).unwrap().permissions();
+        ro.set_mode(0o555); // no tmp-file writes => persist AND mark both fail
+        std::fs::set_permissions(&fdir, ro).unwrap();
+        if std::fs::write(fdir.join("probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(fdir.join("probe"));
+            eprintln!("SKIP cleanup_skips_marker_when_clears_cannot_persist: read-only dir not enforceable here");
+            return;
+        }
+
+        run_ai_title_shadow_cleanup(&store).await;
+
+        let mut rw = std::fs::metadata(&fdir).unwrap().permissions();
+        rw.set_mode(0o755);
+        std::fs::set_permissions(&fdir, rw).unwrap();
+        assert!(!store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+        let cfg = read_config(dir);
+        assert_eq!(
+            cfg["sessionOverrides"]["amplifier:a1"]["titleOverride"],
+            json!("Auto"),
+            "the clear never reached disk, so nothing may claim it did"
+        );
     }
 }
