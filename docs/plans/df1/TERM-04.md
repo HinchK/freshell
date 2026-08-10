@@ -45,10 +45,10 @@ What is genuinely missing (the item's remaining work):
 
 | Semantics | Legacy anchor (`server/ws-handler.ts`) | Rust answer |
 |---|---|---|
-| Server-global settled cache `createdTerminalByRequestId` (cross-connection map) | decl :575, `rememberCreatedRequestId` :891-900, `resolveCreatedTerminalBinding` :922-936 | `CreateDedupe` `Entry::Settled`, settle at `terminal.rs:3075` |
+| Server-global settled cache `createdTerminalByRequestId` (cross-connection map) | decl :575, `rememberCreatedRequestId` :891-900, `resolveCreatedTerminalBinding` :921-936 | `CreateDedupe` `Entry::Settled`, settle at `terminal.rs:3075` |
 | Per-connection `createdByRequestId` with `REPAIR_PENDING_SENTINEL` in-flight marker | `ClientState` :478; sentinel checks :2329/:2416; set :2495; clear :2704 | global `Entry::InFlight{origin,waiters}` sentinel (mechanism divergence: the sentinel carries the reply path so a cross-connection duplicate is never swallowed) |
 | Create-lock serialization around the whole decision | `withTerminalCreateLock`/`terminalCreateLockKey` :1002-1033, call :2218 | the dedupe mutex makes begin atomic; restore creates additionally serialize on the spawn gate FIFO |
-| Duplicate answered with the SAME `terminal.created` (`reused:true` lifecycle event) | `attachReusedTerminal` :2260-2319 (`reuseSource: 'request_id_cache'`) | `DedupeDecision::DuplicateSettled(created)` replays the exact stored frame (`terminal.rs:575-580`) |
+| Duplicate answered with the SAME `terminal.created` (`reused:true` lifecycle event) | `attachReusedTerminal` :2259-2319 (`reuseSource: 'request_id_cache'`) | `DedupeDecision::DuplicateSettled(created)` replays the exact stored frame (`terminal.rs:575-580`) |
 | Sentinel cleanup on failure / RATE_LIMITED so the client retry ladder (same requestId) proceeds fresh | catch arm :2704-2706 | `clear_if_in_flight` at `terminal.rs:622` + all `create_gate.rs` exits; fail-loud `error{PTY_SPAWN_FAILED, requestId}` forwarded to waiters |
 | Eager eviction at terminal exit + lazy eviction on registry miss | eager at exit (`onTerminalExitBound` call site :593 → `forgetCreatedRequestIdsForTerminal` :906-910); lazy on registry miss :929-931 | liveness-anchored prune: `begin()` probes `registry.is_pty_running` (helper at `registry.rs` `is_pty_running`) and replays only while running; `settle()` prunes dead settled entries |
 | expectedSessionKey-mismatch falls through to the normal path | `createdRequestBindingMatchesExpectedSession` :914-919 | restore-flag-mismatch falls through (documented divergence in `Entry::Settled.restore`; reachable skew needs same requestId + same restore flag + DIFFERENT sessionRef, which no client path produces — a pane never changes its create payload identity fields, only its restore latch) |
@@ -184,21 +184,19 @@ the server spawn treats it as the binary; ledger/program env propagate through s
 This is the same fake-CLI shim convention as `truly-idle-alerting.spec.ts`'s
 `installFakeClaudeCli`, pointed at the HARNESS-03 fixture instead of an inline script.)
 
-Wire frame (verbatim shape from `restore_spawn_gate.rs`, matching `shared/ws-protocol.ts` `terminal.create` schema — extra fields omitted):
+Wire frame (matching `shared/ws-protocol.ts` `terminal.create` schema — extra fields omitted):
 
 ```json
 {"type":"terminal.create","requestId":"K","mode":"claude","restore":true}
 ```
 
-`restore:true` on raw legs: bypasses the rate limiter entirely (legacy `if (!m.restore)`
-parity — two rapid same-K sends must never RATE_LIMITED) and needs no `sessionRef` when
-restore falls through (checked against the invalid-restore guards: `restore:true` +
-`modeSupportsResume` + missing sessionRef → `RESTORE_UNAVAILABLE` *only when* a live
-canonical owner isn't found... — INVALID: legacy requires sessionRef for restore:true.
-So raw legs use the PLAIN non-restore frame `{"type":"terminal.create","requestId":"K","mode":"claude"}`
-(the Task-1 legs land it on rust first; ACCEPT THE RISK the rate limiter is irrelevant),
-which also matches what the frozen client actually sends first. Confirm in the probe run
-that no `RESTORE_UNAVAILABLE`/rate-limit frame appears — an unexpected `error` frame
+**Do NOT use the restore:true frame above on the raw legs.** Post-audit correction:
+legacy rejects `restore:true` without a canonical `sessionRef` (`RESTORE_UNAVAILABLE`,
+guards at ws-handler.ts:2186-2205 — "only when a live canonical owner isn't found" does
+not rescue a first create). The delivered raw legs therefore use the PLAIN non-restore
+frame `{"type":"terminal.create","requestId":"K","mode":"claude"}` — which also matches
+what the frozen client actually sends first. Confirm in the probe run that no
+`RESTORE_UNAVAILABLE`/rate-limit frame appears — an unexpected `error` frame
 fails the reply await (timeouts are loud), and each test sends at most 3 creates against
 the 10/10s limiter budget so the limiter cannot fire regardless.
 

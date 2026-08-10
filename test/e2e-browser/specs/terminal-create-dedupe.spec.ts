@@ -43,6 +43,7 @@ import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external
 import type { TestServerInfo } from '../helpers/test-server.js'
 import { RawWsClient, rawHttpRequest } from '../helpers/raw-clients.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { PROVIDER_FIXTURE_DIR, childPidsOf } from '../helpers/provider-fixture-launcher.js'
 
 type LedgerRow = { t: number; pid: number; provider: string; argv: string[]; cwd: string }
@@ -137,7 +138,13 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
         env: {
           CLAUDE_CMD: fakeClaude,
           FRESHELL_FAKE_LEDGER: ledgerPath,
-          FRESHELL_FAKE_PROGRAM: JSON.stringify({ rules: [] }),
+          // One scripted rule answers the leg-C post-reconnect marker
+          // round-trip; every other stdin line gets the canned busy→BEL turn.
+          FRESHELL_FAKE_PROGRAM: JSON.stringify({
+            rules: [
+              { on: 'stdin:^term04-ping$', emit: [{ kind: 'marker', data: { text: 'term04-pong-marker' } }] },
+            ],
+          }),
         },
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -199,7 +206,11 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     // this server, nothing else spawned).
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    expect(childPidsOf(info.pid)).toContain(rows[0].pid)
+    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
+    // Linux-hosted, but keep the assert honest off-Linux ([] there).
+    if (process.platform === 'linux') {
+      expect(childPidsOf(info.pid)).toContain(rows[0].pid)
+    }
 
     // One terminal ID in the server inventory, and it is the replied one.
     await expect
@@ -239,7 +250,11 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
 
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    expect(childPidsOf(info.pid)).toContain(rows[0].pid)
+    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
+    // Linux-hosted, but keep the assert honest off-Linux ([] there).
+    if (process.platform === 'linux') {
+      expect(childPidsOf(info.pid)).toContain(rows[0].pid)
+    }
 
     await expect
       .poll(() => runningTerminalIds(info), { timeout: 10_000 })
@@ -291,13 +306,20 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     await harnessA.forceDisconnect()
     await harnessA.waitForConnection()
 
-    // One pane owner for the SAME terminal after the reconnect; no relaunch.
+    // Prove REATTACH, not local-state retention: the pane layout kept
+    // terminalId client-side even while disconnected, so asserting the id
+    // alone would be vacuous. A marker round-trip through the real xterm
+    // (typed by the page, answered by the fake CLI's program rule) only
+    // succeeds if the pane re-attached to the SAME live PTY.
     await expect
       .poll(async () => {
         const leaf = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))
         return leaf?.content?.terminalId ?? null
       }, { timeout: 20_000 })
       .toBe(terminalId)
+    const termA = new TerminalHelper(pageA)
+    await termA.executeCommand('term04-ping')
+    await termA.waitForOutput('term04-pong-marker', { timeout: 15_000 })
     expect(await readLedger(ledgerPath)).toHaveLength(1)
 
     // Second real page: issue the SAME create request over its own real WS
@@ -349,10 +371,11 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
       )?.terminalId ?? null, { timeout: 15_000 })
       .toBe(terminalId)
 
-    // The checklist invariants, AFTER the answered duplicate (no sleep-based
-    // window: a wrongful second spawn would answer page B with a DIFFERENT
-    // terminalId and/or append a second ledger row before its reply — the
-    // poll ordering above already excludes both).
+    // The checklist invariants, AFTER the answered duplicate. No timing
+    // window is load-bearing: the reply poll above already excludes a
+    // wrongful second spawn (a Proceed would answer page B with a DIFFERENT
+    // terminalId long before these lines run), so the ledger/inventory/owner
+    // reads below are confirming state, not racing it.
     expect(await readLedger(ledgerPath)).toHaveLength(1)
     expect(await runningTerminalIds(info)).toEqual([terminalId])
     const leafAfter = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))

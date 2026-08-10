@@ -133,6 +133,11 @@ matrix-proven `CLAUDE_CMD` seam + `FRESHELL_FAKE_LEDGER` launch ledger):
   observes a legacy double-spawn flake in leg B, the fix is a legacy-side cross-connection
   sentinel (pre-existing gap, deliberately out of TERM-04 scope — legacy is the parity
   source here, and the checklist's target is the rust port).
+- The same pre-settle window technically exists for legacy leg A (sentinels are
+  per-connection), but that leg is load-proof in practice: `waitForLedgerRows` only
+  returns after the child's Node boot (far slower than the server's spawn→
+  `rememberCreatedRequestId` path), so the reconnect resend always lands on the settled
+  cache. Registered for completeness; no action.
 
 ## Review round 1 → fixes (fresheyes independent review, claude provider, verdict FAILED→fixed)
 

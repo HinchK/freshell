@@ -1,13 +1,12 @@
 //! Server-wide `terminal.create` requestId -> terminal dedupe guard
 //! (legacy: `server/ws-handler.ts` — server-global `createdByRequestId`
-//! settled cache (declaration :467, lookup :2167-2172), per-connection
-//! in-flight sentinel (`ClientState`, :1166; set :2434), create-lock
-//! serialization (:2159-2161)). The Rust port had no equivalent (fresh
-//! UUIDs minted unconditionally, terminal.rs:748; omission self-documented
-//! at :805-807), and the frozen client re-sends unanswered creates with
-//! the SAME requestId on every reconnect — without this guard every
-//! resend spawns a duplicate PTY and orphans the original as a detached
-//! background session.
+//! settled cache (declaration :575, lookup :921-936), per-connection
+//! in-flight sentinel (`ClientState` `createdByRequestId`, :478; set :2495),
+//! create-lock serialization (:2218, lock/key defined :1002-1033)). The Rust
+//! port had no equivalent: fresh UUIDs were minted unconditionally, and the
+//! frozen client re-sends unanswered creates with the SAME requestId on every
+//! reconnect — without this guard every resend spawns a duplicate PTY and
+//! orphans the original as a detached background session.
 //!
 //! Mechanism divergence, same wire outcome: legacy serializes duplicates
 //! on the create lock and answers them from the settled cache on the NEW
@@ -17,16 +16,18 @@
 //! the stored `terminal.created` to every waiter; every non-settled exit
 //! (`clear_if_in_flight`) forwards a fail-loud error instead. A silently
 //! swallowed duplicate would wedge the reconnected pane in 'creating'
-//! (A2, TerminalView.tsx:3995-3999).
+//! (the frozen client's reply matching is by requestId,
+//! TerminalView.tsx:4216; error match :4702).
 //!
 //! Eviction semantics:
 //! - failed create -> the wrapper calls `clear_if_in_flight` (legacy
-//!   sentinel cleanup, ws-handler.ts:2460), which also notifies waiters
+//!   sentinel cleanup, ws-handler.ts:2704), which also notifies waiters
 //! - settled entries are retained for replay for exactly as long as their
 //!   terminal is running (legacy parity with the Node server's
 //!   delete-at-exit requestId pruning: `createdTerminalByRequestId` is
-//!   pruned eagerly at terminal exit, ws-handler.ts:580-587, and lazily
-//!   on registry miss, :914-921). Eviction is lazy -- `settle()` prunes
+//!   pruned eagerly at terminal exit (onTerminalExitBound :591-593 ->
+//!   forgetCreatedRequestIdsForTerminal :906-910) and lazily
+//!   on registry miss, :929-931). Eviction is lazy -- `settle()` prunes
 //!   all dead entries on access and `begin()` displaces per-id via the
 //!   `is_running` probe -- with no background task. Within a terminal's
 //!   running lifetime a duplicate replays the original `terminal.created`
