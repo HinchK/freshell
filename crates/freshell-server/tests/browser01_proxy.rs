@@ -80,6 +80,18 @@ fn drain_stderr(child: &mut Child) -> String {
     buf
 }
 
+/// Kill-on-drop guard: a panicking assertion must never orphan the spawned
+/// server (std's `Child` does NOT kill on drop; a leaked freshell-server
+/// would hold its port and confuse sibling swarm workers).
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 // ── Raw wire helpers (verbatim both directions) ────────────────────────────
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -331,11 +343,10 @@ async fn browser01_proxy_through_the_real_binary() {
         panic!("freshell-server never became healthy on port {port}; stderr:\n{stderr}");
     }
 
-    let result = run_proxy_flow(port, &token).await;
-
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    // From here on the guard owns teardown: any panic in the flow still
+    // kills and reaps the child.
+    let _guard = ChildGuard(child);
+    run_proxy_flow(port, &token).await;
 }
 
 async fn run_proxy_flow(port: u16, token: &str) {
