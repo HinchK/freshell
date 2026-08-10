@@ -225,5 +225,26 @@ if ! echo "$DRY_OUTPUT" | grep -q -- "--grep=wrap-review spaced sentinel --proje
 fi
 echo "PASS: entrypoint keeps space-containing PLAYWRIGHT_ARGS entries intact"
 
+# Check 14: SPLIT-FORM value flags ("--grep foo", "--project chromium") are
+# normalized to =form before either backend consumes the args. Without
+# normalization the cloud entrypoint's dash-vs-positional classification
+# silently reordered split values behind later flags
+# ("--project chromium --grep 'auth modal'" corrupted into
+# "--project --grep chromium 'auth modal'"). Playwright binds =form
+# identically, so the observable pin here is the local run filtering
+# auth.spec.ts down to its 3 modal-titled tests via split-form args.
+echo "Testing: split-form flags normalize (--project chromium --grep 'auth modal')"
+SPLIT_OUTPUT=$("$SCRIPT" run --local --project chromium test/e2e-browser/specs/auth.spec.ts --reporter line --grep "auth modal" 2>&1) || {
+  echo "FAIL: --local run with split-form flags failed (normalization corrupted argv?)"
+  echo "$SPLIT_OUTPUT" | tail -20
+  exit 1
+}
+if ! echo "$SPLIT_OUTPUT" | grep -q "3 passed"; then
+  echo "FAIL: expected '3 passed' for split-form --grep 'auth modal'"
+  echo "$SPLIT_OUTPUT" | tail -20
+  exit 1
+fi
+echo "PASS: split-form value flags are normalized before dispatch"
+
 echo ""
 echo "=== All checks passed ==="

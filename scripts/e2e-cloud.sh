@@ -209,6 +209,38 @@ cmd_run() {
     esac
   done
 
+  # Normalize split-form Playwright value flags ("--grep foo" ->
+  # "--grep=foo") BEFORE either backend consumes pw_args. The cloud path
+  # serializes the args one per line and the container entrypoint
+  # classifies entries by shape (dash-prefixed => flag, else positional
+  # spec filter), which is only correct when every value-carrying flag is
+  # a SINGLE token: a split-form value would be reclassified as a spec
+  # filter and silently REORDERED behind the remaining flags
+  # ("--project chromium --grep 'auth modal'" became
+  # "--project --grep chromium 'auth modal'"). Playwright binds =form
+  # identically to split form, so local runs are unaffected. Only the
+  # documented value-taking flags are rewritten; boolean switches and the
+  # optional-value --update-snapshots are never split-form here.
+  local -a value_flags=(--grep --grep-invert --project --reporter --retries --workers --timeout --global-timeout --max-failures --repeat-each --output)
+  local -a normalized=()
+  local i arg vf matched
+  for ((i = 0; i < ${#pw_args[@]}; i++)); do
+    arg="${pw_args[i]}"
+    matched=false
+    for vf in "${value_flags[@]}"; do
+      if [ "$arg" = "$vf" ] && [ $((i + 1)) -lt ${#pw_args[@]} ]; then
+        normalized+=("$vf=${pw_args[i + 1]}")
+        i=$((i + 1))
+        matched=true
+        break
+      fi
+    done
+    if [ "$matched" = false ]; then
+      normalized+=("$arg")
+    fi
+  done
+  pw_args=("${normalized[@]}")
+
   # Resolve backend: explicit flags override env var; env var defaults to local.
   if $cloud_mode; then
     local_mode=false
