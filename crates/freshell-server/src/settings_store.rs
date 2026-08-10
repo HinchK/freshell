@@ -322,6 +322,20 @@ impl SettingsStore {
         self.inner.read().await.clone()
     }
 
+    /// CFG-12: share the ONE live settings tree by lock so the `/ws`
+    /// connect handshake (`freshell_ws::WsState::handshake_settings` →
+    /// `build_handshake_with_capabilities`) resolves CURRENT values on every
+    /// connection — the original's per-connection `handshakeSnapshotProvider`
+    /// (`server/index.ts:415-427` awaits `configStore.getSettings()`; the
+    /// frame goes out via `ws-handler.ts:1815-1845`). Because this vends THIS
+    /// store's inner lock (never a copy), a value committed by [`Self::patch`]
+    /// is precisely what the next (re)connecting client's `settings.updated`
+    /// carries — closing the boot-frozen-snapshot gap behind the CFG-12 e2e
+    /// red (a PATCHed `defaultCwd` never reached a second browser context).
+    pub fn shared_settings_lock(&self) -> Arc<RwLock<ServerSettings>> {
+        Arc::clone(&self.inner)
+    }
+
     /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
     /// — the resolve route's unsearched-provider computation and snapshot
     /// provider gate read this (`resolve.rs`). Async because the settings
@@ -3082,6 +3096,55 @@ mod tests {
         assert_unmanaged_document_state_preserved(&cfg);
         assert_eq!(cfg["settings"]["logging"]["debug"], json!(false));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CFG-12 RED/GREEN target (Arc identity): `shared_settings_lock()` must
+    /// vend the store's ONE live tree, so a PATCH-committed value is exactly
+    /// what the next `/ws` connection's handshake resolves
+    /// (`server/index.ts:415-427` per-connection `configStore.getSettings()`
+    /// parity). If this ever vended a copy/divergent handle, the handshake
+    /// would silently freeze again while every REST surface stayed live.
+    #[tokio::test]
+    async fn patch_is_visible_through_shared_settings_lock() {
+        let dir = std::env::temp_dir().join(format!("frs-sharedlk-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let shared = store.shared_settings_lock();
+
+        assert!(shared.read().await.default_cwd.is_none());
+        store
+            .patch(&json!({ "defaultCwd": "/tmp/replicated-cwd" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            shared.read().await.default_cwd.as_deref(),
+            Some("/tmp/replicated-cwd"),
+            "the handshake's live source must observe the committed PATCH tree"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CFG-12 (restart half of the checklist validation text): a PATCHed
+    /// `defaultCwd` is durable -- it survives a full store reload from disk
+    /// (the e2e restart leg boots a second process over the same home).
+    #[tokio::test]
+    async fn patched_default_cwd_survives_reload_from_disk() {
+        let dir = std::env::temp_dir().join(format!("frs-cwdreload-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        store
+            .patch(&json!({ "defaultCwd": "/tmp/durable-cwd" }))
+            .await
+            .unwrap();
+        drop(store);
+
+        let reloaded = store_at(&dir);
+        assert_eq!(
+            reloaded.get().await.default_cwd.as_deref(),
+            Some("/tmp/durable-cwd")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

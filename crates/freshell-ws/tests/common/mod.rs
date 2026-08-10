@@ -39,6 +39,19 @@ pub fn isolate_amplifier_home() -> std::path::PathBuf {
         .clone()
 }
 
+/// CFG-12: the live handshake-settings handle for harness `WsState`s. Seeded
+/// from the SAME fixture tree as the frozen `settings` field (clean-boot byte
+/// parity), but independently mutable behind the lock: a test writing through
+/// it changes what the NEXT `/ws` connection's handshake resolves — exactly
+/// like a `PATCH /api/settings`-committed value in production, where
+/// freshell-server wires `SettingsStore::shared_settings_lock()` into the
+/// same slot (`crates/freshell-server/src/main.rs`).
+pub fn handshake_settings_lock() -> Arc<tokio::sync::RwLock<freshell_protocol::ServerSettings>> {
+    Arc::new(tokio::sync::RwLock::new(
+        serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
+    ))
+}
+
 pub fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -108,6 +121,92 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
     .await
 }
 
+/// [`spawn_server_with_specs`], additionally handing back the LIVE
+/// handshake-settings lock wired into `WsState.handshake_settings` (CFG-12),
+/// so a test can mutate the tree between connections and assert what each
+/// `/ws` handshake resolves. The frozen `settings` field is seeded
+/// independently — mirroring prod, where create-time derivations stay
+/// boot-scoped (CFG-06's separate boundary).
+#[allow(dead_code)] // not every test binary uses the shared-settings variant
+pub async fn spawn_server_with_specs_and_shared_settings(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<tokio::sync::RwLock<freshell_protocol::ServerSettings>>,
+) {
+    let _ = isolate_amplifier_home();
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let handshake_settings = handshake_settings_lock();
+    let registry = freshell_terminal::TerminalRegistry::new();
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        handshake_settings: Arc::clone(&handshake_settings),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (
+        format!("ws://{addr}/ws", addr = addr),
+        registry,
+        handshake_settings,
+    )
+}
+
 #[allow(dead_code)] // not every test binary uses the injectable variant
 pub async fn spawn_server_with_specs(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
@@ -127,6 +226,7 @@ pub async fn spawn_server_with_specs(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
@@ -204,6 +304,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -285,6 +386,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -363,6 +465,7 @@ pub async fn spawn_server_with_specs_and_state(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
@@ -449,6 +552,7 @@ pub async fn spawn_server_with_ledger(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
@@ -531,6 +635,7 @@ pub async fn spawn_server_with_specs_and_activity(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
@@ -612,6 +717,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
@@ -715,6 +821,7 @@ pub async fn spawn_server_with_create_protect_probes(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),

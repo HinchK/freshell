@@ -793,6 +793,12 @@ async fn main() -> ExitCode {
         server_instance_id: Arc::clone(&server_instance_id),
         boot_id,
         settings: Arc::clone(&settings),
+        // CFG-12: the /ws handshake's `settings.updated` resolves the LIVE
+        // store per connection (legacy parity: per-connection
+        // `handshakeSnapshotProvider` -> `configStore.getSettings()`), so a
+        // PATCH committed after boot reaches the next (re)connecting client.
+        // `settings` above stays the boot-frozen create-time view (CFG-06).
+        handshake_settings: settings_store.shared_settings_lock(),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),

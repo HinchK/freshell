@@ -90,10 +90,15 @@ test.describe('Settings Persistence Split', () => {
   //     deeper one-shot-consumption acceptance lives in
   //     `cfg04-legacy-browser-seed.spec.ts`; triage entry point for a seed
   //     regression is docs/plans/df1-evidence/CFG-04.md);
-  //   - defaultCwd replication test at the bottom: expected-PASS on
-  //     `legacy-chromium`, pinned `test.fail` on `rust-chromium` with owner
-  //     CFG-12. When CFG-12 lands, Playwright turns the unexpected pass
-  //     into a hard failure -- the signal to delete that `test.fail` line.
+  //   - defaultCwd replication test at the bottom: expected-PASS on BOTH
+  //     projects. This was pinned `test.fail` on `rust-chromium` with owner
+  //     CFG-12; CFG-12 (df1) then made the rust `/ws` connect handshake
+  //     resolve the LIVE settings store per connection
+  //     (`crates/freshell-ws/src/lib.rs` `WsState::handshake_settings` +
+  //     `SettingsStore::shared_settings_lock()`, mirroring the original's
+  //     per-connection `handshakeSnapshotProvider`, `server/index.ts:415-427`)
+  //     and the pin was deleted; triage entry point for a replication
+  //     regression is docs/plans/df1-evidence/CFG-12.md.
   test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo }) => {
     const contextA = await browser.newContext()
     const pageA = await contextA.newPage()
@@ -151,20 +156,7 @@ test.describe('Settings Persistence Split', () => {
     await contextA.close()
   })
 
-  test('server-shared defaultCwd set by one profile replicates to another and persists to config.json', async ({ browser, serverInfo, e2eServerKind }) => {
-    // CFG-12 (owner; queued, not yet started -- pinned 2026-08-09): the
-    // rust server accepts PATCH /api/settings { defaultCwd } but never
-    // surfaces it through the WS/bootstrap resolved-settings payload, so a
-    // second client reloads to `defaultCwd === undefined`. Observed red on
-    // `rust-chromium` at the `getResolvedSettings(pageB)?.defaultCwd`
-    // poll below (evidence: docs/plans/df1-evidence/JAN-87.md). Legacy is
-    // expected-pass; a rust unexpected pass after CFG-12 lands fails hard
-    // here, flagging this pin for deletion.
-    test.fail(
-      e2eServerKind === 'rust',
-      'CFG-12: rust WS/bootstrap settings resolution drops a PATCHed server-shared defaultCwd (2026-08-09)',
-    )
-
+  test('server-shared defaultCwd set by one profile replicates to another and persists to config.json', async ({ browser, serverInfo }) => {
     const contextA = await browser.newContext()
     const pageA = await contextA.newPage()
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
