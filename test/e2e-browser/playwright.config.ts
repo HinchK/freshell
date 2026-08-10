@@ -124,6 +124,13 @@ export const MATRIX_SPECS = [
   // server) — browser-independent content, standard for MATRIX_SPECS. See
   // docs/plans/df1-evidence/TERM-04.md.
   /terminal-create-dedupe\.spec\.ts$/,
+  // HARNESS-12 — leak/resource measurement gate: a bounded create/send/close
+  // loop + restart + stop must return to a bounded baseline (no listening-port,
+  // fd-handle, process, RSS, or socket-queue leaks) on BOTH server kinds; the
+  // collector logic itself is unit-tested fixture-driven in
+  // helpers/leak-metrics.test.ts. See leak-metrics.spec.ts and
+  // docs/plans/df1-evidence/HARNESS-12.md.
+  /leak-metrics\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
