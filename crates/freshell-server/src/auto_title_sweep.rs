@@ -468,12 +468,49 @@ fn spawn_ai_title_task(
     });
 }
 
+/// The sweep's per-session title overlay -- the override-applied display
+/// title fed to [`SweepSession::title`] (and from there to
+/// `compute_session_title_sync`'s `session_title` input / the canonical-title
+/// push). Node parity: the sweep's `sessionTitle` input is the already-
+/// `applyOverride`'d session title (`auto-title.ts:52-54`), so this mirrors
+/// `applyOverride`'s title clause (`session-indexer.ts:210-214`).
+///
+/// NOTE the scope: this guards ONLY the display/push title.
+/// [`run_auto_title_pass`] still reads the RAW override row for
+/// `compute_session_title_sync`'s `override_title`/`override_source` inputs
+/// (write-side rung gating) -- if the sweep saw a suppressed row as absent
+/// it would re-patch every tick (a config write storm Node does not have).
+fn overlay_session_title(
+    overrides: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    parsed_title: Option<&str>,
+    parsed_title_source: Option<&str>,
+) -> Option<String> {
+    let row = overrides.get(key);
+    // Node's applyOverride guard (`session-indexer.ts:210-214`): the override
+    // title applies iff it is NON-EMPTY (JS `!!`) AND NOT (the PARSED source
+    // is 'provider-generated' AND the row's `titleSource` is exactly
+    // 'dir'/'first-message', strict `===` -- 'ai'/'user'/absent/any-other row
+    // source still applies).
+    let row_source = row
+        .and_then(|r| r.get("titleSource"))
+        .and_then(|v| v.as_str());
+    let provider_generated_shadow = parsed_title_source == Some("provider-generated")
+        && matches!(row_source, Some("dir") | Some("first-message"));
+    row.and_then(|r| r.get("titleOverride"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty() && !provider_generated_shadow)
+        .map(str::to_string)
+        .or_else(|| parsed_title.map(str::to_string))
+}
+
 /// The background loop — same shape as `spawn_sessions_sweep` (main.rs):
 /// `tokio::time::interval` with `MissedTickBehavior::Skip`; per tick,
 /// snapshot the index with the SAME accessor (`SessionIndex::snapshot`),
 /// map `IndexedSession` -> [`SweepSession`] (the `title` is the
-/// OVERRIDE-APPLIED title: `overrides[key].titleOverride` when present,
-/// else the parsed title), then [`run_auto_title_pass`].
+/// OVERRIDE-APPLIED title via [`overlay_session_title`], which mirrors
+/// `applyOverride`'s provider-generated suppression), then
+/// [`run_auto_title_pass`].
 pub fn spawn_auto_title_sweep(
     state: AutoTitleSweepState,
     index: Arc<freshell_sessions::directory_index::SessionIndex>,
@@ -490,12 +527,12 @@ pub fn spawn_auto_title_sweep(
                 .iter()
                 .map(|s| {
                     let key = s.key();
-                    let title = overrides
-                        .get(&key)
-                        .and_then(|row| row.get("titleOverride"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or_else(|| s.title.clone());
+                    let title = overlay_session_title(
+                        &overrides,
+                        &key,
+                        s.title.as_deref(),
+                        s.title_source.as_deref(),
+                    );
                     SweepSession {
                         provider: s.provider.clone(),
                         session_id: s.session_id.clone(),
@@ -594,6 +631,48 @@ mod tests {
             title_source: None,
             git_branch: None,
         }
+    }
+
+    // -- Task 5b: the provider-generated read-guard on the SweepSession
+    // title overlay (`applyOverride`, `session-indexer.ts:204-220`) --------
+
+    #[test]
+    fn provider_generated_session_keeps_parsed_title_over_dir_override_row_in_overlay() {
+        // The mapping that feeds run_auto_title_pass must NOT drive the
+        // canonical-push input to the dir basename for a provider-generated
+        // session: the parsed provider title stands.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "amplifier:s1".into(),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        let title = overlay_session_title(
+            &overrides,
+            "amplifier:s1",
+            Some("Provider Title"),
+            Some("provider-generated"),
+        );
+        assert_eq!(title.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn overlay_applies_dir_override_row_for_non_provider_generated_session() {
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:s1".into(),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        let title = overlay_session_title(&overrides, "claude:s1", Some("parsed"), None);
+        assert_eq!(title.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn overlay_never_applies_empty_string_override() {
+        // Node `!!ov?.titleOverride`: '' is falsy, for ANY session.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("claude:s1".into(), json!({ "titleOverride": "" }));
+        let title = overlay_session_title(&overrides, "claude:s1", Some("parsed"), None);
+        assert_eq!(title.as_deref(), Some("parsed"));
     }
 
     #[tokio::test]

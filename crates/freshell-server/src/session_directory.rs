@@ -128,6 +128,14 @@ struct DirItem {
     /// in this port (the original's parsed items don't set it either, see
     /// `toItems`/`joinRunningState`, `service.ts:132-151`).
     session_type: Option<String>,
+    /// The PARSED (pre-override) title source (`IndexedSession::title_source`,
+    /// Node's `ParsedSessionTitleSource`; `"provider-generated"` or absent) --
+    /// consulted by [`apply_session_overrides`]'s provider-generated
+    /// read-guard (`applyOverride`, `session-indexer.ts:204-220`). Internal
+    /// only: never serialized by [`DirItem::to_value`] (this port's directory
+    /// response has never carried `titleSource`; exposing it would be a
+    /// separate parity decision).
+    title_source: Option<String>,
     /// SESSION-07: the on-disk transcript to scan for the `userMessages`/
     /// `fullText` tiers (`IndexedSession::source_file`). Internal only --
     /// never serialized (`to_value` never reads it), mirroring
@@ -502,6 +510,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        title_source: idx.title_source.clone(),
         source_file: idx.source_file.clone(),
     }
 }
@@ -652,6 +661,7 @@ fn item_from_meta(
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        title_source: meta.title_source.clone(),
         source_file,
     }
 }
@@ -673,7 +683,22 @@ fn apply_session_overrides(
                     return None;
                 }
                 if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
-                    item.title = Some(t.to_string());
+                    // Node's applyOverride guard (`session-indexer.ts:210-214`):
+                    // the override title applies iff it is NON-EMPTY (JS `!!`)
+                    // AND NOT (the PARSED source is 'provider-generated' AND
+                    // the row's `titleSource` is exactly 'dir'/'first-message',
+                    // strict `===` -- 'ai'/'user'/absent/any-other row source
+                    // still applies). Without this, the auto-title sweep's
+                    // dir/first-message row re-shadows a provider-generated
+                    // title within one 2s tick of the ai-title-shadow-cleanup
+                    // migration clearing it.
+                    let row_source = ov.get("titleSource").and_then(Value::as_str);
+                    let provider_generated_shadow = item.title_source.as_deref()
+                        == Some("provider-generated")
+                        && matches!(row_source, Some("dir") | Some("first-message"));
+                    if !t.is_empty() && !provider_generated_shadow {
+                        item.title = Some(t.to_string());
+                    }
                 }
                 if let Some(s) = ov.get("summaryOverride").and_then(Value::as_str) {
                     item.summary = Some(s.to_string());
@@ -800,6 +825,10 @@ fn build_live_terminal_session_item(
         running_terminal_id: Some(identity.terminal_id.clone()),
         live_terminal_only: identity.session_id.is_none(),
         session_type: Some(provider),
+        // A synthesized live-terminal item has no parsed transcript, hence no
+        // parsed title source (Node's `buildLiveTerminalSessionItem` sets no
+        // `titleSource` either, `service.ts:110-130`).
+        title_source: None,
         source_file: None,
     })
 }
@@ -858,6 +887,7 @@ mod join_tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         }
     }
@@ -1593,6 +1623,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
@@ -1806,6 +1837,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let items = vec![mk("keep"), mk("gone")];
@@ -1849,6 +1881,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
@@ -1856,6 +1889,143 @@ mod tests {
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
         assert_eq!(v["title"], json!("t"));
+    }
+
+    // -- Task 5b: the provider-generated read-guard (`applyOverride`,
+    // `session-indexer.ts:204-220`) ------------------------------------------
+    //
+    // The auto-title sweep re-writes a qualifying `dir`/`first-message`
+    // override row for any live amplifier session within one 2s tick of the
+    // ai-title-shadow-cleanup migration clearing it (write parity with Node,
+    // `auto-title.ts:24-46`). Node stays correct because its READ model hides
+    // such rows; this matrix pins that suppression, ported here.
+
+    /// One parsed item whose PARSED title source is configurable; the parsed
+    /// title is always "Provider Title" so tests can assert whether the
+    /// override or the parsed title won.
+    fn guard_item(sid: &str, title_source: Option<&str>) -> DirItem {
+        DirItem {
+            session_id: sid.into(),
+            provider: "amplifier".into(),
+            project_path: "/p".into(),
+            title: Some("Provider Title".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: title_source.map(str::to_string),
+            source_file: None,
+        }
+    }
+
+    /// Overlay ONE override row onto ONE item; returns the resulting title.
+    fn overlaid_title(item: DirItem, row: Value) -> Option<String> {
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(item.key(), row);
+        let out = apply_session_overrides(vec![item], &overrides);
+        out[0].title.clone()
+    }
+
+    #[test]
+    fn provider_generated_session_suppresses_dir_override_row() {
+        // The load-bearing case: a provider-generated session with a
+        // sweep-written dir row must serve the PARSED provider title.
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        assert_eq!(title.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_suppresses_first_message_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "Fix the flux", "titleSource": "first-message" }),
+        );
+        assert_eq!(title.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_ai_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "AI Title", "titleSource": "ai" }),
+        );
+        assert_eq!(title.as_deref(), Some("AI Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_user_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "My Rename", "titleSource": "user" }),
+        );
+        assert_eq!(title.as_deref(), Some("My Rename"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_absent_source_override_row() {
+        // Node compares strict `===` against exactly 'dir'/'first-message':
+        // an ABSENT (or legacy/other) row source fails both comparisons and
+        // the override still applies.
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "Legacy Rename" }),
+        );
+        assert_eq!(title.as_deref(), Some("Legacy Rename"));
+    }
+
+    #[test]
+    fn empty_string_title_override_never_applies() {
+        // Node `!!ov?.titleOverride`: '' is falsy, for ANY session.
+        let provider_generated = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "", "titleSource": "user" }),
+        );
+        assert_eq!(provider_generated.as_deref(), Some("Provider Title"));
+        let plain = overlaid_title(guard_item("s2", None), json!({ "titleOverride": "" }));
+        assert_eq!(plain.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn non_provider_generated_session_still_applies_dir_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", None),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        assert_eq!(title.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn suppressed_title_row_still_overlays_summary_and_archived() {
+        // applyOverride suppresses ONLY the title clause; summary/archived
+        // overlay regardless (session-indexer.ts:215-217).
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "amplifier:s1".into(),
+            json!({
+                "titleOverride": "proj", "titleSource": "dir",
+                "summaryOverride": "sum", "archived": true
+            }),
+        );
+        let out = apply_session_overrides(
+            vec![guard_item("s1", Some("provider-generated"))],
+            &overrides,
+        );
+        assert_eq!(out[0].title.as_deref(), Some("Provider Title"));
+        assert_eq!(out[0].summary.as_deref(), Some("sum"));
+        assert!(out[0].archived);
     }
 
     // -- Batch B: the `SessionIndex`-backed production path --
@@ -2709,6 +2879,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let mut overrides = serde_json::Map::new();
