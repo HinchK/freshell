@@ -45,8 +45,13 @@
 //!   - Terminals: `terminal_id` plus spawn-mode/cwd/pid on
 //!     `terminal.created`, `exit_code` on `terminal.exited`, the kill actor
 //!     (`by`: api/idle/shutdown) on `terminal.killed`
-//!   - Fresh agents: `provider`, `session_id`, plus sidecar `pid` on
-//!     `freshagent.sidecar.spawned`
+//!   - Fresh agents: `provider` + `session_id` on the session lifecycle
+//!     events (`freshagent.session.created`, `...session.crash_detected`,
+//!     `...sidecar.reaped`, crash-recovery events); `freshagent.sidecar.spawned`
+//!     carries `provider` + the spawned process `pid` (no `session_id` --
+//!     the spawn can precede session minting on the create path; the
+//!     pid<->session join is the same session's adjacent created/reaped
+//!     events). Prompt/turn CONTENT is never logged anywhere.
 //!   - Server lifecycle: `server.started` (`bind`, `port`, `boot_id`,
 //!     `instance_id`, `commit`, `dirty`) -> `server.stopping` (`signal`)
 //!     -> `server.stopped` (plus the `shutdown_forensics` diagnostic record)

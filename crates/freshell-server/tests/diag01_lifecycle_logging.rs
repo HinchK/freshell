@@ -533,6 +533,21 @@ async fn diag01_full_flow_log_schema_and_correlation() {
             .unwrap_or(false),
         "freshagent.session.created carries a session_id"
     );
+    // The sidecar spawn event: the schema documents `pid` (the process just
+    // created) and static `provider` -- never a prompt or token. The
+    // pid<->session join is the same session's adjacent created/reaped
+    // events (spawned can precede session minting on the create path).
+    let sidecar = find_line(&lines, "freshagent.sidecar.spawned")
+        .expect("freshagent.sidecar.spawned must be logged");
+    assert!(
+        sidecar.value["pid"].as_u64().unwrap_or(0) > 0,
+        "sidecar.spawned carries the spawned process pid"
+    );
+    assert_eq!(
+        sidecar.value["provider"].as_str(),
+        Some("codex"),
+        "sidecar.spawned carries its provider"
+    );
 
     // Error entries: warn-level, route-correlated, distinct request ids.
     let http_events = find_all(&lines, "http_request");

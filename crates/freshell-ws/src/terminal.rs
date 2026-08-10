@@ -136,7 +136,12 @@ pub(crate) fn connection_span(conn_id: u64, origin_kind: &'static str) -> tracin
 /// (`freshell_ws=off`), nothing in this crate logs at all by the operator's
 /// express choice; the registry's `terminal.created` then joins only via
 /// `terminal_id` (documented in freshell-server's logging.rs schema).
-fn log_create_settled(conn_id: u64, request_id: &str, terminal_id: &str, path: &'static str) {
+pub(crate) fn log_create_settled(
+    conn_id: u64,
+    request_id: &str,
+    terminal_id: &str,
+    path: &'static str,
+) {
     tracing::info!(
         connection_id = conn_id,
         request_id = %request_id,
@@ -677,11 +682,13 @@ async fn handle_client_text(
             // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
             // so a resend during any of those windows is answered from here instead
             // of re-entering the create path.
-            match state
-                .create_dedupe
-                .begin(&create.request_id, conn_sink, create.restore, |tid| {
-                    state.registry.is_pty_running(tid)
-                }) {
+            match state.create_dedupe.begin(
+                &create.request_id,
+                conn_sink,
+                create.restore,
+                |tid| state.registry.is_pty_running(tid),
+                conn_id,
+            ) {
                 crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
                     // Re-send the original terminal.created (same requestId,
                     // same terminalId) — never spawn a duplicate.

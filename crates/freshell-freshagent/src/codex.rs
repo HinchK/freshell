@@ -2050,7 +2050,11 @@ impl FreshCodexState {
             }
         }
 
-        tracing::info!(pid = child.id().unwrap_or(0), "freshagent.sidecar.spawned");
+        tracing::info!(
+            provider = PROVIDER,
+            pid = child.id().unwrap_or(0),
+            "freshagent.sidecar.spawned"
+        );
         Ok((client, notifs, ownership_id, child))
     }
 
@@ -3284,7 +3288,7 @@ fn spawn_exit_watcher(
                 reap_owned_codex_sidecars(&ownership_id);
                 // Task 12: the bound session is gone -- reopen its durable id.
                 leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
@@ -3292,7 +3296,7 @@ fn spawn_exit_watcher(
                 // durable id (the entry stays mapped for PR-4 lazy respawn, which
                 // re-claims through the attach/send seams).
                 leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
                 // handled in the sibling arm above with no event here).
