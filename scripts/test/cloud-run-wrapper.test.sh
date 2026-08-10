@@ -155,5 +155,36 @@ if echo "$CLOUD_FLAG_OUTPUT" | grep -q "Running locally"; then
 fi
 echo "PASS: --cloud flag overrides FRESHELL_E2E_BACKEND=local"
 
+# Check 12: the wrapper works on machines WITHOUT gcloud for non-cloud
+# subcommands. The top-level gcloud-sdk PATH setup must not kill the script
+# under `set -e` before dispatch (previously a silent 127). `help` is the
+# deterministic pin (needs no node/npx); the `run --local` dispatch itself
+# never calls gcloud.
+echo "Testing: help works without gcloud on PATH"
+CLEAN_PATH="$PATH"
+if GCLOUD_PATH=$(command -v gcloud 2>/dev/null); then
+  GCLOUD_DIRNAME="$(cd "$(dirname "$GCLOUD_PATH")" && pwd)"
+  CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -vx "$GCLOUD_DIRNAME" | paste -sd:)"
+  if [ "$CLEAN_PATH" = "$PATH" ]; then
+    echo "FAIL: could not construct a gcloud-free PATH (gcloud dir not on PATH?)"
+    exit 1
+  fi
+fi
+if env PATH="$CLEAN_PATH" command -v gcloud >/dev/null 2>&1; then
+  echo "FAIL: gcloud still resolvable on the filtered PATH"
+  exit 1
+fi
+NO_GCLOUD_HELP=$(env PATH="$CLEAN_PATH" "$SCRIPT" help 2>&1) || {
+  echo "FAIL: help subcommand died without gcloud (top-level gcloud probe is not set -e safe)"
+  echo "$NO_GCLOUD_HELP" | tail -10
+  exit 1
+}
+if ! echo "$NO_GCLOUD_HELP" | grep -qi "usage"; then
+  echo "FAIL: help output without gcloud does not contain 'usage'"
+  echo "$NO_GCLOUD_HELP" | tail -10
+  exit 1
+fi
+echo "PASS: help works without gcloud on PATH"
+
 echo ""
 echo "=== All checks passed ==="

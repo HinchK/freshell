@@ -54,10 +54,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
-# Docker when pushing to Artifact Registry).
-GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
-if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
-  export PATH="$GCLOUD_BIN:$PATH"
+# Docker when pushing to Artifact Registry). Guarded: local runs, `help`,
+# and machines without gcloud must get past this section — a failing
+# `gcloud info` inside a bare assignment's command substitution would trip
+# `set -e` before ANY subcommand dispatch (a silent 127 with stderr
+# suppressed). Only the cloud paths below actually require gcloud.
+GCLOUD_SDK_ROOT=""
+if command -v gcloud >/dev/null 2>&1; then
+  GCLOUD_SDK_ROOT="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null || true)"
+fi
+if [ -n "$GCLOUD_SDK_ROOT" ] && [ -d "$GCLOUD_SDK_ROOT/bin" ] && ! echo "$PATH" | grep -q "$GCLOUD_SDK_ROOT/bin"; then
+  export PATH="$GCLOUD_SDK_ROOT/bin:$PATH"
 fi
 
 # ---------------------------------------------------------------------------
