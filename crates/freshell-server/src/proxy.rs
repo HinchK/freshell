@@ -69,7 +69,44 @@ const HOP_BY_HOP_RESPONSE_HEADERS: [&str; 3] = ["connection", "transfer-encoding
 
 /// Request headers dropped before forwarding upstream (`proxy-router.ts:91-93`:
 /// `host` is rewritten to the target; `connection`/`transfer-encoding` dropped).
-const STRIPPED_REQUEST_HEADERS: [&str; 3] = ["host", "connection", "transfer-encoding"];
+///
+/// SECURITY (wrap-review r3, deliberate hardening BEYOND the original legacy
+/// design; the same strip was applied to `server/proxy-router.ts` so both
+/// servers behave identically): `x-auth-token` is Freshell's own gate
+/// credential — the original forwarded it (and the `freshell-auth` cookie,
+/// filtered pair-wise in [`forward`]) to ANY proxied loopback app, handing a
+/// hostile local dev server a bearer token that drives every authenticated
+/// API/WS surface. A proxied app's OWN cookies/authorization still pass
+/// through (its session/login flows keep working); only our credentials are
+/// withheld.
+const STRIPPED_REQUEST_HEADERS: [&str; 4] =
+    ["host", "connection", "transfer-encoding", "x-auth-token"];
+
+/// The cookie NAME of Freshell's own gate credential ([`crate::boot::is_authed`]
+/// reads exactly this pair). Filtered out of forwarded `Cookie` values —
+/// upstream apps never learn the token, while their own cookies survive.
+const AUTH_COOKIE_NAME: &str = "freshell-auth";
+
+/// Rebuild a `Cookie` header value with every `freshell-auth` pair removed
+/// (name-compared exactly like [`crate::boot::cookie_value`]). `None` when
+/// nothing remains — the header is then dropped entirely.
+fn filter_auth_cookie(raw: &str) -> Option<String> {
+    let kept: Vec<&str> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            pair.split_once('=')
+                .map(|(name, _)| name.trim() != AUTH_COOKIE_NAME)
+                .unwrap_or(true)
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("; "))
+    }
+}
 
 /// Shared, cheaply-cloneable state for the proxy surface.
 #[derive(Clone)]
@@ -179,6 +216,23 @@ async fn forward(
     let mut fwd_headers = HeaderMap::new();
     for (name, value) in headers.iter() {
         if STRIPPED_REQUEST_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        if name == axum::http::header::COOKIE {
+            // Cookie values need PAIR-level filtering, not a whole-header
+            // drop: upstream apps keep their own cookies, only our
+            // `freshell-auth` credential pair is withheld. Unparseable
+            // values are dropped (fail closed for this header class).
+            let filtered = value.to_str().ok().and_then(filter_auth_cookie);
+            match filtered {
+                Some(joined) => match HeaderValue::from_str(&joined) {
+                    Ok(v) => {
+                        fwd_headers.append(name.clone(), v);
+                    }
+                    Err(_) => continue,
+                },
+                None => continue,
+            }
             continue;
         }
         fwd_headers.append(name.clone(), value.clone());
@@ -1422,7 +1476,11 @@ mod socket_contract_rest {
 
     /// Useful request headers pass through; `host` is rewritten to the
     /// loopback target; hop-by-hop framing headers are dropped —
-    /// `proxy-router.ts:90-93` exactly.
+    /// `proxy-router.ts:90-93` plus the wrap-review r3 security strip on
+    /// BOTH servers: the gate's own credentials (`x-auth-token` header,
+    /// the `freshell-auth` cookie pair) are withheld from upstream while
+    /// an app's own cookies (`session=live` here, mingled in ONE cookie
+    /// header with the auth pair) still flow.
     #[tokio::test]
     async fn useful_request_headers_pass_host_rewritten_framing_dropped() {
         let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
@@ -1435,7 +1493,7 @@ mod socket_contract_rest {
                 upstream_port,
                 "/h",
                 &[
-                    "cookie: session=live",
+                    "cookie: freshell-auth=the-gate-token; session=live; theme=dark",
                     "authorization: Bearer abc123",
                     "user-agent: FreshellE2E/1.0",
                     "accept: text/html, application/xhtml+xml",
@@ -1457,7 +1515,8 @@ mod socket_contract_rest {
         );
         assert_eq!(
             req.header_values("cookie").collect::<Vec<_>>(),
-            vec!["session=live"]
+            vec!["session=live; theme=dark"],
+            "the app's cookies survive; ONLY the freshell-auth pair is withheld"
         );
         assert_eq!(
             req.header_values("authorization").collect::<Vec<_>>(),
@@ -1494,11 +1553,47 @@ mod socket_contract_rest {
             0,
             "hop-by-hop dropped"
         );
-        // The auth token header is forwarded upstream too (legacy does the
-        // same — it strips nothing but host/connection/transfer-encoding).
+        // The gate's own credential must NEVER reach the upstream (the
+        // wrap-review r3 strip — the original legacy leak is patched on
+        // both servers).
         assert_eq!(
-            req.header_values("x-auth-token").collect::<Vec<_>>(),
-            vec![TOKEN]
+            req.header_values("x-auth-token").count(),
+            0,
+            "x-auth-token is withheld from upstream"
+        );
+    }
+
+    /// A request carrying ONLY the auth cookie (the browser pane's iframe
+    /// navigation shape: the browser attaches `freshell-auth` because the
+    /// iframe is same-origin) arrives at the upstream with NO cookie header
+    /// at all — not even an empty residue.
+    #[tokio::test]
+    async fn auth_only_cookie_is_dropped_entirely_upstream() {
+        let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(
+                proxy_port,
+                TOKEN,
+                "GET",
+                upstream_port,
+                "/only-auth",
+                &["cookie: freshell-auth=the-gate-token"],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200);
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].header_values("cookie").count(),
+            0,
+            "a cookie header carrying only freshell-auth must not reach upstream"
+        );
+        assert_eq!(
+            got[0].header_values("x-auth-token").count(),
+            0,
+            "the gate header never reaches upstream"
         );
     }
 

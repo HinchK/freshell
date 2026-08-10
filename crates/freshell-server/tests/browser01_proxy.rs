@@ -371,12 +371,42 @@ async fn run_proxy_flow(port: u16, token: &str) {
             "GET /api/proxy/http/{upstream_port}/ HTTP/1.1\r\n\
              host: 127.0.0.1:{port}\r\n\
              x-auth-token: {token}\r\n\
+             cookie: freshell-auth={token}; app=kept\r\n\
              connection: close\r\n\r\n"
         )
         .as_bytes(),
     )
     .await;
     assert_eq!(resp.status_code(), 200, "proxied GET status");
+    // The proxy gate's own credentials never cross to the upstream
+    // (wrap-review r3, both servers): the captured upstream request carries
+    // neither `x-auth-token` nor the `freshell-auth` cookie pair — while
+    // the proxied app's own cookie survives.
+    {
+        let got = captured.lock().await;
+        let upstream_req = got
+            .iter()
+            .find(|r| r.raw_target() == "/")
+            .expect("upstream captured the GET");
+        assert!(
+            !upstream_req
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-auth-token")),
+            "x-auth-token leaked upstream: {:?}",
+            upstream_req.headers
+        );
+        let cookie = upstream_req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            cookie,
+            Some("app=kept"),
+            "freshell-auth pair filtered, app cookie preserved"
+        );
+    }
     assert_eq!(resp.body, b"<h1>hi!</h1>");
     assert_eq!(resp.header_values("x-frame-options").count(), 0);
     assert_eq!(resp.header_values("content-security-policy").count(), 0);

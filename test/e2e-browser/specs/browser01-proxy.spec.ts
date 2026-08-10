@@ -63,6 +63,10 @@ function chrome(result: string): string {
   <pre id="stream-result"></pre>
 
   <script>
+    // An app-scoped cookie: proves the proxy withholds ONLY the freshell-auth
+    // credential pair (set AFTER the root navigation, so the echo/fetch legs
+    // below carry it while the root capture proves the auth pair never crossed).
+    document.cookie = 'app-session=fixture-1'
     document.getElementById('echo-btn').addEventListener('click', async () => {
       const resp = await fetch('api/echo?x=%2F&plus=1+2')
       document.getElementById('echo-result').textContent = await resp.text()
@@ -230,13 +234,20 @@ test.describe('BROWSER-01 same-origin reverse proxy', () => {
       // Upstream-side exactness: what the fixture server actually received.
       const root = fixture.captured.find((c) => c.rawUrl === '/')
       expect(root, 'upstream saw the iframe navigation').toBeTruthy()
-      expect(String(root!.headers.cookie ?? '')).toContain('freshell-auth=')
+      // Wrap-review r3 (both servers): the proxy's gate credentials are
+      // withheld from upstream — the root navigation carried ONLY the
+      // freshell-auth cookie, so nothing cookie-shaped may survive.
+      expect(String(root!.headers.cookie ?? '')).not.toContain('freshell-auth')
 
       const post = fixture.captured.find((c) => c.method === 'POST' && c.rawUrl === '/form-submit')
       expect(post?.body).toBe('message=hello+world&sigil=P%25ss%2F%26%3D%3F')
 
       const echo = fixture.captured.find((c) => c.rawUrl.startsWith('/api/echo'))
       expect(echo?.rawUrl).toBe('/api/echo?x=%2F&plus=1+2')
+      // By echo time the fixture's JS had set app-session=fixture-1: the
+      // app's cookie flows through, still without freshell-auth.
+      expect(String(echo?.headers.cookie ?? '')).toContain('app-session=fixture-1')
+      expect(String(echo?.headers.cookie ?? '')).not.toContain('freshell-auth')
 
       const query = fixture.captured.find((c) => c.rawUrl.startsWith('/query-submit'))
       expect(query?.rawUrl).toBe('/query-submit?q=a%2Fb%2Bc+d')
