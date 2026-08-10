@@ -6,7 +6,7 @@
 //! - resize percent math (`router.ts:608-619`)
 //! - the legacy fresh-agent content migration (`shared/fresh-agent.ts:140-360`
 //!   + `shared/session-contract.ts:34-62`) that `normalizeLayouts` /
-//!   `normalizePaneContentSnapshot` (`layout-store.ts:29-38`) run.
+//!     `normalizePaneContentSnapshot` (`layout-store.ts:29-38`) run.
 
 use serde_json::{json, Map, Value};
 

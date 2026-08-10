@@ -605,9 +605,8 @@ fn split_pane_select_pane_and_attach_content_reseed_derived_titles() {
     );
     let snap = store.get_normalized_snapshot(None);
     assert_eq!(snap["activePane"][tab_id.as_str()], json!(pane_id.clone()));
-    assert_eq!(
+    assert!(
         store.select_pane(Some(&tab_id), "ghost").is_ok(),
-        true,
         "Node trusts pane id when tab exists"
     );
     assert_eq!(store.select_pane(None, "ghost"), Err("pane not found"));
