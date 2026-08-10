@@ -58,14 +58,14 @@ const IFRAME_BLOCKED_HEADERS: [&str; 3] = [
     "content-security-policy-report-only",
 ];
 
-/// Hop-by-hop / framing response headers `hyper` recomputes for the outgoing
-/// response; forwarding them verbatim alongside a streamed body would double-frame.
-const HOP_BY_HOP_RESPONSE_HEADERS: [&str; 4] = [
-    "connection",
-    "transfer-encoding",
-    "content-length",
-    "keep-alive",
-];
+/// Hop-by-hop response headers `hyper` recomputes for the outgoing response;
+/// forwarding `transfer-encoding`/`connection` verbatim alongside a re-framed
+/// body would double-frame (or lie about) the wire. `content-length` is NOT in
+/// this set: reqwest runs with zero compression features, so response bytes
+/// are bit-exact (probe L4) and the upstream's declared length stays truthful
+/// — and legacy forwards it (`proxy-router.ts:35` strips ONLY the three
+/// iframe-blockers).
+const HOP_BY_HOP_RESPONSE_HEADERS: [&str; 3] = ["connection", "transfer-encoding", "keep-alive"];
 
 /// Request headers dropped before forwarding upstream (`proxy-router.ts:91-93`:
 /// `host` is rewritten to the target; `connection`/`transfer-encoding` dropped).
@@ -1192,5 +1192,88 @@ mod socket_contract_g3 {
             b"helloworld",
             "reassembled upstream body is the full stream"
         );
+    }
+}
+
+#[cfg(test)]
+mod socket_contract_g4 {
+    use super::wire_support::*;
+    use super::*;
+
+    const TOKEN: &str = "contract-token-0123456789abcdef";
+
+    fn spawn_proxy_router() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    fn head_for(proxy_port: u16, upstream_port: u16, path: &str) -> Vec<u8> {
+        format!(
+            "GET /api/proxy/http/{upstream_port}{path} HTTP/1.1\r\n\
+             host: 127.0.0.1:{proxy_port}\r\n\
+             x-auth-token: {TOKEN}\r\n\
+             connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// G4: `content-length` is NOT an iframe-blocking header — the removal set
+    /// is exactly `{x-frame-options, content-security-policy,
+    /// content-security-policy-report-only}` (`proxy-router.ts:19-23`), and
+    /// legacy's `writeHead(status, strippedHeaders)` forwards everything else,
+    /// length included. Because reqwest runs with zero compression features,
+    /// response bytes are bit-exact (probe L4), so the advertised length stays
+    /// truthful. hyper re-frames ONLY the genuinely hop-by-hop headers
+    /// (`connection`, `transfer-encoding`, `keep-alive`).
+    #[tokio::test]
+    async fn response_forwards_content_length_and_every_non_blocking_header() {
+        let upstream_port = spawn_raw_listener(move |mut wire| async move {
+            let _req = read_request(&mut wire).await;
+            wire.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  content-type: text/plain; charset=utf-8\r\n\
+                  content-length: 11\r\n\
+                  etag: \"v1-abc\"\r\n\
+                  cache-control: no-store\r\n\
+                  x-custom-upstream: keep-me\r\n\
+                  vary: accept-encoding\r\n\
+                  x-frame-options: DENY\r\n\
+                  content-security-policy: frame-ancestors 'none'\r\n\
+                  content-security-policy-report-only: default-src 'self'\r\n\r\n\
+                  hello world",
+            )
+            .await;
+        });
+        let proxy_port = spawn_proxy_router();
+        let resp = raw_exchange(proxy_port, &head_for(proxy_port, upstream_port, "/page")).await;
+        assert_eq!(resp.status_code(), 200);
+        assert_eq!(resp.body, b"hello world");
+        assert_eq!(
+            resp.header_values("content-length").collect::<Vec<_>>(),
+            vec!["11"],
+            "content-length must survive — it is not an iframe-blocking header"
+        );
+        assert_eq!(
+            resp.header_values("etag").collect::<Vec<_>>(),
+            vec!["\"v1-abc\""]
+        );
+        assert_eq!(resp.header_values("cache-control").collect::<Vec<_>>(), vec!["no-store"]);
+        assert_eq!(resp.header_values("x-custom-upstream").collect::<Vec<_>>(), vec!["keep-me"]);
+        assert_eq!(resp.header_values("vary").collect::<Vec<_>>(), vec!["accept-encoding"]);
+        assert_eq!(
+            resp.header_values("content-type").collect::<Vec<_>>(),
+            vec!["text/plain; charset=utf-8"]
+        );
+        // The removal set is EXACTLY these three — nothing more.
+        assert_eq!(resp.header_values("x-frame-options").count(), 0);
+        assert_eq!(resp.header_values("content-security-policy").count(), 0);
+        assert_eq!(resp.header_values("content-security-policy-report-only").count(), 0);
     }
 }
