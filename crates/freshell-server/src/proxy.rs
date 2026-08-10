@@ -1277,3 +1277,387 @@ mod socket_contract_g4 {
         assert_eq!(resp.header_values("content-security-policy-report-only").count(), 0);
     }
 }
+
+#[cfg(test)]
+mod socket_contract_rest {
+    use super::wire_support::*;
+    use super::*;
+
+    const TOKEN: &str = "contract-token-0123456789abcdef";
+
+    fn spawn_proxy_router() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    fn capture_upstream() -> (u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        (port, captured)
+    }
+
+    fn head_for(proxy_port: u16, method: &str, upstream_port: u16, path: &str) -> Vec<u8> {
+        head_for_extra(proxy_port, method, upstream_port, path, &[])
+    }
+
+    fn head_for_extra(
+        proxy_port: u16,
+        method: &str,
+        upstream_port: u16,
+        path: &str,
+        extra_headers: &[&str],
+    ) -> Vec<u8> {
+        let extras: String = extra_headers
+            .iter()
+            .map(|h| format!("{h}\r\n"))
+            .collect();
+        format!(
+            "{method} /api/proxy/http/{upstream_port}{path} HTTP/1.1\r\n\
+             host: 127.0.0.1:{proxy_port}\r\n\
+             x-auth-token: {TOKEN}\r\n\
+             {extras}\
+             connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    async fn one_free_closed_port() -> u16 {
+        // Bind then drop: nobody is listening at this port afterwards.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    /// Every HTTP method reaches upstream verbatim (`any(proxy)` mirrors
+    /// Express's method-agnostic `router.use`).
+    #[tokio::test]
+    async fn all_methods_forward_verbatim() {
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
+            let (upstream_port, captured) = capture_upstream();
+            let proxy_port = spawn_proxy_router();
+            let resp = raw_exchange(
+                proxy_port,
+                &head_for(proxy_port, method, upstream_port, "/m"),
+            )
+            .await;
+            assert_eq!(resp.status_code(), 200, "method {method}");
+            let got = captured.lock().await;
+            assert_eq!(got.len(), 1, "method {method}");
+            assert!(
+                got[0].request_line.starts_with(&format!("{method} /m ")),
+                "method {method} must reach upstream verbatim: {:?}",
+                got[0].request_line
+            );
+        }
+    }
+
+    /// Upstream statuses pass through untouched, including a 302 whose
+    /// `location` header must reach the iframe (redirects are NEVER followed
+    /// — Node's raw `http.request` follows none either).
+    #[tokio::test]
+    async fn statuses_and_redirect_location_forward_verbatim() {
+        let cases: &[(&[u8], u16)] = &[
+            (b"HTTP/1.1 201 Created\r\ncontent-length: 7\r\n\r\ncreated", 201),
+            (
+                b"HTTP/1.1 302 Found\r\nlocation: /target?x=%2F&y=1\r\ncontent-length: 0\r\n\r\n",
+                302,
+            ),
+            (b"HTTP/1.1 404 Not Found\r\ncontent-length: 7\r\n\r\nmissing", 404),
+            (b"HTTP/1.1 418 I'm a Teapot\r\ncontent-length: 6\r\n\r\nteapot", 418),
+        ];
+        for (response_bytes, expected_status) in cases {
+            let response_bytes = response_bytes.to_vec();
+            let upstream_port = spawn_raw_listener(move |mut wire| {
+                let response_bytes = response_bytes.clone();
+                async move {
+                    let _req = read_request(&mut wire).await;
+                    wire.write_all(&response_bytes).await;
+                }
+            });
+            let proxy_port = spawn_proxy_router();
+            let resp = raw_exchange(proxy_port, &head_for(proxy_port, "GET", upstream_port, "/s")).await;
+            assert_eq!(resp.status_code(), *expected_status);
+            if *expected_status == 302 {
+                assert_eq!(
+                    resp.header_values("location").collect::<Vec<_>>(),
+                    vec!["/target?x=%2F&y=1"],
+                    "the iframe must see the real 302 target (never followed)"
+                );
+            }
+        }
+    }
+
+    /// Error shapes stay byte-compatible with legacy:
+    /// `502 {"error":"Failed to connect to localhost:<port>"}`,
+    /// `400 {"error":"Invalid port number"}`,
+    /// `401 {"error":"Unauthorized"}`.
+    #[tokio::test]
+    async fn error_shapes_match_legacy() {
+        let proxy_port = spawn_proxy_router();
+
+        // 502: port with nobody listening.
+        let closed = one_free_closed_port().await;
+        let resp = raw_exchange(proxy_port, &head_for(proxy_port, "GET", closed, "/x")).await;
+        assert_eq!(resp.status_code(), 502);
+        assert_eq!(
+            String::from_utf8(resp.body).unwrap(),
+            format!("{{\"error\":\"Failed to connect to localhost:{closed}\"}}")
+        );
+
+        // 400: out-of-range and non-numeric ports.
+        for bad in ["0", "65536", "abc", "-1", "80x"] {
+            let resp = raw_exchange(
+                proxy_port,
+                format!(
+                    "GET /api/proxy/http/{bad}/x HTTP/1.1\r\n\
+                     host: 127.0.0.1:{proxy_port}\r\n\
+                     x-auth-token: {TOKEN}\r\n\
+                     connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert_eq!(resp.status_code(), 400, "port {bad:?}");
+            assert_eq!(String::from_utf8(resp.body).unwrap(), "{\"error\":\"Invalid port number\"}");
+        }
+
+        // 401: missing and wrong credentials.
+        for auth_line in ["", "x-auth-token: wrong-token\r\n"] {
+            let resp = raw_exchange(
+                proxy_port,
+                format!(
+                    "GET /api/proxy/http/{closed}/x HTTP/1.1\r\n\
+                     host: 127.0.0.1:{proxy_port}\r\n\
+                     {auth_line}\
+                     connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert_eq!(resp.status_code(), 401, "auth line {auth_line:?}");
+            assert_eq!(String::from_utf8(resp.body).unwrap(), "{\"error\":\"Unauthorized\"}");
+        }
+    }
+
+    /// Auth via the `freshell-auth` cookie (the browser pane's iframe path —
+    /// `buildHttpProxyUrl` keeps requests same-origin, so the cookie rides).
+    #[tokio::test]
+    async fn cookie_auth_accepted() {
+        let (upstream_port, _) = capture_upstream();
+        let proxy_port = spawn_proxy_router();
+        let resp = raw_exchange(
+            proxy_port,
+            format!(
+                "GET /api/proxy/http/{upstream_port}/ HTTP/1.1\r\n\
+                 host: 127.0.0.1:{proxy_port}\r\n\
+                 cookie: freshell-auth={TOKEN}\r\n\
+                 connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200);
+    }
+
+    /// Useful request headers pass through; `host` is rewritten to the
+    /// loopback target; hop-by-hop framing headers are dropped —
+    /// `proxy-router.ts:90-93` exactly.
+    #[tokio::test]
+    async fn useful_request_headers_pass_host_rewritten_framing_dropped() {
+        let (upstream_port, captured) = capture_upstream();
+        let proxy_port = spawn_proxy_router();
+        let resp = raw_exchange(
+            proxy_port,
+            &head_for_extra(
+                proxy_port,
+                "GET",
+                upstream_port,
+                "/h",
+                &[
+                    "cookie: session=live",
+                    "authorization: Bearer abc123",
+                    "user-agent: FreshellE2E/1.0",
+                    "accept: text/html, application/xhtml+xml",
+                    "accept-encoding: gzip",
+                    "x-custom-request: yes-please",
+                    "referer: http://127.0.0.1:9/inside",
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200);
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        let req = &got[0];
+        assert_eq!(
+            req.header_values("host").collect::<Vec<_>>(),
+            vec![format!("127.0.0.1:{upstream_port}")],
+            "host is rewritten to the loopback target exactly"
+        );
+        assert_eq!(req.header_values("cookie").collect::<Vec<_>>(), vec!["session=live"]);
+        assert_eq!(
+            req.header_values("authorization").collect::<Vec<_>>(),
+            vec!["Bearer abc123"]
+        );
+        assert_eq!(
+            req.header_values("user-agent").collect::<Vec<_>>(),
+            vec!["FreshellE2E/1.0"]
+        );
+        assert_eq!(
+            req.header_values("accept").collect::<Vec<_>>(),
+            vec!["text/html, application/xhtml+xml"]
+        );
+        assert_eq!(
+            req.header_values("accept-encoding").collect::<Vec<_>>(),
+            vec!["gzip"],
+            "the client's accept-encoding forwards untouched (passthrough, L4)"
+        );
+        assert_eq!(
+            req.header_values("x-custom-request").collect::<Vec<_>>(),
+            vec!["yes-please"]
+        );
+        assert_eq!(
+            req.header_values("referer").collect::<Vec<_>>(),
+            vec!["http://127.0.0.1:9/inside"]
+        );
+        assert_eq!(req.header_values("connection").count(), 0, "hop-by-hop dropped");
+        assert_eq!(req.header_values("keep-alive").count(), 0, "hop-by-hop dropped");
+        // The auth token header is forwarded upstream too (legacy does the
+        // same — it strips nothing but host/connection/transfer-encoding).
+        assert_eq!(
+            req.header_values("x-auth-token").collect::<Vec<_>>(),
+            vec![TOKEN]
+        );
+    }
+
+    /// Response streaming: the first chunk must be observable at the CLIENT
+    /// while the upstream is still holding the second back — the response is a
+    /// live pipe, not a filled buffer. Signal-gated both directions; zero
+    /// wall-clock sleeps.
+    #[tokio::test]
+    async fn response_streams_chunk_by_chunk_incrementally() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let release_rx = Arc::clone(&release_rx);
+            async move {
+                let _req = read_request(&mut wire).await;
+                wire.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      content-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\n\r\n\
+                      5\r\nhello\r\n",
+                )
+                .await;
+                // Hold the second chunk until the test proves the first one
+                // already arrived at the client.
+                if let Some(rx) = release_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+                wire.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
+            }
+        });
+        let proxy_port = spawn_proxy_router();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
+            let mut wire = Wire::new(stream);
+            wire.write_all(&head_for(proxy_port, "GET", upstream_port, "/events"))
+                .await;
+            let head = wire.read_until(b"\r\n\r\n").await;
+            let (status_line, _headers) = parse_head(&head);
+            assert_eq!(status_line, "HTTP/1.1 200 OK");
+            // First chunk ONLY (frame: "5\r\nhello\r\n").
+            let size_line = wire.read_until(b"\r\n").await;
+            assert_eq!(String::from_utf8_lossy(&size_line).trim(), "5");
+            let first = wire.read_n(5).await;
+            assert_eq!(first, b"hello", "first chunk arrives while upstream holds the rest");
+            let crlf = wire.read_n(2).await;
+            assert_eq!(crlf, b"\r\n");
+            // Release the upstream's second chunk; the full body reassembles.
+            release_tx.send(()).unwrap();
+            let rest = wire.read_chunked().await;
+            assert_eq!(rest, b"world");
+        })
+        .await
+        .expect("response must stream (deadlock = buffered response)");
+    }
+
+    /// HEAD: status + headers forward; the (declared-but-absent) body must not
+    /// hang the client. Upstream follows HEAD semantics (no body bytes).
+    #[tokio::test]
+    async fn head_request_forwards_headers_without_body_hang() {
+        let (upstream_port, captured) = capture_upstream();
+        let proxy_port = spawn_proxy_router();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
+            let mut wire = Wire::new(stream);
+            wire.write_all(&head_for(proxy_port, "HEAD", upstream_port, "/h"))
+                .await;
+            let head = wire.read_until(b"\r\n\r\n").await;
+            let (status_line, headers) = parse_head(&head);
+            assert_eq!(status_line, "HTTP/1.1 200 OK", "HEAD status forwards");
+            assert_eq!(
+                header_values(&headers, "content-length").collect::<Vec<_>>(),
+                vec!["2"],
+                "HEAD content-length forwards"
+            );
+            let body = wire.read_to_eof().await;
+            assert_eq!(body, b"", "HEAD never carries a body");
+        })
+        .await
+        .expect("HEAD response must complete (not hang waiting for a body)");
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        assert!(got[0].request_line.starts_with("HEAD /h "));
+    }
+
+    /// Bodies forward BYTE-EXACT — including pretty-printed JSON whitespace
+    /// legacy would have re-serialized (deliberate, recorded divergence:
+    /// strictly stronger body preservation) and arbitrary binary.
+    #[tokio::test]
+    async fn bodies_forward_byte_exact() {
+        let pretty_json = "{\n  \"key\": \"v\u{00e8}lue\",\n  \"n\": 1\n}".as_bytes();
+        let binary: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+        for (label, body) in [("pretty-json", pretty_json.to_vec()), ("binary", binary)] {
+            let (upstream_port, captured) = capture_upstream();
+            let proxy_port = spawn_proxy_router();
+            let mut request = format!(
+                "POST /api/proxy/http/{upstream_port}/echo HTTP/1.1\r\n\
+                 host: 127.0.0.1:{proxy_port}\r\n\
+                 x-auth-token: {TOKEN}\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            request.extend_from_slice(&body);
+            let resp = raw_exchange(proxy_port, &request).await;
+            assert_eq!(resp.status_code(), 200, "{label}");
+            let got = captured.lock().await;
+            assert_eq!(got.len(), 1, "{label}");
+            assert_eq!(got[0].body, body, "{label} must arrive byte-exact");
+        }
+    }
+}
