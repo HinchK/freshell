@@ -195,9 +195,10 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
       const paneShell = page.locator(`[data-context="pane"][data-tab-id="${tabId}"]`)
       await expect(paneShell.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-      // ...but the badge never appears: no meta record is ever seeded for a
-      // REST-created terminal, so this is the assertion that fails today and
-      // flips when the gap is closed.
+      // REST-created terminals are now seeded via the FreshAgentState
+      // post-create hook (Task 23 fix). This assertion pins that parity:
+      // badges must appear for REST-created terminals just as they do
+      // for terminal-create sessions.
       await expect(paneShell.getByText(BADGE_LABEL, { exact: true })).toBeVisible({ timeout: 20_000 })
     } finally {
       await server.stop().catch(() => {})

@@ -232,9 +232,8 @@ export default defineConfig({
         /automation-layout-rust\.spec\.ts$/,
         // Task 23 -- git branch/dirty badges (TerminalMetaRegistry +
         // create-time git enrichment + handshake `terminal_meta` reload
-        // persistence, Tasks 17-18), plus a `test.fail()` KNOWN-GAP pin for
-        // REST-created terminals never receiving meta records (see the
-        // spec's own doc comment + flip instruction).
+        // persistence, Tasks 17-18). Covers git badge parity for
+        // REST-created terminals via FreshAgentState post-create seeding.
         /git-badges-rust\.spec\.ts$/,
       ],
     },
