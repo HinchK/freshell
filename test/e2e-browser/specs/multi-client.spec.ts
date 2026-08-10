@@ -1,7 +1,17 @@
 import fs from 'fs/promises'
 import path from 'path'
-import type { Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
+import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
+
+// RESTORE-01: manual contexts bypass the fixtures' built-in `context`
+// override, so they adopt the shared recovery auto-decline watcher directly
+// (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
+async function newClientContext(browser: Browser): Promise<BrowserContext> {
+  const context = await browser.newContext()
+  installRecoveryOfferAutoDeclineOnContext(context)
+  return context
+}
 
 // Helper: wait for a page to be connected and ready
 async function waitForReady(page: Page): Promise<void> {
@@ -174,7 +184,7 @@ async function activateTab(page: Page, tabId: string): Promise<void> {
 test.describe('Multi-Client', () => {
   test('two browser tabs share the same server', async ({ browser, serverInfo }) => {
     // Open two pages to the same server
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -189,7 +199,7 @@ test.describe('Multi-Client', () => {
   })
 
   test('terminal output appears in both clients', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const page1 = await context.newPage()
 
     await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -215,7 +225,7 @@ test.describe('Multi-Client', () => {
   })
 
   test('reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const page1 = await context.newPage()
     await page1.setViewportSize({ width: 1500, height: 980 })
 
@@ -323,7 +333,7 @@ test.describe('Multi-Client', () => {
   })
 
   test('settings change broadcasts to other clients', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -378,7 +388,7 @@ test.describe('Multi-Client', () => {
   })
 
   test('server handles many concurrent connections', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const pages = []
 
     // Open 5 pages
@@ -400,7 +410,7 @@ test.describe('Multi-Client', () => {
   })
 
   test('client disconnect is handled gracefully', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+    const context = await newClientContext(browser)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 

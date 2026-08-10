@@ -30,6 +30,8 @@ import type { BrowserContext, Page, Response } from '@playwright/test'
  * all benign and only logged).
  */
 
+export type RecoveryOfferHandling = 'auto-decline' | 'manual'
+
 export const RECOVERY_PANEL_TESTID = 'recovery-offer-panel'
 export const RECOVERY_DECLINE_TESTID = 'recovery-decline'
 const INVENTORY_URL_MARKER = '/api/recovery/inventory'
