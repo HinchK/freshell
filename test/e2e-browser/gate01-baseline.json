@@ -1,0 +1,4369 @@
+{
+  "schema": 1,
+  "item": "GATE-01",
+  "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
+  "head": "47b3b5dce5ae8bf3b43e68567b0cf45bf3cf67f9",
+  "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
+  "suiteDefinition": {
+    "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
+    "specCount": 69,
+    "rustOnlyExcluded": [
+      "agent-crash-autoresume-rust.spec.ts",
+      "amplifier-lane-resilience-rust.spec.ts",
+      "codex-status-completeness-rust.spec.ts",
+      "codex-terminal-restore-rust.spec.ts",
+      "compound-restart-rust.spec.ts",
+      "continuity-smoke.spec.ts",
+      "create-protection-isolation-rust.spec.ts",
+      "create-protection-restore-storm-rust.spec.ts",
+      "create-rate-limit-ladder-rust.spec.ts",
+      "createrequestid-stabilization-rust.spec.ts",
+      "deploy-tab-diff-rust.spec.ts",
+      "double-restart-terminal-restore-rust.spec.ts",
+      "freshagent-settings-resume-rust.spec.ts",
+      "freshclaude-identity-persistence-rust.spec.ts",
+      "freshclaude-restart-parity-rust.spec.ts",
+      "freshclaude-zero-turn-restart-rust.spec.ts",
+      "hidden-pane-rebind-rust.spec.ts",
+      "idle-gate-semantics-rust.spec.ts",
+      "launch-retry-restart-rust.spec.ts",
+      "opencode-rebind-rust.spec.ts",
+      "pane-ledger-restart-rust.spec.ts",
+      "reconcile-client-adoption-rust.spec.ts",
+      "reconcile-completion-rust.spec.ts",
+      "recover-my-panes-rust.spec.ts",
+      "rest-spawn-gate-rust.spec.ts",
+      "restore-contract-wall-rust.spec.ts",
+      "sidebar-registry-sync-rust.spec.ts",
+      "silent-input-loss-rust.spec.ts",
+      "terminal-activity-rust.spec.ts",
+      "turn-complete-restart-resume-rust.spec.ts",
+      "wavea-interactions-rust.spec.ts"
+    ]
+  },
+  "specs": {
+    "agent-checkpoint-rewind.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 27588,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 27588
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 1,
+          "expectedFail": 0,
+          "durationMs": 170,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 1,
+              "expectedFail": 0,
+              "durationMs": 170
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "gap",
+            "owner": "AGENT-14",
+            "note": "spec's own test.skip(e2eServerKind==='rust') KNOWN DIVERGENCE: rust-only skip of a user-visible feature (Rewind UI gesture). GATE-01 bar requires this be empty or explicitly approved; surface in skipped-test report; checkpoint routes proven by 41 rust unit/integration tests per the skip comment"
+          }
+        }
+      }
+    },
+    "agent-continuity-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 12895,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 12895
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 2315,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 2315
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "amplifier-restore-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 205,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 205
+            }
+          ],
+          "failures": [
+            {
+              "title": "amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included",
+              "line": 158,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  161 |     // future accidental `MATRIX_SPECS` inclusion fails loudly instead of\n  162 |     // silently no-op'ing on legacy.\n> 163 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  164 |\n  165 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amplifier-restore-'))\n  166 |     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deliberate loud guard expect(e2eServerKind).toBe('rust') at :163 (fail-by-design on legacy; same registration-errata class as term28)"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 1,
+          "durationMs": 33232,
+          "runs": [
+            "slice-3",
+            "reproof-s3-amplifier-rust",
+            "postpin-verify"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 35643
+            },
+            {
+              "run": "reproof-s3-amplifier-rust",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 32660
+            },
+            {
+              "run": "postpin-verify",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 33232
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-27",
+            "note": "deterministic red incl isolated rerun reproof-s3-amplifier-rust; resume after restart reports session not found on disk. sibling SESSION-01 noted; pinned test.fail(rust, TERM-27) in-spec"
+          }
+        }
+      }
+    },
+    "auth.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 16563,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16563
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 10264,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10264
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "browser-pane-screenshot.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 24491,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 24491
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 49918,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 49918
+            }
+          ],
+          "failures": [
+            {
+              "title": "proxied localhost URL with iframe-blocking headers renders actual content, not placeholder",
+              "line": 56,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): dialog in context; legacy green"
+          }
+        }
+      }
+    },
+    "browser-pane.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 59354,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 59354
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 141173,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 2,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 141173
+            }
+          ],
+          "failures": [
+            {
+              "title": "browser pane has URL input and navigation buttons",
+              "line": 22,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "browser pane URL bar updates on navigation",
+              "line": 57,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "browser pane preserves URL across tab switches",
+              "line": 90,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 3/3 contexts show Restore dialog; legacy green 5/5"
+          }
+        }
+      }
+    },
+    "cfg03-backup-restore.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 2,
+          "expectedFail": 0,
+          "durationMs": 2405,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 2,
+              "expectedFail": 0,
+              "durationMs": 2405
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 4,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 29511,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 4,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 29511
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "cfg04-legacy-browser-seed.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 3791,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 3791
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 2611,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 2611
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "codex-terminal-bounce-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 226,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 226
+            }
+          ],
+          "failures": [
+            {
+              "title": "a sidebar-resumed codex pane re-resumes (argv `resume <id>`) across a server restart without a page reload",
+              "line": 101,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  100 |\n  101 |   test('a sidebar-resumed codex pane re-resumes (argv `resume <id>`) across a server restart without a page reload', async ({ page, e2eServerKind }) => {\n> 102 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  103 |\n  104 |     const CODEX_SESSION_ID = 'codex-bounce-resume-0001'\n  105 |     const SESSION_TITLE = 'codex-terminal-bounce seeded session'"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :102; registration-errata class (term28/amplifier-restore/opencode-terminal-restore)"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 1,
+          "durationMs": 28016,
+          "runs": [
+            "slice-5",
+            "reproof-s5-codexbounce",
+            "postpin-verify"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 28010
+            },
+            {
+              "run": "reproof-s5-codexbounce",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 28699
+            },
+            {
+              "run": "postpin-verify",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 28016
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-22",
+            "note": "deterministic red incl reproof-s5-codexbounce; terminalId null after restart re-resume; pinned in-spec"
+          }
+        }
+      }
+    },
+    "diag03-rotation-redaction-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4094,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4094
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4395,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4395
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "editor-pane.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 58679,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 58679
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 119308,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 119308
+            }
+          ],
+          "failures": [
+            {
+              "title": "editor pane has path input and open button",
+              "line": 120,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "editor pane shows empty state with Open File button",
+              "line": 133,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): waitForTerminal .xterm timeouts float between runs (slice-0: :120/:133; isolated: :83/:133/:193); dialog verified in contexts"
+          }
+        }
+      }
+    },
+    "fresh-agent-centralization-smoke.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 42564,
+          "runs": [
+            "slice-7",
+            "reproof-s7-facent"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42309
+            },
+            {
+              "run": "reproof-s7-facent",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42564
+            }
+          ],
+          "failures": [
+            {
+              "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+              "line": 402,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m422\u001b[39m\nReceived: \u001b[31m500\u001b[39m\n\n  418 |\n  419 |     const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')\n> 420 |     expect(capture.status).toBe(422)\n      |                            ^\n  421 |     expect(await capture.json()).toMatchObject({\n  422 |       status: 'error',\n  423 |       message: expect.stringContaining('pane kind \"fresh-agent\"'),"
+            },
+            {
+              "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+              "line": 448,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Fresh agent')\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByText('Fresh agent')\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s7-facent (500-vs-422 on /api/panes/:id/capture for fresh-agent panes; missing 'Fresh agent' UI text); spec vs frozen-legacy drift"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 107700,
+          "runs": [
+            "slice-7",
+            "reproof-s7-facent"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 91534
+            },
+            {
+              "run": "reproof-s7-facent",
+              "passed": 2,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 107700
+            }
+          ],
+          "failures": [
+            {
+              "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+              "line": 402,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32mArrayContaining [ObjectContaining {\"id\": \"pane-legacy-agent\", \"kind\": \"fresh-agent\"}]\u001b[39m\nReceived: \u001b[31m[]\u001b[39m\n\nCall Log:\n- Timeout 10000ms exceeded while waiting on the predicate\n\n  406 |     await sendLegacyLayoutSync(page)\n  407 |\n> 408 |     await expect.poll(async () => {\n      |     ^"
+            },
+            {
+              "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+              "line": 448,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mnot\u001b[2m.\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: not \u001b[32m404\u001b[39m\n\n  468 |\n  469 |     const modelCapabilities = await fetchWithAuth(serverInfo, '/api/fresh-agent/model-capabilities/freshclaude')\n> 470 |     expect(modelCapabilities.status).not.toBe(404)\n      |                                          ^\n  471 |     const thread = await fetchWithAuth(serverInfo, `/api/fresh-agent/threads/freshclaude/claude/${CANONICAL_CLAUDE_SESSION_ID}`)\n  472 |     expect(thread.headers.get('content-type')).toContain('application/json')\n  473 |     if (thread.status === 404) {\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:470:42"
+            }
+          ],
+          "attribution": {
+            "kind": "gap",
+            "owner": "AGENT-10",
+            "note": "rust 404 on GET /api/fresh-agent/model-capabilities/freshclaude (AGENT-10 scope: model capabilities + refresh); SECOND divergence in same file: legacy-layout-sync normalization yields [] fresh-agent panes (candidate AUTO-12/AGENT-16 -- owner adjudication needed). deterministic incl reproof-s7-facent"
+          }
+        }
+      }
+    },
+    "fresh-agent-mobile.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7574,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7574
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7224,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7224
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "fresh-agent.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 9,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 80378,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 9,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 80378
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 4,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 213821,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 5,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 213821
+            }
+          ],
+          "failures": [
+            {
+              "title": "fresh-agent header keeps identity visible in a narrow split pane",
+              "line": 132,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "freshclaude settings use FreshAgent model defaults and create payload",
+              "line": 183,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "freshclaude banners render through the fresh-agent pane surface and answer over WS",
+              "line": 649,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "renders the fresh-agent transcript at the terminal font size without clipping the composer",
+              "line": 776,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 4/4 ctx dialog (.xterm waits behind the modal); legacy 9/9 green"
+          }
+        }
+      }
+    },
+    "freshopencode-db-history.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 60741,
+          "runs": [
+            "slice-1",
+            "reproof-s1-fophx-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 51898
+            },
+            {
+              "run": "reproof-s1-fophx-legacy",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 60741
+            }
+          ],
+          "failures": [
+            {
+              "title": "restores Freshopencode turns from DB history when export is truncated",
+              "line": 245,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Persist this Freshopencode DB turn')\nExpected: visible\nError: strict mode violation: getByText('Persist this Freshopencode DB turn') resolved to 3 elements:\n    1) <span class=\"flex-1 min-w-0 whitespace-nowrap truncate text-sm\">Persist this Freshopencode DB turn</span> aka getByTestId('tab-strip').getByLabel('Persist this Freshopencode DB')\n    2) <span title=\"Persist this Freshopencode DB turn\" class=\"pane-header-fresh-agent-detail block min-w-0 truncate\">Persist this Freshopencode DB turn</span> aka getByTitle('Persist this Freshopencode DB')\n    3) <p class=\"whitespace-pre-wrap break-words leading-[inherit]\">Persist this Freshopencode DB turn</p> aka getByLabel('You transcript turn').getByText('Persist this Freshopencode DB')\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 30000ms\u001b[22m\n\u001b[2m  - waiting for getByText('Persist this Freshopencode DB turn')\u001b[22m"
+            },
+            {
+              "title": "does not materialize Freshopencode from DB rows without top-level run sessionID",
+              "line": 324,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoMatchObject\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\n\u001b[1mMatcher error\u001b[22m: \u001b[31mreceived\u001b[39m value must be a non-null object\n\nReceived has value: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate\n\n  354 |       await sendFreshAgentPrompt(page, prompt)\n  355 |\n> 356 |       await expect.poll(async () => {"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "red deterministically in isolation (reproof-s1-fophx-legacy): spec drift vs current UI (strict-mode getByText resolved to 3 elements; expect.poll 30s null). Red identically on rust leg of slice-1 -> not a rust parity gap; pre-existing suite redness on this branch"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 41407,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 41407
+            }
+          ],
+          "failures": [
+            {
+              "title": "restores Freshopencode turns from DB history when export is truncated",
+              "line": 245,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByText('Persist this Freshopencode DB turn')\nExpected: visible\nError: strict mode violation: getByText('Persist this Freshopencode DB turn') resolved to 4 elements:\n    1) <span class=\"text-sm truncate font-medium\">Persist this Freshopencode DB turn</span> aka getByTestId('sidebar-session-list').getByRole('button', { name: 'Persist this Freshopencode DB' })\n    2) <span class=\"flex-1 min-w-0 whitespace-nowrap truncate text-sm\">Persist this Freshopencode DB turn</span> aka getByTestId('tab-strip').getByLabel('Persist this Freshopencode DB')\n    3) <span title=\"Persist this Freshopencode DB turn\" class=\"pane-header-fresh-agent-detail block min-w-0 truncate\">Persist this Freshopencode DB turn</span> aka getByTitle('Persist this Freshopencode DB')\n    4) <p class=\"whitespace-pre-wrap break-words leading-[inherit]\">Persist this Freshopencode DB turn</p> aka getByLabel('You transcript turn').getByText('Persist this Freshopencode DB')\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 30000ms\u001b[22m"
+            },
+            {
+              "title": "does not materialize Freshopencode from DB rows without top-level run sessionID",
+              "line": 324,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoMatchObject\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\n\u001b[1mMatcher error\u001b[22m: \u001b[31mreceived\u001b[39m value must be a non-null object\n\nReceived has value: \u001b[31mnull\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate\n\n  354 |       await sendFreshAgentPrompt(page, prompt)\n  355 |\n> 356 |       await expect.poll(async () => {"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical failures as legacy (same assertions); pre-existing spec drift, not rust-specific"
+          }
+        }
+      }
+    },
+    "freshopencode-first-send-reload-repro.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 5369,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5369
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4780,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4780
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "freshopencode-model-picker.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 18969,
+          "runs": [
+            "slice-8",
+            "reproof-s8-fomp"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 19541
+            },
+            {
+              "run": "reproof-s8-fomp",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 18969
+            }
+          ],
+          "failures": [
+            {
+              "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+              "line": 41,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s8-fomp: Freshopencode model-picker group never renders; identical on rust; UI/spec drift (pre-existing, both-server)"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 18979,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 18979
+            }
+          ],
+          "failures": [
+            {
+              "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+              "line": 41,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('group').filter({ has: getByText('Freshopencode', { exact: true }) }).last()\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical assertion red as legacy; pre-existing both-server"
+          }
+        }
+      }
+    },
+    "freshopencode-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7224,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7224
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7345,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7345
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-01-rust-server.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 12979,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 12979
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 11963,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11963
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-02-matrix-bite.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1145,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1145
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1120,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1120
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-03-provider-fixtures.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 26,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4777,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4777
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 26,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 3507,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 3507
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-04-session-corpus.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 16627,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16627
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 13988,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 13988
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-05-raw-clients.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4253,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4253
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4223,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4223
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-06-misc-fixtures.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1530,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1530
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 1414,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1414
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-11-a11y-gate.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 14092,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 14092
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 11071,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11071
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "harness-14-server-clock.spec.ts": {
+      "bucket": "harness",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 9259,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9259
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 10896,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10896
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "mcp-bridge-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 5204,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5204
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 5211,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5211
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "mcp-qa-smoke-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 6477,
+          "runs": [
+            "slice-5",
+            "reproof-s5-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8177
+            },
+            {
+              "run": "reproof-s5-legacy",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 6477
+            }
+          ],
+          "failures": [
+            {
+              "title": "the unmodified legacy MCP stdio binary drives an ephemeral Rust server across every pane mode",
+              "line": 68,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"ok\"\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\n  255 |       // -----------------------------------------------------------------\n  256 |       const codexFresh = await mcp.callFreshellAction('new-tab', { mode: 'codex', cwd: sharedRoot })\n> 257 |       expect(codexFresh.status).toBe('ok')\n      |                                 ^\n  258 |       const codexFreshPaneId: string = codexFresh.data.paneId\n  259 |       preRestartTabIds.push(codexFresh.data.tabId)\n  260 |       const codexFreshWait = await mcp.callFreshellAction('wait-for', { target: codexFreshPaneId, pattern: 'codex> ', timeout: 20 })"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s5-legacy: MCP new-tab mode=codex status undefined; identical assertion red on rust leg of slice-5 -> pre-existing smoke-breaking drift on both servers, not rust-specific"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7165,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7165
+            }
+          ],
+          "failures": [
+            {
+              "title": "the unmodified legacy MCP stdio binary drives an ephemeral Rust server across every pane mode",
+              "line": 68,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"ok\"\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\n  255 |       // -----------------------------------------------------------------\n  256 |       const codexFresh = await mcp.callFreshellAction('new-tab', { mode: 'codex', cwd: sharedRoot })\n> 257 |       expect(codexFresh.status).toBe('ok')\n      |                                 ^\n  258 |       const codexFreshPaneId: string = codexFresh.data.paneId\n  259 |       preRestartTabIds.push(codexFresh.data.tabId)\n  260 |       const codexFreshWait = await mcp.callFreshellAction('wait-for', { target: codexFreshPaneId, pattern: 'codex> ', timeout: 20 })"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical assertion red as legacy (MCP codex new-tab); pre-existing both-server drift"
+          }
+        }
+      }
+    },
+    "mobile-viewport.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 60909,
+          "runs": [
+            "slice-5",
+            "reproof-s5-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 6,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 64621
+            },
+            {
+              "run": "reproof-s5-legacy",
+              "passed": 6,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 60909
+            }
+          ],
+          "failures": [
+            {
+              "title": "permission banner buttons are visible and functional on mobile",
+              "line": 195,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoContainText\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('alert', { name: /permission request for bash/i })\nExpected substring: \u001b[32m\"Permission requested: Bash\"\u001b[39m\nReceived string:    \u001b[31m\"approvalBashecho mobile-permission-testAllowAlways allow Bash this sessionDeny\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toContainText\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('alert', { name: /permission request for bash/i })\u001b[22m\n\u001b[2m    14 × locator resolved to <div role=\"alert\" aria-label=\"Permission request for Bash\" class=\"fresh-agent-approval-card rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm\">…</div>\u001b[22m\n\u001b[2m       - unexpected value \"approvalBashecho mobile-permission-testAllowAlways allow Bash this sessionDeny\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s5-legacy: permission banner toContainText mismatch; spec/UI drift"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 168217,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 4,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 168217
+            }
+          ],
+          "failures": [
+            {
+              "title": "mobile new tab button creates tab",
+              "line": 99,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "fresh-agent composer and region are visible on mobile viewport",
+              "line": 112,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "permission banner buttons are visible and functional on mobile",
+              "line": 195,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoContainText\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('alert', { name: /permission request for bash/i })\nExpected substring: \u001b[32m\"Permission requested: Bash\"\u001b[39m\nReceived string:    \u001b[31m\"approvalBashecho mobile-permission-testAllowAlways allow Bash this sessionDeny\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toContainText\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('alert', { name: /permission request for bash/i })\u001b[22m\n\u001b[2m    14 × locator resolved to <div role=\"alert\" aria-label=\"Permission request for Bash\" class=\"fresh-agent-approval-card rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm\">…</div>\u001b[22m\n\u001b[2m       - unexpected value \"approvalBashecho mobile-permission-testAllowAlways allow Bash this sessionDeny\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1) on 2/3 red tests (dialog ctx); PLUS shares legacy's preexisting banner-text failure (deterministic)"
+          }
+        }
+      }
+    },
+    "multi-client.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 17137,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 17137
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 98447,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 98447
+            }
+          ],
+          "failures": [
+            {
+              "title": "terminal output appears in both clients",
+              "line": 191,
+              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
+            },
+            {
+              "title": "reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output",
+              "line": 217,
+              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 2/2 rust failure ctx show Restore dialog; legacy 6/7->6/6 green; NOTE multi-client:217 class known both-server flake (B002) remains latent, not observed here"
+          }
+        }
+      }
+    },
+    "multirow-tabs.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 65698,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 65698
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 188313,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 188313
+            }
+          ],
+          "failures": [
+            {
+              "title": "multirow tabs render between 150 and 200px wide",
+              "line": 50,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "last-row tabs match the width of the full rows above",
+              "line": 77,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 2/2 failure contexts contain the Restore dialog; legacy green"
+          }
+        }
+      }
+    },
+    "opencode-replay-write-progression.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7893,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7893
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 56574,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 56574
+            }
+          ],
+          "failures": [
+            {
+              "title": "submits barrier-heavy replay to real xterm in bounded writes",
+              "line": 26,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n   at ../helpers/terminal-helpers.ts:102\n\n  100 |     const { timeout = 15_000, terminalId } = options\n  101 |\n> 102 |     await this.page.waitForFunction(\n      |                     ^\n  103 |       (id) => {\n  104 |         const harness = window.__FRESHELL_TEST_HARNESS__\n  105 |         if (!harness) return false\n    at TerminalHelper.waitForPrompt (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/helpers/terminal-helpers.ts:102:21)"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy green"
+          }
+        }
+      }
+    },
+    "opencode-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 5,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 197648,
+          "runs": [
+            "slice-4",
+            "reproof-s4-opencode-restart"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 207233
+            },
+            {
+              "run": "reproof-s4-opencode-restart",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 197648
+            }
+          ],
+          "failures": [
+            {
+              "title": "reattaches a UI-created OpenCode pane across browser refresh",
+              "line": 628,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:664:37"
+            },
+            {
+              "title": "recovers a hidden OpenCode sessionRef when association lands while the browser is closed",
+              "line": 713,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32m{\"provider\": \"opencode\", \"sessionId\": \"ses_root_35121\"}\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n\n  810 |       await fsp.writeFile(sessionEventGatePath, 'release\\n', 'utf8')\n  811 |       await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)\n> 812 |       await expect.poll(async () => {\n      |       ^"
+            },
+            {
+              "title": "preserves an associated OpenCode pane across browser refresh",
+              "line": 901,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:945:37"
+            },
+            {
+              "title": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed",
+              "line": 1042,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1043:5"
+            },
+            {
+              "title": "restores multiple OpenCode panes after hard server kill",
+              "line": 1051,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1052:5"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic 5/5 red incl isolated legacy rerun reproof-s4-opencode-restart; assertion-level (sessionId never materializes, waitForOpenCodeSessions 30s timeouts). Identical on rust -> not a rust parity gap; legacy suite redness on this branch"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 5,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 201438,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 201438
+            }
+          ],
+          "failures": [
+            {
+              "title": "reattaches a UI-created OpenCode pane across browser refresh",
+              "line": 628,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:664:37"
+            },
+            {
+              "title": "recovers a hidden OpenCode sessionRef when association lands while the browser is closed",
+              "line": 713,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m\n\nExpected: \u001b[32m{\"provider\": \"opencode\", \"sessionId\": \"ses_root_36693\"}\u001b[39m\nReceived: \u001b[31mundefined\u001b[39m\n\nCall Log:\n- Timeout 15000ms exceeded while waiting on the predicate\n\n  810 |       await fsp.writeFile(sessionEventGatePath, 'release\\n', 'utf8')\n  811 |       await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)\n> 812 |       await expect.poll(async () => {\n      |       ^"
+            },
+            {
+              "title": "preserves an associated OpenCode pane across browser refresh",
+              "line": 901,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:945:37"
+            },
+            {
+              "title": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed",
+              "line": 1042,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1043:5"
+            },
+            {
+              "title": "restores multiple OpenCode panes after hard server kill",
+              "line": 1051,
+              "error": "TimeoutError: page.waitForFunction: Timeout 30000ms exceeded.\n\n  182 |\n  183 | async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {\n> 184 |   await page.waitForFunction((ids) => {\n      |              ^\n  185 |     const state = window.__FRESHELL_TEST_HARNESS__?.getState()\n  186 |     const findTerminal = (node: any): any => {\n  187 |       if (!node) return undefined\n    at waitForOpenCodeSessions (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:184:14)\n    at runRestartScenario (/home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:487:13)\n    at /home/dan/code/freshell/.worktrees/df1-gate-01-unchanged-suite-both/test/e2e-browser/specs/opencode-restart-recovery.spec.ts:1052:5"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical failures to legacy leg (same assertions); pre-existing, not rust-specific"
+          }
+        }
+      }
+    },
+    "opencode-terminal-restore-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 331,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 331
+            }
+          ],
+          "failures": [
+            {
+              "title": "an opencode terminal pane restores across a server restart via `opencode --session <id>`, and a never-submitted pane restores fresh",
+              "line": 151,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  154 |     // future accidental `MATRIX_SPECS` inclusion fails loudly instead of\n  155 |     // silently no-op'ing on legacy.\n> 156 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  157 |\n  158 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-terminal-restore-'))\n  159 |     const argLogPath = path.join(sharedRoot, 'fake-opencode-terminal-argv.jsonl')"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "fail-by-design guard expect(e2eServerKind).toBe('rust') (~:154); same registration-errata class as term28/amplifier-restore (in rust-chromium testMatch + match-all chromium lane, not in RUST_ONLY_SPECS). rust leg GREEN"
+          }
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 22961,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 22961
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-activity-indicator.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 31405,
+          "runs": [
+            "slice-5",
+            "reproof-s5-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 2,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 32398
+            },
+            {
+              "run": "reproof-s5-legacy",
+              "passed": 2,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 31405
+            }
+          ],
+          "failures": [
+            {
+              "title": "freshclaude panes transition from waiting to blue running and back to idle",
+              "line": 79,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveClass\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('banner', { name: /^Pane:/ }).locator('svg').first()\nExpected pattern: \u001b[32m/text-blue-500/\u001b[39m\nReceived string:  \u001b[31m\"lucide lucide-settings h-[18px] w-[18px] sm:h-3 sm:w-3\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toHaveClass\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('banner', { name: /^Pane:/ }).locator('svg').first()\u001b[22m\n\u001b[2m    14 × locator resolved to <svg width=\"24\" height=\"24\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke=\"currentColor\" stroke-linecap=\"round\" stroke-linejoin=\"round\" xmlns=\"http://www.w3.org/2000/svg\" class=\"lucide lucide-settings h-[18px] w-[18px] sm:h-3 sm:w-3\">…</svg>\u001b[22m\n\u001b[2m       - unexpected value \"lucide lucide-settings h-[18px] w-[18px] sm:h-3 sm:w-3\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s5-legacy: freshclaude waiting->blue toHaveClass assertion; spec/U I drift on legacy lane"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 89506,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 1,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 89506
+            }
+          ],
+          "failures": [
+            {
+              "title": "freshclaude panes transition from waiting to blue running and back to idle",
+              "line": 79,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "claude terminals go blue while the server marks them busy and clear on idle",
+              "line": 185,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): dialog in 2/2 contexts; note legacy leg also preexisting-red on a different assertion"
+          }
+        }
+      }
+    },
+    "pane-picker-layout.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 8439,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8439
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 8601,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8601
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-picker.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 16452,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16452
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 16756,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16756
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "pane-system.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 90604,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 90604
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 5,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 253030,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 5,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 253030
+            }
+          ],
+          "failures": [
+            {
+              "title": "split pane horizontally",
+              "line": 48,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "close pane returns to single pane",
+              "line": 75,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "pane picker allows choosing pane type",
+              "line": 107,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "pane focus switches correctly",
+              "line": 153,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "nested splits create complex layouts",
+              "line": 204,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 5/5 ctx dialog; legacy 10/10 green"
+          }
+        }
+      }
+    },
+    "project-colors-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 9137,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9137
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 6486,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 6486
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "reconcile-handshake-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 9217,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9217
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 8714,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 8714
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "reconnection.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 63613,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 63613
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 150728,
+          "runs": [
+            "slice-1",
+            "reproof-s1-reconnect-rust"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 3,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 146181
+            },
+            {
+              "run": "reproof-s1-reconnect-rust",
+              "passed": 4,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 150728
+            }
+          ],
+          "failures": [
+            {
+              "title": "multiple rapid disconnects handled gracefully",
+              "line": 61,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: locator('.xterm').first()\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('.xterm').first()\u001b[22m\n\n"
+            },
+            {
+              "title": "tabs and panes preserved across reconnect",
+              "line": 83,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): isolated rust rerun reproof-s1-reconnect-rust 4p/2f with failure set shifted vs slice-1 (whack-a-mole); Restore dialog present in 2/2 error-contexts"
+          }
+        }
+      }
+    },
+    "remote-tab-linkage-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 136,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 136
+            }
+          ],
+          "failures": [
+            {
+              "title": "a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef",
+              "line": 107,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  109 |     // assert the precondition explicitly so an accidental matrix inclusion\n  110 |     // fails loudly instead of silently no-op'ing on legacy.\n> 111 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  112 |\n  113 |     const SEEDED_SESSION_ID = 'amp-remote-linkage-0001'\n  114 |     const SESSION_TITLE = 'remote-tab-linkage seeded session'"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :111; registration-errata class; rust leg green"
+          }
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 11903,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11903
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "rest-tab-persistence.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 234,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 234
+            }
+          ],
+          "failures": [
+            {
+              "title": "creating a tab via REST with an out-of-enum mode materializes it in the tab strip and persists to localStorage, but the tab strip goes empty on reload while localStorage still holds the data",
+              "line": 136,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  139 |     // explicitly so an accidental `MATRIX_SPECS` inclusion fails loudly\n  140 |     // instead of silently no-op'ing on legacy.\n> 141 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  142 |\n  143 |     const { baseUrl, token } = serverInfo\n  144 |     const cwd = (testServer as any).__cwd as string"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "design guard expect(e2eServerKind).toBe('rust') at :141; registration-errata class; rust leg green"
+          }
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 2552,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 2552
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-double-restart.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 66917,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 66917
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 50679,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 50679
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 178833,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 178833
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 10,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 118235,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 10,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 118235
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "restore-sync05.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 46124,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 46124
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 26857,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 26857
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "resume-button.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 42752,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 42752
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 26705,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 3,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 26705
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "safe01-auth-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 12,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 20219,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 12,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 20219
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 12,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 4159,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 12,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4159
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "safe03-origin-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 83,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 83
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 63,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 63
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "screenshot-baselines.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 36201,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36201
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 3,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 173123,
+          "runs": [
+            "slice-0"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-0",
+              "passed": 3,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 173123
+            }
+          ],
+          "failures": [
+            {
+              "title": "default app layout",
+              "line": 4,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "settings view",
+              "line": 16,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar collapsed",
+              "line": 52,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): click-intercept by the Restore dialog overlay; victim tests float (slice-0: :4/:16/:52; isolated: :16/:52)"
+          }
+        }
+      }
+    },
+    "server-restart-recovery.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 84559,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 84559
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 67506,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 67506
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "session-directory-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 7,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 67121,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 7,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 67121
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 190562,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 6,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 190562
+            }
+          ],
+          "failures": [
+            {
+              "title": "typing into the sidebar search box filters the session list to matching titles only",
+              "line": 617,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy 7/7 green"
+          }
+        }
+      }
+    },
+    "settings-live-reload.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 15592,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 15592
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 9771,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9771
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "settings-persistence-split.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 9370,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 9370
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 1,
+          "durationMs": 14017,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 14017
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "settings.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 8,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 68312,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 68312
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 4,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 272141,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 4,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 272141
+            }
+          ],
+          "failures": [
+            {
+              "title": "terminal font size input changes setting",
+              "line": 35,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "terminal color scheme selection",
+              "line": 60,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "scrollback lines slider changes setting",
+              "line": 130,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "debug logging toggle",
+              "line": 148,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 4/4 ctx dialog; legacy 8/8 green same run"
+          }
+        }
+      }
+    },
+    "sidebar-click-resume.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "skip-all",
+          "passed": 0,
+          "failed": 0,
+          "skipped": 2,
+          "expectedFail": 0,
+          "durationMs": 283,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 0,
+              "failed": 0,
+              "skipped": 2,
+              "expectedFail": 0,
+              "durationMs": 283
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "by-design: codex leg test.fixme (frozen server/) + amplifier leg test.skip KNOWN DIVERGENCE (no legacy amplifier provider) -- both documented in-spec"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 1,
+          "durationMs": 36955,
+          "runs": [
+            "slice-7",
+            "reproof-s7-sideclick",
+            "postpin-verify"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36718
+            },
+            {
+              "run": "reproof-s7-sideclick",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 36562
+            },
+            {
+              "run": "postpin-verify",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 1,
+              "durationMs": 36955
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "gap",
+            "owner": "TERM-22",
+            "note": "deterministic rust red incl reproof-s7-sideclick (codex leg terminalId null 20s); amplifier leg green on rust; pinned in-spec TERM-22; same family as codex-terminal-bounce"
+          }
+        }
+      }
+    },
+    "sidebar-opencode-rail.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7017,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7017
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 6934,
+          "runs": [
+            "slice-3"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-3",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 6934
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "sidebar.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 8,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 64118,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 64118
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 5,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 237695,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 5,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 237695
+            }
+          ],
+          "failures": [
+            {
+              "title": "sidebar collapse toggle works",
+              "line": 11,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar search input is functional",
+              "line": 99,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "sidebar view switches: settings and back",
+              "line": 127,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 3/3 ctx dialog; legacy 8/8 green"
+          }
+        }
+      }
+    },
+    "stress.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 41496,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 41496
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 3,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 300434,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 2,
+              "failed": 3,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 300434
+            }
+          ],
+          "failures": [
+            {
+              "title": "handles 6+ panes simultaneously",
+              "line": 6,
+              "error": "\u001b[31mTest timeout of 120000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "handles 10 tabs",
+              "line": 25,
+              "error": "\u001b[31mTest timeout of 120000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "large output does not crash",
+              "line": 68,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 3/3 contexts dialog; stress+load amplifies; legacy 5/5 green same run"
+          }
+        }
+      }
+    },
+    "tab-bar-resize.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 40262,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 40262
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 4,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 129546,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 4,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 129546
+            }
+          ],
+          "failures": [
+            {
+              "title": "defaults to 3 visible rows and drags to reveal more",
+              "line": 4,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy green"
+          }
+        }
+      }
+    },
+    "tab-management.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 11,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 99942,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 11,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 99942
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 5,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 367143,
+          "runs": [
+            "slice-7"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-7",
+              "passed": 6,
+              "failed": 5,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 367143
+            }
+          ],
+          "failures": [
+            {
+              "title": "clicking tab switches to it",
+              "line": 46,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "close tab removes it",
+              "line": 61,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "restored top tabs stay hot across page reload and still switch without replay",
+              "line": 111,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "tab overflow shows scroll controls",
+              "line": 172,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            },
+            {
+              "title": "Ctrl+Shift+brackets follow reordered tab order from a focused terminal",
+              "line": 219,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 5/5 ctx dialog; legacy 11/11 green"
+          }
+        }
+      }
+    },
+    "tab-recency-sync.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 10108,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10108
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 10842,
+          "runs": [
+            "slice-4"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-4",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10842
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "tabs-client-retire.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 11800,
+          "runs": [
+            "slice-5",
+            "reproof-s5-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 12838
+            },
+            {
+              "run": "reproof-s5-legacy",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11800
+            }
+          ],
+          "failures": [
+            {
+              "title": "closed browser client is removed from the Tabs UI through the unload retire API",
+              "line": 108,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('button', { name: 'closing-device-e2e: Retire endpoint e2e tab' })\nExpected: visible\nTimeout: 10000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('button', { name: 'closing-device-e2e: Retire endpoint e2e tab' })\u001b[22m\n\n"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s5-legacy: retire row never becomes visible; candidate owner for the underlying feature gap: CFG-08 (tab-registry durability)"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 60069,
+          "runs": [
+            "slice-5"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-5",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 60069
+            }
+          ],
+          "failures": [
+            {
+              "title": "closed browser client is removed from the Tabs UI through the unload retire API",
+              "line": 108,
+              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1) dialog ctx; legacy leg also preexisting-red (different assertion)"
+          }
+        }
+      }
+    },
+    "term13-scrollback-boundary.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 19173,
+          "runs": [
+            "slice-9"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 19173
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 22344,
+          "runs": [
+            "slice-9",
+            "reproof-s9-term13"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-9",
+              "passed": 1,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 35680
+            },
+            {
+              "run": "reproof-s9-term13",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 22344
+            }
+          ],
+          "failures": [],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): slice-9 red w/ dialog ctx ('No shell option available' = picker blocked by modal); isolated rust reproof-s9-term13 GREEN 2/2 -> interference, not scrollback parity gap; legacy green"
+          }
+        }
+      }
+    },
+    "term28-path-shadow-rust.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 2,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 185,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 0,
+              "failed": 2,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 185
+            }
+          ],
+          "failures": [
+            {
+              "title": "a same-named directory in the launch cwd never shadows the real $PATH CLI",
+              "line": 150,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  149 |\n  150 |   test('a same-named directory in the launch cwd never shadows the real $PATH CLI', async ({ page, e2eServerKind }) => {\n> 151 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  152 |\n  153 |     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-term28-shadow-'))\n  154 |     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')"
+            },
+            {
+              "title": "a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)",
+              "line": 236,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m\n\nExpected: \u001b[32m\"rust\"\u001b[39m\nReceived: \u001b[31m\"legacy\"\u001b[39m\n\n  235 |\n  236 |   test('a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)', async ({ e2eServerKind }) => {\n> 237 |     expect(e2eServerKind).toBe('rust')\n      |                           ^\n  238 |\n  239 |     // This scenario is driven over a RAW WebSocket connection\n  240 |     // (`terminal.create`), not the browser UI/PanePicker: the picker only"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "fail-by-design guard: expect(e2eServerKind).toBe('rust') at spec lines 151/237; spec asserts the Rust TERM-28 fix and is registered in rust-chromium testMatch; it is ALSO picked up by the match-all chromium lane (missing RUST_ONLY_SPECS entry) -- suite-registration errata, deterministically red on legacy. Not a product gap on either server",
+            "note": "candidate config fix: add to RUST_ONLY_SPECS (left to consolidation to avoid churning the union-hot config mid-campaign)"
+          }
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 10891,
+          "runs": [
+            "slice-1"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-1",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 10891
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    },
+    "terminal-background-freeze-catchup.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 7657,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 7657
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 180246,
+          "runs": [
+            "slice-8"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-8",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 180246
+            }
+          ],
+          "failures": [
+            {
+              "title": "process suspend catches up terminal output without silent gaps or quarantine",
+              "line": 351,
+              "error": "\u001b[31mTest timeout of 180000ms exceeded.\u001b[39m"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 1/1 ctx dialog (180s test timeout with dialog intercepting); legacy green"
+          }
+        }
+      }
+    },
+    "terminal-lifecycle.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 13,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 124715,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 13,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 124715
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 6,
+          "failed": 7,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 344641,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 6,
+              "failed": 7,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 344641
+            }
+          ],
+          "failures": [
+            {
+              "title": "creates a terminal on first load",
+              "line": 31,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "typing in terminal sends input",
+              "line": 53,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "terminal survives tab switch and return",
+              "line": 75,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "detached terminal keeps running",
+              "line": 196,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "terminal handles rapid input",
+              "line": 219,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "close tab kills terminal",
+              "line": 248,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            },
+            {
+              "title": "terminal scrollback is preserved",
+              "line": 286,
+              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+            }
+          ],
+          "attribution": {
+            "kind": "gap-unscoped",
+            "note": "recovery-offer interference (F1): 7/7 failure contexts contain the Restore dialog; legacy leg 13/13 green in same run"
+          }
+        }
+      }
+    },
+    "truly-idle-alerting.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 14594,
+          "runs": [
+            "slice-6",
+            "reproof-s6-idle-legacy"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 13324
+            },
+            {
+              "run": "reproof-s6-idle-legacy",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 14594
+            }
+          ],
+          "failures": [
+            {
+              "title": "claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade",
+              "line": 76,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveClass\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: locator('[data-context=\"tab\"][data-tab-id=\"S_dMZjOWYmf4y1VNRxWB7\"]').locator('svg').first()\nExpected pattern: \u001b[32m/text-blue-500/\u001b[39m\nReceived string:  \u001b[31m\"shrink-0 h-3 w-3 shrink-0\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toHaveClass\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('[data-context=\"tab\"][data-tab-id=\"S_dMZjOWYmf4y1VNRxWB7\"]').locator('svg').first()\u001b[22m\n\u001b[2m    14 × locator resolved to <svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" class=\"shrink-0 h-3 w-3 shrink-0\">…</svg>\u001b[22m\n\u001b[2m       - unexpected value \"shrink-0 h-3 w-3 shrink-0\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "deterministic in reproof-s6-idle-legacy: tab icon never gains text-blue-500 (busy) though resolved 14x; identical on rust -> pre-existing both-server redness (client/spec drift; TERM-15/TERM-16 lane) not rust-specific"
+          }
+        },
+        "rust": {
+          "verdict": "fail",
+          "passed": 0,
+          "failed": 1,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 13032,
+          "runs": [
+            "slice-6"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-6",
+              "passed": 0,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 13032
+            }
+          ],
+          "failures": [
+            {
+              "title": "claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade",
+              "line": 76,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveClass\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed\n\nLocator: locator('[data-context=\"tab\"][data-tab-id=\"SiD4Q_063yGrbdKMyVGmw\"]').locator('svg').first()\nExpected pattern: \u001b[32m/text-blue-500/\u001b[39m\nReceived string:  \u001b[31m\"shrink-0 h-3 w-3 shrink-0\"\u001b[39m\nTimeout: 10000ms\n\nCall log:\n\u001b[2m  - Expect \"toHaveClass\" with timeout 10000ms\u001b[22m\n\u001b[2m  - waiting for locator('[data-context=\"tab\"][data-tab-id=\"SiD4Q_063yGrbdKMyVGmw\"]').locator('svg').first()\u001b[22m\n\u001b[2m    14 × locator resolved to <svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" class=\"shrink-0 h-3 w-3 shrink-0\">…</svg>\u001b[22m\n\u001b[2m       - unexpected value \"shrink-0 h-3 w-3 shrink-0\"\u001b[22m"
+            }
+          ],
+          "attribution": {
+            "kind": "preexisting",
+            "ref": "identical assertion red as legacy (blue class missing); pre-existing both-server"
+          }
+        }
+      }
+    },
+    "ws-ping-pong-matrix.spec.ts": {
+      "bucket": "product",
+      "legs": {
+        "legacy": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 48,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 48
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        },
+        "rust": {
+          "verdict": "pass",
+          "passed": 2,
+          "failed": 0,
+          "skipped": 0,
+          "expectedFail": 0,
+          "durationMs": 122,
+          "runs": [
+            "slice-2"
+          ],
+          "runHistory": [
+            {
+              "run": "slice-2",
+              "passed": 2,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 122
+            }
+          ],
+          "failures": [],
+          "attribution": null
+        }
+      }
+    }
+  }
+}

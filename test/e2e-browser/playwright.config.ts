@@ -154,6 +154,8 @@ export const MATRIX_SPECS = [
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
+// Exported (no behavior change) so test/e2e-browser/playwright.gate01.config.ts
+// (GATE-01) can testIgnore the SAME array instead of drifting a copy.
 export const RUST_ONLY_SPECS = [
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,

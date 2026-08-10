@@ -101,6 +101,17 @@ test.describe('Codex Terminal Bounce (Rust only)', () => {
   test('a sidebar-resumed codex pane re-resumes (argv `resume <id>`) across a server restart without a page reload', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
 
+    // GATE-01 (2026-08-09): deterministic rust-side regression — after the
+    // restart, the re-resumed pane's `content.terminalId` stays null (20 s
+    // expect.poll at :195 times out), so the pane never reattaches. Red in
+    // slice-5 AND isolated rerun reproof-s5-codexbounce. Owner: TERM-22
+    // (current-main Codex lifecycle hardening, expected-restart behavior).
+    // Pin masks assertions after :195 (B001: un-pin must re-verify all).
+    test.fail(
+      e2eServerKind === 'rust',
+      'TERM-22: codex terminal re-resume across restart leaves terminalId null (GATE-01 2026-08-09)',
+    )
+
     const CODEX_SESSION_ID = 'codex-bounce-resume-0001'
     const SESSION_TITLE = 'codex-terminal-bounce seeded session'
 
