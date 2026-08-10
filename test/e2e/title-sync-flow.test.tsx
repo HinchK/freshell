@@ -13,7 +13,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
-import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
+import { updatePaneTitleByTerminalId } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -160,7 +160,7 @@ describe('title sync flow', () => {
     expect(screen.getAllByText('Shell').length).toBeGreaterThanOrEqual(1)
 
     await act(async () => {
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep', setByUser: false }))
     })
 
     expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
@@ -197,7 +197,7 @@ describe('title sync flow', () => {
     expect(screen.queryByText('Opencode')).not.toBeInTheDocument()
 
     await act(async () => {
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep', setByUser: false }))
     })
 
     expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
