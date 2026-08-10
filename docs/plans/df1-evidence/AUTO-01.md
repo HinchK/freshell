@@ -107,12 +107,13 @@ Per-leg outcomes (probe rule: run once per relevant leg; classified):
   - v3 (test 2 solo under `-g`, debugging a 2-worker timeout): PASS (40s).
     The v1/v2 test-2 timeout was load/parallelism, not a defect.
   - v4 (both tests, 2 workers, final spec): **PASS 2/2 (33.7s)**.
-- `rust-chromium`: **GREEN — PASS 2/2 (1.6m incl. the harness's release
-  rebuild)**, first attempt, against the final code at the time (post
-  serde-row fix `4d7dac7c5`). This leg is the proof the checklist item is
-  about: UI-only mutations read back exactly from the Rust server.
-- Probe logs: `/tmp/auto01-pw-legacy4.log`, `/tmp/auto01-pw-rust.log`
-  (ephemeral; the MATRIX registration makes both legs re-runnable any time).
+- `rust-chromium`: **GREEN**. First attempt 2/2 (1.6m incl. release rebuild)
+  at `4d7dac7c5`; **re-probed at the final review-complete code (2/2, 51.1s,
+  `/tmp/auto01-pw-rust-final.log`)** after the review-round Rust changes, so
+  the probe covers the final state.
+- Probe logs: `/tmp/auto01-pw-legacy4.log`, `/tmp/auto01-pw-rust.log`,
+  `/tmp/auto01-pw-rust-final.log` (ephemeral; the MATRIX registration makes
+  both legs re-runnable any time).
 
 ## Review loop (fresheyes independent reviews, GPT; Task tool unavailable in
 this dispatch environment — the authorized fallback)
