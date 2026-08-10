@@ -920,10 +920,31 @@ impl SettingsStore {
     /// (`project-colors-router.ts:24`, `await configStore.setProjectColor`)
     /// before responding, so a failed write is a failed request — and an
     /// axum handler can translate that error, which the original's
-    /// unwrapped express-4 async handler cannot do gracefully. On failure
-    /// the in-memory value REMAINS set (marked dirty) exactly like a
-    /// concurrent-writer race loss: a later successful persist lands it.
+    /// unwrapped express-4 async handler cannot do gracefully.
+    ///
+    /// FAILURE SEMANTICS (legacy parity): `ConfigStore.saveInternal`
+    /// assigns `this.cache = cfg` only AFTER the atomic write succeeds
+    /// (`config-store.ts:424-435`), so a failed persist leaves the legacy
+    /// in-memory map untouched. We must therefore install the new value
+    /// first (the persisted settings tree is derived from the in-memory
+    /// map via [`overlay_dirty_keys`]), but ROLL BACK on failure —
+    /// restoring the prior value and prior dirty-set membership so
+    /// `project_colors()` keeps serving the last-successfully-persisted
+    /// state and the freshness reload can still adopt a later external
+    /// disk edit (a stale dirty mark would tombstone it). The rollback
+    /// only fires while the installed value is still ours: a concurrent
+    /// same-path write that raced us is left alone (last-writer-wins,
+    /// exactly like two Legacy writers). Pinned by
+    /// `set_project_color_rolls_back_in_memory_state_when_persist_fails`.
     pub async fn set_project_color(&self, path: &str, color: &str) -> std::io::Result<()> {
+        let (prior_value, prior_dirty) = {
+            let all = self.project_colors.lock().expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            (all.get(path).cloned(), dirty.contains(path))
+        };
         {
             let mut all = self.project_colors.lock().expect("project colors lock");
             all.insert(path.to_string(), json!(color));
@@ -933,7 +954,32 @@ impl SettingsStore {
                 .insert(path.to_string());
         }
         let settings = self.get().await;
-        self.persist(&settings)
+        match self.persist(&settings) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let mut all = self.project_colors.lock().expect("project colors lock");
+                if all.get(path) == Some(&json!(color)) {
+                    match prior_value {
+                        Some(value) => {
+                            all.insert(path.to_string(), value);
+                        }
+                        None => {
+                            all.remove(path);
+                        }
+                    }
+                    let mut dirty = self
+                        .project_colors_dirty
+                        .lock()
+                        .expect("project colors dirty lock");
+                    if prior_dirty {
+                        dirty.insert(path.to_string());
+                    } else {
+                        dirty.remove(path);
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 }
 
@@ -4127,6 +4173,100 @@ mod tests {
     // in memory with the SAME side-by-side adopt-from-disk discipline as
     // the override maps (dirty keys win; untouched keys defer to disk).
     // ------------------------------------------------------------------
+
+    /// PERSIST-FAILURE ROLLBACK (legacy parity): a failed
+    /// `set_project_color` must leave the in-memory map AND the dirty set
+    /// exactly as they were before the attempt — mirroring
+    /// `ConfigStore.saveInternal`, which assigns `this.cache = cfg` only
+    /// AFTER the atomic write succeeds (`config-store.ts:424-435`). Covers
+    /// both shapes: overwriting an existing key (prior value restored) and
+    /// inserting a brand-new key (key absent afterwards), plus the
+    /// dirty-set consequence: a later external disk edit to the failed key
+    /// must still be adopted by the freshness reload (a stale dirty mark
+    /// would tombstone it in [`overlay_dirty_keys`]).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_project_color_rolls_back_in_memory_state_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": { "/proj/alpha": "#aaaaaa" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Zero-width throttle window: every read re-stats (test-scaled).
+        let store = store_at(&dir).with_reload_throttle_window(std::time::Duration::ZERO);
+
+        // `.freshell` read+execute only: persist()'s tmp-file create fails.
+        let original_perms = std::fs::metadata(&freshell).unwrap().permissions();
+        std::fs::set_permissions(&freshell, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Overwrite an EXISTING key: must Err, and the prior value must be
+        // restored — never the failed write.
+        store
+            .set_project_color("/proj/alpha", "#bbbbbb")
+            .await
+            .expect_err("a read-only config dir must fail the write");
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#aaaaaa"),
+            "a failed overwrite must restore the last-persisted value"
+        );
+
+        // Insert a NEW key: must Err, and the key must not be visible.
+        store
+            .set_project_color("/proj/beta", "#00ff00")
+            .await
+            .expect_err("a read-only config dir must fail the write");
+        let colors = store.project_colors();
+        assert!(
+            !colors.contains_key("/proj/beta"),
+            "a failed insert must not leak into project_colors(): {colors:?}"
+        );
+
+        // Dirty-set rollback: a later EXTERNAL disk edit to the failed key
+        // must be adopted by the freshness reload (20ms so the write lands
+        // on a later mtime tick — same pattern as
+        // `project_colors_external_write_becomes_visible_without_restart`).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/beta"] = json!("#123456");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#123456"),
+            "a stale dirty mark must not tombstone the external edit"
+        );
+
+        // Restore permissions; a retry now succeeds and persists.
+        std::fs::set_permissions(&freshell, original_perms).unwrap();
+        store
+            .set_project_color("/proj/alpha", "#bbbbbb")
+            .await
+            .expect("a writable config dir must persist");
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["projectColors"]["/proj/alpha"], json!("#bbbbbb"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// LOAD + ROUND-TRIP: a boot-time `projectColors` map is readable via
     /// `project_colors()`; `set_project_color` persists so the color is

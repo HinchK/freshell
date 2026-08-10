@@ -518,6 +518,9 @@ mod tests {
         let (state, mut rx) = state_at(&dir);
         let original_perms = std::fs::metadata(&freshell).unwrap().permissions();
         std::fs::set_permissions(&freshell, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Clone the shared store handle BEFORE `router` consumes `state`
+        // so the post-failure in-memory assertion below can read it.
+        let store = state.settings.clone();
         let app = router(state);
 
         let (status, resp) = put_json(
@@ -533,6 +536,14 @@ mod tests {
         );
         // No broadcast for a failed write.
         assert!(rx.try_recv().is_err(), "no sessions.changed on failure");
+        // The failed color must not leak into the live in-memory map
+        // (legacy parity: `saveInternal` updates the cache only AFTER the
+        // atomic write succeeds — `config-store.ts:424-435`).
+        let colors = store.project_colors();
+        assert!(
+            !colors.contains_key("/proj/a"),
+            "a failed write must not become visible via project_colors(): {colors:?}"
+        );
 
         std::fs::set_permissions(&freshell, original_perms).unwrap();
         std::fs::remove_dir_all(&dir).ok();
