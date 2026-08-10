@@ -137,7 +137,7 @@ test/e2e-browser/playwright.config.ts                     # +1 MATRIX_SPECS line
 - `minisignVerify(tauriPubkeyConfig, sigFileText, data): boolean` — independent verifier (parse .pub text → raw pub32+keynum; parse .sig → keynum match + Ed25519 verify artifact + verify trusted-comment global signature).
 - `startUpdateFeed(opts): Promise<UpdateFeed>` — `GET /latest.json` (Tauri manifest; `platforms` from opts, `signature`=base64(sig(text))), `GET /artifacts/:name` (raw bytes, octet-stream, content-length), `GET /github/releases/latest` (`{tag_name:"v"+version, html_url}` — Rust `/api/version` updateCheck shape leg). Knobs: `signWith: otherKeypair`, `tamperArtifact: true`, older/equal/wrong-platform versions. `UpdateFeed = { port, baseUrl, manifestUrl, artifactName, artifactBytes, keypair, stop() }`.
 
-**https.ts + fixtures/tls/`** — committed assets (generated once, `REGENERATE.md` documents the openssl commands): `ca.key/cert.pem` (CN "Freshell E2E Test CA (DO NOT TRUST)", 100 y), `localhost.key/cert.pem` (CA-signed; SAN DNS:localhost, IP:127.0.0.1, IP:::1), `untrusted.key/cert.pem` (self-signed, unrelated). 
+**https.ts + fixtures/tls/`** — committed assets (generated once, `REGENERATE.md` documents the openssl commands): `ca.key/cert.pem` (CN "Freshell E2E Test CA (DO NOT TRUST)", 100 y), `localhost.key/cert.pem` (CA-signed; SAN DNS:localhost, IP:127.0.0.1, IP:::1), `untrusted.key/cert.pem` (self-signed, unrelated).
 - `loadTestTlsAssets(): TlsAssets` — `{ caCert, server:{key,cert}, untrusted:{key,cert}, serverSpkiSha256B64 }`.
 - `startHttpsTarget(kind:'trusted'|'untrusted', opts?)` — target-server handler over `https`.
 - `fetchWithCa(url, ca?): Promise<{status, body}>` — Node-level trust probe.
