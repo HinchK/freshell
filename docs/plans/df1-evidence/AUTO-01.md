@@ -114,18 +114,33 @@ Per-leg outcomes (probe rule: run once per relevant leg; classified):
 - Probe logs: `/tmp/auto01-pw-legacy4.log`, `/tmp/auto01-pw-rust.log`
   (ephemeral; the MATRIX registration makes both legs re-runnable any time).
 
-Review loop (fresheyes, independent GPT review, pid 3154216) — round 1
-verdict FAILED with 3 findings, all fixed and verified:
-1. (major) `ui_layout_sync_ingest_never_replies` asserted via
-   `next_frame_of_type` which SKIPS interleaved frames — could pass vacuously.
-   Fixed: the test now reads the VERY NEXT raw frame and asserts it IS the
-   pong (any ack/error would arrive first).
-2. (major) this evidence file claimed probes without the per-leg
-   classification — this section is that fix.
-3. (minor) `list_tabs` title fallback was `None`-only; legacy `t.title ||
-   t.id` also falls back on `""`. Fixed + regression test.
+## Review loop (fresheyes independent reviews, GPT; Task tool unavailable in
+this dispatch environment — the authorized fallback)
 
-Round 2: (pending — rerun after round-1 fixes)
+- **Round 1** (pid 3154216, verdict FAILED → fixed): (major) vacuous
+  never-replies test → now reads the very next raw frame and asserts it IS the
+  pong; (major) evidence lacked per-leg probe classification → the section
+  above; (minor) `list_tabs` `""`-title fallback parity + regression test.
+- **Round 2** (pid 3886807, verdict FAILED → fixed): (major) `split_pane`
+  trusted stale `pane_tabs` and spawned PTYs before authoritative rejection —
+  reordered to legacy's store-first shape (`router.ts:1305-1315`), with
+  stale-shadow + mirror-only regression tests; `respawn_pane`/`navigate_pane`
+  got the same store-first resolution.
+- **Round 3** (pid 1364265, verdict FAILED → fixed): (major) `swap_pane` still
+  gated on the shadow map — rewritten store-first with legacy's
+  200-`{message:'panes not found'}` decline shape (no 404 exists on the
+  legacy swap route); stale-shadow/mirror-only regression tests; (minor)
+  browser title hostname now lowercases (`new URL` canonicalization).
+- **Round 4** (pid 3281298, verdict FAILED → fixed): (major) the store-first
+  swap left the fresh-agent session binding (`panes` map) behind — bindings
+  now follow swapped content (legacy's content-driven fresh-agent send
+  resolution parity), with a fresh-agent↔browser swap regression test;
+  (minor, recorded, not fixed) `url_hostname` is deliberately a cheap
+  extractor, not full WHATWG URL parity (IDNA/punycode, invalid-port rejects).
+- **Round 5** (pid 679777): **PASSED** — "Only a minor edge-case issue
+  remains... stop iterating because only minor/nit issues remain." The nit is
+  the recorded `url_hostname` approximation (IDNA/punycode + invalid-port
+  corners vs `new URL`).
 
 ## Verifier-facing GREEN commands (at final SHA)
 
