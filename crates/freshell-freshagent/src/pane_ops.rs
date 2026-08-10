@@ -778,12 +778,12 @@ pub(crate) async fn resize_pane(
 /// layout no longer contains; a mirror-only pair swaps fine). When the store
 /// declines (unknown pane, or the two panes share no single tab) the route
 /// answers legacy's own 200-`{message:'panes not found'}` with ZERO side
-/// effects (no bookkeeping mutation, no broadcast); success swaps the
-/// dispatch bookkeeping (`terminal_panes`/`content_panes`, whichever each
-/// pane occupies) and broadcasts. Fresh-agent pane pairs are stored leaves
-/// too, so they now swap like legacy does (their dispatch binding lives in
-/// the fresh-agent `panes` map keyed by pane id -- any send-side implications
-/// of a swapped binding are AUTO-09's re-point, noted in AUTO-01 evidence).
+/// effects (no bookkeeping mutation, no broadcast); success swaps ALL
+/// dispatch bookkeeping in lockstep with the content (`terminal_panes`,
+/// `content_panes`, AND the fresh-agent session map `panes`), then
+/// broadcasts. Fresh-agent pane pairs swap with their session binding
+/// following the content, exactly like legacy's content-driven fresh-agent
+/// send resolution.
 pub(crate) async fn swap_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -814,7 +814,12 @@ pub(crate) async fn swap_pane(
 
     // Dispatch bookkeeping exchange (post-AUTO-01 quality holdover for the
     // not-yet-repointed dispatch routes): swap whichever per-kind map holds
-    // each pane, per side independently.
+    // each pane, per side independently — INCLUDING the fresh-agent session
+    // binding map (`state.panes`): legacy's fresh-agent sends resolve sessions
+    // from the leaf CONTENT (`layoutStore.getPaneSnapshot(...).paneContent`),
+    // so after a content swap the binding must follow the content, or a
+    // send/capture would drive the pane id whose content no longer carries
+    // the session.
     {
         let mut terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
         let a = terminal_panes.remove(&pane_id);
@@ -835,6 +840,17 @@ pub(crate) async fn swap_pane(
         }
         if let Some(a) = a {
             content_panes.insert(other_id.clone(), a);
+        }
+    }
+    {
+        let mut fresh_panes = state.panes.lock().expect("panes mutex");
+        let a = fresh_panes.remove(&pane_id);
+        let b = fresh_panes.remove(&other_id);
+        if let Some(b) = b {
+            fresh_panes.insert(pane_id.clone(), b);
+        }
+        if let Some(a) = a {
+            fresh_panes.insert(other_id.clone(), a);
         }
     }
 
@@ -2186,6 +2202,69 @@ mod tests {
         for id in registry.inventory() {
             registry.kill(&id.terminal_id);
         }
+    }
+
+    /// Review-round-4 regression: swapping a fresh-agent pane with another
+    /// pane moves the session binding (`panes` map) WITH the content —
+    /// legacy's content-driven fresh-agent send resolution demands it
+    /// (`layoutStore.getPaneSnapshot(paneId).paneContent`).
+    #[tokio::test]
+    async fn swap_moves_fresh_agent_session_binding_with_content() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        // REST fresh-agent create (no sidecar starts — create is lazy).
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "agent": "opencode", "name": "Agent" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let agent_pane = body["data"]["paneId"].as_str().unwrap().to_string();
+        let tab_id = body["data"]["tabId"].as_str().unwrap().to_string();
+        // Split in a browser pane, then swap the two.
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{agent_pane}/split"),
+            json!({ "browser": "https://swap.example.com" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let browser_pane = body["data"]["paneId"].as_str().unwrap().to_string();
+
+        assert!(state
+            .panes
+            .lock()
+            .expect("panes mutex")
+            .contains_key(&agent_pane));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{agent_pane}/swap"),
+            json!({ "target": browser_pane }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"], json!({ "tabId": tab_id }));
+
+        // The binding FOLLOWED the content: the browser-pane id no longer
+        // resolves, and the session now lives under what was the agent pane id.
+        let fresh = state.panes.lock().expect("panes mutex");
+        assert!(!fresh.contains_key(&agent_pane));
+        assert!(fresh.contains_key(&browser_pane));
+        drop(fresh);
+        // And the store's tree agrees (content follows too).
+        let snap = state.layout_store().get_normalized_snapshot(Some(&tab_id));
+        let tree = serde_json::to_string(&snap["layouts"][&tab_id]).unwrap();
+        let a_content = &snap["layouts"][&tab_id]["children"][0];
+        assert_eq!(a_content["id"], json!(agent_pane));
+        assert_eq!(a_content["content"]["kind"], json!("browser"), "{tree}");
+        let b_content = &snap["layouts"][&tab_id]["children"][1];
+        assert_eq!(b_content["id"], json!(browser_pane));
+        assert_eq!(b_content["content"]["kind"], json!("fresh-agent"), "{tree}");
     }
 
     /// The mirror-only flip side: both panes exist ONLY in the store —
