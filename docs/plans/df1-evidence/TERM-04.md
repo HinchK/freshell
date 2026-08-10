@@ -69,8 +69,8 @@ violation.
 
 | Leg | Command suffix | Outcome | Notes |
 |---|---|---|---|
-| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 passed (1.3m)** | THE PW-RUST proof leg. First probe run had one spec-shaping flaw (RawWsClient R2 anti-stale rule violation in test B's interleaved hello/ready — a spec bug, not a server bug); fixed (`3ef9b7e4c`) and rerun green. |
-| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 passed (43.6s)** | True parity control: the contract is legacy-native, and the legacy server passes the identical spec unmodified (global settled cache + sentinel semantics replay one terminalId across abort/reconnect/two-clients). |
+| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3, exit 0 @ dfb5fe963** | THE PW-RUST proof leg. (Round-1-era intermediates: 3/3 at `3ef9b7e4c` after a spec-shaping fix for RawWsClient's R2 anti-stale rule; 3/3 at `e6fc55a3d` after the r1 fixes. Authoritative run is the latest SHA one.) |
+| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3, exit 0 @ dfb5fe963** | True parity control: the contract is legacy-native, and the legacy server passes the identical spec unmodified (global settled cache + sentinel semantics replay one terminalId across abort/reconnect/two-clients). |
 
 ## File map for the spec
 
@@ -166,3 +166,32 @@ Substantive findings, all reproduced and fixed:
   now names the server-global cache; stale "fake CLI banner" comment rewritten to match
   the Redux-layout poll; per-test `mkdtemp` trees now removed in afterEach; plan Task-1
   snippets updated to the real shared-harness helpers.
+
+## Review round 2 → fixes (fresheyes independent review #2, claude provider, verdict FAILED→fixed)
+
+- **[blocker — provenance]** "Evidence table recorded runs that predate the r1
+  assertion changes without saying so." True of the STAMP, false of the RUNS (post-r1
+  runs at `e6fc55a3d` had been green before this commit but unrecorded; the table still
+  showed pre-r1 timings). Fixed by re-running the FULL gate at `dfb5fe963` (cargo
+  create_dedupe 3/3 + restore_spawn_gate 12/12 + clippy -D warnings + fmt + tsc
+  attribution 0; PW rust 3/3 exit 0; PW legacy 3/3 exit 0) and re-stamping the table
+  with the run SHA. The command chain's `grep -c` zero-match footgun (exit 1) was the
+  only infra wrinkle — cargo legs completed first; PW legs re-invoked separately.
+- **[minor] Leg C reconnect proof was local-state-vacuous** (Redux keeps terminalId
+  while disconnected). Fixed with a real marker round-trip: fake-claude program rule
+  `stdin:^term04-ping$` → `marker term04-pong-marker`, typed into page A's xterm after
+  the forced reconnect; attach truth is now "bytes round-trip through THE same PTY".
+- **[minor] Leg C final ledger assert justified by a false ordering claim** (server
+  replies to page B BEFORE a wrongful duplicate's child could write its ledger row):
+  comment rewritten — the ordering guarantee comes from the reply poll's terminalId
+  match, not from any timing window; the ledger/inventory/owner reads are confirming.
+- **[minor] `childPidsOf` is `[]` off Linux** (vacuous-in-reverse): both pid asserts are
+  now `process.platform === 'linux'`-guarded (the matrix host is Linux).
+- **[minor] Legacy pre-settle window named for leg A too** — registered in Residual
+  notes with the reason it's load-proof (ledger gating >> spawn→remember).
+- **[nit] Drifted `create_dedupe.rs` header anchors** (pre-existing, the module under
+  proof): updated to current `ws-handler.ts` lines (:575/:921-936/:478/:2495/:2218/
+  :591-593/:906-910/:929-931; cleanup :2704; TerminalView reply match :4216/:4702).
+- **[nit] Plan-anchor off-by-ones + the INVALID restore-frame mid-edit artifact** in
+  `docs/plans/df1/TERM-04.md`: anchors corrected (:921-936, :2259-2319); the frame
+  discussion now leads with the DO-NOT-USE note.
