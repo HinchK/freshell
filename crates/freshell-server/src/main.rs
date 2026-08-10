@@ -27,6 +27,7 @@ mod extensions;
 mod files;
 mod instance_id;
 mod logging;
+mod migrations;
 mod network;
 mod proxy;
 mod rate_limit;
