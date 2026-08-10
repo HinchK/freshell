@@ -268,11 +268,32 @@ test.describe('Title sync convergence', () => {
     const NEW_NAME = 'Automation Name Three'
     const { tabId, paneId } = await resumeSeededSession(page, harness, SESSION_AUTOMATION_RENAME)
 
+    // The server-side layout mirror is client-pushed (`ui.layout.sync`,
+    // 200 ms trailing debounce, layoutMirrorMiddleware.ts) — until it lands,
+    // BOTH servers answer a rename of the not-yet-mirrored pane with the
+    // Node-parity no-op 200 `{message:'pane not found'}` (router.ts:1411 /
+    // rename_pane lib.rs:1516-1521) and skip the broadcast + cascade
+    // entirely. That miss is a real automation-contract outcome, not a
+    // convergence failure, so arrange like a real automation client: target
+    // a pane the server actually lists (GET /api/panes on both kinds).
+    await expect.poll(async () => {
+      const listRes = await page.request.get(`${serverInfo.baseUrl}/api/panes?tabId=${encodeURIComponent(tabId)}`, {
+        headers: { 'x-auth-token': serverInfo.token },
+      })
+      const body = await listRes.json().catch(() => null)
+      const panes = body?.data?.panes
+      return Array.isArray(panes) && panes.some((p: { id?: string }) => p?.id === paneId)
+    }, { timeout: 15_000 }).toBe(true)
+
     const res = await page.request.patch(`${serverInfo.baseUrl}/api/panes/${encodeURIComponent(paneId)}`, {
       headers: { 'x-auth-token': serverInfo.token, 'content-type': 'application/json' },
       data: { name: NEW_NAME },
     })
     expect(res.ok()).toBe(true)
+    // The rename must have actually APPLIED (`data.tabId` present) — a bare
+    // `res.ok()` is also true for the `{message:'pane not found'}` no-op.
+    const patchBody = await res.json()
+    expect(patchBody?.data?.tabId, JSON.stringify(patchBody)).toBe(tabId)
 
     // Pane header (ui.command pane.rename fold-in).
     await expect(visiblePaneHeader(page)).toContainText(NEW_NAME, { timeout: 10_000 })
