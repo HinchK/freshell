@@ -283,3 +283,515 @@ mod tests {
         );
     }
 }
+
+// ── Load-bearing probes (BROWSER-01, `docs/plans/df1/BROWSER-01.md`) ─────────
+//
+// One-shot EMPIRICAL validations of the assumptions the BROWSER-01 design
+// rests on (plan §L1..L5). They deliberately probe framework behavior
+// (axum routing/extraction, `http::HeaderMap`, reqwest body handling) rather
+// than proxy correctness — the durable contract tests live in
+// `mod socket_contract`. Raw sockets everywhere: no framework client/server
+// on either side of the wire, so nothing normalizes the bytes being proven.
+#[cfg(test)]
+mod lb_probes {
+    use super::*;
+
+    const TEST_TOKEN: &str = "lb-probe-token-0123456789abcdef";
+
+    // ── Raw-wire helpers ────────────────────────────────────────────────────
+
+    /// One side of a raw TCP conversation plus a read-ahead buffer, so a
+    /// single `read()` that straddles the head/body boundary loses nothing.
+    struct Wire {
+        stream: tokio::net::TcpStream,
+        buf: Vec<u8>,
+    }
+
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Parse `\r\n`-terminated head bytes into (first line, ordered headers).
+    /// Duplicate headers are preserved in wire order.
+    fn parse_head(raw: &[u8]) -> (String, Vec<(String, String)>) {
+        let text = String::from_utf8_lossy(raw);
+        let mut lines = text.split("\r\n");
+        let first = lines.next().unwrap_or("").to_string();
+        let headers = lines
+            .take_while(|l| !l.is_empty())
+            .filter_map(|l| {
+                l.split_once(':')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        (first, headers)
+    }
+
+    fn header_values<'a>(
+        headers: &'a [(String, String)],
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a str> {
+        headers
+            .iter()
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    impl Wire {
+        fn new(stream: tokio::net::TcpStream) -> Self {
+            Self {
+                stream,
+                buf: Vec::new(),
+            }
+        }
+
+        async fn write_all(&mut self, bytes: &[u8]) {
+            use tokio::io::AsyncWriteExt;
+            self.stream.write_all(bytes).await.unwrap();
+        }
+
+        /// Read until `needle` (inclusive) and return it, retaining any
+        /// over-read bytes in the buffer.
+        async fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            loop {
+                if let Some(pos) = find_subslice(&self.buf, needle) {
+                    let end = pos + needle.len();
+                    return self.buf.drain(..end).collect();
+                }
+                let mut tmp = [0u8; 8192];
+                let n = self.stream.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    return std::mem::take(&mut self.buf);
+                }
+                self.buf.extend_from_slice(&tmp[..n]);
+            }
+        }
+
+        async fn read_n(&mut self, n: usize) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            while self.buf.len() < n {
+                let mut tmp = [0u8; 8192];
+                let r = self.stream.read(&mut tmp).await.unwrap();
+                if r == 0 {
+                    break;
+                }
+                self.buf.extend_from_slice(&tmp[..r]);
+            }
+            let take = self.buf.len().min(n);
+            self.buf.drain(..take).collect()
+        }
+
+        async fn read_to_eof(&mut self) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            let mut tmp = [0u8; 8192];
+            loop {
+                match self.stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            std::mem::take(&mut self.buf)
+        }
+
+        /// Read one RFC 7230 chunked body (with optional trailer lines) and
+        /// return the reassembled payload.
+        async fn read_chunked(&mut self) -> Vec<u8> {
+            let mut body = Vec::new();
+            loop {
+                let size_line = self.read_until(b"\r\n").await;
+                let size_text = String::from_utf8_lossy(&size_line);
+                let size_text = size_text.trim();
+                let size = usize::from_str_radix(
+                    size_text.split(';').next().unwrap_or("").trim(),
+                    16,
+                )
+                .unwrap_or_else(|_| panic!("bad chunk size line {size_text:?}"));
+                if size == 0 {
+                    // Trailer lines until a bare CRLF (common case: none).
+                    loop {
+                        let line = self.read_until(b"\r\n").await;
+                        if line == b"\r\n" {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                body.extend_from_slice(&self.read_n(size).await);
+                let crlf = self.read_n(2).await;
+                assert_eq!(crlf, b"\r\n", "chunk terminator");
+            }
+            body
+        }
+    }
+
+    /// A request as captured verbatim by the raw upstream fixture.
+    #[derive(Debug, Default)]
+    struct CapturedRequest {
+        request_line: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl CapturedRequest {
+        fn raw_target(&self) -> &str {
+            self.request_line.split(' ').nth(1).unwrap_or("")
+        }
+        fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+            header_values(&self.headers, name)
+        }
+    }
+
+    /// Read one full request (head + framed body) from a wire.
+    async fn read_request(wire: &mut Wire) -> CapturedRequest {
+        let head = wire.read_until(b"\r\n\r\n").await;
+        let (request_line, headers) = parse_head(&head);
+        let body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
+            wire.read_chunked().await
+        } else if let Some(cl) = header_values(&headers, "content-length").next() {
+            wire.read_n(cl.parse().expect("content-length integer")).await
+        } else {
+            Vec::new()
+        };
+        CapturedRequest {
+            request_line,
+            headers,
+            body,
+        }
+    }
+
+    /// A full response as captured on the client side.
+    #[derive(Debug)]
+    struct RawResponse {
+        status_line: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl RawResponse {
+        fn status_code(&self) -> u16 {
+            self.status_line
+                .split(' ')
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .expect("status code")
+        }
+        fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+            header_values(&self.headers, name)
+        }
+    }
+
+    /// Send verbatim request bytes and read the full framed response.
+    async fn raw_exchange(port: u16, request: &[u8]) -> RawResponse {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut wire = Wire::new(stream);
+            wire.write_all(request).await;
+            let head = wire.read_until(b"\r\n\r\n").await;
+            let (status_line, headers) = parse_head(&head);
+            let body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked"))
+            {
+                wire.read_chunked().await
+            } else if let Some(cl) = header_values(&headers, "content-length").next() {
+                wire.read_n(cl.parse().expect("content-length integer")).await
+            } else {
+                wire.read_to_eof().await
+            };
+            RawResponse {
+                status_line,
+                headers,
+                body,
+            }
+        })
+        .await
+        .expect("exchange timed out")
+    }
+
+    /// Bind `127.0.0.1:0` synchronously (usable before the runtime schedules
+    /// the accept loop) and spawn one task per accepted connection.
+    fn spawn_raw_listener<F, Fut>(handler: F) -> u16
+    where
+        F: Fn(Wire) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let h = Arc::clone(&handler);
+                tokio::spawn(async move { h(Wire::new(stream)).await });
+            }
+        });
+        port
+    }
+
+    /// Spawn the REAL proxy router (production state constructor) on an
+    /// ephemeral loopback port.
+    async fn spawn_proxy() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(TEST_TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    /// Spawn an arbitrary standalone axum router on an ephemeral port.
+    async fn spawn_app(app: Router) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    /// Static client→proxy head for `path`. `connection: close` gives the
+    /// response a deterministic EOF. Ends with the blank line that terminates
+    /// the head. Callers append body bytes for body-bearing requests (with a
+    /// matching `content-length` or chunked framing added to the head).
+    fn proxy_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
+        format!(
+            "{method} /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
+             host: 127.0.0.1:{port}\r\n\
+             x-auth-token: {TEST_TOKEN}\r\n\
+             connection: close\r\n\r\n",
+        )
+        .into_bytes()
+    }
+
+    // ── L0 sanity: a plain GET passes through the proxy at all ────────────
+    #[tokio::test]
+    async fn l0_sanity_plain_get_through_proxy() {
+        let upstream_port = spawn_raw_listener(move |mut wire| async move {
+            let _req = read_request(&mut wire).await;
+            wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                .await;
+        });
+        let proxy_port = spawn_proxy().await;
+        let resp = raw_exchange(proxy_port, &proxy_head(proxy_port, "GET", upstream_port, "/")).await;
+        assert_eq!(resp.status_code(), 200);
+        assert_eq!(resp.body, b"hello");
+    }
+
+    // ── L1: axum matches percent-ENCODED paths and `uri.path()` is raw ─────
+    //
+    // The G1 fix parses `<port>`/`<rest>` off the raw URI instead of the
+    // decoded `Path<String>` catch-all. Load-bearing: if axum rejected encoded
+    // paths at routing time or handed the handler a decoded URI, the fix would
+    // have to move elsewhere entirely.
+    #[tokio::test]
+    async fn l1_route_matches_encoded_path_and_uri_path_is_raw() {
+        let app = Router::new().route(
+            "/api/proxy/http/{*tail}",
+            any(|uri: Uri| async move { uri.path().to_string() }),
+        );
+        let port = spawn_app(app).await;
+        let resp = raw_exchange(
+            port,
+            b"GET /api/proxy/http/5173/a%2Fb/c%20d?q=%2F HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200, "route must match an encoded path");
+        assert_eq!(
+            String::from_utf8(resp.body).unwrap(),
+            "/api/proxy/http/5173/a%2Fb/c%20d",
+            "uri.path() must be the RAW, undecoded path"
+        );
+    }
+
+    // ── L2: `HeaderMap::insert` collapses; `append` preserves ──────────────
+    //
+    // Confirms G2's mechanism: the current proxy copies headers with
+    // `insert`, which REPLACES all existing values (multi `Set-Cookie` dies).
+    #[test]
+    fn l2_headermap_insert_collapses_append_preserves() {
+        let mut collapsed = HeaderMap::new();
+        collapsed.insert(
+            HeaderName::from_static("x-dupe"),
+            HeaderValue::from_static("one"),
+        );
+        collapsed.insert(
+            HeaderName::from_static("x-dupe"),
+            HeaderValue::from_static("two"),
+        );
+        assert_eq!(
+            collapsed.get_all("x-dupe").iter().count(),
+            1,
+            "insert REPLACES every existing value for the name"
+        );
+
+        let mut preserved = HeaderMap::new();
+        preserved.append(
+            HeaderName::from_static("x-dupe"),
+            HeaderValue::from_static("one"),
+        );
+        preserved.append(
+            HeaderName::from_static("x-dupe"),
+            HeaderValue::from_static("two"),
+        );
+        let values: Vec<_> = preserved
+            .get_all("x-dupe")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, ["one", "two"], "append preserves order + values");
+    }
+
+    // ── L3: `Bytes` extraction is DefaultBodyLimit-capped; `Body` is not ────
+    //
+    // The G3 fix streams `axum::body::Body` instead of buffering `Bytes`.
+    // Load-bearing: confirms the observed 413 mechanism and that extracting
+    // `Body` directly really sidesteps the limit (no extra layer needed).
+    #[tokio::test]
+    async fn l3_bytes_extractor_hits_default_body_limit_body_extractor_does_not() {
+        let big = vec![b'x'; 3 * 1024 * 1024];
+
+        let bytes_app = Router::new().route(
+            "/t",
+            any(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        );
+        let port = spawn_app(bytes_app).await;
+        let mut req = format!(
+            "POST /t HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            big.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(&big);
+        let resp = raw_exchange(port, &req).await;
+        assert_eq!(
+            resp.status_code(),
+            413,
+            "Bytes extraction must hit axum's 2 MiB DefaultBodyLimit"
+        );
+
+        let body_app = Router::new().route(
+            "/t",
+            any(|body: Body| async move {
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                bytes.len().to_string()
+            }),
+        );
+        let port = spawn_app(body_app).await;
+        let resp = raw_exchange(port, &req).await;
+        assert_eq!(resp.status_code(), 200, "Body extraction is uncapped");
+        assert_eq!(resp.body.len().to_string().len() > 0, true);
+        assert_eq!(String::from_utf8(resp.body).unwrap(), big.len().to_string());
+    }
+
+    // ── L4: reqwest injects NO accept-encoding and performs NO decompression ─
+    //
+    // The proxy forwards whatever the client sent (gzip included) byte-exact.
+    // Load-bearing: if reqwest auto-added `Accept-Encoding` or transparently
+    // decompressed, forwarded `content-encoding` + body bytes would disagree.
+    // (Cargo already shows `default-features=false` without compression
+    // features; this probe proves the runtime behavior, not the manifest.)
+    #[tokio::test]
+    async fn l4_reqwest_no_accept_encoding_injection_and_no_decompression() {
+        // Real gzip bytes of "proxied-gzip-payload-0123456789" (gzip -n).
+        const GZIP: [u8; 51] = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2b, 0x28, 0xca, 0xaf,
+            0xc8, 0x4c, 0x4d, 0xd1, 0x4d, 0xaf, 0xca, 0x2c, 0xd0, 0x2d, 0x48, 0xac, 0xcc, 0xc9,
+            0x4f, 0x4c, 0xd1, 0x35, 0x30, 0x34, 0x32, 0x36, 0x31, 0x35, 0x33, 0xb7, 0xb0, 0x04,
+            0x00, 0x0d, 0xae, 0xc4, 0xd7, 0x1f, 0x00, 0x00, 0x00,
+        ];
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                let mut resp =
+                    b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 51\r\n\r\n"
+                        .to_vec();
+                resp.extend_from_slice(&GZIP);
+                wire.write_all(&resp).await;
+            }
+        });
+        let proxy_port = spawn_proxy().await;
+        // NOTE: the client deliberately sends NO accept-encoding.
+        let resp = raw_exchange(proxy_port, &proxy_head(proxy_port, "GET", upstream_port, "/")).await;
+        assert_eq!(resp.status_code(), 200);
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].header_values("accept-encoding").count(),
+            0,
+            "reqwest must NOT inject accept-encoding; got {:?}",
+            got[0].headers
+        );
+        assert_eq!(
+            resp.header_values("content-encoding").collect::<Vec<_>>(),
+            vec!["gzip"],
+            "content-encoding header must survive"
+        );
+        assert_eq!(
+            resp.body,
+            GZIP,
+            "gzip body bytes must pass through untouched (no decompression)"
+        );
+    }
+
+    // ── L5: reqwest honors an explicit content-length with a streamed body ──
+    //
+    // The G3 fix streams the incoming body via `Body::wrap_stream` while
+    // forwarding the client's original `content-length` (legacy parity). If
+    // reqwest overrode or ignored the explicit header, swe would fall back to
+    // chunked (still spec-legal, but a parity wobble worth knowing upfront).
+    #[tokio::test]
+    async fn l5_wrap_stream_honors_explicit_content_length() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"hello world"),
+        )]);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{upstream_port}/x"))
+            .header("content-length", "11")
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].header_values("content-length").collect::<Vec<_>>(),
+            vec!["11"],
+            "explicit content-length must reach the wire; got {:?}",
+            got[0].headers
+        );
+        assert_eq!(
+            got[0].header_values("transfer-encoding").count(),
+            0,
+            "no chunked framing when content-length is known"
+        );
+        assert_eq!(got[0].body, b"hello world");
+    }
+}

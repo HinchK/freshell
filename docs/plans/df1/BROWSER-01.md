@@ -100,6 +100,22 @@ and `rust-chromium`.
 7. **C. PW spec** authored + registered; one probe run per leg; classify.
 8. fmt/clippy/typecheck clean; focused greens ×2; evidence doc; review loop.
 
+## Load-bearing audit (validated 2026-08-09, probes in `proxy.rs::lb_probes`)
+
+| ID | Claim | Verdict | Evidence |
+|----|-------|---------|----------|
+| L1 | axum route `/api/proxy/http/{*tail}` matches percent-ENCODED paths and `uri.path()` in the handler is the RAW undecoded path | **verified** | probe green: `GET /api/proxy/http/5173/a%2Fb/c%20d?q=%2F` → handler sees `/api/proxy/http/5173/a%2Fb/c%20d` byte-exact |
+| L2 | `HeaderMap::insert` REPLACES all existing values (collapse); `append` preserves order + all values | **verified** | probe green (pure `http` crate semantics) |
+| L3 | axum `Bytes` extractor is capped by `DefaultBodyLimit` (2 MiB → 413); extracting `axum::body::Body` directly is uncapped | **verified** | probe green: 3 MiB body → 413 via `Bytes`, 200 + exact len via `Body` |
+| L4 | reqwest (`default-features=false, features=["stream","rustls"]`) injects NO `accept-encoding` and performs NO transparent decompression | **verified** | probe green through the live proxy: upstream saw zero `accept-encoding`; 51 real gzip bytes + `content-encoding: gzip` passed through byte-exact |
+| L5 | `reqwest::Body::wrap_stream` + explicit `content-length` header puts that exact length on the wire (no chunked fallback) | **verified** | probe green: upstream received `content-length: 11`, no `transfer-encoding`, exact body |
+| L6 | legacy `req.url` inside `router.use('/http/:port')` is the RAW undecoded path+query (parity target for G1) | **verified (inspection)** | `proxy-router.ts:99` `path: req.url`; Express strips the mount prefix only — Node never percent-decodes `req.url` |
+
+All five unknowns resolved; no plan reshaping needed. Harness lesson recorded: a
+client head missing the terminating blank line hangs exactly like a buffering
+proxy (L4 initially "failed" for this reason — the read deadlines exist to catch
+harness bugs, and staged sanity probes (L0) isolated it in minutes).
+
 ## Acceptance evidence (what "complete" means here)
 
 Every parity-table row proven green on Rust (A/B), the PW-RUST spec authored + probe-run
