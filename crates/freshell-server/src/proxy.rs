@@ -444,11 +444,9 @@ pub(crate) mod wire_support {
                 let size_line = self.read_until(b"\r\n").await;
                 let size_text = String::from_utf8_lossy(&size_line);
                 let size_text = size_text.trim();
-                let size = usize::from_str_radix(
-                    size_text.split(';').next().unwrap_or("").trim(),
-                    16,
-                )
-                .unwrap_or_else(|_| panic!("bad chunk size line {size_text:?}"));
+                let size =
+                    usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
+                        .unwrap_or_else(|_| panic!("bad chunk size line {size_text:?}"));
                 if size == 0 {
                     // Trailer lines until a bare CRLF (common case: none).
                     loop {
@@ -491,7 +489,8 @@ pub(crate) mod wire_support {
         let body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
             wire.read_chunked().await
         } else if let Some(cl) = header_values(&headers, "content-length").next() {
-            wire.read_n(cl.parse().expect("content-length integer")).await
+            wire.read_n(cl.parse().expect("content-length integer"))
+                .await
         } else {
             Vec::new()
         };
@@ -533,14 +532,15 @@ pub(crate) mod wire_support {
             wire.write_all(request).await;
             let head = wire.read_until(b"\r\n\r\n").await;
             let (status_line, headers) = parse_head(&head);
-            let body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked"))
-            {
-                wire.read_chunked().await
-            } else if let Some(cl) = header_values(&headers, "content-length").next() {
-                wire.read_n(cl.parse().expect("content-length integer")).await
-            } else {
-                wire.read_to_eof().await
-            };
+            let body =
+                if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
+                    wire.read_chunked().await
+                } else if let Some(cl) = header_values(&headers, "content-length").next() {
+                    wire.read_n(cl.parse().expect("content-length integer"))
+                        .await
+                } else {
+                    wire.read_to_eof().await
+                };
             RawResponse {
                 status_line,
                 headers,
@@ -574,15 +574,17 @@ pub(crate) mod wire_support {
     }
 
     /// Spawn the REAL proxy router (production state constructor) on an
-    /// ephemeral loopback port.
-    pub(crate) async fn spawn_proxy() -> u16 {
+    /// ephemeral loopback port, gated by `token`.
+    pub(crate) async fn spawn_proxy(token: &str) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(TEST_TOKEN.to_string())));
+        let app = router(ProxyState::new(Arc::new(token.to_string())));
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
         });
         port
     }
@@ -594,25 +596,56 @@ pub(crate) mod wire_support {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
         });
         port
     }
 
-    /// Static client→proxy head for `path`. `connection: close` gives the
-    /// response a deterministic EOF. Ends with the blank line that terminates
-    /// the head. Callers append body bytes for body-bearing requests (with a
-    /// matching `content-length` or chunked framing added to the head).
-    pub(crate) fn proxy_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
+    /// Static client→proxy head for `path_and_query`. `connection: close`
+    /// gives the response a deterministic EOF. Ends with the blank line that
+    /// terminates the head. Callers append body bytes for body-bearing
+    /// requests (with a matching `content-length` or chunked framing added to
+    /// the head) and pass extra request header lines (`"name: value"`).
+    pub(crate) fn proxy_head(
+        port: u16,
+        token: &str,
+        method: &str,
+        upstream_port: u16,
+        path_and_query: &str,
+        extra_headers: &[&str],
+    ) -> Vec<u8> {
+        let extras: String = extra_headers.iter().map(|h| format!("{h}\r\n")).collect();
         format!(
             "{method} /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
              host: 127.0.0.1:{port}\r\n\
-             x-auth-token: {TEST_TOKEN}\r\n\
+             x-auth-token: {token}\r\n\
+             {extras}\
              connection: close\r\n\r\n",
         )
         .into_bytes()
     }
 
+    /// Spawn a capture-all upstream plus the proxy, returning
+    /// (proxy_port, upstream_port, captured).
+    pub(crate) async fn spawn_proxy_and_capture(
+        token: &str,
+    ) -> (u16, u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let proxy_port = spawn_proxy(token).await;
+        (proxy_port, upstream_port, captured)
+    }
 }
 
 #[cfg(test)]
@@ -628,8 +661,12 @@ mod lb_probes {
             wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
                 .await;
         });
-        let proxy_port = spawn_proxy().await;
-        let resp = raw_exchange(proxy_port, &proxy_head(proxy_port, "GET", upstream_port, "/")).await;
+        let proxy_port = spawn_proxy(TEST_TOKEN).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(proxy_port, TEST_TOKEN, "GET", upstream_port, "/", &[]),
+        )
+        .await;
         assert_eq!(resp.status_code(), 200);
         assert_eq!(resp.body, b"hello");
     }
@@ -735,7 +772,6 @@ mod lb_probes {
         let port = spawn_app(body_app).await;
         let resp = raw_exchange(port, &req).await;
         assert_eq!(resp.status_code(), 200, "Body extraction is uncapped");
-        assert_eq!(resp.body.len().to_string().len() > 0, true);
         assert_eq!(String::from_utf8(resp.body).unwrap(), big.len().to_string());
     }
 
@@ -769,9 +805,13 @@ mod lb_probes {
                 wire.write_all(&resp).await;
             }
         });
-        let proxy_port = spawn_proxy().await;
+        let proxy_port = spawn_proxy(TEST_TOKEN).await;
         // NOTE: the client deliberately sends NO accept-encoding.
-        let resp = raw_exchange(proxy_port, &proxy_head(proxy_port, "GET", upstream_port, "/")).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(proxy_port, TEST_TOKEN, "GET", upstream_port, "/", &[]),
+        )
+        .await;
         assert_eq!(resp.status_code(), 200);
         let got = captured.lock().await;
         assert_eq!(got.len(), 1);
@@ -787,8 +827,7 @@ mod lb_probes {
             "content-encoding header must survive"
         );
         assert_eq!(
-            resp.body,
-            GZIP,
+            resp.body, GZIP,
             "gzip body bytes must pass through untouched (no decompression)"
         );
     }
@@ -854,28 +893,6 @@ mod socket_contract {
 
     const CONTRACT_TOKEN: &str = "contract-token-0123456789abcdef";
 
-    async fn spawn_contract_proxy() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(CONTRACT_TOKEN.to_string())));
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
-        });
-        port
-    }
-
-    fn contract_head(port: u16, method: &str, upstream_port: u16, path_and_query: &str) -> Vec<u8> {
-        format!(
-            "{method} /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
-             host: 127.0.0.1:{port}\r\n\
-             x-auth-token: {CONTRACT_TOKEN}\r\n\
-             connection: close\r\n\r\n",
-        )
-        .into_bytes()
-    }
-
     /// G2 response direction: multi-`Set-Cookie` (and any other repeated
     /// header) must survive the proxy in wire order — the header copy must
     /// APPEND, never collapse. Legacy: Node forwards header arrays verbatim
@@ -896,8 +913,12 @@ mod socket_contract {
             )
             .await;
         });
-        let proxy_port = spawn_contract_proxy().await;
-        let resp = raw_exchange(proxy_port, &contract_head(proxy_port, "GET", upstream_port, "/")).await;
+        let proxy_port = spawn_proxy(CONTRACT_TOKEN).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(proxy_port, CONTRACT_TOKEN, "GET", upstream_port, "/", &[]),
+        )
+        .await;
         assert_eq!(resp.status_code(), 200);
         let cookies: Vec<_> = resp.header_values("set-cookie").collect();
         assert_eq!(
@@ -925,7 +946,7 @@ mod socket_contract {
                     .await;
             }
         });
-        let proxy_port = spawn_contract_proxy().await;
+        let proxy_port = spawn_proxy(CONTRACT_TOKEN).await;
         let resp = raw_exchange(
             proxy_port,
             format!(
@@ -954,32 +975,8 @@ mod socket_contract {
 #[cfg(test)]
 mod socket_contract_g1 {
     use super::wire_support::*;
-    use super::*;
 
     const TOKEN: &str = "contract-token-0123456789abcdef";
-
-    async fn spawn_proxy_and_capture() -> (u16, u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
-        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let cap = Arc::clone(&captured);
-        let upstream_port = spawn_raw_listener(move |mut wire| {
-            let cap = Arc::clone(&cap);
-            async move {
-                let req = read_request(&mut wire).await;
-                cap.lock().await.push(req);
-                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let proxy_port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
-        });
-        (proxy_port, upstream_port, captured)
-    }
 
     /// G1: the upstream request-target must be `[<rest>] [? <query>]` with
     /// EVERY byte the client sent — legacy forwards Node's RAW `req.url`
@@ -1013,7 +1010,7 @@ mod socket_contract_g1 {
             "",
         ];
         for path_and_query in cases {
-            let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture().await;
+            let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
             let resp = raw_exchange(
                 proxy_port,
                 format!(
@@ -1028,7 +1025,11 @@ mod socket_contract_g1 {
             assert_eq!(resp.status_code(), 200, "case {path_and_query:?}");
             let got = captured.lock().await;
             assert_eq!(got.len(), 1, "case {path_and_query:?}");
-            let expected = if path_and_query.is_empty() { "/" } else { *path_and_query };
+            let expected = if path_and_query.is_empty() {
+                "/"
+            } else {
+                *path_and_query
+            };
             assert_eq!(
                 got[0].raw_target(),
                 expected,
@@ -1041,36 +1042,9 @@ mod socket_contract_g1 {
 #[cfg(test)]
 mod socket_contract_g3 {
     use super::wire_support::*;
-    use super::*;
+    use std::sync::Arc;
 
     const TOKEN: &str = "contract-token-0123456789abcdef";
-
-    fn spawn_proxy_router() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
-        });
-        port
-    }
-
-    fn capture_upstream() -> (u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
-        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let cap = Arc::clone(&captured);
-        let port = spawn_raw_listener(move |mut wire| {
-            let cap = Arc::clone(&cap);
-            async move {
-                let req = read_request(&mut wire).await;
-                cap.lock().await.push(req);
-                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-        (port, captured)
-    }
 
     /// G3 (capacity + framing): a multi-MiB body must stream through — legacy
     /// pipes the raw request stream with NO size ceiling (`req.pipe(proxyReq)`,
@@ -1080,8 +1054,7 @@ mod socket_contract_g3 {
     /// re-framed chunked upload when the client declared a length.
     #[tokio::test]
     async fn large_body_streams_through_with_original_content_length() {
-        let (upstream_port, captured) = capture_upstream();
-        let proxy_port = spawn_proxy_router();
+        let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
         let big: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
         let mut request = format!(
             "POST /api/proxy/http/{upstream_port}/upload HTTP/1.1\r\n\
@@ -1147,7 +1120,7 @@ mod socket_contract_g3 {
                     .await;
             }
         });
-        let proxy_port = spawn_proxy_router();
+        let proxy_port = spawn_proxy(TOKEN).await;
 
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
@@ -1176,13 +1149,14 @@ mod socket_contract_g3 {
             let (status_line, headers) = parse_head(&resp_head);
             assert_eq!(status_line, "HTTP/1.1 200 OK");
             // Framing-agnostic body drain (content-length forwarding is G4).
-            let _body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
-                wire.read_chunked().await
-            } else if let Some(cl) = header_values(&headers, "content-length").next() {
-                wire.read_n(cl.parse().unwrap()).await
-            } else {
-                wire.read_to_eof().await
-            };
+            let _body =
+                if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
+                    wire.read_chunked().await
+                } else if let Some(cl) = header_values(&headers, "content-length").next() {
+                    wire.read_n(cl.parse().unwrap()).await
+                } else {
+                    wire.read_to_eof().await
+                };
         })
         .await
         .expect("request body must stream (deadlock = full buffering)");
@@ -1198,31 +1172,8 @@ mod socket_contract_g3 {
 #[cfg(test)]
 mod socket_contract_g4 {
     use super::wire_support::*;
-    use super::*;
 
     const TOKEN: &str = "contract-token-0123456789abcdef";
-
-    fn spawn_proxy_router() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
-        });
-        port
-    }
-
-    fn head_for(proxy_port: u16, upstream_port: u16, path: &str) -> Vec<u8> {
-        format!(
-            "GET /api/proxy/http/{upstream_port}{path} HTTP/1.1\r\n\
-             host: 127.0.0.1:{proxy_port}\r\n\
-             x-auth-token: {TOKEN}\r\n\
-             connection: close\r\n\r\n"
-        )
-        .into_bytes()
-    }
 
     /// G4: `content-length` is NOT an iframe-blocking header — the removal set
     /// is exactly `{x-frame-options, content-security-policy,
@@ -1251,8 +1202,12 @@ mod socket_contract_g4 {
             )
             .await;
         });
-        let proxy_port = spawn_proxy_router();
-        let resp = raw_exchange(proxy_port, &head_for(proxy_port, upstream_port, "/page")).await;
+        let proxy_port = spawn_proxy(TOKEN).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(proxy_port, TOKEN, "GET", upstream_port, "/page", &[]),
+        )
+        .await;
         assert_eq!(resp.status_code(), 200);
         assert_eq!(resp.body, b"hello world");
         assert_eq!(
@@ -1264,9 +1219,18 @@ mod socket_contract_g4 {
             resp.header_values("etag").collect::<Vec<_>>(),
             vec!["\"v1-abc\""]
         );
-        assert_eq!(resp.header_values("cache-control").collect::<Vec<_>>(), vec!["no-store"]);
-        assert_eq!(resp.header_values("x-custom-upstream").collect::<Vec<_>>(), vec!["keep-me"]);
-        assert_eq!(resp.header_values("vary").collect::<Vec<_>>(), vec!["accept-encoding"]);
+        assert_eq!(
+            resp.header_values("cache-control").collect::<Vec<_>>(),
+            vec!["no-store"]
+        );
+        assert_eq!(
+            resp.header_values("x-custom-upstream").collect::<Vec<_>>(),
+            vec!["keep-me"]
+        );
+        assert_eq!(
+            resp.header_values("vary").collect::<Vec<_>>(),
+            vec!["accept-encoding"]
+        );
         assert_eq!(
             resp.header_values("content-type").collect::<Vec<_>>(),
             vec!["text/plain; charset=utf-8"]
@@ -1274,68 +1238,20 @@ mod socket_contract_g4 {
         // The removal set is EXACTLY these three — nothing more.
         assert_eq!(resp.header_values("x-frame-options").count(), 0);
         assert_eq!(resp.header_values("content-security-policy").count(), 0);
-        assert_eq!(resp.header_values("content-security-policy-report-only").count(), 0);
+        assert_eq!(
+            resp.header_values("content-security-policy-report-only")
+                .count(),
+            0
+        );
     }
 }
 
 #[cfg(test)]
 mod socket_contract_rest {
     use super::wire_support::*;
-    use super::*;
+    use std::sync::Arc;
 
     const TOKEN: &str = "contract-token-0123456789abcdef";
-
-    fn spawn_proxy_router() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, app.into_make_service()).await.unwrap();
-        });
-        port
-    }
-
-    fn capture_upstream() -> (u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
-        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let cap = Arc::clone(&captured);
-        let port = spawn_raw_listener(move |mut wire| {
-            let cap = Arc::clone(&cap);
-            async move {
-                let req = read_request(&mut wire).await;
-                cap.lock().await.push(req);
-                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-        (port, captured)
-    }
-
-    fn head_for(proxy_port: u16, method: &str, upstream_port: u16, path: &str) -> Vec<u8> {
-        head_for_extra(proxy_port, method, upstream_port, path, &[])
-    }
-
-    fn head_for_extra(
-        proxy_port: u16,
-        method: &str,
-        upstream_port: u16,
-        path: &str,
-        extra_headers: &[&str],
-    ) -> Vec<u8> {
-        let extras: String = extra_headers
-            .iter()
-            .map(|h| format!("{h}\r\n"))
-            .collect();
-        format!(
-            "{method} /api/proxy/http/{upstream_port}{path} HTTP/1.1\r\n\
-             host: 127.0.0.1:{proxy_port}\r\n\
-             x-auth-token: {TOKEN}\r\n\
-             {extras}\
-             connection: close\r\n\r\n"
-        )
-        .into_bytes()
-    }
 
     async fn one_free_closed_port() -> u16 {
         // Bind then drop: nobody is listening at this port afterwards.
@@ -1350,11 +1266,10 @@ mod socket_contract_rest {
     #[tokio::test]
     async fn all_methods_forward_verbatim() {
         for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
-            let (upstream_port, captured) = capture_upstream();
-            let proxy_port = spawn_proxy_router();
+            let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
             let resp = raw_exchange(
                 proxy_port,
-                &head_for(proxy_port, method, upstream_port, "/m"),
+                &proxy_head(proxy_port, TOKEN, method, upstream_port, "/m", &[]),
             )
             .await;
             assert_eq!(resp.status_code(), 200, "method {method}");
@@ -1374,13 +1289,22 @@ mod socket_contract_rest {
     #[tokio::test]
     async fn statuses_and_redirect_location_forward_verbatim() {
         let cases: &[(&[u8], u16)] = &[
-            (b"HTTP/1.1 201 Created\r\ncontent-length: 7\r\n\r\ncreated", 201),
+            (
+                b"HTTP/1.1 201 Created\r\ncontent-length: 7\r\n\r\ncreated",
+                201,
+            ),
             (
                 b"HTTP/1.1 302 Found\r\nlocation: /target?x=%2F&y=1\r\ncontent-length: 0\r\n\r\n",
                 302,
             ),
-            (b"HTTP/1.1 404 Not Found\r\ncontent-length: 7\r\n\r\nmissing", 404),
-            (b"HTTP/1.1 418 I'm a Teapot\r\ncontent-length: 6\r\n\r\nteapot", 418),
+            (
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 7\r\n\r\nmissing",
+                404,
+            ),
+            (
+                b"HTTP/1.1 418 I'm a Teapot\r\ncontent-length: 6\r\n\r\nteapot",
+                418,
+            ),
         ];
         for (response_bytes, expected_status) in cases {
             let response_bytes = response_bytes.to_vec();
@@ -1391,8 +1315,12 @@ mod socket_contract_rest {
                     wire.write_all(&response_bytes).await;
                 }
             });
-            let proxy_port = spawn_proxy_router();
-            let resp = raw_exchange(proxy_port, &head_for(proxy_port, "GET", upstream_port, "/s")).await;
+            let proxy_port = spawn_proxy(TOKEN).await;
+            let resp = raw_exchange(
+                proxy_port,
+                &proxy_head(proxy_port, TOKEN, "GET", upstream_port, "/s", &[]),
+            )
+            .await;
             assert_eq!(resp.status_code(), *expected_status);
             if *expected_status == 302 {
                 assert_eq!(
@@ -1410,11 +1338,15 @@ mod socket_contract_rest {
     /// `401 {"error":"Unauthorized"}`.
     #[tokio::test]
     async fn error_shapes_match_legacy() {
-        let proxy_port = spawn_proxy_router();
+        let proxy_port = spawn_proxy(TOKEN).await;
 
         // 502: port with nobody listening.
         let closed = one_free_closed_port().await;
-        let resp = raw_exchange(proxy_port, &head_for(proxy_port, "GET", closed, "/x")).await;
+        let resp = raw_exchange(
+            proxy_port,
+            &proxy_head(proxy_port, TOKEN, "GET", closed, "/x", &[]),
+        )
+        .await;
         assert_eq!(resp.status_code(), 502);
         assert_eq!(
             String::from_utf8(resp.body).unwrap(),
@@ -1435,7 +1367,10 @@ mod socket_contract_rest {
             )
             .await;
             assert_eq!(resp.status_code(), 400, "port {bad:?}");
-            assert_eq!(String::from_utf8(resp.body).unwrap(), "{\"error\":\"Invalid port number\"}");
+            assert_eq!(
+                String::from_utf8(resp.body).unwrap(),
+                "{\"error\":\"Invalid port number\"}"
+            );
         }
 
         // 401: missing and wrong credentials.
@@ -1452,7 +1387,10 @@ mod socket_contract_rest {
             )
             .await;
             assert_eq!(resp.status_code(), 401, "auth line {auth_line:?}");
-            assert_eq!(String::from_utf8(resp.body).unwrap(), "{\"error\":\"Unauthorized\"}");
+            assert_eq!(
+                String::from_utf8(resp.body).unwrap(),
+                "{\"error\":\"Unauthorized\"}"
+            );
         }
     }
 
@@ -1460,8 +1398,7 @@ mod socket_contract_rest {
     /// `buildHttpProxyUrl` keeps requests same-origin, so the cookie rides).
     #[tokio::test]
     async fn cookie_auth_accepted() {
-        let (upstream_port, _) = capture_upstream();
-        let proxy_port = spawn_proxy_router();
+        let (proxy_port, upstream_port, _) = spawn_proxy_and_capture(TOKEN).await;
         let resp = raw_exchange(
             proxy_port,
             format!(
@@ -1481,12 +1418,12 @@ mod socket_contract_rest {
     /// `proxy-router.ts:90-93` exactly.
     #[tokio::test]
     async fn useful_request_headers_pass_host_rewritten_framing_dropped() {
-        let (upstream_port, captured) = capture_upstream();
-        let proxy_port = spawn_proxy_router();
+        let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
         let resp = raw_exchange(
             proxy_port,
-            &head_for_extra(
+            &proxy_head(
                 proxy_port,
+                TOKEN,
                 "GET",
                 upstream_port,
                 "/h",
@@ -1511,7 +1448,10 @@ mod socket_contract_rest {
             vec![format!("127.0.0.1:{upstream_port}")],
             "host is rewritten to the loopback target exactly"
         );
-        assert_eq!(req.header_values("cookie").collect::<Vec<_>>(), vec!["session=live"]);
+        assert_eq!(
+            req.header_values("cookie").collect::<Vec<_>>(),
+            vec!["session=live"]
+        );
         assert_eq!(
             req.header_values("authorization").collect::<Vec<_>>(),
             vec!["Bearer abc123"]
@@ -1537,8 +1477,16 @@ mod socket_contract_rest {
             req.header_values("referer").collect::<Vec<_>>(),
             vec!["http://127.0.0.1:9/inside"]
         );
-        assert_eq!(req.header_values("connection").count(), 0, "hop-by-hop dropped");
-        assert_eq!(req.header_values("keep-alive").count(), 0, "hop-by-hop dropped");
+        assert_eq!(
+            req.header_values("connection").count(),
+            0,
+            "hop-by-hop dropped"
+        );
+        assert_eq!(
+            req.header_values("keep-alive").count(),
+            0,
+            "hop-by-hop dropped"
+        );
         // The auth token header is forwarded upstream too (legacy does the
         // same — it strips nothing but host/connection/transfer-encoding).
         assert_eq!(
@@ -1574,15 +1522,22 @@ mod socket_contract_rest {
                 wire.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
             }
         });
-        let proxy_port = spawn_proxy_router();
+        let proxy_port = spawn_proxy(TOKEN).await;
 
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
                 .await
                 .unwrap();
             let mut wire = Wire::new(stream);
-            wire.write_all(&head_for(proxy_port, "GET", upstream_port, "/events"))
-                .await;
+            wire.write_all(&proxy_head(
+                proxy_port,
+                TOKEN,
+                "GET",
+                upstream_port,
+                "/events",
+                &[],
+            ))
+            .await;
             let head = wire.read_until(b"\r\n\r\n").await;
             let (status_line, _headers) = parse_head(&head);
             assert_eq!(status_line, "HTTP/1.1 200 OK");
@@ -1590,7 +1545,10 @@ mod socket_contract_rest {
             let size_line = wire.read_until(b"\r\n").await;
             assert_eq!(String::from_utf8_lossy(&size_line).trim(), "5");
             let first = wire.read_n(5).await;
-            assert_eq!(first, b"hello", "first chunk arrives while upstream holds the rest");
+            assert_eq!(
+                first, b"hello",
+                "first chunk arrives while upstream holds the rest"
+            );
             let crlf = wire.read_n(2).await;
             assert_eq!(crlf, b"\r\n");
             // Release the upstream's second chunk; the full body reassembles.
@@ -1606,15 +1564,21 @@ mod socket_contract_rest {
     /// hang the client. Upstream follows HEAD semantics (no body bytes).
     #[tokio::test]
     async fn head_request_forwards_headers_without_body_hang() {
-        let (upstream_port, captured) = capture_upstream();
-        let proxy_port = spawn_proxy_router();
+        let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
                 .await
                 .unwrap();
             let mut wire = Wire::new(stream);
-            wire.write_all(&head_for(proxy_port, "HEAD", upstream_port, "/h"))
-                .await;
+            wire.write_all(&proxy_head(
+                proxy_port,
+                TOKEN,
+                "HEAD",
+                upstream_port,
+                "/h",
+                &[],
+            ))
+            .await;
             let head = wire.read_until(b"\r\n\r\n").await;
             let (status_line, headers) = parse_head(&head);
             assert_eq!(status_line, "HTTP/1.1 200 OK", "HEAD status forwards");
@@ -1641,8 +1605,7 @@ mod socket_contract_rest {
         let pretty_json = "{\n  \"key\": \"v\u{00e8}lue\",\n  \"n\": 1\n}".as_bytes();
         let binary: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
         for (label, body) in [("pretty-json", pretty_json.to_vec()), ("binary", binary)] {
-            let (upstream_port, captured) = capture_upstream();
-            let proxy_port = spawn_proxy_router();
+            let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture(TOKEN).await;
             let mut request = format!(
                 "POST /api/proxy/http/{upstream_port}/echo HTTP/1.1\r\n\
                  host: 127.0.0.1:{proxy_port}\r\n\
