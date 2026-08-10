@@ -54,9 +54,11 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
 # Docker when pushing to Artifact Registry).
-GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
-if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
-  export PATH="$GCLOUD_BIN:$PATH"
+if command -v gcloud &>/dev/null; then
+  GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
+  if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
+    export PATH="$GCLOUD_BIN:$PATH"
+  fi
 fi
 
 DEFAULT_CONFIGS="config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts"
@@ -316,60 +318,56 @@ cmd_run() {
     vitest_args_json=$(printf '%s\n' "${vt_args[@]}" | jq -R . | jq -sc .)
   fi
 
-  # Build a YAML env-vars file for the Cloud Run Job.
-  # Use double-quoted YAML with proper escaping for the JSON value.
-  # jq -Rs produces a YAML-safe double-quoted string with all special chars escaped.
-  local vitest_args_yaml
-  vitest_args_yaml=$(echo "$vitest_args_json" | jq -Rs .)
-  local env_file
-  env_file=$(mktemp /tmp/vitest-env-vars.XXXXXX.yaml)
-  cat > "$env_file" <<ENVEOF
-TEST_MODE: "vitest"
-VITEST_CONFIGS: "$configs"
-VITEST_ARGS_JSON: $vitest_args_yaml
-ENVEOF
-
-  # Create or update the Cloud Run Job (create fails if it already exists,
-  # fall back to update).
+  # Ensure the job exists with the correct image (create fails if it already
+  # exists, fall back to update image only — NOT tasks/timeout/env, which are
+  # per-execution overrides passed to `execute` below to avoid racing with
+  # concurrent agents on the shared job).
   gcloud run jobs create $(gcloud_flags) "$GCP_JOB" \
     --image="$IMAGE_REMOTE" \
-    --tasks="$shards" \
-    --task-timeout="$timeout" \
     --max-retries=0 \
-    --env-vars-file="$env_file" \
     --memory=4Gi \
     --cpu=4 \
     2>/dev/null || \
   gcloud run jobs update $(gcloud_flags) "$GCP_JOB" \
     --image="$IMAGE_REMOTE" \
-    --tasks="$shards" \
-    --task-timeout="$timeout" \
     --max-retries=0 \
-    --env-vars-file="$env_file" \
     --memory=4Gi \
     --cpu=4
 
-  rm -f "$env_file"
-
-  # Execute the job and wait for completion.
-  # Capture the execution ID from the execute output to avoid a race with
-  # concurrent agents updating/executing the same shared job.
+  # Execute the job with per-execution overrides (tasks, timeout, env-vars).
+  # This avoids mutating the shared job with per-run state, preventing races
+  # with concurrent agents. Capture the execution ID from the output.
   echo "[vitest-cloud] Executing Cloud Run Job..."
   local execute_output
-  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait 2>&1) || true
+  local execute_exit=0
+  # Use ^@^ delimiter for --update-env-vars to handle commas in JSON arrays.
+  local env_overrides="^@^TEST_MODE=vitest@VITEST_CONFIGS=${configs}@VITEST_ARGS_JSON=${vitest_args_json}"
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" \
+    --tasks="$shards" \
+    --task-timeout="$timeout" \
+    --update-env-vars="$env_overrides" \
+    --wait 2>&1) || execute_exit=$?
   echo "$execute_output"
 
   # Extract the execution ID from the execute output (format: "Execution NAME")
   local execution_id
   execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1)
   if [ -z "$execution_id" ]; then
-    # Fallback: query the latest execution (may race with concurrent agents)
     echo "[vitest-cloud] WARNING: could not capture execution ID, falling back to latest"
     execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
       --job="$GCP_JOB" \
       --sort-by="~metadata.creationTimestamp" \
       --format="value(name)" \
       --limit=1)
+  fi
+
+  # If execute itself failed, report and exit — don't mask with status queries.
+  if [ "$execute_exit" -ne 0 ]; then
+    echo "[vitest-cloud] Cloud Run Job execution failed (exit code $execute_exit)."
+    # Still fetch logs for debugging
+    echo "[vitest-cloud] Fetching logs..."
+    gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
+    exit 1
   fi
 
   # Fetch logs
@@ -385,13 +383,19 @@ ENVEOF
   echo "[vitest-cloud] Per-shard summary:"
   echo "$log_output" | grep -E '(\[vitest-entrypoint\]|Test Files|Tests )' || true
 
-  # Check execution status
+  # Check execution status — propagate query errors instead of normalizing to 0.
   local succeeded
   local failed
-  succeeded=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.succeededCount)" 2>/dev/null || echo "0")
-  failed=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.failedCount)" 2>/dev/null || echo "0")
+  if ! succeeded=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+    --format="value(status.succeededCount)" 2>/dev/null); then
+    echo "[vitest-cloud] ERROR: failed to query execution status"
+    exit 1
+  fi
+  if ! failed=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+    --format="value(status.failedCount)" 2>/dev/null); then
+    echo "[vitest-cloud] ERROR: failed to query execution status"
+    exit 1
+  fi
 
   # Normalize empty/null to 0
   succeeded="${succeeded:-0}"
@@ -413,7 +417,13 @@ ENVEOF
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
-  gcloud beta run jobs executions logs read $(gcloud_flags) "$GCP_JOB" "$@"
+  local execution_id
+  execution_id=$(gcloud run jobs executions list $(gcloud_flags) --job="$GCP_JOB" --sort-by="~metadata.creationTimestamp" --format="value(name)" --limit=1)
+  if [ -z "$execution_id" ]; then
+    echo "[vitest-cloud] No executions found for job $GCP_JOB"
+    exit 1
+  fi
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -422,7 +432,7 @@ cmd_logs() {
 SUBCOMMAND="${1:-run}"
 case "$SUBCOMMAND" in
   run)
-    shift
+    if [ $# -gt 0 ]; then shift; fi
     cmd_run "$@"
     ;;
   build)

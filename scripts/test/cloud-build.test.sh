@@ -36,8 +36,10 @@ check "cloudbuild.yaml references docker/cloud-run/Dockerfile" \
   grep -q 'docker/cloud-run/Dockerfile' "$CLOUDBUILD"
 
 # Check 4: cloudbuild.yaml uses buildx build with --push
-check "cloudbuild.yaml uses buildx build with --push" \
+check "cloudbuild.yaml uses buildx build" \
   grep -q 'buildx' "$CLOUDBUILD"
+check "cloudbuild.yaml uses --push" \
+  grep -q -- '--push' "$CLOUDBUILD"
 
 # Check 5: cloudbuild.yaml uses E2_HIGHCPU_32 under options
 check "cloudbuild.yaml uses E2_HIGHCPU_32" \

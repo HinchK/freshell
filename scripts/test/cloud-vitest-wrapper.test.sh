@@ -56,32 +56,38 @@ for i in "$@"; do
     fi
   fi
 done
-# For artifacts docker images describe, exit 0 (image exists)
+# More specific patterns first; catch-all run jobs last
 if [[ "$*" == *"artifacts docker images describe"* ]]; then
   exit 0
 fi
-# For run jobs create/update/execute, exit 0
-if [[ "$*" == *"run jobs"* ]]; then
+if [[ "$*" == *"artifacts repositories describe"* ]]; then
   exit 0
 fi
-# For logs read, output something
+if [[ "$*" == *"auth print-access-token"* ]]; then
+  echo "fake-token"
+  exit 0
+fi
+if [[ "$*" == *"info"* ]]; then
+  echo "/usr/lib/google-cloud-sdk"
+  exit 0
+fi
 if [[ "$*" == *"logs read"* ]]; then
   echo "Test Files  1 passed (1)"
   exit 0
 fi
-# For executions describe
 if [[ "$*" == *"executions describe"* ]]; then
   echo "1"
   exit 0
 fi
-# For executions list
 if [[ "$*" == *"executions list"* ]]; then
   echo "test-execution-1"
   exit 0
 fi
-# For info (sdk_root)
-if [[ "$*" == *"info"* ]]; then
-  echo "/usr/lib/google-cloud-sdk"
+if [[ "$*" == *"builds submit"* ]]; then
+  exit 0
+fi
+# Catch-all for run jobs create/update/execute
+if [[ "$*" == *"run jobs"* ]]; then
   exit 0
 fi
 exit 0
@@ -97,36 +103,39 @@ check "--cloud calls gcloud (fake)" grep -q 'FAKE_GCLOUD' "$FAKE_GCLOUD_LOG"
 check "--cloud references freshell-vitest job" grep -q 'freshell-vitest' "$FAKE_GCLOUD_LOG"
 
 # Check 6: --config=default sets VITEST_CONFIGS to only default config
-check "--config=default sets correct config" grep -q 'vitest.config.ts' "${FAKE_GCLOUD_LOG}.envvars"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+bash "$SCRIPT" run --cloud --config=default 2>&1 > /dev/null || true
+check "--config=default sets correct config" grep -q 'vitest.config.ts' "$FAKE_GCLOUD_LOG"
 
 # Check 7: --config=server sets VITEST_CONFIGS to only server config
-rm -f "${FAKE_GCLOUD_LOG}.envvars"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 bash "$SCRIPT" run --cloud --config=server 2>&1 > /dev/null || true
-check "--config=server sets correct config" grep -q 'vitest.server.config.ts' "${FAKE_GCLOUD_LOG}.envvars"
+check "--config=server sets correct config" grep -q 'vitest.server.config.ts' "$FAKE_GCLOUD_LOG"
 
 # Check 8: VITEST_ARGS_JSON is valid JSON when pass-through args are present
-rm -f "${FAKE_GCLOUD_LOG}.envvars"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 bash "$SCRIPT" run --cloud --config=default test/unit/lib/pane-utils.test.ts 2>&1 > /dev/null || true
-if [ -f "${FAKE_GCLOUD_LOG}.envvars" ]; then
-  # Extract the YAML double-quoted value and unescape it to get the raw JSON
-  VITEST_ARGS_VAL=$(grep 'VITEST_ARGS_JSON' "${FAKE_GCLOUD_LOG}.envvars" | sed 's/^VITEST_ARGS_JSON: //' || true)
+# Extract VITEST_ARGS_JSON from the --update-env-vars flag in the gcloud log
+ENV_VARS_LINE=$(grep 'update-env-vars' "$FAKE_GCLOUD_LOG" | head -1 || true)
+if [ -n "$ENV_VARS_LINE" ]; then
+  # Extract the JSON array value after VITEST_ARGS_JSON= (non-greedy match for [...])
+  VITEST_ARGS_VAL=$(echo "$ENV_VARS_LINE" | grep -oP 'VITEST_ARGS_JSON=\K\[.*?\]' || true)
   if [ -n "$VITEST_ARGS_VAL" ]; then
-    # Use jq to parse the YAML double-quoted string back to raw JSON, then validate
-    check "VITEST_ARGS_JSON is valid JSON" bash -c "echo '$VITEST_ARGS_VAL' | jq -r . | jq -e '.' > /dev/null 2>&1"
+    check "VITEST_ARGS_JSON is valid JSON" bash -c "echo '$VITEST_ARGS_VAL' | jq -e '.' > /dev/null 2>&1"
   else
-    echo "FAIL: VITEST_ARGS_JSON not found in env-vars file"
+    echo "FAIL: VITEST_ARGS_JSON not found in --update-env-vars"
     FAILURES=$((FAILURES + 1))
   fi
 else
-  echo "FAIL: env-vars file not captured by fake gcloud"
+  echo "FAIL: --update-env-vars not found in fake gcloud log"
   FAILURES=$((FAILURES + 1))
 fi
 
-# Check 9: TEST_MODE=vitest is set in env-vars file
-if [ -f "${FAKE_GCLOUD_LOG}.envvars" ]; then
-  check "env-vars file sets TEST_MODE=vitest" grep -q 'TEST_MODE.*vitest' "${FAKE_GCLOUD_LOG}.envvars"
+# Check 9: TEST_MODE=vitest is set in --update-env-vars
+if [ -n "$ENV_VARS_LINE" ]; then
+  check "TEST_MODE=vitest set in --update-env-vars" grep -q 'TEST_MODE=vitest' <<< "$ENV_VARS_LINE"
 else
-  echo "FAIL: env-vars file not available for TEST_MODE check"
+  echo "FAIL: --update-env-vars not available for TEST_MODE check"
   FAILURES=$((FAILURES + 1))
 fi
 

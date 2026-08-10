@@ -56,9 +56,11 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
 # Docker when pushing to Artifact Registry).
-GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
-if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
-  export PATH="$GCLOUD_BIN:$PATH"
+if command -v gcloud &>/dev/null; then
+  GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
+  if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
+    export PATH="$GCLOUD_BIN:$PATH"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -391,7 +393,13 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
-  gcloud beta run jobs executions logs read $(gcloud_flags) "$GCP_JOB" "$@"
+  local execution_id
+  execution_id=$(gcloud run jobs executions list $(gcloud_flags) --job="$GCP_JOB" --sort-by="~metadata.creationTimestamp" --format="value(name)" --limit=1)
+  if [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] No executions found for job $GCP_JOB"
+    exit 1
+  fi
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -400,7 +408,7 @@ cmd_logs() {
 SUBCOMMAND="${1:-run}"
 case "$SUBCOMMAND" in
   run)
-    shift
+    if [ $# -gt 0 ]; then shift; fi
     cmd_run "$@"
     ;;
   build)
