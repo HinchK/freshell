@@ -112,13 +112,28 @@ async fn main() -> ExitCode {
     let port = resolve_port();
     let home = resolve_home();
 
+    // The app version string, resolved ONCE here (before logging init, which
+    // stamps it onto every line) and shared (Arc::clone) into BOTH
+    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`),
+    // so the two endpoints can never disagree. Overridable via
+    // `FRESHELL_APP_VERSION`. Pure env read + constant -- no dependency on
+    // anything built later, so it is safe to resolve this early.
+    let app_version =
+        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
+
     // DIAG-01/DIAG-03: structured JSONL logging to
     // `<home>/.freshell/logs/rust-server.jsonl`, redacted from the first
     // byte (the live AUTH_TOKEN is the ONE secret this process itself
-    // knows verbatim). A failure here (e.g. an unwritable log dir) must
-    // never prevent boot -- the pre-existing stderr "listening on" line
-    // below still gets the operator to a running server either way.
-    let logging_config = logging::resolve_config(home.as_deref(), auth_token.as_str().to_string());
+    // knows verbatim) and stamped per-line with the app version + server
+    // pid (DIAG-01's app-version / process-ownership fields). A failure
+    // here (e.g. an unwritable log dir) must never prevent boot -- the
+    // pre-existing stderr "listening on" line below still gets the
+    // operator to a running server either way.
+    let logging_config = logging::resolve_config(
+        home.as_deref(),
+        auth_token.as_str().to_string(),
+        app_version.as_str().to_string(),
+    );
     if let Err(err) = logging::init(logging_config) {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
@@ -168,12 +183,6 @@ async fn main() -> ExitCode {
     // changed `bootId` on reconnect means the server restarted), never by
     // `server_instance_id`.
     let boot_id = Arc::new(format!("boot-{}", Uuid::new_v4()));
-
-    // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
-    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`), so
-    // the two endpoints can never disagree. Overridable via `FRESHELL_APP_VERSION`.
-    let app_version =
-        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
 
     // The server-start timestamp, captured once here as an ISO-8601 string
     // (millisecond precision + `Z`, matching JS `Date.toISOString()` in
@@ -791,7 +800,9 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
-        boot_id,
+        // Shared (not moved) so the DIAG-01 `server.started` lifecycle event
+        // (emitted after the listener binds, below) can log the SAME boot id.
+        boot_id: Arc::clone(&boot_id),
         settings: Arc::clone(&settings),
         // CFG-12: the /ws handshake's `settings.updated` resolves the LIVE
         // store per connection (legacy parity: per-connection
@@ -1478,6 +1489,22 @@ async fn main() -> ExitCode {
             &diag::iso8601_utc(now_secs),
         )
     );
+    // DIAG-01 lifecycle context: the ONE authoritative STRUCTURED boot
+    // record (the stderr line above is for terminal tails; this event is
+    // what log parses key on). `app_version`/`server_pid` are stamped on
+    // every line by the logging layer, so the boot record carries the
+    // per-installation identity (`instance_id`, CFG-07), the per-boot
+    // restart signal (`boot_id`), and build provenance (`commit`/`dirty`,
+    // the same values `GET /api/server-info` reports).
+    tracing::info!(
+        bind = %boot_ip,
+        port,
+        boot_id = %boot_id.as_str(),
+        instance_id = %server_instance_id.as_str(),
+        commit = diag::build_commit(),
+        dirty = diag::build_dirty_str(),
+        "server.started"
+    );
 
     // Block until SIGTERM/SIGINT (the same graceful-shutdown trigger the old
     // `axum::serve(...).with_graceful_shutdown(...)` used), then drain the
@@ -1537,6 +1564,13 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    // DIAG-01 lifecycle context: the terminal "we are done" marker. Every
+    // owner above has run (WS drain, registry kill_all, all three fresh-agent
+    // sidecar reapers, the codex launch manager); the logging writer flushes
+    // synchronously per line, so this line is guaranteed on disk before the
+    // process exits -- the DIAG-03 "final shutdown event is flushed" clause
+    // holds by construction here.
+    tracing::info!("server.stopped");
     ExitCode::SUCCESS
 }
 
@@ -1593,6 +1627,11 @@ async fn shutdown_signal(
         _ = terminate => "SIGTERM",
         _ = hangup => "SIGHUP",
     };
+
+    // DIAG-01 lifecycle context: the clean "we are going down" marker, FIRST
+    // (before the drain below), so a log tail always answers "did this
+    // server stop intentionally, and on which signal".
+    tracing::info!(signal = signal_name, "server.stopping");
 
     // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
     // creates consult this flag around registry.create.

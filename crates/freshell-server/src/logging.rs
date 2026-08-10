@@ -1,13 +1,69 @@
-//! Structured JSONL logging (DIAG-01 slice) with size-based rotation and
-//! from-the-first-byte secret redaction (DIAG-03 slice).
+//! Structured JSONL logging (DIAG-01) with size-based rotation and
+//! from-the-first-byte secret redaction (DIAG-03).
 //!
-//! ## Scope (deliberately shrunk, per the validated plan)
+//! ## Canonical line schema (the Tauri-ready contract)
 //!
-//! `tracing`-based JSONL logs written to `<home>/.freshell/logs/rust-server.jsonl`:
+//! Every line written to `<home>/.freshell/logs/rust-server.jsonl` is one
+//! self-describing JSON object. Fields every line ALWAYS carries:
 //!
-//!   - **Structured fields**: `ts`, `level`, `target`, `msg`, plus a per-HTTP-
-//!     request correlation id (`request_id`) and route/method/status/duration
-//!     for every request ([`request_logging_middleware`]).
+//!   - `ts`          RFC3339-millis `Z` UTC timestamp (tracing event time)
+//!   - `level`       severity: `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR`
+//!   - `target`      component: the emitting crate's module path (e.g.
+//!     `freshell_ws::terminal`, `freshell_terminal::registry`)
+//!   - `msg`         human summary or dotted event name (`terminal.created`,
+//!     `ws.connection.closed`, `server.started`); events that prefer prose in
+//!     `msg` additionally carry an `event` field with the dotted
+//!     machine-readable name
+//!   - `app_version` the release that wrote the line (DIAG-01 "app version";
+//!     resolved once at boot from `FRESHELL_APP_VERSION`/the build constant,
+//!     so any arbitrary log tail is attributable)
+//!   - `server_pid`  the server process that wrote the line (DIAG-01 process
+//!     ownership of the WRITER; child processes an event spawns report their
+//!     own `pid` field alongside)
+//!
+//! Context fields, flattened into the same object when applicable (span
+//! fields merge root->leaf, then the event's own fields win collisions):
+//!
+//!   - HTTP requests: `request_id`, `route`, `method`, `status`,
+//!     `duration_ms` (one `http_request` event per response; see
+//!     [`request_logging_middleware`])
+//!   - WS connections: `connection_id`, `origin_kind` -- carried on the
+//!     `ws.connection.established`/`closed` lifecycle events, via the
+//!     per-connection `ws_conn` span on every event emitted while serving
+//!     that connection, AND as explicit event fields on the create-reply
+//!     settle companions (`ws.terminal.create.settled` with
+//!     `connection_id`/`request_id`/`terminal_id`/`path`). Ownership-
+//!     envelope NOTE: span enrichment is active under bare level filters
+//!     (any `RUST_LOG=error..trace`) and globally-anchored mixes
+//!     (`info,freshell_terminal=debug`); tracing-subscriber disables span
+//!     callsites under TARGET-DIRECTIVE-ONLY filters (even a matched
+//!     `freshell_ws=info`), which is exactly why the settle companions
+//!     carry the join as event fields -- event fields ride through any
+//!     filter admitting the event. Under `freshell_ws=off` nothing in the
+//!     ws crate logs at all (operator's express choice); a
+//!     `terminal.created` line then joins only via `terminal_id`.
+//!   - Terminals: `terminal_id` plus spawn-mode/cwd/pid on
+//!     `terminal.created`, `exit_code` on `terminal.exited`, the kill actor
+//!     (`by`: api/idle/shutdown) on `terminal.killed`
+//!   - Fresh agents: `provider` + `session_id` on the session lifecycle
+//!     events (`freshagent.session.created`, `...session.crash_detected`,
+//!     `...sidecar.reaped`, crash-recovery events); `freshagent.sidecar.spawned`
+//!     carries `provider` + the spawned process `pid` (no `session_id` --
+//!     the spawn can precede session minting on the create path; the
+//!     pid<->session join is the same session's adjacent created/reaped
+//!     events). Prompt/turn CONTENT is never logged anywhere.
+//!   - Server lifecycle: `server.started` (`bind`, `port`, `boot_id`,
+//!     `instance_id`, `commit`, `dirty`) -> `server.stopping` (`signal`)
+//!     -> `server.stopped` (plus the `shutdown_forensics` diagnostic record)
+//!
+//! A Tauri host-side producer (or any other Rust component of the desktop
+//! app) emitting THIS EXACT SHAPE -- with its own `app_version` and its
+//! process's pid -- produces a coherent, combinable diagnostic stream; the
+//! schema is deliberately free of server-only assumptions so that producer
+//! can be layered on without a contract change.
+//!
+//! ## Rotation + redaction (DIAG-03)
+//!
 //!   - **Size-based rotation**, bounded total: [`DEFAULT_MAX_BYTES`] per file
 //!     (10 MiB) x [`DEFAULT_MAX_BACKUPS`] backups (2) = 3 files total,
 //!     overridable via `FRESHELL_LOG_MAX_BYTES`/`FRESHELL_LOG_MAX_BACKUPS`.
@@ -31,22 +87,15 @@
 //!   - The pre-existing single stdout ("`freshell-server listening on
 //!     ...`") line is left untouched for compat -- this module is additive.
 //!
-//! ## NOT in scope (see the DIAG-01/DIAG-03 checklist text for the full
-//! acceptance criteria this slice does not attempt)
+//! ## NOT in scope
 //!
 //!   - OTLP/telemetry export, remote log shipping.
-//!   - Full WS connect/disconnect+reason and terminal spawn/exit event
-//!     wiring: those lifecycles live inside `freshell-ws`/`freshell-terminal`
-//!     (crates this slice's ownership boundary does not touch to avoid
-//!     colliding with concurrent work on those crates). The global request
-//!     middleware below DOES log the initial `/ws` upgrade request (route,
-//!     status, duration), which is partial coverage.
-//!   - `settings_store.rs` persistence events (that file is explicitly
-//!     frozen for this slice).
 //!   - Client-log ingestion (`DIAG-02`), live debug/perf toggles (`DIAG-04`).
 //!
-//! See `crates/freshell-server/tests/diag01_diag03_logging.rs` for the
-//! outer, black-box, operator-experience proof of this slice.
+//! See `crates/freshell-server/tests/diag01_diag03_logging.rs` (rotation/
+//! redaction) and `crates/freshell-server/tests/diag01_lifecycle_logging.rs`
+//! (full-flow schema + correlation + restart) for the outer, black-box,
+//! operator-experience proof of this contract.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -92,6 +141,13 @@ pub struct LoggingConfig {
     /// every log line. Never logged itself, including here (this struct is
     /// never `Debug`-derived/printed).
     pub secret: String,
+    /// The app version stamped onto EVERY line as `app_version` (DIAG-01's
+    /// "app version" field): any arbitrary log tail is then attributable to
+    /// the release that produced it without cross-referencing boot lines.
+    /// Resolved by the caller (`main.rs`: `FRESHELL_APP_VERSION` env ->
+    /// `APP_VERSION` const) so this module stays env-free about versioning
+    /// and tests can inject a known value.
+    pub app_version: String,
 }
 
 /// Resolve [`LoggingConfig`] from the environment, mirroring the legacy
@@ -99,7 +155,7 @@ pub struct LoggingConfig {
 /// `resolveDebugLogPath`) and adding two new, narrowly-scoped overrides
 /// (`FRESHELL_LOG_MAX_BYTES`/`FRESHELL_LOG_MAX_BACKUPS`) so the rotation
 /// bound is testable without waiting to actually accumulate 10 MiB.
-pub fn resolve_config(home: Option<&Path>, secret: String) -> LoggingConfig {
+pub fn resolve_config(home: Option<&Path>, secret: String, app_version: String) -> LoggingConfig {
     let log_dir = std::env::var("FRESHELL_LOG_DIR")
         .ok()
         .filter(|v| !v.is_empty())
@@ -121,6 +177,7 @@ pub fn resolve_config(home: Option<&Path>, secret: String) -> LoggingConfig {
         max_bytes,
         max_backups,
         secret,
+        app_version,
     }
 }
 
@@ -139,7 +196,11 @@ pub fn init(config: LoggingConfig) -> std::io::Result<()> {
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let json_layer = JsonLayer { writer };
+    let json_layer = JsonLayer {
+        writer,
+        app_version: config.app_version,
+        server_pid: std::process::id() as u64,
+    };
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
         .with(json_layer);
@@ -361,12 +422,24 @@ impl Visit for JsonVisitor {
 /// `route`, `status`, `duration_ms`), and writes it through a
 /// [`RotatingWriter`] (which redacts before any byte reaches disk).
 ///
+/// Every line is additionally stamped with `app_version` (the release that
+/// produced it) and `server_pid` (the process that wrote it) -- DIAG-01's
+/// app-version and process-ownership requirements at per-line granularity,
+/// so ANY arbitrary log tail is self-attributing (which build, which
+/// process) without cross-referencing a boot line that may have rotated
+/// away. Both are inserted into the base field map BEFORE span/event fields
+/// merge, so an event that legitimately carries its own `pid` (e.g. a
+/// spawned child's pid on `terminal.created`) keeps its own meaning --
+/// `server_pid` never collides with it.
+///
 /// Hand-rolled rather than `tracing_subscriber::fmt`'s JSON formatter
 /// because `fmt` hardcodes different field names (`timestamp`/`message`,
 /// nested `fields`/`span` objects) with no rename hook -- reimplementing the
 /// ~80 lines below is simpler than fighting that shape.
 struct JsonLayer {
     writer: RotatingWriter,
+    app_version: String,
+    server_pid: u64,
 }
 
 /// Span-local storage for this layer: the JSON fields recorded when the
@@ -413,6 +486,15 @@ where
             "target".to_string(),
             Value::String(event.metadata().target().to_string()),
         );
+        // DIAG-01 per-line identity: the emitting build + process, before
+        // any span/event fields merge (event-level fields would win a
+        // collision; no call site uses either name -- verified by rg across
+        // all server-side crates when this was added).
+        map.insert(
+            "app_version".to_string(),
+            Value::String(self.app_version.clone()),
+        );
+        map.insert("server_pid".to_string(), Value::from(self.server_pid));
 
         // Merge span-chain fields root -> leaf, so the innermost span's
         // fields win on any (unexpected) key collision.
@@ -526,6 +608,38 @@ pub async fn request_logging_middleware(req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_line_stamps_app_version_and_server_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-logging-stamp-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rust-server.jsonl");
+        let writer = RotatingWriter::create(path.clone(), 1 << 20, 1, String::new()).unwrap();
+        let layer = JsonLayer {
+            writer,
+            app_version: "9.9.9-test".to_string(),
+            server_pid: 424242,
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(route = "/api/health", "http_request");
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(line["app_version"], serde_json::json!("9.9.9-test"));
+        assert_eq!(line["server_pid"], serde_json::json!(424242u64));
+        // The pre-existing envelope fields must still be there.
+        assert!(line["ts"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(line["level"], serde_json::json!("INFO"));
+        assert_eq!(line["msg"], serde_json::json!("http_request"));
+        assert_eq!(line["route"], serde_json::json!("/api/health"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn scrub_redacts_the_exact_secret_value_wherever_it_appears() {

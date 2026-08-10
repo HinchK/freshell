@@ -1138,6 +1138,7 @@ impl FreshCodexState {
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
         tracing::info!(
+            provider = PROVIDER,
             session_id = %session_id,
             turn = %submitted_turn_id,
             "freshagent.send.accepted"
@@ -1781,7 +1782,7 @@ impl FreshCodexState {
 
         // DIAG-01: crash recovery took the resume-first path -- the durable
         // session_id is unchanged, conversation memory survives.
-        tracing::info!(session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
+        tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
 
         Ok(EnsureAliveOutcome::Recovered)
     }
@@ -1910,8 +1911,13 @@ impl FreshCodexState {
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
         // memory for the old thread is lost. `warn`, unlike the resume-first
-        // path, because this is the degraded fallback.
+        // path, because this is the degraded fallback. Carries the canonical
+        // `session_id` (= the NEW, now-current thread) alongside the
+        // recovery-forensics old/new pair, so generic session-lifecycle
+        // parses see one uniform identity field on every lifecycle event.
         tracing::warn!(
+            provider = PROVIDER,
+            session_id = %new_thread_id,
             old_session_id = %old_session_id,
             new_session_id = %new_thread_id,
             "freshagent.crash_recovery.minted_new"
@@ -2050,7 +2056,11 @@ impl FreshCodexState {
             }
         }
 
-        tracing::info!(pid = child.id().unwrap_or(0), "freshagent.sidecar.spawned");
+        tracing::info!(
+            provider = PROVIDER,
+            pid = child.id().unwrap_or(0),
+            "freshagent.sidecar.spawned"
+        );
         Ok((client, notifs, ownership_id, child))
     }
 
@@ -2097,7 +2107,7 @@ impl FreshCodexState {
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
-                        tracing::info!(session_id = %session_id, "freshagent.turn.complete");
+                        tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
                     }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
@@ -3284,7 +3294,7 @@ fn spawn_exit_watcher(
                 reap_owned_codex_sidecars(&ownership_id);
                 // Task 12: the bound session is gone -- reopen its durable id.
                 leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
@@ -3292,11 +3302,11 @@ fn spawn_exit_watcher(
                 // durable id (the entry stays mapped for PR-4 lazy respawn, which
                 // re-claims through the attach/send seams).
                 leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
                 // handled in the sibling arm above with no event here).
-                tracing::warn!(session_id = %thread_id, "freshagent.session.crash_detected");
+                tracing::warn!(provider = PROVIDER, session_id = %thread_id, "freshagent.session.crash_detected");
                 // PR-4: flip the lazy-restart flag BEFORE broadcasting, so a client that
                 // reacts to the `exited` status by immediately sending/attaching never
                 // races ahead of `ensure_session_alive` observing a stale `false`.
@@ -3847,6 +3857,14 @@ pub(crate) mod tests {
             crash.fields.get("session_id").map(String::as_str),
             Some(thread_id.as_str())
         );
+        // DIAG-01 schema completeness (review round 4): the crash lifecycle
+        // event must carry the same provider/session identity the schema
+        // documents for every fresh-agent session lifecycle event.
+        assert_eq!(
+            crash.fields.get("provider").map(String::as_str),
+            Some("codex"),
+            "crash_detected must carry provider per the canonical schema"
+        );
 
         let spawned = capture
             .untagged_events_since_start()
@@ -3857,6 +3875,26 @@ pub(crate) mod tests {
             spawned >= 1,
             "expected at least one freshagent.sidecar.spawned event"
         );
+        // DIAG-01: every spawned event carries provider + the spawned pid.
+        for e in capture
+            .untagged_events_since_start()
+            .iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+        {
+            assert_eq!(
+                e.fields.get("provider").map(String::as_str),
+                Some("codex"),
+                "sidecar.spawned must carry provider"
+            );
+            assert!(
+                e.fields
+                    .get("pid")
+                    .and_then(|p| p.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    > 0,
+                "sidecar.spawned must carry the spawned process pid"
+            );
+        }
     }
 
     fn state() -> FreshCodexState {
