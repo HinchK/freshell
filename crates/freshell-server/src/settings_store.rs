@@ -381,16 +381,33 @@ impl SettingsStore {
                 ));
             }
         }
-        if let Some(details) = validate_patch(patch_body, &self.valid_cli_providers) {
+        // The legacy strip/validate/merge stages all operate on private mutable
+        // copies of the request body (`{...value}` spreads in
+        // `stripDeprecatedSettingsPatchAliases`, `normalizeSettingsPatch`),
+        // never the caller's object \u2014 mirror that with one clone up front.
+        let mut patch_body = patch_body.clone();
+        // SESSION-13: `stripDeprecatedSettingsPatchAliases`
+        // (`settings-router.ts:23-36`) runs BEFORE the strict schema, so a
+        // sidebar carrying only the deprecated alias is a no-op, not an
+        // unrecognized-key rejection.
+        strip_deprecated_settings_patch_aliases(&mut patch_body);
+        if let Some(details) = validate_patch(&patch_body, &self.valid_cli_providers) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Invalid request", "details": details }),
             ));
         }
+        // SESSION-13: legacy zod's `z.coerce.boolean()` (validation stage) and
+        // `mergeServerSettings`' `normalizeTrimmedStringList` (merge stage)
+        // both fire before the base tree is touched; normalizing the private
+        // patch copy here is observationally identical, since a PRESENT
+        // sidebar key always REPLACES the base value (`hasOwn` semantics,
+        // `shared/settings.ts:1276-1285`).
+        normalize_sidebar_patch(&mut patch_body);
 
         let guard = self.inner.write().await;
         let mut value = serde_json::to_value(&*guard).unwrap_or_else(|_| json!({}));
-        deep_merge(&mut value, patch_body);
+        deep_merge(&mut value, &patch_body);
         // NOTE: `knownProviders` is regular patchable, persisted state in the
         // original (pinned live 2026-07-12: PATCH `{codingCli:{knownProviders:
         // ["claude"]}}` replaces and persists it); names are validated against
@@ -1638,6 +1655,12 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
             issues.push(enum_issue(&["panes", "defaultNewPane"], VALID));
         }
     }
+    // SESSION-13: the sidebar patch object (`shared/settings.ts:796-800`
+    // `.strict()`) — between `panes` and `codingCli`, matching the legacy
+    // zod schema's field order for multi-issue patches.
+    if let Some(v) = map.get("sidebar") {
+        validate_sidebar_patch(v, &mut issues);
+    }
     if let Some(cli) = map.get("codingCli") {
         validate_coding_cli_patch(cli, valid_cli_providers, &mut issues);
     }
@@ -1678,6 +1701,115 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
         None
     } else {
         Some(Value::Array(issues))
+    }
+}
+
+/// SESSION-13: the legacy sidebar patch sub-schema
+/// (`buildServerSettingsPatchSchema`, `shared/settings.ts:796-800`):
+/// `{excludeFirstChatSubstrings?: string[], excludeFirstChatMustStart?:
+/// z.coerce.boolean(), autoGenerateTitles?: z.coerce.boolean()}.strict()`.
+/// The two boolean keys are never type-rejected — `z.coerce.boolean()`
+/// accepts ANY JSON value (JS `Boolean()` truthiness), coercion happens in
+/// [`normalize_sidebar_patch`]. Per-field type issues first, then ONE
+/// strict unknown-keys issue carrying all unknown subkeys (mirroring this
+/// module's top-level/`codingCli` ordering convention).
+fn validate_sidebar_patch(sidebar: &Value, issues: &mut Vec<Value>) {
+    let Value::Object(sb) = sidebar else {
+        issues.push(invalid_type_issue("object", &json!(["sidebar"]), sidebar));
+        return;
+    };
+    if let Some(subs) = sb.get("excludeFirstChatSubstrings") {
+        match subs {
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if !item.is_string() {
+                        issues.push(invalid_type_issue(
+                            "string",
+                            &json!(["sidebar", "excludeFirstChatSubstrings", i]),
+                            item,
+                        ));
+                    }
+                }
+            }
+            other => issues.push(invalid_type_issue(
+                "array",
+                &json!(["sidebar", "excludeFirstChatSubstrings"]),
+                other,
+            )),
+        }
+    }
+    const SIDEBAR_KEYS: &[&str] = &[
+        "excludeFirstChatSubstrings",
+        "excludeFirstChatMustStart",
+        "autoGenerateTitles",
+    ];
+    let unknown: Vec<&str> = sb
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !SIDEBAR_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        issues.push(unrecognized_keys_issue(&unknown, &json!(["sidebar"])));
+    }
+}
+
+/// SESSION-13: `stripDeprecatedSettingsPatchAliases`
+/// (`server/settings-router.ts:23-36`) — the `sidebar` alias
+/// `ignoreCodexSubagentSessions` (browser-local since the settings split,
+/// CFG-04/CFG-12) is deleted BEFORE the strict schema runs on the legacy
+/// PATCH path; this port runs it before [`validate_patch`].
+fn strip_deprecated_settings_patch_aliases(patch: &mut Value) {
+    if let Some(sb) = patch.get_mut("sidebar").and_then(Value::as_object_mut) {
+        sb.remove("ignoreCodexSubagentSessions");
+    }
+}
+
+/// SESSION-13: the value normalization of the legacy sidebar PATCH write
+/// path, applied to the private patch copy before `deep_merge`:
+///
+/// * `excludeFirstChatMustStart` / `autoGenerateTitles` — legacy
+///   `z.coerce.boolean()` coerces at schema time (before merge), via JS
+///   `Boolean()` truthiness: `""`, `0`, `null` are false; every non-empty
+///   string (even `"false"`), non-zero number, array, and object is true.
+/// * `excludeFirstChatSubstrings` — `mergeServerSettings` runs
+///   `normalizeTrimmedStringList` (`shared/string-list.ts`): keep strings,
+///   trim, drop empties, dedupe first-occurrence-wins. The string filter is
+///   dead code here post-validation (all elements are strings) but kept as
+///   the `sanitizeServerSettingsPatch` mirror.
+fn normalize_sidebar_patch(patch: &mut Value) {
+    let Some(sb) = patch.get_mut("sidebar").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in ["excludeFirstChatMustStart", "autoGenerateTitles"] {
+        if let Some(v) = sb.get_mut(key) {
+            let coerced = js_truthiness(v);
+            *v = Value::Bool(coerced);
+        }
+    }
+    if let Some(slot) = sb.get_mut("excludeFirstChatSubstrings") {
+        if let Value::Array(items) = slot {
+            let strings: Vec<String> = items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect();
+            let normalized = normalize_trimmed_string_list(&strings);
+            *slot = json!(normalized);
+        }
+    }
+}
+
+/// JS `Boolean(x)` — the coercion `z.coerce.boolean()` applies
+/// (`shared/settings.ts:798-799`).
+fn js_truthiness(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        // JSON has no NaN/-0 distinctness: `Boolean(0)`/`Boolean(-0)` are the
+        // only false numbers; every other number coerces true.
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        // `Boolean([])` and `Boolean({})` are both true in JS.
+        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -3192,6 +3324,449 @@ mod tests {
             Some("/tmp/durable-cwd")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── SESSION-13: server-wide first-chat exclusion controls ────────────
+    //
+    // The legacy PATCH write path for the `sidebar` patch object is
+    // `server/settings-router.ts:127-147` (alias strip -> zod4 strict
+    // sidebar schema, `shared/settings.ts:796-800`) ->
+    // `configStore.patchSettings` -> `mergeServerSettings`
+    // (`shared/settings.ts:1261+`, sidebar keys at :1276-1285) with
+    // `normalizeTrimmedStringList` (`shared/string-list.ts`). Every
+    // expectation in this section was produced by executing those REAL
+    // legacy functions under tsx on this checkout (19-case oracle battery;
+    // see docs/plans/df1/SESSION-13.md for the table).
+
+    /// Strict-object parity: an unknown `sidebar` subkey is a 400-class
+    /// `unrecognized_keys` issue at path `["sidebar"]`, byte-matched to zod4
+    /// (legacy: `{sidebar:{bogus:1}}` -> `Unrecognized key: "bogus"`).
+    #[test]
+    fn validate_patch_sidebar_unknown_key_rejected() {
+        let details = validate_patch(&json!({ "sidebar": { "bogus": 1 } }), &valid5()).unwrap();
+        assert_eq!(details.as_array().unwrap().len(), 1);
+        assert_eq!(details[0]["code"], "unrecognized_keys");
+        assert_eq!(details[0]["keys"], json!(["bogus"]));
+        assert_eq!(details[0]["path"], json!(["sidebar"]));
+        assert_eq!(details[0]["message"], "Unrecognized key: \"bogus\"");
+    }
+
+    /// Legacy zod: `sidebar` must be an object when present — a bare string
+    /// is `invalid_type` expected `object` at path `["sidebar"]`.
+    #[test]
+    fn validate_patch_sidebar_not_an_object_rejected() {
+        let details = validate_patch(&json!({ "sidebar": "nope" }), &valid5()).unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "object");
+        assert_eq!(details[0]["path"], json!(["sidebar"]));
+    }
+
+    /// Legacy zod: `excludeFirstChatSubstrings` must be an array —
+    /// `invalid_type` expected `array` at the full nested path.
+    #[test]
+    fn validate_patch_sidebar_substrings_wrong_type_rejected() {
+        let details = validate_patch(
+            &json!({ "sidebar": { "excludeFirstChatSubstrings": "nope" } }),
+            &valid5(),
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "array");
+        assert_eq!(
+            details[0]["path"],
+            json!(["sidebar", "excludeFirstChatSubstrings"])
+        );
+    }
+
+    /// Legacy zod: each substring element must be a string — the issue
+    /// carries the ELEMENT index in its path (`[1,"a"]` fails at index 0).
+    #[test]
+    fn validate_patch_sidebar_substring_element_type_rejected() {
+        let details = validate_patch(
+            &json!({ "sidebar": { "excludeFirstChatSubstrings": [1, "a"] } }),
+            &valid5(),
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "string");
+        assert_eq!(
+            details[0]["path"],
+            json!(["sidebar", "excludeFirstChatSubstrings", 0])
+        );
+    }
+
+    /// Ordering parity (`settings-router.ts:23-36` runs BEFORE the strict
+    /// schema): the deprecated `ignoreCodexSubagentSessions` alias is
+    /// stripped pre-validation, so an alias-only sidebar patch is accepted
+    /// as a no-op instead of tripping the strict unknown-key check, and a
+    /// mixed alias+unknown patch reports ONLY the unknown key (proving the
+    /// strip ran before the strict check, at `patch()` entry).
+    #[tokio::test]
+    async fn patch_sidebar_deprecated_alias_stripped_before_validation() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-alias-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        let merged = store
+            .patch(&json!({ "sidebar": { "ignoreCodexSubagentSessions": true } }))
+            .await
+            .expect("alias-only sidebar patch must be accepted as a no-op");
+        assert!(merged.sidebar.exclude_first_chat_substrings.is_empty());
+        assert!(!merged.sidebar.exclude_first_chat_must_start);
+
+        let (_status, body) = store
+            .patch(&json!({ "sidebar": { "ignoreCodexSubagentSessions": true, "bogus": 1 } }))
+            .await
+            .unwrap_err();
+        let details = &body["details"];
+        assert_eq!(details[0]["code"], "unrecognized_keys");
+        assert_eq!(
+            details[0]["keys"],
+            json!(["bogus"]),
+            "the alias itself must NOT appear among the rejected keys"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `z.coerce.boolean()` parity: the legacy schema coerces ANY JSON value
+    /// for `excludeFirstChatMustStart` via JS `Boolean()` truthiness —
+    /// oracle table rows: "yes"→true, "false"→true, 1→true, {}→true,
+    /// []→true, ""→false, 0→false, null→false.
+    #[tokio::test]
+    async fn patch_coerces_exclude_first_chat_must_start_truthiness() {
+        for (input, expected) in [
+            (json!("yes"), true),
+            (json!("false"), true),
+            (json!(1), true),
+            (json!({}), true),
+            (json!([]), true),
+            (json!(""), false),
+            (json!(0), false),
+            (Value::Null, false),
+        ] {
+            let dir = std::env::temp_dir().join(format!("frs-s13-coerce-{}", uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            let store = store_at(&dir);
+            let merged = store
+                .patch(&json!({ "sidebar": { "excludeFirstChatMustStart": input } }))
+                .await
+                .unwrap_or_else(|_| panic!("legacy accepts this coercion"));
+            assert_eq!(
+                merged.sidebar.exclude_first_chat_must_start, expected,
+                "z.coerce.boolean() truthiness parity"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `normalizeTrimmedStringList` parity (`shared/string-list.ts`): trim,
+    /// drop empties, dedupe first-occurrence-wins; a PRESENT key always
+    /// replaces (an explicit `[]` clears), an ABSENT key keeps the base.
+    #[tokio::test]
+    async fn patch_normalizes_exclude_first_chat_substrings() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-norm-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        store
+            .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": ["keep"] } }))
+            .await
+            .unwrap();
+        let merged = store
+            .patch(
+                &json!({ "sidebar": { "excludeFirstChatSubstrings": [" a ", "a", "", " b ", "b"] } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.sidebar.exclude_first_chat_substrings,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Present-but-empty replaces (clears) — legacy `hasOwn` semantics.
+        let cleared = store
+            .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": [] } }))
+            .await
+            .unwrap();
+        assert!(cleared.sidebar.exclude_first_chat_substrings.is_empty());
+        // Absent key preserves the base.
+        let untouched = store
+            .patch(&json!({ "sidebar": { "autoGenerateTitles": false } }))
+            .await
+            .unwrap();
+        assert!(untouched.sidebar.exclude_first_chat_substrings.is_empty());
+        assert!(!untouched.sidebar.auto_generate_titles);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Full-route write-through: PATCH via the REAL `patch_settings` handler
+    /// returns the normalized tree, persists it to `config.json`, broadcasts
+    /// it to connected clients in the `settings.updated` frame, and a store
+    /// reload (the restart leg) sees the same normalized values.
+    #[tokio::test]
+    async fn sidebar_patch_write_through_persists_normalized_disk_broadcast_and_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-route-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        // Build the router state by hand (keeping the broadcast receiver —
+        // `router_state_at` drops it).
+        let auth_token = Arc::new("tok".to_string());
+        let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let state = SettingsRouterState {
+            store: store_at(&dir),
+            auth_token: Arc::clone(&auth_token),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                json!({}),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+        };
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({
+                "sidebar": {
+                    "excludeFirstChatSubstrings": [" __S13AUTO__ ", "__S13AUTO__", "canary"],
+                    "excludeFirstChatMustStart": true,
+                }
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(body["sidebar"]["excludeFirstChatMustStart"], json!(true));
+
+        // The broadcast frame carries the same normalized tree.
+        let frame = broadcast_rx.try_recv().expect("a settings.updated frame");
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], "settings.updated");
+        assert_eq!(
+            frame["settings"]["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(
+            frame["settings"]["sidebar"]["excludeFirstChatMustStart"],
+            json!(true)
+        );
+
+        // config.json on disk holds the normalized values.
+        let disk = read_disk_config(&dir);
+        assert_eq!(
+            disk["settings"]["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(
+            disk["settings"]["sidebar"]["excludeFirstChatMustStart"],
+            json!(true)
+        );
+
+        // Restart leg: a fresh store over the same home sees them.
+        drop(state);
+        let reloaded = store_at(&dir);
+        let after = reloaded.get().await;
+        assert_eq!(
+            after.sidebar.exclude_first_chat_substrings,
+            vec!["__S13AUTO__".to_string(), "canary".to_string()]
+        );
+        assert!(after.sidebar.exclude_first_chat_must_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SESSION-13 replication leg at store level: a sidebar PATCH is visible
+    /// through the SAME shared lock the CFG-12 per-connection handshake
+    /// resolves (`WsState::handshake_settings`) — a freshly-connecting client
+    /// receives the new exclusion controls in its handshake `settings`.
+    #[tokio::test]
+    async fn sidebar_patch_visible_through_shared_settings_lock() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-lock-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let shared = store.shared_settings_lock();
+
+        assert!(shared
+            .read()
+            .await
+            .sidebar
+            .exclude_first_chat_substrings
+            .is_empty());
+        store
+            .patch(&json!({
+                "sidebar": {
+                    "excludeFirstChatSubstrings": ["a"],
+                    "excludeFirstChatMustStart": true,
+                }
+            }))
+            .await
+            .unwrap();
+        let seen = shared.read().await;
+        assert_eq!(
+            seen.sidebar.exclude_first_chat_substrings,
+            vec!["a".to_string()],
+            "the handshake's live source must observe the committed sidebar PATCH"
+        );
+        assert!(seen.sidebar.exclude_first_chat_must_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The 19-row oracle battery, produced by executing the REAL legacy
+    /// `buildServerSettingsPatchSchema(...).safeParse(strip(body))` +
+    /// `mergeServerSettings(base, parsed.data)` under tsx on this checkout
+    /// (see docs/plans/df1/SESSION-13.md). Each row replays one PATCH at
+    /// store level and asserts identical accept/reject and an identical
+    /// merged sidebar (key order fixed by `SettingsSidebar`'s serde:
+    /// autoGenerateTitles, excludeFirstChatMustStart, excludeFirstChatSubstrings).
+    #[tokio::test]
+    async fn sidebar_patch_oracle_byte_parity_battery() {
+        // (patch, accepted?, resulting sidebar JSON when accepted) — base
+        // fixture: substrings ["keep"], mustStart false, autoGenerateTitles true.
+        let rows: &[(Value, bool, Option<&str>)] = &[
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":"yes"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":""}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":"false"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":0}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":1}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":null}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":{}}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":[]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[" a ","a",""," b ","b"]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["a","b"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":"nope"}}),
+                false,
+                None,
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[1,"a"]}}),
+                false,
+                None,
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":["x"],"excludeFirstChatMustStart":true,"bogus":1}}),
+                false,
+                None,
+            ),
+            (json!({"sidebar":{"bogus":1}}), false, None),
+            (json!({"sidebar":"nope"}), false, None),
+            (
+                json!({"sidebar":{"ignoreCodexSubagentSessions":true}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"autoGenerateTitles":"yes"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"autoGenerateTitles":0}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":false,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":[]}"#,
+                ),
+            ),
+        ];
+        for (i, (patch, accepted, sidebar_json)) in rows.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("frs-s13-oracle-{}-{}", i, uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            let store = store_at(&dir);
+            // Base fixture: substrings ["keep"] (the oracle battery's base).
+            store
+                .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": ["keep"] } }))
+                .await
+                .unwrap();
+            match store.patch(patch).await {
+                Ok(merged) => {
+                    assert!(accepted, "row {i}: legacy REJECTS this patch");
+                    let sidebar = serde_json::to_string(&merged.sidebar).unwrap();
+                    assert_eq!(&sidebar, sidebar_json.unwrap(), "row {i} byte parity");
+                }
+                Err((_status, _body)) => {
+                    assert!(!accepted, "row {i}: legacy ACCEPTS this patch");
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// Same document-preservation guarantee through the terminal-override
