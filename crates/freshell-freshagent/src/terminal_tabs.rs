@@ -1004,6 +1004,23 @@ pub(crate) async fn spawn_terminal_pane(
         .expect("pane_tabs mutex")
         .insert(pane_id.to_string(), tab_id.to_string());
 
+    // Fix round 1 (Task 23 gap): fire the injected post-create hook -- Node's
+    // registry-'terminal.created'-event analog (`server/index.ts:647-655` ->
+    // `seedFromTerminal` for EVERY terminal). `freshell-server` wires it to the
+    // SAME meta seed -> async git enrich -> `terminal.meta.updated` broadcast
+    // the WS `terminal.create` path runs, so REST-created terminals get git
+    // badges too. Fired AFTER the bookkeeping (create fully succeeded), with
+    // the RESOLVED spawn cwd (`spec.cwd` -- what the registry record carries).
+    // The production hook is non-blocking (record build + `tokio::spawn`).
+    if let Some(hook) = &state.terminal_created_hook {
+        hook(crate::TerminalCreatedEvent {
+            terminal_id: terminal_id.clone(),
+            mode: mode.clone(),
+            resume_session_id: resume_session_id.clone(),
+            cwd: spec.cwd.clone(),
+        });
+    }
+
     Ok(TerminalSpawnResult {
         pane_content,
         terminal_id,
@@ -1640,6 +1657,57 @@ mod tests {
         assert_eq!(payload["paneContent"]["kind"], json!("terminal"));
         assert_eq!(payload["paneContent"]["terminalId"], json!(terminal_id));
         assert_eq!(payload["paneContent"]["status"], json!("running"));
+    }
+
+    /// Fix round 1 (Task 23 gap): a REST-created terminal must fire the
+    /// injected terminal-created hook with the create identity, so
+    /// `freshell-server`'s wiring can run the SAME meta seed -> async git
+    /// enrich -> `terminal.meta.updated` broadcast the WS `terminal.create`
+    /// path gets (Node seeds off the registry's 'terminal.created' event for
+    /// EVERY terminal, `server/index.ts:647-655` -> `seedFromTerminal`).
+    /// The hook is the seam: `freshell-ws` depends on THIS crate, so the
+    /// `TerminalMetaRegistry` itself is unreachable here (same constraint the
+    /// exit hook documents for `identity.retire`).
+    #[tokio::test]
+    async fn create_shell_tab_invokes_terminal_created_hook_with_create_identity() {
+        let captured: Arc<std::sync::Mutex<Vec<crate::TerminalCreatedEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_captured = Arc::clone(&captured);
+        let state = state_with_registry().with_terminal_created_hook(Arc::new(move |event| {
+            hook_captured.lock().unwrap().push(event);
+        }));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let terminal_id = body["data"]["terminalId"].as_str().expect("terminalId");
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one hook call per create");
+        let event = &events[0];
+        assert_eq!(event.terminal_id, terminal_id);
+        assert_eq!(event.mode, "shell");
+        assert_eq!(event.resume_session_id, None);
+        // The RESOLVED spawn cwd (what the registry record carries -- Node's
+        // `seedFromTerminal` reads `record.cwd`), not the raw request field.
+        assert_eq!(event.cwd.as_deref(), Some(tmp.to_string_lossy().as_ref()));
+    }
+
+    /// The hook is optional wiring (the `rename_persistence` convention):
+    /// an unwired state creates terminals exactly as before -- no panic, no
+    /// behavior change (every pre-existing test in this module already runs
+    /// unwired; this pins the contract explicitly).
+    #[tokio::test]
+    async fn create_shell_tab_without_hook_wired_still_creates() {
+        let state = state_with_registry();
+        let (status, body) = post(app(state), "/api/tabs", json!({ "mode": "shell" }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data"]["terminalId"].as_str().is_some());
     }
 
     #[tokio::test]

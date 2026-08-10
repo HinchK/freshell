@@ -24,22 +24,18 @@ import type { TestServerInfo } from '../helpers/test-server.js'
  *    so a freshly-reloaded client shows the badge again without any live
  *    `terminal.meta.updated` frame.
  *
- * CLIENT-CREATE PATH (deviation from the brief's `POST /api/tabs {cwd}`,
- * documented in `sdd/task-23-report.md`): the ONLY create-time meta seeding
- * in the Rust port lives in the WS `terminal.create` handler
- * (`terminal.rs:1295-1369`). The REST `POST /api/tabs` pipeline
- * (`freshell-freshagent`, `spawn_terminal_pane`) never touches the
- * TerminalMetaRegistry (zero references in that crate), and the Task 18
- * sweep refresh only rebuilds records the create path ALREADY seeded
- * (`auto_title_sweep.rs:262-264`, Node `applySessionMetadata:184-185`
- * parity) -- so a REST-created shell terminal never gets a badge today
- * (empirically confirmed: handshake `terminalMeta` stays `[]`). Test 1
- * therefore drives the tab through the CLIENT create path (Redux `addTab`
- * with `initialCwd` -> `TerminalView` sends `terminal.create{cwd}`,
- * `TerminalView.tsx:2783-2787` -- the SAME path every user-created tab
- * takes), proving the badge feature end-to-end. Test 2 pins the brief's
- * exact REST flow as a KNOWN GAP via `test.fail()`
- * (rest-tab-persistence.spec.ts precedent).
+ * TWO CREATE PATHS, BOTH SEEDED (Fix round 1 closed the Task 23 gap
+ * documented in `sdd/task-23-report.md`): Test 1 drives the tab through the
+ * CLIENT create path (Redux `addTab` with `initialCwd` -> `TerminalView`
+ * sends `terminal.create{cwd}`, `TerminalView.tsx:2783-2787` -- the WS
+ * `terminal.create` handler's create-time seed, `terminal.rs`). Test 2
+ * drives the brief's exact REST flow (`POST /api/tabs {cwd}`): the
+ * `freshell-freshagent` spawn pipeline now fires the terminal-created hook
+ * `main.rs` wires to `freshell_ws::terminal_meta::seed_from_terminal`
+ * (Node `seedFromTerminal` parity, `server/index.ts:647-655` -- legacy
+ * seeds off the registry's 'terminal.created' event for EVERY terminal,
+ * REST creates included). Test 2 was a `test.fail()` KNOWN-GAP pin until
+ * the hook landed; its flip instruction has been executed.
  *
  * PER-TEST OWNED SERVERS (auto-title-rust.spec.ts / Task 21 precedent), with
  * the badge repo seeded INSIDE each server's isolated home by `setupHome`
@@ -161,26 +157,20 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
   })
 
   // ---------------------------------------------------------------------
-  // KNOWN GAP (test.fail): the brief's exact flow -- a REST-created shell
-  // tab (`POST /api/tabs {cwd}`) -- never gets a git badge on the Rust
-  // server today. Node parity note: the legacy server seeds a meta record
-  // off the registry's 'terminal.created' EVENT for EVERY terminal
-  // (`server/index.ts:647-655` -> `seedFromTerminal`), REST creates
-  // included; the Rust port only seeds inside the WS `terminal.create`
-  // handler (`crates/freshell-ws/src/terminal.rs:1295-1369`), and the REST
-  // pipeline (`freshell-freshagent::spawn_terminal_pane`) never touches the
-  // TerminalMetaRegistry. The Task 18 sweep can't fill the hole either: it
-  // skips terminals the create path never seeded
-  // (`auto_title_sweep.rs:262-264`).
-  //
-  // FLIP INSTRUCTION: when REST creates gain meta seeding (Node
-  // `seedFromTerminal` parity), the badge assertion below will START
-  // passing, which trips this `test.fail()` annotation into a hard failure
-  // -- that is the signal to delete the annotation and let this run green
-  // (same regime as rest-tab-persistence.spec.ts's flip note).
+  // Fix round 1 (flip executed): the brief's exact flow -- a REST-created
+  // shell tab (`POST /api/tabs {cwd}`) -- now gets a git badge. The
+  // `freshell-freshagent` spawn pipeline (`spawn_terminal_pane`) fires an
+  // injected terminal-created hook after every successful REST create;
+  // `crates/freshell-server/src/main.rs` wires it to
+  // `freshell_ws::terminal_meta::seed_from_terminal` -- the SAME seed ->
+  // async git enrich -> `commit_if_changed` -> `terminal.meta.updated`
+  // pipeline the WS `terminal.create` handler runs. Node parity:
+  // legacy seeds off the registry's 'terminal.created' EVENT for EVERY
+  // terminal (`server/index.ts:647-655` -> `seedFromTerminal`), REST
+  // creates included. This leg was a `test.fail()` KNOWN-GAP pin until the
+  // hook landed (rest-tab-persistence.spec.ts flip regime).
   // ---------------------------------------------------------------------
-  test('KNOWN GAP: a REST-created shell tab (POST /api/tabs {cwd}) never shows a git badge', async ({ page }) => {
-    test.fail()
+  test('a REST-created shell tab (POST /api/tabs {cwd}) shows a git badge (seedFromTerminal parity)', async ({ page }) => {
     const { server, info, repoDir } = await bootBadgeServer()
     try {
       // Connect the browser FIRST: the `ui.command{tab.create}` broadcast is

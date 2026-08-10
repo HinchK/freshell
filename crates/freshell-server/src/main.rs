@@ -474,7 +474,29 @@ async fn main() -> ExitCode {
         // `terminals.changed` revision counter the WS lifecycle and REST
         // `/api/terminals` broadcasts stamp — one monotonic sequence.
         .with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))
-        .with_shared_terminals_revision(Arc::clone(&terminals_revision));
+        .with_shared_terminals_revision(Arc::clone(&terminals_revision))
+        // Fix round 1 (Task 23 gap): REST-pipeline creates (`POST /api/tabs`,
+        // pane split, restore) get the SAME create-time meta seed -> async git
+        // enrich -> `terminal.meta.updated` broadcast the WS `terminal.create`
+        // path runs (Node seeds off the registry's 'terminal.created' event
+        // for EVERY terminal, `server/index.ts:647-655` -> `seedFromTerminal`).
+        // Wired HERE because only this crate sees both sides: freshagent (the
+        // hook seam) and freshell-ws (the meta registry). WS creates never
+        // fire this hook, so no terminal is double-seeded.
+        .with_terminal_created_hook({
+            let terminal_meta = terminal_meta.clone();
+            let broadcast_tx = Arc::clone(&broadcast_tx);
+            Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
+                freshell_ws::terminal_meta::seed_from_terminal(
+                    &terminal_meta,
+                    &broadcast_tx,
+                    &event.terminal_id,
+                    &event.mode,
+                    event.resume_session_id.as_deref(),
+                    event.cwd.as_deref(),
+                );
+            })
+        });
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();

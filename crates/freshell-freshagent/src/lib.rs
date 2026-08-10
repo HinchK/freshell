@@ -201,7 +201,43 @@ pub struct FreshAgentState {
     /// cascade's broadcast draws from the ONE monotonic sequence. `None`
     /// until wired — the cascade then skips the broadcast honestly.
     pub(crate) terminals_revision: Option<Arc<AtomicI64>>,
+    /// Fix round 1 (Task 23 gap): the injectable post-create seam Node covers
+    /// with the registry's `'terminal.created'` EVENT (`server/index.ts:647-655`
+    /// -> `seedFromTerminal` for EVERY terminal, REST creates included). The
+    /// Rust registry has no such event mechanism, and the meta store
+    /// (`freshell_ws::terminal_meta::TerminalMetaRegistry`) is unreachable
+    /// from this crate (`freshell-ws` depends on THIS crate, not vice versa
+    /// -- the same constraint `spawn_terminal_pane`'s exit hook documents for
+    /// `identity.retire`). So `freshell-server`'s `main.rs` -- where both
+    /// crates are visible -- wires a closure here (via
+    /// [`Self::with_terminal_created_hook`]) that runs the SAME create-time
+    /// meta seed -> async git enrich -> `terminal.meta.updated` broadcast the
+    /// WS `terminal.create` path gets. Fired by
+    /// [`terminal_tabs::spawn_terminal_pane`] after every successful
+    /// REST-pipeline create (tab create, pane split, restore). `None` until
+    /// wired (the `rename_persistence` convention): creates proceed, only the
+    /// meta seeding is skipped.
+    pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
 }
+
+/// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
+/// terminal-created hook: the create-time identity Node's `seedFromTerminal`
+/// reads off the registry record (`terminal-metadata-service.ts:138-146`).
+/// `cwd` is the RESOLVED spawn cwd (what the registry record carries), not
+/// the raw request field.
+#[derive(Clone, Debug)]
+pub struct TerminalCreatedEvent {
+    pub terminal_id: String,
+    pub mode: String,
+    pub resume_session_id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// The injectable post-create hook (see
+/// [`FreshAgentState::with_terminal_created_hook`]). Must be cheap and
+/// non-blocking on the create path -- the production wiring only builds a
+/// meta record and `tokio::spawn`s the git enrichment.
+pub type TerminalCreatedHook = Arc<dyn Fn(TerminalCreatedEvent) + Send + Sync>;
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
 #[derive(Clone)]
@@ -267,6 +303,7 @@ impl FreshAgentState {
             layout: layout_store::LayoutStore::default(),
             rename_persistence: None,
             terminals_revision: None,
+            terminal_created_hook: None,
         }
     }
 
@@ -394,6 +431,16 @@ impl FreshAgentState {
     /// skips the syncable-terminal persistence cascade.
     pub fn with_rename_persistence(mut self, persistence: Arc<dyn RenamePersistence>) -> Self {
         self.rename_persistence = Some(persistence);
+        self
+    }
+
+    /// Fix round 1 (Task 23 gap): wire the post-create hook `freshell-server`
+    /// uses to run the WS-parity meta seed -> async git enrich ->
+    /// `terminal.meta.updated` broadcast for every REST-pipeline create (see
+    /// the field doc for why this seam exists). Unwired == creates proceed,
+    /// meta seeding skipped. Mirrors [`Self::with_rename_persistence`].
+    pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
+        self.terminal_created_hook = Some(hook);
         self
     }
 

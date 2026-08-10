@@ -284,6 +284,110 @@ pub fn broadcast_terminal_meta_updated(
     }
 }
 
+/// Build the create-time `TerminalMetaRecord` (DEV-0008 closure, Task 18;
+/// moved here from `terminal.rs` in Fix round 1 so BOTH create paths -- the WS
+/// `terminal.create` handler and the REST pipeline's terminal-created hook
+/// ([`seed_from_terminal`]) -- share the ONE builder).
+///
+/// The original's `TerminalMetadataService.seedFromTerminal`
+/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
+/// `'terminal.created'` event (`server/index.ts:647-655`) for EVERY terminal:
+/// `provider` only for non-shell modes (`isTerminalProvider`, `:39-41`), and
+/// `sessionId` only riding along with a provider -- derived from
+/// `record.resumeSessionId`, which is set for a fresh server-preallocated id
+/// (e.g. claude) just as much as for a genuine resume
+/// (`terminal-registry.ts:176-195` `TerminalSessionRefSource`).
+///
+/// Built here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` --
+/// the fields known at create time with zero extra I/O. Git enrichment
+/// (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
+/// `enrichFromCwd`) happens in the ASYNC task
+/// ([`spawn_enrich_commit_broadcast`]) so terminal-creation latency never
+/// pays for the git probes.
+pub fn record_for_create(
+    terminal_id: &str,
+    mode: &str,
+    resume_session_id: Option<&str>,
+    cwd: Option<&str>,
+    updated_at: i64,
+) -> TerminalMetaRecord {
+    let provider = (mode != "shell").then(|| mode.to_string());
+    let session_id = if provider.is_some() {
+        resume_session_id.map(str::to_string)
+    } else {
+        None
+    };
+    TerminalMetaRecord {
+        terminal_id: terminal_id.to_string(),
+        updated_at,
+        branch: None,
+        checkout_root: None,
+        cwd: cwd.map(str::to_string),
+        display_subdir: None,
+        is_dirty: None,
+        provider,
+        repo_root: None,
+        session_id,
+        token_usage: None,
+    }
+}
+
+/// The async half of create-time seeding (extracted from `terminal.rs`'s
+/// `handle_create` in Fix round 1 so both create paths share it): git-enrich +
+/// commit + broadcast OFF the create path, exactly like Node's async
+/// `seedFromTerminal` fan-out (`server/index.ts:647-655`) -- the git probes
+/// must never add latency to the create reply. `commit_if_changed` on a fresh
+/// terminalId always changes, so the enriched upsert reaches every connected
+/// client; the handshake's `terminal_meta.list()` serves late-connecting
+/// clients the same record.
+pub fn spawn_enrich_commit_broadcast(
+    terminal_meta: &TerminalMetaRegistry,
+    broadcast_tx: &Arc<tokio::sync::broadcast::Sender<String>>,
+    mut record: TerminalMetaRecord,
+) {
+    let terminal_meta = terminal_meta.clone();
+    let broadcast_tx = Arc::clone(broadcast_tx);
+    tokio::spawn(async move {
+        enrich_from_cwd(&mut record).await;
+        if let Some(record) = terminal_meta.commit_if_changed(record, crate::terminal::now_ms()) {
+            broadcast_terminal_meta_updated(&broadcast_tx, vec![record], vec![]);
+        }
+    });
+}
+
+/// Node's `seedFromTerminal` (`server/index.ts:647-655` +
+/// `terminal-metadata-service.ts:138-146`) for the REST create pipeline (Fix
+/// round 1, Task 23 gap): the full create-time treatment -- relaxed record
+/// build ([`record_for_create`]) -> async `enrich_from_cwd` ->
+/// `commit_if_changed` -> `terminal.meta.updated {upsert}` broadcast --
+/// packaged as ONE call for `freshell-server`'s `main.rs` to wire into
+/// `freshell_freshagent::FreshAgentState::with_terminal_created_hook`
+/// (`freshell-freshagent` cannot import this crate; the hook closure built
+/// where both crates are visible is the seam). The WS `terminal.create` path
+/// does NOT call this: it needs the record BEFORE the `terminal.created`
+/// frame (identity seeding + `sessionRef` stamping), so it calls the two
+/// halves directly -- no double-seeding, since each terminal is created by
+/// exactly one of the two paths.
+///
+/// Must be called from within a tokio runtime (it spawns the enrichment task).
+pub fn seed_from_terminal(
+    terminal_meta: &TerminalMetaRegistry,
+    broadcast_tx: &Arc<tokio::sync::broadcast::Sender<String>>,
+    terminal_id: &str,
+    mode: &str,
+    resume_session_id: Option<&str>,
+    cwd: Option<&str>,
+) {
+    let record = record_for_create(
+        terminal_id,
+        mode,
+        resume_session_id,
+        cwd,
+        crate::terminal::now_ms(),
+    );
+    spawn_enrich_commit_broadcast(terminal_meta, broadcast_tx, record);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +576,66 @@ mod tests {
             session_id: None,
             token_usage: None,
         }
+    }
+
+    /// Fix round 1 (Task 23 gap): `seed_from_terminal` -- the Node
+    /// `seedFromTerminal` analog `freshell-server` wires into the REST
+    /// create path's terminal-created hook -- must run the FULL create-time
+    /// pipeline the WS `terminal.create` path gets: relaxed record build ->
+    /// async `enrich_from_cwd` (real git probes) -> `commit_if_changed` ->
+    /// `terminal.meta.updated {upsert}` broadcast. No PTY involved.
+    #[tokio::test]
+    async fn seed_from_terminal_commits_enriched_record_and_broadcasts_upsert() {
+        let t = tempfile::tempdir().unwrap();
+        init_repo(t.path());
+        // Dirty it: the branch badge's `*` half must survive the pipeline.
+        std::fs::write(t.path().join("f.txt"), "dirty").unwrap();
+        let canonical = t.path().canonicalize().unwrap();
+
+        let reg = TerminalMetaRegistry::default();
+        let tx = Arc::new(tokio::sync::broadcast::channel::<String>(4).0);
+        let mut rx = tx.subscribe();
+
+        seed_from_terminal(
+            &reg,
+            &tx,
+            "t-rest",
+            "shell",
+            None,
+            Some(&t.path().to_string_lossy()),
+        );
+
+        // The enrichment task is async off the create path; the broadcast is
+        // its completion signal (exactly one frame per fresh terminal --
+        // `commit_if_changed` on a fresh id always changes).
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("terminal.meta.updated within 30s")
+            .expect("broadcast channel open");
+        let msg: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["type"], serde_json::json!("terminal.meta.updated"));
+        assert_eq!(msg["remove"], serde_json::json!([]));
+        let upsert = msg["upsert"].as_array().expect("upsert array");
+        assert_eq!(upsert.len(), 1);
+        assert_eq!(upsert[0]["terminalId"], serde_json::json!("t-rest"));
+        assert_eq!(upsert[0]["branch"], serde_json::json!("main"));
+        assert_eq!(upsert[0]["isDirty"], serde_json::json!(true));
+        assert_eq!(
+            upsert[0]["checkoutRoot"],
+            serde_json::json!(canonical.to_str().unwrap())
+        );
+        // A shell terminal seeds WITHOUT provider/sessionId (Node
+        // `isTerminalProvider` gate) -- absent fields are skipped on the wire.
+        assert!(upsert[0].get("provider").is_none());
+        assert!(upsert[0].get("sessionId").is_none());
+
+        // The registry holds the SAME enriched record (this is what the WS
+        // handshake's `terminal_meta.list()` serves to late-connecting
+        // clients -- the reload-persistence leg of the badge feature).
+        let stored = reg.get("t-rest").expect("record committed");
+        assert_eq!(stored.branch.as_deref(), Some("main"));
+        assert_eq!(stored.is_dirty, Some(true));
+        assert_eq!(stored.provider, None);
     }
 
     /// `selectMoreSpecificCwd` (`terminal-metadata-service.ts:63-76`).

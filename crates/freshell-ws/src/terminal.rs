@@ -1354,68 +1354,23 @@ pub(crate) async fn handle_create(
     // DEV-0008 closure (Task 18): git-enrich + commit + broadcast OFF the create
     // path, exactly like Node's async `seedFromTerminal` fan-out
     // (`server/index.ts:647-655`) -- the git probes must never add latency to
-    // `terminal.created`. `commit_if_changed` on a fresh terminalId always
-    // changes, so the enriched upsert reaches every connected client; the
-    // handshake's `terminal_meta.list()` serves late-connecting clients the
-    // same record.
-    let terminal_meta = state.terminal_meta.clone();
-    let meta_tx = Arc::clone(&state.broadcast_tx);
-    let mut meta_record = create_meta_record;
-    tokio::spawn(async move {
-        crate::terminal_meta::enrich_from_cwd(&mut meta_record).await;
-        if let Some(record) = terminal_meta.commit_if_changed(meta_record, now_ms()) {
-            crate::terminal_meta::broadcast_terminal_meta_updated(&meta_tx, vec![record], vec![]);
-        }
-    });
+    // `terminal.created`. Fix round 1: routed through the SHARED helper the
+    // REST pipeline's terminal-created hook also uses (see
+    // `crate::terminal_meta::seed_from_terminal`'s doc for why this path calls
+    // the halves separately: the record must exist BEFORE the created frame).
+    crate::terminal_meta::spawn_enrich_commit_broadcast(
+        &state.terminal_meta,
+        &state.broadcast_tx,
+        create_meta_record,
+    );
     sent
 }
 
-/// Build the create-time `TerminalMetaRecord` (DEV-0008 closure, Task 18).
-///
-/// The original's `TerminalMetadataService.seedFromTerminal`
-/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
-/// `'terminal.created'` event (`server/index.ts:647-655`) for EVERY terminal:
-/// `provider` only for non-shell modes (`isTerminalProvider`, `:39-41`), and
-/// `sessionId` only riding along with a provider -- derived from
-/// `record.resumeSessionId`, which is set for a fresh server-preallocated id
-/// (e.g. claude) just as much as for a genuine resume
-/// (`terminal-registry.ts:176-195` `TerminalSessionRefSource`; this fn's
-/// `resume_session_id` is the same value, `terminal.rs:507-536`).
-///
-/// Built here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` --
-/// the fields known at create time with zero extra I/O. Git enrichment
-/// (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
-/// `enrichFromCwd`) happens in the ASYNC task `handle_create` spawns after
-/// the `terminal.created` frame (`crate::terminal_meta::enrich_from_cwd` ->
-/// `commit_if_changed` -> `terminal.meta.updated`), so terminal-creation
-/// latency never pays for the git probes.
-fn terminal_meta_record_for_create(
-    terminal_id: &str,
-    mode: &str,
-    resume_session_id: Option<&str>,
-    cwd: Option<&str>,
-    updated_at: i64,
-) -> TerminalMetaRecord {
-    let provider = (mode != "shell").then(|| mode.to_string());
-    let session_id = if provider.is_some() {
-        resume_session_id.map(str::to_string)
-    } else {
-        None
-    };
-    TerminalMetaRecord {
-        terminal_id: terminal_id.to_string(),
-        updated_at,
-        branch: None,
-        checkout_root: None,
-        cwd: cwd.map(str::to_string),
-        display_subdir: None,
-        is_dirty: None,
-        provider,
-        repo_root: None,
-        session_id,
-        token_usage: None,
-    }
-}
+/// Fix round 1: the create-time record builder moved to
+/// [`crate::terminal_meta::record_for_create`] so the REST pipeline's
+/// terminal-created hook shares it; this alias keeps every existing call
+/// site (and the Task 18 tests below) reading at its historical name.
+use crate::terminal_meta::record_for_create as terminal_meta_record_for_create;
 
 /// `wsHandler.broadcastTerminalsChanged()` (`ws-handler.ts:3670-3679`) from the WS
 /// terminal lifecycle paths: bump the handler-scoped revision (SHARED with the REST
