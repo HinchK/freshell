@@ -207,9 +207,46 @@ const SENTINEL_KEYS = [
   'zzCfg01FutureKey',
 ] as const
 
-/** Assert every CFG-01 sentinel key deep-equals between two snapshots. */
-function expectSentinelsIntact(before: any, after: any, context: string): void {
+/** Assert every CFG-01 sentinel key deep-equals between two snapshots. Keys in
+ * `except` are the writer-under-test's own managed map (pinned to its intended
+ * paths by `expectDiffWithin` already); for those, assert CONTAINMENT instead:
+ * every pre-existing entry must survive bit-for-bit — EXCEPT the entry the
+ * writer is deliberately mutating (`mutatingEntries`, e.g. the terminal-delete
+ * leg adds `deleted:true` to the entry the rename leg just created), where
+ * every pre-existing FIELD of that entry must still survive (additions
+ * allowed; field removal/overwrite flagged). A wholesale replace/regression of
+ * a managed map therefore fails here even when the allowed-path diff passes. */
+function expectSentinelsIntact(
+  before: any,
+  after: any,
+  context: string,
+  except: string[] = [],
+  mutatingEntries: Array<[string, string]> = [],
+): void {
   for (const key of SENTINEL_KEYS) {
+    if (except.includes(key)) {
+      const b = before?.[key]
+      expect(isPlainObject(b), `${context}: sentinel ${key} (pre-write) must be an object`).toBe(true)
+      for (const [entryKey, entryValue] of Object.entries(b)) {
+        const mutating = mutatingEntries.some(([mk, ek]) => mk === key && ek === entryKey)
+        if (mutating && isPlainObject(entryValue)) {
+          for (const [field, fieldValue] of Object.entries(entryValue)) {
+            const diffs = collectDiffPaths(fieldValue, after?.[key]?.[entryKey]?.[field], [key, entryKey, field])
+            expect(
+              diffs.map(fmt),
+              `${context}: the writer's own mutation must not disturb pre-existing field ${fmt([key, entryKey, field])}`,
+            ).toEqual([])
+          }
+          continue
+        }
+        const diffs = collectDiffPaths(entryValue, after?.[key]?.[entryKey], [key, entryKey])
+        expect(
+          diffs.map(fmt),
+          `${context}: pre-existing ${key} entry ${JSON.stringify(entryKey)} must survive the writer bit-for-bit`,
+        ).toEqual([])
+      }
+      continue
+    }
     const diffs = collectDiffPaths(before?.[key], after?.[key], [key])
     expect(diffs.map(fmt), `${context}: sentinel ${key} must survive bit-for-bit`).toEqual([])
   }
@@ -304,6 +341,8 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
       name: string
       run: () => Promise<void>
       allowed: DiffPath[]
+      /** Sentinel-map entry this writer intentionally mutates (in-run). */
+      mutates?: [string, string]
     }> = [
       {
         name: 'settings save (PATCH /api/settings)',
@@ -328,6 +367,7 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
           expect(res.status).toBe(200)
         },
         allowed: [['terminalOverrides', 'cfg01-term-rename', 'deleted']],
+        mutates: ['terminalOverrides', 'cfg01-term-rename'],
       },
       {
         name: 'session mutation (PATCH /api/sessions/:id)',
@@ -365,7 +405,11 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
       await c.run()
       const after = await readConfig(homeDir)
       expectDiffWithin(collectDiffPaths(before, after), c.allowed, c.name)
-      expectSentinelsIntact(before, after, c.name)
+      // The writer's own managed key is pinned by `allowed` (diffWithin) and by
+      // entry-containment (survival of every pre-existing entry) — exclude it
+      // from the strict bit-for-bit sentinel check only.
+      const targetedSentinels = SENTINEL_KEYS.filter((k) => c.allowed.some((a) => a[0] === k))
+      expectSentinelsIntact(before, after, c.name, [...targetedSentinels], c.mutates ? [c.mutates] : [])
       before = after
     }
 
@@ -382,7 +426,12 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
       ],
       'cumulative',
     )
-    expectSentinelsIntact(afterRestart, before, 'cumulative')
+    expectSentinelsIntact(
+      afterRestart,
+      before,
+      'cumulative',
+      ['terminalOverrides', 'sessionOverrides', 'projectColors'],
+    )
     // The server's own minted codex secret survived every writer.
     expect(before.serverSecrets?.codexDisplayIdSecret).toBe(
       afterFirstWrite.serverSecrets?.codexDisplayIdSecret,
