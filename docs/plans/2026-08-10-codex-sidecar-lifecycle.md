@@ -201,6 +201,7 @@ freshagent lane tracked in the follow-up. Only the terminal-pane path
 | `crates/freshell-ws/src/codex_proxy_route.rs` | forward captured thread id into the sidecar record (one call beside `mark_candidate_persisted`) |
 | `crates/freshell-server/src/main.rs` | boot: construct store + reconciler, arm reap sweep; shutdown: retention before `registry.kill_all()` |
 | `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs` | verify unchanged-green (it has NO terminal-pane codex assertions — reports/V4.md); optionally add a terminal-pane retention scenario with a re-scoped descendants assertion |
+| `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` | add a scriptable per-thread `thread/read` status knob (`threadStatuses`) for Task 9's sweep tests — repo-owned test fixture, not shipped code |
 
 ## Background for implementers (read before Task 1)
 
@@ -740,13 +741,19 @@ impl SidecarReconciler {
     /// Restore-time claim: re-verify identity at claim time and return ONE
     /// record for this session. With duplicates, pick the WRITER: prefer the
     /// candidate whose live sidecar reports this session in
-    /// thread/loaded/list (a bounded probe), else newest updated_at. Losers
+    /// thread/loaded/list (a bounded ws probe — duplicate arm only, ~1s per
+    /// candidate), else newest updated_at. Losers
     /// STAY held (they keep their sweep fate — never silently dropped).
     /// Retained-state records ARE claimable (re-verified; adopt flips them
     /// back to Active) — a late restore after the sweep must still reattach
     /// a mid-turn survivor instead of reproducing the -32600 (reports/V3.md).
     /// Only the returned record leaves `held`; each record is claimable ONCE.
-    pub fn claim_for_session(&self, session_id: &str) -> Option<CodexSidecarRecord>;
+    /// ASYNC because of the writer probe (Task 7's factory is async-aware and
+    /// awaits this): the 0/1-candidate fast path opens no connection; the
+    /// duplicate arm snapshots candidates OUT of the `held`/`by_session`
+    /// locks before any await (std Mutex guards must never be held across an
+    /// await point — clippy `await_holding_lock`).
+    pub async fn claim_for_session(&self, session_id: &str) -> Option<CodexSidecarRecord>;
 
     pub fn unclaimed_len(&self) -> usize;
 }
@@ -772,6 +779,10 @@ pub fn codex_sidecar_reconciler() -> Option<Arc<SidecarReconciler>>;   // RwLock
     records sharing one session id (two live test children): claim returns
     one, the OTHER remains held for the sweep (`unclaimed_len() == 1` after
     the claim), and both children are still alive (nothing signalled).
+    (`sleep` children speak no ws, so the writer probe fails fast on both
+    and the newest-`updated_at` fallback decides — deterministic and
+    bounded; the probe's positive arm is exercised by Task 9's
+    fixture-backed tests.)
 - [ ] **Step 2: Verify red:**
   `cargo test -p freshell-codex --features real-transport sidecar_reconcile`
 - [ ] **Step 3: Implement** per the interface. Removal on prune uses
@@ -929,16 +940,26 @@ EOF
 **Interface change** (quoting the current seam):
 
 ```rust
-// BEFORE (launch_lifecycle.rs:46):
+// BEFORE (launch_lifecycle.rs:98):
 pub type CodexRuntimeFactory = Box<dyn Fn() -> Arc<dyn CodexLaunchRuntime> + Send + Sync>;
-// AFTER:
-pub type CodexRuntimeFactory =
-    Box<dyn Fn(&CodexLaunchPlan) -> Arc<dyn CodexLaunchRuntime> + Send + Sync>;
+// AFTER (async-aware: the selector must await the reconciler's writer-probe
+// claim — claim_for_session is async, Task 5 — and plan_create is already
+// async, so the factory returns a boxed future):
+pub type CodexRuntimeFactory = Box<
+    dyn for<'a> Fn(&'a CodexLaunchPlan)
+            -> Pin<Box<dyn Future<Output = Arc<dyn CodexLaunchRuntime>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 ```
 
-`plan_create` (`:238-299`) moves the factory call AFTER
-`plan_codex_launch(input)` succeeds and passes `&plan`. New pure-ish selector
-(unit-testable without globals):
+(If closure-site lifetime inference gets awkward, the mechanical alternative —
+take an owned `CodexLaunchPlan` clone and return a `'static` future — is
+equally acceptable; the binding contract is only that async `plan_create`
+AWAITS the factory's future.) The factory call already sits after
+`plan_codex_launch(input)` succeeds (plan at `:306`, factory mint at `:308`);
+this task only changes the signature: pass `&plan` and `.await` the returned
+future. New pure-ish selector (unit-testable without globals):
 
 ```rust
 /// The production selection: a claimable verified survivor for the plan's
@@ -946,7 +967,7 @@ pub type CodexRuntimeFactory =
 /// only to resume plans (plan.session_id is Some ⇔ resume, launch_lifecycle.rs:169),
 /// so the A4 fresh-restore exclusion and the 45s candidate-capture timer are
 /// untouched.
-pub fn select_codex_runtime(
+pub async fn select_codex_runtime(
     reconciler: Option<&Arc<SidecarReconciler>>,
     store: Option<&Arc<CodexSidecarStore>>,
     plan: &CodexLaunchPlan,
@@ -954,8 +975,9 @@ pub fn select_codex_runtime(
 ```
 
 `CodexTerminalLaunchManager::global()` (`:584-590`) installs
-`Box::new(|plan| select_codex_runtime(codex_sidecar_reconciler().as_ref(),
-codex_sidecar_store().as_ref(), plan))`.
+`Box::new(|plan| Box::pin(async move {
+select_codex_runtime(codex_sidecar_reconciler().as_ref(),
+codex_sidecar_store().as_ref(), plan).await }))`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `select_codex_runtime_prefers_a_claimable_survivor` (unit, in
@@ -974,8 +996,11 @@ codex_sidecar_store().as_ref(), plan))`.
   implemented — stub first, then red on assertions):
   `cargo test -p freshell-codex --features real-transport select_codex_runtime`
 - [ ] **Step 3: Implement** the type change, thread `&plan` through
-  `plan_create`, fix every closure site (`Box::new(move |_plan| …)` for
-  existing fakes), implement `select_codex_runtime`, update `global()`.
+  `plan_create` and `.await` the factory's future there, fix every closure
+  site (existing fakes become
+  `Box::new(move |_plan| { let rt = fake.clone(); Box::pin(async move { rt }) })`
+  — a ready future, no behavior change), implement async
+  `select_codex_runtime`, update `global()`.
 - [ ] **Step 4: Whole-workspace compile + affected suites:**
   `cargo test -p freshell-codex --features real-transport` and
   `cargo test -p freshell-ws` (factory closures in ws tests updated;
@@ -989,9 +1014,11 @@ git add crates/freshell-codex/src crates/freshell-codex/tests crates/freshell-ws
 git commit -m "$(cat <<'EOF'
 feat(codex): plan-aware runtime factory selects reattach over spawn
 
-CodexRuntimeFactory now receives the pure launch plan; the global manager's
-factory claims a verified surviving sidecar for resume plans via the
-reconciler and mints ReattachedCodexAppServerRuntime, else the spawn runtime.
+CodexRuntimeFactory now receives the pure launch plan and returns a boxed
+future that async plan_create awaits (the claim's duplicate arm awaits a
+bounded ws writer probe); the global manager's factory claims a verified
+surviving sidecar for resume plans via the reconciler and mints
+ReattachedCodexAppServerRuntime, else the spawn runtime.
 Claim consumption makes fresh-spawn fallback structural through the existing
 plan retry loop (kata da92).
 
@@ -1098,6 +1125,8 @@ EOF
 
 **Files:**
 - Modify: `crates/freshell-codex/src/sidecar_reconcile.rs` (+ tests file)
+- Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`
+  (Step 0 adds the per-thread `threadStatuses` knob — it does NOT exist yet)
 
 **Interfaces:**
 
@@ -1136,14 +1165,22 @@ The mid-turn probe reuses the crate's own client
 connect → `initialize`/`initialized` → `thread/loaded/list` → `thread/read`
 per loaded thread, discriminating on its status (`active` vs idle). The
 fixture implements `thread/loaded/list` (`loadedThreadIds` knob,
-`tests-and-persistence.md` §1.3/§1.5); EXTEND it with a scriptable
-`thread/read` status knob (e.g. `threadStatuses: {"<id>": "active"|"idle"}`)
-if not already present — the fixture is repo-owned. Kill mechanics use
+`tests-and-persistence.md` §1.3/§1.5) but has NO per-thread status knob
+today: `thread/read` hardcodes `status: { type: 'idle' }`
+(`fake-app-server.mjs:252-259`) and the `overrides` knob is a per-method
+blanket, not per-thread. Step 0 therefore extends the repo-owned fixture
+with a scriptable `threadStatuses: {"<id>": "active"|"idle"}` config knob
+consulted by `thread/read` (absent knob/id ⇒ current idle behavior, so all
+existing fixture consumers are untouched). Kill mechanics use
 Task 6's `kill_verified_sidecar_tree` (tree-aware — A3 falsified, sidecars
 have children in their own pgids) plus the tag sweep supplement,
 `reap_owned_codex_sidecars(ownership_id)` (`transport.rs:86-121`, quoted:
 "we only signal processes carrying OUR unique tag").
 
+- [ ] **Step 0: Extend the fixture (test harness, not production code):** add
+  the `threadStatuses` knob described above to
+  `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`; sanity:
+  existing suites that drive the fixture stay green (Tasks 3/6/8 tests).
 - [ ] **Step 1: Write the failing tests** (all pids test-spawned):
   - `sweep_reaps_verified_idle_unclaimed_sidecar` — fixture with
     `{"loadedThreadIds": ["t-1"], "threadStatuses": {"t-1": "idle"}}` +
@@ -1193,7 +1230,8 @@ have children in their own pgids) plus the tag sweep supplement,
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/freshell-codex/src/sidecar_reconcile.rs crates/freshell-codex/src/sidecar_reconcile_tests.rs
+git add crates/freshell-codex/src/sidecar_reconcile.rs crates/freshell-codex/src/sidecar_reconcile_tests.rs \
+  test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs
 git commit -m "$(cat <<'EOF'
 feat(codex): conservative reap sweep — tracked, verified, never mid-turn (ynfn)
 
@@ -1206,7 +1244,8 @@ are retained, not killed; mismatched/unverifiable pids are never signalled.
 Invariant encoded in
 restart_reconciliation_leaves_no_sidecar_silently_orphaned: every tracked
 sidecar (including session-id duplicates) ends reattached, reaped, or
-retained-with-reason.
+retained-with-reason. The repo-owned fake app-server fixture gains a
+per-thread threadStatuses knob so tests can script thread/read status.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -1536,3 +1575,37 @@ snapshot-verified per pid; nothing signals unverified pids; the ~20 live
 orphans remain structurally unreachable — the store starts empty),
 (e) scope decisions recorded (Node parity + freshagent lane + SAFE-11
 deviation all carried into Task 11/PR description).
+
+## Fresh-eyes review pass (iteration 1)
+
+An independent zero-context cross-model review (log:
+`.worktrees/.the-usual-logs/codex-sidecar-lifecycle/fresheyes-plan.md`) found
+two blocking executable-spec defects, both fixed above:
+
+- **Task 9's fixture extension was unnamed.** The required `threadStatuses`
+  knob does not exist in `fake-app-server.mjs` (`thread/read` hardcodes idle
+  at `:252-259`; `overrides` is per-method, not per-thread), yet the fixture
+  file was missing from the File Structure table, Task 9's Files list, and
+  Task 9's commit — stranding the edit uncommitted and breaking Task 11
+  Step 3's binding "only files this plan names" audit. Fixed: fixture named
+  in File Structure and Task 9 Files, added as Task 9 Step 0
+  (default-idle, backward-compatible), staged in Task 9's commit, and
+  described in its commit message.
+- **`claim_for_session` sync/async impedance.** The claim's writer
+  preference requires a bounded ws probe, but the fn was spec'd sync and
+  reached through a sync factory inside async `plan_create` — no awaitable
+  path (`block_on`/`block_in_place` panic in the runtimes involved). Fixed:
+  `claim_for_session` and `select_codex_runtime` are now async, and
+  `CodexRuntimeFactory` returns a boxed future that async `plan_create`
+  awaits; fake-closure sites wrap ready futures (mechanical, no behavior
+  change); duplicate candidates are snapshotted out of the locks before any
+  await.
+
+Self-review re-run over the edited tasks (5, 7, 9): failing-test-first
+ordering intact (fixture Step 0 is harness work preceding Task 9's red
+tests; Task 7 keeps stub-first red); paths/symbols grounded (fixture
+hardcoded-idle at `fake-app-server.mjs:252-259` and factory alias at
+`launch_lifecycle.rs:98` are reviewer-verified against the worktree);
+invariant coverage unchanged (five fates incl. the duplicate loser; retained
+rows stay claimable); process-safety unchanged (no new signal paths); scope
+decisions unchanged.
