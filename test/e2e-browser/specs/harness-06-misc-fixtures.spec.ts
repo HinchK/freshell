@@ -130,20 +130,22 @@ test.describe('harness-06 misc fixtures smoke', () => {
       ])
       await page.goto(`${target.baseUrl}/ws-page?subprotocol=freshell.test`)
       await expect(page.locator('#ws-log')).toHaveAttribute('data-state', 'open')
-      await expect(page.locator('#ws-log .ws-open')).toHaveText('open:freshell.test')
+      // Log entries are located by their user-visible text (HARNESS-11
+      // convention), not by the fixture's CSS classes.
+      await expect(page.locator('#ws-log').getByText('open:freshell.test', { exact: true })).toBeVisible()
 
       // Text frame -> verbatim echo back into the DOM.
       await page.evaluate(() => {
         ;(window as unknown as { __fixtureWs: WebSocket }).__fixtureWs.send('hello-e2e ünï')
       })
-      await expect(page.locator('#ws-log .ws-message', { hasText: 'text:hello-e2e ünï' })).toBeVisible()
+      await expect(page.locator('#ws-log').getByText('text:hello-e2e ünï', { exact: true })).toBeVisible()
 
       // Binary frame -> echoed base64 into the DOM.
       const binaryB64 = Buffer.from([0x00, 0x01, 0xfe, 0xff]).toString('base64')
       await page.evaluate(() => {
         ;(window as unknown as { __fixtureWs: WebSocket }).__fixtureWs.send(new Uint8Array([0, 1, 0xfe, 0xff]))
       })
-      await expect(page.locator('#ws-log .ws-message', { hasText: `bin:${binaryB64}` })).toBeVisible()
+      await expect(page.locator('#ws-log').getByText(`bin:${binaryB64}`, { exact: true })).toBeVisible()
 
       // Server-side ledger: open (subprotocol + cookie verbatim) + both frames.
       const open = target.ledger().find((e) => e.kind === 'ws-open')
