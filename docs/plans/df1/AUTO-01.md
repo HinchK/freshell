@@ -140,6 +140,9 @@ Residual risks (accepted + recorded, none blocking):
 
 ## Tasks (TDD, commit each)
 
+ALL TASKS LANDED (see evidence `docs/plans/df1-evidence/AUTO-01.md`; task 5+6
+merged — one store in legacy, one coherent change here).
+
 1. **`layout_store.rs` core + test scaffold** — `LayoutStore { inner: Mutex<State> }`,
    `update_from_ui`, `get_normalized_snapshot`, never-fed empty shape (no `timestamp`
    key), tab-filter semantics. RED→GREEN on new unit tests in-module.
