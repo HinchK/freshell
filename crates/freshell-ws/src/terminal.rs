@@ -1134,11 +1134,27 @@ async fn handle_client_text(
             )
             .await
         }
+        // AUTO-01: the connected UI's layout mirror
+        // (`src/store/layoutMirrorMiddleware.ts`) feeds the shared
+        // `LayoutStore` (freshell-freshagent) — the port of legacy
+        // `ws-handler.ts:2025-2039`'s `layoutStore.updateFromUi(m,
+        // ws.connectionId || 'unknown')`. Last write wins; ingest replaces the
+        // whole snapshot and NEVER replies (legacy `return`s immediately).
+        // The Rust connection id is the per-server u64 counter; it is an
+        // opaque label here (legacy's `conn-*` string shape carries no
+        // meaning for the store, only identity for AUTO-14's window source
+        // tracking) and is rendered as its decimal string.
+        ClientMessage::UiLayoutSync(sync) => {
+            state
+                .fresh_opencode
+                .fresh_agent()
+                .layout_store()
+                .update_from_ui(&sync, &conn_id.to_string());
+            true
+        }
         // Deliberately inert remainder -- every arm here is unreachable from the
         // frozen client's live surface: `hello` was already consumed by the
-        // pre-loop handshake (`evaluate_hello`); `ui.layout.sync` is not consumed
-        // anywhere in this port yet (documented deferral --
-        // freshell-freshagent/src/pane_ops.rs `resize_pane`); `codingcli.*` has
+        // pre-loop handshake (`evaluate_hello`); `codingcli.*` has
         // no runtime here and the frozen client never sends it (zero senders in
         // `src/`). The user-reachable fresh-agent control frames
         // (approval.respond / question.respond / fork / compact) are answered

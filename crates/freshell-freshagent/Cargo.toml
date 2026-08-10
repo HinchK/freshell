@@ -58,6 +58,7 @@ freshell-sessions = { path = "../freshell-sessions" }
 freshell-platform = { path = "../freshell-platform" }
 # The REST router + JSON extraction.
 axum = "0.8"
+serde = { workspace = true }
 serde_json = { workspace = true }
 # `<think>`/`<thinking>` balanced-tag segmentation for opencode assistant text
 # (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, normalize.ts:100-189) needs a

@@ -144,6 +144,12 @@ export const MATRIX_SPECS = [
   // helpers/leak-metrics.test.ts. See leak-metrics.spec.ts and
   // docs/plans/df1-evidence/HARNESS-12.md.
   /leak-metrics\.spec\.ts$/,
+  // AUTO-01 — ui.layout.sync authoritative: visible-UI-driven mutations read
+  // back exactly through /api/layout/snapshot (+ raw-frame normalization
+  // leg). Legacy is a true parity control (identical LayoutStore semantics).
+  // Authored under the df1 deferred-Playwright policy; see
+  // docs/plans/df1-evidence/AUTO-01.md.
+  /layout-sync-authoritative\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project

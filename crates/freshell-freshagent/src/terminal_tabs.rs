@@ -52,8 +52,7 @@ use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
-    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
-    TerminalPaneEntry,
+    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TerminalPaneEntry,
 };
 
 /// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
@@ -230,7 +229,6 @@ async fn create_terminal_or_content_tab_with_delivery(
         return create_content_tab(
             &state,
             name,
-            "browser",
             json!({
                 "kind": "browser",
                 "url": url,
@@ -250,7 +248,6 @@ async fn create_terminal_or_content_tab_with_delivery(
         return create_content_tab(
             &state,
             name,
-            "editor",
             json!({
                 "kind": "editor",
                 "filePath": file_path,
@@ -273,7 +270,6 @@ async fn create_terminal_or_content_tab_with_delivery(
 fn create_content_tab(
     state: &FreshAgentState,
     name: Option<String>,
-    kind: &str,
     pane_content: Value,
     restore_key: Option<&str>,
     broadcast: bool,
@@ -286,20 +282,18 @@ fn create_content_tab(
         .lock()
         .expect("content_panes mutex")
         .insert(pane_id.clone(), pane_content.clone());
-    state.tabs.lock().expect("tabs mutex").insert(
-        tab_id.clone(),
-        TabRecord {
-            id: tab_id.clone(),
-            title: name.clone(),
-            pane_id: pane_id.clone(),
-            kind: kind.to_string(),
-        },
-    );
     state
         .pane_tabs
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+    // AUTO-01 write-through (legacy `layoutStore.createTab({title, browser,
+    // editor})`, `router.ts:740/793`): the cheap content kinds are complete at
+    // this point, so the legacy create-THEN-attach two-step lands as one
+    // create with the final content.
+    state
+        .layout_store()
+        .create_tab(&tab_id, &pane_id, name.clone(), pane_content.clone());
     let command = ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(json!({
@@ -2116,9 +2110,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 }
 
 /// `POST /api/tabs` terminal-mode path (`router.ts:695-793`'s `else` branch):
-/// mint a fresh `{tabId,paneId}`, spawn via [`spawn_terminal_pane`], record the
-/// `TabRecord`, and broadcast `ui.command{tab.create}` with the legacy-exact
-/// payload keys.
+/// mint a fresh `{tabId,paneId}`, spawn via [`spawn_terminal_pane`], write the
+/// tab through to the authoritative layout store (AUTO-01), and broadcast
+/// `ui.command{tab.create}` with the legacy-exact payload keys.
 async fn create_terminal_tab(
     state: &FreshAgentState,
     name: Option<String>,
@@ -2145,15 +2139,15 @@ async fn create_terminal_tab(
         cwd,
     } = spawned;
 
-    state.tabs.lock().expect("tabs mutex").insert(
-        tab_id.clone(),
-        TabRecord {
-            id: tab_id.clone(),
-            title: name.clone(),
-            pane_id: pane_id.clone(),
-            kind: "terminal".to_string(),
-        },
-    );
+    // AUTO-01 write-through (legacy `layoutStore.createTab({title})` +
+    // `attachPaneContent(tabId, paneId, paneContent)`, `router.ts:740/773`):
+    // written AFTER the spawn succeeds, so a failed spawn leaves no visible
+    // row — no rollback needed, unlike legacy's create-first shape whose
+    // `catch` must `closeTab` (`router.ts:822-824`, the documented
+    // mid-spawn read-window difference).
+    state
+        .layout_store()
+        .create_tab(&tab_id, &pane_id, name.clone(), pane_content.clone());
     // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
     // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
     // `sessionRef` (whichever `paneContent` carries -- mutually exclusive,
@@ -2236,11 +2230,13 @@ async fn create_terminal_tab(
 
 // ── GET /api/tabs ───────────────────────────────────────────────────────────
 
-/// `GET /api/tabs` (`router.ts:879-883`): `{tabs, activeTabId}`. Reduced shape
-/// vs. the legacy `layoutStore.listTabs()` row (no split/layout tree -- this
-/// port keeps no server-side layout store, see `rename_pane`'s doc comment in
-/// `lib.rs` for the established precedent) -- sufficient for MCP target
-/// resolution (`resolveTabTarget` only needs `id`/`title`).
+/// `GET /api/tabs` (`router.ts:879-883`): `{tabs, activeTabId}`. AUTO-01:
+/// answered from the authoritative layout store — legacy-exact
+/// `layoutStore.listTabs()` rows `{id, title (falling back to id), activePaneId}`
+/// in real UI tab order, and the REAL `getActiveTabId()` (the pre-AUTO-01
+/// shadow map was unordered and hard-coded `activeTabId: null`). The legacy
+/// row shape is the one the MCP `resolveTabTarget` consumes
+/// (`freshell-tool.ts`).
 pub(crate) async fn list_tabs(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -2248,35 +2244,33 @@ pub(crate) async fn list_tabs(
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    let tabs: Vec<Value> = state
-        .tabs
-        .lock()
-        .expect("tabs mutex")
-        .values()
-        .map(|t| json!({ "id": t.id, "title": t.title, "paneId": t.pane_id, "kind": t.kind }))
+    let store = state.layout_store();
+    // ListedTab serializes legacy-exactly (a missing activePaneId is OMITTED,
+    // never a null key — JSON.stringify drops `undefined`).
+    let tabs: Vec<Value> = store
+        .list_tabs()
+        .iter()
+        .map(|t| serde_json::to_value(t).expect("ListedTab serializes"))
         .collect();
-    ok_json(json!({ "tabs": tabs, "activeTabId": Value::Null }), "")
+    let active_tab_id = store.active_tab_id();
+    ok_json(json!({ "tabs": tabs, "activeTabId": active_tab_id }), "")
 }
 
-/// `GET /api/panes` (`router.ts:898-902`): `{panes}`, optionally filtered by
-/// `?tabId=`. Added post-hoc (proof round in `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
-/// \u00a76.2/\u00a78.3): the legacy Node MCP binary's `resolvePaneTarget`/`fetchPanes`
-/// (`freshell-tool.js:130-136`) calls this to resolve a bare pane-id target
-/// before `send-keys`/`capture-pane`/`wait-for` -- WITHOUT it, every MCP action
-/// past `new-tab` 404s inside the MCP client's own target resolution, even
-/// though the underlying REST routes work fine when hit directly (proven by
-/// the direct-REST e2e round trip). Each row carries `id`/`tabId`/`title`/
-/// `kind`/`terminalId` -- the fields `resolvePaneTarget` and `handleDisplay`
-/// read (`freshell-tool.js:151-207`).
-/// `GET /api/panes` (`router.ts:898-902`): iterates the [`FreshAgentState::pane_tabs`]
-/// reverse index (NOT `state.tabs`) so every pane ANY pane-minting path has ever
-/// registered is listed -- including `pane_ops::split_pane` panes, which have no
-/// `TabRecord` of their own (a tab can now own more than one pane; `TabRecord` still
-/// only carries the tab's ORIGINAL pane for `GET /api/tabs`'s reduced row shape). Falls
-/// back to the owning tab's title (no independent per-pane title is tracked at this
-/// slice, matching `rename_pane`'s documented reduced fidelity) and resolves `kind`/
-/// `terminalId` from whichever per-kind map (`terminal_panes`/`content_panes`/
-/// fresh-agent `panes`) actually holds the pane.
+/// `GET /api/panes` (`router.ts:898-902`): `{panes}`, from the authoritative
+/// layout store (AUTO-01) — legacy `layoutStore.listPanes(tabId?)` semantics:
+/// the tab resolves as `?tabId || activeTabId || tabs[0].id` and the rows are
+/// the tab's leaves IN TREE ORDER with `{id, index, kind?, terminalId?,
+/// title?}` (titles are the seeded/user-set pane titles). The additive
+/// `tabId` field the pre-AUTO-01 surface added for the MCP bridge is KEPT
+/// (one deviation on an otherwise legacy-exact row).
+///
+/// This route exists (post-hoc, `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
+/// \u00a76.2/\u00a78.3) because the legacy Node MCP binary's
+/// `resolvePaneTarget`/`fetchPanes` (`freshell-tool.js:130-136`) resolves a
+/// bare pane-id target via `GET /api/panes` BEFORE calling
+/// send-keys/capture/wait-for -- WITHOUT it, every MCP action past `new-tab`
+/// 404s inside the MCP client's own resolution, even though the underlying
+/// REST routes work fine when hit directly.
 pub(crate) async fn list_panes(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -2286,44 +2280,19 @@ pub(crate) async fn list_panes(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let tab_filter = params.get("tabId");
-    let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex").clone();
-    let tabs = state.tabs.lock().expect("tabs mutex").clone();
-    let terminal_panes = state
-        .terminal_panes
-        .lock()
-        .expect("terminal_panes mutex")
-        .clone();
-    let content_panes = state
-        .content_panes
-        .lock()
-        .expect("content_panes mutex")
-        .clone();
-    let panes: Vec<Value> = pane_tabs
-        .iter()
-        .filter(|(_, tab_id)| tab_filter.is_none_or(|tid| tid == *tab_id))
-        .map(|(pane_id, tab_id)| {
-            let title = tabs.get(tab_id).and_then(|t| t.title.clone());
-            let (kind, terminal_id) = if let Some(tp) = terminal_panes.get(pane_id) {
-                ("terminal".to_string(), Some(tp.terminal_id.clone()))
-            } else if let Some(content) = content_panes.get(pane_id) {
-                (
-                    content
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    None,
-                )
-            } else {
-                ("fresh-agent".to_string(), None)
-            };
-            json!({
-                "id": pane_id,
-                "tabId": tab_id,
-                "title": title,
-                "kind": kind,
-                "terminalId": terminal_id,
-            })
+    let panes: Vec<Value> = state
+        .layout_store()
+        .list_panes(tab_filter.map(String::as_str))
+        .into_iter()
+        .map(|p| {
+            let tab_id = p.tab_id.clone();
+            // ListedPane serializes the legacy row exactly: `undefined`-valued
+            // fields are OMITTED (JSON.stringify semantics), never null keys.
+            let mut row = serde_json::to_value(p).expect("ListedPane serializes");
+            row.as_object_mut()
+                .expect("row object")
+                .insert("tabId".to_string(), Value::from(tab_id));
+            row
         })
         .collect();
     ok_json(json!({ "panes": panes }), "")
@@ -3042,7 +3011,7 @@ mod tests {
         .await;
         assert_ne!(status, StatusCode::OK, "a bad cwd must fail the spawn");
         assert!(
-            state.tabs.lock().unwrap().is_empty(),
+            state.layout_store().list_tabs().is_empty(),
             "no tab record left behind on failure"
         );
         assert!(
@@ -3146,32 +3115,114 @@ mod tests {
         assert_eq!(panes[0]["kind"], json!("terminal"));
     }
 
+    /// AUTO-01: rows are the legacy `layoutStore.listTabs()` shape exactly —
+    /// `{id, title (id fallback), activePaneId}` in creation order — and
+    /// `activeTabId` is the REAL active tab (REST create activates its tab,
+    /// legacy `createTab` parity). The pre-AUTO-01 additive `paneId`/`kind`
+    /// fields and the hard-coded `activeTabId: null` are gone.
     #[tokio::test]
-    async fn get_tabs_lists_every_created_tab_kind() {
+    async fn get_tabs_lists_created_tabs_in_order_with_real_active_tab() {
         let state = state_with_registry();
         let router = app(state.clone());
-        let _ = post(
+        let (_, first) = post(
             router.clone(),
             "/api/tabs",
             json!({ "mode": "shell" }),
             true,
         )
         .await;
-        let _ = post(
+        let first_tab = first["data"]["tabId"].as_str().unwrap().to_string();
+        let first_pane = first["data"]["paneId"].as_str().unwrap().to_string();
+        let (_, second) = post(
             router.clone(),
             "/api/tabs",
-            json!({ "browser": "https://example.com" }),
+            json!({ "browser": "https://example.com", "name": "Docs" }),
             true,
         )
         .await;
+        let second_tab = second["data"]["tabId"].as_str().unwrap().to_string();
+        let second_pane = second["data"]["paneId"].as_str().unwrap().to_string();
 
         let (status, body) = get(router, "/api/tabs", true).await;
         assert_eq!(status, StatusCode::OK);
-        let tabs = body["data"]["tabs"].as_array().expect("tabs array");
-        assert_eq!(tabs.len(), 2);
-        let kinds: Vec<&str> = tabs.iter().map(|t| t["kind"].as_str().unwrap()).collect();
-        assert!(kinds.contains(&"terminal"));
-        assert!(kinds.contains(&"browser"));
+        assert_eq!(
+            body["data"],
+            json!({
+                "tabs": [
+                    { "id": first_tab, "title": first_tab, "activePaneId": first_pane },
+                    { "id": second_tab, "title": "Docs", "activePaneId": second_pane },
+                ],
+                "activeTabId": second_tab,
+            })
+        );
+    }
+
+    /// AUTO-01: `GET /api/panes` answers from the authoritative layout store —
+    /// tree-order leaves of the RESOLVED tab (`?tabId || activeTabId ||
+    /// tabs[0]`, legacy `listPanes`), seeded titles, plus the additive `tabId`.
+    #[tokio::test]
+    async fn get_panes_resolves_tabs_like_legacy_and_lists_tree_order() {
+        let state = state_with_registry();
+        state.layout_store().update_from_ui(
+            &freshell_protocol::UiLayoutSync {
+                tabs: serde_json::from_value(json!([
+                    { "id": "tab_a", "title": "alpha" },
+                    { "id": "tab_b" },
+                ]))
+                .expect("tabs"),
+                layouts: json!({
+                    "tab_a": {
+                        "type": "split",
+                        "id": "split_a",
+                        "direction": "horizontal",
+                        "sizes": [50, 50],
+                        "children": [
+                            { "type": "leaf", "id": "pane_a1", "content": { "kind": "editor", "filePath": "/tmp/a1.txt" } },
+                            { "type": "split", "id": "split_a2", "direction": "vertical", "sizes": [50, 50], "children": [
+                                { "type": "leaf", "id": "pane_a2", "content": { "kind": "terminal", "terminalId": "term_a2", "mode": "codex" } },
+                                { "type": "leaf", "id": "pane_a3", "content": { "kind": "browser", "url": "https://a3.example.com", "devToolsOpen": false } },
+                            ] },
+                        ],
+                    },
+                    "tab_b": { "type": "leaf", "id": "pane_b1", "content": { "kind": "terminal", "terminalId": "term_b1" } },
+                }),
+                active_pane: serde_json::from_value(json!({ "tab_a": "pane_a2", "tab_b": "pane_b1" }))
+                    .expect("active_pane"),
+                timestamp: 5_i64,
+                active_tab_id: Some(Some("tab_b".to_string())),
+                pane_title_set_by_user: None,
+                pane_titles: None,
+            },
+            "conn-test",
+        );
+        let router = app(state);
+
+        // Explicit filter: tab_a in tree order with derived titles.
+        let (status, body) = get(router.clone(), "/api/panes?tabId=tab_a", true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"]["panes"],
+            // `terminalId` keys are OMITTED when absent (legacy JSON.stringify
+            // drops undefined values — never a null key).
+            json!([
+                { "id": "pane_a1", "index": 0, "kind": "editor", "title": "a1.txt", "tabId": "tab_a" },
+                { "id": "pane_a2", "index": 1, "kind": "terminal", "terminalId": "term_a2", "title": "Codex CLI", "tabId": "tab_a" },
+                { "id": "pane_a3", "index": 2, "kind": "browser", "title": "a3.example.com", "tabId": "tab_a" },
+            ])
+        );
+
+        // No filter: the ACTIVE tab (tab_b) only — legacy resolution.
+        let (_, body) = get(router.clone(), "/api/panes", true).await;
+        assert_eq!(
+            body["data"]["panes"],
+            json!([
+                { "id": "pane_b1", "index": 0, "kind": "terminal", "terminalId": "term_b1", "title": "Shell", "tabId": "tab_b" },
+            ])
+        );
+
+        // Unknown filter: empty (legacy `layouts[resolved]` miss).
+        let (_, body) = get(router, "/api/panes?tabId=nope", true).await;
+        assert_eq!(body["data"]["panes"], json!([]));
     }
 
     // ── terminal send-keys / capture / wait-for (real PTY round trip) ──────
