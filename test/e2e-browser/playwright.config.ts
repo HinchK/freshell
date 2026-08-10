@@ -41,6 +41,13 @@ export const MATRIX_SPECS = [
   /browser-pane\.spec\.ts$/,
   /multi-client\.spec\.ts$/,
   /session-directory-matrix\.spec\.ts$/,
+  // SESSION-16 — malformed/partial provider-data tolerance: quarantine classes never
+  // render, tolerated classes (valid-prefix truncation, invalid UTF-8) do, and a
+  // completed partial record lands as exactly one live addition. Runs against BOTH
+  // server kinds (legacy is the behavioral control — incl. the amplifier legs, wired
+  // since the provider exists on this base). Deferred-policy probe spec; see
+  // docs/plans/df1-evidence/SESSION-16.md for the per-leg probe classification.
+  /session-malformed-data\.spec\.ts$/,
   // Bulletproof-restore acceptance suite: terminal reload/restart, FreshCodex
   // reload (no new session minted), historical session open (pane title +
   // non-blank content), and mid-life exit surfacing. Restore is a core
