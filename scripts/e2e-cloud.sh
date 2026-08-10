@@ -349,7 +349,19 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
-  gcloud beta run jobs executions logs read $(gcloud_flags) "$GCP_JOB" "$@"
+  # `logs read` takes an EXECUTION name, not the job name — resolve the
+  # latest execution exactly like cmd_run does before fetching its logs.
+  local execution_id
+  execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
+    --job="$GCP_JOB" \
+    --sort-by="~metadata.creationTimestamp" \
+    --format="value(name)" \
+    --limit=1)
+  if [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] No executions found for job $GCP_JOB" >&2
+    exit 1
+  fi
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" "$@"
 }
 
 # ---------------------------------------------------------------------------
