@@ -8,6 +8,7 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
+import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -43,6 +44,7 @@ function createTestStore() {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      tabRegistry: tabRegistryReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -120,6 +122,39 @@ function simulateTouch(
   })
   target.dispatchEvent(touchEvent)
   return touchEvent
+}
+
+function seedRemoteCardRecord(store: ReturnType<typeof createTestStore>) {
+  store.dispatch(setTabRegistrySnapshot({
+    localOpen: [],
+    remoteOpen: [{
+      tabKey: 'remote:open-1',
+      tabId: 'open-1',
+      serverInstanceId: 'srv-remote',
+      deviceId: 'remote-device',
+      deviceLabel: 'Remote Device',
+      tabName: 'remote open',
+      status: 'open',
+      revision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [],
+    }],
+    closed: [],
+  }))
+}
+
+function simulateNativeContextMenu(target: Element, clientX = 100, clientY = 100) {
+  const event = new MouseEvent('contextmenu', {
+    bubbles: true,
+    cancelable: true,
+    clientX,
+    clientY,
+  })
+  target.dispatchEvent(event)
+  return event
 }
 
 describe('ContextMenuProvider long-press', () => {
@@ -409,5 +444,212 @@ describe('ContextMenuProvider long-press', () => {
     })
 
     expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('keeps the menu open when a native contextmenu wins the long-press race (Android)', () => {
+    const { store } = renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+
+    // Android fires a real (trusted) contextmenu event mid-gesture,
+    // BEFORE our 500ms JS timer fires.
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    act(() => {
+      simulateNativeContextMenu(target, 100, 100)
+    })
+
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // Finger lifts. On click-synthesizing engines (iOS-like; Chromium-Android
+    // does not synthesize one after a native contextmenu) an unsuppressed
+    // release becomes a click at (100,100) -- exactly where the menu's
+    // top-left (first item) now sits.
+    const firstItem = screen.getAllByRole('menuitem')[0]
+    act(() => {
+      const release = simulateTouch('touchend', firstItem, 100, 100)
+      if (!release.defaultPrevented) {
+        firstItem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+    })
+
+    // Any menu-item click also closes the menu, so "menu still open" proves
+    // no item action fired.
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(store.getState().tabs.tabs).toHaveLength(2)
+  })
+
+  it('cancels the pending long-press timer when a native contextmenu opens the menu mid-gesture', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    act(() => {
+      simulateNativeContextMenu(target, 100, 100)
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // The custom long-press timer must have been cancelled: its callback is
+    // the only code path that calls document.elementFromPoint.
+    elementFromPointMock.mockClear()
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('ignores a native contextmenu that arrives after the long-press timer already opened the menu', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    const menu = screen.getByRole('menu')
+    expect(menu.style.left).toBe('100px')
+
+    // Some Android browsers fire contextmenu AFTER the 500ms threshold --
+    // i.e. after our timer already opened the menu for this same gesture.
+    // Re-opening would jump the menu position and corrupt focus restore.
+    act(() => {
+      simulateNativeContextMenu(target, 300, 300)
+    })
+
+    const menuAfter = screen.getByRole('menu')
+    expect(menuAfter).toBeInTheDocument()
+    expect(menuAfter.style.left).toBe('100px')
+  })
+
+  it('opens the menu at the touch-session position when the native contextmenu reports drifted coords', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    // Mid-gesture native contextmenu with coordinates that drifted away from
+    // the touch start (some engines report offset/degenerate coords). The
+    // unified handler must prefer the live touch-session position.
+    act(() => {
+      simulateNativeContextMenu(target, 300, 300)
+    })
+
+    const menu = screen.getByRole('menu')
+    expect(menu.style.left).toBe('100px')
+  })
+
+  it('long-press opens the tabs-card menu and suppresses the card click', () => {
+    const onCardClick = vi.fn()
+    const { store } = renderWithProvider(
+      <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1" onClick={onCardClick}>
+        remote card
+      </button>
+    )
+    act(() => {
+      seedRemoteCardRecord(store)
+    })
+
+    const target = screen.getByText('remote card')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
+
+    act(() => {
+      const release = simulateTouch('touchend', target, 100, 100)
+      if (!release.defaultPrevented) {
+        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+    })
+
+    // The card is a <button> with onClick -- suppression must prevent the
+    // synthetic click from both closing the menu AND pulling the tab.
+    expect(onCardClick).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('keeps the tabs-card menu open when a native contextmenu wins the race (Android)', () => {
+    const onCardClick = vi.fn()
+    const { store } = renderWithProvider(
+      <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1" onClick={onCardClick}>
+        remote card
+      </button>
+    )
+    act(() => {
+      seedRemoteCardRecord(store)
+    })
+
+    const target = screen.getByText('remote card')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    act(() => {
+      simulateNativeContextMenu(target, 100, 100)
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    const firstItem = screen.getAllByRole('menuitem')[0]
+    act(() => {
+      const release = simulateTouch('touchend', firstItem, 100, 100)
+      if (!release.defaultPrevented) {
+        firstItem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+    })
+
+    expect(onCardClick).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 })
