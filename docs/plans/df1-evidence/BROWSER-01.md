@@ -38,6 +38,14 @@ Per-leg probe outcomes (pw lease, one probe per leg + confirmation):
 - **legacy-chromium:** PASS ×2 (1.1m cold incl. client build; 30.4s warm) — true parity control, identical assertions green on legacy.
 - **rust-chromium:** run 1 FAIL — cold-start artifact: the release-profile `freshell-server` build (`ensureRustServerBuilt`) exceeded the per-test window on first touch (same documented cold-run pattern as SAFE-01's annotation); runs 2–3 PASS (35.4s, 29.2s) with the current-branch binary. Classified environmental, not a spec/product failure.
 
+## Review loop (2 rounds; Task-tool subagent unavailable in this environment → recorded structured fresh-eyes self-review fallback per dispatch)
+
+- **Round 1 (product diff):** one finding — `[P3, pre-existing]` reqwest's builder defaults to system-proxy autodetection (`HTTP_PROXY`/`HTTPS_PROXY`), which could shunt the always-loopback upstream through an env proxy; legacy Node's `http.request` never consults env proxies. **Fixed:** `.no_proxy()` on the client builder (+comment), commit `review round 1`. No P0/P1/P2 findings in the G1–G4 diff.
+- **Round 2 (test harness + spec):** one finding — the black-box test could orphan the spawned `freshell-server` on a panicking assert (std `Child` doesn't kill on drop). **Fixed:** kill-on-drop `ChildGuard`, commit `review round 2`. Spec + MATRIX registration + tsconfig gate reviewed clean.
+- Loop closed: no remaining serious findings.
+
+**Final verification at head `32301f6de`:** cargo proxy 24/24 · black-box 1/1 (×2 consecutive incl. earlier runs) · clippy 0 warnings · `cargo fmt --check` clean · spec-attributed tsc errors 0 · control vitest 209/209 · PW legacy PASS (30.3s) · PW rust PASS (55.4s, warm binary).
+
 ## What this item does NOT cover (owned by siblings)
 
 - `BROWSER-02` WS-upgrade proxying (legacy `attachProxyUpgradeHandler`, `proxy-router.ts:144–219`) — separate item, untouched.
