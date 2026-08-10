@@ -4,6 +4,11 @@
 //! automation surface reads and mutates. Pure model: no axum, no broadcasts;
 //! Tasks 13-16 wire this into the REST routes and `ui.layout.sync` handling.
 //!
+//! INTENTIONAL DIVERGENCE from Node: this port keeps one snapshot PER client
+//! connection instead of Node's single last-writer-wins snapshot, so pane/tab
+//! ids from EVERY connected client resolve (see [`LayoutInner`]). Node retains
+//! the single-snapshot behavior.
+//!
 //! The legacy fresh-agent content migration (`normalizeLayouts` /
 //! `normalizePaneContentSnapshot`, `layout-store.ts:29-38`) is ported from
 //! `shared/fresh-agent.ts:199-360` + `shared/session-contract.ts:34-62` at the
@@ -50,10 +55,67 @@ pub struct UiSnapshot {
     pub timestamp: Option<i64>,
 }
 
+/// One connected client's mirrored snapshot.
+struct ClientEntry {
+    key: String,
+    snapshot: UiSnapshot,
+}
+
+/// Snapshot key for server-side bootstrap mutations (`create_tab` on an empty
+/// store). Evicted on the first real client sync — mirroring the old
+/// wholesale-replace semantics, where a client's `ui.layout.sync` superseded
+/// server-created state.
+const SERVER_CLIENT_KEY: &str = "__server__";
+
+/// INTENTIONAL DIVERGENCE from Node (`layout-store.ts:44-46`): Node keeps ONE
+/// shared snapshot, wholesale-replaced by whichever client synced last
+/// (last-writer-wins). But pane/tab ids are client-local (`nanoid()` per
+/// browser/device), so any client that was not the last writer got
+/// `pane not found` from every by-id agent-API operation. This port keeps one
+/// snapshot PER client connection instead:
+///
+/// - default/active-tab reads answer from the PRIMARY (most recently synced)
+///   snapshot only — identical to Node with a single client connected;
+/// - by-id lookups search the primary first, then the other clients
+///   most-recent-first;
+/// - mutations land in EVERY client snapshot containing the id (same-origin
+///   windows share localStorage and therefore ids);
+/// - a client's snapshot is evicted when its WS connection closes.
 #[derive(Default)]
 struct LayoutInner {
-    snapshot: Option<UiSnapshot>,
-    source_connection_id: Option<String>,
+    /// Most-recent-first: index 0 is the PRIMARY (last writer).
+    clients: Vec<ClientEntry>,
+}
+
+impl LayoutInner {
+    fn primary(&self) -> Option<&UiSnapshot> {
+        self.clients.first().map(|entry| &entry.snapshot)
+    }
+
+    fn primary_mut(&mut self) -> Option<&mut UiSnapshot> {
+        self.clients.first_mut().map(|entry| &mut entry.snapshot)
+    }
+
+    /// All client snapshots, primary first, then most-recent-first.
+    fn snapshots(&self) -> impl Iterator<Item = &UiSnapshot> {
+        self.clients.iter().map(|entry| &entry.snapshot)
+    }
+
+    fn snapshots_mut(&mut self) -> impl Iterator<Item = &mut UiSnapshot> {
+        self.clients.iter_mut().map(|entry| &mut entry.snapshot)
+    }
+
+    /// `ensureSnapshot` (`layout-store.ts:212-217`) for server-side
+    /// bootstraps: the primary snapshot, or a fresh server-owned one.
+    fn ensure_primary(&mut self) -> &mut UiSnapshot {
+        if self.clients.is_empty() {
+            self.clients.push(ClientEntry {
+                key: SERVER_CLIENT_KEY.to_string(),
+                snapshot: UiSnapshot::default(),
+            });
+        }
+        &mut self.clients[0].snapshot
+    }
 }
 
 /// Shared, cheaply-cloneable layout store (`LayoutStore`, `layout-store.ts:48`).
@@ -123,13 +185,19 @@ impl LayoutStore {
         self.inner.lock().expect("layout store mutex")
     }
 
-    /// Clone of the current snapshot for read-only walkers (target resolver).
-    pub(crate) fn snapshot_clone(&self) -> Option<UiSnapshot> {
-        self.lock().snapshot.clone()
+    /// Clones of every client snapshot — primary first, then most-recent-first
+    /// — for read-only walkers (target resolver).
+    pub(crate) fn snapshots_clone(&self) -> Vec<UiSnapshot> {
+        self.lock()
+            .clients
+            .iter()
+            .map(|entry| entry.snapshot.clone())
+            .collect()
     }
 
-    /// REPLACES the snapshot; runs the legacy fresh-agent migration on every
-    /// layout node, then seeds a derived title per leaf
+    /// REPLACES this client's snapshot (multi-client store; see
+    /// [`LayoutInner`]) and makes it the primary; runs the legacy fresh-agent
+    /// migration on every layout node, then seeds a derived title per leaf
     /// (`updateFromUi`, `layout-store.ts:169-181`).
     pub fn update_from_ui(
         &self,
@@ -176,16 +244,31 @@ impl LayoutStore {
             }
         }
         let mut inner = self.lock();
-        inner.snapshot = Some(snapshot);
-        inner.source_connection_id = Some(source_connection_id.to_string());
+        // Re-sync replaces this client's own snapshot; a real client sync also
+        // supersedes the server bootstrap entry (old wholesale-replace parity).
+        inner
+            .clients
+            .retain(|entry| entry.key != source_connection_id && entry.key != SERVER_CLIENT_KEY);
+        inner.clients.insert(
+            0,
+            ClientEntry {
+                key: source_connection_id.to_string(),
+                snapshot,
+            },
+        );
     }
 
     pub fn has_snapshot(&self) -> bool {
-        self.lock().snapshot.is_some()
+        !self.lock().clients.is_empty()
     }
 
+    /// The PRIMARY (most recently synced) client's connection id.
     pub fn source_connection_id(&self) -> Option<String> {
-        self.lock().source_connection_id.clone()
+        self.lock()
+            .clients
+            .first()
+            .map(|entry| entry.key.clone())
+            .filter(|key| key != SERVER_CLIENT_KEY)
     }
 
     /// Exact Node keys: `tabs`/`activeTabId`/`layouts`/`activePane`/`paneTitles`/
@@ -193,7 +276,7 @@ impl LayoutStore {
     /// (`getNormalizedSnapshot`, `layout-store.ts:44-46, 191-210`).
     pub fn get_normalized_snapshot(&self, tab_id: Option<&str>) -> Value {
         let inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_ref() else {
+        let Some(snapshot) = inner.primary() else {
             return json!({
                 "tabs": [],
                 "layouts": {},
@@ -254,7 +337,7 @@ impl LayoutStore {
     /// (`listTabs`, `layout-store.ts:327-334`; `getActiveTabId`, `:187-189`).
     pub fn list_tabs(&self) -> (Vec<Value>, Option<String>) {
         let inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_ref() else {
+        let Some(snapshot) = inner.primary() else {
             return (Vec::new(), None);
         };
         let rows = snapshot
@@ -283,19 +366,20 @@ impl LayoutStore {
         )
     }
 
-    /// Matches by tab id OR title (`hasTab`, `layout-store.ts:336-339`).
+    /// Matches by tab id OR title (`hasTab`, `layout-store.ts:336-339`),
+    /// against ANY client snapshot (by-id/title resolution).
     pub fn has_tab(&self, target: &str) -> bool {
         let inner = self.lock();
-        inner
-            .snapshot
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .tabs
-                    .iter()
-                    .any(|t| t.id == target || t.title.as_deref() == Some(target))
-            })
-            .unwrap_or(false)
+        for snapshot in inner.snapshots() {
+            if snapshot
+                .tabs
+                .iter()
+                .any(|t| t.id == target || t.title.as_deref() == Some(target))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// `ensureSnapshot` + append an ordered tab with a single terminal leaf and
@@ -306,7 +390,7 @@ impl LayoutStore {
         // `buildContent({})` (`layout-store.ts:317-325`): a detached terminal pane.
         let content = json!({ "kind": "terminal" });
         let mut inner = self.lock();
-        let snapshot = inner.snapshot.get_or_insert_with(UiSnapshot::default);
+        let snapshot = inner.ensure_primary();
         snapshot.tabs.push(TabRow {
             id: tab_id.clone(),
             title: title.map(str::to_string),
@@ -326,35 +410,50 @@ impl LayoutStore {
     }
 
     /// Purges layouts/activePane/title maps (`closeTab`, `layout-store.ts:577-587`
-    /// + `removeTabMetadata`, `:87-91`).
+    /// + `removeTabMetadata`, `:87-91`) in EVERY client snapshot containing
+    /// the tab.
     pub fn close_tab(&self, tab_id: &str) -> RenameOutcome {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
-        };
-        let before = snapshot.tabs.len();
-        snapshot.tabs.retain(|t| t.id != tab_id);
-        if snapshot.tabs.len() == before {
-            return RenameOutcome::failed("tab not found");
         }
-        snapshot.layouts.remove(tab_id);
-        snapshot.active_pane.remove(tab_id);
-        snapshot.pane_titles.remove(tab_id);
-        snapshot.pane_title_set_by_user.remove(tab_id);
-        snapshot.active_tab_id = snapshot.tabs.first().map(|t| t.id.clone());
-        RenameOutcome::tab(tab_id)
+        let mut found = false;
+        for snapshot in inner.snapshots_mut() {
+            let before = snapshot.tabs.len();
+            snapshot.tabs.retain(|t| t.id != tab_id);
+            if snapshot.tabs.len() == before {
+                continue;
+            }
+            snapshot.layouts.remove(tab_id);
+            snapshot.active_pane.remove(tab_id);
+            snapshot.pane_titles.remove(tab_id);
+            snapshot.pane_title_set_by_user.remove(tab_id);
+            snapshot.active_tab_id = snapshot.tabs.first().map(|t| t.id.clone());
+            found = true;
+        }
+        if found {
+            RenameOutcome::tab(tab_id)
+        } else {
+            RenameOutcome::failed("tab not found")
+        }
     }
 
-    /// `ensureSnapshot`; sets the active tab when it exists
+    /// Sets the active tab in every client snapshot that has it
     /// (`selectTab`, `layout-store.ts:518-524`).
     pub fn select_tab(&self, tab_id: &str) -> RenameOutcome {
         let mut inner = self.lock();
-        let snapshot = inner.snapshot.get_or_insert_with(UiSnapshot::default);
-        if !snapshot.tabs.iter().any(|t| t.id == tab_id) {
-            return RenameOutcome::failed("tab not found");
+        let mut found = false;
+        for snapshot in inner.snapshots_mut() {
+            if snapshot.tabs.iter().any(|t| t.id == tab_id) {
+                snapshot.active_tab_id = Some(tab_id.to_string());
+                found = true;
+            }
         }
-        snapshot.active_tab_id = Some(tab_id.to_string());
-        RenameOutcome::tab(tab_id)
+        if found {
+            RenameOutcome::tab(tab_id)
+        } else {
+            RenameOutcome::failed("tab not found")
+        }
     }
 
     /// Ordered cycle modulo len (`selectNextTab`, `layout-store.ts:589-596`).
@@ -375,7 +474,7 @@ impl LayoutStore {
 
     fn cycle_tab(&self, pick: impl Fn(Option<usize>, usize) -> usize) -> Option<String> {
         let mut inner = self.lock();
-        let snapshot = inner.snapshot.as_mut()?;
+        let snapshot = inner.primary_mut()?;
         if snapshot.tabs.is_empty() {
             return None;
         }
@@ -389,57 +488,91 @@ impl LayoutStore {
     }
 
     /// Sets the tab title; single-pane tabs mirror it into the pane title maps
-    /// as sticky (`renameTab`, `layout-store.ts:542-556`).
+    /// as sticky (`renameTab`, `layout-store.ts:542-556`). Lands in EVERY
+    /// client snapshot containing the tab.
     pub fn rename_tab(&self, tab_id: &str, title: &str) -> RenameOutcome {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
-        };
-        let Some(index) = snapshot.tabs.iter().position(|t| t.id == tab_id) else {
-            return RenameOutcome::failed("tab not found");
-        };
-        snapshot.tabs[index].title = Some(title.to_string());
-        // Node guard is `if (singlePaneId && title)` — empty titles don't mirror.
-        if !title.is_empty() {
-            if let Some(pane_id) = single_pane_id(snapshot, tab_id) {
-                set_sticky_title(snapshot, tab_id, &pane_id, title);
-            }
         }
-        RenameOutcome::tab(tab_id)
+        let mut found = false;
+        for snapshot in inner.snapshots_mut() {
+            let Some(index) = snapshot.tabs.iter().position(|t| t.id == tab_id) else {
+                continue;
+            };
+            snapshot.tabs[index].title = Some(title.to_string());
+            // Node guard is `if (singlePaneId && title)` — empty titles don't mirror.
+            if !title.is_empty() {
+                if let Some(pane_id) = single_pane_id(snapshot, tab_id) {
+                    set_sticky_title(snapshot, tab_id, &pane_id, title);
+                }
+            }
+            found = true;
+        }
+        if found {
+            RenameOutcome::tab(tab_id)
+        } else {
+            RenameOutcome::failed("tab not found")
+        }
     }
 
     /// Sets the pane title sticky; single-pane tabs mirror it onto the tab
-    /// title (`renamePane`, `layout-store.ts:558-575`).
+    /// title (`renamePane`, `layout-store.ts:558-575`). Lands in EVERY client
+    /// snapshot containing the pane (two same-origin windows share
+    /// localStorage and therefore pane ids); the reported `tabId` comes from
+    /// the first (most-recent) match.
     pub fn rename_pane(&self, pane_id: &str, title: &str) -> RenameOutcome {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
-        };
-        let Some(tab_id) = find_pane_tab(snapshot, pane_id) else {
-            return RenameOutcome::failed("pane not found");
-        };
-        set_sticky_title(snapshot, &tab_id, pane_id, title);
-        if single_pane_id(snapshot, &tab_id).as_deref() == Some(pane_id) {
-            if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
-                tab.title = Some(title.to_string());
-            }
         }
-        RenameOutcome::tab_pane(&tab_id, pane_id)
+        let mut first: Option<String> = None;
+        for snapshot in inner.snapshots_mut() {
+            let Some(tab_id) = find_pane_tab(snapshot, pane_id) else {
+                continue;
+            };
+            set_sticky_title(snapshot, &tab_id, pane_id, title);
+            if single_pane_id(snapshot, &tab_id).as_deref() == Some(pane_id) {
+                if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.title = Some(title.to_string());
+                }
+            }
+            first.get_or_insert(tab_id);
+        }
+        match first {
+            Some(tab_id) => RenameOutcome::tab_pane(&tab_id, pane_id),
+            None => RenameOutcome::failed("pane not found"),
+        }
     }
 
-    /// Default tab = active then first (`listPanes`, `layout-store.ts:341-355`).
+    /// Default tab = active then first, answered from the PRIMARY snapshot
+    /// (`listPanes`, `layout-store.ts:341-355`); an EXPLICIT tab id resolves
+    /// against the first client snapshot that knows it (multi-client store),
+    /// falling back to the primary (empty rows) when none does.
     pub fn list_panes(&self, tab_id: Option<&str>) -> Result<Vec<PaneRow>, &'static str> {
         let inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_ref() else {
+        let Some(primary) = inner.primary() else {
             return Err("no layout snapshot");
         };
-        let resolved = tab_id
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .or_else(|| snapshot.active_tab_id.clone().filter(|t| !t.is_empty()))
-            .or_else(|| snapshot.tabs.first().map(|t| t.id.clone()));
-        let Some(resolved) = resolved else {
-            return Ok(Vec::new());
+        let (snapshot, resolved) = match tab_id.filter(|t| !t.is_empty()) {
+            Some(target) => (
+                inner
+                    .snapshots()
+                    .find(|s| s.tabs.iter().any(|tab| tab.id == target))
+                    .unwrap_or(primary),
+                target.to_string(),
+            ),
+            None => {
+                let resolved = primary
+                    .active_tab_id
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| primary.tabs.first().map(|t| t.id.clone()));
+                let Some(resolved) = resolved else {
+                    return Ok(Vec::new());
+                };
+                (primary, resolved)
+            }
         };
         Ok(leaves_of(snapshot, &resolved)
             .into_iter()
@@ -458,70 +591,92 @@ impl LayoutStore {
             .collect())
     }
 
-    /// (`getPaneSnapshot`, `layout-store.ts:379-397`.)
+    /// (`getPaneSnapshot`, `layout-store.ts:379-397`.) Resolves against the
+    /// first client snapshot (primary first, then most-recent-first) that
+    /// contains the pane.
     pub fn get_pane_snapshot(&self, pane_id: &str) -> Option<PaneSnapshot> {
         let inner = self.lock();
-        let snapshot = inner.snapshot.as_ref()?;
-        let tab_id = find_pane_tab(snapshot, pane_id)?;
-        let content = match snapshot.layouts.get(&tab_id)?.find_leaf(pane_id)? {
-            PaneNode::Leaf { content, .. } => content.clone(),
-            PaneNode::Split { .. } => return None,
-        };
-        Some(PaneSnapshot {
-            tab_id,
-            pane_id: pane_id.to_string(),
-            kind: string_field(&content, "kind"),
-            terminal_id: string_field(&content, "terminalId"),
-            pane_content: (!content.is_null()).then_some(content),
-        })
+        for snapshot in inner.snapshots() {
+            let Some(tab_id) = find_pane_tab(snapshot, pane_id) else {
+                continue;
+            };
+            let Some(leaf) = snapshot
+                .layouts
+                .get(&tab_id)
+                .and_then(|root| root.find_leaf(pane_id))
+            else {
+                continue;
+            };
+            let content = match leaf {
+                PaneNode::Leaf { content, .. } => content.clone(),
+                PaneNode::Split { .. } => continue,
+            };
+            return Some(PaneSnapshot {
+                tab_id,
+                pane_id: pane_id.to_string(),
+                kind: string_field(&content, "kind"),
+                terminal_id: string_field(&content, "terminalId"),
+                pane_content: (!content.is_null()).then_some(content),
+            });
+        }
+        None
     }
 
     /// Binary split 50/50; the new pane becomes active and gets a seeded title
-    /// (`splitPane`, `layout-store.ts:462-499`).
+    /// (`splitPane`, `layout-store.ts:462-499`). Applied (with the SAME new
+    /// ids) to every client snapshot containing the source pane; the reported
+    /// tab comes from the first (most-recent) match.
     pub fn split_pane(
         &self,
         pane_id: &str,
         direction: &str,
     ) -> Result<(String, String), &'static str> {
         let mut inner = self.lock();
-        let snapshot = inner.snapshot.get_or_insert_with(UiSnapshot::default);
-        let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
-        for tab_id in tab_ids {
-            let existing_content = match snapshot
-                .layouts
-                .get(&tab_id)
-                .and_then(|root| root.find_leaf(pane_id))
-            {
-                Some(PaneNode::Leaf { content, .. }) => content.clone(),
-                _ => continue,
-            };
-            let new_pane_id = Uuid::new_v4().to_string();
-            let new_content = json!({ "kind": "terminal" });
-            let split = PaneNode::Split {
-                id: Uuid::new_v4().to_string(),
-                direction: direction.to_string(),
-                sizes: [50.0, 50.0],
-                children: Box::new([
-                    PaneNode::Leaf {
-                        id: pane_id.to_string(),
-                        content: existing_content,
-                    },
-                    PaneNode::Leaf {
-                        id: new_pane_id.clone(),
-                        content: new_content.clone(),
-                    },
-                ]),
-            };
-            let root = snapshot.layouts.get_mut(&tab_id).expect("root exists");
-            if replace_node(root, pane_id, &split) {
-                snapshot
-                    .active_pane
-                    .insert(tab_id.clone(), new_pane_id.clone());
-                seed_pane_title(snapshot, &tab_id, &new_pane_id, &new_content);
-                return Ok((tab_id, new_pane_id));
+        let new_pane_id = Uuid::new_v4().to_string();
+        let split_node_id = Uuid::new_v4().to_string();
+        let new_content = json!({ "kind": "terminal" });
+        let mut first: Option<String> = None;
+        for snapshot in inner.snapshots_mut() {
+            let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
+            for tab_id in tab_ids {
+                let existing_content = match snapshot
+                    .layouts
+                    .get(&tab_id)
+                    .and_then(|root| root.find_leaf(pane_id))
+                {
+                    Some(PaneNode::Leaf { content, .. }) => content.clone(),
+                    _ => continue,
+                };
+                let split = PaneNode::Split {
+                    id: split_node_id.clone(),
+                    direction: direction.to_string(),
+                    sizes: [50.0, 50.0],
+                    children: Box::new([
+                        PaneNode::Leaf {
+                            id: pane_id.to_string(),
+                            content: existing_content,
+                        },
+                        PaneNode::Leaf {
+                            id: new_pane_id.clone(),
+                            content: new_content.clone(),
+                        },
+                    ]),
+                };
+                let root = snapshot.layouts.get_mut(&tab_id).expect("root exists");
+                if replace_node(root, pane_id, &split) {
+                    snapshot
+                        .active_pane
+                        .insert(tab_id.clone(), new_pane_id.clone());
+                    seed_pane_title(snapshot, &tab_id, &new_pane_id, &new_content);
+                    first.get_or_insert(tab_id);
+                    break;
+                }
             }
         }
-        Err("pane not found")
+        match first {
+            Some(tab_id) => Ok((tab_id, new_pane_id)),
+            None => Err("pane not found"),
+        }
     }
 
     /// Re-seeds the derived title (non-sticky). Runs the legacy content
@@ -533,88 +688,94 @@ impl LayoutStore {
         content: Value,
     ) -> RenameOutcome {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
-        };
+        }
         let normalized = migrate_legacy_fresh_agent_content(&content);
-        let Some(root) = snapshot.layouts.get_mut(tab_id) else {
-            return RenameOutcome::failed("tab not found");
-        };
-        // Node's recursive update is a no-op for an absent pane but still
-        // reports `{tabId, paneId}` — mirrored here (return value ignored).
-        root.replace_leaf_content(pane_id, normalized.clone());
-        seed_pane_title(snapshot, tab_id, pane_id, &normalized);
-        RenameOutcome::tab_pane(tab_id, pane_id)
+        let mut found = false;
+        for snapshot in inner.snapshots_mut() {
+            let Some(root) = snapshot.layouts.get_mut(tab_id) else {
+                continue;
+            };
+            // Node's recursive update is a no-op for an absent pane but still
+            // reports `{tabId, paneId}` — mirrored here (return value ignored).
+            root.replace_leaf_content(pane_id, normalized.clone());
+            seed_pane_title(snapshot, tab_id, pane_id, &normalized);
+            found = true;
+        }
+        if found {
+            RenameOutcome::tab_pane(tab_id, pane_id)
+        } else {
+            RenameOutcome::failed("tab not found")
+        }
     }
 
     /// Pure tree mutation — never kills PTYs (`closePane`, `layout-store.ts:501-516`).
+    /// Applied to every client snapshot containing the pane; the FIRST
+    /// (most-recent) match is authoritative for the returned result, and an
+    /// error there leaves every other snapshot untouched.
     pub fn close_pane(&self, pane_id: &str) -> Result<String, &'static str> {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return Err("no layout snapshot");
-        };
-        let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
-        for tab_id in tab_ids {
-            let Some(root) = snapshot.layouts.get(&tab_id) else {
-                continue;
-            };
-            let mut leaves = Vec::new();
-            root.collect_leaves(&mut leaves);
-            let total = leaves.len();
-            let remaining: Vec<PaneNode> = leaves
-                .into_iter()
-                .filter(|leaf| !matches!(leaf, PaneNode::Leaf { id, .. } if id == pane_id))
-                .cloned()
-                .collect();
-            if remaining.len() == total {
-                continue;
-            }
-            if remaining.is_empty() {
-                return Err("cannot close only pane");
-            }
-            let last_id = match remaining.last() {
-                Some(PaneNode::Leaf { id, .. }) => id.clone(),
-                _ => return Err("pane not found"),
-            };
-            let rebuilt = build_grid_layout(remaining);
-            snapshot.layouts.insert(tab_id.clone(), rebuilt);
-            snapshot.active_pane.insert(tab_id.clone(), last_id);
-            remove_pane_metadata(snapshot, &tab_id, pane_id);
-            return Ok(tab_id);
         }
-        Err("pane not found")
+        let mut first: Option<Result<String, &'static str>> = None;
+        for snapshot in inner.snapshots_mut() {
+            let Some(result) = close_pane_in(snapshot, pane_id) else {
+                continue;
+            };
+            let refused = result.is_err();
+            if first.is_none() {
+                first = Some(result);
+                if refused {
+                    break;
+                }
+            }
+        }
+        first.unwrap_or(Err("pane not found"))
     }
 
-    /// (`selectPane`, `layout-store.ts:526-540`.)
+    /// (`selectPane`, `layout-store.ts:526-540`.) Applied to every client
+    /// snapshot where the target resolves; the reported tab comes from the
+    /// first (most-recent) match.
     pub fn select_pane(
         &self,
         tab_id: Option<&str>,
         pane_id: &str,
     ) -> Result<(String, String), &'static str> {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return Err("no layout snapshot");
-        };
-        let tab_exists = tab_id
-            .map(|t| snapshot.tabs.iter().any(|tab| tab.id == t))
-            .unwrap_or(false);
-        let target = if tab_exists {
-            tab_id.map(str::to_string)
-        } else {
-            find_pane_tab(snapshot, pane_id)
-        };
-        let Some(target) = target else {
-            return Err("pane not found");
-        };
-        snapshot
-            .active_pane
-            .insert(target.clone(), pane_id.to_string());
-        snapshot.active_tab_id = Some(target.clone());
-        Ok((target, pane_id.to_string()))
+        }
+        let mut first: Option<String> = None;
+        for snapshot in inner.snapshots_mut() {
+            let tab_exists = tab_id
+                .map(|t| snapshot.tabs.iter().any(|tab| tab.id == t))
+                .unwrap_or(false);
+            let target = if tab_exists {
+                tab_id.map(str::to_string)
+            } else {
+                find_pane_tab(snapshot, pane_id)
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            snapshot
+                .active_pane
+                .insert(target.clone(), pane_id.to_string());
+            snapshot.active_tab_id = Some(target.clone());
+            first.get_or_insert(target);
+        }
+        match first {
+            Some(target) => Ok((target, pane_id.to_string())),
+            None => Err("pane not found"),
+        }
     }
 
     /// Swaps content AND both title-map entries
-    /// (`swapPane`, `layout-store.ts:609-654`).
+    /// (`swapPane`, `layout-store.ts:609-654`). Applied to every client
+    /// snapshot holding BOTH panes in one tab; the reported tab comes from
+    /// the first (most-recent) match.
     pub fn swap_pane(
         &self,
         tab_id: Option<&str>,
@@ -622,9 +783,9 @@ impl LayoutStore {
         other_id: &str,
     ) -> Result<String, &'static str> {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
+        if inner.clients.is_empty() {
             return Err("no layout snapshot");
-        };
+        }
         let has_both = |snapshot: &UiSnapshot, tab: &str| {
             snapshot
                 .layouts
@@ -632,40 +793,44 @@ impl LayoutStore {
                 .map(|root| root.find_leaf(pane_id).is_some() && root.find_leaf(other_id).is_some())
                 .unwrap_or(false)
         };
-        let target = match tab_id.filter(|t| !t.is_empty()) {
-            Some(t) => Some(t.to_string()),
-            None => snapshot
-                .tabs
-                .iter()
-                .map(|t| t.id.clone())
-                .find(|t| has_both(snapshot, t)),
-        };
-        let Some(target) = target else {
-            return Err("panes not found");
-        };
-        if !has_both(snapshot, &target) {
-            return Err("panes not found");
+        let mut first: Option<String> = None;
+        for snapshot in inner.snapshots_mut() {
+            let target = match tab_id.filter(|t| !t.is_empty()) {
+                Some(t) => Some(t.to_string()),
+                None => snapshot
+                    .tabs
+                    .iter()
+                    .map(|t| t.id.clone())
+                    .find(|t| has_both(snapshot, t)),
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            if !has_both(snapshot, &target) {
+                continue;
+            }
+            let root = snapshot.layouts.get(&target).expect("checked above");
+            let content_a = match root.find_leaf(pane_id) {
+                Some(PaneNode::Leaf { content, .. }) => content.clone(),
+                _ => continue,
+            };
+            let content_b = match root.find_leaf(other_id) {
+                Some(PaneNode::Leaf { content, .. }) => content.clone(),
+                _ => continue,
+            };
+            let root = snapshot.layouts.get_mut(&target).expect("checked above");
+            root.replace_leaf_content(pane_id, content_b);
+            root.replace_leaf_content(other_id, content_a);
+            swap_map_entries(&mut snapshot.pane_titles, &target, pane_id, other_id);
+            swap_map_entries(
+                &mut snapshot.pane_title_set_by_user,
+                &target,
+                pane_id,
+                other_id,
+            );
+            first.get_or_insert(target);
         }
-        let root = snapshot.layouts.get(&target).expect("checked above");
-        let content_a = match root.find_leaf(pane_id) {
-            Some(PaneNode::Leaf { content, .. }) => content.clone(),
-            _ => return Err("panes not found"),
-        };
-        let content_b = match root.find_leaf(other_id) {
-            Some(PaneNode::Leaf { content, .. }) => content.clone(),
-            _ => return Err("panes not found"),
-        };
-        let root = snapshot.layouts.get_mut(&target).expect("checked above");
-        root.replace_leaf_content(pane_id, content_b);
-        root.replace_leaf_content(other_id, content_a);
-        swap_map_entries(&mut snapshot.pane_titles, &target, pane_id, other_id);
-        swap_map_entries(
-            &mut snapshot.pane_title_set_by_user,
-            &target,
-            pane_id,
-            other_id,
-        );
-        Ok(target)
+        first.ok_or("panes not found")
     }
 
     /// splitId-first, then pane -> parent split; returns the split's CURRENT
@@ -678,7 +843,7 @@ impl LayoutStore {
     ) -> Result<(String, String, [f64; 2]), &'static str> {
         {
             let inner = self.lock();
-            if let Some(snapshot) = inner.snapshot.as_ref() {
+            for snapshot in inner.snapshots() {
                 let candidates: Vec<String> = match tab_id {
                     Some(t) => vec![t.to_string()],
                     None => snapshot.tabs.iter().map(|t| t.id.clone()).collect(),
@@ -698,8 +863,9 @@ impl LayoutStore {
         match resolve_target(self, raw) {
             ResolvedTarget::Pane { pane_id, .. } => {
                 let inner = self.lock();
-                if let Some(snapshot) = inner.snapshot.as_ref() {
-                    // `findSplitForPane` (`layout-store.ts:399-407`): all tabs.
+                // `findSplitForPane` (`layout-store.ts:399-407`): all tabs,
+                // across every client snapshot (primary first).
+                for snapshot in inner.snapshots() {
                     for tab in &snapshot.tabs {
                         let Some(root) = snapshot.layouts.get(&tab.id) else {
                             continue;
@@ -723,20 +889,45 @@ impl LayoutStore {
     /// known tab.)
     pub fn resize_split(&self, tab_id: &str, split_id: &str, sizes: [f64; 2]) -> bool {
         let mut inner = self.lock();
-        let Some(snapshot) = inner.snapshot.as_mut() else {
-            return false;
-        };
-        snapshot
-            .layouts
-            .get_mut(tab_id)
-            .map(|root| root.set_split_sizes(split_id, sizes))
-            .unwrap_or(false)
+        let mut any = false;
+        for snapshot in inner.snapshots_mut() {
+            if let Some(root) = snapshot.layouts.get_mut(tab_id) {
+                any |= root.set_split_sizes(split_id, sizes);
+            }
+        }
+        any
     }
 
-    /// Root is a leaf (`getSinglePaneId`, `layout-store.ts:247-251`).
+    /// Root is a leaf (`getSinglePaneId`, `layout-store.ts:247-251`),
+    /// answered by the first client snapshot that knows the tab.
     pub fn get_single_pane_id(&self, tab_id: &str) -> Option<String> {
         let inner = self.lock();
-        single_pane_id(inner.snapshot.as_ref()?, tab_id)
+        for snapshot in inner.snapshots() {
+            if snapshot.layouts.contains_key(tab_id) {
+                return single_pane_id(snapshot, tab_id);
+            }
+        }
+        None
+    }
+
+    /// Drops the snapshot owned by `client_key` (WS disconnect eviction). The
+    /// primary falls back to the most recently synced remaining client.
+    pub fn remove_client(&self, client_key: &str) {
+        self.lock().clients.retain(|entry| entry.key != client_key);
+    }
+
+    /// Whether the tab holding `pane_id` has exactly one pane — the
+    /// `tabRenamed` check of `PATCH /api/panes/:id` (`router.ts:1414-1415`),
+    /// answered from the snapshot where the pane actually resolves (NOT the
+    /// primary's same-id tab, which may have a different shape).
+    pub fn pane_is_sole_in_tab(&self, pane_id: &str) -> bool {
+        let inner = self.lock();
+        for snapshot in inner.snapshots() {
+            if let Some(tab_id) = find_pane_tab(snapshot, pane_id) {
+                return leaves_of(snapshot, &tab_id).len() == 1;
+            }
+        }
+        false
     }
 }
 
@@ -844,6 +1035,41 @@ fn leaves_of(snapshot: &UiSnapshot, tab_id: &str) -> Vec<(String, Value)> {
             PaneNode::Split { .. } => None,
         })
         .collect()
+}
+
+/// `closePane` (`layout-store.ts:501-516`) against ONE snapshot: `None` when
+/// no tab of this snapshot contains the pane; mutates only on `Ok`.
+fn close_pane_in(snapshot: &mut UiSnapshot, pane_id: &str) -> Option<Result<String, &'static str>> {
+    let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
+    for tab_id in tab_ids {
+        let Some(root) = snapshot.layouts.get(&tab_id) else {
+            continue;
+        };
+        let mut leaves = Vec::new();
+        root.collect_leaves(&mut leaves);
+        let total = leaves.len();
+        let remaining: Vec<PaneNode> = leaves
+            .into_iter()
+            .filter(|leaf| !matches!(leaf, PaneNode::Leaf { id, .. } if id == pane_id))
+            .cloned()
+            .collect();
+        if remaining.len() == total {
+            continue;
+        }
+        if remaining.is_empty() {
+            return Some(Err("cannot close only pane"));
+        }
+        let last_id = match remaining.last() {
+            Some(PaneNode::Leaf { id, .. }) => id.clone(),
+            _ => return Some(Err("pane not found")),
+        };
+        let rebuilt = build_grid_layout(remaining);
+        snapshot.layouts.insert(tab_id.clone(), rebuilt);
+        snapshot.active_pane.insert(tab_id.clone(), last_id);
+        remove_pane_metadata(snapshot, &tab_id, pane_id);
+        return Some(Ok(tab_id));
+    }
+    None
 }
 
 fn find_pane_tab(snapshot: &UiSnapshot, pane_id: &str) -> Option<String> {

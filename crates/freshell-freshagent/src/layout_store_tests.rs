@@ -644,6 +644,202 @@ fn split_pane_select_pane_and_attach_content_reseed_derived_titles() {
     );
 }
 
+// ── multi-client snapshots (the pane-rename cross-client fix) ──────────────
+//
+// Pane/tab ids are client-local (`nanoid()` per browser/device), so the store
+// keeps one snapshot PER client connection. By-id resolution searches the
+// PRIMARY (last-writer) snapshot first, then the other clients most-recent
+// first; default/active-tab reads stay primary-only (single-client parity).
+// This intentionally diverges from Node's single shared snapshot
+// (`layout-store.ts:44-46`), whose last-writer-wins replace made any
+// non-last-writer client's rename fail with `pane not found`.
+
+/// One tab/one pane sync payload for a distinct simulated client.
+fn client_sync(tab_id: &str, tab_title: &str, pane_id: &str, ts: i64) -> UiLayoutSync {
+    sync_from(json!({
+        "tabs": [{ "id": tab_id, "title": tab_title }],
+        "activeTabId": tab_id,
+        "layouts": { tab_id: leaf(pane_id, json!({ "kind": "terminal", "terminalId": format!("term-{pane_id}") })) },
+        "activePane": { tab_id: pane_id },
+        "timestamp": ts,
+    }))
+}
+
+#[test]
+fn rename_pane_resolves_ids_from_any_client_snapshot() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&client_sync("tA", "Desktop", "pA", 1), "conn-a");
+    store.update_from_ui(&client_sync("tB", "Phone", "pB", 2), "conn-b"); // last writer
+
+    // THE BUG: a pane from the non-last-writer client must still resolve.
+    let out = store.rename_pane("pA", "Renamed A");
+    assert_eq!(
+        out.message, None,
+        "pane from a non-primary client snapshot must resolve"
+    );
+    assert_eq!(out.tab_id.as_deref(), Some("tA"));
+    assert_eq!(out.pane_id.as_deref(), Some("pA"));
+
+    // The last writer keeps working too.
+    let out = store.rename_pane("pB", "Renamed B");
+    assert_eq!(out.message, None);
+    assert_eq!(out.tab_id.as_deref(), Some("tB"));
+
+    // Default reads stay primary-only: the last writer's view.
+    let (rows, active) = store.list_tabs();
+    assert_eq!(rows.len(), 1, "list_tabs reads the PRIMARY snapshot only");
+    assert_eq!(rows[0]["id"], json!("tB"));
+    assert_eq!(active.as_deref(), Some("tB"));
+}
+
+#[test]
+fn by_id_reads_and_mutations_resolve_across_clients() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&client_sync("tA", "Desktop", "pA", 1), "conn-a");
+    store.update_from_ui(&client_sync("tB", "Phone", "pB", 2), "conn-b"); // primary
+
+    // Reads by id.
+    let snap = store.get_pane_snapshot("pA").expect("pA resolves via conn-a");
+    assert_eq!(snap.tab_id, "tA");
+    assert_eq!(snap.terminal_id.as_deref(), Some("term-pA"));
+    let rows = store.list_panes(Some("tA")).expect("panes list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "pA");
+    assert!(store.has_tab("tA"));
+    assert!(store.has_tab("Desktop"));
+    assert_eq!(
+        resolve_target(&store, "pA"),
+        ResolvedTarget::Pane {
+            tab_id: "tA".to_string(),
+            pane_id: "pA".to_string(),
+            message: None,
+        }
+    );
+
+    // Mutations by id.
+    let (tab, new_pane) = store.split_pane("pA", "vertical").expect("split resolves");
+    assert_eq!(tab, "tA");
+    assert_eq!(store.close_pane(&new_pane), Ok("tA".to_string()));
+    assert_eq!(
+        store.select_pane(None, "pA"),
+        Ok(("tA".to_string(), "pA".to_string()))
+    );
+    assert_eq!(store.rename_tab("tA", "Desk 2").message, None);
+
+    // Primary reads still answer from the last writer.
+    let (rows, _) = store.list_tabs();
+    assert_eq!(rows[0]["id"], json!("tB"));
+}
+
+#[test]
+fn rename_pane_updates_every_client_snapshot_containing_the_id() {
+    let store = LayoutStore::default();
+    // Two same-origin browser windows share localStorage => identical ids.
+    store.update_from_ui(&client_sync("t1", "Shared", "p1", 1), "conn-a");
+    store.update_from_ui(&client_sync("t1", "Shared", "p1", 2), "conn-b");
+
+    store.rename_pane("p1", "Both");
+
+    // Visible via the primary (conn-b)…
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["paneTitles"]["t1"]["p1"], json!("Both"));
+    // …and STILL visible after the primary disconnects, because conn-a's copy
+    // was renamed too (multi-hit mutation).
+    store.remove_client("conn-b");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(
+        snap["paneTitles"]["t1"]["p1"],
+        json!("Both"),
+        "rename must land in every client snapshot containing the id"
+    );
+    assert_eq!(snap["paneTitleSetByUser"]["t1"]["p1"], json!(true));
+}
+
+#[test]
+fn remove_client_evicts_and_primary_falls_back_to_most_recent_remaining() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&client_sync("tA", "Desktop", "pA", 1), "conn-a");
+    store.update_from_ui(&client_sync("tB", "Phone", "pB", 2), "conn-b");
+
+    store.remove_client("conn-b");
+
+    // Primary falls back to the most recent remaining client (conn-a).
+    let (rows, active) = store.list_tabs();
+    assert_eq!(rows.len(), 1, "conn-a's snapshot survives conn-b's eviction");
+    assert_eq!(rows[0]["id"], json!("tA"));
+    assert_eq!(active.as_deref(), Some("tA"));
+    // conn-b's panes no longer resolve.
+    assert_eq!(store.rename_pane("pB", "X").message, Some("pane not found"));
+    assert!(store.get_pane_snapshot("pB").is_none());
+
+    // Evicting the last client empties the store (Node-parity message).
+    store.remove_client("conn-a");
+    assert!(!store.has_snapshot());
+    assert_eq!(
+        store.rename_pane("pA", "X").message,
+        Some("no layout snapshot")
+    );
+}
+
+#[test]
+fn sole_pane_check_uses_the_snapshot_where_the_pane_resolves() {
+    let terminal = json!({ "kind": "terminal" });
+    let store = LayoutStore::default();
+    // conn-a: tab T is a two-pane split (p1, p2).
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "T", "title": "Shared" }],
+            "activeTabId": "T",
+            "layouts": { "T": split(
+                "s1", "horizontal", [50, 50],
+                leaf("p1", terminal.clone()),
+                leaf("p2", terminal.clone()),
+            ) },
+            "activePane": { "T": "p1" },
+            "timestamp": 1,
+        })),
+        "conn-a",
+    );
+    // conn-b (primary): the SAME tab id, but a single pane pB.
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "T", "title": "Shared" }],
+            "activeTabId": "T",
+            "layouts": { "T": leaf("pB", terminal) },
+            "activePane": { "T": "pB" },
+            "timestamp": 2,
+        })),
+        "conn-b",
+    );
+
+    assert!(store.pane_is_sole_in_tab("pB"));
+    assert!(
+        !store.pane_is_sole_in_tab("p1"),
+        "p1 resolves in conn-a where tab T has TWO panes; the primary's \
+         same-id single-pane tab must not answer for it"
+    );
+    assert!(!store.pane_is_sole_in_tab("missing"));
+}
+
+#[test]
+fn update_from_ui_still_replaces_the_same_clients_snapshot() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&client_sync("t1", "One", "p1", 1), "conn-a");
+    store.update_from_ui(&client_sync("t2", "Two", "p2", 2), "conn-a");
+
+    // Same client re-sync REPLACES its own snapshot (single-client parity
+    // with Node's wholesale replace, `layout-store.ts:169-181`).
+    assert_eq!(
+        store.rename_pane("p1", "X").message,
+        Some("pane not found"),
+        "the same client's earlier snapshot must not linger"
+    );
+    assert_eq!(store.rename_pane("p2", "X").message, None);
+    let (rows, _) = store.list_tabs();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], json!("t2"));
+}
+
 #[test]
 fn update_from_ui_migrates_legacy_agent_chat_and_fresh_agent_content() {
     const CANONICAL: &str = "123e4567-e89b-42d3-a456-426614174000";

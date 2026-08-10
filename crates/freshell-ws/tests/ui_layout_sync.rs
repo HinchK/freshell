@@ -2,10 +2,14 @@
 //!
 //! A REAL `/ws` connection (the `session_identity_frames.rs` harness
 //! convention) sends the client's layout mirror frame; the socket loop's
-//! `ClientMessage::UiLayoutSync` dispatch arm must REPLACE the shared
+//! `ClientMessage::UiLayoutSync` dispatch arm must REPLACE that CONNECTION'S
 //! server-side `LayoutStore` snapshot (`update_from_ui`) -- the port of the
 //! dedicated `case 'ui.layout.sync'` arm's `this.layoutStore.updateFromUi(m,
 //! ws.connectionId || 'unknown')` (`server/ws-handler.ts:1966-1969`).
+//! Intentional divergence: the store keeps one snapshot PER connection
+//! (Node keeps a single last-writer-wins snapshot), so by-id agent-API
+//! operations resolve pane/tab ids from EVERY connected client, and a
+//! connection's snapshot is evicted when it closes.
 //!
 //! No reply frame exists (Node sends none), so a `ping`/`pong` round-trip on
 //! the SAME connection is the ordering barrier: the serve loop dispatches
@@ -44,16 +48,26 @@ fn test_settings_value() -> serde_json::Value {
     })
 }
 
-/// Real axum server on an ephemeral loopback port. Returns the ws URL plus
-/// the SAME `LayoutStore` handle cloned into `WsState::layout` (the store is
-/// `Arc`-backed, so asserting on this handle observes the socket path's
-/// ingestion).
-async fn spawn_server() -> (String, LayoutStore) {
+/// Real axum server on an ephemeral loopback port. Returns the ws URL, the
+/// http base URL (the fresh-agent REST router is merged in, sharing the SAME
+/// layout store — the `freshell-server` wiring), plus the `LayoutStore`
+/// handle cloned into `WsState::layout` (the store is `Arc`-backed, so
+/// asserting on this handle observes the socket path's ingestion).
+async fn spawn_server() -> (String, String, LayoutStore) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let layout = LayoutStore::default();
+
+    // The REST agent surface (`PATCH /api/panes/:id` etc.) sharing the same
+    // layout store, exactly like `freshell-server/src/main.rs`'s wiring.
+    let rest_state = freshell_freshagent::FreshAgentState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+    )
+    .with_layout(layout.clone());
+    let rest_router = freshell_freshagent::router(rest_state);
 
     let state = WsState {
         layout: layout.clone(),
@@ -104,7 +118,7 @@ async fn spawn_server() -> (String, LayoutStore) {
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state).merge(rest_router);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -113,7 +127,11 @@ async fn spawn_server() -> (String, LayoutStore) {
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws", addr = addr), layout)
+    (
+        format!("ws://{addr}/ws", addr = addr),
+        format!("http://{addr}", addr = addr),
+        layout,
+    )
 }
 
 type TestWs =
@@ -169,7 +187,7 @@ async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value 
 /// (the `pong` barrier proves dispatch completed).
 #[tokio::test]
 async fn ui_layout_sync_frame_populates_the_shared_layout_store() {
-    let (url, layout) = spawn_server().await;
+    let (url, _http, layout) = spawn_server().await;
     let mut ws = connect_and_hello(&url).await;
     assert!(
         !layout.has_snapshot(),
@@ -218,4 +236,98 @@ async fn ui_layout_sync_frame_populates_the_shared_layout_store() {
         layout.source_connection_id().is_some(),
         "ingestion must stamp the source connection id"
     );
+}
+
+/// Send one `ui.layout.sync` frame (single tab/pane) on an open connection and
+/// barrier on ping/pong so ingestion is proven complete.
+async fn sync_single_pane(ws: &mut TestWs, tab_id: &str, pane_id: &str, ts: i64) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "ui.layout.sync",
+            "tabs": [{"id": tab_id, "title": format!("Tab {tab_id}")}],
+            "activeTabId": tab_id,
+            "layouts": {tab_id: {"type": "leaf", "id": pane_id, "content": {
+                "kind": "terminal", "mode": "shell",
+                "createRequestId": format!("r-{pane_id}"), "status": "running"
+            }}},
+            "activePane": {tab_id: pane_id},
+            "paneTitles": {},
+            "paneTitleSetByUser": {},
+            "timestamp": ts
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send ui.layout.sync");
+    ws.send(WsMessage::Text(
+        serde_json::json!({ "type": "ping" }).to_string(),
+    ))
+    .await
+    .expect("send ping");
+    next_frame_of_type(ws, "pong").await;
+}
+
+/// Multi-client layout store (the cross-client pane-rename fix): two REAL WS
+/// connections sync DIFFERENT layouts (pane/tab ids are client-local); the
+/// REST agent surface must resolve pane ids from the NON-last-writer
+/// connection, and closing a connection must evict its snapshot. This
+/// intentionally diverges from Node's single last-writer-wins snapshot
+/// (`server/agent-api/layout-store.ts`).
+#[tokio::test]
+async fn two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_evicts() {
+    let (url, http, layout) = spawn_server().await;
+
+    let mut ws1 = connect_and_hello(&url).await;
+    sync_single_pane(&mut ws1, "t1", "p1", 100).await;
+    let mut ws2 = connect_and_hello(&url).await;
+    sync_single_pane(&mut ws2, "t2", "p2", 200).await; // ws2 = last writer
+
+    // REST rename of ws1's pane (the NON-last-writer) must succeed.
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!("{http}/api/panes/p1"))
+        .header("x-auth-token", AUTH_TOKEN)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "name": "Cross Client" }).to_string())
+        .send()
+        .await
+        .expect("PATCH /api/panes/p1");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("body")).expect("json body");
+    assert_eq!(
+        body["data"]["tabId"],
+        serde_json::json!("t1"),
+        "pane id from the non-last-writer connection must resolve: {body}"
+    );
+    assert_eq!(body["data"]["paneId"], serde_json::json!("p1"));
+
+    // Primary (default) reads still answer from the last writer.
+    let (tabs, active) = layout.list_tabs();
+    assert_eq!(tabs.len(), 1, "list_tabs reads the primary snapshot only");
+    assert_eq!(tabs[0]["id"], serde_json::json!("t2"));
+    assert_eq!(active.as_deref(), Some("t2"));
+
+    // Closing ws1 evicts its snapshot (poll: disconnect handling is async).
+    ws1.close(None).await.expect("close ws1");
+    drop(ws1);
+    let mut evicted = false;
+    for _ in 0..100u8 {
+        if layout.get_pane_snapshot("p1").is_none() {
+            evicted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(evicted, "disconnect must evict the closed client's snapshot");
+    assert_eq!(
+        layout.rename_pane("p1", "X").message,
+        Some("pane not found"),
+        "evicted panes no longer resolve"
+    );
+
+    // The surviving connection keeps working.
+    assert!(layout.get_pane_snapshot("p2").is_some());
+    let (tabs, _) = layout.list_tabs();
+    assert_eq!(tabs[0]["id"], serde_json::json!("t2"));
 }

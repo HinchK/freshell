@@ -1738,7 +1738,9 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
 ///    (`'pane not found'` / `'no layout snapshot'`, `router.ts:1411`+`:1423`);
 /// 4. on success, the best-effort syncable-terminal cascade
 ///    ([`rename_persistence::persist_syncable_terminal_rename`]);
-/// 5. `tabRenamed` = the tab has exactly one pane; broadcast
+/// 5. `tabRenamed` = the tab has exactly one pane — computed against the
+///    client snapshot where the pane resolved (multi-client store; Node reads
+///    its single snapshot); broadcast
 ///    `ui.command{pane.rename,{tabId,paneId,title}}`; respond
 ///    `ok({tabId, paneId, tabRenamed}, 'pane renamed')`.
 async fn rename_pane(
@@ -1779,13 +1781,11 @@ async fn rename_pane(
         rename_persistence::persist_syncable_terminal_rename(&state, snapshot, &name).await;
     }
 
-    // `tabRenamed` = single-pane tab (`router.ts:1414-1415`; a listPanes
-    // failure counts as `[]`, exactly like Node's `|| []`).
-    let tab_renamed = state
-        .layout
-        .list_panes(Some(&tab_id))
-        .map(|rows| rows.len() == 1)
-        .unwrap_or(false);
+    // `tabRenamed` = single-pane tab (`router.ts:1414-1415`), computed from
+    // the client snapshot where the pane actually RESOLVED (multi-client
+    // store) — another client's same-id tab may have a different shape, so
+    // Node's `listPanes(tabId)` read would answer from the wrong snapshot.
+    let tab_renamed = state.layout.pane_is_sole_in_tab(&pane_id);
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.rename".to_string(),
