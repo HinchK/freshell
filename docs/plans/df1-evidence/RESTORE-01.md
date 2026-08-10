@@ -205,4 +205,63 @@ legacy unchanged 53/15/1.
   touched files: 0 errors (spec files are outside the repo eslint config's
   configured scope — "file ignored" warnings only, same at base);
   `tsconfig.restore01-check.json` clean except the 2 base-reproducible TS2459s.
+- **Opt-out runtime proof:** restore-contract-wall-rust's
+  panel-asserting leg (`SIGKILL-within-5s-of-pane-creation`, asserts
+  `recovery-offer-panel` visibility at :1910) ran twice: attempt 1 RED at
+  :1862 (pre-panel phase — the fake-CLI `--session-id` argv-log poll timed
+  out under load; provably earlier than any panel interaction and the watcher
+  is provably absent under `manual`), attempt 2 **GREEN in 20.4s** — the
+  panel assertion passing requires the watcher ABSENT, so
+  `test.use({ recoveryOfferHandling: 'manual' })` is honored at runtime.
+
+## Review loop (recorded)
+
+Dispatch preferred a fresh review subagent via Task; **the Task tool is not
+available in this environment**, and a fresh-agent pane attempt through the
+freshell MCP failed at the harness level (new-tab returned ids
+ok, but every follow-up send-keys/capture-pane answered "no tabs" — live
+session tooling quirk; recorded as the fallback trigger). Per the dispatch's
+stated fallback, a **structured fresh-eyes review** was executed against
+`git diff 5521f3aba..HEAD -- test/ docs/plans/` using the review-agent rubric
+(defect-first, diff-introduced only, demonstrable call path, P0–P3).
+
+Scrutiny outcomes: (a) no listener leaks/dupes (context 'page' hook +
+`context.pages()` at install; manual contexts adopted exactly once by their
+single creation helper); (b) watcher cannot disturb non-panel specs — it acts
+only on `/api/recovery/inventory` responses, declines post-mount pre-spec-
+interaction (all specs gate on harness/WS readiness first), and re-offers
+cannot recur within a context (decline clears pending; reloads carry
+persisted layout ⇒ D1 gate skips the fetch); (c) chain resilience unit-tested
+(error swallowed, later offers still answered); (d) fixture scoping legal —
+proven at runtime by every green leg and by the contract-wall opt-out leg;
+(e) panel-owning surfaces pinned (recover-my-panes 3/3 green untouched);
+(f) spec edits are adopt-call-only / dance-removal-with-equivalence.
+Cross-checks: no test dir outside e2e-browser imports helpers/fixtures.js;
+panel testid references confined to exactly the 6 known files.
+
+Two self-found defects were FIXED before verification: the project-colors
+tripled duplicate import (caught by the restore01 tsc gate), and the
+invalid `test.use` on sidebar-registry's RAW `@playwright/test` import
+(replaced with a clarifying comment). A third catch is now load-bearing
+project truth: the pre-existing `fixtures.ts` worker-scope tuple typing error
+cascaded the extended test type to a degraded map (it would have made
+`test.use({ recoveryOfferHandling … })` a type error at every consumer);
+fixed type-only (declaration moved to the worker generic group), all four
+item-scoped tsc gates re-run clean.
+
+**Review findings outstanding: none.**
+
+## Out-of-scope discoveries surfaced for the campaign (NOT fixed here)
+
+1. **multi-client reconnect attach multiplicity** (rust emits 3
+   reconnect-shaped `terminal.attach` vs spec bound ≤ 2; probe-proofed
+   watcher-independent and deterministic; F1-masked at gate). Attribution:
+   rewritten gap-unscoped note on the leg; candidate owner: reconcile lane.
+2. **sidebar-registry-sync-rust case-c red at base** (REST `POST /api/tabs`
+   codex create non-OK at :282; reproduces in isolation on a comments-only
+   diff vs base; rust-only spec, not a gate leg). Serial case-b/a/d block
+   behind it.
+3. Occasional one-off flakes observed and not attributed: editor-pane :68
+   loading-shell transient (once in 6 green-runs), contract-wall argv-log
+   poll (once, green on immediate rerun).
 
