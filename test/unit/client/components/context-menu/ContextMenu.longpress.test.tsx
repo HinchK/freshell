@@ -652,4 +652,219 @@ describe('ContextMenuProvider long-press', () => {
     expect(onCardClick).not.toHaveBeenCalled()
     expect(screen.getByRole('menu')).toBeInTheDocument()
   })
+
+  describe('dismissal policy (scroll / resize / blur)', () => {
+    // NOTE: the outer suite's beforeEach already installs vi.useFakeTimers().
+    // Vitest's default toFake includes Date (verified by probe against this
+    // repo's vitest 3.2.4), so vi.advanceTimersByTime() advances Date.now(),
+    // which the grace-window implementation reads. Do NOT add a nested
+    // vi.useFakeTimers({ toFake: [...] }) here: re-calling it while fake
+    // timers are already installed is a verified silent no-op (the new
+    // config is ignored). If Date faking ever regressed, these tests would
+    // fail loudly rather than silently.
+
+    function openMenuByLongPress() {
+      renderWithProvider(
+        <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+          Tab One
+        </div>
+      )
+      const target = screen.getByText('Tab One')
+      elementFromPointMock.mockReturnValue(target)
+      act(() => {
+        simulateTouch('touchstart', target, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    }
+
+    it('ignores scroll events during the post-open grace window, then closes on a later scroll', () => {
+      openMenuByLongPress()
+
+      // Mechanical scroll immediately after open (focus scroll-into-view,
+      // xterm refit, keyboard viewport settling) must NOT dismiss.
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // Still inside the 500ms grace window.
+      act(() => {
+        vi.advanceTimersByTime(100)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // 600ms after open — past the 500ms grace window: a genuine user
+      // scroll dismisses the menu (correct UX).
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('never closes on scrolls that originate inside the menu itself', () => {
+      openMenuByLongPress()
+
+      // Get past the grace window so this test proves the target-origin
+      // exclusion specifically, not the grace window.
+      act(() => {
+        vi.advanceTimersByTime(600)
+      })
+
+      // scroll does not bubble, but the provider's listener is registered
+      // on window with capture: true, so it still sees this event during
+      // the capture phase with e.target === the menu element.
+      const menu = screen.getByRole('menu')
+      act(() => {
+        menu.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // Sanity: a window-level scroll at the same moment DOES close.
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('ignores resize during the grace window but closes on a later resize', () => {
+      openMenuByLongPress()
+
+      // Keyboard show/hide can resize the window (older Android WebViews)
+      // right as the menu opens — must not dismiss.
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      act(() => {
+        vi.advanceTimersByTime(600)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('closes on window blur immediately, even during the grace window', () => {
+      openMenuByLongPress()
+
+      act(() => {
+        window.dispatchEvent(new Event('blur'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+  })
+
+  it('focuses the first menu item with preventScroll so opening never triggers scroll-into-view', () => {
+    // The auto-focus effect schedules via requestAnimationFrame; run the
+    // callback synchronously so the focus happens within this test.
+    const rafSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0)
+        return 1
+      })
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus')
+
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // The only .focus() calls in this flow are the menu's item auto-focus;
+    // every one of them must pass { preventScroll: true }.
+    expect(focusSpy).toHaveBeenCalled()
+    for (const call of focusSpy.mock.calls) {
+      expect(call[0]).toEqual({ preventScroll: true })
+    }
+
+    rafSpy.mockRestore()
+    focusSpy.mockRestore()
+  })
+
+  it('positions the menu inside the visual viewport when the on-screen keyboard is showing', () => {
+    const originalVisualViewport = window.visualViewport
+    // Keyboard visible: visual viewport is 400px tall while the layout
+    // viewport (jsdom window.innerHeight) stays 768px.
+    Object.defineProperty(window, 'visualViewport', {
+      value: {
+        width: 1024,
+        height: 400,
+        offsetLeft: 0,
+        offsetTop: 0,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
+      configurable: true,
+    })
+
+    try {
+      renderWithProvider(
+        <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+          Tab One
+        </div>
+      )
+      const target = screen.getByText('Tab One')
+      elementFromPointMock.mockReturnValue(target)
+
+      // Long-press at y=600 -- inside the keyboard-occluded region.
+      act(() => {
+        simulateTouch('touchstart', target, 100, 600)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      const menu = screen.getByRole('menu')
+      // jsdom reports a zero-size menu rect, so the clamp ceiling is
+      // maxY = 400 - 0 - 8 = 392. The menu must NOT stay at y=600 (under
+      // the keyboard, where focus-driven scroll would then dismiss it).
+      expect(menu.style.top).toBe('392px')
+      expect(menu.style.left).toBe('100px')
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: originalVisualViewport,
+        configurable: true,
+      })
+    }
+  })
+
+  it('renders the menu itself with text selection suppressed', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    // A long-press release drifting onto the menu must not start selecting
+    // menu label text on mobile.
+    expect(screen.getByRole('menu').className).toContain('select-none')
+  })
 })

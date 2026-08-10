@@ -717,6 +717,27 @@ describe('ContextMenuProvider', () => {
     expect(screen.queryByRole('menu')).toBeNull()
   })
 
+  it('closes the menu when the user scrolls after the post-open grace period', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // Wait out the 500ms post-open grace window (this suite uses real
+    // timers by design — do not add fake timers to this file).
+    await new Promise((resolve) => setTimeout(resolve, 550))
+
+    act(() => {
+      window.dispatchEvent(new Event('scroll'))
+    })
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+  })
+
   it('respects native menu for input-like elements', async () => {
     const user = userEvent.setup()
     renderWithProvider(
@@ -2511,5 +2532,29 @@ describe('ContextMenuProvider', () => {
 
     expect(store.getState().tabs.tabs.some((t) => t.title === 'remote open')).toBe(true)
     expect(onViewChange).toHaveBeenCalledWith('terminal')
+  })
+
+  it('keyboard navigation focuses menu items with preventScroll', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+    const menu = screen.getByRole('menu')
+
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus')
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    fireEvent.keyDown(menu, { key: 'End' })
+    fireEvent.keyDown(menu, { key: 'Home' })
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+
+    expect(focusSpy).toHaveBeenCalled()
+    for (const call of focusSpy.mock.calls) {
+      expect(call[0]).toEqual({ preventScroll: true })
+    }
+    focusSpy.mockRestore()
   })
 })
