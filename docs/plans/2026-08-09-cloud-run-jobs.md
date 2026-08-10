@@ -38,7 +38,7 @@
 
 ## Requirements
 
-- **R1 — Cloud default:** `npm run test:e2e` executes the Playwright e2e suite on Google Cloud Run Jobs by default, not locally.
+- **R1 — Cloud default (NOT SHIPPED as written — see the Shipped-deviation note above):** `npm run test:e2e` executes the Playwright e2e suite on Google Cloud Run Jobs by default, not locally. **Shipped behavior:** unset `FRESHELL_E2E_BACKEND` resolves to **local** (`scripts/e2e-cloud.sh` `"${FRESHELL_E2E_BACKEND:-local}"`, pinned by `scripts/test/cloud-run-wrapper.test.sh` checks 9-11); cloud runs only via `FRESHELL_E2E_BACKEND=cloud`, the `--cloud` flag, or `npm run test:e2e:cloud`. Any agent executing steps below must verify against the SHIPPED contract, not this bullet.
 - **R2 — Local fallback:** `npm run test:e2e:local` (and `npm run test:e2e -- --local`) runs the same suite locally via direct Playwright invocation, preserving the pre-change behavior.
 - **R3 — End-to-end validation:** A Cloud Run Job executes a real test run (at minimum `auth.spec.ts`) and returns passing results that match the local baseline.
 - **R4 — Pass-through args:** The cloud execution path supports `--grep`, `--project`, and spec-file filter arguments passed through to Playwright inside the container.
@@ -357,6 +357,6 @@ git commit -m "test: validate Cloud Run Jobs end-to-end with smoke and full suit
 ## Notes
 
 - The `playwright.config.ts` refactor to export `MATRIX_SPECS` and `RUST_ONLY_SPECS` (Task 2) is a minimal DRY improvement that does not change any behavior. The base config's `export default defineConfig(...)` remains unchanged.
-- The `package.json` change (Task 3) repurposes `test:e2e` from local to cloud. The old behavior is preserved as `test:e2e:local`. This is the user's explicit request: "Make that the new default with a flag For any other options like running locally."
+- The `package.json` change (Task 3) was PLANNED to repurpose `test:e2e` from local to cloud, per the user's explicit request: "Make that the new default with a flag For any other options like running locally." **As shipped, it did not:** `test:e2e` routes through `scripts/e2e-cloud.sh run`, which defaults unset `FRESHELL_E2E_BACKEND` to LOCAL — the old behavior is fully preserved by default and cloud is opt-in (`test:e2e:cloud`, `--cloud`, or the env var). See the Shipped-deviation note at the top of this plan.
 - Cloud Run Jobs have a maximum execution time of 24 hours and a maximum of 256 tasks. The default 1-shard config runs all tests in one task; `--shards=N` splits across N parallel tasks.
 - The Docker image includes the Rust server binary for `rust-chromium` project support. The image will be large (~2-3 GB) due to Playwright browsers + Node deps + Rust binary.
