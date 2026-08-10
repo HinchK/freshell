@@ -2,18 +2,19 @@
 
 **Item:** EXT-01 — Port the complete strict manifest schema (P1 — Extensions).
 **Worker:** df1-ext-01-manifest-schema, worktree `.worktrees/df1-ext-01-manifest-schema`, branch `df1/ext-01-manifest-schema` (base: `origin/df1/integration` @ `3dbba43c2`).
-**Verdict:** PASS (see review section for independent-review outcome).
-**Plan:** `docs/plans/df1/EXT-01.md` (committed; contains the full design-call record DC-1…DC-7).
+**Verdict:** PASS. Independent defect-first review (fresheyes, claude provider, FRESHPID 2196947) found 1 major + 8 minor/nit findings; ALL majors/minors fixed and re-verified, nits recorded. Review loop iterations used: 2 of ≤5 (gpt run died on SIGPIPE 141 infrastructure failure before producing findings; claude run completed).
+**Plan:** `docs/plans/df1/EXT-01.md` (committed; contains the full design-call record DC-1…DC-7 incl. review-driven amendments DC-4.11/4.12, DC-5).
 
 ## What landed
 
 1. **New crate `crates/freshell-extensions`** — the complete strict manifest validator:
-   - `src/manifest.rs` — typed model (`ExtensionManifest`, `ClientConfig`, `ServerConfig` with materialized `args=[]`/`readyTimeout=10000`/`singleton=true`, full 15-field `CliConfig`, `PickerConfig`, `TerminalBehavior` with single/two-option enums, `ContentSchemaField` + `DefaultValue` union) with output-side `Serialize` reproducing zod's `result.data` shape exactly (camelCase, absent-optionals elided, defaults present). No `Deserialize` impls: the typed model is obtainable ONLY through validation.
-   - `src/validate.rs` — hand-written `serde_json::Value` walker: strict unknown-key rejection at every object level; category↔config-block refine; content-schema field typeof-refine; zod-4 refine-gating abort rule; issue emission in schema-definition order with `unrecognized_keys` last per object; JS-safe-int positive `readyTimeout` with accumulating check failures; null-vs-absent `.optional()`; byte-exact zod 4.3.6 `(code, path, message)` triples.
-   - `tests/oracle.rs` + `fixtures/manifest-oracle.json` — **124-case differential oracle** (39 valid / 84 schema-invalid / 1 invalid-JSON-text) generated from the UNMODIFIED legacy schema.
-   - 7 focused unit tests (error-class split, log Display, insertion-order fidelity of contentSchema/env, single-issue union failure, full CLI surface round-trip, typeof-name coupling pin).
-2. **Oracle generator** `port/contract/generate-manifest-oracle.ts` — runs the real zod schema over the pinned case list (mirrors all 35 legacy vitest cases, all bundled manifests as raw text, duplicate-key/raw-text edge rows, and every probed zod-4 semantic). Hermetic: byte-identical regeneration.
-3. **`crates/freshell-server/src/extensions.rs` rewired** to consume the crate: strict rejection with legacy's two warn lines ('invalid JSON in manifest' / 'invalid manifest' + issues), icon gate corrected to legacy truthiness semantics, UTF-8-lossy read to match `fs.readFileSync(…, 'utf-8')`, frozen public surface (`ExtensionRegistry`/`CliDetectionSpec`/`detect_available_clis`/`resolve_extension_dirs`) unchanged.
+   - `src/manifest.rs` — typed model (`ExtensionManifest`, `ClientConfig`, `ServerConfig` with materialized `args=[]`/`readyTimeout=10000`/`singleton=true`, full 15-field `CliConfig`, `PickerConfig`, `TerminalBehavior` with single/two-option enums, `ContentSchemaField` + `DefaultValue` union with JS-double-faithful canonicalization) with output-side `Serialize` reproducing zod's `result.data` shape. No `Deserialize` impls: the typed model is obtainable ONLY through validation.
+   - `src/validate.rs` — hand-written `serde_json::Value` walker: strict unknown-key rejection at every object level; category↔config-block refine; content-schema field typeof-refine; zod-4 refine-gating abort rule; definition-order issue emission with `unrecognized_keys` last; JS-safe-int positive `readyTimeout` with accumulating checks; null-vs-absent `.optional()`; `__proto__` record-skip; JS own-key enumeration order; byte-exact zod 4.3.6 `(code, path, message)` triples.
+   - `src/issue.rs` — the issue model (codes, path segments, `ManifestError` with legacy's two log classes).
+   - `src/validate/tests.rs` — 10 focused unit tests (error-class split, log Display, error paths; own-key ORDER text fidelity incl. numeric keys; `__proto__` drop/reject asymmetry; union single-issue shape; full CLI surface round-trip; typeof-name coupling pin).
+   - `tests/oracle.rs` + `fixtures/manifest-oracle.json` — **130-case differential oracle** (43 valid / 86 schema-invalid / 1 invalid-JSON-text) generated from the UNMODIFIED legacy schema. Comparator `js_value_eq` implements JS-double semantics (serde Number equality is variant-strict).
+2. **Oracle generator** `port/contract/generate-manifest-oracle.ts` — runs the real zod schema over the pinned case list (all 35 legacy vitest cases, all 6 bundled manifests as raw text, duplicate-key/raw-text rows, every probed zod-4 semantic, 6 review-driven rows). Hard-refuses to generate if installed zod ≠ package-lock.json pin. Hermetic: byte-identical regeneration. Listed in `port/contract/README.md`.
+3. **`crates/freshell-server/src/extensions.rs` rewired** to consume the crate: strict rejection with legacy's two warn lines (asserted by a new global-subscriber capture test, parallel-safe per the repo's documented pattern), icon gate corrected to legacy truthiness, UTF-8-lossy read matching `fs.readFileSync(…, 'utf-8')`, frozen public surface unchanged.
 
 ## Parity coverage vs the checklist keywords
 
@@ -36,7 +37,7 @@
 
 | ID | Assumption | Status | Evidence |
 |---|---|---|---|
-| LB-1 | zod 4.3.6 issue codes/messages/ordering/gating semantics | VERIFIED | probe batches against `npx tsx` + oracle fixture (124 rows) |
+| LB-1 | zod 4.3.6 issue codes/messages/ordering/gating semantics | VERIFIED | probe batches against `npx tsx` + oracle fixture (130 rows) |
 | LB-2 | Only `freshell-server/src/extensions.rs` parses freshell.json in Rust land | VERIFIED | `grep -rn freshell.json crates/` — 5 hits, 4 comments |
 | LB-3 | All 6 bundled manifests pass the strict schema | VERIFIED | tsx run over legacy schema (all VALID) + server test `all_bundled_manifests_validate_and_register_through_scan` |
 | LB-4 | tsx runnable in-worktree for the generator | VERIFIED | node_modules/.bin/tsx, devDep ^4.19.2 |
@@ -69,7 +70,7 @@ cargo fmt --check
 ```
 
 Results at final SHA (see header/git log):
-- `freshell-extensions`: 7 unit + 1 oracle (124 cases) green — 3 consecutive runs.
+- `freshell-extensions`: 10 unit + 1 oracle (130 cases) green — 3 consecutive runs.
 - `freshell-server`: full crate suite **614 passed, 0 failed, 1 ignored** (plus harness binaries green) — 3 consecutive runs; not flaky (hermetic; only fs use is per-test unique temp dirs).
 - clippy `-D warnings`: clean. fmt: clean.
 
@@ -79,12 +80,26 @@ Results at final SHA (see header/git log):
 
 ## Playwright posture
 
-Queue item `pwMode: null`; the checklist's PW-RUST line describes seeding manifests + registry assertions with no named spec file. Per dispatch: crate tests carry the proof. The registry-level behavior (only valid extensions appear; every registry field matches fixtures; invalid manifests produce logged diagnostics without disturbing discovery) is pinned by the 6 new server scan tests + the 124-case oracle. No pw lease taken.
+Queue item `pwMode: null`; the checklist's PW-RUST line describes seeding manifests + registry assertions with no named spec file. Per dispatch: crate tests carry the proof. The registry-level behavior (only valid extensions appear; every registry field matches fixtures; invalid manifests produce logged diagnostics without disturbing discovery) is pinned by the 7 new server scan/warn tests + the 130-case oracle. No pw lease taken.
 
 ## Review record
 
-1. **Structured fresh-eyes self-review** (recorded): 34-point adversarial checklist over the diff; found and fixed 2 parity gaps (`field-refine-gated-by-aborting-member` oracle row; `from_utf8_lossy` read semantics) + 1 panic-hazard class found pre-commit during implementation (unguarded `opt_out` in block closures — eliminated via `bad!()` guards before first run). 1 doc drift fixed (plan Task-1 wording).
-2. **Independent fresheyes review** (gpt provider, FRESHPID=1440188, scope: defect-first review of `git diff origin/df1/integration...HEAD` with the df1 review-agent brief): OUTCOME-BELOW.
-3. Task-tool subagent + freshell fresh-agent pane were both attempted first and are unavailable in this environment (no Task tool; fresh-agent pane never materialized a reachable tab — production server answers `no tabs`).
+1. **Structured fresh-eyes self-review** (recorded): 34-point adversarial checklist over the diff; found and fixed 2 parity gaps (`field-refine-gated-by-aborting-member` oracle row; `from_utf8_lossy` read semantics) + 1 panic-hazard class found pre-commit during implementation (unguarded `opt_out` in block closures — eliminated via `bad!()` guards before first run) + 1 doc drift.
+2. **Independent fresheyes review** (FRESHPID 1440188, gpt provider): DIED on infrastructure failure (exit 141 SIGPIPE, `runner_state: failed`, no findings produced) — retried on the claude provider per the skill's fallback rule.
+3. **Independent fresheyes review** (FRESHPID 2196947, claude provider): completed, verdict **FAILED** with a real defect. Cross-checked the port against the vendored zod 4.3.6 SOURCE (`node_modules/zod/v4/core/*.js`), not just behavior. Findings and dispositions:
+   - **[major] `__proto__` skipped by `z.record`** → accept/reject flip. VERIFIED by direct zod probe; FIXED (record walkers skip `__proto__`, strict objects still reject it) + 3 oracle rows + unit test.
+   - **[minor] >2^53 integer defaults stayed u64-exact** (JS rounds). VERIFIED; FIXED (always-through-f64 canonicalization; typed value now bit-identical to JS's double) + 2 oracle rows.
+   - **[minor] JS own-key order** (array-index keys first) not replicated. VERIFIED; FIXED (`js_ordered_keys` used by `unrecognized()` + both record walkers) + 1 oracle row (message text pin) + 2 order unit tests.
+   - **[minor] oracle version pin advisory-only.** VERIFIED (this bit me mid-task); FIXED (generator hard-refuses on lock mismatch; crate test asserts exact `4.3.6`).
+   - **[minor] scan warn lines untested.** FIXED (global-subscriber capture test; thread-local was nondeterministic under `cargo test` — resolved per the repo's documented OnceLock pattern; 6× parallel re-runs green).
+   - **[minor] plan doc drift** (stale "4.4.3" labels, case counts, unchecked boxes, silently-replaced acceptance criterion, wrong NaN/Infinity reasoning). FIXED in `docs/plans/df1/EXT-01.md` (incl. DC-4.10 correction: `1e400` → JSON.parse yields `Infinity` → legacy warns 'invalid manifest', we warn 'invalid JSON in manifest' — verdict parity holds, warn CLASS diverges; accepted residual).
+   - **[minor] evidence file untracked + self-contradictory.** FIXED (this file, committed, verdict consistent).
+   - **[nit] generator `as const`, README discoverability, commit-splitting, redundant oracle row.** First two FIXED; commit history and the one redundant row left as-is (cosmetic; regenerating to drop a row churns the fixture for no behavioral gain).
+4. **Unavailability note (per dispatch fallback rules):** no Task tool in this environment; the freshell fresh-agent review pane (ext01-review) never materialized a reachable tab (production server answered "no tabs"; no orphan terminal left — verified via list-terminals). Self-review + independent CLI-driven review were used instead; both recorded here.
 
-OUTCOME: (pending — filled when the review completes)
+## Fixture/regeneration discipline
+
+- `npx tsx port/contract/generate-manifest-oracle.ts` — byte-identical output on re-run (sha256-stable), and hard-fails on zod/lock drift.
+- NEVER hand-edit the fixture to match Rust; the legacy schema is the only oracle.
+
+OUTCOME: COMPLETED — see verdict at top.
