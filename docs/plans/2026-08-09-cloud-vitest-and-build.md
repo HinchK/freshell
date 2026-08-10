@@ -194,17 +194,19 @@ In `.dockerignore`, add after the `*.md` line:
 
 In `docker/cloud-run/Dockerfile`, in the runtime stage (Stage 3), after the `RUN chmod +x /usr/local/bin/e2e-entrypoint.sh` line (line 128) and before the `HEALTHCHECK` line, add ownership transfer and switch to non-root user. This must come AFTER the `COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh` and `RUN chmod +x` lines — those write to root-owned paths (`/usr/local/bin/`) and must run as root:
 
-```dockerfile
-# Install Playwright browsers to a shared system path so the node user can
-# access them (default ~/.cache/ms-playwright would be root's home).
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npx --yes playwright@1.58.2 install --with-deps chromium
+Two changes to the Dockerfile runtime stage:
 
-# Switch to non-root user for runtime (node:22-bookworm provides UID 1000).
-# This is required by server-side tests that verify permission errors
-# propagate (claude-transcript-locator.test.ts chmod 0o000 tests) — root
-# would bypass those mode bits.
-# Must be AFTER the entrypoint COPY+chmod (lines 127-128) which write to /usr/local/bin/.
+**Change 1:** Set `PLAYWRIGHT_BROWSERS_PATH` before the **existing** Playwright install (line 105), so browsers go to a shared system path instead of root's home. Do NOT add a second install — move the env var to before the existing one:
+
+```dockerfile
+# Before the existing install line (line 105):
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# (existing line) RUN npx --yes playwright@1.58.2 install --with-deps chromium
+```
+
+**Change 2:** After the `RUN chmod +x /usr/local/bin/e2e-entrypoint.sh` line (line 128) and before `HEALTHCHECK`, add ownership transfer and switch to non-root user:
+
+```dockerfile
 RUN chown -R node:node /app
 USER node
 ```
@@ -302,7 +304,7 @@ Create `scripts/vitest-cloud.sh` with:
   - `GCP_JOB="freshell-vitest"` (not `freshell-e2e`)
   - `FRESHELL_VITEST_BACKEND` env var (not `FRESHELL_E2E_BACKEND`)
   - Local mode: `npx vitest run --passWithNoTests --config <config>` for each config (not `npx playwright test`)
-  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `printf '%s\n' "${pw_args[@]}" | jq -R . | jq -sc .` (produces a flat JSON array preserving argument boundaries; the `jq -nc --args` form nests the array and includes a literal `--`)
+  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `printf '%s\n' "${pw_args[@]}" | jq -R . | jq -sc .`. Since the JSON array contains double quotes, write the env-vars file using a YAML-safe method: either single-quote the JSON value in YAML (`VITEST_ARGS_JSON: '<json>'`) or use `jq -Rs .` to produce a YAML-safe double-quoted string with proper escaping. The env-vars file must round-trip through `gcloud run jobs execute --env-vars-file` without corrupting JSON values.
   - `--config=default|server|all` flag controls which configs to run
   - Log summary greps for vitest output patterns (`Test Files`, `Tests`)
   - Default `--shards=4` (not 1)
@@ -322,7 +324,9 @@ Review for duplication with `e2e-cloud.sh`. If `cmd_build` and `cmd_push` are id
 
 - [ ] **Step 6: Run broader verification**
 
-Run: `bash scripts/test/cloud-run-wrapper.test.sh` — **but only the local-mode checks**. The `--cloud` test cases in this script use real `gcloud` and can create/update/execute the live `freshell-e2e` Cloud Run Job. Run with a fake `gcloud` on PATH to ensure no real infrastructure is touched.
+Run: `bash scripts/test/cloud-run-dockerfile.test.sh` (Dockerfile tests, no gcloud interaction).
+
+Do NOT run `scripts/test/cloud-run-wrapper.test.sh` as a verification gate — its `--cloud` check uses real `gcloud` and can mutate/execute the live Cloud Run Job. That script's own CI gate is responsible for its safety.
 
 Expected: PASS
 
@@ -439,7 +443,7 @@ if (process.env.FRESHELL_VITEST_BACKEND === 'cloud') {
 
 In `package.json`, add:
 ```json
-"test:cloud": "bash scripts/vitest-cloud.sh run",
+"test:cloud": "bash scripts/vitest-cloud.sh run --cloud",
 "test:cloud:build": "bash scripts/vitest-cloud.sh build",
 ```
 
@@ -482,7 +486,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
 - `docker/cloud-run/cloudbuild.yaml` configures Google Cloud Build with:
   - BuildKit enabled (`DOCKER_BUILDKIT=1`) for `mode=max` registry caching, which preserves intermediate stage layers (rust-builder, node-builder) — not just the final image
   - `docker pull` of existing image for `--cache-from` layer caching
-  - `docker build -f docker/cloud-run/Dockerfile --cache-from type=registry,ref=<image> --cache-to type=registry,ref=<image>,mode=max -t <image> .`
+  - `docker buildx build -f docker/cloud-run/Dockerfile --cache-from type=registry,ref=<image>-cache --cache-to type=registry,ref=<image>-cache,mode=max -t <image> --push .`
   - `images:` field for automatic push to Artifact Registry
   - `E2_HIGHCPU_32` machine type, 200GB disk
   - `timeout` at the **top level** (not under `options`), per the [Cloud Build schema](https://docs.cloud.google.com/build/docs/build-config-file-schema)
@@ -506,7 +510,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
 **Test cases:**
 - `docker/cloud-run/cloudbuild.yaml` exists and is valid YAML
 - `cloudbuild.yaml` references the correct Dockerfile path (`docker/cloud-run/Dockerfile`)
-- `cloudbuild.yaml` contains `images:` field
+- `cloudbuild.yaml` uses `docker buildx build` with `--push` (not `images:` field)
 - `cloudbuild.yaml` uses `E2_HIGHCPU_32` machine type (under `options`)
 - `cloudbuild.yaml` has `timeout` at top level (NOT under `options`)
 - `cloudbuild.yaml` uses substitutions (`${_IMAGE}`) not hard-coded image URLs
@@ -527,7 +531,7 @@ Create `scripts/test/cloud-build.test.sh` with:
 - Check 1: `docker/cloud-run/cloudbuild.yaml` exists
 - Check 2: `cloudbuild.yaml` is valid YAML (parse with `python3 -c "import yaml; yaml.safe_load(open('...'))"`)
 - Check 3: `cloudbuild.yaml` contains `docker/cloud-run/Dockerfile`
-- Check 4: `cloudbuild.yaml` contains `images:`
+- Check 4: `cloudbuild.yaml` uses `buildx build` with `--push`
 - Check 5: `cloudbuild.yaml` contains `E2_HIGHCPU_32` under `options:`
 - Check 6: `cloudbuild.yaml` contains `timeout` at top level (verify it's NOT nested under `options`)
 - Check 7: `cloudbuild.yaml` uses `${_IMAGE}` substitution (not a hard-coded URL)
@@ -556,27 +560,27 @@ steps:
   # Pull existing image for layer caching (exit 0 if not found yet).
   - name: 'gcr.io/cloud-builders/docker'
     entrypoint: 'bash'
-    args: ['-c', 'docker pull ${_IMAGE} || exit 0']
+    args: ['-c', 'docker pull ${_IMAGE}-cache || exit 0']
     env:
       - 'DOCKER_BUILDKIT=1'
   # Build with BuildKit + mode=max registry cache to preserve intermediate
   # stage layers (rust-builder, node-builder), not just the final image.
   - name: 'gcr.io/cloud-builders/docker'
     args:
+      - 'buildx'
       - 'build'
       - '-f'
       - 'docker/cloud-run/Dockerfile'
       - '-t'
       - '${_IMAGE}'
       - '--cache-from'
-      - 'type=registry,ref=${_IMAGE}'
+      - 'type=registry,ref=${_IMAGE}-cache'
       - '--cache-to'
-      - 'type=registry,ref=${_IMAGE},mode=max'
+      - 'type=registry,ref=${_IMAGE}-cache,mode=max'
+      - '--push'
       - '.'
     env:
       - 'DOCKER_BUILDKIT=1'
-images:
-  - '${_IMAGE}'
 options:
   machineType: 'E2_HIGHCPU_32'
   diskSizeGb: 200
@@ -585,7 +589,7 @@ timeout: '3600s'
 
 Note: No `substitutions` block — the wrapper always passes `--substitutions=_IMAGE="$IMAGE_REMOTE"` on the `gcloud builds submit` command line, so the image URL is never hard-coded in the YAML.
 
-Create `.gcloudignore` (same exclusions as `.dockerignore` plus `.worktrees/`), including the same `!AGENTS.md` and `!docs/skills/testing.md` exceptions — Cloud Build source upload respects `.gcloudignore`, and without these exceptions the server Vitest suite would fail in the container.
+Create `.gcloudignore` with the same exclusions as `.dockerignore` plus `.worktrees/`, but **do not exclude `docs/` wholesale** — `.gcloudignore` follows gitignore rules where a child cannot be re-included if its parent directory is excluded, so `!docs/skills/testing.md` would be ignored. Instead, exclude only the docs subdirectories not needed by tests (e.g. `docs/plans/`, `docs/development/`, `docs/index.html`), keeping `docs/skills/testing.md` accessible. Include `!AGENTS.md` as an exception (AGENTS.md is at the root, not under an excluded parent).
 
 In `scripts/e2e-cloud.sh`, modify `cmd_build` to default to Cloud Build:
 - When `--local-build` is NOT set: run `gcloud builds submit --config "$ROOT/docker/cloud-run/cloudbuild.yaml" --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" --substitutions=_IMAGE="$IMAGE_REMOTE" "$ROOT"`
@@ -606,7 +610,9 @@ The `--local-build` flag logic is a simple if/else in `cmd_build`. No refactor n
 
 - [ ] **Step 6: Run broader verification**
 
-Run: `bash scripts/test/cloud-run-wrapper.test.sh` (e2e wrapper still works)
+Run: `bash scripts/test/cloud-run-dockerfile.test.sh` (Dockerfile tests, no gcloud interaction).
+
+Do NOT run `scripts/test/cloud-run-wrapper.test.sh` as a verification gate — its `--cloud` check uses real `gcloud` and can mutate/execute the live Cloud Run Job.
 
 Expected: PASS
 
