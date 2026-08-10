@@ -93,7 +93,7 @@ runtime is unprivileged. The server globalSetup writes to `/app/dist/server`
 - If any config fails, the exit code is non-zero (but both configs still run)
 - When `TEST_MODE` is unset or `playwright`, current behavior is unchanged
 - `.dockerignore` is updated to allow `AGENTS.md` and `docs/skills/testing.md` into the image (needed by `test/integration/server/test-coordinator.test.ts`)
-- The Dockerfile runtime stage switches to `USER node` (non-root) so that `claude-transcript-locator.test.ts` permission tests (lines 120, 134) behave correctly — `chmod 0o000` is not bypassed by root
+- The Dockerfile runtime stage switches to `USER node` (non-root) so that `claude-transcript-locator.test.ts` permission tests (lines 120, 134) behave correctly — `chmod 0o000` is not bypassed by root. Playwright browsers must be installed to a shared system path (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`) before the `USER node` switch, since the default `~/.cache/ms-playwright` would be root's home and inaccessible to the `node` user
 - The entrypoint accepts `VITEST_ARGS_JSON` env var for pass-through arguments (JSON array, parsed with `jq`), so the container smoke test can run a single fast test file without losing argument boundaries
 
 **Files:**
@@ -192,13 +192,19 @@ In `.dockerignore`, add after the `*.md` line:
 !docs/skills/testing.md
 ```
 
-In `docker/cloud-run/Dockerfile`, in the runtime stage (Stage 3), after the `COPY . .` line (line 120) and before the `ENV FRESHELL_E2E_RUST_SERVER_BIN` line, add ownership transfer and switch to non-root user:
+In `docker/cloud-run/Dockerfile`, in the runtime stage (Stage 3), after the `RUN chmod +x /usr/local/bin/e2e-entrypoint.sh` line (line 128) and before the `HEALTHCHECK` line, add ownership transfer and switch to non-root user. This must come AFTER the `COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh` and `RUN chmod +x` lines — those write to root-owned paths (`/usr/local/bin/`) and must run as root:
 
 ```dockerfile
+# Install Playwright browsers to a shared system path so the node user can
+# access them (default ~/.cache/ms-playwright would be root's home).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npx --yes playwright@1.58.2 install --with-deps chromium
+
 # Switch to non-root user for runtime (node:22-bookworm provides UID 1000).
 # This is required by server-side tests that verify permission errors
 # propagate (claude-transcript-locator.test.ts chmod 0o000 tests) — root
 # would bypass those mode bits.
+# Must be AFTER the entrypoint COPY+chmod (lines 127-128) which write to /usr/local/bin/.
 RUN chown -R node:node /app
 USER node
 ```
@@ -296,7 +302,7 @@ Create `scripts/vitest-cloud.sh` with:
   - `GCP_JOB="freshell-vitest"` (not `freshell-e2e`)
   - `FRESHELL_VITEST_BACKEND` env var (not `FRESHELL_E2E_BACKEND`)
   - Local mode: `npx vitest run --passWithNoTests --config <config>` for each config (not `npx playwright test`)
-  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `jq -nc --args -- '{VITEST_ARGS_JSON: [$ARGS.positional]}' -- "${pw_args[@]}"` (or equivalent that produces valid JSON)
+  - Cloud mode: env-vars-file sets `TEST_MODE: "vitest"`, `VITEST_CONFIGS: "<configs>"`, and `VITEST_ARGS_JSON: "<json array>"`. The JSON array is built with: `printf '%s\n' "${pw_args[@]}" | jq -R . | jq -sc .` (produces a flat JSON array preserving argument boundaries; the `jq -nc --args` form nests the array and includes a literal `--`)
   - `--config=default|server|all` flag controls which configs to run
   - Log summary greps for vitest output patterns (`Test Files`, `Tests`)
   - Default `--shards=4` (not 1)
@@ -316,7 +322,7 @@ Review for duplication with `e2e-cloud.sh`. If `cmd_build` and `cmd_push` are id
 
 - [ ] **Step 6: Run broader verification**
 
-Run: `bash scripts/test/cloud-run-wrapper.test.sh` (existing e2e wrapper tests still pass)
+Run: `bash scripts/test/cloud-run-wrapper.test.sh` — **but only the local-mode checks**. The `--cloud` test cases in this script use real `gcloud` and can create/update/execute the live `freshell-e2e` Cloud Run Job. Run with a fake `gcloud` on PATH to ensure no real infrastructure is touched.
 
 Expected: PASS
 
@@ -476,7 +482,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
 - `docker/cloud-run/cloudbuild.yaml` configures Google Cloud Build with:
   - BuildKit enabled (`DOCKER_BUILDKIT=1`) for `mode=max` registry caching, which preserves intermediate stage layers (rust-builder, node-builder) — not just the final image
   - `docker pull` of existing image for `--cache-from` layer caching
-  - `docker build -f docker/cloud-run/Dockerfile --cache-from type=registry,ref=<image>,mode=max -t <image> .`
+  - `docker build -f docker/cloud-run/Dockerfile --cache-from type=registry,ref=<image> --cache-to type=registry,ref=<image>,mode=max -t <image> .`
   - `images:` field for automatic push to Artifact Registry
   - `E2_HIGHCPU_32` machine type, 200GB disk
   - `timeout` at the **top level** (not under `options`), per the [Cloud Build schema](https://docs.cloud.google.com/build/docs/build-config-file-schema)
@@ -505,7 +511,7 @@ git commit -m "feat: integrate cloud vitest with run-standard-tests.ts and npm s
 - `cloudbuild.yaml` has `timeout` at top level (NOT under `options`)
 - `cloudbuild.yaml` uses substitutions (`${_IMAGE}`) not hard-coded image URLs
 - `cloudbuild.yaml` enables BuildKit (`DOCKER_BUILDKIT=1` env or `--build-arg BUILDKIT=1`)
-- `cloudbuild.yaml` uses `mode=max` in the cache-from reference (for intermediate layer preservation)
+- `cloudbuild.yaml` uses `mode=max` in the cache-to reference (for intermediate layer export); `cache-from` has no `mode` (import reads all available cache)
 - `.gcloudignore` exists and excludes `.git`, `node_modules`, `target`, `dist`, `.worktrees/`
 - `e2e-cloud.sh help` mentions `--local-build`
 - `vitest-cloud.sh help` mentions `--local-build`
@@ -526,7 +532,7 @@ Create `scripts/test/cloud-build.test.sh` with:
 - Check 6: `cloudbuild.yaml` contains `timeout` at top level (verify it's NOT nested under `options`)
 - Check 7: `cloudbuild.yaml` uses `${_IMAGE}` substitution (not a hard-coded URL)
 - Check 8: `cloudbuild.yaml` enables BuildKit (contains `DOCKER_BUILDKIT=1` or `BUILDKIT=1`)
-- Check 9: `cloudbuild.yaml` uses `mode=max` in cache-from reference
+- Check 9: `cloudbuild.yaml` uses `mode=max` in cache-to reference
 - Check 10: `.gcloudignore` exists
 - Check 11: `.gcloudignore` excludes `.git`, `node_modules`, `target`, `dist`, `.worktrees/`
 - Check 12: `e2e-cloud.sh help` contains `--local-build`
@@ -563,6 +569,8 @@ steps:
       - '-t'
       - '${_IMAGE}'
       - '--cache-from'
+      - 'type=registry,ref=${_IMAGE}'
+      - '--cache-to'
       - 'type=registry,ref=${_IMAGE},mode=max'
       - '.'
     env:
@@ -573,11 +581,11 @@ options:
   machineType: 'E2_HIGHCPU_32'
   diskSizeGb: 200
 timeout: '3600s'
-substitutions:
-  _IMAGE: 'us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:latest'
 ```
 
-Create `.gcloudignore` (same exclusions as `.dockerignore` plus `.worktrees/`).
+Note: No `substitutions` block — the wrapper always passes `--substitutions=_IMAGE="$IMAGE_REMOTE"` on the `gcloud builds submit` command line, so the image URL is never hard-coded in the YAML.
+
+Create `.gcloudignore` (same exclusions as `.dockerignore` plus `.worktrees/`), including the same `!AGENTS.md` and `!docs/skills/testing.md` exceptions — Cloud Build source upload respects `.gcloudignore`, and without these exceptions the server Vitest suite would fail in the container.
 
 In `scripts/e2e-cloud.sh`, modify `cmd_build` to default to Cloud Build:
 - When `--local-build` is NOT set: run `gcloud builds submit --config "$ROOT/docker/cloud-run/cloudbuild.yaml" --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" --substitutions=_IMAGE="$IMAGE_REMOTE" "$ROOT"`
