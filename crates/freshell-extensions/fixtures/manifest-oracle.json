@@ -1,0 +1,2552 @@
+{
+  "meta": {
+    "generator": "port/contract/generate-manifest-oracle.ts",
+    "schemaSource": "server/extension-manifest.ts (UNMODIFIED legacy zod schema)",
+    "zodVersion": "4.3.6",
+    "note": "GENERATED — do not edit by hand. Regenerate: npx tsx port/contract/generate-manifest-oracle.ts"
+  },
+  "cases": [
+    {
+      "name": "valid-server-manifest",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "valid-client-manifest",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "valid-cli-manifest",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "lazygit",
+            "args": []
+          }
+        }
+      }
+    },
+    {
+      "name": "cli-full-launch-templates-and-permission-mapping",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"opencode\",\"resumeArgs\":[\"--session\",\"{{sessionId}}\"],\"createSessionArgs\":[\"--session-id\",\"{{sessionId}}\"],\"modelArgs\":[\"--model\",\"{{model}}\"],\"sandboxArgs\":[\"--sandbox\",\"{{sandbox}}\"],\"permissionModeArgs\":[\"--permission-mode\",\"{{permissionMode}}\"],\"permissionModeEnvVar\":\"AGENT_PERMISSION_MODE\",\"permissionModeValues\":{\"plan\":\"{\\\"edit\\\":\\\"ask\\\",\\\"bash\\\":\\\"ask\\\"}\"},\"supportsPermissionMode\":true,\"supportsModel\":true,\"supportsSandbox\":true}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "opencode",
+            "args": [],
+            "resumeArgs": [
+              "--session",
+              "{{sessionId}}"
+            ],
+            "createSessionArgs": [
+              "--session-id",
+              "{{sessionId}}"
+            ],
+            "modelArgs": [
+              "--model",
+              "{{model}}"
+            ],
+            "sandboxArgs": [
+              "--sandbox",
+              "{{sandbox}}"
+            ],
+            "permissionModeArgs": [
+              "--permission-mode",
+              "{{permissionMode}}"
+            ],
+            "permissionModeEnvVar": "AGENT_PERMISSION_MODE",
+            "permissionModeValues": {
+              "plan": "{\"edit\":\"ask\",\"bash\":\"ask\"}"
+            },
+            "supportsPermissionMode": true,
+            "supportsModel": true,
+            "supportsSandbox": true
+          }
+        }
+      }
+    },
+    {
+      "name": "optional-fields-icon-url-contentschema-picker",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true},\"icon\":\"./icon.svg\",\"url\":\"/run/{{runId}}\",\"contentSchema\":{\"runId\":{\"type\":\"string\",\"label\":\"Run ID\",\"required\":true}},\"picker\":{\"shortcut\":\"K\",\"group\":\"tools\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "icon": "./icon.svg",
+          "url": "/run/{{runId}}",
+          "contentSchema": {
+            "runId": {
+              "type": "string",
+              "label": "Run ID",
+              "required": true
+            }
+          },
+          "picker": {
+            "shortcut": "K",
+            "group": "tools"
+          },
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "picker-shortcut-only",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":{\"shortcut\":\"C\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "picker": {
+            "shortcut": "C"
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "picker-group-only",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":{\"group\":\"viewers\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "picker": {
+            "group": "viewers"
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "picker-empty-object",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":{}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "picker": {},
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "server-env-template-vars",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true,\"env\":{\"PORT\":\"{{port}}\",\"RUNS_DIR\":\"{{runsDir}}\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "env": {
+              "PORT": "{{port}}",
+              "RUNS_DIR": "{{runsDir}}"
+            },
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "server-health-check",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true,\"healthCheck\":\"/api/health\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "healthCheck": "/api/health",
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "server-singleton-explicit-false",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":false}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "singleton": false
+          }
+        }
+      }
+    },
+    {
+      "name": "server-defaults-materialize",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "server-args-default-empty",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [],
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "cli-args-default-empty",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "lazygit",
+            "args": []
+          }
+        }
+      }
+    },
+    {
+      "name": "cli-args-and-env",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"args\":[\"-d\",\"10\"],\"env\":{\"TERM\":\"xterm-256color\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "htop",
+            "args": [
+              "-d",
+              "10"
+            ],
+            "env": {
+              "TERM": "xterm-256color"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "contentschema-all-three-field-types",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"name\":{\"type\":\"string\",\"label\":\"Name\",\"required\":true},\"count\":{\"type\":\"number\",\"label\":\"Count\",\"default\":5},\"verbose\":{\"type\":\"boolean\",\"label\":\"Verbose\",\"default\":false}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {
+            "name": {
+              "type": "string",
+              "label": "Name",
+              "required": true
+            },
+            "count": {
+              "type": "number",
+              "label": "Count",
+              "default": 5
+            },
+            "verbose": {
+              "type": "boolean",
+              "label": "Verbose",
+              "default": false
+            }
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "contentschema-string-default",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"dir\":{\"type\":\"string\",\"label\":\"Directory\",\"default\":\"/tmp\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {
+            "dir": {
+              "type": "string",
+              "label": "Directory",
+              "default": "/tmp"
+            }
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "contentschema-empty-record",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {},
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "contentschema-number-float-default",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"ratio\":{\"type\":\"number\",\"label\":\"Ratio\",\"default\":1.5}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {
+            "ratio": {
+              "type": "number",
+              "label": "Ratio",
+              "default": 1.5
+            }
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "empty-icon-string-valid",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true},\"icon\":\"\"}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "icon": "",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "empty-url-string-valid",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"url\":\"\"}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "url": "",
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "cli-empty-envvar-valid",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"envVar\":\"\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "htop",
+            "args": [],
+            "envVar": ""
+          }
+        }
+      }
+    },
+    {
+      "name": "server-empty-readypattern-valid",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "",
+            "readyTimeout": 10000,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "server-empty-healthcheck-valid",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true,\"healthCheck\":\"\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 10000,
+            "healthCheck": "",
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "picker-empty-shortcut-valid",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":{\"shortcut\":\"\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "picker": {
+            "shortcut": ""
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "name-whitespace-valid",
+      "rawText": "{\"name\":\" \",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": " ",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "lazygit",
+            "args": []
+          }
+        }
+      }
+    },
+    {
+      "name": "args-empty-string-element-valid",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"args\":[\"\"]}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "htop",
+            "args": [
+              ""
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "terminalbehavior-both-fields",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"opencode\",\"terminalBehavior\":{\"preferredRenderer\":\"canvas\",\"scrollInputPolicy\":\"fallbackToCursorKeysWhenAltScreenMouseCapture\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "opencode",
+            "args": [],
+            "terminalBehavior": {
+              "preferredRenderer": "canvas",
+              "scrollInputPolicy": "fallbackToCursorKeysWhenAltScreenMouseCapture"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "terminalbehavior-scroll-input-policy-native",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"opencode\",\"terminalBehavior\":{\"scrollInputPolicy\":\"native\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "opencode",
+            "args": [],
+            "terminalBehavior": {
+              "scrollInputPolicy": "native"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "terminalbehavior-empty-object",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"opencode\",\"terminalBehavior\":{}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-cli-ext",
+          "version": "0.2.0",
+          "label": "Test CLI Extension",
+          "description": "A test CLI extension",
+          "category": "cli",
+          "cli": {
+            "command": "opencode",
+            "args": [],
+            "terminalBehavior": {}
+          }
+        }
+      }
+    },
+    {
+      "name": "server-readytimeout-max-safe-int",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":9007199254740991,\"singleton\":true}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-server-ext",
+          "version": "0.1.0",
+          "label": "Test Server Extension",
+          "description": "A test server extension",
+          "category": "server",
+          "server": {
+            "command": "node",
+            "args": [
+              "dist/index.js"
+            ],
+            "readyPattern": "Listening on",
+            "readyTimeout": 9007199254740991,
+            "singleton": true
+          }
+        }
+      }
+    },
+    {
+      "name": "duplicate-name-key-last-wins",
+      "rawText": "{ \"name\": \"first-name\", \"name\": \"second-name\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"x\" } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "second-name",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "cli",
+          "cli": {
+            "command": "x",
+            "args": []
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-json-text",
+      "rawText": "{ \"name\": \"x\", ",
+      "expected": {
+        "success": false,
+        "parseError": true
+      }
+    },
+    {
+      "name": "missing-most-required-fields",
+      "rawText": "{\"name\":\"x\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "version"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "label"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "description"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          },
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-name",
+      "rawText": "{\"name\":\"\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "name"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-version",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "version"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-label",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "label"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-description",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "description"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "name-wrong-type-number",
+      "rawText": "{\"name\":5,\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "name"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "version-missing",
+      "rawText": "{\"name\":\"test-server-ext\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "version"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          }
+        ]
+      }
+    },
+    {
+      "name": "description-wrong-type-boolean",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":true,\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "description"
+            ],
+            "message": "Invalid input: expected string, received boolean"
+          }
+        ]
+      }
+    },
+    {
+      "name": "category-invalid-string",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"weird\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "category-case-sensitive-CLI",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"CLI\",\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "category-wrong-type-number",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":5,\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "category-missing",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"cli\":{\"command\":\"lazygit\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-category-without-server-block",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "client-category-without-client-block",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-category-without-cli-block",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-category-with-extra-client-block",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true},\"client\":{\"entry\":\"./index.html\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-category-with-all-three-blocks",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"lazygit\"},\"client\":{\"entry\":\"./index.html\"},\"server\":{\"command\":\"node\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "refine-gated-by-unrecognized-key",
+      "rawText": "{\"name\":\"x\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"cli\",\"bogusUnknownKey\":1}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized key: \"bogusUnknownKey\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "refine-gated-by-invalid-enum",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"weird\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "refine-not-gated-by-too-small",
+      "rawText": "{\"name\":\"\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"cli\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "name"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "refine-passes-when-matching-block-has-only-check-failures",
+      "rawText": "{\"name\":\"x\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"server\",\"server\":{\"command\":\"\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "both-refine-levels-fire-deeper-first",
+      "rawText": "{\"name\":\"x\",\"version\":\"1.0.0\",\"label\":\"L\",\"description\":\"D\",\"category\":\"server\",\"cli\":{\"command\":\"c\"},\"contentSchema\":{\"f\":{\"type\":\"number\",\"label\":\"L\",\"default\":\"s\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [
+              "contentSchema",
+              "f"
+            ],
+            "message": "default value must match the declared field type"
+          },
+          {
+            "code": "custom",
+            "path": [],
+            "message": "category must have exactly its own config block (no others)"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown-top-level-key-typo",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true},\"descripton\":\"typo\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized key: \"descripton\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown-top-level-keys-plural-order",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"lazygit\"},\"aa\":1,\"zz\":2}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized keys: \"aa\", \"zz\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "picker-unknown-key-typo",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":{\"shortcut\":\"C\",\"gropu\":\"tools\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "picker"
+            ],
+            "message": "Unrecognized key: \"gropu\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-config-unknown-key-typo",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true,\"commmand\":\"node\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "server"
+            ],
+            "message": "Unrecognized key: \"commmand\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "client-config-unknown-key",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./index.html\",\"entrypoint\":\"./other.html\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "client"
+            ],
+            "message": "Unrecognized key: \"entrypoint\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-config-unknown-key-flags",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"flags\":[\"--color\"]}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "cli"
+            ],
+            "message": "Unrecognized key: \"flags\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-field-unknown-key",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"name\":{\"type\":\"string\",\"label\":\"Name\",\"placeholder\":\"Enter name\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "contentSchema",
+              "name"
+            ],
+            "message": "Unrecognized key: \"placeholder\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "terminalbehavior-unknown-key",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"terminalBehavior\":{\"preferedRenderer\":\"canvas\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "cli",
+              "terminalBehavior"
+            ],
+            "message": "Unrecognized key: \"preferedRenderer\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-command-empty",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-command-wrong-type",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":42,\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "command"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-command-missing",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"args\":[\"x\"]}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "command"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-negative",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":-1,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too small: expected number to be >0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-zero",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":0,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too small: expected number to be >0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-non-integer",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":1.5,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Invalid input: expected int, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-negative-non-integer",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":-1.5,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Invalid input: expected int, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-below-safe-int",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":-9007199254740992,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too small: expected int to be >=-9007199254740991"
+          },
+          {
+            "code": "too_small",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too small: expected number to be >0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-above-safe-int",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":9007199254740992,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_big",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too big: expected int to be <=9007199254740991"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-text-beyond-2e53-rounds",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"server\", \"server\": { \"command\": \"node\", \"readyTimeout\": 9007199254740993 } }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_big",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Too big: expected int to be <=9007199254740991"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-wrong-type-string",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":\"10000\",\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Invalid input: expected number, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-args-non-string-element",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"a\",1,\"b\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "args",
+              1
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-args-wrong-type",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":\"x\",\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "args"
+            ],
+            "message": "Invalid input: expected array, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-env-non-string-value",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":true,\"env\":{\"PORT\":3000}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "env",
+              "PORT"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-singleton-wrong-type",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":10000,\"singleton\":\"yes\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "singleton"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "client-entry-empty",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "client",
+              "entry"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "client-entry-missing",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "client",
+              "entry"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-command-empty",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "cli",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-args-non-string-element",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"args\":[\"a\",1]}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "args",
+              1
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-env-non-string-value",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"htop\",\"env\":{\"TERM\":5}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "env",
+              "TERM"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-resumeargs-non-string-element",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"resumeArgs\":[\"--resume\",42]}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "resumeArgs",
+              1
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-supportspermissionmode-wrong-type",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"supportsPermissionMode\":1}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "supportsPermissionMode"
+            ],
+            "message": "Invalid input: expected boolean, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-supportsmodel-wrong-type",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"supportsModel\":\"true\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "supportsModel"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-supportssandbox-wrong-type",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"supportsSandbox\":null}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "supportsSandbox"
+            ],
+            "message": "Invalid input: expected boolean, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-permissionmodevalues-non-string-value",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"permissionModeValues\":{\"plan\":42}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "permissionModeValues",
+              "plan"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-permissionmodeenvvar-wrong-type",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"permissionModeEnvVar\":5}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "permissionModeEnvVar"
+            ],
+            "message": "Invalid input: expected string, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-block-wrong-type",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":\"htop\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli"
+            ],
+            "message": "Invalid input: expected object, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-terminalbehavior-preferredrenderer-invalid-single-option-enum",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"terminalBehavior\":{\"preferredRenderer\":\"dom\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "cli",
+              "terminalBehavior",
+              "preferredRenderer"
+            ],
+            "message": "Invalid input: expected \"canvas\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-terminalbehavior-scrollinputpolicy-invalid-multi-option-enum",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"terminalBehavior\":{\"scrollInputPolicy\":\"weird\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "cli",
+              "terminalBehavior",
+              "scrollInputPolicy"
+            ],
+            "message": "Invalid option: expected one of \"native\"|\"fallbackToCursorKeysWhenAltScreenMouseCapture\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-invalid-field-type",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"bad\":{\"type\":\"object\",\"label\":\"Bad\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "contentSchema",
+              "bad",
+              "type"
+            ],
+            "message": "Invalid option: expected one of \"string\"|\"number\"|\"boolean\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-field-missing-type",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"label\":\"L\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_value",
+            "path": [
+              "contentSchema",
+              "f",
+              "type"
+            ],
+            "message": "Invalid option: expected one of \"string\"|\"number\"|\"boolean\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-field-missing-label",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema",
+              "f",
+              "label"
+            ],
+            "message": "Invalid input: expected string, received undefined"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-label-empty-string-valid",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\",\"label\":\"\"}}}",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "test-client-ext",
+          "version": "1.0.0",
+          "label": "Test Client Extension",
+          "description": "A test client extension",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "string",
+              "label": ""
+            }
+          },
+          "client": {
+            "entry": "./dist/index.html"
+          }
+        }
+      }
+    },
+    {
+      "name": "contentschema-number-field-string-default-mismatch",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"count\":{\"type\":\"number\",\"label\":\"Count\",\"default\":\"not-a-number\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [
+              "contentSchema",
+              "count"
+            ],
+            "message": "default value must match the declared field type"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-boolean-field-number-default-mismatch",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"flag\":{\"type\":\"boolean\",\"label\":\"Flag\",\"default\":42}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [
+              "contentSchema",
+              "flag"
+            ],
+            "message": "default value must match the declared field type"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-string-field-boolean-default-mismatch",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"name\":{\"type\":\"string\",\"label\":\"Name\",\"default\":true}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "custom",
+            "path": [
+              "contentSchema",
+              "name"
+            ],
+            "message": "default value must match the declared field type"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-default-array-invalid-union",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\",\"label\":\"L\",\"default\":[1]}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_union",
+            "path": [
+              "contentSchema",
+              "f",
+              "default"
+            ],
+            "message": "Invalid input"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-default-null-invalid-union",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\",\"label\":\"L\",\"default\":null}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_union",
+            "path": [
+              "contentSchema",
+              "f",
+              "default"
+            ],
+            "message": "Invalid input"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-required-wrong-type",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"string\",\"label\":\"L\",\"required\":\"yes\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema",
+              "f",
+              "required"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "field-refine-gated-by-aborting-member",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":{\"type\":\"number\",\"label\":\"L\",\"default\":\"s\",\"required\":\"no\"}}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema",
+              "f",
+              "required"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-field-wrong-type",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":{\"f\":\"not-an-object\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema",
+              "f"
+            ],
+            "message": "Invalid input: expected object, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "contentschema-wrong-type",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"contentSchema\":\"x\"}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "contentSchema"
+            ],
+            "message": "Invalid input: expected record, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "picker-null-rejected",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"picker\":null}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "picker"
+            ],
+            "message": "Invalid input: expected object, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "icon-null-rejected",
+      "rawText": "{\"name\":\"test-client-ext\",\"version\":\"1.0.0\",\"label\":\"Test Client Extension\",\"description\":\"A test client extension\",\"category\":\"client\",\"client\":{\"entry\":\"./dist/index.html\"},\"icon\":null}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "icon"
+            ],
+            "message": "Invalid input: expected string, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cli-env-null-rejected",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"command\":\"x\",\"env\":null}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "env"
+            ],
+            "message": "Invalid input: expected record, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-null-rejected",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"server\",\"cli\":{\"command\":\"lazygit\"},\"server\":null}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server"
+            ],
+            "message": "Invalid input: expected object, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-readytimeout-null-rejected",
+      "rawText": "{\"name\":\"test-server-ext\",\"version\":\"0.1.0\",\"label\":\"Test Server Extension\",\"description\":\"A test server extension\",\"category\":\"server\",\"server\":{\"command\":\"node\",\"args\":[\"dist/index.js\"],\"readyPattern\":\"Listening on\",\"readyTimeout\":null,\"singleton\":true}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [
+              "server",
+              "readyTimeout"
+            ],
+            "message": "Invalid input: expected number, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "top-level-array",
+      "rawText": "[]",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [],
+            "message": "Invalid input: expected object, received array"
+          }
+        ]
+      }
+    },
+    {
+      "name": "top-level-string",
+      "rawText": "\"hi\"",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [],
+            "message": "Invalid input: expected object, received string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "top-level-null",
+      "rawText": "null",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [],
+            "message": "Invalid input: expected object, received null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "top-level-number",
+      "rawText": "42",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [],
+            "message": "Invalid input: expected object, received number"
+          }
+        ]
+      }
+    },
+    {
+      "name": "top-level-boolean",
+      "rawText": "true",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "invalid_type",
+            "path": [],
+            "message": "Invalid input: expected object, received boolean"
+          }
+        ]
+      }
+    },
+    {
+      "name": "issue-order-definition-order-not-input-order",
+      "rawText": "{ \"version\": \"\", \"name\": \"\", \"category\": \"cli\", \"label\": \"\", \"description\": \"\", \"cli\": { \"command\": \"x\" } }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "name"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "too_small",
+            "path": [
+              "version"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "too_small",
+            "path": [
+              "label"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "too_small",
+            "path": [
+              "description"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unrecognized-keys-issue-position-after-field-issues",
+      "rawText": "{\"aa\":1,\"name\":\"\",\"version\":5,\"label\":\"L\",\"description\":\"D\",\"category\":\"weird\",\"zz\":2,\"cli\":{\"command\":\"x\"}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "name"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "version"
+            ],
+            "message": "Invalid input: expected string, received number"
+          },
+          {
+            "code": "invalid_value",
+            "path": [
+              "category"
+            ],
+            "message": "Invalid option: expected one of \"client\"|\"server\"|\"cli\""
+          },
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized keys: \"aa\", \"zz\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "nested-block-definition-order-pin",
+      "rawText": "{\"name\":\"test-cli-ext\",\"version\":\"0.2.0\",\"label\":\"Test CLI Extension\",\"description\":\"A test CLI extension\",\"category\":\"cli\",\"cli\":{\"env\":{\"X\":1},\"command\":\"\",\"supportsModel\":\"x\",\"bogus\":2}}",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "too_small",
+            "path": [
+              "cli",
+              "command"
+            ],
+            "message": "Too small: expected string to have >=1 characters"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "env",
+              "X"
+            ],
+            "message": "Invalid input: expected string, received number"
+          },
+          {
+            "code": "invalid_type",
+            "path": [
+              "cli",
+              "supportsModel"
+            ],
+            "message": "Invalid input: expected boolean, received string"
+          },
+          {
+            "code": "unrecognized_keys",
+            "path": [
+              "cli"
+            ],
+            "message": "Unrecognized key: \"bogus\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "proto-in-env-skipped-even-with-invalid-value",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\", \"env\": { \"__proto__\": 5, \"x\": \"y\" } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "cli",
+          "cli": {
+            "command": "c",
+            "args": [],
+            "env": {
+              "x": "y"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "proto-in-contentschema-field-never-validated",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"__proto__\": { \"type\": \"bad\" }, \"a\": { \"type\": \"string\", \"label\": \"L\" } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "a": {
+              "type": "string",
+              "label": "L"
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
+      "name": "proto-top-level-is-unrecognized-key",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\" }, \"__proto__\": 1 }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized key: \"__proto__\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "unrecognized-numeric-keys-list-in-numeric-order",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"cli\", \"cli\": { \"command\": \"c\" }, \"10\": 1, \"2\": 1 }",
+      "expected": {
+        "success": false,
+        "issues": [
+          {
+            "code": "unrecognized_keys",
+            "path": [],
+            "message": "Unrecognized keys: \"2\", \"10\""
+          }
+        ]
+      }
+    },
+    {
+      "name": "huge-int-default-rounds-like-js",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"f\": { \"type\": \"number\", \"label\": \"L\", \"default\": 12345678901234567890 } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "number",
+              "label": "L",
+              "default": 12345678901234567000
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
+      "name": "integral-float-text-default-2e53",
+      "rawText": "{ \"name\": \"x\", \"version\": \"1.0.0\", \"label\": \"L\", \"description\": \"D\", \"category\": \"client\", \"client\": { \"entry\": \"e\" }, \"contentSchema\": { \"f\": { \"type\": \"number\", \"label\": \"L\", \"default\": 9007199254740992.0 } } }",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "x",
+          "version": "1.0.0",
+          "label": "L",
+          "description": "D",
+          "category": "client",
+          "contentSchema": {
+            "f": {
+              "type": "number",
+              "label": "L",
+              "default": 9007199254740992
+            }
+          },
+          "client": {
+            "entry": "e"
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-amplifier",
+      "rawText": "{\n  \"name\": \"amplifier\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Amplifier\",\n  \"description\": \"Microsoft's Amplifier CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"amplifier\",\n    \"envVar\": \"AMPLIFIER_CMD\",\n    \"resumeArgs\": [\"session\", \"resume\", \"--full-history\", \"{{sessionId}}\"],\n    \"env\": { \"PROMPT_TOOLKIT_NO_CPR\": \"1\" }\n  },\n  \"picker\": {\n    \"shortcut\": \"A\",\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "amplifier",
+          "version": "1.0.0",
+          "label": "Amplifier",
+          "description": "Microsoft's Amplifier CLI agent",
+          "category": "cli",
+          "picker": {
+            "shortcut": "A",
+            "group": "agents"
+          },
+          "cli": {
+            "command": "amplifier",
+            "args": [],
+            "env": {
+              "PROMPT_TOOLKIT_NO_CPR": "1"
+            },
+            "envVar": "AMPLIFIER_CMD",
+            "resumeArgs": [
+              "session",
+              "resume",
+              "--full-history",
+              "{{sessionId}}"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-claude-code",
+      "rawText": "{\n  \"name\": \"claude\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Claude CLI\",\n  \"description\": \"Anthropic's Claude Code CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"claude\",\n    \"envVar\": \"CLAUDE_CMD\",\n    \"resumeArgs\": [\"--resume\", \"{{sessionId}}\"],\n    \"createSessionArgs\": [\"--session-id\", \"{{sessionId}}\"],\n    \"permissionModeArgs\": [\"--permission-mode\", \"{{permissionMode}}\"],\n    \"supportsPermissionMode\": true\n  },\n  \"picker\": {\n    \"shortcut\": \"L\",\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "claude",
+          "version": "1.0.0",
+          "label": "Claude CLI",
+          "description": "Anthropic's Claude Code CLI agent",
+          "category": "cli",
+          "picker": {
+            "shortcut": "L",
+            "group": "agents"
+          },
+          "cli": {
+            "command": "claude",
+            "args": [],
+            "envVar": "CLAUDE_CMD",
+            "resumeArgs": [
+              "--resume",
+              "{{sessionId}}"
+            ],
+            "createSessionArgs": [
+              "--session-id",
+              "{{sessionId}}"
+            ],
+            "permissionModeArgs": [
+              "--permission-mode",
+              "{{permissionMode}}"
+            ],
+            "supportsPermissionMode": true
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-codex-cli",
+      "rawText": "{\n  \"name\": \"codex\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Codex CLI\",\n  \"description\": \"OpenAI's Codex CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"codex\",\n    \"envVar\": \"CODEX_CMD\",\n    \"resumeArgs\": [\"resume\", \"{{sessionId}}\"],\n    \"modelArgs\": [\"--model\", \"{{model}}\"],\n    \"sandboxArgs\": [\"--sandbox\", \"{{sandbox}}\"],\n    \"supportsModel\": true,\n    \"supportsSandbox\": true\n  },\n  \"picker\": {\n    \"shortcut\": \"X\",\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "codex",
+          "version": "1.0.0",
+          "label": "Codex CLI",
+          "description": "OpenAI's Codex CLI agent",
+          "category": "cli",
+          "picker": {
+            "shortcut": "X",
+            "group": "agents"
+          },
+          "cli": {
+            "command": "codex",
+            "args": [],
+            "envVar": "CODEX_CMD",
+            "resumeArgs": [
+              "resume",
+              "{{sessionId}}"
+            ],
+            "modelArgs": [
+              "--model",
+              "{{model}}"
+            ],
+            "sandboxArgs": [
+              "--sandbox",
+              "{{sandbox}}"
+            ],
+            "supportsModel": true,
+            "supportsSandbox": true
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-gemini",
+      "rawText": "{\n  \"name\": \"gemini\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Gemini\",\n  \"description\": \"Google's Gemini CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"gemini\",\n    \"envVar\": \"GEMINI_CMD\"\n  },\n  \"picker\": {\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "gemini",
+          "version": "1.0.0",
+          "label": "Gemini",
+          "description": "Google's Gemini CLI agent",
+          "category": "cli",
+          "picker": {
+            "group": "agents"
+          },
+          "cli": {
+            "command": "gemini",
+            "args": [],
+            "envVar": "GEMINI_CMD"
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-kimi",
+      "rawText": "{\n  \"name\": \"kimi\",\n  \"version\": \"1.0.0\",\n  \"label\": \"Kimi\",\n  \"description\": \"Kimi CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"kimi\",\n    \"envVar\": \"KIMI_CMD\"\n  },\n  \"picker\": {\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "kimi",
+          "version": "1.0.0",
+          "label": "Kimi",
+          "description": "Kimi CLI agent",
+          "category": "cli",
+          "picker": {
+            "group": "agents"
+          },
+          "cli": {
+            "command": "kimi",
+            "args": [],
+            "envVar": "KIMI_CMD"
+          }
+        }
+      }
+    },
+    {
+      "name": "bundled-opencode",
+      "rawText": "{\n  \"name\": \"opencode\",\n  \"version\": \"1.0.0\",\n  \"label\": \"OpenCode\",\n  \"description\": \"OpenCode CLI agent\",\n  \"category\": \"cli\",\n  \"cli\": {\n    \"command\": \"opencode\",\n    \"envVar\": \"OPENCODE_CMD\",\n    \"resumeArgs\": [\"--session\", \"{{sessionId}}\"],\n    \"modelArgs\": [\"--model\", \"{{model}}\"],\n    \"supportsModel\": true,\n    \"terminalBehavior\": {\n      \"preferredRenderer\": \"canvas\",\n      \"scrollInputPolicy\": \"native\"\n    }\n  },\n  \"picker\": {\n    \"group\": \"agents\"\n  }\n}\n",
+      "expected": {
+        "success": true,
+        "data": {
+          "name": "opencode",
+          "version": "1.0.0",
+          "label": "OpenCode",
+          "description": "OpenCode CLI agent",
+          "category": "cli",
+          "picker": {
+            "group": "agents"
+          },
+          "cli": {
+            "command": "opencode",
+            "args": [],
+            "envVar": "OPENCODE_CMD",
+            "resumeArgs": [
+              "--session",
+              "{{sessionId}}"
+            ],
+            "modelArgs": [
+              "--model",
+              "{{model}}"
+            ],
+            "supportsModel": true,
+            "terminalBehavior": {
+              "preferredRenderer": "canvas",
+              "scrollInputPolicy": "native"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

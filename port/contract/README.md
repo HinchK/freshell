@@ -14,6 +14,7 @@ oracle — is measured against these files.
 | `ws-server-messages.schema.json` | JSON Schema for **every server→client message shape** (all 56), keyed by `type` discriminant, plus `wsProtocolVersion`. Synthesized from the `ServerMessage` union via the TypeScript type checker — the **outbound shape contract** for the oracle. |
 | `ws-message-inventory.json` | The **T0 conformance surface**: the `type` discriminants of every client→server and server→client message. |
 | `generate-ws-contract.ts` | The generator. Reads `shared/ws-protocol.ts` and emits the three JSON files deterministically. |
+| `generate-manifest-oracle.ts` | The **manifest-schema oracle** generator (df1 EXT-01 — separate from the WS wire contract). Drives the UNMODIFIED legacy zod schema (`server/extension-manifest.ts`) over a pinned case list and emits `crates/freshell-extensions/fixtures/manifest-oracle.json` deterministically (regenerate: `npx tsx port/contract/generate-manifest-oracle.ts`; it hard-refuses if the installed zod differs from the package-lock pin). Consumed by `cargo test -p freshell-extensions`. |
 | `nondeterministic-fields.md` | Enumeration of runtime-nondeterministic fields (ids, timestamps, ports, paths, blobs) — the input to the oracle's normalization layer. |
 
 ## Inbound vs outbound authority
