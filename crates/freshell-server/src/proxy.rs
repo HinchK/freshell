@@ -86,6 +86,13 @@ impl ProxyState {
     pub fn new(auth_token: Arc<String>) -> Self {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // The upstream target is ALWAYS 127.0.0.1, and legacy's raw
+            // `http.request` never consults proxy env vars — but reqwest's
+            // builder defaults to auto-detecting `HTTP_PROXY`/`HTTPS_PROXY`
+            // ("system proxy"), which on some hosts would shunt the loopback
+            // request through a corporate/MITM proxy. Pin no-proxy so the
+            // loopback guarantee holds under any environment.
+            .no_proxy()
             .build()
             .unwrap_or_default();
         Self { auth_token, client }
