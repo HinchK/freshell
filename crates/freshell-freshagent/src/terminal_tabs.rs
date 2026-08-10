@@ -228,7 +228,6 @@ async fn create_terminal_or_content_tab_with_delivery(
         return create_content_tab(
             &state,
             name,
-            "browser",
             json!({
                 "kind": "browser",
                 "url": url,
@@ -248,7 +247,6 @@ async fn create_terminal_or_content_tab_with_delivery(
         return create_content_tab(
             &state,
             name,
-            "editor",
             json!({
                 "kind": "editor",
                 "filePath": file_path,
@@ -276,7 +274,6 @@ async fn create_terminal_or_content_tab_with_delivery(
 fn create_content_tab(
     state: &FreshAgentState,
     name: Option<String>,
-    kind: &str,
     pane_content: Value,
     restore_key: Option<&str>,
     broadcast: bool,
@@ -295,8 +292,6 @@ fn create_content_tab(
         tab_id.clone(),
         TabRecord {
             title: name.clone(),
-            pane_id: pane_id.clone(),
-            kind: kind.to_string(),
         },
     );
     state
@@ -1072,8 +1067,6 @@ async fn create_terminal_tab(
         tab_id.clone(),
         TabRecord {
             title: name.clone(),
-            pane_id: pane_id.clone(),
-            kind: "terminal".to_string(),
         },
     );
     // The SAME paneContent this route broadcasts, attached to the store leaf

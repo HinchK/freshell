@@ -375,7 +375,7 @@ async fn rename_updates_store_title_single_pane_mirror_and_legacy_record() {
         snap["paneTitleSetByUser"][tab_id.as_str()][pane_id.as_str()],
         json!(true)
     );
-    // Legacy TabRecord.title stays updated (continuity/restore reads it).
+    // Legacy TabRecord.title stays updated (nothing reads it in production today; mirror pinned for consistency).
     assert_eq!(
         state
             .tabs
@@ -617,4 +617,109 @@ async fn tabs_prev_cycles_backwards_from_the_active_tab() {
     );
     let (_, body) = post(router, "/api/tabs/prev", json!({}), true).await;
     assert_eq!(body["data"]["tabId"], json!("t1"));
+}
+
+// ── POST /api/tabs {"agent":"opencode"} registers in the store (A1) ────────
+
+#[tokio::test]
+async fn fresh_agent_rest_create_registers_tab_and_pane_in_the_layout_store() {
+    let state = state_with_registry();
+    let router = app(state.clone());
+    let (status, body) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({ "agent": "opencode", "name": "My Agent" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tab_id = body["data"]["tabId"].as_str().unwrap().to_string();
+    let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+
+    // The store carries the tab under the SAME ids the route returned
+    // (Node mints {tabId,paneId} via layoutStore.createTab, router.ts:701).
+    let (rows, active) = state.layout.list_tabs();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], json!(tab_id));
+    assert_eq!(rows[0]["title"], json!("My Agent"));
+    assert_eq!(rows[0]["activePaneId"], json!(pane_id));
+    assert_eq!(active.as_deref(), Some(tab_id.as_str()));
+
+    // GET /api/panes: fresh-agent kind, derived "OpenCode" title
+    // (layout_store_content.rs:51), and NO terminalId key (absent = omitted).
+    let (status, body) = get(router.clone(), "/api/panes", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let panes = body["data"]["panes"].as_array().unwrap();
+    assert_eq!(panes.len(), 1, "{panes:?}");
+    assert_eq!(panes[0]["id"], json!(pane_id));
+    assert_eq!(panes[0]["kind"], json!("fresh-agent"));
+    assert_eq!(panes[0]["title"], json!("OpenCode"));
+    assert!(panes[0].get("terminalId").is_none(), "{:?}", panes[0]);
+
+    // GET /api/tabs over HTTP agrees with the store read.
+    let (status, body) = get(router, "/api/tabs", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["activeTabId"], json!(tab_id));
+    assert_eq!(body["data"]["tabs"][0]["id"], json!(tab_id));
+}
+
+#[tokio::test]
+async fn fresh_agent_rest_created_pane_renames_via_patch() {
+    let state = state_with_registry();
+    let router = app(state.clone());
+    let (status, body) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({ "agent": "opencode" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tab_id = body["data"]["tabId"].as_str().unwrap().to_string();
+    let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+
+    let (status, body) = patch(
+        router,
+        &format!("/api/panes/{pane_id}"),
+        json!({ "name": "Renamed Agent" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Pre-fix this is {message:"pane not found"}; post-fix it is the real
+    // rename result (router.ts:1420 shape), tabRenamed because single-pane.
+    assert_eq!(body["data"]["tabId"], json!(tab_id), "{body}");
+    assert_eq!(body["data"]["paneId"], json!(pane_id));
+    assert_eq!(body["data"]["tabRenamed"], json!(true));
+
+    let rows = state
+        .layout
+        .list_panes(Some(&tab_id))
+        .expect("tab in store");
+    assert_eq!(rows[0].title.as_deref(), Some("Renamed Agent"));
+}
+
+#[tokio::test]
+async fn delete_fresh_agent_tab_cleans_legacy_shadow_maps() {
+    let state = state_with_registry();
+    let router = app(state.clone());
+    let (status, body) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({ "agent": "opencode" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tab_id = body["data"]["tabId"].as_str().unwrap().to_string();
+    let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+
+    let (status, body) = delete(router, &format!("/api/tabs/{tab_id}"), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // delete_tab's legacy shadow cleanup is gated on
+    // state.tabs.remove(..).is_some() (pane_ops.rs:485-491): without A1's
+    // TabRecord registration the pane_tabs entry leaks.
+    assert!(!state.tabs.lock().unwrap().contains_key(&tab_id));
+    assert!(!state.pane_tabs.lock().unwrap().contains_key(&pane_id));
 }

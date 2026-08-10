@@ -423,8 +423,7 @@ pub(crate) async fn select_tab(
 /// (`router.ts:845`'s `if (result?.tabId)` guard). Legacy applies no length
 /// bound here (unlike `PATCH /api/panes/:id`'s `MAX_TERMINAL_TITLE_OVERRIDE_LENGTH`
 /// check) -- mirrored exactly, no bound added. The legacy `TabRecord.title`
-/// shadow is kept updated too: split/close/respawn continuity and restore
-/// still read it (see this module's top doc comment).
+/// shadow is kept updated too (nothing reads it in production today; `pane_ops_tab_tests` pins the mirror).
 pub(crate) async fn rename_tab(
     State(state): State<FreshAgentState>,
     Path(tab_id): Path<String>,
