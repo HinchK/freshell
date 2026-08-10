@@ -455,11 +455,17 @@ mod tests {
         let after = snapshot();
         // A rejected advance must not drift the clock (modulo real elapsed).
         assert!((after.now_ms - before.now_ms).abs() < 1_000);
-        assert_eq!(advance_ms(MAX_ADVANCE_MS), Ok(after_boundary_helper()));
-        // ^ 31 days exactly is IN range (boundary is inclusive).
-        fn after_boundary_helper() -> ClockSnapshot {
-            snapshot()
-        }
+        // ^ 31 days exactly is IN range (boundary is inclusive). Asserted
+        // on a FROZEN clock: the whole-snapshot equality below compares the
+        // snapshot `advance_ms` captured with a fresh `snapshot()`, and on
+        // the live path each sample calls `system_now_ms()` separately —
+        // a real-time ms tick between them would flake the equality.
+        // Frozen makes `now_ms` a pure function of core state, so the
+        // boundary probe is deterministic. (Input validation runs before
+        // `drive` on both paths, so the frozen advance still pins
+        // boundary inclusiveness.)
+        freeze().unwrap();
+        assert_eq!(advance_ms(MAX_ADVANCE_MS), Ok(snapshot()));
     }
 
     #[test]
