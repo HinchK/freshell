@@ -375,7 +375,7 @@ async fn rename_updates_store_title_single_pane_mirror_and_legacy_record() {
         snap["paneTitleSetByUser"][tab_id.as_str()][pane_id.as_str()],
         json!(true)
     );
-    // Legacy TabRecord.title stays updated (continuity/restore reads it).
+    // Legacy TabRecord.title stays updated (nothing reads it in production today; mirror pinned for consistency).
     assert_eq!(
         state
             .tabs

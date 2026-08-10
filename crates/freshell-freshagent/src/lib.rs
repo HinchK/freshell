@@ -124,8 +124,9 @@ pub struct FreshAgentState {
     /// kinds -- no process, just the content the client folds via
     /// `ui.command{tab.create}`).
     pub(crate) content_panes: Arc<Mutex<HashMap<String, Value>>>,
-    /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
-    /// tab-creating path (fresh-agent, terminal, browser, editor).
+    /// tabId -> legacy shadow record. `GET /api/tabs` reads the LayoutStore
+    /// (AUTO-03), not this map; it remains only as `delete_tab`'s cleanup
+    /// gate and `rename_tab`'s title mirror.
     pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
     /// Slice 3b-1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
     /// \u00a72.2 pane routes): paneId -> owning tabId, the reverse index
@@ -270,13 +271,13 @@ pub struct RestoreKeyEntry {
     pub delivered_to: HashSet<u64>,
 }
 
-/// A `GET /api/tabs` row (Slice 1's reduced shape -- see `terminal_tabs::list_tabs`
-/// doc comment for the deviation from legacy's full layout-tree row).
+/// Legacy per-tab shadow record. NOT the `GET /api/tabs` row -- that reads
+/// the shared LayoutStore (AUTO-03). Load-bearing only for `pane_ops`:
+/// `rename_tab` mirrors the title here, and `delete_tab` gates its legacy
+/// shadow-map cleanup on this record's presence.
 #[derive(Clone)]
 pub(crate) struct TabRecord {
     pub(crate) title: Option<String>,
-    pub(crate) pane_id: String,
-    pub(crate) kind: String,
 }
 
 impl FreshAgentState {
