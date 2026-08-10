@@ -58,7 +58,7 @@ violation.
   unconditionally fails exactly the two resend tests (`plain_resend_same_connection…`,
   `plain_resend_on_new_connection…`); `different_requestids…` stays green. Mutation was
   worktree-local, reverted before commit (`git checkout`).
-- **fmt/clippy:** `cargo fmt -p freshell-ws -- --check` clean; `cargo clippy -p freshell-ws --tests -- -D warnings` clean at `ffca688a1`.
+- **fmt/clippy:** `cargo fmt -p freshell-ws -- --check` clean and `cargo clippy -p freshell-ws --tests -- -D warnings` clean; first verified at `ffca688a1`, re-verified at `dfb5fe963` (the full-gate stamp).
 - **Spec typecheck:** `npx tsc -p test/e2e-browser/tsconfig.term04-check.json` — zero
   errors attributed to `specs/terminal-create-dedupe.spec.ts` (pre-existing dependency
   errors repro on base; per the tsconfig's own attribution rule).
@@ -69,8 +69,8 @@ violation.
 
 | Leg | Command suffix | Outcome | Notes |
 |---|---|---|---|
-| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3, exit 0 @ dfb5fe963** | THE PW-RUST proof leg. (Round-1-era intermediates: 3/3 at `3ef9b7e4c` after a spec-shaping fix for RawWsClient's R2 anti-stale rule; 3/3 at `e6fc55a3d` after the r1 fixes. Authoritative run is the latest SHA one.) |
-| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3, exit 0 @ dfb5fe963** | True parity control: the contract is legacy-native, and the legacy server passes the identical spec unmodified (global settled cache + sentinel semantics replay one terminalId across abort/reconnect/two-clients). |
+| rust-chromium | `--project=rust-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 (2.2m), exit 0 @ final HEAD** | THE PW-RUST proof leg. (Round-1-era intermediates: 3/3 at `3ef9b7e4c` after a spec-shaping fix for RawWsClient's R2 anti-stale rule; 3/3 at `e6fc55a3d` after the r1 fixes. Authoritative runs: dfb5fe963, then re-run at final HEAD after the r3 nit polish.) |
+| legacy-chromium | `--project=legacy-chromium specs/terminal-create-dedupe.spec.ts` | **green — 3/3 (32.7s), exit 0 @ final HEAD** | True parity control: the contract is legacy-native, and the legacy server passes the identical spec unmodified (global settled cache + sentinel semantics replay one terminalId across abort/reconnect/two-clients). |
 
 ## File map for the spec
 
@@ -195,3 +195,26 @@ Substantive findings, all reproduced and fixed:
 - **[nit] Plan-anchor off-by-ones + the INVALID restore-frame mid-edit artifact** in
   `docs/plans/df1/TERM-04.md`: anchors corrected (:921-936, :2259-2319); the frame
   discussion now leads with the DO-NOT-USE note.
+
+## Review round 3 (fresheyes independent review #3, claude provider): PASSED
+
+"Round-2 fixes are correct in code, not just in the changelog" — every corrected anchor
+line-exact, the leg-C marker round-trip verified end-to-end against the fixture rule
+engine + PTY line discipline + TerminalHelper typing path, provenance confirmed
+(`dfb5fe963` → final-HEAD delta is docs-only / pre-commit-identical), own re-run of the
+tsc gate reproduced. Remaining minor/nit items, all closed in the final commit (no
+further round needed per the reviewer's own stop rule):
+
+- Leg-A comment now states the DETERMINISTIC settled-window truth (ledger row ⇒ child
+  booted ⇒ create settled before the abort) and points at the in-flight window's real
+  pins (`resend_on_new_connection_never_swallowed_while_inflight` + unit waiter tests).
+- "One fixture launch record" is no longer `≥1`-shaped: both raw legs re-read the ledger
+  AFTER the inventory poll (closes the wrongful-child-boot lag window); leg C's ledger
+  truth rides on the answered-duplicate terminalId match (a Proceed answers a DIFFERENT
+  id before any ledger read).
+- Leg C: `waitForOutput` now pinned to `terminalId`; page-B pane tree asserted to contain
+  NO leaf owning T (the negative half of "one pane owner"); single-socket WS-tap scope
+  documented.
+- `waiter_error` doc anchor updated (the last `TerminalView.tsx:3995-3999` → :4702);
+  "a RATE_LIMITED" grammar; probe-record stamp consistency (clippy/fmt at dfb5fe963);
+  MATRIX registration comment now notes the default chromium project also matches.

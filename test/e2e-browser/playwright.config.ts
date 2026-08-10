@@ -117,9 +117,12 @@ const MATRIX_SPECS = [
   /harness-06-misc-fixtures\.spec\.ts$/,
   // TERM-04 — terminal.create requestId dedupe (retry/reconnect/lost-reply/
   // two-clients → one PTY/one terminalId/one pane owner/one fixture launch).
-  // Serviced by BOTH servers (legacy's server-global `createdTerminalByRequestId`
-  // settled cache is the parity source), so legacy-chromium runs as a true
-  // parity control. See docs/plans/df1-evidence/TERM-04.md.
+  // Serviced by BOTH server kinds (legacy's server-global
+  // `createdTerminalByRequestId` settled cache is the parity source), so
+  // legacy-chromium runs as a true parity control; the default `chromium`
+  // match-all project also picks it up (with the fixture-default legacy
+  // server) — browser-independent content, standard for MATRIX_SPECS. See
+  // docs/plans/df1-evidence/TERM-04.md.
   /terminal-create-dedupe\.spec\.ts$/,
 ]
 

@@ -183,9 +183,15 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     // the connection dies — otherwise the resend below would be a fresh
     // create and the test would pass without exercising dedupe at all.
     await waitForLedgerRows(ledgerPath, 1)
-    // NOW kill the asker: the terminal.created reply is either already on
-    // the wire to a socket that never reads it, or not yet sent — exactly
-    // the intercepted/delayed-then-lost response shape.
+    // NOW kill the asker. Because the ledger row only exists after the child
+    // booted — strictly after the server settled the create and pushed
+    // terminal.created — the reply deterministically lands in the dead
+    // socket's receive buffer: the settled-entry/lost-reply shape (the
+    // checklist's "intercept/delay the first terminal.created, force
+    // reconnect" leg). The in-flight/waiter window of the same contract is
+    // pinned separately by restore_spawn_gate.rs
+    // (resend_on_new_connection_never_swallowed_while_inflight) and the unit
+    // waiter tests.
     asking.abort()
     await asking.dispose()
 
@@ -213,9 +219,15 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     }
 
     // One terminal ID in the server inventory, and it is the replied one.
+    // The inventory poll gives a wrongful second spawn a real window to
+    // surface (a Proceed-resend creates a second running row); the ledger
+    // re-check afterwards then closes the child-boot lag (a duplicate's
+    // ledger row lands tens of ms after its spawn, strictly before this
+    // point is reached).
     await expect
       .poll(() => runningTerminalIds(info), { timeout: 10_000 })
       .toEqual([created.terminalId])
+    expect(await readLedger(ledgerPath)).toHaveLength(1)
 
     await reconnected.dispose()
   })
@@ -259,6 +271,8 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     await expect
       .poll(() => runningTerminalIds(info), { timeout: 10_000 })
       .toEqual([r1.terminalId])
+    // Same lag-closing re-check as leg A (see its comment).
+    expect(await readLedger(ledgerPath)).toHaveLength(1)
 
     await c1.dispose()
     await c2.dispose()
@@ -319,7 +333,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
       .toBe(terminalId)
     const termA = new TerminalHelper(pageA)
     await termA.executeCommand('term04-ping')
-    await termA.waitForOutput('term04-pong-marker', { timeout: 15_000 })
+    await termA.waitForOutput('term04-pong-marker', { timeout: 15_000, terminalId })
     expect(await readLedger(ledgerPath)).toHaveLength(1)
 
     // Second real page: issue the SAME create request over its own real WS
@@ -333,7 +347,9 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     const contextB = await browser.newContext()
     const pageB = await contextB.newPage()
     const harnessB = new TestHarness(pageB)
-    // Attach the tap BEFORE navigation creates the socket.
+    // Attach the tap BEFORE navigation creates the socket. (The tap binds
+    // page B's boot-time socket only; leg C performs no reconnect on page B,
+    // so no later socket needs observing.)
     const wsEventPromise = pageB.waitForEvent('websocket', { timeout: 15_000 })
     await pageB.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const pageBWs = await wsEventPromise
@@ -381,6 +397,21 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     const leafAfter = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))
     expect(leafAfter.content.terminalId).toBe(terminalId)
     expect(leafAfter.content.createRequestId).toBe(requestId)
+    // One pane owner, BOTH halves: page B's own pane tree must not have
+    // adopted the terminal either (the checklist's "one pane owner").
+    const pageBOwnersT: boolean = await pageB.evaluate((tid) => {
+      const st = window.__FRESHELL_TEST_HARNESS__?.getState()
+      const layouts = st?.panes?.layouts ?? {}
+      const stack: any[] = Object.values(layouts)
+      while (stack.length) {
+        const node = stack.pop()
+        if (!node) continue
+        if (node.type === 'leaf' && node.content?.terminalId === tid) return true
+        for (const child of node.children ?? []) stack.push(child)
+      }
+      return false
+    }, terminalId)
+    expect(pageBOwnersT).toBe(false)
     // Page B stays healthy (its unicast reply must not wedge its app).
     expect(await harnessB.getConnectionStatus()).toBe('ready')
 

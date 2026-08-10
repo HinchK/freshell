@@ -13,7 +13,7 @@
 //!
 //! - `plain_resend_same_connection_replays_settled_terminal` — retry on the
 //!   same socket after settlement: replay, no respawn (the reply is a
-//!   `terminal.created`, so an RATE_LIMITED error frame would fail the await —
+//!   `terminal.created`, so a RATE_LIMITED error frame would fail the await —
 //!   dedupe preceding the limiter is what makes this leg deterministic).
 //! - `plain_resend_on_new_connection_replays_settled_terminal` — the lost
 //!   response: the first client's `terminal.created` arrived but its pane is

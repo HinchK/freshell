@@ -98,8 +98,8 @@ pub enum DedupeDecision {
 
 /// The fail-loud frame forwarded to waiters on a non-settled exit — the
 /// same `{ code, message, requestId }` shape `send_create_error` builds
-/// (Task 4 Step 5), so the frozen client's requestId match
-/// (TerminalView.tsx:3995-3999) fails the pane loud and its retry ladder
+/// (Task 4 Step 5), so the frozen client's requestId error match
+/// (TerminalView.tsx:4702) fails the pane loud and its retry ladder
 /// re-drives with the same requestId (the sentinel is gone by then, so
 /// the retry proceeds as a fresh create).
 fn waiter_error(request_id: &str) -> ServerMessage {
