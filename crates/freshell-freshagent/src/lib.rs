@@ -1394,8 +1394,13 @@ async fn create_tab(
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
-    let tab_id = Uuid::new_v4().to_string();
-    let pane_id = Uuid::new_v4().to_string();
+    // A1 (naming-sweep ledger deferral): the shared LayoutStore mints
+    // {tabId, paneId} -- Node does the same for fresh-agent tabs
+    // (`layoutStore.createTab`, router.ts:701) -- so REST/MCP-created
+    // fresh-agent tabs are visible to GET /api/tabs + GET /api/panes and
+    // renamable via PATCH /api/panes/:id, exactly like the
+    // terminal/browser/editor paths (`terminal_tabs::create_content_tab`).
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     // `makePlaceholderSessionId(requestId)` = `freshopencode-<requestId>` (adapter.ts:75).
     let request_id = Uuid::new_v4().simple().to_string();
     let placeholder = format!("freshopencode-{request_id}");
@@ -1419,18 +1424,15 @@ async fn create_tab(
         pane_content["effort"] = json!(effort);
     }
 
-    // Broadcast ui.command{tab.create} (broadcastUiCommand → broadcast to ALL clients,
-    // router.ts:704) so the capture socket records the `ui.command` wire type.
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
-        command: "tab.create".to_string(),
-        payload: Some(json!({
-            "id": tab_id,
-            "title": name,
-            "paneId": pane_id,
-            "paneContent": pane_content,
-        })),
-    }));
-
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
+    state.tabs.lock().expect("tabs mutex").insert(
+        tab_id.clone(),
+        TabRecord {
+            title: name.clone(),
+        },
+    );
     state.panes.lock().expect("panes mutex").insert(
         pane_id.clone(),
         PaneEntry {
@@ -1441,17 +1443,36 @@ async fn create_tab(
             durable_id: None,
         },
     );
-    // Slice 3b-1: every pane-minting path records its owning tab in the
-    // shared `pane_tabs` reverse index (see the field's doc comment) so
-    // `pane_ops`'s split/close/select handlers can resolve this pane's tab
-    // even though this crate keeps no fresh-agent `TabRecord` (the
-    // fresh-agent path never touches `state.tabs` -- see `terminal_tabs`'s
-    // module doc for why that's an intentional, separately-scoped gap).
+    // Every pane-minting path records its owning tab in the shared
+    // `pane_tabs` reverse index so `pane_ops`'s split/close/select handlers
+    // can resolve this pane's tab.
     state
         .pane_tabs
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+
+    // Broadcast AFTER registration -- Node's order is createTab -> runtime
+    // create -> attachPaneContent -> broadcast -> respond (router.ts:546-589),
+    // and `create_content_tab` likewise inserts before broadcasting.
+    // Shape note (validated): Node OMITS the `title` key when no name was
+    // provided (JSON.stringify drops undefined, router.ts:704). Serialize
+    // the same shape instead of `"title": null` -- the shared client
+    // tolerates both (`payload.title ||`, tabsSlice.ts:306), but keep the
+    // broadcast Node-shaped. If an existing test pins a null-title
+    // broadcast, update it to this shape.
+    let mut create_payload = json!({
+        "id": tab_id,
+        "paneId": pane_id,
+        "paneContent": pane_content,
+    });
+    if let Some(name) = &name {
+        create_payload["title"] = json!(name);
+    }
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "tab.create".to_string(),
+        payload: Some(create_payload),
+    }));
 
     ok_json(
         json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
