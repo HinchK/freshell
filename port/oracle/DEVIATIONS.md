@@ -969,6 +969,41 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   coding-CLI terminal already exited still persists; previously the pane kept the stale name
   until a sidebar click (or the rename was silently lost).
 
+### EDEV-10 — Pane-rename cascade finalizes `titleSource:'user'` on the session override (Node writes a plain `{titleOverride}` the sweep can steal)
+- what_differs: `PATCH /api/panes/:id`'s syncable-terminal cascade persists the
+  session override as `{titleOverride, titleSource:'user'}`
+  (`crates/freshell-server/src/main.rs::SettingsRenamePersistence::patch_session_override_title`).
+  Node's `persistSyncableTerminalRename` writes a plain `{titleOverride}` with
+  NO `titleSource` (`server/agent-api/router.ts:679-681`), leaving the
+  title-source ladder rung unfinalized.
+- why_intentional: Rust is the better side. A pane rename is a USER rename.
+  When the rename lands BEFORE the auto-title sweep finalizes the session
+  (dir/absent rung), the unfinalized row makes the next sweep pass compute the
+  first-message patch and permanently steal the rename — override, registry
+  title, and a stale `terminal.title.updated` push; every later pass then sees
+  registry == override and never heals (Node's per-session fresh override read
+  does NOT close this window: a fresh read of an unfinalized row clobbers just
+  the same, `server/auto-title.ts` first-message-wins). The `user` rung matches
+  what BOTH servers already write on the terminals-route rename cascade
+  (`crates/freshell-server/src/terminals.rs:1000-1004`; Node
+  `rename-cascade.ts:26` default `titleSource='user'`) — Node's panes route is
+  internally inconsistent with its own terminals route. Surfaced by the final
+  full-suite gate: title-sync-convergence Test 3 under parallel load.
+- evidence: RED-first regression
+  `crates/freshell-server/src/auto_title_sweep.rs::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`
+  (RED: sweep rewrote the override to
+  `{"titleOverride":"convergence gamma automation rename journey","titleSource":"first-message"}`;
+  GREEN with the `'user'` write). Ladder interaction: a later sweep
+  `{first-message}` patch is rejected against the `user` rung
+  (`settings_store.rs::can_upgrade_title`), and an in-flight pass that
+  snapshotted overrides before the rename has its stale override write
+  ladder-rejected at the store, so any stale registry push self-corrects on
+  the next tick.
+- user_impact: renaming a coding-CLI pane via the automation surface (REST/MCP)
+  right after opening a session no longer loses the new name to the background
+  auto-title sweep; the sidebar, registry, and session directory keep the
+  user's title.
+
 <!--
 Template:
 

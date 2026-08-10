@@ -27,8 +27,14 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 pub trait RenamePersistence: Send + Sync {
     /// `configStore.patchTerminalOverride(terminalId, {titleOverride})` (`router.ts:681`).
     fn patch_terminal_override_title(&self, terminal_id: &str, title: &str) -> BoxFuture<()>;
-    /// key = "provider:sessionId"; NO titleSource — bypasses the ladder on purpose
-    /// (persistSyncableTerminalRename, router.ts:683: plain {titleOverride}).
+    /// key = "provider:sessionId". The write is a USER rename: the live
+    /// implementation (`main.rs::SettingsRenamePersistence`) finalizes
+    /// `titleSource:'user'` alongside the title — a deliberate divergence
+    /// from Node's plain `{titleOverride}` patch
+    /// (persistSyncableTerminalRename, router.ts:679-681), ledgered as
+    /// EDEV-10: an unfinalized rung lets the auto-title sweep's
+    /// first-message pass permanently steal a rename that lands before the
+    /// session finalizes.
     fn patch_session_override_title(&self, key: &str, title: &str) -> BoxFuture<()>;
 }
 

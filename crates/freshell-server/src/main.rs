@@ -77,11 +77,18 @@ fn load_dotenv_from(dir: &Path) {
 /// Task 16 (`PATCH /api/panes/:id` cascade): the production
 /// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
 /// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
-/// live settings store. Both writes are plain `{titleOverride}` patches; the
-/// session write carries NO `titleSource` ON PURPOSE, mirroring the
-/// original's plain `{titleOverride}` patch (the title-source ladder only
-/// engages when BOTH title keys are patched — see
-/// [`settings_store::SettingsStore::patch_session_override`]).
+/// live settings store. The terminal write is a plain `{titleOverride}`
+/// patch (terminal overrides have no source ladder). The session write
+/// carries `titleSource:'user'` — a DELIBERATE divergence from Node's plain
+/// `{titleOverride}` patch (`persistSyncableTerminalRename`,
+/// `router.ts:679-681`), ledgered as EDEV-10 in `port/oracle/DEVIATIONS.md`:
+/// a pane rename is a USER rename, and leaving the ladder rung unfinalized
+/// lets the auto-title sweep's first-message pass permanently steal a rename
+/// that lands before the session finalizes (pinned RED-first by
+/// `auto_title_sweep::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`).
+/// This matches the `user` rung both servers already write on the
+/// terminals-route cascade (`terminals.rs:1000-1004`; Node
+/// `rename-cascade.ts:26`).
 struct SettingsRenamePersistence(settings_store::SettingsStore);
 
 impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
@@ -110,7 +117,13 @@ impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
         let title = serde_json::json!(title);
         Box::pin(async move {
             let _ = store
-                .patch_session_override(&key, &[("titleOverride", Some(title))])
+                .patch_session_override(
+                    &key,
+                    &[
+                        ("titleOverride", Some(title)),
+                        ("titleSource", Some(serde_json::json!("user"))),
+                    ],
+                )
                 .await;
         })
     }
