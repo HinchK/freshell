@@ -112,7 +112,7 @@ async fn proxy(
     method: Method,
     headers: HeaderMap,
     uri: Uri,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     // Split `<port>` off the front of the RAW, never-percent-decoded path
     // (`uri.path()` — proven raw by `lb_probes::l1_...`). Extracting the
@@ -147,7 +147,7 @@ async fn forward(
     method: Method,
     headers: HeaderMap,
     uri: Uri,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
@@ -177,8 +177,23 @@ async fn forward(
         fwd_headers.append(name.clone(), value.clone());
     }
     req = req.headers(fwd_headers);
-    if !body.is_empty() {
-        req = req.body(body);
+    // Stream the request body (never buffer it): the incoming hyper body
+    // becomes the outgoing reqwest body chunk-for-chunk, so multi-MiB uploads
+    // pass through (no `Bytes` extraction → no 2 MiB `DefaultBodyLimit` 413)
+    // and chunked uploads are observable upstream incrementally — legacy's
+    // `req.pipe(proxyReq)` (`proxy-router.ts:119-120`). A body is attached
+    // only when the client DECLARED one (the only two HTTP/1.1 framings);
+    // attaching an empty streamed body to a plain GET would spontaneously
+    // re-frame it as `transfer-encoding: chunked`.
+    // The client's original `content-length` is among the forwarded headers
+    // (it is NOT in `STRIPPED_REQUEST_HEADERS`), and reqwest honors an
+    // explicit content-length alongside a streamed body (probe L5), so
+    // length-declared uploads keep their exact framing — legacy's header
+    // passthrough + piped bytes.
+    let declared_body = headers.contains_key(axum::http::header::CONTENT_LENGTH)
+        || headers.contains_key(axum::http::header::TRANSFER_ENCODING);
+    if declared_body {
+        req = req.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
 
     let upstream = match req.send().await {
@@ -1020,5 +1035,162 @@ mod socket_contract_g1 {
                 "upstream must receive the byte-exact raw path+query (legacy: raw req.url)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_contract_g3 {
+    use super::wire_support::*;
+    use super::*;
+
+    const TOKEN: &str = "contract-token-0123456789abcdef";
+
+    fn spawn_proxy_router() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        port
+    }
+
+    fn capture_upstream() -> (u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        (port, captured)
+    }
+
+    /// G3 (capacity + framing): a multi-MiB body must stream through — legacy
+    /// pipes the raw request stream with NO size ceiling (`req.pipe(proxyReq)`,
+    /// `proxy-router.ts:119-120`; only the pre-proxy `express.json` 1MB cap
+    /// touches JSON). The original `content-length` rides along (legacy strips
+    /// only host/connection/transfer-encoding), so upstream never sees a
+    /// re-framed chunked upload when the client declared a length.
+    #[tokio::test]
+    async fn large_body_streams_through_with_original_content_length() {
+        let (upstream_port, captured) = capture_upstream();
+        let proxy_port = spawn_proxy_router();
+        let big: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        let mut request = format!(
+            "POST /api/proxy/http/{upstream_port}/upload HTTP/1.1\r\n\
+             host: 127.0.0.1:{proxy_port}\r\n\
+             x-auth-token: {TOKEN}\r\n\
+             content-type: application/octet-stream\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\r\n",
+            big.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&big);
+        let resp = raw_exchange(proxy_port, &request).await;
+        assert_eq!(resp.status_code(), 200, "3 MiB upload must not 413");
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].header_values("content-length").collect::<Vec<_>>(),
+            vec![big.len().to_string()],
+            "upstream must see the ORIGINAL content-length, not a re-framed body"
+        );
+        assert_eq!(
+            got[0].header_values("transfer-encoding").count(),
+            0,
+            "no chunked re-framing when the client declared a length"
+        );
+        assert_eq!(got[0].body.len(), big.len(), "byte count preserved");
+        assert!(got[0].body == big, "every byte preserved");
+    }
+
+    /// G3 (incrementality): the first body chunk must be observable UPSTREAM
+    /// before the client has sent the last chunk — i.e. the proxy streams the
+    /// request body instead of fully buffering it. Signal-gated both ways:
+    /// zero wall-clock sleeps; pre-fix this deadlocks into the read deadline
+    /// (the buffered extractor waits for a complete body the client is
+    /// holding back), post-fix it flows.
+    #[tokio::test]
+    async fn request_body_chunks_arrive_upstream_incrementally() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let seen_tx = Arc::new(tokio::sync::Mutex::new(Some(seen_tx)));
+        let full_body = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let fb = Arc::clone(&full_body);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let seen_tx = Arc::clone(&seen_tx);
+            let fb = Arc::clone(&fb);
+            async move {
+                let _head = wire.read_until(b"\r\n\r\n").await;
+                // First chunk only (frame: "5\r\nhello\r\n").
+                let size_line = wire.read_until(b"\r\n").await;
+                assert_eq!(String::from_utf8_lossy(&size_line).trim(), "5");
+                let first = wire.read_n(5).await;
+                let crlf = wire.read_n(2).await;
+                assert_eq!(crlf, b"\r\n");
+                // Prove arrival BEFORE the client's final chunk leaves.
+                if let Some(tx) = seen_tx.lock().await.take() {
+                    let _ = tx.send(first.clone());
+                }
+                let mut body = first;
+                // Remaining chunks through the terminator.
+                body.extend_from_slice(&wire.read_chunked().await);
+                fb.lock().await.extend_from_slice(&body);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let proxy_port = spawn_proxy_router();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
+            let mut wire = Wire::new(stream);
+            let head = format!(
+                "POST /api/proxy/http/{upstream_port}/stream-upload HTTP/1.1\r\n\
+                 host: 127.0.0.1:{proxy_port}\r\n\
+                 x-auth-token: {TOKEN}\r\n\
+                 content-type: text/plain\r\n\
+                 transfer-encoding: chunked\r\n\
+                 connection: close\r\n\r\n"
+            );
+            wire.write_all(head.as_bytes()).await;
+            wire.write_all(b"5\r\nhello\r\n").await;
+
+            // The upstream MUST observe the first chunk while the client is
+            // still holding the second one back.
+            let first = seen_rx.await.expect("upstream must see the first chunk");
+            assert_eq!(first, b"hello");
+
+            wire.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
+
+            let resp_head = wire.read_until(b"\r\n\r\n").await;
+            let (status_line, headers) = parse_head(&resp_head);
+            assert_eq!(status_line, "HTTP/1.1 200 OK");
+            // Framing-agnostic body drain (content-length forwarding is G4).
+            let _body = if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
+                wire.read_chunked().await
+            } else if let Some(cl) = header_values(&headers, "content-length").next() {
+                wire.read_n(cl.parse().unwrap()).await
+            } else {
+                wire.read_to_eof().await
+            };
+        })
+        .await
+        .expect("request body must stream (deadlock = full buffering)");
+
+        assert_eq!(
+            full_body.lock().await.as_slice(),
+            b"helloworld",
+            "reassembled upstream body is the full stream"
+        );
     }
 }
