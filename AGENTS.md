@@ -151,6 +151,21 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
   run test/integration/real/ --config config/vitest/vitest.server.config.ts
 ```
 
+### Vitest Test Backend (Cloud Run Jobs)
+
+Vitest unit/server test suites can run locally or on Google Cloud Run Jobs. The `FRESHELL_VITEST_BACKEND` environment variable controls the default:
+- **Unset or `"local"`**: run locally (the safe default for new clones)
+- **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~5 min local, ~$0.02/run)
+
+```bash
+npm run test:cloud          # Run vitest on Cloud Run Jobs (client + server suites)
+npm run test:cloud:build    # Build and push the Docker image to Artifact Registry
+```
+
+**If `FRESHELL_VITEST_BACKEND` is not set, ask the user which way to set it** before running cloud vitest tests. Explain that cloud is faster (parallel shards, ~2-3 min vs ~5 min) but is a paid Google Cloud service (~$0.02/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
+
+**Note:** The electron suite always runs locally even in cloud mode (it needs a display and native modules not available in the container).
+
 ## Architecture
 
 ### Tech Stack
