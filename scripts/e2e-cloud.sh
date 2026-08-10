@@ -252,11 +252,22 @@ cmd_run() {
   # Build a YAML env-vars file for the Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
   # --set-env-vars splits on spaces, breaking PLAYWRIGHT_ARGS.
+  # PLAYWRIGHT_ARGS is NEWLINE-delimited (one arg per line, YAML literal
+  # block scalar) so args CONTAINING spaces (e.g. --grep "foo bar") or YAML
+  # metacharacters survive verbatim — a space-joined quoted scalar would be
+  # re-split on spaces by the entrypoint and quotes could corrupt the YAML.
   # Note: CLOUD_RUN_TASK_COUNT and CLOUD_RUN_TASK_INDEX are reserved env vars
   # set automatically by Cloud Run when --tasks > 1 — do NOT set them here.
   local env_file
   env_file=$(mktemp /tmp/e2e-env-vars.XXXXXX.yaml)
-  echo "PLAYWRIGHT_ARGS: \"${pw_args[*]}\"" > "$env_file"
+  if [ "${#pw_args[@]}" -gt 0 ]; then
+    {
+      echo "PLAYWRIGHT_ARGS: |-"
+      printf '  %s\n' "${pw_args[@]}"
+    } > "$env_file"
+  else
+    echo 'PLAYWRIGHT_ARGS: ""' > "$env_file"
+  fi
 
   # Create or update the Cloud Run Job (create fails if it already exists,
   # fall back to update).

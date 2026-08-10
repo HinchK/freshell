@@ -20,8 +20,10 @@
 #
 # Args can be passed two ways:
 # 1. As container args (docker run ... --project=chromium auth.spec.ts)
-# 2. Via PLAYWRIGHT_ARGS env var (space-separated, for Cloud Run Jobs where
-#    --args uses comma separators that conflict with Playwright arg values)
+# 2. Via PLAYWRIGHT_ARGS env var (NEWLINE-separated, one arg per line — for
+#    Cloud Run Jobs where --args uses comma separators that conflict with
+#    Playwright arg values; newline-delimited so args containing spaces,
+#    e.g. --grep "foo bar", survive verbatim)
 #
 # If both are present, they are combined.
 #
@@ -46,17 +48,19 @@ DRY_RUN=false
 FLAGS=()
 SPEC_FILTERS=()
 
-# From PLAYWRIGHT_ARGS env (space-separated).
+# From PLAYWRIGHT_ARGS env (newline-separated — one arg per line, so args
+# containing spaces are never re-split; see e2e-cloud.sh's --env-vars-file
+# emission).
 if [ -n "${PLAYWRIGHT_ARGS:-}" ]; then
-  # shellcheck disable=SC2206
-  for arg in $PLAYWRIGHT_ARGS; do
+  while IFS= read -r arg; do
+    [ -z "$arg" ] && continue
     case "$arg" in
       --dry-run) DRY_RUN=true ;;
       --shard=*) ;;  # strip stale shard flags (entrypoint handles sharding)
       -*) FLAGS+=("$arg") ;;
       *) SPEC_FILTERS+=("$arg") ;;
     esac
-  done
+  done <<< "$PLAYWRIGHT_ARGS"
 fi
 
 # From container args ($@).

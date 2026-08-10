@@ -186,5 +186,44 @@ if ! echo "$NO_GCLOUD_HELP" | grep -qi "usage"; then
 fi
 echo "PASS: help works without gcloud on PATH"
 
+# Check 13: pass-through args CONTAINING SPACES survive end-to-end.
+# Two halves:
+#  (a) local path: `run --local` execs playwright with the raw arg array —
+#      `--grep "auth modal"` (two whitespace-separated words, one arg)
+#      must filter auth.spec.ts down to exactly its 3 modal-titled tests.
+#  (b) cloud path: the container entrypoint reads PLAYWRIGHT_ARGS
+#      newline-delimited (e2e-cloud.sh emits a YAML literal block scalar)
+#      and must NOT word-split on spaces — pinned via the single-task
+#      --dry-run echo, where a split arg would land in the spec-filter
+#      tail instead of the flags list.
+echo "Testing: spaced --grep arg filters locally (pass-through array)"
+GREP_LOCAL_OUTPUT=$("$SCRIPT" run --local --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line --grep "auth modal" 2>&1) || {
+  echo "FAIL: --local run with spaced --grep failed"
+  echo "$GREP_LOCAL_OUTPUT" | tail -20
+  exit 1
+}
+if ! echo "$GREP_LOCAL_OUTPUT" | grep -q "3 passed"; then
+  echo "FAIL: expected '3 passed' for --grep 'auth modal' (spaced arg corrupted?)"
+  echo "$GREP_LOCAL_OUTPUT" | tail -20
+  exit 1
+fi
+echo "PASS: spaced --grep arg survives local pass-through"
+
+echo "Testing: spaced args survive PLAYWRIGHT_ARGS newline round-trip (entrypoint)"
+ENTRYPOINT="$ROOT/docker/cloud-run/entrypoint.sh"
+DRY_OUTPUT=$(CLOUD_RUN_TASK_COUNT=1 \
+  PLAYWRIGHT_ARGS="$(printf -- '--grep=wrap-review spaced sentinel\n--project=chromium')" \
+  "$ENTRYPOINT" --dry-run 2>&1) || {
+  echo "FAIL: entrypoint --dry-run with spaced PLAYWRIGHT_ARGS died"
+  echo "$DRY_OUTPUT" | tail -10
+  exit 1
+}
+if ! echo "$DRY_OUTPUT" | grep -q -- "--grep=wrap-review spaced sentinel --project=chromium"; then
+  echo "FAIL: spaced arg was word-split by the entrypoint (expected intact flag in dry-run echo)"
+  echo "$DRY_OUTPUT" | tail -10
+  exit 1
+fi
+echo "PASS: entrypoint keeps space-containing PLAYWRIGHT_ARGS entries intact"
+
 echo ""
 echo "=== All checks passed ==="
