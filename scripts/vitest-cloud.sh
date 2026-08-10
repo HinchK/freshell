@@ -21,6 +21,7 @@
 #   --local           Run locally (overrides FRESHELL_VITEST_BACKEND)
 #   --cloud           Run on Cloud Run (overrides FRESHELL_VITEST_BACKEND)
 #   --build           Force image rebuild + push before running
+#   --local-build     Build locally with Docker instead of Cloud Build
 #   --shards=N        Number of parallel Cloud Run tasks (default: 4)
 #   --timeout=DURATION Cloud Run task timeout (default: 30m)
 #   --config=default|server|all  Which vitest configs to run (default: all)
@@ -87,6 +88,7 @@ Flags:
   --local           Run locally (overrides FRESHELL_VITEST_BACKEND)
   --cloud           Run on Cloud Run (overrides FRESHELL_VITEST_BACKEND)
   --build           Force image rebuild + push before running
+  --local-build     Build locally with Docker instead of Cloud Build
   --shards=N        Number of parallel Cloud Run tasks (default: 4)
   --timeout=DURATION Cloud Run task timeout (default: 30m)
   --config=default|server|all  Which vitest configs to run (default: all)
@@ -110,10 +112,35 @@ EOF
 # Subcommand: build
 # ---------------------------------------------------------------------------
 cmd_build() {
-  echo "[vitest-cloud] Building Docker image..."
-  docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
-  echo "[vitest-cloud] Image built: $IMAGE_LOCAL"
-  cmd_push
+  local local_build=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-build)
+        local_build=true
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  if $local_build; then
+    echo "[vitest-cloud] Building Docker image locally..."
+    docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
+    echo "[vitest-cloud] Image built: $IMAGE_LOCAL"
+    cmd_push
+  else
+    echo "[vitest-cloud] Building Docker image via Cloud Build..."
+    gcloud builds submit \
+      --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
+      --account="$GCP_ACCOUNT" \
+      --project="$GCP_PROJECT" \
+      --substitutions=_IMAGE="$IMAGE_REMOTE" \
+      "$ROOT"
+    echo "[vitest-cloud] Cloud Build complete: $IMAGE_REMOTE"
+  fi
 }
 
 # ---------------------------------------------------------------------------

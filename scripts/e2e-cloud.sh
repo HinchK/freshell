@@ -21,6 +21,7 @@
 #   --local           Run locally (overrides FRESHELL_E2E_BACKEND)
 #   --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
 #   --build           Force image rebuild + push before running
+#   --local-build     Build locally with Docker instead of Cloud Build
 #   --shards=N        Number of parallel Cloud Run tasks (default: 1)
 #   --timeout=DURATION Cloud Run task timeout (default: 60m)
 #   --grep=PATTERN    Pass --grep=PATTERN to Playwright
@@ -87,6 +88,7 @@ Flags:
   --local           Run locally (overrides FRESHELL_E2E_BACKEND)
   --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
   --build           Force image rebuild + push before running
+  --local-build     Build locally with Docker instead of Cloud Build
   --shards=N        Number of parallel Cloud Run tasks (default: 1)
   --timeout=DURATION Cloud Run task timeout (default: 60m)
   --grep=PATTERN    Pass --grep=PATTERN to Playwright
@@ -112,10 +114,35 @@ EOF
 # Subcommand: build
 # ---------------------------------------------------------------------------
 cmd_build() {
-  echo "[e2e-cloud] Building Docker image..."
-  docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
-  echo "[e2e-cloud] Image built: $IMAGE_LOCAL"
-  cmd_push
+  local local_build=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-build)
+        local_build=true
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  if $local_build; then
+    echo "[e2e-cloud] Building Docker image locally..."
+    docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
+    echo "[e2e-cloud] Image built: $IMAGE_LOCAL"
+    cmd_push
+  else
+    echo "[e2e-cloud] Building Docker image via Cloud Build..."
+    gcloud builds submit \
+      --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
+      --account="$GCP_ACCOUNT" \
+      --project="$GCP_PROJECT" \
+      --substitutions=_IMAGE="$IMAGE_REMOTE" \
+      "$ROOT"
+    echo "[e2e-cloud] Cloud Build complete: $IMAGE_REMOTE"
+  fi
 }
 
 # ---------------------------------------------------------------------------
