@@ -120,8 +120,29 @@ bit-for-bit).
 
 No `Task` tool exists in this harness; the freshell-pane agent attempt (`new-tab
 agent=opencode`) timed out server-side with no tab created. **Fallback used:** fresh review
-subagent via `opencode run` CLI (read-only review-agent rules), cwd = the worktree. Findings
-recorded below after it returns.
+subagent via `opencode run` CLI (read-only review-agent rules, defect-first), cwd = the
+worktree. The subagent verified the full claim chain itself (fixture canonical-key-order vs
+`legacy_local_seed.rs`, store.callers, all five Playwright project registrations incl. the
+gate01 config's shared `RUST_ONLY_SPECS` import, route semantics for every leg) and returned
+**two actionable findings, both fixed in this branch**:
+
+1. **[P2] port-steal deflake missing** in the spec's hand-rolled spawn (bare `findFreePort`
+   TOCTOU + token-blind `/api/health` poll). Fixed by mirroring `RustServer.start`'s kata-f3wp
+   remedy exactly: 3-attempt boot loop, fresh port per attempt, token-gated
+   `/api/server-info` identity check with a 2s `AbortSignal` timeout, retry only on
+   bind-race-shaped failures, kill-child-only between attempts.
+2. **[P3] no failure-path cleanup** — a mid-test assertion failure orphaned a listening
+   server. Fixed: `liveChildren` tracking, test-scope `afterEach` SIGKILL sweep, and
+   `stopProcessGracefully`/`killChildNow` untrack on success paths.
+
+Non-actionable residual risks it recorded (all documented non-goals): provider-migration PW
+leg covers seed-when-missing only (append branch has crate coverage); Batch-B cross-process
+settings residuals (CFG-02's queue); cascade parity out of scope (SESSION-03/TERM-*); seed
+key-order-canonicality assumption (fixtures match the extractor's assignment order — a future
+seed field needs the same care).
+
+Its overall assessment: *"The tests substantively prove what they claim — this is not vacuous
+coverage."*
 
 ## Foreign flake encountered (NOT this item, classified + filed)
 

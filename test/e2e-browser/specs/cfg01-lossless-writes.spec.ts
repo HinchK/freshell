@@ -86,6 +86,27 @@ interface SpawnedServer {
   homeDir: string
 }
 
+/** Every live child this spec spawned, for failure-path cleanup (a mid-test
+ * assertion failure must not orphan a listening server). */
+const liveChildren = new Set<ChildProcess>()
+
+function trackChild(proc: ChildProcess): void {
+  liveChildren.add(proc)
+}
+
+async function killChildNow(proc: ChildProcess): Promise<void> {
+  liveChildren.delete(proc)
+  if (proc.exitCode !== null || proc.signalCode !== null) return
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => resolve(), 2_000)
+    proc.once('exit', () => {
+      clearTimeout(timeout)
+      resolve()
+    })
+    proc.kill('SIGKILL')
+  })
+}
+
 async function waitForHealth(baseUrl: string, proc: ChildProcess, stderrRef: { buf: string }, timeoutMs: number): Promise<void> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
@@ -107,6 +128,7 @@ async function waitForHealth(baseUrl: string, proc: ChildProcess, stderrRef: { b
 }
 
 async function stopProcessGracefully(proc: ChildProcess): Promise<void> {
+  liveChildren.delete(proc)
   await new Promise<void>((resolve) => {
     const timeout = setTimeout(() => {
       proc.kill('SIGKILL')
@@ -125,28 +147,79 @@ async function stopProcessGracefully(proc: ChildProcess): Promise<void> {
  * pinned to EMPTY (see the file doc comment). `cwd` is deliberately the
  * home itself, never the repo root, so the cwd-relative builtin
  * `extensions/` lookup finds no manifests.
+ *
+ * PORT-STEAL DEFLAKE (f3wp, mirrors `RustServer.start`): `findFreePort` has a
+ * close-then-bind TOCTOU window — another agent's server can steal the port.
+ * `/api/health` is unauthenticated and instance-anonymous, so a foreign
+ * freshell would answer the health poll while our child lies dead
+ * (EADDRINUSE). Retry up to 3 times: on each attempt, after health passes,
+ * confirm the responder is OURS via the token-gated `/api/server-info`
+ * (`crates/freshell-server/src/diag.rs` — a foreign server rejects this
+ * spec's token with 401/403), and retry only bind-race-shaped failures while
+ * hard-failing anything else.
  */
 async function spawnRustServer(homeDir: string, emptyExtDir: string): Promise<SpawnedServer> {
-  const port = await findFreePort()
-  const baseUrl = `http://127.0.0.1:${port}`
-  const stderrRef = { buf: '' }
   const bin = ensureRustServerBuilt(PROJECT_ROOT)
-  const env = applyTestServerHomeEnvironment({
-    ...(process.env as Record<string, string>),
-    PORT: String(port),
-    FRESHELL_BIND_HOST: '127.0.0.1',
-    FRESHELL_CLIENT_DIR: rustClientDistPath(PROJECT_ROOT),
-    FRESHELL_EXTENSIONS_DIR: emptyExtDir,
-    FRESHELL_DISABLE_WSL_PORT_FORWARD: '1',
-    HIDE_STARTUP_TOKEN: 'true',
-    AUTH_TOKEN,
-  }, homeDir, 'isolated')
-  delete (env as Record<string, string | undefined>).VITE_PORT
-  const proc = spawn(bin, [], { cwd: homeDir, env, stdio: ['ignore', 'pipe', 'pipe'] })
-  proc.stderr?.on('data', (chunk: Buffer) => { stderrRef.buf += chunk.toString() })
-  proc.stdout?.on('data', () => {})
-  await waitForHealth(baseUrl, proc, stderrRef, 30_000)
-  return { proc, baseUrl, homeDir }
+  let lastError: unknown
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const port = await findFreePort()
+    const baseUrl = `http://127.0.0.1:${port}`
+    const stderrRef = { buf: '' }
+    const env = applyTestServerHomeEnvironment({
+      ...(process.env as Record<string, string>),
+      PORT: String(port),
+      FRESHELL_BIND_HOST: '127.0.0.1',
+      FRESHELL_CLIENT_DIR: rustClientDistPath(PROJECT_ROOT),
+      FRESHELL_EXTENSIONS_DIR: emptyExtDir,
+      FRESHELL_DISABLE_WSL_PORT_FORWARD: '1',
+      HIDE_STARTUP_TOKEN: 'true',
+      AUTH_TOKEN,
+    }, homeDir, 'isolated')
+    delete (env as Record<string, string | undefined>).VITE_PORT
+    const proc = spawn(bin, [], { cwd: homeDir, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    trackChild(proc)
+    let server: SpawnedServer | undefined
+    try {
+      proc.stderr?.on('data', (chunk: Buffer) => { stderrRef.buf += chunk.toString() })
+      proc.stdout?.on('data', () => {})
+      await waitForHealth(baseUrl, proc, stderrRef, 30_000)
+      // Identity check: a stolen port means the health responder is a FOREIGN
+      // server (our child exited with EADDRINUSE—the health poll above passed
+      // on the foreign process, since /api/health answers any caller). The
+      // token-gated endpoint distinguishes us from it; the explicit AbortSignal
+      // timeout keeps a stalling foreign server from hanging the retry loop
+      // (Node fetch has no default timeout — kata f3wp).
+      const identity = await fetch(`${baseUrl}/api/server-info`, {
+        headers: { 'x-auth-token': AUTH_TOKEN },
+        signal: AbortSignal.timeout(2_000),
+      }).catch((fetchError: unknown) => {
+        const name = fetchError instanceof Error ? fetchError.name : ''
+        if (name === 'TimeoutError' || name === 'AbortError') {
+          throw new Error(
+            `bind race: foreign server on port ${port} stalled on the server-info identity check`,
+          )
+        }
+        throw fetchError
+      })
+      if (!identity.ok) {
+        throw new Error(
+          `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
+        )
+      }
+      server = { proc, baseUrl, homeDir }
+      return server
+    } catch (error) {
+      lastError = error
+      // Between attempts: kill ONLY the child (never the home — the next
+      // attempt reuses it; that's what makes a mid-test restart meaningful).
+      await killChildNow(proc)
+      const message = error instanceof Error ? error.message : String(error)
+      const bindRace =
+        /EADDRINUSE|address (?:already )?in use|bind race/i.test(message)
+      if (!bindRace) throw error
+    }
+  }
+  throw lastError
 }
 
 // ── Structural deep-compare ────────────────────────────────────────────────
@@ -297,6 +370,15 @@ async function api(baseUrl: string, method: string, route: string, body?: unknow
 test.describe('CFG-01 lossless config.json writes (rust)', () => {
   // Serial by construction: each step mutates the one owned server's file.
   test.describe.configure({ mode: 'serial' })
+
+  // Failure-path cleanup: on a mid-test assertion failure, stop whatever the
+  // test left running (success paths already call stopProcessGracefully, which
+  // untracks; this only fires for strays).
+  test.afterEach(async () => {
+    for (const proc of [...liveChildren]) {
+      await killChildNow(proc)
+    }
+  })
 
   test('every REST writer preserves all sentinels; restart writes nothing', async () => {
     test.setTimeout(120_000)
