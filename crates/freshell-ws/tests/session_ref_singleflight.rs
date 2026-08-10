@@ -184,6 +184,92 @@ async fn two_clients_same_session_ref_yield_exactly_one_pty() {
     registry.kill_all();
 }
 
+/// df1 wrap-review r2 pin: a sessionRef ADOPTION is a successful create —
+/// it must SETTLE the server-wide `create_dedupe` entry so a later
+/// same-requestId resend replays the settled frame instead of re-entering
+/// `handle_create`. Before the fix, the `session_ref_attached` early
+/// return skipped `create_dedupe.settle`: the caller's
+/// `clear_if_in_flight` dropped the still-InFlight sentinel (erroring any
+/// cross-connection waiters with PTY_SPAWN_FAILED) and — worst case — a
+/// blind same-requestId resend on a NON-negotiated (frozen) connection
+/// re-entered `handle_create` with `pane_reconcile_v1 == false` and
+/// SPAWNED A DUPLICATE PTY. (The §5.4 keyed adopt early return shares the
+/// identical settle discipline — its remaining seed is REST-stamped
+/// registry rows, and both returns were fixed together.) The sequence
+/// here is fully serialized — winner awaited before the attacher sends —
+/// so no reservation race is involved.
+#[tokio::test]
+async fn session_ref_adoption_settles_dedupe_for_later_legacy_resends() {
+    const SESS_SETTLE: &str = "22222222-2222-4222-8222-222222222222";
+    let (url, registry) = spawn_server_with_specs(vec![sleeper_cli_spec("claude")]).await;
+
+    // The winner spawns the session's PTY under requestId "wr-win".
+    let mut winner = connect(&url, true).await;
+    send_json(
+        &mut winner,
+        terminal_create_resume("wr-win", "claude", SESS_SETTLE),
+    )
+    .await;
+    let created = next_created_or_error(&mut winner, "wr-win").await;
+    assert_eq!(
+        created["type"],
+        serde_json::json!("terminal.created"),
+        "{created}"
+    );
+    let tid = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    // The attacher: SAME sessionRef, fresh requestId "wr-attach" — the
+    // claim reports BoundElsewhere and the attach path names the winner's
+    // terminal (no second spawn).
+    let mut attacher = connect(&url, true).await;
+    send_json(
+        &mut attacher,
+        terminal_create_resume("wr-attach", "claude", SESS_SETTLE),
+    )
+    .await;
+    let attached = next_created_or_error(&mut attacher, "wr-attach").await;
+    assert_eq!(
+        attached["type"],
+        serde_json::json!("terminal.created"),
+        "{attached}"
+    );
+    assert_eq!(attached["terminalId"], serde_json::json!(tid.clone()));
+
+    // Post-fix, "wr-attach" is SETTLED to the winner's terminal: the frozen
+    // client's blind same-requestId resend on reconnect replays the frame.
+    let mut legacy = connect(&url, false).await;
+    send_json(
+        &mut legacy,
+        terminal_create_resume("wr-attach", "claude", SESS_SETTLE),
+    )
+    .await;
+    let replayed = next_created_or_error(&mut legacy, "wr-attach").await;
+    assert_eq!(
+        replayed["type"],
+        serde_json::json!("terminal.created"),
+        "a settled adoption must replay its terminal.created, not error: {replayed}"
+    );
+    assert_eq!(
+        replayed["terminalId"],
+        serde_json::json!(tid.clone()),
+        "the legacy resend must name the adopted terminal, never a fresh PTY"
+    );
+
+    assert_eq!(
+        live_pty_count_for_session(&registry, "claude", SESS_SETTLE),
+        1,
+        "exactly one live PTY for the session across winner + attach + resend"
+    );
+    assert_eq!(
+        registry.kill_all(),
+        1,
+        "no duplicate spawn anywhere in the flow"
+    );
+}
+
 /// Legacy connections (no capability) never see SESSION_RESERVED — the
 /// frozen-client create path is byte-for-byte unchanged.
 #[tokio::test]

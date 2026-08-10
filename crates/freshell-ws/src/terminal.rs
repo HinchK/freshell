@@ -2065,6 +2065,9 @@ pub(crate) async fn handle_create(
                     "terminal.create.adopted"
                 );
                 log_create_settled(conn_id, &create.request_id, &existing, "adopted");
+                // Clone before the struct literal moves `create.request_id`
+                // (same discipline as the main spawn path's dedupe locals).
+                let dedupe_request_id = create.request_id.clone();
                 let created = ServerMessage::TerminalCreated(TerminalCreated {
                     created_at: now_ms(),
                     request_id: create.request_id,
@@ -2075,6 +2078,21 @@ pub(crate) async fn handle_create(
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
                 });
+                // An adoption IS a successful create for this requestId:
+                // settle the server-wide dedupe entry exactly like the main
+                // spawn path. Without it, the caller's `clear_if_in_flight`
+                // drops the still-InFlight sentinel and answers any
+                // cross-connection waiters with PTY_SPAWN_FAILED despite the
+                // success — and a later same-requestId resend begins fresh
+                // instead of replaying, letting a NON-negotiated (frozen)
+                // connection's blind resend spawn a duplicate PTY.
+                state.create_dedupe.settle(
+                    &dedupe_request_id,
+                    &existing,
+                    &created,
+                    create.restore,
+                    |tid| state.registry.is_pty_running(tid),
+                );
                 return out.send(&created).await;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
@@ -2136,6 +2154,10 @@ pub(crate) async fn handle_create(
                             &terminal_id,
                             "session_ref_attached",
                         );
+                        // Clone before the struct literal moves
+                        // `create.request_id` (same discipline as the main
+                        // spawn path's dedupe locals).
+                        let dedupe_request_id = create.request_id.clone();
                         let created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
@@ -2149,6 +2171,22 @@ pub(crate) async fn handle_create(
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
                         });
+                        // Attaching to the winner IS a successful create for
+                        // this requestId: settle the dedupe entry exactly
+                        // like the §5.4 adopt path above and the main spawn
+                        // path — otherwise the caller's `clear_if_in_flight`
+                        // errors any same-requestId waiters with
+                        // PTY_SPAWN_FAILED despite the success, and a later
+                        // resend on a NON-negotiated connection re-enters
+                        // handle_create and spawns a duplicate PTY for the
+                        // session.
+                        state.create_dedupe.settle(
+                            &dedupe_request_id,
+                            &terminal_id,
+                            &created,
+                            create.restore,
+                            |tid| state.registry.is_pty_running(tid),
+                        );
                         return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
