@@ -141,5 +141,73 @@ findings only, record MINOR/rejected here.
   clippy -p freshell-ws --all-targets` clean; `cargo fmt` applied to
   touched Rust files.
 
-<!-- Round 3+ records go below. -->
+## Round 3
 
+- **Fresh Eyes verdict:** FAILED (`FRESHPID=1859657`, provider gpt).
+- **Majors found: 1 critical + 3 major — 3 fixed, 1 rejected-by-design:**
+
+  1. **CRITICAL — proxy forwarded Freshell's gate credentials to proxied
+     apps** (`crates/freshell-server/src/proxy.rs:179`): after
+     authenticating, the proxy passed `x-auth-token` and the
+     `freshell-auth` cookie verbatim to arbitrary loopback upstreams (the
+     legacy `server/proxy-router.ts` did the same; the leak predates the
+     port, and new tests on both sides had codified it as intent). In the
+     browser pane the same-origin `allow-scripts` iframe makes it
+     JS-readable — any app you open gets a bearer token for every
+     authenticated API/WS surface.
+     **Fix:** `8b13d83a6` — BOTH servers strip `x-auth-token` and filter
+     the `freshell-auth` pair out of forwarded Cookie values (app cookies
+     survive; auth-only cookie dropped entirely), including the legacy
+     WS-upgrade leg. Pins flipped/added: rust in-module + real-binary
+     capture asserts, legacy supertest capture route, browser01 e2e
+     (root sees no `freshell-auth`; fixture-set `app-session` cookie does
+     flow). RED-verified by stashing (legacy vitest 1 failing, rust
+     black-box + wire pins failing without the fix).
+  2. **`scripts/e2e-cloud.sh` — cloud runs could pass against a stale
+     image** (mutable `:latest`; rebuild only on `--build`/missing), a
+     vacuously-green test gate.
+     **Fix:** `ade55e095` — commit-addressed tags
+     (`rev-parse --short=12 HEAD`, `-dirty` suffix for uncommitted/
+     untracked trees); `run` resolves the HEAD tag, builds+pushes when
+     absent; `:latest` still pushed as a pointer but never consumed.
+     Wrapper check 11 rewritten FULLY STUBBED (its previous form invoked
+     real gcloud/docker — an authenticated machine could really
+     build/push/run from a test; observed a real `docker build` start
+     during r3 verification) and now asserts the job targets + pushes the
+     HEAD tag. Full wrapper suite green; sibling cloud-run-config/
+     dockerfile suites green.
+  3. **`crates/freshell-ws/src/create_dedupe.rs:266` — `restore:
+     Option<bool>` compared literally**, but the protocol has it optional
+     and the SPA omits false (`...(restore ? { restore: true } : {})`), so
+     `None` vs `Some(false)` spellings of the SAME request missed the
+     replay and could spawn a duplicate PTY.
+     **Fix:** `b7b3da712` — canonical key `restore == Some(true)` stored
+     + compared; `restore:true` latch-flip mismatching preserved. Unit
+     pin (both spelling directions replay; `true` still mismatches) +
+     wire pin (`explicit_restore_false_resend_replays_omitted_restore_
+     settled`), RED-verified by stashing.
+  4. **Commit `ab8d6ed46`'s message claims "Google Cloud Run Jobs as
+     default Playwright e2e backend"** while shipped code defaults unset
+     `FRESHELL_E2E_BACKEND` to local. **REJECTED (by design):** the
+     commit is a merged squash-merged mid-history commit; its message is
+     immutable without rewriting every downstream SHA on a shared
+     integration branch, and the claimed default deliberately did NOT
+     ship — the repo's current contract (wrapper checks 9-11, plan-doc
+     annotations from r2, and the top-level AGENTS.md backend-selection
+     policy requiring the user's explicit choice for unset backends) all
+     say local-unless-opted-in. The doc inaccuracy half was fixed in r2
+     (`b8f1dad1e`); no code change is wanted here.
+
+- **Minors (2, both nits; both fixed as safely-trivial):**
+  `docs/plans/df1/HARNESS-06.md:140` trailing whitespace → `92dd5f49a`;
+  `docs/plans/df1-evidence/WRAP-REVIEW.md` blank line at EOF → removed
+  with this round's record edit. `git diff 4c2297667...HEAD --check` is
+  clean at the worktree.
+- **Verification notes:** `nice -n 19 npm run typecheck` clean; `cargo
+  clippy -p freshell-server -p freshell-ws --all-targets` zero warnings;
+  `cargo fmt` applied; freshell-server proxy in-module 25/25, browser01
+  black-box 1/1, freshell-ws lib create_dedupe 15/15, wire create_dedupe
+  4/4 + session_ref_singleflight 4/4; legacy proxy-router vitest 14/14
+  (210/210 across the matched files).
+
+<!-- Round 4+ records go below. -->
