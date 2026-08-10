@@ -14,9 +14,13 @@
 //! ## Faithful behaviour (matches `proxy-router.ts`)
 //! * Target is always `127.0.0.1:<port>` (never a remote host).
 //! * `<port>` must be `1..=65535`, else `400 { error: "Invalid port number" }`.
+//! * The upstream PATH+QUERY is the client's raw bytes, never percent-decoded
+//!   or re-encoded (legacy forwards `req.url` verbatim — `proxy-router.ts:99`;
+//!   `Path<String>` extraction would decode `%2F`→`/` and corrupt routes).
 //! * The upstream request carries the incoming method + body and the incoming
 //!   headers minus hop-by-hop framing (`host` is set to the target;
 //!   `connection` / `transfer-encoding` are dropped — `proxy-router.ts:90-93`).
+//!   Repeated headers keep all values in wire order, both directions.
 //! * The response echoes the upstream status + headers **minus** the three
 //!   iframe-blocking headers (and minus the framing headers `hyper` recomputes),
 //!   streaming the body through unchanged.
@@ -38,7 +42,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
@@ -105,17 +109,23 @@ pub fn router(state: ProxyState) -> Router {
 /// `/api/proxy/http/{*tail}` where `tail` is `<port>` or `<port>/<path…>`.
 async fn proxy(
     State(state): State<ProxyState>,
-    Path(tail): Path<String>,
     method: Method,
     headers: HeaderMap,
     uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    // Split `<port>` off the front; the remainder (possibly empty) is the upstream
-    // path. `5173` → ("5173",""); `5173/` → ("5173",""); `5173/a/b` → ("5173","a/b").
+    // Split `<port>` off the front of the RAW, never-percent-decoded path
+    // (`uri.path()` — proven raw by `lb_probes::l1_...`). Extracting the
+    // catch-all as `Path<String>` would percent-DECODE it (`%2F`→`/`,
+    // `%25`→`%`), corrupting routes that dev servers actually serve
+    // (Vite `/@fs/%2F…`, file names with `%20`). Legacy forwards Node's raw
+    // `req.url` untouched (`proxy-router.ts:99`); so do we.
+    // `5173` → ("5173",""); `5173/` → ("5173",""); `5173/a/b` → ("5173","a/b").
+    let raw_path = uri.path();
+    let tail = raw_path.strip_prefix("/api/proxy/http/").unwrap_or("");
     let (port_raw, rest) = match tail.split_once('/') {
         Some((port, rest)) => (port, rest),
-        None => (tail.as_str(), ""),
+        None => (tail, ""),
     };
     forward(
         state,
@@ -923,5 +933,92 @@ mod socket_contract {
             vec!["alpha", "beta"],
             "a repeated client header must reach upstream twice, in wire order"
         );
+    }
+}
+
+#[cfg(test)]
+mod socket_contract_g1 {
+    use super::wire_support::*;
+    use super::*;
+
+    const TOKEN: &str = "contract-token-0123456789abcdef";
+
+    async fn spawn_proxy_and_capture() -> (u16, u16, Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let upstream_port = spawn_raw_listener(move |mut wire| {
+            let cap = Arc::clone(&cap);
+            async move {
+                let req = read_request(&mut wire).await;
+                cap.lock().await.push(req);
+                wire.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let app = router(ProxyState::new(Arc::new(TOKEN.to_string())));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        (proxy_port, upstream_port, captured)
+    }
+
+    /// G1: the upstream request-target must be `[<rest>] [? <query>]` with
+    /// EVERY byte the client sent — legacy forwards Node's RAW `req.url`
+    /// (`proxy-router.ts:99`), which is never percent-decoded. A dev server
+    /// routing on encoded segments (Vite's `/@fs/%2F...`, file names with
+    /// `%20`/`%25`) MUST see its real route, not a decoded-and-re-encoded
+    /// mutation.
+    #[tokio::test]
+    async fn path_and_query_reach_upstream_byte_exact_never_decoded() {
+        let cases: &[&str] = &[
+            // Percent-encoded slash must NOT become a path separator.
+            "/a%2Fb/c",
+            // Encoded space round-trips as %20, not a literal space.
+            "/hello%20world.txt",
+            // Encoded percent must not collapse.
+            "/100%25-certain",
+            // UTF-8 encoded bytes stay encoded exactly as sent.
+            "/caf%C3%A9/na%C3%AFve",
+            // Encoded '?' stays data, not a query boundary.
+            "/x%3Fy/z",
+            // Encoded query values pass through untranslated.
+            "/search?q=a%2Fb&r=%20&n=1%2B1",
+            // '?' + raw '+' in query: no form-decoding games.
+            "/plus?a=1+2&b=x+y",
+            // Repeated and empty query keys, order preserved.
+            "/multi?a=1&a=2&empty=&b=3",
+            // Deep path with trailing slash.
+            "/assets/vendor/%40scope/pkg/dist/",
+            // Bare root forms.
+            "/",
+            "",
+        ];
+        for path_and_query in cases {
+            let (proxy_port, upstream_port, captured) = spawn_proxy_and_capture().await;
+            let resp = raw_exchange(
+                proxy_port,
+                format!(
+                    "GET /api/proxy/http/{upstream_port}{path_and_query} HTTP/1.1\r\n\
+                     host: 127.0.0.1:{proxy_port}\r\n\
+                     x-auth-token: {TOKEN}\r\n\
+                     connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert_eq!(resp.status_code(), 200, "case {path_and_query:?}");
+            let got = captured.lock().await;
+            assert_eq!(got.len(), 1, "case {path_and_query:?}");
+            let expected = if path_and_query.is_empty() { "/" } else { *path_and_query };
+            assert_eq!(
+                got[0].raw_target(),
+                expected,
+                "upstream must receive the byte-exact raw path+query (legacy: raw req.url)"
+            );
+        }
     }
 }
