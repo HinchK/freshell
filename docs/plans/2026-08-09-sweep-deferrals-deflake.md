@@ -15,7 +15,9 @@ deterministic.
 (`server/` is frozen — read-only oracle). A1 mirrors the already-correct
 `create_content_tab` registration pattern into the fresh-agent create path.
 A4 ports Node's one-time boot migration into a new `migrations` module with
-marker I/O on `SettingsStore`. B converts the one panicking live-interop test
+marker I/O on `SettingsStore`, plus the Node read-model guard
+(`applyOverride`'s provider-generated suppression, Task 5b) the Rust port
+was missing — validation proved the cleanup is not durable without it. B converts the one panicking live-interop test
 to an explicit env-gated opt-in and backfills the hermetic coverage it was
 informally providing.
 
@@ -32,7 +34,7 @@ Copied from the task spec + `port/AGENTS.md` (binding for every task):
 - **Purity invariant:** `git diff --name-only origin/feat/rust-tauri-port -- server/ shared/` MUST be empty at delivery. `server/` and `shared/ws-protocol.ts` are frozen; Node code is a read-only reference.
 - **Port equivalence:** behavior-equivalent to Node except objectively defective behavior; intentional divergences require a `port/oracle/DEVIATIONS.md` entry with an objective defect criterion + pinning test (adjudicated by an antagonist reviewer, never self-approved). None are expected in this plan.
 - **TDD:** red-green-refactor for every non-trivial change.
-- **Structural limits:** ≤10K LOC/crate, ≤1K lines/file. New logic goes in NEW modules; the only exception is ~70 lines of marker I/O added to `settings_store.rs` because `home` and `ConfigLock` are private to it (justified in Task 4).
+- **Structural limits:** ≤10K LOC/crate, ≤1K lines/file. New logic goes in NEW modules; the only exception is ~85 lines of marker/flush I/O added to `settings_store.rs` because `home`, `persist`, and `ConfigLock` are private to it (justified in Task 4).
 - **Process safety:** NEVER touch the user's live freshell server on port 3001; never broad-kill; test servers bind unique high ports and only kill PIDs they spawned. No test in this plan spawns a server.
 - **Vitest:** focused runs via `npm run test:vitest -- run <file>` (NEVER raw `npx vitest`). Broad TS runs (`npm run check`) are coordinator-gated — wait for the holder, never kill a foreign run.
 - **Commits:** conventional, focused, atomic (`feat:`/`fix:`/`test:`/`refactor:`/`docs:`).
@@ -50,9 +52,11 @@ Copied from the task spec + `port/AGENTS.md` (binding for every task):
 | `test/unit/client/store/tab-pane-title-sync.test.ts` | 3 | Modify | Dispatch reducer action directly |
 | `test/e2e/title-sync-flow.test.tsx` | 3 | Modify | Dispatch reducer action directly |
 | `crates/freshell-server/src/migrations.rs` | 4, 5 | **Create** | Pure cleanup helper + migration orchestration + all A4 tests |
-| `crates/freshell-server/src/settings_store.rs` | 4 | Modify | `is_migration_done` / `mark_migration_done` |
+| `crates/freshell-server/src/settings_store.rs` | 4 | Modify | `is_migration_done` / `mark_migration_done` / `flush_to_disk` |
 | `crates/freshell-server/src/main.rs` | 4, 5 | Modify | `mod migrations;` + boot wiring |
-| `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` | 5 | Modify | SESSION-04 evidence text |
+| `crates/freshell-server/src/session_directory.rs` | 5b | Modify | Provider-generated read-guard in `apply_session_overrides` (+ `title_source` plumbing) |
+| `crates/freshell-server/src/auto_title_sweep.rs` | 5b | Modify | Same guard on the sweep's session-title overlay (canonical-push input) |
+| `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` | 5, 5b | Modify | SESSION-04 evidence text |
 | `crates/freshell-platform/src/port_forward.rs` | 6 | Modify | Tests module only: hermetic fakes + env-gated live test |
 | `port/machine/specs/platform-glue.md` | 6 | Modify | P19 row: note the opt-in live leg |
 
@@ -453,14 +457,23 @@ branch, currently `:1374-1459`): replace everything from the two
     // Broadcast AFTER registration -- Node's order is createTab -> runtime
     // create -> attachPaneContent -> broadcast -> respond (router.ts:546-589),
     // and `create_content_tab` likewise inserts before broadcasting.
+    // Shape note (validated): Node OMITS the `title` key when no name was
+    // provided (JSON.stringify drops undefined, router.ts:704). Serialize
+    // the same shape instead of `"title": null` -- the shared client
+    // tolerates both (`payload.title ||`, tabsSlice.ts:306), but keep the
+    // broadcast Node-shaped. If an existing test pins a null-title
+    // broadcast, update it to this shape.
+    let mut create_payload = json!({
+        "id": tab_id,
+        "paneId": pane_id,
+        "paneContent": pane_content,
+    });
+    if let Some(name) = &name {
+        create_payload["title"] = json!(name);
+    }
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
-        payload: Some(json!({
-            "id": tab_id,
-            "title": name,
-            "paneId": pane_id,
-            "paneContent": pane_content,
-        })),
+        payload: Some(create_payload),
     }));
 
     ok_json(
@@ -626,6 +639,7 @@ setByUser: false (what the thunk defaulted); assertions unchanged."
   - `migrations::override_keys_to_clear(session_overrides: &serde_json::Map<String, Value>, authoritative: &[&str]) -> Vec<String>`
   - `SettingsStore::is_migration_done(&self, id: &str) -> bool`
   - `SettingsStore::mark_migration_done(&self, id: &str) -> std::io::Result<()>`
+  - `SettingsStore::flush_to_disk(&self) -> std::io::Result<()>` (async; surfaces the persist result that `patch_session_override` swallows — Task 5's orchestration gates the marker on it)
 
 Node reference semantics (must match exactly): a session-override key
 qualifies for clearing when ALL of (`provider-title-cleanup.ts:17-30`):
@@ -640,10 +654,10 @@ qualifies. A key with no `:` parses as legacy provider `claude`
 append-only + idempotent (`config-store.ts:565-580`).
 
 Structural-limit note: `settings_store.rs` is already over the 1K-line
-guideline; the two marker methods (~70 lines incl. doc comments) must live
-there because `home`/`ConfigLock` are private, but ALL other A4 code and ALL
-A4 tests go in the new `migrations.rs` to avoid growing it further. State
-this in the commit message.
+guideline; the two marker methods plus `flush_to_disk` (~85 lines incl. doc
+comments) must live there because `home`/`persist`/`ConfigLock` are private,
+but ALL other A4 code and ALL A4 tests go in the new `migrations.rs` to
+avoid growing it further. State this in the commit message.
 
 - [ ] **Step 1: Write the failing helper tests**
 
@@ -927,9 +941,15 @@ Add to the `impl SettingsStore` block in
 
     /// `configStore.markMigrationDone(id)` (`config-store.ts:570-580`):
     /// append-only + idempotent. Whole read-modify-write under [`ConfigLock`]
-    /// with the same atomic tmp+rename as `persist`, so a concurrent Node or
-    /// Rust writer never sees a torn document and other top-level keys
-    /// round-trip untouched.
+    /// with the same atomic tmp+rename as `persist`, so no reader ever sees
+    /// a torn document and other top-level keys round-trip untouched.
+    /// HONEST LIMIT (mirrors [`ConfigLock`]'s own doc): this protects
+    /// against a legacy Node that wrote FIRST and is now quiescent. A
+    /// still-RUNNING legacy Node never re-reads config.json (cache-for-life,
+    /// config-store.ts:401-412) and rewrites the WHOLE document from its
+    /// stale cache on its next write, clobbering this marker (and any
+    /// cleared rows). Bounded: the cleanup is idempotent and simply re-runs
+    /// on the next Rust boot; `titleSource:"user"` rows are never touched.
     pub fn mark_migration_done(&self, id: &str) -> std::io::Result<()> {
         let Some(home) = &self.home else {
             return Ok(());
@@ -968,10 +988,27 @@ Add to the `impl SettingsStore` block in
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
+
+    /// Re-attempts a full settings persist and SURFACES the result.
+    /// `patch_session_override` deliberately swallows persist errors
+    /// (best-effort, `let _ = self.persist(..)`, :758-767); a marker-gated
+    /// one-shot migration must not record completion on unknown persistence
+    /// state, so it calls this once after its clears and aborts (retrying
+    /// next boot) on failure -- matching Node, where a failed override write
+    /// THROWS and the chain's .catch aborts before `markMigrationDone`
+    /// (config-store.ts:195-210, :424-432; index.ts:1039-1058). Safe to call
+    /// repeatedly: `persist` re-reads disk and overlays only dirty keys.
+    pub async fn flush_to_disk(&self) -> std::io::Result<()> {
+        let settings = self.get().await;
+        self.persist(&settings)
+    }
 ```
 
 (Adapt the `ConfigLock::acquire(&dir)` call to the exact form `persist` uses
-at `settings_store.rs:406-430` if the signature differs.)
+at `settings_store.rs:406-430` if the signature differs; likewise mirror
+`persist`'s exact call shape inside `flush_to_disk` — the two-line body
+above assumes `get()` is async and `persist(&Settings)` is sync, which is
+how `patch_session_override` calls them at :758-767.)
 
 - [ ] **Step 7: Run to verify GREEN, then the store's regression suite**
 
@@ -992,10 +1029,17 @@ git commit -m "feat(rust-server): add completedMigrations marker I/O to Settings
 
 Ports config-store.ts isMigrationDone/markMigrationDone: append-only,
 idempotent, disk read-modify-write under ConfigLock with atomic tmp+rename.
-completedMigrations stays an UNMANAGED copy-forward key so concurrent Node
-appends survive. Lives in settings_store.rs only because home/ConfigLock
-are private there; all other migration code + tests live in the new
-migrations module to respect the file-size guideline."
+completedMigrations stays an UNMANAGED copy-forward key, so a Node append
+that reached disk BEFORE a Rust persist survives (Rust re-reads disk fresh).
+Validated limit, stated honestly: a still-RUNNING legacy Node writes the
+whole document from a never-invalidated cache and clobbers the marker on
+its next write -- side-by-side operation with a live Node is out of scope;
+a clobbered marker only means a safe idempotent re-run next boot. Also adds
+flush_to_disk, the Result-surfacing persist the migration orchestration
+needs to avoid marking unpersisted clears as complete. Lives in
+settings_store.rs only because home/persist/ConfigLock are private there;
+all other migration code + tests live in the new migrations module to
+respect the file-size guideline."
 ```
 
 ---
@@ -1009,7 +1053,7 @@ migrations module to respect the file-size guideline."
 
 **Interfaces:**
 - Consumes (Task 4): `migrations::{AI_TITLE_SHADOW_CLEANUP, AUTHORITATIVE_TITLE_PROVIDERS, override_keys_to_clear}`,
-  `SettingsStore::{is_migration_done, mark_migration_done}`; plus existing
+  `SettingsStore::{is_migration_done, mark_migration_done, flush_to_disk}`; plus existing
   `SettingsStore::session_overrides(&self) -> serde_json::Map<String, Value>`
   (`settings_store.rs:671-679`) and
   `SettingsStore::patch_session_override(&self, key: &str, patch: &[(&str, Option<Value>)]) -> Value` (async, `settings_store.rs:681-769`),
@@ -1031,7 +1075,14 @@ Rust session index is poll-based and `session_overrides()` freshness-reloads
 (`maybe_reload_overrides`) — say so in a comment. Timing: Node runs this
 fire-and-forget after boot; the condition reads ONLY `sessionOverrides`
 (never live enrichment — Node's own comment), so a detached Rust boot task
-is observationally equivalent.
+is observationally equivalent. Error model (validated against the oracle):
+Node's `patchSessionOverride` THROWS on a failed config write
+(`atomicWriteFile` config-store.ts:195-210 → `saveInternal` :424-432 →
+mutex :23-37, no catch anywhere) and the chain's `.catch`
+(index.ts:1056-1058) aborts BEFORE `markMigrationDone`, so the migration
+retries next boot. Rust's `patch_session_override` swallows persist errors
+(`let _ = self.persist(..)`, settings_store.rs:758-767) — the orchestration
+must therefore flush-and-check before marking (Step 3) to match.
 
 - [ ] **Step 1: Write the failing orchestration tests**
 
@@ -1118,6 +1169,45 @@ Append to `crates/freshell-server/src/migrations.rs` `mod tests`:
             json!([AI_TITLE_SHADOW_CLEANUP])
         );
     }
+
+    /// Error-model pin (validated divergence): a clear that cannot reach
+    /// disk must NOT be recorded as complete -- Node aborts before
+    /// markMigrationDone and retries next boot. Self-skips when the process
+    /// can write through a read-only dir (e.g. root/CAP_DAC_OVERRIDE).
+    #[tokio::test]
+    async fn cleanup_skips_marker_when_clears_cannot_persist() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(
+            dir,
+            json!({ "amplifier:a1": { "titleOverride": "Auto", "titleSource": "ai" } }),
+            None,
+        );
+        let store = store_at(dir);
+        let fdir = dir.join(".freshell");
+        let mut ro = std::fs::metadata(&fdir).unwrap().permissions();
+        ro.set_mode(0o555); // no tmp-file writes => persist AND mark both fail
+        std::fs::set_permissions(&fdir, ro).unwrap();
+        if std::fs::write(fdir.join("probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(fdir.join("probe"));
+            eprintln!("SKIP cleanup_skips_marker_when_clears_cannot_persist: read-only dir not enforceable here");
+            return;
+        }
+
+        run_ai_title_shadow_cleanup(&store).await;
+
+        let mut rw = std::fs::metadata(&fdir).unwrap().permissions();
+        rw.set_mode(0o755);
+        std::fs::set_permissions(&fdir, rw).unwrap();
+        assert!(!store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+        let cfg = read_config(dir);
+        assert_eq!(
+            cfg["sessionOverrides"]["amplifier:a1"]["titleOverride"],
+            json!("Auto"),
+            "the clear never reached disk, so nothing may claim it did"
+        );
+    }
 ```
 
 - [ ] **Step 2: Run to verify they fail to compile**
@@ -1138,12 +1228,16 @@ use crate::settings_store::SettingsStore;
 /// Port of the one-time `ai-title-shadow-cleanup` migration
 /// (`server/index.ts:1039-1054`): drop auto-written (non-user) title
 /// overrides that shadow an authoritative provider-generated title (e.g.
-/// Amplifier's own AI name). Guard -> compute -> clear -> mark, in Node's
-/// exact order; the marker is written even when nothing qualified, so a
-/// clean home never re-scans. Node's trailing `codingCliIndexer.refresh()`
-/// deliberately has NO analogue here: the Rust session index is poll-based
-/// and `session_overrides()` freshness-reloads (`maybe_reload_overrides`),
-/// so the next sweep tick already sees the cleared rows.
+/// Amplifier's own AI name). Guard -> compute -> clear -> flush -> mark, in
+/// Node's order; the marker is written even when nothing qualified, so a
+/// clean home never re-scans. Error model matches Node too: a failed
+/// override write in Node THROWS and the chain's `.catch` aborts BEFORE
+/// `markMigrationDone` (retry next boot) -- here, clears that cannot be
+/// flushed to disk leave the migration unmarked (see below). Node's
+/// trailing `codingCliIndexer.refresh()` deliberately has NO analogue here:
+/// the Rust session index is poll-based and `session_overrides()`
+/// freshness-reloads (`maybe_reload_overrides`), so the next sweep tick
+/// already sees the cleared rows.
 pub async fn run_ai_title_shadow_cleanup(settings: &SettingsStore) {
     if settings.is_migration_done(AI_TITLE_SHADOW_CLEANUP) {
         return;
@@ -1154,6 +1248,20 @@ pub async fn run_ai_title_shadow_cleanup(settings: &SettingsStore) {
         settings
             .patch_session_override(key, &[("titleOverride", None), ("titleSource", None)])
             .await;
+    }
+    if !keys.is_empty() {
+        // `patch_session_override` swallows persist errors (best-effort,
+        // settings_store.rs:758-767): a marker-gated one-shot must not
+        // record completion on unknown persistence state. Re-flush and
+        // abort unmarked on failure, mirroring Node's abort-before-marker.
+        if let Err(err) = settings.flush_to_disk().await {
+            tracing::warn!(
+                event = "ai_title_shadow_cleanup_flush_failed",
+                error = %err,
+                "clears not persisted; leaving migration unmarked to retry next boot"
+            );
+            return;
+        }
     }
     if let Err(err) = settings.mark_migration_done(AI_TITLE_SHADOW_CLEANUP) {
         tracing::warn!(
@@ -1178,7 +1286,9 @@ pub async fn run_ai_title_shadow_cleanup(settings: &SettingsStore) {
 cargo test -p freshell-server migrations::
 ```
 
-Expected: all migrations tests PASS (helper + marker + 3 orchestration).
+Expected: all migrations tests PASS (helper + marker + 4 orchestration,
+incl. the flush-failure pin, which self-skips only where a read-only dir
+cannot be enforced).
 
 - [ ] **Step 5: Wire it into boot**
 
@@ -1222,7 +1332,7 @@ sub-string:
 
 with (fill `<sha>` with the Step 7 commit sha afterwards, or amend):
 
-> the one-time stale-AI-title cleanup + its marker ARE ported (2026-08-XX sweep-deferrals-deflake, commit `<sha>`): `crates/freshell-server/src/migrations.rs` `run_ai_title_shadow_cleanup` wired as a detached boot task in `main.rs`, marker via `SettingsStore::{is_migration_done,mark_migration_done}`; tests `migrations::tests::{clears_authoritative_auto_written_titles, cleanup_clears_amplifier_shadow_titles_and_marks_done, cleanup_never_reruns_once_marked, cleanup_marks_done_even_when_nothing_qualifies, migration_marker_roundtrip_is_idempotent_and_reload_visible}` — but line 146's Playwright "cleanup marker" assertion is still not e2e-proven;
+> the one-time stale-AI-title cleanup + its marker ARE ported (2026-08-XX sweep-deferrals-deflake, commit `<sha>`): `crates/freshell-server/src/migrations.rs` `run_ai_title_shadow_cleanup` wired as a detached boot task in `main.rs`, marker gated on a disk flush via `SettingsStore::{is_migration_done,mark_migration_done,flush_to_disk}`; tests `migrations::tests::{clears_authoritative_auto_written_titles, cleanup_clears_amplifier_shadow_titles_and_marks_done, cleanup_never_reruns_once_marked, cleanup_marks_done_even_when_nothing_qualifies, cleanup_skips_marker_when_clears_cannot_persist, migration_marker_roundtrip_is_idempotent_and_reload_visible}` — but line 146's Playwright "cleanup marker" assertion is still not e2e-proven;
 
 The entry stays `- [ ]` / PARTIAL — the other two MISSING sub-criteria
 (legacy-rung e2e, provider-authoritative e2e) remain unmet and MUST NOT be
@@ -1239,7 +1349,10 @@ Node-equivalent semantics (server/index.ts:1039-1054): clears auto-written
 amplifier:* session overrides, preserves all other row fields, writes the
 'ai-title-shadow-cleanup' completedMigrations marker even when nothing
 qualified, never re-runs. The (None,None) patch bypasses the title-source
-ladder exactly like Node's {undefined,undefined}. No indexer refresh
+ladder exactly like Node's {undefined,undefined}. Error model matches Node
+too: clears are flushed to disk before marking, and a failed flush leaves
+the migration unmarked to retry next boot (Node throws out of the chain
+before markMigrationDone). No indexer refresh
 analogue needed: the Rust index is poll-based and session_overrides()
 freshness-reloads. SESSION-04 checklist evidence narrowed accordingly
 (stays PARTIAL: legacy-rung e2e + provider-authoritative e2e + PW marker
@@ -1248,6 +1361,126 @@ assertion still missing)."
 
 If needed, amend the checklist line with the real sha:
 `git commit --amend --no-edit` after editing.
+
+---
+
+### Task 5b: A4 (part 3) — Port Node's provider-generated read-guard (cleanup durability)
+
+**Files:**
+- Modify: `crates/freshell-server/src/session_directory.rs` (`apply_session_overrides`, `:663-686`; sole production caller `:403`)
+- Modify: `crates/freshell-server/src/auto_title_sweep.rs:493-498` (the `SweepSession` title overlay; `s.title_source` is already in scope at `:505`)
+- Tests: in each file's existing test module, following its current conventions
+
+**Interfaces:**
+- Consumes: `IndexedSession.title_source` (`directory_index.rs:75` — the provider-PARSED source; `"provider-generated"` for named amplifier sessions).
+- Produces: behavioral only — `dir`/`first-message` override rows no longer shadow a provider-generated session title in listings or in the sweep's canonical-title push. No new named interfaces.
+
+Background (validated 2026-08-09, load-bearing check): the auto-title sweep
+re-writes a qualifying `dir` or `first-message` override for ANY amplifier
+session with a live matching terminal within one 2s tick of Task 5's clear —
+Node's write side does exactly the same (`server/auto-title.ts:24-46`; write
+parity, so a write-side filter would be a deviation). Node stays correct
+because its READ model hides such rows: `applyOverride`
+(`server/coding-cli/session-indexer.ts:204-220`, the single choke point all
+persisted-override display reads flow through) applies `titleOverride` only
+when NOT (parsed `titleSource === 'provider-generated'` AND
+`ov.titleSource ∈ {'dir','first-message'}`). The Rust port is missing this
+guard (`apply_session_overrides` applies unconditionally), so WITHOUT this
+task the A4 migration is observably ineffective: cleared amplifier titles
+re-shadow within one tick under a permanently-set marker. This is a straight
+parity port; no `DEVIATIONS.md` entry.
+
+Guard semantics to mirror EXACTLY (`session-indexer.ts:204-220`):
+- Apply the override title iff `titleOverride` is a NON-EMPTY string AND NOT
+  (parsed source is `"provider-generated"` AND the row's `titleSource` is
+  exactly `"dir"` or `"first-message"`).
+- For provider-generated sessions, rows with `titleSource` `"ai"`, `"user"`,
+  ABSENT, or any other value STILL apply (Node uses strict `===`).
+- Rust today applies empty-string overrides where Node's `!!` does not — the
+  non-empty check above fixes that in the same edit.
+
+Scope guards (do NOT do):
+- Do NOT guard the fresh-patch canonical push (`auto_title.rs:116-120`) —
+  Node pushes the raw freshly-written patch title for one tick by design
+  (`auto-title.ts:78`: `canonicalTitle = overridePatch?.titleOverride ??
+  sessionTitle`); it self-corrects next tick. Guarding it would deviate.
+- Do NOT add a write-side filter to the sweep (Node has none).
+- CRITICAL: the guard applies ONLY to display/push titles.
+  `compute_auto_title_patch`'s `existing_title_override`/
+  `existing_title_source` inputs MUST keep reading the RAW override row —
+  if the sweep saw a suppressed row as absent it would re-patch every tick
+  (a config write storm Node does not have).
+
+- [ ] **Step 1: Write the failing tests**
+
+`session_directory` tests (RED — the first one fails today): a session whose
+parsed `title_source` is `"provider-generated"` with an override row
+`{ "titleOverride": "proj", "titleSource": "dir" }` must serve the PARSED
+provider title. Matrix alongside it: `dir` suppressed; `first-message`
+suppressed; `ai` applies; `user` applies; ABSENT `titleSource` applies;
+empty-string `titleOverride` never applies (any session); a
+non-provider-generated session + `dir` row still applies.
+
+`auto_title_sweep` overlay test: a sweep session with
+`title_source: Some("provider-generated")` and a `dir` override row keeps
+the parsed title in the `SweepSession` mapping (the canonical-push input is
+not driven to the dir basename).
+
+- [ ] **Step 2: Run to verify RED**
+
+```bash
+cargo test -p freshell-server session_directory
+cargo test -p freshell-server auto_title
+```
+
+Expected: the new tests FAIL (guard absent); all existing tests still PASS.
+
+- [ ] **Step 3: Implement the guard at both sites**
+
+Plumb the parsed `title_source` to where `apply_session_overrides` runs —
+it is not on the item today; source it from `IndexedSession.title_source`
+at the `dir_item_from_indexed` construction site (`:485` — verify the exact
+spot) — then add the guard condition in `apply_session_overrides` and in
+the sweep's title overlay (`auto_title_sweep.rs:493-498`).
+
+- [ ] **Step 4: Verify GREEN, then the crate suite**
+
+```bash
+cargo test -p freshell-server session_directory
+cargo test -p freshell-server auto_title
+cargo test -p freshell-server
+```
+
+Expected: new tests PASS; full crate suite PASS.
+
+- [ ] **Step 5: Extend the SESSION-04 evidence (same clause as Task 5 Step 6)**
+
+In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`
+line 147, inside the clause Task 5 rewrote, insert immediately before
+` — but line 146's Playwright`:
+
+> , and the sweep re-shadowing gap is closed by the provider-generated read-guard port (commit `<sha>`): `apply_session_overrides` + the sweep title overlay now mirror `applyOverride`'s suppression (session-indexer.ts:204-220), with matrix tests in `session_directory`/`auto_title_sweep`
+
+The entry stays `- [ ]` / PARTIAL.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/freshell-server/src/session_directory.rs crates/freshell-server/src/auto_title_sweep.rs docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
+git commit -m "fix(rust-server): port Node's provider-generated override read-guard
+
+Parity port of applyOverride's suppression (session-indexer.ts:204-220):
+dir/first-message override rows no longer shadow a provider-generated
+session title in listings or the sweep's canonical-title push; ai/user/
+absent-source rows still apply; empty-string overrides never apply (Node's
+!! truthiness). Without this guard the ai-title-shadow-cleanup migration is
+observably ineffective: the sweep (write-parity with Node, auto-title.ts:
+24-46) re-creates a qualifying dir/first-message row for any live amplifier
+session within one 2s tick of the clear, and Rust applied it
+unconditionally. compute_auto_title_patch still reads the RAW row (no
+write-side change), and the one-tick fresh-patch push stays unguarded --
+both exactly as Node."
+```
 
 ---
 
@@ -1285,6 +1518,23 @@ a possibly-empty vec) CANNOT fail on interop state — they are deliberately
 left un-gated so default runs keep exercising live Windows paths, per
 `port/AGENTS.md`'s live-interop encouragement. Only the panicking test is
 gated.
+
+Gating-mechanism note (recorded decision, 2026-08-09): the acceptance
+criterion for this work item explicitly requires the live variant behind an
+explicit env flag, so the env-gate + early-return mechanism stands — even
+though a validation census found all four existing gated Rust tests use
+`#[ignore]` (`freshell-terminal/tests/wsl_interop_live.rs:81,116`,
+`freshell-ws/tests/codex_managed_launch_e2e.rs:255`,
+`directory_index.rs:1834`) and this flag is the first runtime env-gate
+Rust-side. The `eprintln!` SKIP lines keep the skip visible in default-run
+output (never silently green in the log).
+
+Determinism pre-validation (2026-08-09, this host, worktree @ `92ccc51ac`):
+15/15 consecutive `cargo test -p freshell-platform` runs green with only the
+live portproxy test skipped (under above-normal load), and the flaky test
+itself passed 5/5 solo runs the same day — the flake is real (captured log)
+but rare and host-state-dependent. Step 5's 10/10 loop remains the
+acceptance proof at the post-change HEAD.
 
 No `DEVIATIONS.md` entry: this is a test-only defect fix, not a port-vs-Node
 behavior change; the documented P19 expectation ("golden vs live netsh") is
@@ -1492,10 +1742,20 @@ no env flags."
 cd /home/dan/code/freshell/.worktrees/sweep-deferrals-deflake
 git fetch origin
 git diff --name-only origin/feat/rust-tauri-port -- server/ shared/
+git diff --name-only origin/feat/rust-tauri-port -- src/
 ```
 
-Expected: EMPTY output. Any file listed = a frozen-tree violation that must
-be reverted before delivery.
+Expected: first diff EMPTY — any file listed is a frozen-tree violation that
+must be reverted before delivery. Second diff: EXACTLY
+`src/store/paneTitleSync.ts` (the sanctioned A3 deletion). Record that
+enumeration in the merge-commit body (precedent: the prior campaign recorded
+its sanctioned src/ delta the same way — "src/ diff = exactly the N task
+files. PASS"). Any other src/ file = unsanctioned; revert or justify before
+delivery. (Adjudicated during validation: `port/HANDOFF.md` §8.3's
+per-commit purity command includes `src/`, but the binding delivery gate for
+this campaign is `server/ shared/` — the deferral ledger itself mandates
+this src/ removal, and port/AGENTS.md precedence plus prior-campaign
+precedent both accept an enumerated, sanctioned src/ delta.)
 
 - [ ] **Step 2: Rust gates**
 
@@ -1506,6 +1766,9 @@ cargo test -p freshell-tauri
 
 Expected: all PASS (use a generous timeout — full workspace compiles). The
 tauri crate was not touched but the end-of-execution gate includes it.
+Baseline note (validated 2026-08-09 at `92ccc51ac`, this worktree): all four
+delivery gates were green before execution started, so any red here is
+attributable to this branch — triage it; do not dismiss it as pre-existing.
 
 - [ ] **Step 3: TS gates (coordinator-gated — wait, never kill)**
 
@@ -1561,6 +1824,6 @@ first-parent chain contains all task commits.
 |---|---|
 | 1. REST/MCP fresh-agent tabs visible in GET /api/tabs + /api/panes, renamable via PATCH, with tests | Task 2 (3 new tests incl. rename + delete-cleanup) |
 | 2. TabRecord write-only fields gone; thunk removed-or-wired with justification | Task 1 (compiler-clean removal), Task 3 (removal + commit-message justification) |
-| 3. ai-title-shadow-cleanup ported w/ Node semantics + marker + tests; SESSION-04 evidence updated honestly | Tasks 4-5 (helper/marker/orchestration tests, boot wiring, checklist edit stays PARTIAL) |
+| 3. ai-title-shadow-cleanup ported w/ Node semantics + marker + tests; SESSION-04 evidence updated honestly | Tasks 4-5 (helper/marker/orchestration tests incl. flush-gated marker, boot wiring, checklist edit stays PARTIAL) + Task 5b (read-guard port making the cleanup durable/observable) |
 | 4. Flaky test identified; default `cargo test -p freshell-platform` 10/10 green; live variant behind explicit env flag | Task 6 (identified test + log evidence; env gate FRESHELL_RUN_LIVE_WINDOWS_INTEROP; 10x loop) |
 | 5. Full suite green; merged to feat/rust-tauri-port; pushed; NO PR; nothing to main | Task 7 |
