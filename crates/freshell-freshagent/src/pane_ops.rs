@@ -75,19 +75,22 @@ pub fn router(state: FreshAgentState) -> Router {
 
 // ── POST /api/panes/:id/split ──────────────────────────────────────────────
 
-/// `POST /api/panes/:id/split` (`router.ts:1250-1394`). AUTO-01 note: the
-/// shared layout store now exists and learns the real split-tree ids from the
-/// `ui.layout.sync` mirror (and write-through from this handler); this route
-/// still resolves the SOURCE pane via [`FreshAgentState::pane_tabs`]
-/// (pre-AUTO-01 resolution kept — re-pointing the mutation routes at the
-/// store is AUTO-05/06's work) rather than `resolvePaneTarget`'s
-/// ambiguous-title matching, so an unknown `paneId` remains an honest 404,
-/// not the original's title-resolution 409. `agent`-based fresh-agent splits
-/// (`router.ts:1258-1285`)
-/// are an explicit, documented deferral (honest 400) -- out of this slice's
-/// bounded scope (reusing the create/send-keys/capture agent machinery for a
-/// split target is a separate, larger unit of work); browser/editor/terminal
-/// splits are fully implemented.
+/// `POST /api/panes/:id/split` (`router.ts:1250-1394`). AUTO-01: legacy order,
+/// exactly — `layoutStore.splitPane` FIRST (`router.ts:1305-1315`), so
+/// authoritative membership + the tree mutation land BEFORE any process spawn
+/// (the placeholder is `buildContent`-parity: the full cheap content for
+/// browser/editor, bare `{kind:'terminal'}` for a terminal that does not exist
+/// yet), then `attachPaneContent` with the full spawned content. Legacy leaves
+/// the placeholder split in the store when the spawn fails (its `catch` only
+/// kills the spawned terminal; no layout rollback) — mirrored deliberately.
+/// Resolution therefore means "the pane exists in the authoritative layout"
+/// (a mirror-fed UI pane splits fine); unknown/absent paneId is an honest 404
+/// with ZERO side effects (no PTY, no bookkeeping, no broadcast), rather than
+/// `resolvePaneTarget`'s title-resolution 409. `agent`-based fresh-agent
+/// splits (`router.ts:1258-1285`) are an explicit, documented deferral (honest
+/// 400) -- out of this slice's bounded scope (reusing the create/send-keys/
+/// capture agent machinery for a split target is a separate, larger unit of
+/// work); browser/editor/terminal splits are fully implemented.
 pub(crate) async fn split_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -97,16 +100,6 @@ pub(crate) async fn split_pane(
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-
-    let Some(tab_id) = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned()
-    else {
-        return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
-    };
 
     if body.get("agent").and_then(Value::as_str).is_some() {
         return fail_json(
@@ -126,20 +119,18 @@ pub(crate) async fn split_pane(
 
     let new_pane_id = Uuid::new_v4().to_string();
 
-    let new_content = if let Some(url) = body.get("browser").and_then(Value::as_str) {
-        let content = json!({
+    // The placeholder content is computable without side effects
+    // (`layout-store.ts::buildContent` parity).
+    let browser_url = body.get("browser").and_then(Value::as_str);
+    let editor_path = body.get("editor").and_then(Value::as_str);
+    let placeholder_content = if let Some(url) = browser_url {
+        json!({
             "kind": "browser",
             "url": url,
             "devToolsOpen": false,
-        });
-        state
-            .content_panes
-            .lock()
-            .expect("content_panes mutex")
-            .insert(new_pane_id.clone(), content.clone());
-        content
-    } else if let Some(file_path) = body.get("editor").and_then(Value::as_str) {
-        let content = json!({
+        })
+    } else if let Some(file_path) = editor_path {
+        json!({
             "kind": "editor",
             "filePath": file_path,
             "language": Value::Null,
@@ -147,7 +138,22 @@ pub(crate) async fn split_pane(
             "content": "",
             "viewMode": "source",
             "wordWrap": true,
-        });
+        })
+    } else {
+        json!({ "kind": "terminal" })
+    };
+
+    let Some(tab_id) =
+        state
+            .layout_store()
+            .split_pane(&pane_id, &direction, &new_pane_id, placeholder_content)
+    else {
+        return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+    };
+
+    let new_content = if browser_url.is_some() || editor_path.is_some() {
+        // Cheap content kinds: the placeholder IS the final content.
+        let content = placeholder_final_content(browser_url, editor_path);
         state
             .content_panes
             .lock()
@@ -157,7 +163,7 @@ pub(crate) async fn split_pane(
     } else {
         match spawn_terminal_pane(&state, &body, &tab_id, &new_pane_id).await {
             Ok(TerminalSpawnResult { pane_content, .. }) => pane_content,
-            Err(resp) => return resp,
+            Err(resp) => return resp, // legacy parity: the placeholder split STAYS in the store
         }
     };
 
@@ -170,33 +176,11 @@ pub(crate) async fn split_pane(
         .expect("pane_tabs mutex")
         .insert(new_pane_id.clone(), tab_id.clone());
 
-    // AUTO-01 write-through, legacy's exact two-step (`router.ts:1305-1371`):
-    // `layoutStore.splitPane({paneId, direction, browser?, editor?})` — the
-    // PLACEHOLDER content (`buildContent`: the full cheap content for
-    // browser/editor, bare `{kind:'terminal'}` for a terminal that does not
-    // exist yet) — then `attachPaneContent` with the full spawned content.
-    let placeholder_content = match new_content.get("kind").and_then(Value::as_str) {
-        Some("browser") | Some("editor") => new_content.clone(),
-        _ => json!({ "kind": "terminal" }),
-    };
-    if state
+    // Legacy's second step (`router.ts:1371`): the full spawned content
+    // replaces the placeholder on the new leaf.
+    state
         .layout_store()
-        .split_pane(&pane_id, &direction, &new_pane_id, placeholder_content)
-        .is_none()
-    {
-        // The store never contained the source pane (a pre-AUTO-01 shadow-only
-        // pane with no mirror): keep the pre-AUTO-01 response behavior; the
-        // client fold + next mirror will rebuild the real tree into the store.
-        tracing::debug!(
-            pane_id = %pane_id,
-            "split_pane: source pane absent from the layout store mirror; \
-             write-through skipped (store self-heals on the next ui.layout.sync)"
-        );
-    } else {
-        state
-            .layout_store()
-            .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
-    }
+        .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
 
     let terminal_id = new_content.get("terminalId").cloned();
 
@@ -542,12 +526,38 @@ pub(crate) async fn layout_snapshot(
     )
 }
 
+/// The cheap-content final builder shared by `split_pane`'s placeholder and
+/// final content (`layout-store.ts::buildContent`/`router.ts:1319-1323`
+/// parity): identical values, written through both seams.
+fn placeholder_final_content(browser_url: Option<&str>, editor_path: Option<&str>) -> Value {
+    if let Some(url) = browser_url {
+        json!({
+            "kind": "browser",
+            "url": url,
+            "devToolsOpen": false,
+        })
+    } else if let Some(file_path) = editor_path {
+        json!({
+            "kind": "editor",
+            "filePath": file_path,
+            "language": Value::Null,
+            "readOnly": false,
+            "content": "",
+            "viewMode": "source",
+            "wordWrap": true,
+        })
+    } else {
+        unreachable!("called only from the cheap-content branch")
+    }
+}
+
 // ── POST /api/panes/:id/navigate ────────────────────────────────────────
 
 /// `POST /api/panes/:id/navigate` (`router.ts:1654-1667`): re-point a
-/// browser pane at a new `url`. Resolved via [`FreshAgentState::pane_tabs`]
-/// (no ambiguous title matching, matching this module's established
-/// precedent). Broadcasts `ui.command{pane.attach}` -- the client folds it
+/// browser pane at a new `url`. Resolved via the authoritative layout store
+/// (AUTO-01 — a mirror-fed UI-only pane navigates fine; unknown/absent pane
+/// is an honest 404, no ambiguous title matching). Broadcasts
+/// `ui.command{pane.attach}` -- the client folds it
 /// via `updatePaneContent` regardless of the pane's PREVIOUS kind, so
 /// navigating a currently-terminal/editor pane into a browser is honored
 /// the same way legacy's unconditional `layoutStore.attachPaneContent` is.
@@ -571,11 +581,9 @@ pub(crate) async fn navigate_pane(
     };
 
     let Some(tab_id) = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned()
+        .layout_store()
+        .get_pane_snapshot(&pane_id)
+        .map(|snap| snap.tab_id)
     else {
         return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
     };
@@ -627,7 +635,9 @@ pub(crate) async fn navigate_pane(
 /// background session in the SAME shared registry -- no leak, matching
 /// "detach, don't kill." Broadcasts `ui.command{pane.attach}` (per the
 /// parity spec's route table), not `pane.split` -- respawn replaces content
-/// on an EXISTING pane, it does not mint a new one.
+/// on an EXISTING pane, it does not mint a new one. AUTO-01: the pane is
+/// resolved through the authoritative layout store BEFORE any spawn, so a
+/// pane the layout no longer contains never reaches the registry.
 pub(crate) async fn respawn_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -639,11 +649,9 @@ pub(crate) async fn respawn_pane(
     }
 
     let Some(tab_id) = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned()
+        .layout_store()
+        .get_pane_snapshot(&pane_id)
+        .map(|snap| snap.tab_id)
     else {
         return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
     };
@@ -1066,6 +1074,157 @@ mod tests {
         // ...and the surviving pane is now the tab's LAST pane: guarded.
         let (_, body) = post(router, "/api/panes/ui_pane_a2/close", json!({}), true).await;
         assert_eq!(body["message"], json!("cannot close only pane"));
+    }
+
+    /// Review-round-2 regression: a STALE `pane_tabs` entry (pane still in
+    /// dispatch bookkeeping but already gone from the authoritative layout —
+    /// e.g. the mirror's tab close) must never reach side effects. Legacy
+    /// ordering is layoutStore-first (`router.ts:1305-1315`); a 404 with no
+    /// PTY spawn, no broadcast, and an untouched snapshot is the contract.
+    #[tokio::test]
+    async fn split_of_stale_shadow_pane_is_a_404_with_zero_side_effects() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+
+        // Divergence: the pane stays in the shadow bookkeeping while the
+        // authoritative store no longer has the tab (as if the mirror
+        // reported the close).
+        assert!(state.layout_store().close_tab(&tab_id));
+        assert!(
+            state
+                .pane_tabs
+                .lock()
+                .expect("pane_tabs mutex")
+                .contains_key(&pane_id),
+            "fixture needs the stale shadow entry"
+        );
+        let mut rx = state.broadcast_tx.subscribe();
+        while rx.try_recv().is_ok() {}
+        let snapshot_before = state.layout_store().get_normalized_snapshot(None);
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["message"], json!("pane not found"));
+
+        assert!(state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .inventory()
+            .is_empty());
+        assert_eq!(
+            state.layout_store().get_normalized_snapshot(None),
+            snapshot_before
+        );
+        // No pane.split frame went out.
+        let drained = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            drained.is_err(),
+            "no pane.split broadcast on a rejected split"
+        );
+    }
+
+    /// The flip side of store-first resolution: a pane that exists ONLY in
+    /// the mirror (UI-created) splits fine over REST — the AUTO-01
+    /// "shared by browser/REST/CLI/MCP" promise.
+    #[tokio::test]
+    async fn split_of_mirror_only_terminal_pane_works() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        feed_store(&state);
+        let before = state.terminal_registry.clone().unwrap().inventory().len();
+
+        let (status, body) = post(
+            router,
+            "/api/panes/ui_pane_a1/split",
+            json!({ "direction": "vertical" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_pane = body["data"]["paneId"].as_str().unwrap().to_string();
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // The store tree gained the real split with the directed geometry.
+        let snap = state
+            .layout_store()
+            .get_normalized_snapshot(Some("ui_tab_a"));
+        let tree = serde_json::to_string(&snap["layouts"]["ui_tab_a"]).unwrap();
+        assert!(tree.contains(&new_pane), "{tree}");
+        assert!(tree.contains(&terminal_id), "{tree}");
+
+        let registry = state.terminal_registry.clone().unwrap();
+        assert_eq!(registry.inventory().len(), before + 1);
+        registry.kill(&terminal_id);
+    }
+
+    /// Same staleness guard for respawn (the other spawn-capable write).
+    #[tokio::test]
+    async fn respawn_of_stale_shadow_pane_is_a_404_with_no_spawn() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        assert!(state.layout_store().close_tab(&tab_id));
+        assert!(state
+            .pane_tabs
+            .lock()
+            .expect("pane_tabs mutex")
+            .contains_key(&pane_id));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["message"], json!("pane not found"));
+        assert!(state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .inventory()
+            .is_empty());
+    }
+
+    /// Navigate rewrites the authoritative store content for mirror-only
+    /// panes too.
+    #[tokio::test]
+    async fn navigate_updates_mirror_only_pane_content() {
+        let state = state_with_registry();
+        feed_store(&state);
+
+        let router = app(state.clone());
+        let (status, body) = post(
+            router,
+            "/api/panes/ui_pane_a2/navigate",
+            json!({ "url": "https://rfc.example.com/rfc9110" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let snap = state
+            .layout_store()
+            .get_normalized_snapshot(Some("ui_tab_a"));
+        let leaf = &snap["layouts"]["ui_tab_a"]["children"][1];
+        assert_eq!(leaf["content"]["kind"], json!("browser"));
+        assert_eq!(
+            leaf["content"]["url"],
+            json!("https://rfc.example.com/rfc9110")
+        );
+        // Seeded title followed the content change (pane title untouched by user).
+        let listed = state.layout_store().list_panes(Some("ui_tab_a"));
+        assert_eq!(listed[1].title.as_deref(), Some("rfc.example.com"));
     }
 
     async fn create_shell_tab(router: Router) -> (String, String, String) {
