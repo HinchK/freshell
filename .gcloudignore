@@ -63,6 +63,7 @@ Thumbs.db
 # Exceptions: files needed by server-side tests
 !AGENTS.md
 !docs/skills/testing.md
+!docs/lab-notes/2026-04-20-coding-cli-session-contract.md
 
 # Explicitly keep package manifests (harmless; guards against future globs)
 !package.json
