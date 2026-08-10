@@ -28,7 +28,12 @@ use tracing_subscriber::Layer;
 #[derive(Debug, Clone, Default)]
 struct CapturedEvent {
     message: String,
+    /// Span-merged view (span fields root->leaf, then event fields) — what
+    /// the production JsonLayer writes.
     fields: BTreeMap<String, String>,
+    /// The event's OWN fields only (no span merge) — proves dual-carrier
+    /// claims, which require the field ON THE EVENT.
+    event_fields: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -109,8 +114,8 @@ where
                 }
             }
         }
-        for (k, v) in visitor.fields {
-            fields.insert(k, v);
+        for (k, v) in &visitor.fields {
+            fields.insert(k.clone(), v.clone());
         }
         self.events
             .lock()
@@ -118,6 +123,7 @@ where
             .push(CapturedEvent {
                 message: visitor.message,
                 fields,
+                event_fields: visitor.fields,
             });
     }
 }
@@ -402,6 +408,12 @@ async fn diag01_ws_lifecycle_events_fire_with_expected_fields_and_never_leak_the
     assert!(
         closed.fields.contains_key("connection_id"),
         "connection.closed must carry connection_id"
+    );
+    assert!(
+        closed.event_fields.contains_key("origin_kind"),
+        "connection.closed must carry origin_kind AS AN EVENT FIELD (dual-carrier: \
+         the span's copy dies along with the span under target-directive-only filters; \
+         only the event's own fields survive those)"
     );
 }
 

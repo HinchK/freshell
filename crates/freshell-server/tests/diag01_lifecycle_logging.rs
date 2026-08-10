@@ -130,6 +130,13 @@ async fn boot_server(server_binary: &std::path::Path, home: &std::path::Path) ->
         // and make the assertions compare against the wrong expectation.
         .env_remove("FRESHELL_APP_VERSION")
         .env_remove("RUST_LOG")
+        // Same ambient-hygiene class for the log SINK: the assertions below
+        // pin the default `<home>/.freshell/logs/rust-server.jsonl` path and
+        // expect no rotation, so ambient log-dir/rotation overrides from the
+        // test host would otherwise fail the test for the wrong reason.
+        .env_remove("FRESHELL_LOG_DIR")
+        .env_remove("FRESHELL_LOG_MAX_BYTES")
+        .env_remove("FRESHELL_LOG_MAX_BACKUPS")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

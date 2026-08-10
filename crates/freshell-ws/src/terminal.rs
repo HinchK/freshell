@@ -248,6 +248,7 @@ pub async fn run(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         conn_id,
+        origin_kind,
     )
     .instrument(span)
     .await;
@@ -267,6 +268,7 @@ async fn run_loop(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     conn_id: u64,
+    origin_kind: &'static str,
 ) {
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
@@ -553,16 +555,21 @@ async fn run_loop(
     }
 
     // DIAG-01: one summary lifecycle event per connection teardown, whatever
-    // the actual reason -- see `close_reason`/`close_code` above.
+    // the actual reason -- see `close_reason`/`close_code` above. Both
+    // identity fields are EVENT-level (not span-only): the dual-carrier
+    // doctrine — under target-directive-only RUST_LOG filters the ws_conn
+    // span's copies vanish while the event's own fields still land.
     match close_code {
         Some(code) => tracing::info!(
             connection_id = conn_id,
+            origin_kind = origin_kind,
             reason = close_reason,
             code = code,
             "ws.connection.closed"
         ),
         None => tracing::info!(
             connection_id = conn_id,
+            origin_kind = origin_kind,
             reason = close_reason,
             "ws.connection.closed"
         ),

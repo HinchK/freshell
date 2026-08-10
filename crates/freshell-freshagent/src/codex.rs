@@ -1911,9 +1911,13 @@ impl FreshCodexState {
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
         // memory for the old thread is lost. `warn`, unlike the resume-first
-        // path, because this is the degraded fallback.
+        // path, because this is the degraded fallback. Carries the canonical
+        // `session_id` (= the NEW, now-current thread) alongside the
+        // recovery-forensics old/new pair, so generic session-lifecycle
+        // parses see one uniform identity field on every lifecycle event.
         tracing::warn!(
             provider = PROVIDER,
+            session_id = %new_thread_id,
             old_session_id = %old_session_id,
             new_session_id = %new_thread_id,
             "freshagent.crash_recovery.minted_new"
