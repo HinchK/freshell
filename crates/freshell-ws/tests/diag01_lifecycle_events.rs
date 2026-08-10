@@ -511,4 +511,29 @@ async fn diag01_in_connection_events_carry_the_connection_id() {
             "expected a {name} event with connection_id {conn_id}"
         );
     }
+
+    // The ws-side settle companion carries the SAME join as explicit EVENT
+    // fields (not span context) -- the dual-carrier design (review round 2):
+    // span enrichment dies under tracing-subscriber's target-directive-only
+    // filters (empirically, even a matched `freshell_ws=info` directive
+    // disables span callsites), but an event's own fields ride through any
+    // filter that admits the event. `ws.terminal.create.settled` is the
+    // connection_id <-> terminal_id <-> requestId join that survives.
+    let settled = captured[start_index..]
+        .iter()
+        .find(|e| {
+            e.message == "ws.terminal.create.settled"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+        })
+        .expect("expected a ws.terminal.create.settled companion event for our terminal_id");
+    assert_eq!(
+        settled.fields.get("connection_id").map(String::as_str),
+        Some(conn_id.as_str()),
+        "settle companion carries connection_id as an event field"
+    );
+    assert_eq!(
+        settled.fields.get("request_id").map(String::as_str),
+        Some(request_id.as_str()),
+        "settle companion carries the client requestId as an event field"
+    );
 }

@@ -123,6 +123,29 @@ pub(crate) fn connection_span(conn_id: u64, origin_kind: &'static str) -> tracin
     )
 }
 
+/// DIAG-01 dual-carrier connection ownership. The `ws_conn` span
+/// ([`connection_span`]) enriches in-connection events under bare /
+/// globally-anchored level filters, but tracing-subscriber disables SPAN
+/// callsites under target-directive-only filters (empirically: even a
+/// matched `freshell_ws=info` directive disables the span while still
+/// admitting that crate's events). An event's own fields ride through ANY
+/// filter that admits the event itself -- so the create-reply join
+/// (connection_id <-> requestId <-> terminal_id) is ALSO emitted as
+/// explicit event fields here, once per `terminal.created` reply path
+/// (`path` says which). Under a filter that silences freshell_ws entirely
+/// (`freshell_ws=off`), nothing in this crate logs at all by the operator's
+/// express choice; the registry's `terminal.created` then joins only via
+/// `terminal_id` (documented in freshell-server's logging.rs schema).
+fn log_create_settled(conn_id: u64, request_id: &str, terminal_id: &str, path: &'static str) {
+    tracing::info!(
+        connection_id = conn_id,
+        request_id = %request_id,
+        terminal_id = %terminal_id,
+        path = path,
+        "ws.terminal.create.settled"
+    );
+}
+
 /// `tokio::task::spawn_blocking` does NOT propagate the caller's tracing
 /// span context across the thread hop (spans are thread-local), which would
 /// silently strip `connection_id` (and any future request-scoped context)
@@ -662,6 +685,14 @@ async fn handle_client_text(
                 crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
                     // Re-send the original terminal.created (same requestId,
                     // same terminalId) — never spawn a duplicate.
+                    if let ServerMessage::TerminalCreated(created_terminal) = &created {
+                        log_create_settled(
+                            conn_id,
+                            &created_terminal.request_id,
+                            &created_terminal.terminal_id,
+                            "duplicate_settled",
+                        );
+                    }
                     let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                     return out.send(&created).await;
                 }
@@ -2003,6 +2034,7 @@ pub(crate) async fn handle_create(
                     create_request_id = %create.request_id,
                     "terminal.create.adopted"
                 );
+                log_create_settled(conn_id, &create.request_id, &existing, "adopted");
                 let created = ServerMessage::TerminalCreated(TerminalCreated {
                     created_at: now_ms(),
                     request_id: create.request_id,
@@ -2067,6 +2099,12 @@ pub(crate) async fn handle_create(
                             provider = %locator.provider,
                             session_id = %locator.session_id,
                             "terminal.create.session_ref_attached"
+                        );
+                        log_create_settled(
+                            conn_id,
+                            &create.request_id,
+                            &terminal_id,
+                            "session_ref_attached",
                         );
                         let created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
@@ -3211,6 +3249,7 @@ pub(crate) async fn handle_create(
         dedupe_restore,
         |tid| state.registry.is_pty_running(tid),
     );
+    log_create_settled(conn_id, &dedupe_request_id, &dedupe_terminal_id, "spawned");
     let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
@@ -6263,6 +6302,88 @@ mod connection_span_filter_tests {
                 probe.fields.get("origin_kind").map(String::as_str),
                 Some("same-origin"),
                 "origin_kind must survive a RUST_LOG={filter_level} filter"
+            );
+        }
+    }
+
+    /// Target-directive behavior, empirically mapped (probe, 2026-08-09) —
+    /// review round 2's finding. tracing-subscriber disables SPAN callsites
+    /// under TARGET-DIRECTIVE-ONLY filters, even when a directive names the
+    /// span's own component at an admitting level (`freshell_ws=info`
+    /// still kills the span). Under GLOBALLY-ANCHORED mixes (`info,
+    /// freshell_terminal=debug`) the span is enabled fine. This test
+    /// therefore pins the guarantees, not the pathologies:
+    ///   (a) a globally-anchored target mix keeps the span enriching a
+    ///       cross-crate in-connection event;
+    ///   (b) under a target-directive-only mix, the ws-side settle event
+    ///       ([`super::log_create_settled`]) still carries the join as
+    ///       EVENT fields, which no filter config can strip. (Empirically
+    ///       the span's fields are absent in this scenario; that absence is
+    ///       tracing-subscriber's per-callsite span-interest behavior, NOT
+    ///       a guarantee of ours, so it is documented here but not
+    ///       asserted.)
+    ///   (c) A filter silencing freshell_ws (`freshell_ws=off`) is the
+    ///       documented boundary: nothing in this crate logs at all then,
+    ///       by the operator's express choice.
+    #[test]
+    fn ws_conn_context_guarantee_envelope_across_filter_shapes() {
+        // (a) globally-anchored target mix: span fields merge onto a
+        // cross-crate in-connection event admitted at info.
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter = tracing_subscriber::EnvFilter::new("info,freshell_terminal=debug");
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                tracing::info!(target: "freshell_terminal::registry", "probe_event");
+            });
+            let captured = events.lock().unwrap().clone();
+            let probe = captured
+                .iter()
+                .find(|e| e.message == "probe_event")
+                .expect("probe event captured under globally-anchored mix");
+            assert_eq!(
+                probe.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "globally-anchored mixes keep span-based context"
+            );
+        }
+        // (b) target-directive-only mix: the event-level dual carrier
+        // survives where span context does not.
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter =
+                tracing_subscriber::EnvFilter::new("freshell_ws=info,freshell_terminal=debug");
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                super::log_create_settled(7u64, "req-123", "term-xyz", "spawned");
+            });
+            let captured = events.lock().unwrap().clone();
+            let settled = captured
+                .iter()
+                .find(|e| e.message == "ws.terminal.create.settled")
+                .expect("settle event captured under target-directive-only mix");
+            assert_eq!(
+                settled.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "event-level connection_id rides through ANY filter admitting the event"
+            );
+            assert_eq!(
+                settled.fields.get("request_id").map(String::as_str),
+                Some("req-123")
+            );
+            assert_eq!(
+                settled.fields.get("terminal_id").map(String::as_str),
+                Some("term-xyz")
             );
         }
     }

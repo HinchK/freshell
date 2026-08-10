@@ -125,6 +125,10 @@ async fn boot_server(server_binary: &std::path::Path, home: &std::path::Path) ->
         .env("HOME", home)
         .env("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()))
         .env_remove("FAKE_CODEX_APP_SERVER_BEHAVIOR")
+        // The version stamps under test must come from the build constant:
+        // an ambient FRESHELL_APP_VERSION on the test host must not leak in
+        // and make the assertions compare against the wrong expectation.
+        .env_remove("FRESHELL_APP_VERSION")
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

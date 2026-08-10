@@ -28,9 +28,20 @@
 //!     `duration_ms` (one `http_request` event per response; see
 //!     [`request_logging_middleware`])
 //!   - WS connections: `connection_id`, `origin_kind` -- carried on the
-//!     `ws.connection.established`/`closed` lifecycle events AND, via the
-//!     per-connection `ws_conn` span in `freshell-ws`, on every event
-//!     emitted while serving that connection
+//!     `ws.connection.established`/`closed` lifecycle events, via the
+//!     per-connection `ws_conn` span on every event emitted while serving
+//!     that connection, AND as explicit event fields on the create-reply
+//!     settle companions (`ws.terminal.create.settled` with
+//!     `connection_id`/`request_id`/`terminal_id`/`path`). Ownership-
+//!     envelope NOTE: span enrichment is active under bare level filters
+//!     (any `RUST_LOG=error..trace`) and globally-anchored mixes
+//!     (`info,freshell_terminal=debug`); tracing-subscriber disables span
+//!     callsites under TARGET-DIRECTIVE-ONLY filters (even a matched
+//!     `freshell_ws=info`), which is exactly why the settle companions
+//!     carry the join as event fields -- event fields ride through any
+//!     filter admitting the event. Under `freshell_ws=off` nothing in the
+//!     ws crate logs at all (operator's express choice); a
+//!     `terminal.created` line then joins only via `terminal_id`.
 //!   - Terminals: `terminal_id` plus spawn-mode/cwd/pid on
 //!     `terminal.created`, `exit_code` on `terminal.exited`, the kill actor
 //!     (`by`: api/idle/shutdown) on `terminal.killed`
