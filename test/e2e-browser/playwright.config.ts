@@ -245,6 +245,12 @@ export const RUST_ONLY_SPECS = [
   /freshclaude-identity-persistence-rust\.spec\.ts$/,
   // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
   /opencode-rebind-rust\.spec\.ts$/,
+  // CFG-01 — lossless config.json writes: seed-sentinels/deep-compare per
+  // writer. Rust-only: the acceptance is PW-RUST and the Rust writer is a
+  // deliberate strict superset of legacy (legacy's normalization rebuild
+  // drops sibling serverSecrets; Rust preserves them). See
+  // specs/cfg01-lossless-writes.spec.ts and docs/plans/df1-evidence/CFG-01.md.
+  /cfg01-lossless-writes\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -436,6 +442,11 @@ export default defineConfig({
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
         // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
         /opencode-rebind-rust\.spec\.ts$/,
+        // CFG-01 — lossless config.json writes: seed sentinels + deep-compare
+        // after every writer action/restart. Rust-only (superset guarantee —
+        // see RUST_ONLY_SPECS entry + the spec's doc comment). Authored under
+        // the df1 deferred-Playwright policy; see docs/plans/df1-evidence/CFG-01.md.
+        /cfg01-lossless-writes\.spec\.ts$/,
         // Sidebar opencode rail fixes (Bug 1 + Bug 2): runs in BOTH matrix
         // projects — Node parity is part of the fix.
         /sidebar-opencode-rail\.spec\.ts$/,
