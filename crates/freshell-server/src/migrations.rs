@@ -120,4 +120,81 @@ mod tests {
         }));
         assert!(override_keys_to_clear(&ov, &AUTHORITATIVE_TITLE_PROVIDERS).is_empty());
     }
+
+    use crate::settings_store::SettingsStore;
+
+    /// Seeds a real config.json. `completed: None` = no marker key at all --
+    /// NOTE the settings_store lossless fixture already seeds the marker
+    /// (settings_store.rs:2511-2530), which would make a load-time migration
+    /// pass accidentally; these tests therefore always build their own
+    /// marker-free fixtures.
+    fn seed_config(dir: &std::path::Path, session_overrides: Value, completed: Option<Value>) {
+        let mut doc = json!({
+            "version": 1,
+            "settings": { "codingCli": {
+                "enabledProviders": ["claude", "codex"],
+                "knownProviders": ["claude", "codex"],
+                "providers": {},
+                "mcpServer": true
+            } },
+            "recentDirectories": ["/a", "/b"],
+            "zzFutureKey": { "a": 1 },
+            "sessionOverrides": session_overrides,
+            "terminalOverrides": {},
+            "projectColors": {}
+        });
+        if let Some(c) = completed {
+            doc["completedMigrations"] = c;
+        }
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn store_at(dir: &std::path::Path) -> SettingsStore {
+        SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into()])
+    }
+
+    fn read_config(dir: &std::path::Path) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    // Mirrors test/unit/server/config-store.test.ts:975-997.
+    #[test]
+    fn migration_marker_roundtrip_is_idempotent_and_reload_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(dir, json!({}), None);
+        let store = store_at(dir);
+        assert!(!store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+        store.mark_migration_done(AI_TITLE_SHADOW_CLEANUP).unwrap();
+        store.mark_migration_done(AI_TITLE_SHADOW_CLEANUP).unwrap();
+        assert!(store.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+        assert_eq!(
+            read_config(dir)["completedMigrations"],
+            json!([AI_TITLE_SHADOW_CLEANUP]),
+            "append-only, no duplicates"
+        );
+        let reloaded = store_at(dir);
+        assert!(reloaded.is_migration_done(AI_TITLE_SHADOW_CLEANUP));
+    }
+
+    #[test]
+    fn mark_migration_done_preserves_unmanaged_document_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        seed_config(dir, json!({}), None);
+        let store = store_at(dir);
+        store.mark_migration_done(AI_TITLE_SHADOW_CLEANUP).unwrap();
+        let cfg = read_config(dir);
+        assert_eq!(cfg["recentDirectories"], json!(["/a", "/b"]));
+        assert_eq!(cfg["zzFutureKey"], json!({ "a": 1 }));
+        assert_eq!(cfg["completedMigrations"], json!([AI_TITLE_SHADOW_CLEANUP]));
+    }
 }
