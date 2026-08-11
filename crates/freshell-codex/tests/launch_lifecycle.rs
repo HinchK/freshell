@@ -30,8 +30,9 @@ use freshell_codex::launch_lifecycle::{
 };
 use freshell_codex::launch_plan::{codex_remote_args, CodexLaunchPlanInput};
 use freshell_codex::{
-    proc_starttime, verify_sidecar_identity, BoxFuture, CodexSidecarStore, IdentityVerdict,
-    SidecarRecordState,
+    proc_cmdline, proc_starttime, verify_sidecar_identity, BoxFuture, CodexSidecarRecord,
+    CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime, SidecarReconciler,
+    SidecarRecordState, SIDECAR_RECORD_VERSION,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,8 +132,9 @@ impl CodexLaunchRuntime for FakeRuntime {
 }
 
 fn planner_for(runtime: Arc<FakeRuntime>) -> CodexLaunchPlanner {
-    CodexLaunchPlanner::new(Box::new(move || {
-        runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    CodexLaunchPlanner::new(Box::new(move |_plan| {
+        let rt = runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }))
 }
 
@@ -403,8 +405,9 @@ async fn retry_never_retries_configuration_errors() {
 async fn manager_adopts_by_terminal_id_and_tears_down_on_exit() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
 
     let launch = manager
@@ -444,8 +447,9 @@ async fn manager_adopts_by_terminal_id_and_tears_down_on_exit() {
 async fn manager_discard_tears_down_an_unadopted_plan() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
     let launch = manager
         .plan_create_with_retry_uncancellable(
@@ -466,7 +470,10 @@ async fn discard_sync_tears_down_an_unadopted_plan() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
     let manager = CodexTerminalLaunchManager::with_plan_budget(
-        Box::new(move || factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+        Box::new(move |_plan| {
+            let rt = factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { rt })
+        }),
         2,
         std::time::Duration::from_secs(30),
         64,
@@ -516,7 +523,10 @@ fn discard_sync_outside_runtime_context_does_not_panic() {
         let runtime = FakeRuntime::start().await;
         let factory_runtime = runtime.clone();
         let manager = CodexTerminalLaunchManager::with_plan_budget(
-            Box::new(move || factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+            Box::new(move |_plan| {
+                let rt = factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>;
+                Box::pin(async move { rt })
+            }),
             2,
             std::time::Duration::from_secs(30),
             64,
@@ -544,8 +554,9 @@ async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans
     // launches the Rust manager keys, since server exit ends those terminals too.
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
 
     // One adopted launch + one unadopted plan.
@@ -593,8 +604,9 @@ async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans
 async fn manager_exit_for_unknown_terminal_is_a_noop() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
     manager.notify_terminal_exit("never-created");
 }
@@ -641,10 +653,11 @@ fn blocking_test_runtime_factory() -> (
 ) {
     let release = Arc::new(tokio::sync::Notify::new());
     let factory_release = release.clone();
-    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move || {
-        Arc::new(BlockingRuntime {
+    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move |_plan| {
+        let rt = Arc::new(BlockingRuntime {
             release: factory_release.clone(),
-        }) as Arc<dyn CodexLaunchRuntime>
+        }) as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     });
     (factory, release)
 }
@@ -744,12 +757,13 @@ async fn eight_restore_class_plans_queue_and_drain_without_error() {
     let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
     let peak = std::sync::Arc::new(AtomicUsize::new(0));
     let (rt_in, rt_peak) = (in_flight.clone(), peak.clone());
-    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move || {
-        std::sync::Arc::new(CountingRuntime {
+    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move |_plan| {
+        let rt = std::sync::Arc::new(CountingRuntime {
             in_flight: rt_in.clone(),
             peak: rt_peak.clone(),
             plan_delay: std::time::Duration::from_millis(200),
-        }) as std::sync::Arc<dyn CodexLaunchRuntime>
+        }) as std::sync::Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     });
     // wait = 200ms: 8 plans / 2 permits * 200ms = ~800ms of queueing.
     // Interactive would die; Restore must drain.
@@ -933,8 +947,9 @@ async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() 
         fake_app_server_command(),
     ));
     let spawn_runtime = runtime.clone();
-    let planner = CodexLaunchPlanner::new(Box::new(move || {
-        spawn_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let planner = CodexLaunchPlanner::new(Box::new(move |_plan| {
+        let rt = spawn_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
 
     let launch = planner
@@ -990,14 +1005,167 @@ async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() 
     }
 }
 
+// ── Task 7: reattach failure falls back to a fresh spawn through the plan retry ────
+
+/// Task 7 (kata da92): the plan-aware factory claims a survivor for a resume
+/// plan. A survivor that DIED between boot reconcile and the restore is
+/// pruned by the claim-time re-verification (record removed, NOTHING
+/// signalled — the pid is dead), the claim returns `None`, and the SAME
+/// factory invocation falls through to the fresh spawn: the launch succeeds
+/// within the retry budget, served by a fresh fixture.
+#[tokio::test]
+async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
+    let (_dir, store) = temp_sidecar_store();
+
+    // A survivor record for s-1 whose process is ALIVE at boot reconcile:
+    // this test's own `sleep 300` child, with its REAL /proc evidence.
+    let mut sleep_child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn this test's own sleep child");
+    let dead_pid = sleep_child.id();
+    // Wait for exec to complete so the captured cmdline is really `sleep 300`
+    // (the sidecar_reconcile_tests post-fork/pre-exec flake guard).
+    let want = vec!["sleep".to_string(), "300".to_string()];
+    let exec_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while proc_cmdline(dead_pid as i32).as_ref() != Some(&want) {
+        assert!(
+            std::time::Instant::now() < exec_deadline,
+            "sleep child failed to exec within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The record's ws_url points at a loopback ephemeral port NOTHING
+    // listens on (bound, read, dropped) — never dialed here (the claim
+    // refuses the dead pid first), and fail-fast if it ever were.
+    let unused_ws_url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        format!("ws://127.0.0.1:{port}")
+    };
+    let dead_record = CodexSidecarRecord {
+        record_version: SIDECAR_RECORD_VERSION,
+        ownership_id: "codex-sidecar-a7000002-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+        pid: dead_pid,
+        starttime: proc_starttime(dead_pid as i32).expect("live child has a starttime"),
+        cmdline: want,
+        ws_url: unused_ws_url,
+        session_id: Some("s-1".to_string()),
+        terminal_id: None,
+        server_instance_id: "srv-prev".to_string(),
+        created_at: 1_700_000_000_000,
+        updated_at: 1_700_000_000_001,
+        state: SidecarRecordState::Active,
+    };
+    store.write(&dead_record).expect("write survivor record");
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());
+    assert_eq!(report.held, 1, "the survivor is held at boot");
+    let reconciler = Arc::new(reconciler);
+
+    // …then the sidecar DIES before the restore claims it (kill + reap OUR
+    // OWN child): the claim-time re-verification prunes the record and the
+    // reattach arm never mints — no signal is ever sent.
+    sleep_child.kill().expect("kill own sleep child");
+    sleep_child.wait().expect("reap own sleep child");
+
+    // The plan-aware factory: the production selection shape, with the spawn
+    // fallback pinned to the committed fixture (never the real `codex`).
+    let factory_reconciler = reconciler.clone();
+    let factory_store = store.clone();
+    let planner = CodexLaunchPlanner::new(Box::new(move |plan| {
+        let reconciler = factory_reconciler.clone();
+        let store = factory_store.clone();
+        Box::pin(async move {
+            if let Some(session_id) = plan.session_id.as_deref() {
+                if let Some(record) = reconciler.claim_for_session(session_id).await {
+                    return Arc::new(ReattachedCodexAppServerRuntime::new(record, store))
+                        as Arc<dyn CodexLaunchRuntime>;
+                }
+            }
+            Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+                fake_app_server_command(),
+                store,
+            )) as Arc<dyn CodexLaunchRuntime>
+        })
+    }));
+
+    let tmp = std::env::temp_dir().join(format!("freshell-codex-t7-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let launch = planner
+        .plan_create_with_retry(
+            &CodexLaunchPlanInput {
+                cwd: Some(tmp.to_str().unwrap()),
+                resume_session_id: Some("s-1"),
+                ..Default::default()
+            },
+            2,
+            /* retry_delay_ms */ 1,
+        )
+        .await
+        .expect("the resume plan must fall back to a fresh spawn");
+
+    // The dead survivor's record is GONE (pruned at claim) and the store's
+    // one record is the FRESH spawn's — a different sidecar entirely.
+    assert_eq!(reconciler.unclaimed_len(), 0, "the dead record left held");
+    let records = store.load_all();
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly the fresh spawn's record remains: {records:?}"
+    );
+    assert_ne!(
+        records[0].ownership_id, dead_record.ownership_id,
+        "the dead survivor's record was removed"
+    );
+    assert_ne!(
+        records[0].pid, dead_pid,
+        "the launch is served by a FRESH sidecar"
+    );
+
+    // The fresh fixture actually serves the launch: an initialize round trip
+    // relays through the planned proxy.
+    let (mut tui, _) = connect_async(&launch.remote_ws_url).await.unwrap();
+    tui.send(Message::Text(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let reply = loop {
+        let msg = timeout(RECV_TIMEOUT, tui.next())
+            .await
+            .expect("timed out waiting for the initialize reply through the proxy")
+            .expect("proxy closed before replying")
+            .unwrap();
+        if let Message::Text(text) = msg {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if value.get("id") == Some(&json!(1)) {
+                break value;
+            }
+        }
+    };
+    assert!(reply.get("result").is_some(), "initialize failed: {reply}");
+
+    launch
+        .sidecar
+        .shutdown()
+        .await
+        .expect("teardown the fresh spawn");
+    assert!(
+        store.load_all().is_empty(),
+        "teardown scrubs the fresh spawn's record"
+    );
+}
+
 // ────── S5.c persistence plumbing (mark_candidate_persisted, fail_candidate_capture) ──────
 
 #[tokio::test]
 async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
     // Must not panic, hang, or error for a terminal that was never adopted.
     manager.mark_candidate_persisted("no-such-terminal").await;
@@ -1008,8 +1176,9 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
     // no-op methods on unknown terminals does not affect it (observable: the
     // adopted launch can still be shut down cleanly).
     let planner_runtime = runtime.clone();
-    let planner = CodexLaunchPlanner::new(Box::new(move || {
-        planner_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let planner = CodexLaunchPlanner::new(Box::new(move |_plan| {
+        let rt = planner_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
     let launch = planner
         .plan_create(&CodexLaunchPlanInput::default())
@@ -1035,8 +1204,9 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
 async fn manager_note_session_id_reaches_adopted_runtime() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
-    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
-        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
     }));
     let launch = manager
         .plan_create_with_retry_uncancellable(

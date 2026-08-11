@@ -112,7 +112,10 @@ async fn installed_manager_is_returned_by_global_and_set_twice_fails() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
     let manager = CodexTerminalLaunchManager::with_plan_budget(
-        Box::new(move || factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+        Box::new(move |_plan| {
+            let rt = factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { rt })
+        }),
         2,
         std::time::Duration::from_secs(30),
         64,
@@ -140,7 +143,10 @@ async fn installed_manager_is_returned_by_global_and_set_twice_fails() {
 
     let runtime2 = FakeRuntime::start().await;
     let second = CodexTerminalLaunchManager::with_plan_budget(
-        Box::new(move || runtime2.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+        Box::new(move |_plan| {
+            let rt = runtime2.clone() as std::sync::Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { rt })
+        }),
         2,
         std::time::Duration::from_secs(30),
         64,

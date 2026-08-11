@@ -625,3 +625,113 @@ async fn reattach_shutdown_kills_only_after_reverification() {
         .await
         .expect("cleanup: kill this test's own fixture");
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: the plan-aware selection seam ([`crate::runtime_select`]).
+//
+// The spawn arm is asserted BEHAVIORALLY without ever spawning: the returned
+// runtime must not have consumed the claim, and its `shutdown` (a no-op for
+// an un-started spawn runtime) must leave the survivor's record untouched —
+// a reattach runtime's shutdown would scrub it.
+// ---------------------------------------------------------------------------
+
+use crate::launch_plan::{plan_codex_launch, CodexLaunchPlanInput};
+use crate::runtime_select::select_codex_runtime;
+
+#[tokio::test]
+async fn select_codex_runtime_prefers_a_claimable_survivor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    let ownership_id = "codex-sidecar-a7000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (mut child, ws_url) = spawn_own_fake_app_server(ownership_id).await;
+    let record = CodexSidecarRecord {
+        ws_url: ws_url.clone(),
+        ..record_for_child(
+            ownership_id,
+            child.id().expect("live fixture pid"),
+            Some(SESSION),
+        )
+    };
+    store.write(&record).expect("write record");
+    let (reconciler, _report) = SidecarReconciler::boot_reconcile(Arc::clone(&store));
+    let reconciler = Arc::new(reconciler);
+
+    let resume_plan = plan_codex_launch(&CodexLaunchPlanInput {
+        resume_session_id: Some(SESSION),
+        ..Default::default()
+    })
+    .expect("resume plan");
+    let fresh_plan = plan_codex_launch(&CodexLaunchPlanInput::default()).expect("fresh plan");
+    let unknown_plan = plan_codex_launch(&CodexLaunchPlanInput {
+        resume_session_id: Some("s-unknown"),
+        ..Default::default()
+    })
+    .expect("unknown-session resume plan");
+
+    // A fresh plan NEVER claims (the A4 fresh-restore exclusion).
+    let runtime = select_codex_runtime(Some(&reconciler), Some(&store), &fresh_plan).await;
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "a fresh plan must not claim the survivor"
+    );
+    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert_eq!(
+        store.load_all(),
+        vec![record.clone()],
+        "fresh plan: the survivor's record must stay untouched"
+    );
+
+    // An unknown resume session has nothing to claim: spawn, survivor held.
+    let runtime = select_codex_runtime(Some(&reconciler), Some(&store), &unknown_plan).await;
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "an unknown session must not claim the survivor"
+    );
+    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert_eq!(
+        store.load_all(),
+        vec![record.clone()],
+        "unknown session: the survivor's record must stay untouched"
+    );
+
+    // No reconciler installed: spawn, even for the claimable resume session.
+    let runtime = select_codex_runtime(None, Some(&store), &resume_plan).await;
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "a None reconciler must claim nothing"
+    );
+    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert_eq!(
+        store.load_all(),
+        vec![record.clone()],
+        "no reconciler: the survivor's record must stay untouched"
+    );
+
+    // The resume plan for the held session claims the survivor and mints the
+    // reattach runtime: the claim leaves `held`, and `ensure_ready` adopts
+    // the record's live listener (no spawn).
+    let runtime = select_codex_runtime(Some(&reconciler), Some(&store), &resume_plan).await;
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        0,
+        "the resume plan must consume the claim"
+    );
+    let ready = runtime
+        .ensure_ready(None)
+        .await
+        .expect("reattach adopts the surviving listener");
+    assert_eq!(ready.ws_url, ws_url, "reattach returns the RECORD's ws url");
+    assert_eq!(
+        child.try_wait().expect("try_wait fixture"),
+        None,
+        "the adopted survivor must still be alive"
+    );
+
+    child
+        .kill()
+        .await
+        .expect("cleanup: kill this test's own fixture");
+}

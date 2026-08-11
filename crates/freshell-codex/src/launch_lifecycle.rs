@@ -35,6 +35,8 @@
 //!   explicitly.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -49,6 +51,8 @@ use crate::launch_plan::{
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
 use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
+use crate::runtime_select::select_codex_runtime;
+use crate::sidecar_reconcile::codex_sidecar_reconciler;
 use crate::sidecar_store::{
     codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore,
     SidecarRecordState, SIDECAR_RECORD_VERSION,
@@ -107,8 +111,22 @@ pub trait CodexLaunchRuntime: Send + Sync {
 }
 
 /// The planner's runtime factory (`CodexLaunchPlanner` ctor `runtimeOrFactory`,
-/// `launch-planner.ts:115-121`): one fresh runtime per plan.
-pub type CodexRuntimeFactory = Box<dyn Fn() -> Arc<dyn CodexLaunchRuntime> + Send + Sync>;
+/// `launch-planner.ts:115-121`): one fresh runtime per plan. Plan-aware and
+/// async (Task 7): the factory receives the S3 pure plan and returns a boxed
+/// future that async [`CodexLaunchPlanner::plan_create`] AWAITS — the
+/// production selection ([`crate::runtime_select::select_codex_runtime`])
+/// must await the reconciler's claim
+/// ([`crate::sidecar_reconcile::SidecarReconciler::claim_for_session`],
+/// whose duplicate arm runs a bounded ws writer probe) before deciding
+/// reattach-vs-spawn.
+pub type CodexRuntimeFactory = Box<
+    dyn for<'a> Fn(
+            &'a CodexLaunchPlan,
+        )
+            -> Pin<Box<dyn Future<Output = Arc<dyn CodexLaunchRuntime>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 // ─── errors ──────────────────────────────────────────────────────────────────────────────
 
@@ -318,7 +336,7 @@ impl CodexLaunchPlanner {
         self.assert_accepting_plans()?;
         let plan = plan_codex_launch(input).map_err(CodexLaunchError::Config)?;
 
-        let runtime = (self.runtime_factory)();
+        let runtime = (self.runtime_factory)(&plan).await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let sidecar = Arc::new(CodexLaunchSidecar {
             id,
@@ -599,12 +617,24 @@ impl CodexTerminalLaunchManager {
         self.plan_waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
-    /// `CodexLaunchPlanner` per server (`server/index.ts:359`).
+    /// The process-wide manager over the REAL selection — legacy has exactly one
+    /// `CodexLaunchPlanner` per server (`server/index.ts:359`). Task 7: the
+    /// factory dispatches through [`select_codex_runtime`] — a claimable
+    /// verified survivor for a resume plan reattaches
+    /// ([`crate::sidecar_reconcile::ReattachedCodexAppServerRuntime`]); every
+    /// other plan (and a `None` reconciler/store — nothing installed at boot)
+    /// gets the spawn runtime, exactly the pre-Task-7 behavior.
     pub fn global() -> &'static CodexTerminalLaunchManager {
         GLOBAL_MANAGER.get_or_init(|| {
-            CodexTerminalLaunchManager::new(Box::new(|| {
-                Arc::new(SpawnedCodexAppServerRuntime::new()) as Arc<dyn CodexLaunchRuntime>
+            CodexTerminalLaunchManager::new(Box::new(|plan| {
+                Box::pin(async move {
+                    select_codex_runtime(
+                        codex_sidecar_reconciler().as_ref(),
+                        codex_sidecar_store().as_ref(),
+                        plan,
+                    )
+                    .await
+                })
             }))
         })
     }

@@ -8,6 +8,9 @@
 //!
 //! Every prune/claim decision emits structured tracing with the ownership id
 //! and identity verdict — auditability is half the invariant.
+//!
+//! The plan-aware reattach-vs-spawn selection OVER a claim lives in the
+//! sibling [`crate::runtime_select`] (Task 7).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
