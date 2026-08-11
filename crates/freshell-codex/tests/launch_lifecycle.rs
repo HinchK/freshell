@@ -32,7 +32,7 @@ use freshell_codex::launch_plan::{codex_remote_args, CodexLaunchPlanInput};
 use freshell_codex::{
     proc_cmdline, proc_starttime, verify_sidecar_identity, BoxFuture, CodexSidecarRecord,
     CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime, SidecarReconciler,
-    SidecarRecordState, SIDECAR_RECORD_VERSION,
+    SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1145,6 +1145,174 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
         }
     };
     assert!(reply.get("result").is_some(), "initialize failed: {reply}");
+
+    launch
+        .sidecar
+        .shutdown()
+        .await
+        .expect("teardown the fresh spawn");
+    assert!(
+        store.load_all().is_empty(),
+        "teardown scrubs the fresh spawn's record"
+    );
+}
+
+/// Task 7 review follow-up: the TRUE retry path. The claim SUCCEEDS (the
+/// survivor's /proc evidence verifies) but the minted
+/// [`ReattachedCodexAppServerRuntime`]'s `ensure_ready` FAILS (the record's
+/// ws_url points at a port where nothing listens), which reaps the
+/// verified-but-unusable survivor's tree (the test's OWN fixture child) and
+/// removes its record; `plan_create`'s cleanup-on-plan-failure tears the
+/// sidecar down and the retry loop's SECOND factory invocation finds
+/// nothing left to claim (claims are one-shot) and spawns fresh.
+#[tokio::test]
+async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
+    let (_dir, store) = temp_sidecar_store();
+
+    // The survivor: this test's OWN fake app-server fixture on loopback
+    // ephemeral port A (spawn shape copied from
+    // `sidecar_reconcile_tests::spawn_own_fake_app_server`; test binaries
+    // cannot share code — the repo's copy-with-attribution convention).
+    let survivor_ownership = "codex-sidecar-a7000003-cccc-4ccc-8ccc-cccccccccccc";
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
+    let bind_unused_ws_url = || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        format!("ws://127.0.0.1:{port}")
+    };
+    let listen_ws_url = bind_unused_ws_url();
+    let mut survivor = tokio::process::Command::new("node")
+        .arg(&fixture)
+        .arg("--listen")
+        .arg(&listen_ws_url)
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, survivor_ownership)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn this test's own fake app-server");
+    let survivor_pid = survivor.id().expect("live fixture pid");
+    // Wait for the WS listener: by then exec has long completed, so the
+    // /proc evidence captured below is really the fixture's (no
+    // post-fork/pre-exec cmdline flake).
+    let listen_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(Ok((probe, _response))) =
+            timeout(Duration::from_secs(1), connect_async(&listen_ws_url)).await
+        {
+            drop(probe);
+            break;
+        }
+        if let Ok(Some(status)) = survivor.try_wait() {
+            panic!("fake app-server exited before listening: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < listen_deadline,
+            "fake app-server WS never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The record: the fixture's REAL /proc evidence (claim-time
+    // re-verification: Verified) BUT a ws_url on ephemeral port B where
+    // NOTHING listens (bind-then-drop) — the reattach probe fails fast.
+    let survivor_record = CodexSidecarRecord {
+        record_version: SIDECAR_RECORD_VERSION,
+        ownership_id: survivor_ownership.to_string(),
+        pid: survivor_pid,
+        starttime: proc_starttime(survivor_pid as i32).expect("live fixture has a starttime"),
+        cmdline: proc_cmdline(survivor_pid as i32).expect("live fixture has a cmdline"),
+        ws_url: bind_unused_ws_url(),
+        session_id: Some("s-1".to_string()),
+        terminal_id: None,
+        server_instance_id: "srv-prev".to_string(),
+        created_at: 1_700_000_000_000,
+        updated_at: 1_700_000_000_001,
+        state: SidecarRecordState::Active,
+    };
+    store
+        .write(&survivor_record)
+        .expect("write survivor record");
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());
+    assert_eq!(report.held, 1, "the survivor is held at boot");
+    let reconciler = Arc::new(reconciler);
+
+    // The plan-aware factory (production selection shape + an invocation
+    // counter): attempt 1 claims and mints the reattach runtime; attempt 2
+    // finds the one-shot claim consumed and spawns the fixture fresh.
+    let factory_invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let invocations = factory_invocations.clone();
+    let factory_reconciler = reconciler.clone();
+    let factory_store = store.clone();
+    let planner = CodexLaunchPlanner::new(Box::new(move |plan| {
+        factory_invocations.fetch_add(1, Ordering::SeqCst);
+        let reconciler = factory_reconciler.clone();
+        let store = factory_store.clone();
+        Box::pin(async move {
+            if let Some(session_id) = plan.session_id.as_deref() {
+                if let Some(record) = reconciler.claim_for_session(session_id).await {
+                    return Arc::new(ReattachedCodexAppServerRuntime::new(record, store))
+                        as Arc<dyn CodexLaunchRuntime>;
+                }
+            }
+            Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+                fake_app_server_command(),
+                store,
+            )) as Arc<dyn CodexLaunchRuntime>
+        })
+    }));
+
+    let tmp = std::env::temp_dir().join(format!("freshell-codex-t7r-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let launch = planner
+        .plan_create_with_retry(
+            &CodexLaunchPlanInput {
+                cwd: Some(tmp.to_str().unwrap()),
+                resume_session_id: Some("s-1"),
+                ..Default::default()
+            },
+            2,
+            /* retry_delay_ms */ 1,
+        )
+        .await
+        .expect("attempt 2 must spawn fresh after the claimed reattach fails");
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        2,
+        "the failed reattach consumes attempt 1; the fresh spawn is attempt 2"
+    );
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        0,
+        "the one-shot claim was consumed by attempt 1"
+    );
+
+    // The verified-but-unusable survivor was REAPED by the reattach failure
+    // arm (an unusable tracked sidecar must not leak) — the fixture is this
+    // test's own child, and nothing else was ever signalled.
+    wait_pid_gone(survivor_pid).await;
+    let _ = survivor.wait().await; // reap our own child
+
+    // The store holds exactly the FRESH spawn's record — the survivor's is
+    // gone, and the launch is served by a different sidecar entirely.
+    let records = store.load_all();
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly the fresh spawn's record remains: {records:?}"
+    );
+    assert_ne!(
+        records[0].ownership_id, survivor_record.ownership_id,
+        "the unusable survivor's record was removed"
+    );
+    assert_ne!(
+        records[0].pid, survivor_pid,
+        "the launch is served by a FRESH sidecar"
+    );
 
     launch
         .sidecar

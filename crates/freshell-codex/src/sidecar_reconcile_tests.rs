@@ -710,6 +710,22 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         "no reconciler: the survivor's record must stay untouched"
     );
 
+    // No store installed: spawn — a reattach runtime cannot be minted
+    // without the store Arc, so the claim must stay unconsumed even with a
+    // live reconciler and a claimable resume session.
+    let runtime = select_codex_runtime(Some(&reconciler), None, &resume_plan).await;
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "a None store must claim nothing"
+    );
+    runtime.shutdown().await.expect("spawn-type shutdown");
+    assert_eq!(
+        store.load_all(),
+        vec![record.clone()],
+        "no store: the survivor's record must stay untouched"
+    );
+
     // The resume plan for the held session claims the survivor and mints the
     // reattach runtime: the claim leaves `held`, and `ensure_ready` adopts
     // the record's live listener (no spawn).
