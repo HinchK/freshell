@@ -101,7 +101,10 @@ the 3-tier Rust test approach), cargo fmt/clippy pinned toolchain 1.96.0.
 - Non-Linux platforms: identity can never be verified (no `/proc`), so reattach
   and reaping are disabled there (conservative no-op, matching the existing
   `reap_owned_codex_sidecars` non-Linux stub at `transport.rs:117-121`); the
-  fresh-spawn path is unchanged.
+  fresh-spawn path is unchanged. Task 3's detach is therefore Linux-only and
+  store-gated (untracked spawns keep today's `kill_on_drop(true)`), and its
+  `process_group(0)` call is `#[cfg(unix)]`-gated
+  (`tokio::process::Command::process_group` does not exist on Windows).
 - Prefer `SpawnedCodexAppServerRuntime::with_command(...)`-style injection over
   process-global env mutation in tests (`launch_lifecycle.rs:882-887`); any test
   that must set `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR` owns its test
@@ -210,7 +213,7 @@ freshagent lane tracked in the follow-up. Only the terminal-pane path
 |---|---|
 | `crates/freshell-codex/Cargo.toml` | add `serde = { workspace = true }`; new `[dev-dependencies]` with `tempfile` |
 | `crates/freshell-codex/src/lib.rs` | declare the two new modules behind `real-transport`; re-export the store/reconciler seams |
-| `crates/freshell-codex/src/launch_lifecycle.rs` | persist-on-spawn / scrub-on-teardown in `SpawnedCodexAppServerRuntime`; `kill_on_drop(false)` + `process_group(0)`; `note_session_id` trait seam; plan-aware `CodexRuntimeFactory`; manager shutdown-retention |
+| `crates/freshell-codex/src/launch_lifecycle.rs` | persist-on-spawn / scrub-on-teardown in `SpawnedCodexAppServerRuntime`; store-gated detach (`kill_on_drop(false)` + `process_group(0)` only when tracked: Linux + enabled store); `note_session_id` trait seam; plan-aware `CodexRuntimeFactory`; manager shutdown-retention |
 | `crates/freshell-ws/src/codex_proxy_route.rs` | forward captured thread id into the sidecar record (one call beside `mark_candidate_persisted`) |
 | `crates/freshell-server/src/main.rs` | boot: construct store + reconciler, arm reap sweep; shutdown: retention before `registry.kill_all()` |
 | `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs` | verify unchanged-green (it has NO terminal-pane codex assertions — reports/V4.md); optionally add a terminal-pane retention scenario with a re-scoped descendants assertion |
@@ -541,7 +544,9 @@ Production resolution: a process-global
 `sidecar_store.rs` using a `RwLock<Option<Arc<…>>>` (re-settable, unlike the
 manager's `OnceLock` — tests inject per-instance instead and never touch the
 global). `SpawnedCodexAppServerRuntime::new()` reads the global; absent global
-⇒ disabled store ⇒ behavior identical to today (all existing tests unaffected).
+⇒ disabled store ⇒ behavior identical to today (all existing tests unaffected)
+— literally: Step 3's detach is store- and platform-gated, so a disabled or
+absent store keeps today's attached `kill_on_drop(true)` spawn.
 
 The trait seam it modifies —
 
@@ -579,6 +584,13 @@ pub trait CodexLaunchRuntime: Send + Sync {
     tracked, reconcilable sidecar — not an invisible orphan). The test then
     kills its own child: re-verify identity via the record, `libc::kill(pid,
     SIGTERM)`, poll gone (only the pid this test spawned).
+  - `drop_without_shutdown_with_disabled_store_keeps_the_kill_on_drop_backstop`
+    — build the runtime with `CodexSidecarStore::disabled()` (Task 1's
+    disabled fallback); `ensure_ready`, then `drop(runtime)` WITHOUT
+    `shutdown()` → poll the child pid GONE. A record-less sidecar must never
+    outlive the server: detaching it would be the silently-orphaned ynfn
+    hole with no reconcile path, so untracked spawns keep today's
+    kill_on_drop backstop.
 - [ ] **Step 2: Verify red:**
   `cargo test -p freshell-codex --features real-transport --test launch_lifecycle ensure_ready_persists`
 - [ ] **Step 3: Implement** inside
@@ -590,12 +602,26 @@ pub trait CodexLaunchRuntime: Send + Sync {
     (`session_id: None`, `server_instance_id: default_server_instance_id()`),
     `store.write(&record)` — write failures are logged loudly, never abort the
     launch (pane-ledger write-failure policy).
-  - Change `cmd.kill_on_drop(true)` → `cmd.kill_on_drop(false)` and add
-    `cmd.process_group(0);` (tokio 1.52 exposes it on Unix) with a comment
-    citing kata ynfn ("surviving restarts is a feature") and the Node
-    `detached: true` parity (`runtime.ts:1828-1843`). The store record now
-    plays the safety-net role kill_on_drop played: an unclean death leaves a
-    tracked record for boot reconcile (Task 5/9).
+  - Detach CONDITIONALLY — only when the sidecar will actually be tracked:
+    `let detach = cfg!(target_os = "linux") && store.is_enabled();`
+    - `detach == true`: `cmd.kill_on_drop(false)` plus, inside a
+      `#[cfg(unix)]` block, `cmd.process_group(0);`
+      (`tokio::process::Command::process_group` is Unix-only, so the call
+      MUST be cfg-gated even though detach is Linux-only today — keeps any
+      non-Unix build compiling). Comment cites kata ynfn ("surviving
+      restarts is a feature") and the Node `detached: true` parity
+      (`runtime.ts:1828-1843`). The store record now plays the safety-net
+      role kill_on_drop played: an unclean death leaves a tracked record
+      for boot reconcile (Task 5/9).
+    - `detach == false` (disabled store — e.g. flock contention, an
+      evidenced same-HOME scenario, reports/V6.md A10 — or non-Linux):
+      keep today's `cmd.kill_on_drop(true)` and skip the record write. A
+      sidecar with NO record must keep the kill_on_drop backstop, else an
+      unclean death creates exactly the silently-orphaned ynfn hole with
+      no reconcile path; and non-Linux identity can never be verified, so
+      a detached sidecar there would be untracked AND unreapable. This
+      makes the Global Constraints claims literal: disabled store ⇒
+      behavior identical to today; non-Linux ⇒ fresh-spawn path unchanged.
   - In `shutdown` (`:894-905` today: `start_kill` → 5s wait →
     `reap_owned_codex_sidecars`): after the reap, `store.remove(&ownership_id)`.
   - In both `ensure_ready` failure arms that already call
@@ -622,13 +648,16 @@ pub trait CodexLaunchRuntime: Send + Sync {
 git add crates/freshell-codex/src/launch_lifecycle.rs crates/freshell-codex/src/lib.rs \
   crates/freshell-codex/src/sidecar_store.rs crates/freshell-codex/tests/launch_lifecycle.rs
 git commit -m "$(cat <<'EOF'
-feat(codex): persist terminal-pane sidecar records at spawn; detach from server death
+feat(codex): persist terminal-pane sidecar records at spawn; detach tracked sidecars from server death
 
 SpawnedCodexAppServerRuntime writes a verified (pid, starttime, cmdline,
 ws url) record on successful spawn, enriches it at adopt, and removes it on
-explicit shutdown. kill_on_drop(true) -> false + process_group(0): a dying
-server no longer silently kills or silently orphans sidecars — an unclean
-death now leaves a TRACKED record for boot reconciliation (kata ynfn).
+explicit shutdown. Tracked spawns (Linux + enabled store) switch
+kill_on_drop(true) -> false + process_group(0): a dying server no longer
+silently kills or silently orphans them — an unclean death leaves a TRACKED
+record for boot reconciliation (kata ynfn). Untracked spawns (disabled store
+or non-Linux) keep today's attached kill_on_drop backstop: a record-less
+sidecar must never outlive the server.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -771,6 +800,13 @@ impl SidecarReconciler {
     /// duplicate arm snapshots candidates OUT of the `held`/`by_session`
     /// locks before any await (std Mutex guards must never be held across an
     /// await point — clippy `await_holding_lock`).
+    /// After the probe await, the winner is claimed by re-acquiring the
+    /// locks and removing it from `held`/`by_session` ONLY if still present;
+    /// a candidate the sweep consumed during the await is skipped (fall
+    /// through to the remaining candidates, else None). Membership in
+    /// `held` is the single source of truth for claim-vs-sweep ownership —
+    /// every exit from `held` happens under its lock (Task 9's sweep
+    /// TOCTOU guard is the mirror of this rule).
     pub async fn claim_for_session(&self, session_id: &str) -> Option<CodexSidecarRecord>;
 
     pub fn unclaimed_len(&self) -> usize;
@@ -885,7 +921,17 @@ userspace-only). "Reaped" must mean the whole tree is gone:
 /// poll → SIGKILL each captured descendant that survived, re-verified by its
 /// snapshot immediately before each signal. Returns what happened per pid.
 /// Never signals anything whose snapshot no longer matches.
-pub fn kill_verified_sidecar_tree(record: &CodexSidecarRecord) -> KillTreeOutcome;
+///
+/// ASYNC (binding): every call site is async on the tokio runtime —
+/// `ReattachedCodexAppServerRuntime::ensure_ready` (inside the user-facing
+/// restore path, holding one of the manager's two plan permits),
+/// `shutdown`, and Task 9's `sweep_unclaimed` — and the poll-gone budgets
+/// wait for multi-second intervals. All waits are `tokio::time::sleep`
+/// awaits, never `std::thread::sleep`: a sync fn here would block executor
+/// workers for the whole SIGTERM→poll→SIGKILL sequence (the same
+/// sync/async impedance class the claim path already fixed). Callers must
+/// not hold any `held`/store lock across this await.
+pub async fn kill_verified_sidecar_tree(record: &CodexSidecarRecord) -> KillTreeOutcome;
 ```
 
 `plan_create`'s existing cleanup-on-plan-failure (`:290-298` calls
@@ -1154,7 +1200,7 @@ pub const FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS_ENV: &str = "FRESHELL_CODEX_SIDEC
 pub const CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT: u64 = 30 * 60 * 1000; // incident gap was 18 min
 
 #[derive(Debug, PartialEq)]
-pub enum SweepOutcome { Reaped, RetainedMidTurn, RetainedWriterHeld, RecordRemovedStale, RetainedUnverifiable }
+pub enum SweepOutcome { Reaped, RetainedMidTurn, RetainedWriterHeld, RecordRemovedStale, RetainedUnverifiable, SkippedClaimedDuringSweep }
 
 impl SidecarReconciler {
     /// For every still-held, unclaimed record: re-verify identity, then
@@ -1171,6 +1217,20 @@ impl SidecarReconciler {
     ///                                      same-uid on this host, reports/V2.md):
     ///        evidence held  -> retain, Retained{reason:"ws-unreachable-writer-held"}
     ///        no evidence    -> kill_verified_sidecar_tree, remove record (Reaped)
+    /// TOCTOU guard (binding): the probe phase runs on a SNAPSHOT of `held`
+    /// (no locks across awaits), and a late claim_for_session may adopt a
+    /// snapshotted record while a probe awaits. Per-pid identity
+    /// re-verification CANNOT detect that (same live process), so it never
+    /// authorizes a kill alone. Structure the sweep decide → commit: for
+    /// each kill decision, re-acquire the `held` lock, confirm the record
+    /// is STILL held (unclaimed), REMOVE it from `held`/`by_session` under
+    /// that lock, release, and only then `kill_verified_sidecar_tree(...)
+    /// .await` + `store.remove`. If the record already left `held`
+    /// (claimed mid-sweep), skip with outcome SkippedClaimedDuringSweep and
+    /// send NO signal — a restore just reattached to that sidecar; killing
+    /// it is the exact da92 harm. Membership in `held` is the single source
+    /// of truth for claim-vs-sweep ownership (Task 5's claim removes
+    /// winners under the same lock).
     /// Sweep CONSUMES only Reaped/RecordRemovedStale entries from `held`;
     /// every Retained row STAYS held and claimable (a late restore must still
     /// reattach a mid-turn survivor — reports/V3.md), and is re-evaluated at
@@ -1221,6 +1281,15 @@ have children in their own pgids) plus the tag sweep supplement,
   - `sweep_never_touches_unverified_pids` — record naming a live
     test-`sleep` pid with mismatched cmdline → `RecordRemovedStale`, sleep
     child still alive.
+  - `sweep_never_kills_a_record_claimed_during_the_probe_window` — the
+    TOCTOU guard, deterministic (no timing dependence): boot a reconciler
+    holding one verified fixture record; claim it via `claim_for_session`
+    (it leaves `held` — a restore now owns it); then drive the sweep's
+    commit arm with the PRE-claim snapshot (the tests file is compiled
+    into the crate via `#[cfg(test)] #[path]`, so it can call the
+    pub(crate) decide/commit helper directly) → outcome
+    `SkippedClaimedDuringSweep`, fixture pid still ALIVE, the claimant's
+    record untouched.
   - `kill_verified_sidecar_tree_reaps_descendants` (unit-level, own
     processes only) — spawn a small tree the test owns (e.g. `bash -c
     'sleep 300 & sleep 300 & wait'`), build a verified record for the root,
@@ -1344,6 +1413,11 @@ proxy may hold the candidate timer); adopted entries get proxy-close +
   `…global().shutdown().await` (`:1355-1357`) in place — it now retains adopted
   sidecars and still reaps unadopted ones. Update the surrounding SAFE-11
   comment block to record the new deliberate behavior (kata ynfn).
+- Retention gate: retention applies ONLY to runtimes whose sidecar record
+  was persisted (enabled store — Task 3's conditional detach). A runtime
+  spawned under a disabled store has NO record and kept `kill_on_drop(true)`;
+  `shutdown()` MUST tear it down exactly as today — "retaining" a
+  record-less sidecar would orphan it silently (the ynfn hole).
 
 - [ ] **Step 1: Write the failing manager tests** in
   `crates/freshell-codex/tests/launch_lifecycle.rs`:
@@ -1354,6 +1428,11 @@ proxy may hold the candidate timer); adopted entries get proxy-close +
     own fixture pid (verified) in cleanup.
   - `shutdown_still_tears_down_unadopted_planner_sidecars` — plan WITHOUT
     adopt, retention on, `shutdown()` → pid gone, record removed.
+  - `retention_with_disabled_store_tears_down_as_today` — runtime built
+    with `CodexSidecarStore::disabled()` (Task 3's conditional detach ⇒
+    kill_on_drop(true), NO record), adopted, retention on,
+    `shutdown().await` → pid GONE: record-less sidecars are never
+    retained.
   - `notify_terminal_exit_retains_under_retention_flag` — adopted +
     retention on + `notify_terminal_exit` → pid alive, record retained
     (vs. the default flag-off behavior: teardown worker reaps — existing
@@ -1664,3 +1743,65 @@ invariant coverage unchanged (five fates incl. the duplicate loser);
 process-safety unchanged (no new signal paths); scope decisions unchanged
 (verification-only amendments; no new files enter the plan's task file
 set, so Task 11 Step 3's binding files audit is unaffected).
+
+## Fresh-eyes review pass (iteration 3)
+
+A third independent zero-context cross-model review (same log) found four
+blocking executable-spec defects, all fixed above:
+
+- **Task 11 Step 3's binding audit tripped on this plan document.** The
+  branch's `git diff origin/main` necessarily contains this plan file,
+  which is not in the audited file set and legitimately contains `pkill`
+  and the audit's own grep pattern — so "only named files" and "zero hits"
+  could never pass as written. Fixed: the audit is now scoped to the code
+  portion of the diff (`-- crates/ test/fixtures/`), with the exclusion
+  reason recorded inline.
+- **Task 3's detach was unconditional.** `kill_on_drop(false)` +
+  `process_group(0)` applied even with a disabled store (flock contention —
+  an evidenced same-HOME scenario, reports/V6.md A10) or off-Linux,
+  contradicting the "disabled store ⇒ identical to today" claim and the
+  non-Linux "fresh-spawn path unchanged" constraint, creating record-less
+  detached orphans (the ynfn hole, minus even today's kill_on_drop
+  backstop), and calling the Unix-only `process_group` unguarded. Fixed:
+  detach is store- and platform-gated
+  (`cfg!(target_os = "linux") && store.is_enabled()`), `process_group(0)`
+  is `#[cfg(unix)]`-gated, untracked spawns keep today's
+  `kill_on_drop(true)`, a new Task 3 Step 1 test pins the disabled-store
+  backstop, Task 10 gains the matching retention gate (record-less
+  sidecars are never retained) with its own test, and the Global
+  Constraints / File Structure / commit-message wording now matches.
+- **Claim/sweep TOCTOU.** The sweep probes a snapshot across awaits; a
+  late claim could adopt a snapshotted record, and per-pid identity
+  re-verification cannot detect that (same live process) — the sweep could
+  kill a just-reattached sidecar (the exact da92 harm). Fixed: membership
+  in `held` is the single source of truth; both claim and sweep remove
+  records under the `held` lock after their awaits (claim skips
+  sweep-consumed candidates; the sweep's commit arm re-checks membership
+  under lock immediately before any signal and skips claimed records with
+  the new `SkippedClaimedDuringSweep` outcome), pinned by the
+  deterministic `sweep_never_kills_a_record_claimed_during_the_probe_window`
+  test.
+- **`kill_verified_sidecar_tree` sync signature.** The
+  SIGTERM→poll(5s drain)→SIGKILL contract was spec'd as a sync `pub fn`
+  yet every call site is async (one holding a plan permit inside the
+  user-facing restore path) — it would block executor workers for
+  multi-second intervals, the same impedance class iteration 1 fixed for
+  `claim_for_session`. Fixed: the helper is `pub async fn` with
+  `tokio::time::sleep` waits and a no-locks-across-await caller rule.
+
+Self-review re-run over the edited sections (Global Constraints, File
+Structure, Tasks 3, 5, 6, 9, 10, 11): failing-test-first ordering intact
+(the new behaviors — disabled-store backstop, sweep TOCTOU skip, retention
+gate — enter as named Step 1 failing tests in their tasks); paths/symbols
+grounded (the gating uses only symbols this plan itself introduces, incl.
+`CodexSidecarStore::disabled()`/`is_enabled()` from Task 1's contract; the
+reviewer verified tokio 1.52.3's `process_group` and the fixture state
+against the worktree); invariant coverage strengthened (record-less spawns
+keep the kill_on_drop backstop, so the recorded fates stay exhaustive for
+tracked sidecars while untracked ones cannot outlive the server;
+claimed-during-sweep records keep their claimant's Active fate);
+process-safety strengthened (one MORE pre-signal check — under-lock
+membership confirmation before every sweep kill; no new signal paths; the
+~20 live orphans remain structurally unreachable); scope decisions
+unchanged (docs-only plan edits; the audit rescope names its reason
+inline).
