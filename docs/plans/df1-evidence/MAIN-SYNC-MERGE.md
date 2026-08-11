@@ -39,8 +39,18 @@ Origin/main advanced ~110 commits past the fork lineage while the campaign ran: 
 
 ## Gate record
 
-- `cargo test --workspace --no-run`: clean (0 errors) at the merge tip.
-- `scripts/test/cloud-run-wrapper.test.sh`: 18/18 PASS, exit 0.
-- Full post-merge gate (cargo full test, clippy `-D warnings`, fmt, npm test, typecheck, focused PW legs, significance sweep): see gate-agent report in the task log for `b87c79c02` (df1-postmerge); results appended below by the orchestrator once complete.
+Pre-commit: `cargo test --workspace --no-run` clean (0 errors); `scripts/test/cloud-run-wrapper.test.sh` 18/18 PASS.
 
-_…gate results to be appended…_
+Post-merge gate (independent gate agent `df1-postmerge`, merge `b87c79c02` → final tip `3b7112842`). Host was heavily contended by foreign worktrees during broad runs (load avg ~45, 167 chrome processes, 3 rustc builds); deadline-framed ws tests are load-sensitive on this box — each saturated-host red was retried isolated, and a final QUIET-window full run (load ~11.7) adjudicated the classification.
+
+- **clippy `--workspace --all-targets -D warnings`: PASS.** **fmt: red → FIXED** (`3b7112842`; merge-added pinned content in `ui_layout_sync.rs` needed a format pass; absent in both parents — cosmetic merge artifact).
+- **cargo test --workspace, quiet window @ `9b2ee0709`: PASS — 116/116 targets, 3157 passed / 0 failed / 7 ignored.** Saturated-host reds (all green in isolation + green in quiet run): `codex_locator_activity::fresh_pane_locator_identity…` (35.46s → 5.47s isolated), `auto_resume_e2e::reconcile_after_replacement…` (10.08s → 0.84s isolated). Classified: ambient-load deadline flakes, not merge defects.
+- **Merge-resolution defect found by the gate and FIXED**: the ported `ui_layout_sync_is_served_back_through_rest_on_the_same_process` pin mounted the REST router against the fresh-agent state's own store while ws-state wiring was separate in the test harness (production threads ONE store via `.with_layout()` in main.rs — verified correct). Fixed in `9b2ee0709` (+ main's evolved Node-exact listPanes row contract: no `tabId`). Verified 5/5.
+- **npm test (coordinated): PASS** — client 444f/5015t, server 319f/4927t, electron 34f/350t, all suites code 0.
+- **typecheck: PASS** (merge tip and final tip).
+- **Focused PW legs**: layout-sync-authoritative ×3 projects 6/6; project-colors legacy+rust; terminal-create-dedupe chromium+rust 6p; recover-my-panes-rust 3p; harness-05/06 chromium 20p; `test:e2e:helpers` 20f/269t; session-13 legacy+rust 2p. All PASS.
+- **Significance sweep**: 0 `.only` anywhere; added-line `.skip`/`.todo` hits vs parent-2 are pre-existing-inherited (conditional skips + 1 hard skip in leak-metrics from parent-1 lineage) — nothing new.
+- **Main-drift items found, classified, and dispositioned**:
+  1. `title-sync-convergence` sidebar context-menu rename: session-row hover tooltip intercepts pointer events (reproduced identically on pure `origin/main`) — a real main-side UX defect, fixed here as a rider (`pointer-events-none` on shared TooltipContent; test green 5/5 chromium + rust-chromium).
+  2. `test:e2e:a11y-gate:deny` (campaign gate, baseline branch-local): 4 novel css-class locator violations in main-authored specs would leave main red the moment both land — fixed by giving the dom semantic handles (`data-context="pane-header"`, `data-remote-status-ring`) and updating the 3 specs; deny gate clean, affected specs re-verified green, unit suites for touched components 171/171.
+- **Lease audit**: zero gate-held leases at close; no gate commits, no pushes.
