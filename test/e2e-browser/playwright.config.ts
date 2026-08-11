@@ -48,6 +48,13 @@ export const MATRIX_SPECS = [
   // since the provider exists on this base). Deferred-policy probe spec; see
   // docs/plans/df1-evidence/SESSION-16.md for the per-leg probe classification.
   /session-malformed-data\.spec\.ts$/,
+  // SESSION-13 — server-wide first-chat exclusion controls: edit both knobs via
+  // the real Settings UI in profile A, exact sidebar membership across providers
+  // (claude/codex/amplifier + the firstUserMessage-less opencode control) in A
+  // AND a fresh isolated profile B, then reload + server restart persistence.
+  // Deferred-with-probe policy spec; per-leg probe classification lives in
+  // docs/plans/df1-evidence/SESSION-13.md.
+  /session-13-first-chat-exclusions\.spec\.ts$/,
   // Bulletproof-restore acceptance suite: terminal reload/restart, FreshCodex
   // reload (no new session minted), historical session open (pane title +
   // non-blank content), and mid-life exit surfacing. Restore is a core

@@ -903,6 +903,41 @@ mod join_tests {
         assert_eq!(provider_display_name("amplifier"), "amplifier");
     }
 
+    // ── SESSION-13: firstUserMessage wire projection ──
+
+    /// The client-side exclusion controls
+    /// (`sidebarSelectors.ts` `isExcludedByFirstUserMessage`) read the
+    /// camelCase `firstUserMessage` key. `to_value` must project it for every
+    /// provider whose parse layer populates one (claude/codex/amplifier) and
+    /// — legacy parity (`session-indexer.ts:1032`'s conditional spread) —
+    /// must OMIT the key entirely (never `"firstUserMessage": null`) when the
+    /// provider has no such data (opencode's direct lister).
+    #[test]
+    fn to_value_projects_first_user_message_camel_case_present_vs_omitted() {
+        let mut with_msg = file_item("claude", "sess-msg", 500);
+        with_msg.first_user_message = Some("hello freshell".to_string());
+        let wire = with_msg.to_value();
+        assert_eq!(wire["firstUserMessage"], json!("hello freshell"));
+
+        for provider in ["codex", "amplifier"] {
+            let mut item = file_item(provider, "sess-msg", 500);
+            item.first_user_message = Some(format!("{provider} first chat"));
+            let wire = item.to_value();
+            assert_eq!(
+                wire["firstUserMessage"],
+                json!(format!("{provider} first chat")),
+                "{provider}: firstUserMessage must reach the wire for exclusion filtering"
+            );
+        }
+
+        let without = file_item("opencode", "sess-none", 500);
+        let wire = without.to_value();
+        assert!(
+            wire.get("firstUserMessage").is_none(),
+            "absent first-user-message must OMIT the key, never serialize null"
+        );
+    }
+
     // ── join_running_state ──
 
     #[test]

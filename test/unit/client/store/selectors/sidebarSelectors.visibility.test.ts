@@ -238,6 +238,30 @@ describe('filterSessionItemsByVisibility', () => {
       expect(result.map((i) => i.id)).toEqual(['2', '3'])
     })
 
+    // SESSION-13 ("apply to complete multi-provider data"): the exclusion is
+    // provider-agnostic — it filters by `firstUserMessage` for every provider
+    // that projects one (claude/codex/amplifier), and a provider whose data
+    // has NO firstUserMessage (opencode's direct lister never populates it —
+    // faithful on both servers) is never excluded by these controls.
+    it('applies exclusions identically across providers and never hides absent-first-chat data', () => {
+      const items = [
+        createSessionItem({ id: 'claude-hit', provider: 'claude', firstUserMessage: '__AUTO__ claude prompt' }),
+        createSessionItem({ id: 'codex-hit', provider: 'codex', firstUserMessage: '__AUTO__ codex prompt' }),
+        createSessionItem({ id: 'amplifier-hit', provider: 'amplifier', firstUserMessage: '__AUTO__ amplifier prompt' }),
+        createSessionItem({ id: 'opencode-no-data', provider: 'opencode' }),
+        createSessionItem({ id: 'claude-control', provider: 'claude', firstUserMessage: 'normal prompt' }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        excludeFirstChatSubstrings: ['__AUTO__'],
+        excludeFirstChatMustStart: false,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['opencode-no-data', 'claude-control'])
+    })
+
     it('does not match prefix with different case', () => {
       const items = [
         createSessionItem({ id: '1', firstUserMessage: '__AUTO__ generate report' }),
