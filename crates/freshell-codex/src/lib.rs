@@ -52,6 +52,8 @@ pub mod launch_lifecycle;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]
+pub mod sidecar_store;
+#[cfg(feature = "real-transport")]
 pub mod transport;
 
 pub use app_server::{
