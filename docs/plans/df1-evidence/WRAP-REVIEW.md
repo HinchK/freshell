@@ -260,4 +260,55 @@ findings only, record MINOR/rejected here.
 - **Verification notes:** see fix 1 for the suite list; no TS/Rust files
   touched this round, so no typecheck/clippy/cargo run was applicable.
 
-<!-- Round 5+ records go below. -->
+## Round 5 (final)
+
+- **Fresh Eyes verdict:** FAILED (`FRESHPID=1564060`, provider gpt) — but
+  triage found **zero genuine majors** (details below). Mid-run polling
+  AGAIN showed the r2-documented false `verdict=passed` echo at 18:39
+  (`pid_state=active`; the reviewer's tooling had dumped this repo's
+  evidence-doc marker strings into its log); true completion at 18:47 was
+  confirmed by `pid_state=missing` + stationary `line_count`, yielding the
+  real verdict FAILED. The r2 caution held: never trust a `complete` with
+  a live PID.
+- **Findings: 2 reported as major — 0 majors after triage; 1 repeat
+  rejection, 1 minor (fixed as safely-trivial):**
+
+  1. **Commit `ab8d6ed46`'s message claims cloud-as-default while shipped
+     behavior is local-default.** **REJECTED — identical to the round-3
+     finding already rejected there.** The commit is merged mid-history
+     squash history; its message is immutable without rewriting every
+     downstream SHA on the shared integration branch. The documented
+     contract is unambiguous: wrapper checks 9-11 pin local-unset-default,
+     the plan doc's shipped-deviation header says "commit messages are
+     immutable history and are not rewritten," and the top-level AGENTS.md
+     requires the user's explicit choice for unset backends. Nothing new
+     since r3; the code is the contract and it is correct.
+  2. **Plan doc's per-task red/green steps no longer fail at merged
+     HEAD** (e.g. "verify failure because the Dockerfile does not exist"
+     — the Dockerfile now exists). **MINOR (not a defect):** these steps
+     are the campaign's execution HISTORY — a TDD plan's red phase
+     expects failure only at that point in the execution, before the
+     task's implementation lands. Every completed TDD plan has this
+     property; the re-runnable surface is the validation runbook, which
+     r4 already corrected. Fixed as safely-trivial: `5f59ce176` adds an
+     executed-plan scope note at the top of the plan so no future reader
+     treats the red/green steps as a currently-reproducible runbook.
+
+- **Majors:** none remaining.
+- **Minors:** 1 (finding 2 above — fixed as safely-trivial,
+  `5f59ce176`).
+- **Rejected findings:** 1 (finding 1 above — repeat of r3 finding 4).
+- **Convergence:** round 5 ended with no genuine majors outstanding
+  across the 5-round loop. Verdict trail: r1 F, r2 F, r3 F, r4 F, r5 F
+  (each FAILED round's genuine majors were fixed in-round; r5's two
+  findings triaged to rejected/minor). Cumulative: 14 majors fixed
+  (6+3+3+2+0 — r3's reported critical counted among its 3 fixes), 2
+  rejected-finding instances total (r3 #4 and its r5 repeat), 3 minors
+  recorded across rounds (2 nits in r3, 1 in r5 — all three fixed as
+  safely-trivial).
+
+## Final state
+
+Branch `df1/integration` in this worktree carries the full campaign delta
+plus all wrap-review fix/record commits. No pushes, no PRs; the final
+gate (broad suites) runs separately.
