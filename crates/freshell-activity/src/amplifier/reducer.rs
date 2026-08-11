@@ -6,8 +6,11 @@
 //!
 //! Contract facts encoded (plan §2 of the legacy durability plan):
 //! * `prompt:submit` is the ONLY input that (re)enters busy (E2/E5).
-//! * `prompt:complete` is the single turn boundary (E2/E3).
-//! * `session:end` while busy ends the turn (E7); while idle it is ignored.
+//! * Turn-end boundary SET (2026-08-10 amendment): `prompt:complete` (E2/E3),
+//!   `session:end` while busy (E7), and `orchestrator:complete` with a null
+//!   `data.parent_id` (provider-error turns never write `prompt:complete`).
+//!   The FIRST boundary record ends the turn; later ones land at idle and
+//!   are ignored.
 //! * `session:resume` never implies a phase change (E7).
 //! * Transitions key on event TYPE only; timestamps are carried through for
 //!   `at` fields but never used to order or gate transitions (E3).
@@ -208,6 +211,40 @@ pub fn reduce_amplifier_event(
             let at = record.ts.clone();
             (next, vec![ReducerEffect::TurnCompleted { at }])
         }
+        "orchestrator:complete" => {
+            // Turn-end boundary (2026-08-10 stuck-busy fix; parity with
+            // server/coding-cli/amplifier-events-reducer.ts,
+            // docs/plans/2026-08-10-amplifier-stuck-busy.md). On
+            // provider-error turns the CLI writes `provider:error` then
+            // `orchestrator:complete` and NEVER `prompt:complete` (27/27
+            // observed error turns), so without this arm a pane stays busy
+            // forever. This is a real CLI-written turn-end record, not a
+            // fabricated completion (the deadman policy stands).
+            //
+            // Exactly-once: on healthy turns this record precedes
+            // `prompt:complete` (724/724 observed; structural in the CLI
+            // source); the later `prompt:complete` lands at idle and the
+            // phase guard swallows it. Known accepted tradeoff: rare
+            // (~0.06%, 3/4,718 census turns) stray mid-turn
+            // `orchestrator:complete` records (status success or error — no
+            // status gate can block them) now end the turn early — one
+            // early completion beats an eternally stuck pane. Transitions
+            // still key on event TYPE only (E3): no status gate.
+            //
+            // Sub-agent guard: sub-agent sessions write their own
+            // events.jsonl and root-file records always carry
+            // `data.parent_id` null — a non-null parent_id can only be a
+            // sub-agent record and must never end the root turn.
+            if record.parent_id.is_some() {
+                return (next, Vec::new());
+            }
+            if next.phase != LifecyclePhase::Busy {
+                return (next, Vec::new());
+            }
+            next.phase = LifecyclePhase::Idle;
+            let at = record.ts.clone();
+            (next, vec![ReducerEffect::TurnCompleted { at }])
+        }
         "session:config" => {
             let Some(cwd) = record.config_cwd.clone() else {
                 return (next, Vec::new());
@@ -219,8 +256,9 @@ pub fn reduce_amplifier_event(
             )
         }
         // session:resume never implies busy; everything else (session:start,
-        // execution:*, llm:*, tool:*, orchestrator:*, ...) never changes phase
-        // — post-complete background naming events are covered here (E2).
+        // execution:*, llm:*, tool:*, and orchestrator:* other than
+        // orchestrator:complete, ...) never changes phase — post-complete
+        // background naming events are covered here (E2).
         _ => (next, Vec::new()),
     }
 }
@@ -278,9 +316,86 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_complete_ends_a_busy_turn_on_the_provider_error_path() {
+        // The stuck-busy bug: provider:error then orchestrator:complete,
+        // nothing after — prompt:complete never arrives.
+        let state = create_reducer_state();
+        let (state, _) = reduce_amplifier_event(&state, &record("prompt:submit"));
+        let (state, effects) = reduce_amplifier_event(&state, &record("provider:error"));
+        assert_eq!(state.phase, LifecyclePhase::Busy);
+        assert!(effects.is_empty());
+        let (state, effects) = reduce_amplifier_event(&state, &record("orchestrator:complete"));
+        assert_eq!(state.phase, LifecyclePhase::Idle);
+        assert!(matches!(effects[0], ReducerEffect::TurnCompleted { .. }));
+    }
+
+    #[test]
+    fn orchestrator_complete_then_late_prompt_complete_completes_exactly_once() {
+        let state = create_reducer_state();
+        let (state, _) = reduce_amplifier_event(&state, &record("prompt:submit"));
+        let (state, effects) = reduce_amplifier_event(&state, &record("orchestrator:complete"));
+        assert_eq!(state.phase, LifecyclePhase::Idle);
+        assert!(matches!(effects[0], ReducerEffect::TurnCompleted { .. }));
+        let (state, effects) = reduce_amplifier_event(&state, &record("prompt:complete"));
+        assert_eq!(state.phase, LifecyclePhase::Idle);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn prompt_complete_then_orchestrator_complete_completes_exactly_once() {
+        let state = create_reducer_state();
+        let (state, _) = reduce_amplifier_event(&state, &record("prompt:submit"));
+        let (state, effects) = reduce_amplifier_event(&state, &record("prompt:complete"));
+        assert!(matches!(effects[0], ReducerEffect::TurnCompleted { .. }));
+        let (state, effects) = reduce_amplifier_event(&state, &record("orchestrator:complete"));
+        assert_eq!(state.phase, LifecyclePhase::Idle);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_complete_at_idle_is_a_no_op() {
+        let state = create_reducer_state();
+        let (state, effects) = reduce_amplifier_event(&state, &record("orchestrator:complete"));
+        assert_eq!(state.phase, LifecyclePhase::Idle);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn subagent_orchestrator_complete_never_ends_the_root_turn() {
+        let state = create_reducer_state();
+        let (state, _) = reduce_amplifier_event(&state, &record("prompt:submit"));
+        let sub = ParsedRecord::from_json(&json!({
+            "ts": "2026-07-23T10:00:00.000Z",
+            "schema": { "name": "amplifier.log", "ver": "1.0.0" },
+            "event": "orchestrator:complete",
+            "session_id": "sess-1",
+            "data": { "parent_id": "0000000000000000-59ae93e4abde4aca_sub-agent" }
+        }))
+        .unwrap();
+        let (state, effects) = reduce_amplifier_event(&state, &sub);
+        assert_eq!(state.phase, LifecyclePhase::Busy);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn other_orchestrator_events_never_end_a_busy_turn() {
+        let state = create_reducer_state();
+        let (state, _) = reduce_amplifier_event(&state, &record("prompt:submit"));
+        let (state, effects) =
+            reduce_amplifier_event(&state, &record("orchestrator:steering_injected"));
+        assert_eq!(state.phase, LifecyclePhase::Busy);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
     fn session_resume_and_noise_events_never_change_phase() {
         let state = create_reducer_state();
-        for event in ["session:resume", "session:start", "execution:start"] {
+        for event in [
+            "session:resume",
+            "session:start",
+            "execution:start",
+            "orchestrator:steering_injected",
+        ] {
             let (next, effects) = reduce_amplifier_event(&state, &record(event));
             assert_eq!(next.phase, LifecyclePhase::Idle, "{event}");
             assert!(effects.is_empty(), "{event}");
