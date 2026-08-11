@@ -59,9 +59,11 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # happily execute whatever source was last pushed and the "cloud e2e gate"
 # could pass against STALE code. `:latest` is still built/pushed (human
 # convenience pointer + layer-cache anchor) but the run path never uses it.
-# A dirty tree gets a non-addressable `-dirty` tag so a build of uncommitted
-# code can never masquerade as the clean commit (untracked files count as
-# dirty — the image bakes the working tree).
+# A dirty tree gets a non-addressable `-dirty` SENTINEL tag so a build of
+# uncommitted code can never masquerade as the clean commit (untracked files
+# count as dirty — the image bakes the working tree); `-dirty` tags are not
+# content-addressable, so the run path ALWAYS rebuilds on a dirty tree
+# instead of reusing a stale `-dirty` image (wrap-review r4).
 image_tag_for_head() {
   local sha
   sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
@@ -304,11 +306,16 @@ cmd_run() {
   # Cloud mode
   if $force_build; then
     cmd_build
-  fi
-
-  # Ensure the image FOR THIS HEAD exists in the remote registry
-  if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
+  elif [[ "$image_tag" == *-dirty ]]; then
+    # A dirty tree has NO addressable content: a stored `<sha>-dirty` tag can
+    # only ever name whatever the FIRST dirty build contained, so reusing it
+    # would silently run stale source (wrap-review r4). Always rebuild+push;
+    # docker's layer cache keeps an unchanged tree cheap.
+    echo "[e2e-cloud] Dirty worktree — rebuilding the image (uncommitted tree has no addressable tag)..."
+    cmd_build
+  elif ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
       --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
+    # Clean tree: the HEAD tag genuinely addresses this image's content.
     echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
     cmd_build
   fi

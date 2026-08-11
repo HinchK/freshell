@@ -179,6 +179,11 @@ esac
 STUB
 cat > "$STUB_DIR/docker" <<'STUB'
 #!/usr/bin/env bash
+# Drain stdin ONLY when it is not a TTY: `gcloud … | docker login
+# --password-stdin` needs the pipe consumed (else pipefail can SIGPIPE the
+# producer), but build/tag/push inherit the caller's stdin, and a bare
+# `cat` on an interactive terminal would block the suite forever.
+if [ ! -t 0 ]; then cat >/dev/null 2>&1 || true; fi
 echo "$*" >> "$STUB_CAPTURE/docker.args"
 exit 0
 STUB
@@ -215,6 +220,19 @@ if ! grep -q "push [^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/docker.args
   echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
   rm -rf "$STUB_DIR"
   exit 1
+fi
+# Dirty-tree rule (wrap-review r4): a -dirty tag is not content-addressable,
+# so a dirty run must ALWAYS rebuild — clean-tree runs may skip the build
+# when the HEAD tag already exists remotely, so only the dirty leg can be
+# asserted here. (This suite commonly runs on a dirty tree, making this a
+# live pin in practice.)
+if [ -n "$(git status --porcelain)" ]; then
+  if ! grep -qE "^build " "$STUB_CAPTURE/docker.args" 2>/dev/null; then
+    echo "FAIL: dirty tree but the cloud path did NOT rebuild the image"
+    echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
+    rm -rf "$STUB_DIR"
+    exit 1
+  fi
 fi
 rm -rf "$STUB_DIR"
 unset STUB_CAPTURE
