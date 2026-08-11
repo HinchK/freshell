@@ -210,4 +210,54 @@ findings only, record MINOR/rejected here.
   4/4 + session_ref_singleflight 4/4; legacy proxy-router vitest 14/14
   (210/210 across the matched files).
 
-<!-- Round 4+ records go below. -->
+## Round 4
+
+- **Fresh Eyes verdict:** FAILED (`FRESHPID=3494485`, provider gpt).
+  (A same-window claude-provider launch, `de4956`, errored before final
+  output — empty log, `runner_state=complete`, no verdict; the gpt review
+  is the round-4 review of record. No provider-error fallback was needed:
+  the primary provider completed normally.)
+- **Driver note:** the prior driver session was interrupted AFTER staging
+  both fixes but BEFORE verifying/committing them; this session verified,
+  hardened one test-stub line (see fix 1), committed, and recorded.
+- **Majors found: 2 — both fixed:**
+
+  1. **`scripts/e2e-cloud.sh` (image_tag_for_head / cmd_run) — dirty-tree
+     cloud runs could reuse a stale image.** Every dirty state on the same
+     commit maps to the same `<sha>-dirty` tag, and r3's commit-addressed
+     run path skipped the build whenever that tag existed remotely — so a
+     second dirty run executed the FIRST dirty build's source, and the
+     cloud e2e gate could pass against stale code. `-dirty` tags are not
+     content-addressed, so no remote-existence check can ever be sound.
+     **Fix:** `8c7bce61a` — an uncommitted/untracked tree
+     now ALWAYS rebuilds+pushes on the cloud path (`--build` force and
+     clean-tree remote-tag reuse unchanged; docker layer cache keeps an
+     unchanged dirty tree cheap). Wrapper check 11 gained a live dirty-leg
+     pin (asserts `docker build` ran when `git status --porcelain` is
+     non-empty). **Driver-found + fixed during verification:** the new
+     stub's unconditional stdin drain (`cat`) blocked forever when stdin
+     was a live TTY (`docker build/tag/push` inherit the caller's stdin) —
+     narrowed to drain only non-TTY stdin (the `docker login
+     --password-stdin` pipe case). Verified: full
+     `scripts/test/cloud-run-wrapper.test.sh` green with the dirty tree
+     (the new pin executed live), sibling `cloud-run-config.test.sh` +
+     `cloud-run-dockerfile.test.sh` green, `bash -n` on all three touched
+     shell files, `git diff --check` clean.
+  2. **`docs/plans/2026-08-09-cloud-run-jobs.md` — the Cloud Run
+     validation runbook no longer selected Cloud Run.** Shipped behavior
+     defaults unset `FRESHELL_E2E_BACKEND` to local (r1/r2 record), so the
+     runbook's bare `scripts/e2e-cloud.sh run ...` commands would execute
+     LOCAL Playwright and could never create a Cloud Run Job, execute two
+     tasks, or verify sharding as the expected results claim.
+     **Fix:** `f289f4964` — every validation/runbook
+     command now prefixes `FRESHELL_E2E_BACKEND=cloud` with an explanatory
+     note, and step-1 expectations document BOTH pushed refs
+     (commit-addressed tag + rolling `:latest` pointer).
+
+- **Minors: none reported.**
+- **Rejected findings: none** (both majors verified genuine by code
+  inspection before fixing).
+- **Verification notes:** see fix 1 for the suite list; no TS/Rust files
+  touched this round, so no typecheck/clippy/cargo run was applicable.
+
+<!-- Round 5+ records go below. -->
