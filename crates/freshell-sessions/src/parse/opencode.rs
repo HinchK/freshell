@@ -170,10 +170,10 @@ pub fn run_opencode_candidate_query(
 /// (`message(session_id, time_created, id)` via
 /// `message_session_time_created_id_idx`; `part(message_id, id)` via
 /// `part_message_id_id_idx`) -- EXPLAIN QUERY PLAN shows index searches,
-/// no scans. Measured on a production 5.7 GB opencode.db (126k messages /
-/// 486k parts): ~0.09-0.5 ms per session; all 175 placeholder sessions in
-/// ~16 ms total. (Task 5 of docs/plans/2026-08-10-opencode-auto-titles.md
-/// re-measures and updates these numbers.)
+/// no scans. Measured 2026-08-10 (read-only) on the production 5.4 GB
+/// opencode.db (2.9k sessions / 127k messages / 490k parts): all 175
+/// placeholder sessions looked up in 69 ms total, ~0.4 ms per session
+/// (168 of the 175 had a first user message).
 ///
 /// Filters opencode-synthetic text parts (`$.synthetic = true` --
 /// tool-call narration that sorts before the real prompt). Degrades to
