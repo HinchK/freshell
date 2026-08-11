@@ -56,9 +56,12 @@ export const AMPLIFIER_TAILER_BACKLOG_MAX_BYTES = 64 * 1024 * 1024
  * Lifecycle event-name prefixes the reducer cares about. Lines are checked
  * with plain substring scans (both `"event":"x` and `"event": "x` spellings —
  * the live CLI writes a space after the colon) so noise never reaches
- * JSON.parse.
+ * JSON.parse. `orchestrator:` covers `orchestrator:complete` (a turn-end
+ * boundary since the 2026-08-10 stuck-busy fix — without this the reducer
+ * never sees the record) plus `orchestrator:steering_injected`; the extra
+ * parse volume is ~2 lines per turn.
  */
-const EVENT_PREFIXES = ['session:', 'prompt:', 'execution:', 'orchestrator:steering'] as const
+const EVENT_PREFIXES = ['session:', 'prompt:', 'execution:', 'orchestrator:'] as const
 
 const PREFILTER_NEEDLES: string[] = EVENT_PREFIXES.flatMap((prefix) => [
   `"event":"${prefix}`,

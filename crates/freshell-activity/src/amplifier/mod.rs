@@ -9,8 +9,8 @@
 //!   by the caller's inotify events or force-read failsafes).
 //! * [`tracker`] — `server/coding-cli/amplifier-activity-tracker.ts` (the
 //!   terminal-keyed state machine: PTY Enter is only PROVISIONALLY busy;
-//!   `prompt:submit` confirms; `prompt:complete`/`session:end` is the single
-//!   turn boundary).
+//!   `prompt:submit` confirms; `prompt:complete` / `session:end` / root
+//!   `orchestrator:complete` are the turn-end boundaries).
 
 pub mod reducer;
 pub mod tailer;

@@ -169,17 +169,21 @@ describe('amplifier events tailer', () => {
     const parseSpy = vi.spyOn(JSON, 'parse')
     const result = await tailer.read()
 
-    // session:start, prompt:submit, orchestrator:steering_injected, execution:end, prompt:complete
+    // session:start, prompt:submit, orchestrator:complete,
+    // orchestrator:steering_injected, execution:end, prompt:complete —
+    // orchestrator:complete is a turn-end boundary since the 2026-08-10
+    // stuck-busy fix, so the prefilter must admit the orchestrator: family.
     expect(okRecords(result)).toEqual([
       'session:start',
       'prompt:submit',
+      'orchestrator:complete',
       'orchestrator:steering_injected',
       'execution:end',
       'prompt:complete',
     ])
-    expect(parseSpy).toHaveBeenCalledTimes(5)
+    expect(parseSpy).toHaveBeenCalledTimes(6)
     if (!result.ok) throw new Error('unreachable')
-    expect(result.skippedLines).toBe(11)
+    expect(result.skippedLines).toBe(10)
   })
 
   it('degrades with file_reset when size < offset, and stays degraded', async () => {

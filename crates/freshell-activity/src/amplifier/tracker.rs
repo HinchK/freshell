@@ -7,9 +7,10 @@
 //! * PTY Enter (`note_input` + submit-shaped) is only a PROVISIONAL busy with
 //!   a submit-grace reversion (one force-read retry, then a silent revert —
 //!   no turn.complete). A `prompt:submit` record (reducer `TurnBegan` effect
-//!   via [`AmplifierActivityTracker::apply_lifecycle`]) confirms busy;
-//!   `prompt:complete`/`session:end` (`TurnCompleted`) is the single turn
-//!   boundary and emits exactly one turn.complete via the ledger.
+//!   via [`AmplifierActivityTracker::apply_lifecycle`]) confirms busy; a
+//!   turn-end record — `prompt:complete` / `session:end` / root
+//!   `orchestrator:complete` (`TurnCompleted`) — ends the turn and emits
+//!   exactly one turn.complete via the ledger.
 //! * PTY output only refreshes liveness (feeds the deadman). The deadman
 //!   never fabricates a completion: it requests a force-read of the events
 //!   tail and STAYS busy.

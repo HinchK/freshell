@@ -7,8 +7,8 @@ import { TurnCompletionLedger } from './turn-completion-ledger.js'
 // Deadman: a busy terminal silent this long triggers the missed-signal failsafe
 // (docs/plans/2026-07-08-amplifier-session-durability-plan.md §6): request a
 // force-read of events.jsonl (WSL2 inotify backstop) and STAY busy — never
-// fabricate a completion; `prompt:complete` / `session:end` records are the
-// only turn ends.
+// fabricate a completion; `prompt:complete` / `session:end` / root
+// `orchestrator:complete` records are the only turn ends.
 export const AMPLIFIER_BUSY_DEADMAN_MS = 120_000
 export const AMPLIFIER_ACTIVITY_SWEEP_MS = 5_000
 // A PTY Enter is only PROVISIONALLY busy. Empty-Enter writes zero events
@@ -92,9 +92,10 @@ type AmplifierTerminalActivity = {
  * - PTY Enter (`noteInput` + `isSubmitInput`) is only a PROVISIONAL busy with a
  *   submit-grace reversion (one force-read retry, then a silent revert — no
  *   turn.complete). A `prompt:submit` record (reducer `turn.began` effect via
- *   applyLifecycle()) confirms busy; `prompt:complete` / `session:end`
- *   (`turn.completed`) is the single turn boundary and emits exactly one
- *   turn.complete via the TurnCompletionLedger.
+ *   applyLifecycle()) confirms busy; a turn-end record — `prompt:complete` /
+ *   `session:end` / root `orchestrator:complete` (`turn.completed`) — ends
+ *   the turn and emits exactly one turn.complete via the
+ *   TurnCompletionLedger.
  * - PTY output only refreshes liveness (feeds the deadman). The deadman never
  *   fabricates a completion: it requests a force-read of the events tail and
  *   stays busy. PTY exit (noteExit) removes state unconditionally.
@@ -219,7 +220,7 @@ export class AmplifierActivityTracker extends EventEmitter {
         return
       }
       case 'turn.completed': {
-        // The single turn boundary (E2/E3): exactly one turn.complete per turn.
+        // A turn-end record's effect (E2/E3): exactly one turn.complete per turn.
         this.completeTurn(state, parseEffectAt(effect.at))
         return
       }
@@ -258,7 +259,8 @@ export class AmplifierActivityTracker extends EventEmitter {
     if (!state) return
     if (state.phase !== 'busy') return
     // Output only refreshes liveness (feeds the deadman). It never ends a
-    // turn — `prompt:complete` is the only turn boundary.
+    // turn — only turn-end records (`prompt:complete` / `session:end` /
+    // root `orchestrator:complete`) do.
     state.lastObservedAt = input.at
     state.forceReadLogged = false
   }
