@@ -6,7 +6,9 @@
 > for tracking.
 
 > **EXECUTION STATUS: TASKS 1–3 COMPLETE; TASKS 4–5 PENDING.** This plan
-> is a retrospective artifact: Tasks 1–3 already exist at commit c22e5e0a6
+> is a retrospective artifact: Tasks 1–3 already exist at commit b9e1fa4f0
+> (fresh-eyes iteration 1 reworded the message of the original c22e5e0a6
+> to drop a false clippy/fmt-clean claim; same tree, same diff)
 > on branch fix/multi-client-layout-store (fork point 669219563),
 > reconstructed from the executed work so the workflow's validation and
 > review stages can run against a committed plan. Stage-2 load-bearing
@@ -84,7 +86,7 @@
     ```
     Add `remove_client` (`clients.retain(|entry| entry.key != client_key)`), `pane_is_sole_in_tab` (`leaves_of(snapshot, &tab_id).len() == 1` in the resolving snapshot), and `snapshots_clone`. Update the `LayoutInner` doc comment to document the intentional divergence from Node's single-snapshot store (`server/agent-api/layout-store.ts` — single-snapshot field at `:49`, wholesale-replace `updateFromUi` at `:169-181`; the committed comment's `layout-store.ts:44-46` anchor mis-points at `emptySnapshot()` — Task 4 corrects it).
 - [x] Run to verify GREEN: `cargo test -p freshell-freshagent --lib layout_store` — all `layout_store::tests` pass (`test result: ok`), including the pre-existing single-client suite unchanged.
-- [x] Commit — landed as part of the single atomic commit `c22e5e0a6` ("fix(rust-server): multi-client layout store resolves pane ids from every client"). All three tasks were implemented and committed together, not as separate commits; this step records that honestly rather than inventing per-task SHAs.
+- [x] Commit — landed as part of the single atomic commit `b9e1fa4f0` ("fix(rust-server): multi-client layout store resolves pane ids from every client"). All three tasks were implemented and committed together, not as separate commits; this step records that honestly rather than inventing per-task SHAs.
 
 ---
 
@@ -118,7 +120,7 @@
 - [x] Run to verify RED: `cargo test -p freshell-ws --test ui_layout_sync two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_evicts` — observed failure: REST returned 200 with body `{"message":"pane not found"}` (conn-2's sync had replaced the shared snapshot, so `p1` was unresolvable).
 - [x] Implement: pass `&conn_id.to_string()` as `update_from_ui`'s `source_connection_id` in the `UiLayoutSync` arm (the port of Node's `this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')` — validated at `server/ws-handler.ts:2026`, arm `:2024-2039`, no reply frame confirmed; the previously cited `:1966-1969` is the `hello` arm); add `state.layout.remove_client(&conn_id.to_string())` to `run()`'s disconnect teardown; update the `ui.layout.sync` arm comment, the disconnect comment, and `WsState.layout`'s doc in `lib.rs` to state the intentional multi-client divergence from Node's single last-writer-wins snapshot. Update the pre-existing `ui_layout_sync_frame_populates_the_shared_layout_store` test's doc to the per-connection wording.
 - [x] Run to verify GREEN: `cargo test -p freshell-ws --test ui_layout_sync` — both tests pass (`test result: ok`).
-- [x] Commit — landed in the same atomic commit `c22e5e0a6` (see Task 1's commit step; the three tasks shipped as one commit).
+- [x] Commit — landed in the same atomic commit `b9e1fa4f0` (see Task 1's commit step; the three tasks shipped as one commit).
 
 ---
 
@@ -150,8 +152,8 @@
 - [x] Run to verify RED: `cargo test -p freshell-freshagent --lib rename_cascade_tests::rename_from_non_primary_client_succeeds_and_tab_renamed_uses_that_snapshot` — observed failure: 200 with the Node-parity miss body `{"status":"ok","data":{"message":"pane not found"},"message":"pane not found"}` (no `tabId`/`paneId`/`tabRenamed` fields), because `p1` existed only in the non-last-writer's snapshot.
 - [x] Implement: in `lib.rs`'s `rename_pane` handler, replace the `list_panes`-based `tabRenamed` computation with `state.layout.pane_is_sole_in_tab(&pane_id)` and update the handler's step-5 doc comment (multi-client note). In `target_resolver.rs`, split the ladder into `resolve_in_snapshot` and make `resolve_target` iterate `store.snapshots_clone()` primary-first, preserving the primary's miss message (`miss.expect("at least one snapshot was checked")` when nothing resolves). `by_id_reads_and_mutations_resolve_across_clients` (Task 1) covers the resolver's cross-client behavior via `resolve_target(&store, "pA")`.
 - [x] Run to verify GREEN: `cargo test -p freshell-freshagent --lib` — full crate lib suite passes, 420/420 (`test result: ok. 420 passed; 0 failed`).
-- [x] Final verification as originally run: `cargo test --workspace` green (including `freshell-ws` integration tests 2/2). **Stage-2 validation correction (claim falsified at HEAD):** `cargo clippy` shows 2 warnings (`layout_store.rs:414` doc-lazy-continuation — the same lint class main fixed in e6e958406; `target_resolver.rs:159` needless borrow) and `cargo fmt --check` shows 3 diffs (`layout_store_tests.rs:699/:765`, `ui_layout_sync.rs:319`). Re-verified green: lib suite 420/420, ui_layout_sync 2/2, workspace green modulo the two known-flaky pre-existing `freshell-server` bin tests (see Global Constraints). The clippy/fmt gates are closed by Task 4.
-- [x] Commit — landed in the same atomic commit `c22e5e0a6` on `fix/multi-client-layout-store` (8 files, +906/−269). No push, no PR (per repo rules and Global Constraints).
+- [x] Final verification as originally run: `cargo test --workspace` green (including `freshell-ws` integration tests 2/2). **Stage-2 validation correction (claim falsified at HEAD):** `cargo clippy` shows 2 warnings (`layout_store.rs:414` doc-lazy-continuation — the same lint class main fixed in e6e958406; `target_resolver.rs:159` needless borrow) and `cargo fmt --check` shows 3 diffs (`layout_store_tests.rs:699/:765`, `ui_layout_sync.rs:319`). Re-verified green: lib suite 420/420, ui_layout_sync 2/2, workspace green modulo the two known-flaky pre-existing `freshell-server` bin tests (see Global Constraints). The clippy/fmt gates are closed by Task 4. Fresh-eyes iteration 1 additionally reworded the commit message itself (now `b9e1fa4f0`) — it originally claimed "Full workspace suite, clippy, and fmt are clean"; the reworded message states the clippy/fmt gates are NOT closed by that commit and defers them to Task 4's follow-up commit.
+- [x] Commit — landed in the same atomic commit `b9e1fa4f0` on `fix/multi-client-layout-store` (8 files, +906/−269). No push, no PR (per repo rules and Global Constraints).
 
 ---
 
@@ -180,9 +182,9 @@
 ## Task 5: Reconnect-window resilience — stale-snapshot retention (added by Stage-2 load-bearing validation)
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/layout_store.rs` (`ClientEntry` staleness, `remove_client`, `update_from_ui`, primary selection)
+- Modify: `crates/freshell-freshagent/src/layout_store.rs` (`ClientEntry` staleness, `remove_client`, `update_from_ui`, primary selection, `pub` entry-count/staleness probes)
 - Test: `crates/freshell-freshagent/src/layout_store_tests.rs` (new tests + assertion updates to the Task 1 eviction tests)
-- Modify (assertion update only): `crates/freshell-ws/tests/ui_layout_sync.rs` (disconnect expectations)
+- Modify (disconnect-phase redesign — new positive barriers, NOT a bare assertion flip): `crates/freshell-ws/tests/ui_layout_sync.rs` (disconnect expectations)
 
 **Why (validated, falsified assumption):** The unmodified TS client's ONLY `ui.layout.sync` sender is `layoutMirrorMiddleware.ts` — change-gated (`if (serialized === lastPayload) return`) and debounced, with `lastPayload` never reset on reconnect; neither server requests a sync on hello. So after a silent WS reconnect (new conn-id, unchanged layout), hard evict-on-disconnect leaves that client's ids unresolvable for an UNBOUNDED window (until the next layout change or a page reload) — transiently re-opening the reported bug for exactly the multi-device users it targets (mobile background/sleep, keepalive drops). Client/protocol changes are out of bounds (Global Constraints), so the mitigation is server-side retention. Retention also restores Node's post-disconnect utility (Node retains its snapshot forever; validation flagged hard-evict as a regression for agent workflows that run after the last UI client closes).
 
@@ -190,18 +192,21 @@
 - `ClientEntry` gains `stale: bool` (false on every live sync).
 - `remove_client(key)` marks the entry stale instead of dropping it.
 - A stale entry is never primary while any live entry exists; if ONLY stale entries remain, the most recent one still answers default reads (Node-parity post-disconnect behavior). `"no layout snapshot"` only when the store is truly empty.
-- Supersede-eviction: when `update_from_ui` applies a live sync, drop any STALE entry whose snapshot shares at least one pane id with the incoming sync (the validated same-id-same-entity invariant makes overlap ⇒ same client/layout sound — this is how a reconnected client's old entry is replaced by its new conn-id entry).
+- Supersede-eviction (SUBSET rule): when `update_from_ui` applies a live sync, drop a STALE entry only if EVERY pane id in that stale snapshot also appears in the incoming sync. Eviction is then lossless by construction — every evicted id remains resolvable via the live entry — so it needs no same-client inference at all. Mere one-id overlap is NOT sufficient evidence of "same client": same-id means same logical ENTITY, not same client — server-minted agent-API ids are broadcast to EVERY client via `ui.command{tab.create}` (so after any agent-API tab creation, every client's snapshot shares that id), and same-origin windows can share localStorage-persisted ids. A one-id-overlap predicate would let any live client's next sync evict a DIFFERENT disconnected client's stale entry and silently discard its unique locally-minted ids during exactly the silent-reconnect window this task protects. A stale entry holding any pane id NOT covered by the incoming sync is retained (until a covering sync arrives, or the cap drops it). The reconnect case still works: a reconnected client's re-sync carries the same layout, so its old entry's ids are fully covered and it is evicted.
 - Cap stale entries at 4 (drop oldest beyond the cap) as a growth safety valve.
 - By-id reads and mutations treat stale entries exactly like live ones (that is the point).
+- Test/diagnostic probes: add `pub fn client_entry_count(&self) -> usize` and `pub fn stale_entry_count(&self) -> usize` to `LayoutStore`. The WS integration test uses these as its disconnect-processed and supersede-processed barriers; they do not exist on the old store, so probe-using tests are compile-fail RED there (Task 1's validated precedent for API-introducing tests).
 
 **Steps:**
 
 - [ ] Write failing tests in `layout_store_tests.rs`:
-  - `disconnected_clients_ids_stay_resolvable_until_superseded` — conn-a syncs `tA`/`pA`; `remove_client("conn-a")`; `rename_pane("pA", "X").message == None` (still resolves); then a live sync containing `pA` under a NEW conn id evicts the stale entry (exactly one entry containing `pA` remains).
+  - `disconnected_clients_ids_stay_resolvable_until_superseded` — conn-a syncs `tA`/`pA`; `remove_client("conn-a")`; `rename_pane("pA", "X").message == None` (still resolves); then a live sync under a NEW conn id whose snapshot covers ALL of the stale entry's pane ids (here just `pA`) evicts the stale entry: `stale_entry_count() == 0` and exactly one entry containing `pA` remains.
+  - `live_sync_sharing_only_broadcast_ids_does_not_evict_another_clients_stale_entry` — the false-positive guard for the subset rule (extend the `client_sync` helper, or add a two-pane sibling, to build a two-pane tab): conn-a syncs a tab holding panes `pA` + `pS`; conn-b syncs a different tab holding `pB` + `pS` (`pS` models a server-minted id broadcast to every client); `remove_client("conn-a")`; conn-b live-syncs again (still containing `pS`, never `pA`). The shared-id overlap must NOT evict conn-a's stale entry: `rename_pane("pA", "Still Here").message == None` and `stale_entry_count() == 1`.
   - `stale_entry_never_primary_while_live_clients_exist` — a live client wins `list_tabs()` even if the stale entry synced later; with only stale entries left, the most recent stale answers default reads.
   - `stale_cap_bounds_growth` — 5 disconnected distinct clients → oldest dropped, 4 retained.
-- [ ] Run to verify RED against the current hard-evict store.
-- [ ] Implement per the design. Update existing end-state assertions to retention semantics: `remove_client_evicts_and_primary_falls_back_to_most_recent_remaining` (primary falls back to the most recent LIVE entry; a fully-stale store still answers; `"no layout snapshot"` only for a truly empty store) and the `ui_layout_sync.rs` disconnect assertions (`p1` remains resolvable after conn-1 closes, until superseded).
+- [ ] Run to verify RED against the current hard-evict store: `cargo test -p freshell-freshagent --lib layout_store` — retention, guard, and cap tests fail behaviorally there (ids unresolvable / entries gone the moment `remove_client` runs); assertions using the new probes additionally fail to COMPILE (`stale_entry_count` does not exist yet) — a discriminating compile-fail RED, per the Task 1 precedent.
+- [ ] Implement per the design. Update existing end-state assertions to retention semantics: `remove_client_evicts_and_primary_falls_back_to_most_recent_remaining` (primary falls back to the most recent LIVE entry; a fully-stale store still answers default reads; `"no layout snapshot"` only for a truly empty store).
+- [ ] Redesign `ui_layout_sync.rs`'s disconnect phase around POSITIVE disconnect-processed barriers. The old `get_pane_snapshot("p1").is_none()` poll was the only proof the disconnect path ran; a bare inversion ("`p1` still resolvable") would pass vacuously before the server even processes the close (it would pass with `remove_client` deleted outright), so it is forbidden here. New sequence, each step gated before the next: (1) re-sync conn-1 LAST so it becomes primary and `list_tabs()` answers `t1`; (2) close conn-1, then poll until `layout.stale_entry_count() == 1` AND `list_tabs()` answers `t2` — stale-never-primary makes the primary flip the behavioral proof the close was processed; (3) only then assert retention: `layout.get_pane_snapshot("p1").is_some()`; (4) open a THIRD connection and sync conn-1's exact layout (`t1`/`p1`, covering all of the stale entry's ids), then poll until `stale_entry_count() == 0` as the supersede barrier. Do NOT use conn-2's sync as the superseder — it never contains `p1`, and under the subset rule it must not evict. Because step (2)'s barrier completes before step (4) begins, the supersede sync can never race the close processing. Against the old store this test is compile-fail RED (no probes) rather than a racy behavioral watch.
 - [ ] Run to verify GREEN: `cargo test -p freshell-freshagent --lib`, `cargo test -p freshell-ws --test ui_layout_sync`, `cargo clippy`, `cargo fmt --check`.
 - [ ] Commit (focused, atomic; no push, no PR).
 
