@@ -52,6 +52,8 @@ pub mod launch_lifecycle;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]
+pub mod sidecar_reconcile;
+#[cfg(feature = "real-transport")]
 pub mod sidecar_store;
 #[cfg(feature = "real-transport")]
 pub mod transport;
@@ -73,6 +75,10 @@ pub use model::{
     normalize_freshcodex_effort, normalize_freshcodex_model, to_codex_reasoning_effort,
     CodexEffortError, CHEAPEST_T2_MODEL, FRESHCODEX_DEFAULT_EFFORT, FRESHCODEX_DEFAULT_MODEL,
     FRESHCODEX_EFFORTS_VERBATIM,
+};
+#[cfg(feature = "real-transport")]
+pub use sidecar_reconcile::{
+    codex_sidecar_reconciler, set_codex_sidecar_reconciler, BootReconcileReport, SidecarReconciler,
 };
 #[cfg(feature = "real-transport")]
 pub use sidecar_store::{
