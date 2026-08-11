@@ -18,6 +18,40 @@ use rusqlite::{Connection, OpenFlags};
 pub const THREE_VIEWS_MARKER_SQL_PATTERN: &str = "%<freshell-session-metadata origin=3-views%";
 const OPENCODE_DB_BUSY_TIMEOUT_MS: u64 = 5000;
 
+/// opencode's own default titles for sessions it has not yet named,
+/// mirroring upstream `Session.isDefaultTitle` (v1.18.16,
+/// `packages/opencode/src/session/session.ts:48-55`):
+/// `New session - <ISO>` (parent) and `Child session - <ISO>` (subagent),
+/// where `<ISO>` is JS `new Date(...).toISOString()` -- always exactly
+/// 24 chars, e.g. `2026-08-10T23:47:23.950Z`. Also accepts the legacy
+/// capital-S `New Session - ` prefix written by opencode <= v0.3.86
+/// (changed in v0.4.0, 2025-08-07): DBs migrated from file storage may
+/// still carry those rows, and SQLite's case-insensitive LIKE masks them
+/// in ad-hoc queries. A NON-placeholder title is a real opencode session
+/// name (opencode retitles parent sessions itself after the first
+/// exchange); the directory index surfaces those as provider-generated.
+/// Deliberate mainline deviation: the retired Node reference never
+/// classified opencode titles at all.
+pub fn is_opencode_placeholder_title(title: &str) -> bool {
+    let rest = ["New session - ", "Child session - ", "New Session - "]
+        .iter()
+        .find_map(|prefix| title.strip_prefix(prefix));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    const DIGITS: [usize; 17] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    b.len() == 24
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'.'
+        && b[23] == b'Z'
+        && DIGITS.iter().all(|&i| b[i].is_ascii_digit())
+}
+
 /// The degradation states the listing can report once (mirrors
 /// `OpencodeDatabaseMessageClass`, minus `sqlite_unavailable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -672,6 +706,51 @@ pub fn default_opencode_data_home() -> PathBuf {
 /// HOME-then-USERPROFILE on ALL platforms.
 fn home_dir() -> Option<PathBuf> {
     std::env::home_dir()
+}
+
+#[cfg(test)]
+mod placeholder_title_tests {
+    use super::is_opencode_placeholder_title;
+
+    #[test]
+    fn matches_opencode_default_placeholder() {
+        assert!(is_opencode_placeholder_title(
+            "New session - 2026-08-10T23:47:23.950Z"
+        ));
+        assert!(is_opencode_placeholder_title(
+            "New session - 1970-01-01T00:00:00.000Z"
+        ));
+        // subagent placeholder (upstream session.ts parentID branch)
+        assert!(is_opencode_placeholder_title(
+            "Child session - 2026-08-10T23:47:23.950Z"
+        ));
+        // legacy capital-S prefix (opencode <= v0.3.86, pre-2025-08-07;
+        // survives in DBs migrated from file storage)
+        assert!(is_opencode_placeholder_title(
+            "New Session - 2025-07-30T12:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn rejects_real_titles_and_near_misses() {
+        assert!(!is_opencode_placeholder_title(
+            "Syncing repos with remote main"
+        ));
+        assert!(!is_opencode_placeholder_title("darkforge-plan-review"));
+        assert!(!is_opencode_placeholder_title(""));
+        // prefix alone is not enough -- a user could name a session this way
+        assert!(!is_opencode_placeholder_title("New session - my notes"));
+        assert!(!is_opencode_placeholder_title("Child session - my notes"));
+        assert!(!is_opencode_placeholder_title("New session - 2026-08-10"));
+        // seconds precision / no ms / no Z -- not toISOString() output
+        assert!(!is_opencode_placeholder_title(
+            "New session - 2026-08-10T23:47:23Z"
+        ));
+        // wrong case in prefix
+        assert!(!is_opencode_placeholder_title(
+            "new session - 2026-08-10T23:47:23.950Z"
+        ));
+    }
 }
 
 #[cfg(test)]
