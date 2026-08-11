@@ -687,3 +687,22 @@ async fn kill_tree_reports_sigterm_sent_when_escalation_is_refused() {
     assert_ne!(proc_starttime(child_pid), Some(child_starttime));
     // ChildGuard drop reaps the re-exec'd root (still this test's child).
 }
+
+/// Task 10: the boot wiring's grace parse — env value in millis, default on
+/// unset/non-numeric, `0` honored (immediate sweep). Pure half only: env
+/// mutation races parallel test binaries.
+#[test]
+fn reap_grace_parse_honors_value_zero_and_default() {
+    let default = std::time::Duration::from_millis(CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT);
+    assert_eq!(
+        reap_grace_from_value(Some("1500")),
+        std::time::Duration::from_millis(1500)
+    );
+    assert_eq!(
+        reap_grace_from_value(Some("0")),
+        std::time::Duration::ZERO,
+        "0 is a legitimate immediate-sweep knob"
+    );
+    assert_eq!(reap_grace_from_value(None), default);
+    assert_eq!(reap_grace_from_value(Some("not-a-number")), default);
+}

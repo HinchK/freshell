@@ -38,6 +38,28 @@ pub const FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS_ENV: &str = "FRESHELL_CODEX_SIDEC
 /// Default reap grace: 30 minutes.
 pub const CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT: u64 = 30 * 60 * 1000; // incident gap was 18 min
 
+/// The boot wiring's grace read (Task 10):
+/// [`FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS_ENV`] parsed as u64 millis; unset
+/// or non-numeric falls back to [`CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT`].
+/// `0` IS honored — an operator/test asking for an immediate sweep (unlike
+/// `FRESHELL_CODEX_PLAN_QUEUE_CAP`, where 0 is meaningless).
+pub fn reap_grace_from_env() -> Duration {
+    reap_grace_from_value(
+        std::env::var(FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse half of [`reap_grace_from_env`] — unit-testable without
+/// process-global env mutation (parallel test runs share the env).
+fn reap_grace_from_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(CODEX_SIDECAR_REAP_GRACE_MS_DEFAULT))
+}
+
 /// Whole-probe budget per sweep candidate (connect → initialize →
 /// thread/loaded/list → thread/read per loaded thread). Bounded so a wedged
 /// survivor cannot stall the sweep; on timeout the candidate is treated as

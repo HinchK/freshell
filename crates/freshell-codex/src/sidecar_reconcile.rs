@@ -25,6 +25,7 @@ use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
 use crate::protocol::{build_request_frame, parse_incoming_frame, IncomingMessage, RequestId};
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict,
+    SidecarRecordState,
 };
 use crate::sidecar_sweep::kill_verified_sidecar_tree;
 
@@ -600,6 +601,33 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                 record.clone()
             };
             write_record_loudly(&self.store, &snapshot);
+            Ok(())
+        })
+    }
+
+    /// Task 10: server-shutdown retention — the reattached survivor stays
+    /// alive across ANOTHER restart. A reattached runtime always wraps a
+    /// persisted record (claims only exist over an enabled store), so
+    /// retention applies unconditionally: NO signal is ever sent, the record
+    /// flips to `Retained{reason}`, and the `verified_usable` gate drops so
+    /// no later teardown path can kill the retained survivor.
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.verified_usable.store(false, Ordering::SeqCst);
+            let snapshot = {
+                let mut record = self.record.lock().unwrap();
+                record.state = SidecarRecordState::Retained { reason };
+                record.updated_at = unix_millis();
+                record.clone()
+            };
+            write_record_loudly(&self.store, &snapshot);
+            tracing::info!(
+                target: "freshell_codex::sidecar_reconcile",
+                ownership_id = %snapshot.ownership_id,
+                pid = snapshot.pid,
+                "sidecar_retained: reattached sidecar left running across \
+                 server shutdown (kata ynfn); record state = Retained"
+            );
             Ok(())
         })
     }

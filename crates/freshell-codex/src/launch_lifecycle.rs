@@ -52,7 +52,7 @@ use crate::launch_plan::{
 };
 use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
 use crate::runtime_select::select_codex_runtime;
-use crate::sidecar_reconcile::codex_sidecar_reconciler;
+use crate::sidecar_reconcile::{codex_sidecar_reconciler, write_record_loudly};
 use crate::sidecar_store::{
     codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore,
     SidecarRecordState, SIDECAR_RECORD_VERSION,
@@ -103,6 +103,20 @@ pub trait CodexLaunchRuntime: Send + Sync {
     /// record have anything to enrich.
     fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
         let _ = session_id;
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Task 10: server-shutdown retention — the runtime is asked to KEEP its
+    /// sidecar alive across the restart (record flipped to
+    /// `Retained{reason}`, process never signalled) instead of tearing it
+    /// down. Default no-op `Ok(())` (the `note_session_id` pattern): only
+    /// runtimes with a durable sidecar record have anything to retain. The
+    /// retention gate lives in the real impls — a runtime whose sidecar has
+    /// NO persisted record (disabled store / non-Linux) MUST tear down
+    /// exactly as `shutdown` would; "retaining" a record-less sidecar would
+    /// orphan it silently (the ynfn hole).
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        let _ = reason;
         Box::pin(async { Ok(()) })
     }
 
@@ -243,6 +257,29 @@ impl CodexLaunchSidecar {
             .update_ownership_metadata(terminal_id.to_string(), generation)
             .await?;
         self.assert_adoptable().await?;
+        self.planner_active.lock().unwrap().remove(&self.id);
+        Ok(())
+    }
+
+    /// Task 10 server-shutdown retention: close the proxy (its listener dies
+    /// with this process anyway) and ask the runtime to
+    /// `prepare_retention(reason)` INSTEAD of tearing it down. Marks the
+    /// sidecar shutdown-complete so any late teardown path (a double-fired
+    /// PTY exit hook, `manager.shutdown()`'s drain) no-ops via the
+    /// idempotence flag instead of re-killing the retained survivor. The
+    /// retention GATE lives in the runtime: a record-less runtime tears its
+    /// sidecar down exactly as today.
+    pub async fn retain(&self, reason: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().await;
+        if inner.shutdown_succeeded {
+            return Ok(());
+        }
+        inner.shutdown_started = true;
+        if let Some(proxy) = inner.proxy.take() {
+            proxy.close().await;
+        }
+        self.runtime.prepare_retention(reason.to_string()).await?;
+        inner.shutdown_succeeded = true;
         self.planner_active.lock().unwrap().remove(&self.id);
         Ok(())
     }
@@ -575,12 +612,23 @@ pub fn set_global_codex_launch_manager_for_tests(manager: CodexTerminalLaunchMan
 pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
-    teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
+    /// Teardown/retention worker feed: the bool is the RETAIN decision,
+    /// made by the sender at hand-off time (Task 10).
+    teardown_tx: OnceLock<mpsc::UnboundedSender<(AdoptedTerminalLaunch, bool)>>,
+    /// Task 10: server-shutdown retention mode — set once by
+    /// [`Self::begin_shutdown_retention`], never cleared (the process is
+    /// exiting).
+    shutdown_retention: AtomicBool,
     plan_budget: Arc<tokio::sync::Semaphore>,
     plan_budget_wait: Duration,
     plan_queue_cap: usize,
     plan_waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// The durable `Retained{reason}` every server-shutdown retention records
+/// (both [`CodexTerminalLaunchManager::shutdown`]'s drain and the retention
+/// arm of the PTY exit hook).
+const SERVER_SHUTDOWN_RETENTION_REASON: &str = "server-shutdown";
 
 impl CodexTerminalLaunchManager {
     pub fn new(runtime_factory: CodexRuntimeFactory) -> Self {
@@ -588,6 +636,7 @@ impl CodexTerminalLaunchManager {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
             teardown_tx: OnceLock::new(),
+            shutdown_retention: AtomicBool::new(false),
             plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
             plan_budget_wait: CODEX_SIDECAR_PLAN_WAIT,
             // The env read MUST live here — `global()` calls `new()`, so
@@ -862,42 +911,69 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Server-shutdown mode: adopted (terminal-owned) sidecars are RETAINED
+    /// across the restart — proxies close, runtimes are asked to
+    /// prepare_retention(reason) instead of shutdown. Unadopted planner
+    /// sidecars (mid-plan) are still torn down. Call BEFORE registry.kill_all()
+    /// so PTY-exit hooks (notify_terminal_exit) also retain instead of reap.
+    pub fn begin_shutdown_retention(&self) {
+        self.shutdown_retention.store(true, Ordering::SeqCst);
+    }
+
     /// Sync-safe (callable from the PTY exit hook's non-async thread): detach the
     /// terminal's launch and hand it to the teardown worker. No-op for terminals without
-    /// a managed launch.
+    /// a managed launch. Task 10: under server-shutdown retention
+    /// ([`Self::begin_shutdown_retention`] runs BEFORE `registry.kill_all()`,
+    /// so every shutdown-driven exit sees the flag set) the entry is routed
+    /// through retention instead of teardown.
     pub fn notify_terminal_exit(&self, terminal_id: &str) {
         let Some(entry) = self.adopted.lock().unwrap().remove(terminal_id) else {
             return;
         };
+        let retain = self.shutdown_retention.load(Ordering::SeqCst);
         if let Some(tx) = self.teardown_tx.get() {
-            let _ = tx.send(entry);
+            let _ = tx.send((entry, retain));
         }
     }
 
     /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
     /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
-    /// the planner stops accepting plans and tears down its unadopted sidecars — PLUS
-    /// the adopted (terminal-owned) launches this manager keys, since server exit ends
-    /// those terminals too (their exit hooks may also queue teardown; sidecar shutdown
-    /// is idempotent, so both paths are safe).
+    /// the planner stops accepting plans and tears down its unadopted sidecars
+    /// unconditionally (they have no pane to reattach to, and a fresh-plan proxy may
+    /// hold the candidate timer) — PLUS the adopted (terminal-owned) launches this
+    /// manager keys. Task 10: with [`Self::begin_shutdown_retention`] set, adopted
+    /// entries get proxy-close + `prepare_retention("server-shutdown")` instead of
+    /// teardown (kata ynfn: surviving restarts is a feature); the runtime-level
+    /// retention gate still tears down record-less sidecars exactly as today. Exit
+    /// hooks may also route the same entries; retain/shutdown share the sidecar's
+    /// idempotence flag, so both paths stay safe.
     pub async fn shutdown(&self) {
         self.planner.shutdown().await;
+        let retain = self.shutdown_retention.load(Ordering::SeqCst);
         let adopted: Vec<AdoptedTerminalLaunch> = {
             let mut map = self.adopted.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
         };
         for entry in adopted {
-            let _ = entry.sidecar.shutdown().await;
+            if retain {
+                let _ = entry.sidecar.retain(SERVER_SHUTDOWN_RETENTION_REASON).await;
+            } else {
+                let _ = entry.sidecar.shutdown().await;
+            }
             entry.drain.abort();
         }
     }
 
     fn ensure_teardown_worker(&self) {
         self.teardown_tx.get_or_init(|| {
-            let (tx, mut rx) = mpsc::unbounded_channel::<AdoptedTerminalLaunch>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<(AdoptedTerminalLaunch, bool)>();
             tokio::spawn(async move {
-                while let Some(entry) = rx.recv().await {
-                    let _ = entry.sidecar.shutdown().await;
+                while let Some((entry, retain)) = rx.recv().await {
+                    if retain {
+                        let _ = entry.sidecar.retain(SERVER_SHUTDOWN_RETENTION_REASON).await;
+                    } else {
+                        let _ = entry.sidecar.shutdown().await;
+                    }
                     entry.drain.abort();
                 }
             });
@@ -1272,6 +1348,52 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Task 10: server-shutdown retention. Tracked spawns (persisted record;
+    /// `kill_on_drop(false)`, Task 3) flip their record to `Retained{reason}`
+    /// and DROP the `Child` handle without a signal — the sidecar outlives
+    /// this process and the record is what the next generation reconciles
+    /// against. The retention GATE: a record-less spawn (disabled store /
+    /// non-Linux ⇒ `kill_on_drop(true)`, NO record) is torn down exactly as
+    /// [`Self::shutdown`] would — "retaining" it would orphan it silently
+    /// with no reconcile path (the ynfn hole).
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            let Some(mut spawned) = state.take() else {
+                return Ok(()); // never spawned / already torn down
+            };
+            match spawned.record.as_mut() {
+                Some(record) => {
+                    record.state = SidecarRecordState::Retained { reason };
+                    record.updated_at = unix_millis();
+                    // Write failures log loudly, never propagate (pane-ledger
+                    // policy): the row stays Active on disk and boot
+                    // reconcile still finds + re-verifies the survivor.
+                    write_record_loudly(&self.store, record);
+                    tracing::info!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %record.ownership_id,
+                        pid = record.pid,
+                        "sidecar_retained: tracked sidecar left running across \
+                         server shutdown (kata ynfn); record state = Retained"
+                    );
+                    // `spawned` drops at scope end: kill_on_drop is false for
+                    // tracked spawns, so the child is released untouched.
+                    Ok(())
+                }
+                None => {
+                    // Record-less: the ynfn gate — teardown exactly as today.
+                    let _ = spawned.child.start_kill();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                    reap_owned_codex_sidecars(&spawned.ownership_id);
+                    self.scrub_record(&spawned.ownership_id);
+                    Ok(())
+                }
+            }
         })
     }
 

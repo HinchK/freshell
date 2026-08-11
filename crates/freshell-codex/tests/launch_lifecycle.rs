@@ -1605,3 +1605,253 @@ async fn drop_without_shutdown_with_disabled_store_keeps_the_kill_on_drop_backst
 
     wait_pid_gone(pid).await;
 }
+
+// ────── Task 10: server-shutdown retention (katas ynfn/da92) ──────
+//
+// `begin_shutdown_retention()` flips the manager into server-shutdown mode:
+// adopted (terminal-owned) TRACKED sidecars are retained across the restart
+// (record → `Retained{reason:"server-shutdown"}`, process never signalled);
+// unadopted planner sidecars and record-less (disabled-store) sidecars are
+// torn down exactly as today — retaining a record-less sidecar would orphan
+// it silently with no reconcile path (the ynfn hole).
+
+/// Manager over a single pre-built spawned runtime (the Task 3 test shape:
+/// per-instance store injection, never the process-global handle).
+fn manager_over(runtime: Arc<SpawnedCodexAppServerRuntime>) -> CodexTerminalLaunchManager {
+    CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    }))
+}
+
+#[tokio::test]
+async fn shutdown_retention_retains_adopted_sidecars_and_records_reason() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    ));
+    let manager = manager_over(runtime.clone());
+
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan");
+    manager
+        .adopt("term-retained", launch, 0)
+        .await
+        .expect("adopt");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    manager.begin_shutdown_retention();
+    manager.shutdown().await;
+
+    // The fixture pid is STILL ALIVE: retention never signals. (Give any
+    // wrong kill a moment to land before asserting liveness — the
+    // spawned_sidecar_survives_runtime_drop_without_shutdown pattern.)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        proc_starttime(pid as i32).is_some(),
+        "retained sidecar (pid {pid}) must survive the server shutdown"
+    );
+
+    // The record carries the reason a restarted server reconciles against.
+    let records = store.load_all();
+    assert_eq!(records.len(), 1, "exactly one record: {records:?}");
+    assert_eq!(records[0].pid, pid);
+    assert_eq!(
+        records[0].state,
+        SidecarRecordState::Retained {
+            reason: "server-shutdown".to_string()
+        },
+        "retention must record its reason"
+    );
+
+    // PROCESS SAFETY cleanup: reap this test's OWN fixture pid, identity
+    // re-verified via the record immediately before the signal.
+    assert_eq!(
+        verify_sidecar_identity(&records[0]),
+        IdentityVerdict::Verified
+    );
+    // SAFETY: plain FFI signal send to our own verified child pid.
+    unsafe {
+        assert_eq!(
+            libc::kill(pid as i32, libc::SIGTERM),
+            0,
+            "SIGTERM this test's own child"
+        );
+    }
+    wait_pid_gone(pid).await;
+}
+
+#[tokio::test]
+async fn shutdown_still_tears_down_unadopted_planner_sidecars() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    ));
+    let manager = manager_over(runtime.clone());
+
+    // Plan WITHOUT adopt: a mid-plan sidecar has no pane to reattach to (and
+    // a fresh-plan proxy may hold the candidate timer) — still torn down.
+    let _unadopted = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    manager.begin_shutdown_retention();
+    manager.shutdown().await;
+
+    wait_pid_gone(pid).await;
+    assert!(
+        store.load_all().is_empty(),
+        "unadopted teardown must scrub the record"
+    );
+}
+
+#[tokio::test]
+async fn retention_with_disabled_store_tears_down_as_today() {
+    // Task 3's conditional detach: disabled store ⇒ kill_on_drop(true), NO
+    // record. The retention gate says record-less sidecars are NEVER
+    // retained — "retaining" one would orphan it silently (the ynfn hole).
+    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        Arc::new(CodexSidecarStore::disabled()),
+    ));
+    let manager = manager_over(runtime.clone());
+
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan");
+    manager
+        .adopt("term-untracked", launch, 0)
+        .await
+        .expect("adopt");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    manager.begin_shutdown_retention();
+    manager.shutdown().await;
+
+    wait_pid_gone(pid).await;
+}
+
+#[tokio::test]
+async fn notify_terminal_exit_retains_under_retention_flag() {
+    let (_dir, store) = temp_sidecar_store();
+    // One runtime per plan (the exit hook consumes its adopted entry, so the
+    // two arms need independent sidecars), each recorded for pid access.
+    let spawned: Arc<Mutex<Vec<Arc<SpawnedCodexAppServerRuntime>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let factory_store = store.clone();
+    let factory_spawned = spawned.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+            fake_app_server_command(),
+            factory_store.clone(),
+        ));
+        factory_spawned.lock().unwrap().push(runtime.clone());
+        let rt = runtime as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    }));
+
+    // Arm 1 — flag OFF (existing behavior, asserted so the contrast is
+    // pinned): the exit hook hands the entry to the teardown worker, which
+    // reaps the sidecar and scrubs its record.
+    let launch_a = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan a");
+    manager
+        .adopt("term-exit-a", launch_a, 0)
+        .await
+        .expect("adopt a");
+    let runtime_a = spawned.lock().unwrap()[0].clone();
+    let pid_a = runtime_a.child_pid().await.expect("pid a");
+
+    manager.notify_terminal_exit("term-exit-a");
+    wait_pid_gone(pid_a).await;
+    // The record scrub is a separate write after the reap — poll for it.
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while !store.load_all().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "flag-off teardown must scrub the record"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Arm 2 — flag ON: the SAME exit hook retains instead of reaping.
+    let launch_b = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan b");
+    manager
+        .adopt("term-exit-b", launch_b, 0)
+        .await
+        .expect("adopt b");
+    let runtime_b = spawned.lock().unwrap()[1].clone();
+    let pid_b = runtime_b.child_pid().await.expect("pid b");
+
+    manager.begin_shutdown_retention();
+    manager.notify_terminal_exit("term-exit-b");
+
+    // Retention flows through the async worker: poll for the Retained write.
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    let record = loop {
+        let mut records = store.load_all();
+        if records.len() == 1 && matches!(records[0].state, SidecarRecordState::Retained { .. }) {
+            break records.remove(0);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retained record never appeared: {records:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(record.pid, pid_b);
+    assert_eq!(
+        record.state,
+        SidecarRecordState::Retained {
+            reason: "server-shutdown".to_string()
+        }
+    );
+    assert!(
+        proc_starttime(pid_b as i32).is_some(),
+        "retained sidecar (pid {pid_b}) must be alive after the exit hook"
+    );
+
+    // PROCESS SAFETY cleanup: verified reap of this test's own fixture pid.
+    assert_eq!(verify_sidecar_identity(&record), IdentityVerdict::Verified);
+    // SAFETY: plain FFI signal send to our own verified child pid.
+    unsafe {
+        assert_eq!(
+            libc::kill(pid_b as i32, libc::SIGTERM),
+            0,
+            "SIGTERM this test's own child"
+        );
+    }
+    wait_pid_gone(pid_b).await;
+}

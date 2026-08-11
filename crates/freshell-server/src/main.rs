@@ -407,6 +407,20 @@ async fn main() -> ExitCode {
         home.as_ref()
             .map(|h| h.join(".freshell").join("pane-ledger")),
     ));
+    // Codex sidecar record store (katas ynfn/da92, Task 10 wiring): the
+    // flock'd single-writer store of the `codex app-server` sidecars that
+    // terminal panes spawn, so a restarted server can reattach to (or
+    // conservatively reap) survivors. Same root policy as the pane ledger
+    // above (no home => disabled no-op store); the `rust-` prefix keeps it
+    // disjoint from Node's `~/.freshell/codex-sidecars/` store. The global
+    // handle is the Task 3 seam every tracked spawn records through.
+    let codex_sidecar_store = std::sync::Arc::new(
+        freshell_codex::sidecar_store::CodexSidecarStore::new_locked(
+            home.as_ref()
+                .map(|h| h.join(".freshell").join("rust-codex-sidecars")),
+        ),
+    );
+    freshell_codex::sidecar_store::set_codex_sidecar_store(codex_sidecar_store.clone());
     // OpenCode terminal-pane restore fix
     // (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): the
     // opencode locator, resolved against the SAME `default_opencode_data_home()`
@@ -1027,6 +1041,53 @@ async fn main() -> ExitCode {
                 "pane_ledger_boot: rows quarantined (see per-row errors above)"
             );
         }
+    }
+
+    // Codex sidecar boot reconcile (Task 10, katas ynfn/da92): load the
+    // previous generation's sidecar records, prune stale rows (Dead/Mismatch
+    // — remove only, NEVER signal), hold verified survivors claimable for
+    // restore-time reattach, then arm the grace-delayed conservative sweep.
+    {
+        // Disablement must be LOUD (A10 validation, reports/V6.md): the
+        // restart script provably waits for old-process exit, so lock
+        // contention is not expected on the normal path — but a same-HOME
+        // scratch server on another port (e.g. the evidenced `--port 3499`
+        // runs) silently loses the flock, disabling sidecar tracking for
+        // this whole generation with no timing race at all.
+        if !codex_sidecar_store.is_enabled() {
+            tracing::error!(
+                "codex_sidecar_store_disabled: sidecar records are NOT being written or \
+                 reconciled this generation (lock contention or no resolvable home) — codex \
+                 terminal-pane sidecars spawned now will NOT survive a restart of this process"
+            );
+        }
+        let (reconciler, report) =
+            freshell_codex::sidecar_reconcile::SidecarReconciler::boot_reconcile(
+                codex_sidecar_store.clone(),
+            );
+        tracing::info!(
+            codex_sidecar_store_enabled = codex_sidecar_store.is_enabled(),
+            loaded = report.loaded,
+            pruned_dead = report.pruned_dead,
+            pruned_mismatch = report.pruned_mismatch,
+            held = report.held,
+            "codex_sidecar_boot_reconcile: previous generation's sidecar records reconciled"
+        );
+        let reconciler = std::sync::Arc::new(reconciler);
+        freshell_codex::sidecar_reconcile::set_codex_sidecar_reconciler(reconciler.clone());
+        // The grace-delayed conservative sweep (Task 9): restores get the
+        // whole grace window (default 30m — the incident's restores arrived
+        // 18m post-boot) to claim survivors before any unclaimed one is
+        // probed and, only when verified AND reap-eligible, reaped.
+        tokio::spawn(async move {
+            tokio::time::sleep(freshell_codex::sidecar_sweep::reap_grace_from_env()).await;
+            let outcomes = reconciler.sweep_unclaimed().await;
+            tracing::info!(
+                swept = outcomes.len(),
+                "codex_sidecar_sweep_done: unclaimed survivors swept \
+                 (per-record decisions logged above)"
+            );
+        });
     }
 
     // P1.8 periodic GC (boot-time + periodic, spec §4.2 lifecycle).
@@ -1755,6 +1816,28 @@ async fn main() -> ExitCode {
     //     port matches that (already implemented before this fix).
     //   * `fresh_codex_state.shutdown()` / `fresh_claude_state.shutdown()` —
     //     the Codex app-server and claude Node sidecars (already implemented).
+    //
+    // SAFE-11 deliberate deviation (Task 10, kata ynfn): TRACKED codex
+    // terminal-pane sidecars (the launch manager's adopted, record-bearing
+    // spawns) are now RETAINED across this shutdown instead of reaped —
+    // "killing sidecars at shutdown is NOT acceptable; surviving restarts is
+    // a feature." Everything else above still reaps exactly as before, and
+    // record-less codex sidecars (disabled store / non-Linux) are still torn
+    // down (retaining them would orphan silently).
+    //
+    // Codex sidecar retention flag: flipped BEFORE the PTY kill below so the
+    // exit hooks (`notify_terminal_exit`) retain adopted terminal-pane codex
+    // sidecars — proxies close, tracked runtimes get
+    // `prepare_retention("server-shutdown")` and their records flip to
+    // Retained — instead of handing them to the teardown worker.
+    //
+    // Supervisor caveat (recorded, no code — reports/V6.md NA-1): the in-repo
+    // systemd unit is NOT installed today (restarts are script-driven). If it
+    // is ever adopted, its KillMode must not be `control-group` — a cgroup
+    // kill would slaughter the retained sidecars this deliberately keeps
+    // alive (`process_group(0)` detaches the pgid, not the cgroup).
+    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+        .begin_shutdown_retention();
     registry.kill_all();
     // A10 re-sweep (V3): kill_all() snapshots the id set ONCE
     // (registry.rs:889-892); a detached gated create settling during the
@@ -1774,13 +1857,16 @@ async fn main() -> ExitCode {
     // SDK abort → SIGKILL straggler + `/proc` ownership sweep) so a freshclaude T2 run
     // leaves no orphaned sidecar or claude CLI grandchild.
     fresh_claude_state.shutdown().await;
-    // DEV-0006 S4: stop accepting codex managed-launch plans and tear down every
-    // launch sidecar + remote proxy the terminal-launch manager still owns (mirrors
-    // legacy's close-time `codexLaunchPlanner.shutdown()` among the shutdown owners,
-    // `server/index.ts:981-1049`). Runs AFTER `registry.kill_all()` above, so adopted
-    // launches whose exit hooks already queued teardown are simply re-shut-down
-    // (idempotent) and unadopted in-flight plans are reaped here. No-op when the
-    // managed-launch flag never planned anything.
+    // DEV-0006 S4 + Task 10 retention: stop accepting codex managed-launch plans
+    // (mirrors legacy's close-time `codexLaunchPlanner.shutdown()` among the shutdown
+    // owners, `server/index.ts:981-1049`). With the retention flag set above, this now
+    // RETAINS adopted terminal-pane sidecars (proxy-close +
+    // `prepare_retention("server-shutdown")`; records flip to Retained) and still
+    // tears down unadopted in-flight plans (no pane to reattach to). The runtime-level
+    // retention gate still reaps record-less sidecars exactly as before. Runs AFTER
+    // `registry.kill_all()` above, so adopted launches whose exit hooks already queued
+    // retention are simply re-retained (idempotent). No-op when the managed-launch
+    // flag never planned anything.
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
