@@ -78,7 +78,9 @@ pub use model::{
 };
 #[cfg(feature = "real-transport")]
 pub use sidecar_reconcile::{
-    codex_sidecar_reconciler, set_codex_sidecar_reconciler, BootReconcileReport, SidecarReconciler,
+    codex_sidecar_reconciler, kill_verified_sidecar_tree, set_codex_sidecar_reconciler,
+    BootReconcileReport, KillOutcome, KillTreeOutcome, ReattachedCodexAppServerRuntime,
+    SidecarReconciler,
 };
 #[cfg(feature = "real-transport")]
 pub use sidecar_store::{
