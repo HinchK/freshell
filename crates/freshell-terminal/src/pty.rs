@@ -669,6 +669,7 @@ mod tests {
     /// `TerminalRegistry::create`), NOTHING may accumulate in `captured`:
     /// before the gate it grew unboundedly for the terminal's whole life
     /// (a multi-GB write-only leak on long-lived terminals).
+    #[cfg(unix)]
     #[test]
     fn spawn_with_sink_does_not_accumulate_captured_messages() {
         let spec = SpawnSpec {
