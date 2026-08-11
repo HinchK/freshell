@@ -676,6 +676,25 @@ mod tests {
         assert_eq!(title.as_deref(), Some("parsed"));
     }
 
+    #[test]
+    fn opencode_ai_override_row_wins_over_late_provider_title() {
+        // Ladder: ai > provider-generated. A Gemini title freshell already
+        // wrote is NOT clobbered when opencode later names the session
+        // (the shadow guard only suppresses dir/first-message rows).
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "opencode:s1".into(),
+            json!({ "titleOverride": "Gemini Title", "titleSource": "ai" }),
+        );
+        let title = overlay_session_title(
+            &overrides,
+            "opencode:s1",
+            Some("Opencode Title"),
+            Some("provider-generated"),
+        );
+        assert_eq!(title.as_deref(), Some("Gemini Title"));
+    }
+
     #[tokio::test]
     async fn session_without_live_terminal_is_skipped_entirely() {
         let dir = tempfile::tempdir().unwrap();
@@ -986,5 +1005,302 @@ mod tests {
             .unwrap();
         assert_eq!(row["titleSource"], "first-message"); // heuristic path, no Gemini
         assert!(state.pending_ai_titles.lock().unwrap().is_empty());
+    }
+
+    // -- opencode auto-title ladder (docs/plans/2026-08-10-opencode-auto-titles.md,
+    // Task 4): sweep-level pins for the opencode reconciliation semantics ----
+
+    #[tokio::test]
+    async fn opencode_first_message_holds_dir_then_finalizes_ai() {
+        // Gap A regression (docs/plans/2026-08-10-opencode-auto-titles.md):
+        // an opencode session with a first user message must reach the
+        // Gemini stage instead of holding the dir placeholder forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/glowforge"), 1);
+        let s = [session(
+            "opencode",
+            "s1",
+            "/x/glowforge",
+            Some("This is a quick naming test"),
+        )];
+        run_auto_title_pass(&state, &s).await;
+        // pass 1: dir placeholder persisted (never first-message when AI on)
+        let row = state
+            .settings
+            .session_overrides()
+            .get("opencode:s1")
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleSource"], "dir");
+        // AI one-shot lands asynchronously; wait for it
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let row = state
+                .settings
+                .session_overrides()
+                .get("opencode:s1")
+                .cloned()
+                .unwrap();
+            if row["titleSource"] == "ai" {
+                break;
+            }
+        }
+        let row = state
+            .settings
+            .session_overrides()
+            .get("opencode:s1")
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleOverride"], "AI Title");
+        assert_eq!(row["titleSource"], "ai");
+        assert!(state.pending_ai_titles.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_provider_named_session_short_circuits_ai() {
+        // Gap B: a session opencode already named must surface that name
+        // and never spawn Gemini -- even when a first message is present
+        // (should_generate_ai's provider-generated conjunct).
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/proj"), 1);
+        for _pass in 0..2 {
+            // mirror spawn_auto_title_sweep's mapping: title is overlay-applied
+            let overrides = state.settings.session_overrides();
+            let title = overlay_session_title(
+                &overrides,
+                "opencode:s1",
+                Some("Fix login flow"),
+                Some("provider-generated"),
+            );
+            let mut s = session("opencode", "s1", "/x/proj", Some("hello"));
+            s.title = title;
+            s.title_source = Some("provider-generated".into());
+            run_auto_title_pass(&state, &[s]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // no Gemini: nothing pending, no ai row (a dir row is claude-parity
+        // behavior for provider-generated sessions and is shadow-suppressed)
+        assert!(state.pending_ai_titles.lock().unwrap().is_empty());
+        if let Some(row) = state.settings.session_overrides().get("opencode:s1") {
+            assert_ne!(row["titleSource"], "ai");
+        }
+        // the provider name is what lands on the live terminal
+        assert_eq!(
+            state.registry.title_of(tid).as_deref(),
+            Some("Fix login flow")
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_stale_dir_override_yields_to_late_provider_title() {
+        // The live-bug state: a dir placeholder row already persisted
+        // (written while the session was unnamed) must not shadow
+        // opencode's own retitle once it lands.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/glowforge"), 1);
+        state
+            .settings
+            .patch_session_override(
+                "opencode:s1",
+                &[
+                    ("titleOverride", Some(json!("glowforge"))),
+                    ("titleSource", Some(json!("dir"))),
+                ],
+            )
+            .await;
+        let overrides = state.settings.session_overrides();
+        let title = overlay_session_title(
+            &overrides,
+            "opencode:s1",
+            Some("Quick naming test"),
+            Some("provider-generated"),
+        );
+        // shadow guard: the stale dir row loses to the provider title
+        assert_eq!(title.as_deref(), Some("Quick naming test"));
+        let mut s = session("opencode", "s1", "/x/glowforge", None);
+        s.title = title;
+        s.title_source = Some("provider-generated".into());
+        run_auto_title_pass(&state, &[s]).await;
+        assert!(state.pending_ai_titles.lock().unwrap().is_empty());
+        assert_eq!(
+            state.registry.title_of(tid).as_deref(),
+            Some("Quick naming test")
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_user_rename_wins_over_provider_title_and_ai() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/proj"), 1);
+        state
+            .settings
+            .patch_session_override(
+                "opencode:s1",
+                &[
+                    ("titleOverride", Some(json!("My Name"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        let overrides = state.settings.session_overrides();
+        let title = overlay_session_title(
+            &overrides,
+            "opencode:s1",
+            Some("Provider Title"),
+            Some("provider-generated"),
+        );
+        // user rows are never shadowed
+        assert_eq!(title.as_deref(), Some("My Name"));
+        let mut s = session("opencode", "s1", "/x/proj", Some("hello"));
+        s.title = title;
+        s.title_source = Some("provider-generated".into());
+        run_auto_title_pass(&state, &[s]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let row = state
+            .settings
+            .session_overrides()
+            .get("opencode:s1")
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleOverride"], "My Name");
+        assert_eq!(row["titleSource"], "user");
+        assert!(state.pending_ai_titles.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_fixture_db_end_to_end_dir_then_ai() {
+        // Acceptance #1 wire-through: fixture opencode.db -> OpencodeSource
+        // -> SessionIndex snapshot -> the sweep's SweepSession mapping ->
+        // fake-Gemini title. Fails without the freshell-sessions data fixes
+        // (first_user_message stays None and titleSource holds at "dir").
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("opencode-data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                project_id TEXT, parent_id TEXT
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_1', '/x/glowforge',
+                'New session - 2026-08-10T23:47:23.950Z', 1000, 5000, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg_1', 'ses_1', 100, '{"role":"user"}')"#,
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO part VALUES ('prt_1', 'msg_1', 'ses_1',
+                '{"type":"text","text":"This is a quick naming test"}')"#,
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sources: Vec<std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>> =
+            vec![std::sync::Arc::new(
+                freshell_sessions::directory_index::OpencodeSource::new(data_home),
+            )];
+        let index = freshell_sessions::directory_index::SessionIndex::new(sources);
+        let items = index.snapshot().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].first_user_message.as_deref(),
+            Some("This is a quick naming test")
+        );
+
+        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        let tid = "term-1";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(
+            tid,
+            Some("opencode"),
+            Some("ses_1"),
+            Some("/x/glowforge"),
+            1,
+        );
+        // mirror spawn_auto_title_sweep's IndexedSession -> SweepSession mapping
+        let overrides = state.settings.session_overrides();
+        let sessions: Vec<SweepSession> = items
+            .iter()
+            .map(|s| {
+                let key = s.key();
+                let title = overlay_session_title(
+                    &overrides,
+                    &key,
+                    s.title.as_deref(),
+                    s.title_source.as_deref(),
+                );
+                SweepSession {
+                    provider: s.provider.clone(),
+                    session_id: s.session_id.clone(),
+                    cwd: s.cwd.clone(),
+                    title,
+                    first_user_message: s.first_user_message.clone(),
+                    title_source: s.title_source.clone(),
+                    git_branch: s.git_branch.clone(),
+                }
+            })
+            .collect();
+        run_auto_title_pass(&state, &sessions).await;
+        let row = state
+            .settings
+            .session_overrides()
+            .get("opencode:ses_1")
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleSource"], "dir"); // placeholder ADVANCES...
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let row = state
+                .settings
+                .session_overrides()
+                .get("opencode:ses_1")
+                .cloned()
+                .unwrap();
+            if row["titleSource"] == "ai" {
+                break;
+            }
+        }
+        let row = state
+            .settings
+            .session_overrides()
+            .get("opencode:ses_1")
+            .cloned()
+            .unwrap();
+        assert_eq!(row["titleOverride"], "AI Title"); // ...to the Gemini title
+        assert_eq!(row["titleSource"], "ai");
     }
 }

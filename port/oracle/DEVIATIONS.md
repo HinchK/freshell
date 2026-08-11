@@ -1197,6 +1197,23 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   directory entry too (survives restart/reindex), instead of silently updating
   only the terminal override.
 
+### EDEV-12 — opencode auto-titles (mainline, post-port)
+- what_differs: `parse/opencode.rs` now extracts a bounded `first_user_message`
+  for placeholder-titled sessions and `directory_index.rs` classifies
+  non-placeholder opencode titles as `provider-generated`.
+- why_intentional: Node reference behavior (always `None`) was a verified
+  functional gap: opencode sessions could never be AI-titled and native
+  opencode names were permanently shadowed by the dir placeholder.
+- evidence: `crates/freshell-sessions/tests/opencode_first_message.rs`, the
+  `directory_index.rs` title-source mapping tests, and the sweep-ladder tests
+  in `crates/freshell-server/src/auto_title_sweep.rs` (commits ecb9a4dec,
+  679dabd01, 4661cc4f4, 31498a808). Measured cost on the production 5.4 GB
+  opencode.db is documented at `FIRST_USER_MESSAGE_SQL` in `parse/opencode.rs`.
+- user_impact: opencode sessions with a first user message now receive AI
+  auto-titles (the dir placeholder advances instead of holding), and sessions
+  natively named inside opencode surface that name as provider-generated
+  (short-circuiting the AI stage) instead of showing the placeholder forever.
+
 
 ### DEV-0011 — Transactional rebind with bind-new-before-persist and SO_REUSEPORT
 

@@ -18,6 +18,40 @@ use rusqlite::{Connection, OpenFlags};
 pub const THREE_VIEWS_MARKER_SQL_PATTERN: &str = "%<freshell-session-metadata origin=3-views%";
 const OPENCODE_DB_BUSY_TIMEOUT_MS: u64 = 5000;
 
+/// opencode's own default titles for sessions it has not yet named,
+/// mirroring upstream `Session.isDefaultTitle` (v1.18.16,
+/// `packages/opencode/src/session/session.ts:48-55`):
+/// `New session - <ISO>` (parent) and `Child session - <ISO>` (subagent),
+/// where `<ISO>` is JS `new Date(...).toISOString()` -- always exactly
+/// 24 chars, e.g. `2026-08-10T23:47:23.950Z`. Also accepts the legacy
+/// capital-S `New Session - ` prefix written by opencode <= v0.3.86
+/// (changed in v0.4.0, 2025-08-07): DBs migrated from file storage may
+/// still carry those rows, and SQLite's case-insensitive LIKE masks them
+/// in ad-hoc queries. A NON-placeholder title is a real opencode session
+/// name (opencode retitles parent sessions itself after the first
+/// exchange); the directory index surfaces those as provider-generated.
+/// Deliberate mainline deviation: the retired Node reference never
+/// classified opencode titles at all.
+pub fn is_opencode_placeholder_title(title: &str) -> bool {
+    let rest = ["New session - ", "Child session - ", "New Session - "]
+        .iter()
+        .find_map(|prefix| title.strip_prefix(prefix));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    const DIGITS: [usize; 17] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    b.len() == 24
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'.'
+        && b[23] == b'Z'
+        && DIGITS.iter().all(|&i| b[i].is_ascii_digit())
+}
+
 /// The degradation states the listing can report once (mirrors
 /// `OpencodeDatabaseMessageClass`, minus `sqlite_unavailable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +104,16 @@ pub struct OpencodeSession {
     pub last_activity_at: i64,
     pub is_subagent: Option<bool>,
     pub is_non_interactive: Option<bool>,
+    /// First real (non-synthetic) user-message text, normalized via
+    /// `crate::text::normalize_first_user_message`. Populated ONLY for
+    /// sessions that still need naming (empty or opencode default
+    /// placeholder titles -- see `is_opencode_placeholder_title`) -- a
+    /// bounded per-session indexed lookup, never
+    /// a full message/part scan (opencode.db can be multi-GB). Feeds the
+    /// first-message/AI rungs of freshell's auto-title ladder. Deliberate
+    /// mainline deviation from the retired Node reference, which never
+    /// read message content for opencode listings.
+    pub first_user_message: Option<String>,
 }
 
 /// Result of a direct listing pass, carrying the (once-)degrade signals for the caller
@@ -119,6 +163,67 @@ pub fn run_opencode_candidate_query(
     limit: i64,
 ) -> rusqlite::Result<OpencodeListingResult> {
     run_opencode_query_inner(conn, marker_pattern, Some(floor_ms), Some(limit))
+}
+
+/// Bounded per-session lookup: the first text part of the earliest
+/// user-role message. Uses the live schema's real indexed columns
+/// (`message(session_id, time_created, id)` via
+/// `message_session_time_created_id_idx`; `part(message_id, id)` via
+/// `part_message_id_id_idx`) -- EXPLAIN QUERY PLAN shows index searches,
+/// no scans. Measured 2026-08-10 (read-only) on the production 5.4 GB
+/// opencode.db (2.9k sessions / 127k messages / 490k parts): all 175
+/// placeholder sessions looked up in 69 ms total, ~0.4 ms per session
+/// (168 of the 175 had a first user message).
+///
+/// Filters opencode-synthetic text parts (`$.synthetic = true` --
+/// tool-call narration that sorts before the real prompt). Degrades to
+/// `None` on ANY schema/query error: older opencode schemas without
+/// `message.id`/`part.message_id` columns must not break listing.
+///
+/// NOTE: as of opencode v1.18.16 the `message`/`part` tables are
+/// dual-written projections of the newer v2 event store
+/// (`session_message`); the column shape is unchanged since v1.2.0 but
+/// should be re-verified on major opencode upgrades.
+const FIRST_USER_MESSAGE_SQL: &str = "\
+    WITH first_user AS (\
+        SELECT m.id FROM message m \
+        WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'user' \
+        ORDER BY m.time_created, m.id LIMIT 1\
+    ) \
+    SELECT json_extract(p.data, '$.text') \
+    FROM part p JOIN first_user f ON p.message_id = f.id \
+    WHERE json_extract(p.data, '$.type') = 'text' \
+      AND coalesce(json_extract(p.data, '$.synthetic'), 0) = 0 \
+      AND json_extract(p.data, '$.text') IS NOT NULL \
+    ORDER BY p.id LIMIT 1";
+
+fn first_user_message_for_session(conn: &Connection, session_id: &str) -> Option<String> {
+    let mut stmt = match conn.prepare_cached(FIRST_USER_MESSAGE_SQL) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode first-user-message prepare failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    let text: Option<String> = match stmt.query_row(rusqlite::params![session_id], |row| row.get(0))
+    {
+        Ok(text) => text,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode first-user-message query failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    text.as_deref()
+        .and_then(crate::text::normalize_first_user_message)
 }
 
 fn run_opencode_query_inner(
@@ -340,6 +445,21 @@ impl OpencodeProvider {
             // worktree verbatim, which is what we return here.
             let project_path = meaningful_worktree(row.project_path).unwrap_or_else(|| cwd.clone());
             let is_three_views = row.has_three_views_marker == Some(1);
+            // Bounded first-message extraction: ONLY for sessions that still
+            // need naming (empty/placeholder title). Named sessions surface
+            // opencode's own title (provider-generated) and never need the
+            // lookup, so listing cost scales with the small unnamed subset,
+            // not with DB size.
+            let needs_naming = row
+                .title
+                .as_deref()
+                .map(|t| t.trim().is_empty() || is_opencode_placeholder_title(t))
+                .unwrap_or(true);
+            let first_user_message = if needs_naming {
+                first_user_message_for_session(&conn, &row.session_id)
+            } else {
+                None
+            };
             sessions.push(OpencodeSession {
                 session_id: row.session_id,
                 project_path,
@@ -349,6 +469,7 @@ impl OpencodeProvider {
                 last_activity_at: row.last_activity_at.unwrap_or(now_ms),
                 is_subagent: if is_three_views { Some(true) } else { None },
                 is_non_interactive: if is_three_views { Some(true) } else { None },
+                first_user_message,
             });
         }
 
@@ -672,6 +793,51 @@ pub fn default_opencode_data_home() -> PathBuf {
 /// HOME-then-USERPROFILE on ALL platforms.
 fn home_dir() -> Option<PathBuf> {
     std::env::home_dir()
+}
+
+#[cfg(test)]
+mod placeholder_title_tests {
+    use super::is_opencode_placeholder_title;
+
+    #[test]
+    fn matches_opencode_default_placeholder() {
+        assert!(is_opencode_placeholder_title(
+            "New session - 2026-08-10T23:47:23.950Z"
+        ));
+        assert!(is_opencode_placeholder_title(
+            "New session - 1970-01-01T00:00:00.000Z"
+        ));
+        // subagent placeholder (upstream session.ts parentID branch)
+        assert!(is_opencode_placeholder_title(
+            "Child session - 2026-08-10T23:47:23.950Z"
+        ));
+        // legacy capital-S prefix (opencode <= v0.3.86, pre-2025-08-07;
+        // survives in DBs migrated from file storage)
+        assert!(is_opencode_placeholder_title(
+            "New Session - 2025-07-30T12:00:00.000Z"
+        ));
+    }
+
+    #[test]
+    fn rejects_real_titles_and_near_misses() {
+        assert!(!is_opencode_placeholder_title(
+            "Syncing repos with remote main"
+        ));
+        assert!(!is_opencode_placeholder_title("darkforge-plan-review"));
+        assert!(!is_opencode_placeholder_title(""));
+        // prefix alone is not enough -- a user could name a session this way
+        assert!(!is_opencode_placeholder_title("New session - my notes"));
+        assert!(!is_opencode_placeholder_title("Child session - my notes"));
+        assert!(!is_opencode_placeholder_title("New session - 2026-08-10"));
+        // seconds precision / no ms / no Z -- not toISOString() output
+        assert!(!is_opencode_placeholder_title(
+            "New session - 2026-08-10T23:47:23Z"
+        ));
+        // wrong case in prefix
+        assert!(!is_opencode_placeholder_title(
+            "new session - 2026-08-10T23:47:23.950Z"
+        ));
+    }
 }
 
 #[cfg(test)]
