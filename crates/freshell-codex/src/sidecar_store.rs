@@ -1,8 +1,9 @@
 //! Durable codex **sidecar record store** — one JSON file per owned
 //! `codex app-server` sidecar, so a restarted server can reattach to (or
 //! conservatively reap) processes a previous generation spawned (kata
-//! ynfn/da92 groundwork; identity verification and the reconciler land in
-//! later tasks).
+//! ynfn/da92 groundwork; the reconciler lands in later tasks). Identity
+//! verification against a record's `/proc` evidence lives below
+//! ([`verify_sidecar_identity`]).
 //!
 //! Production root (wired in Task 10): `<home>/.freshell/rust-codex-sidecars/`.
 //! The `rust-` prefix is the anti-collision convention with Node's
@@ -242,6 +243,109 @@ impl CodexSidecarStore {
         }
         records
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pid identity evidence + verification. A durable record is only ever
+// TRUSTED after its `(pid, starttime, cmdline)` evidence is re-verified
+// against live `/proc` — only [`IdentityVerdict::Verified`] may ever be
+// signalled. Environ tags are deliberately NOT required here: YAMA can hide
+// `/proc/<pid>/environ` for reparented orphans, while `stat` and `cmdline`
+// are world-readable.
+// ---------------------------------------------------------------------------
+
+/// /proc/<pid>/stat field 22; None for gone/zombie. (pid, starttime) is the
+/// pid-reuse guard. Deliberate duplicate of the private
+/// freshell-freshagent/src/session_lease.rs:144-160 helper (dependency
+/// direction forbids importing it) — keep the parsing identical: split at the
+/// LAST ')' then index 19, rejecting Z/X states.
+#[cfg(target_os = "linux")]
+pub fn proc_starttime(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may contain spaces/parens: split at the LAST ')' — the
+    // remainder starts at field 3 (state), so starttime (field 22) is index
+    // 19 there (session_lease.rs:144-160 parsing, kept identical).
+    let rest = stat.rsplit(')').next()?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    match fields.first() {
+        Some(&"Z") | Some(&"X") | None => return None,
+        Some(_) => {}
+    }
+    fields.get(19)?.parse().ok()
+}
+
+/// Non-Linux stub: no `/proc`, no evidence — `None` (never verified ⇒ never
+/// killed).
+#[cfg(not(target_os = "linux"))]
+pub fn proc_starttime(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// /proc/<pid>/cmdline, NUL-split into argv. World-readable (no ptrace/YAMA
+/// constraint, unlike /proc/<pid>/environ).
+#[cfg(target_os = "linux")]
+pub fn proc_cmdline(pid: i32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        bytes
+            .split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
+}
+
+/// Non-Linux stub: no `/proc`, no evidence — `None` (never verified ⇒ never
+/// killed).
+#[cfg(not(target_os = "linux"))]
+pub fn proc_cmdline(_pid: i32) -> Option<Vec<String>> {
+    None
+}
+
+/// The answer to "is `/proc/<pid>` still the process this record describes?"
+/// — the gate every reattach/reap decision goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// (pid, starttime, cmdline) all match the record — this IS our sidecar.
+    Verified,
+    /// pid gone or zombie — the sidecar is dead; the record is stale.
+    Dead,
+    /// pid alive but starttime or cmdline differ — pid reuse; NEVER signal.
+    Mismatch,
+    /// non-Linux / evidence unreadable — NEVER signal.
+    Unverifiable,
+}
+
+/// Re-verify a record's `(pid, starttime, cmdline)` evidence against live
+/// `/proc`. Read-only — never signals anything. A pid that vanishes between
+/// the two reads yields [`IdentityVerdict::Unverifiable`] (conservative:
+/// never signalled), not a guess.
+#[cfg(target_os = "linux")]
+pub fn verify_sidecar_identity(record: &CodexSidecarRecord) -> IdentityVerdict {
+    // pid > i32::MAX cannot exist on Linux (PID_MAX_LIMIT = 2^22); the `as`
+    // wrap would produce a negative pid whose /proc entry never exists, so
+    // the verdict is still the safe `Dead`.
+    let pid = record.pid as i32;
+    let Some(starttime) = proc_starttime(pid) else {
+        return IdentityVerdict::Dead;
+    };
+    if starttime != record.starttime {
+        return IdentityVerdict::Mismatch;
+    }
+    let Some(cmdline) = proc_cmdline(pid) else {
+        return IdentityVerdict::Unverifiable;
+    };
+    if cmdline != record.cmdline {
+        return IdentityVerdict::Mismatch;
+    }
+    IdentityVerdict::Verified
+}
+
+/// Non-Linux stub: no `/proc` evidence — [`IdentityVerdict::Unverifiable`]
+/// (never verified ⇒ never killed).
+#[cfg(not(target_os = "linux"))]
+pub fn verify_sidecar_identity(_record: &CodexSidecarRecord) -> IdentityVerdict {
+    IdentityVerdict::Unverifiable
 }
 
 fn record_path(root: &Path, ownership_id: &str) -> PathBuf {

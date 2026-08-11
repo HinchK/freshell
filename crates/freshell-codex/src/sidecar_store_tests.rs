@@ -1,10 +1,14 @@
 //! Unit tests for the durable codex sidecar record store ([`super`]).
 //!
-//! Tempfile tempdirs ONLY — no global state, no processes, nothing outside
-//! each test's own temp dir. In particular these tests must NEVER touch
+//! Tempfile tempdirs ONLY — no global state, nothing outside each test's own
+//! temp dir. In particular these tests must NEVER touch
 //! `~/.freshell/codex-sidecars/` (Node's store), the production
 //! `~/.freshell/rust-codex-sidecars/` root (wired in Task 10), or any live
-//! process.
+//! process the test did not itself spawn.
+//!
+//! PROCESS SAFETY (identity tests): each identity test spawns and reaps ONLY
+//! its own child (`sleep 300`), killed in a [`ChildGuard`] drop guard —
+//! nothing else on the machine is ever signalled.
 
 use super::*;
 
@@ -156,4 +160,123 @@ fn second_locked_open_comes_up_disabled() {
         "the disabled loser's no-op write left no file behind"
     );
     drop(holder);
+}
+
+// ---------------------------------------------------------------------------
+// Pid identity evidence + verification (Task 2). /proc semantics are
+// Linux-only, so these tests are #[cfg(target_os = "linux")]; the non-Linux
+// stubs (None / Unverifiable) are covered by the type system, not spawned
+// processes.
+// ---------------------------------------------------------------------------
+
+/// Kills and reaps ONLY the guarded child on drop (defer-style guard) — the
+/// test's own `sleep 300`, nothing else on the machine. `kill` on an
+/// already-reaped `Child` is a no-op error inside std (no signal is sent to
+/// a possibly-recycled pid), so double-cleanup is safe.
+#[cfg(target_os = "linux")]
+struct ChildGuard(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_own_sleep_child() -> ChildGuard {
+    ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn this test's own sleep child"),
+    )
+}
+
+/// A record carrying the spawned child's REAL `/proc` evidence.
+#[cfg(target_os = "linux")]
+fn record_for_child(pid: u32) -> CodexSidecarRecord {
+    CodexSidecarRecord {
+        pid,
+        starttime: proc_starttime(pid as i32).expect("live child has a starttime"),
+        cmdline: proc_cmdline(pid as i32).expect("live child has a cmdline"),
+        ..sample_record("codex-sidecar-88888888-8888-4888-8888-888888888888")
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_starttime_identifies_a_live_child_and_none_after_exit() {
+    let mut child = spawn_own_sleep_child();
+    let pid = child.0.id() as i32;
+    assert!(
+        proc_starttime(pid).is_some(),
+        "a live child must have a readable starttime"
+    );
+    // Kill + reap OUR OWN child; after the reap the pid is gone from /proc.
+    child.0.kill().expect("kill own child");
+    child.0.wait().expect("reap own child");
+    assert_eq!(proc_starttime(pid), None, "a reaped pid must read as gone");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_identity_confirms_own_spawned_child() {
+    let child = spawn_own_sleep_child();
+    let record = record_for_child(child.0.id());
+    assert_eq!(verify_sidecar_identity(&record), IdentityVerdict::Verified);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_identity_rejects_cmdline_mismatch_without_signalling() {
+    let mut child = spawn_own_sleep_child();
+    // The live child's pid+starttime but a DIFFERENT cmdline: pid-reuse shape.
+    let record = CodexSidecarRecord {
+        cmdline: vec!["codex".to_string(), "app-server".to_string()],
+        ..record_for_child(child.0.id())
+    };
+    assert_eq!(verify_sidecar_identity(&record), IdentityVerdict::Mismatch);
+    // Verification is read-only: the mismatching child must still be alive
+    // (NEVER signalled) afterwards.
+    assert_eq!(
+        child.0.try_wait().expect("try_wait own child"),
+        None,
+        "verification must never signal a mismatching pid"
+    );
+    assert!(
+        proc_starttime(child.0.id() as i32).is_some(),
+        "the mismatching child is still visible in /proc"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_identity_reports_dead_for_missing_pid() {
+    // A reaped child: real evidence captured live, then the pid goes away.
+    let mut child = spawn_own_sleep_child();
+    let record = record_for_child(child.0.id());
+    child.0.kill().expect("kill own child");
+    child.0.wait().expect("reap own child");
+    assert_eq!(verify_sidecar_identity(&record), IdentityVerdict::Dead);
+
+    // And a pid that cannot exist: far beyond /proc/sys/kernel/pid_max
+    // (kernel ceiling PID_MAX_LIMIT = 4_194_304), verified against the
+    // machine's actual setting so the "impossible" claim is real evidence.
+    let pid_max: u64 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .expect("read pid_max")
+        .trim()
+        .parse()
+        .expect("parse pid_max");
+    let impossible = CodexSidecarRecord {
+        pid: 999_999_999,
+        ..sample_record("codex-sidecar-99999999-9999-4999-8999-999999999999")
+    };
+    assert!(
+        u64::from(impossible.pid) > pid_max,
+        "test pid {} must exceed this machine's pid_max {pid_max}",
+        impossible.pid
+    );
+    assert_eq!(verify_sidecar_identity(&impossible), IdentityVerdict::Dead);
 }
