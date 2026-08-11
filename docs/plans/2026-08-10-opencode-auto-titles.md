@@ -16,8 +16,9 @@ sweep-logic gaps. The auto-title sweep, ladder, and shadow guard in
 opencode sessions carry (1) a `first_user_message` (bounded extraction from
 opencode.db's `message`/`part` tables, only for sessions that still need
 naming) and (2) `title_source: Some("provider-generated")` when opencode has
-already named the session (any title that is not the `New session - <ISO>`
-placeholder). No production change to `freshell-server` is needed; it gains
+already named the session (any title that is not one of opencode's default
+placeholder forms — see Task 1's classifier). No production change to
+`freshell-server` is needed; it gains
 sweep-level tests pinning the reconciliation semantics.
 
 **Tech Stack:** Rust, rusqlite 0.31 (`bundled`, SQLite JSON functions
@@ -98,9 +99,19 @@ tests in `freshell-server`; Task 5 verifies, measures, and pushes.
   JSON `data`; `$.type`/`$.text`/`$.synthetic` live in part JSON `data`.
   **Trap:** synthetic text parts (`"synthetic": true` — opencode-injected
   tool-narration) sort BEFORE the real prompt in ~40% of recent sessions and
-  must be filtered. `session.title` is a `TEXT NOT NULL` real column; the
-  placeholder shape is `New session - <ISO-8601 ms UTC>` (JS
-  `new Date(time_created).toISOString()`, exactly 24 chars after the prefix).
+  must be filtered. `session.title` is a `TEXT NOT NULL` real column. The
+  placeholder shapes (verified against upstream v1.18.16,
+  `packages/opencode/src/session/session.ts:48-55` — opencode's own
+  `isDefaultTitle` regex) are `New session - <ISO>` (parent sessions) and
+  `Child session - <ISO>` (subagent sessions), where `<ISO>` is JS
+  `new Date(...).toISOString()` — exactly 24 chars after the prefix.
+  Releases ≤ v0.3.86 (pre-2025-08-07) wrote a capital-S `New Session - `
+  prefix, so DBs migrated from file storage may carry those rows (SQLite
+  `LIKE` is case-insensitive and masks them; this machine's DB, checked
+  read-only 2026-08-10: 175 lower-s rows, 0 capital-S, 0 child-placeholder).
+  Also note: `message`/`part` are dual-written projections of opencode's
+  newer v2 event store (`session_message`); their column shape is unchanged
+  since v1.2.0 but should be re-verified on major opencode upgrades.
 
 ## Design Decisions (locked)
 
@@ -116,7 +127,11 @@ tests in `freshell-server`; Task 5 verifies, measures, and pushes.
    same predicate** (per `parse/claude.rs:526-528` convention) — set both.
 4. **Graceful degradation.** Any schema/query failure in the first-message
    lookup yields `None` (session just keeps the dir-placeholder behavior);
-   listing never breaks. No new `OpencodeDegrade` variants.
+   listing never breaks. No new `OpencodeDegrade` variants. If the crate
+   already has a logging facade (check `freshell-sessions`'s Cargo.toml for
+   `tracing` or `log` before coding — do NOT add a dependency), emit a
+   debug-level log on lookup `Err` paths other than no-rows so future
+   schema drift stays observable; otherwise skip logging.
 5. **No sweep production changes.** `run_auto_title_pass`,
    `compute_auto_title_patch`, `should_generate_ai`, `overlay_session_title`
    already implement the required semantics; opencode inherits exact
@@ -126,6 +141,26 @@ tests in `freshell-server`; Task 5 verifies, measures, and pushes.
    retired Node reference. Plain code comments document it at each changed
    site; `port/oracle/DEVIATIONS.md` gets a note ONLY if that campaign file
    still exists and pins opencode listing behavior (checked in Task 5).
+7. **ai may beat a late native retitle (accepted race).** Upstream opencode
+   fires its own titling (`session/prompt.ts:193-255`, forked at
+   `:1133-1139`) while processing the FIRST user message, concurrent with
+   the assistant reply — a ~1–5 s small-model call with 2 retries that
+   skips child sessions and gives up permanently if a second user message
+   lands first. Freshell's 2 s-cadence sweep can win that race, after which
+   the `ai` override row wins in freshell (goal ladder:
+   `user > ai > provider-generated`) while opencode's own UI shows its
+   native name. Accepted: this is the stated ladder and matches live
+   claude/amplifier semantics (`should_generate_ai` already short-circuits
+   whenever the native name lands first). opencode is deliberately NOT
+   added to `AUTHORITATIVE_TITLE_PROVIDERS` (`migrations.rs` — a one-time
+   amplifier cleanup, not a live precedence rule); no production
+   precedence change.
+8. **Live-terminal scope (accepted).** The sweep titles only sessions bound
+   to a live freshell terminal — identical to every other provider. The
+   ~175 historical placeholder sessions stay as-is unless reopened in a
+   live pane (opencode itself will never rename most of them either — see
+   Decision 7's one-user-message guard). No backfill pass; Gap B already
+   surfaces the opencode-named majority of the corpus.
 
 ## File Structure
 
@@ -178,6 +213,15 @@ mod placeholder_title_tests {
         assert!(is_opencode_placeholder_title(
             "New session - 1970-01-01T00:00:00.000Z"
         ));
+        // subagent placeholder (upstream session.ts parentID branch)
+        assert!(is_opencode_placeholder_title(
+            "Child session - 2026-08-10T23:47:23.950Z"
+        ));
+        // legacy capital-S prefix (opencode <= v0.3.86, pre-2025-08-07;
+        // survives in DBs migrated from file storage)
+        assert!(is_opencode_placeholder_title(
+            "New Session - 2025-07-30T12:00:00.000Z"
+        ));
     }
 
     #[test]
@@ -187,6 +231,7 @@ mod placeholder_title_tests {
         assert!(!is_opencode_placeholder_title(""));
         // prefix alone is not enough -- a user could name a session this way
         assert!(!is_opencode_placeholder_title("New session - my notes"));
+        assert!(!is_opencode_placeholder_title("Child session - my notes"));
         assert!(!is_opencode_placeholder_title("New session - 2026-08-10"));
         // seconds precision / no ms / no Z -- not toISOString() output
         assert!(!is_opencode_placeholder_title("New session - 2026-08-10T23:47:23Z"));
@@ -209,17 +254,25 @@ Add near the other pub helpers in `parse/opencode.rs` (e.g. below
 `THREE_VIEWS_MARKER_SQL_PATTERN`):
 
 ```rust
-/// opencode's own default title for a session it has not yet named:
-/// `New session - <ISO-8601 UTC ms>`, e.g.
-/// `New session - 2026-08-10T23:47:23.950Z` -- JS
-/// `new Date(time_created).toISOString()`, always exactly 24 chars after
-/// the prefix. A NON-placeholder title is a real opencode session name
-/// (opencode retitles sessions itself after the first exchange); the
-/// directory index surfaces those as provider-generated. Deliberate
-/// mainline deviation: the retired Node reference never classified
-/// opencode titles at all.
+/// opencode's own default titles for sessions it has not yet named,
+/// mirroring upstream `Session.isDefaultTitle` (v1.18.16,
+/// `packages/opencode/src/session/session.ts:48-55`):
+/// `New session - <ISO>` (parent) and `Child session - <ISO>` (subagent),
+/// where `<ISO>` is JS `new Date(...).toISOString()` -- always exactly
+/// 24 chars, e.g. `2026-08-10T23:47:23.950Z`. Also accepts the legacy
+/// capital-S `New Session - ` prefix written by opencode <= v0.3.86
+/// (changed in v0.4.0, 2025-08-07): DBs migrated from file storage may
+/// still carry those rows, and SQLite's case-insensitive LIKE masks them
+/// in ad-hoc queries. A NON-placeholder title is a real opencode session
+/// name (opencode retitles parent sessions itself after the first
+/// exchange); the directory index surfaces those as provider-generated.
+/// Deliberate mainline deviation: the retired Node reference never
+/// classified opencode titles at all.
 pub fn is_opencode_placeholder_title(title: &str) -> bool {
-    let Some(rest) = title.strip_prefix("New session - ") else {
+    let rest = ["New session - ", "Child session - ", "New Session - "]
+        .iter()
+        .find_map(|prefix| title.strip_prefix(prefix));
+    let Some(rest) = rest else {
         return false;
     };
     let b = rest.as_bytes();
@@ -546,8 +599,9 @@ In `crates/freshell-sessions/src/parse/opencode.rs`:
 ```rust
     /// First real (non-synthetic) user-message text, normalized via
     /// `crate::text::normalize_first_user_message`. Populated ONLY for
-    /// sessions that still need naming (empty or `New session - <ISO>`
-    /// placeholder titles) -- a bounded per-session indexed lookup, never
+    /// sessions that still need naming (empty or opencode default
+    /// placeholder titles -- see `is_opencode_placeholder_title`) -- a
+    /// bounded per-session indexed lookup, never
     /// a full message/part scan (opencode.db can be multi-GB). Feeds the
     /// first-message/AI rungs of freshell's auto-title ladder. Deliberate
     /// mainline deviation from the retired Node reference, which never
@@ -572,6 +626,11 @@ In `crates/freshell-sessions/src/parse/opencode.rs`:
 /// tool-call narration that sorts before the real prompt). Degrades to
 /// `None` on ANY schema/query error: older opencode schemas without
 /// `message.id`/`part.message_id` columns must not break listing.
+///
+/// NOTE: as of opencode v1.18.16 the `message`/`part` tables are
+/// dual-written projections of the newer v2 event store
+/// (`session_message`); the column shape is unchanged since v1.2.0 but
+/// should be re-verified on major opencode upgrades.
 const FIRST_USER_MESSAGE_SQL: &str = "\
     WITH first_user AS (\
         SELECT m.id FROM message m \
@@ -643,6 +702,14 @@ listing connection already has the 5000 ms busy timeout set by
 code constructs `OpencodeSession` literally, the compiler will point at it —
 set `first_user_message: None` there with a one-line comment (only the
 listing path pays for extraction).
+
+Logging latitude (verify, don't guess): if `freshell-sessions` already
+depends on a logging facade (check its Cargo.toml for `tracing` or `log`),
+emit a debug-level log on the two `Err` paths in
+`first_user_message_for_session` (prepare error; query error other than
+`QueryReturnedNoRows`) before degrading to `None` — Design Decision 4. If
+no facade exists, skip logging; do NOT add a new dependency (Global
+Constraint).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -893,11 +960,14 @@ Also update the `IndexedSession::title_source` doc comment
 Replace the opencode bullet:
 
 ```rust
-    /// - **opencode**: `"provider-generated"` iff the stored session title is
-    ///   a real name (not blank and not the `New session - <ISO>` default
-    ///   placeholder) -- opencode names sessions itself after the first
-    ///   exchange. `None` for placeholder-titled sessions (those instead
-    ///   carry `first_user_message` for the first-message/AI rungs).
+    /// - **opencode**: `"provider-generated"` iff the stored session title
+    ///   is a real name -- not blank and not one of opencode's default
+    ///   placeholders (`New session - `/`Child session - ` plus the legacy
+    ///   capital-S `New Session - `, each followed by the 24-char ISO
+    ///   stamp; see `parse::is_opencode_placeholder_title`). opencode
+    ///   names parent sessions itself after the first exchange. `None` for
+    ///   placeholder-titled sessions (those instead carry
+    ///   `first_user_message` for the first-message/AI rungs).
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1339,6 +1409,9 @@ sqlite3 "file:$HOME/.local/share/opencode/opencode.db?mode=ro" <<'SQL'
 PRAGMA query_only=ON;
 .timer on
 -- how many sessions would pay the lookup on this corpus
+-- (LIKE is case-insensitive, so this also counts legacy capital-S
+--  'New Session - ' rows; child placeholders are excluded by
+--  parent_id IS NULL)
 SELECT count(*) FROM session
 WHERE time_archived IS NULL AND parent_id IS NULL
   AND (title LIKE 'New session - %' OR trim(title) = '');
