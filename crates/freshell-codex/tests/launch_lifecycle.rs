@@ -29,7 +29,10 @@ use freshell_codex::launch_lifecycle::{
     CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE, CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE,
 };
 use freshell_codex::launch_plan::{codex_remote_args, CodexLaunchPlanInput};
-use freshell_codex::BoxFuture;
+use freshell_codex::{
+    proc_starttime, verify_sidecar_identity, BoxFuture, CodexSidecarStore, IdentityVerdict,
+    SidecarRecordState,
+};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -980,4 +983,175 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
         .await;
     // The adopted terminal is unaffected (observable: manager can shut down cleanly).
     manager.shutdown().await;
+}
+
+// ────── Task 3: durable sidecar records — persist on spawn, scrub on teardown,
+// survive server death (kata ynfn "surviving restarts is a feature") ──────────────
+
+/// A lock-free store over its own tempdir (the tests-and-verification
+/// construction, `sidecar_store.rs` docs). The `TempDir` guard is returned so
+/// the record files outlive every runtime the test builds over the store.
+fn temp_sidecar_store() -> (tempfile::TempDir, Arc<CodexSidecarStore>) {
+    let dir = tempfile::tempdir().expect("tempdir for the sidecar store");
+    let store = Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()));
+    (dir, store)
+}
+
+/// Poll until `pid` reads gone from `/proc`. `proc_starttime` returns `None`
+/// for reaped AND zombie (Z) states, so this stays robust to tokio's
+/// background orphan-reaping timing.
+async fn wait_pid_gone(pid: u32) {
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        if proc_starttime(pid as i32).is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pid {pid} still alive past the {RECV_TIMEOUT:?} deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn ensure_ready_persists_a_verified_sidecar_record() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+
+    let ready = runtime.ensure_ready(None).await.expect("ensure_ready");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    let records = store.load_all();
+    assert_eq!(records.len(), 1, "exactly one record: {records:?}");
+    let record = &records[0];
+    assert_eq!(record.state, SidecarRecordState::Active);
+    assert_eq!(record.pid, pid, "record pid is the live child's pid");
+    assert_eq!(
+        record.ws_url, ready.ws_url,
+        "record ws_url is the returned one"
+    );
+    assert_eq!(
+        verify_sidecar_identity(record),
+        IdentityVerdict::Verified,
+        "(starttime, cmdline) must verify against the live child"
+    );
+
+    runtime
+        .shutdown()
+        .await
+        .expect("shutdown cleans up the child");
+}
+
+#[tokio::test]
+async fn runtime_shutdown_removes_the_sidecar_record() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    runtime.ensure_ready(None).await.expect("ensure_ready");
+    let pid = runtime.child_pid().await.expect("child pid");
+    assert_eq!(store.load_all().len(), 1, "record present before shutdown");
+
+    runtime.shutdown().await.expect("shutdown");
+
+    assert!(
+        store.load_all().is_empty(),
+        "explicit shutdown must scrub the record"
+    );
+    wait_pid_gone(pid).await;
+}
+
+#[tokio::test]
+async fn update_ownership_metadata_enriches_the_record() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    runtime.ensure_ready(None).await.expect("ensure_ready");
+
+    runtime
+        .update_ownership_metadata("term-42".to_string(), 7)
+        .await
+        .expect("update_ownership_metadata");
+
+    let records = store.load_all();
+    assert_eq!(records.len(), 1, "still exactly one record: {records:?}");
+    assert_eq!(
+        records[0].terminal_id.as_deref(),
+        Some("term-42"),
+        "adopt must enrich the record with the terminal id"
+    );
+
+    runtime
+        .shutdown()
+        .await
+        .expect("shutdown cleans up the child");
+}
+
+#[tokio::test]
+async fn spawned_sidecar_survives_runtime_drop_without_shutdown() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    runtime.ensure_ready(None).await.expect("ensure_ready");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    // Server death without shutdown(): kill_on_drop is OFF for tracked spawns.
+    drop(runtime);
+
+    // Give any (wrong) kill-on-drop a chance to land before asserting liveness.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        proc_starttime(pid as i32).is_some(),
+        "detached sidecar (pid {pid}) must survive the runtime drop"
+    );
+
+    // The record still exists: an uncleanly-dying server leaves a TRACKED,
+    // reconcilable sidecar — not an invisible orphan (the whole point).
+    let records = store.load_all();
+    assert_eq!(
+        records.len(),
+        1,
+        "record must survive the drop: {records:?}"
+    );
+    let record = &records[0];
+    assert_eq!(record.pid, pid);
+
+    // PROCESS SAFETY: kill ONLY the child this test spawned, and only after
+    // re-verifying (pid, starttime, cmdline) identity via the record.
+    assert_eq!(verify_sidecar_identity(record), IdentityVerdict::Verified);
+    // SAFETY: plain FFI signal send to our own verified child pid.
+    unsafe {
+        assert_eq!(
+            libc::kill(pid as i32, libc::SIGTERM),
+            0,
+            "SIGTERM this test's own child"
+        );
+    }
+    wait_pid_gone(pid).await;
+}
+
+#[tokio::test]
+async fn drop_without_shutdown_with_disabled_store_keeps_the_kill_on_drop_backstop() {
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        Arc::new(CodexSidecarStore::disabled()),
+    );
+    runtime.ensure_ready(None).await.expect("ensure_ready");
+    let pid = runtime.child_pid().await.expect("child pid");
+
+    // A record-less sidecar must NEVER outlive the server: detaching it would
+    // be the silently-orphaned ynfn hole with no reconcile path, so untracked
+    // spawns keep today's kill_on_drop backstop.
+    drop(runtime);
+
+    wait_pid_gone(pid).await;
 }

@@ -28,6 +28,7 @@
 //!   module header).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 /// Schema version stamped into every record. Rows with a different version
 /// are quarantined loudly at load, never silently reinterpreted (the
@@ -346,6 +347,28 @@ pub fn verify_sidecar_identity(record: &CodexSidecarRecord) -> IdentityVerdict {
 #[cfg(not(target_os = "linux"))]
 pub fn verify_sidecar_identity(_record: &CodexSidecarRecord) -> IdentityVerdict {
     IdentityVerdict::Unverifiable
+}
+
+// ---------------------------------------------------------------------------
+// Process-global store handle (Task 3 seam; wired at server boot in Task 10).
+// A re-settable RwLock rather than the manager's OnceLock: tests inject a
+// per-instance store (`SpawnedCodexAppServerRuntime::with_command_and_store`)
+// and never touch this global, so no set-once ratchet is needed here.
+// ---------------------------------------------------------------------------
+
+static GLOBAL_SIDECAR_STORE: RwLock<Option<Arc<CodexSidecarStore>>> = RwLock::new(None);
+
+/// Install the process-wide sidecar store (server boot, before any codex
+/// terminal can spawn). Later calls replace the handle.
+pub fn set_codex_sidecar_store(store: Arc<CodexSidecarStore>) {
+    *GLOBAL_SIDECAR_STORE.write().unwrap() = Some(store);
+}
+
+/// The installed process-wide store, if any. `None` (nothing installed) means
+/// callers fall back to [`CodexSidecarStore::disabled`] — behavior identical
+/// to the pre-store world.
+pub(crate) fn codex_sidecar_store() -> Option<Arc<CodexSidecarStore>> {
+    GLOBAL_SIDECAR_STORE.read().unwrap().clone()
 }
 
 fn record_path(root: &Path, ownership_id: &str) -> PathBuf {

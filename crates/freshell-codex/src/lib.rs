@@ -74,6 +74,13 @@ pub use model::{
     CodexEffortError, CHEAPEST_T2_MODEL, FRESHCODEX_DEFAULT_EFFORT, FRESHCODEX_DEFAULT_MODEL,
     FRESHCODEX_EFFORTS_VERBATIM,
 };
+#[cfg(feature = "real-transport")]
+pub use sidecar_store::{
+    proc_cmdline, proc_starttime, set_codex_sidecar_store, verify_sidecar_identity,
+    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarRecordState,
+    SIDECAR_RECORD_VERSION,
+};
+
 pub use protocol::{
     build_notification_frame, build_request_frame, classify_notification,
     extract_turn_notification_event, parse_client_frame, parse_incoming_frame, turn_status,
