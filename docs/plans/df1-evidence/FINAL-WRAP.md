@@ -34,3 +34,9 @@ Integration span: `4c2297667` (fork) .. `5dece6822` (tip). Branch `df1/integrati
 - **PR #2 (wrap batch):** `36b7e09b4..5dece6822` — 4 item merges + B005 evidence + r6 doc + gate fix; gated by R2 + per-item B005 verification + review r6 (0 majors).
 
 Deferred by design (later sessions): REV-01→REVIEW-01→DEFER-01 chain, GATE-01/HARNESS-10 defers, TERM-22 (with arbitration note), SESSION-09 (worker died mid-item; task-1 commit preserved on branch), CT-01, no-rust-leg tail.
+
+## Post-wrap main-sync (2026-08-11)
+- `df1/integration` was merged with current `origin/main` (+~110 commits: rust-port mainline #633+sweep, opencode auto-titles #637, remote status rings #636, mobile context menu #635, pty-captured-leak #634) as merge commit `b87c79c02`; NOT a rebase (embedded fork-lineage sync merges make --rebase-merges degenerate; branch already pushed).
+- Full conflict/resolution/gate record: docs/plans/df1-evidence/MAIN-SYNC-MERGE.md. Post-merge gate quiet-window: cargo workspace 116/116 targets / 3157 passed; npm test PASS; typecheck PASS; focused PW legs PASS; a11y deny-gate clean.
+- Two main-drift dispositions fixed in-branch (`3b7112842` + `9b2ee0709`): TooltipContent pointer-events-none (fixes a main-owned title-sync spec + real right-click interception on pure origin/main) and semantic handles (`data-context="pane-header"`, `data-remote-status-ring`) so the campaign's deny-gate lands green with main's specs.
+- PR split note: the wave-1 anchor `36b7e09b4` is now PRE-sync history; proposal A/B shapes change accordingly — deciding the split against the sync'd single branch is an open follow-up when the user resumes.
