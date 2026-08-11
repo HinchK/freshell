@@ -46,6 +46,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
@@ -98,6 +99,79 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// DIAG-01 connection ownership: run the whole serve loop inside a
+/// per-connection span, so EVERY event emitted while serving this
+/// connection carries `connection_id` + `origin_kind` when the server-side
+/// JsonLayer flattens span fields into the JSONL line.
+///
+/// The span is created at ERROR level ON PURPOSE (this is context
+/// infrastructure, not a message: our JsonLayer never renders span
+/// open/close, so the level has zero output effect). An INFO-level span is
+/// silently disabled by an operator's `RUST_LOG=warn`/`error` filter, and
+/// once disabled its fields vanish from the scope of the very WARN/ERROR
+/// in-connection events that still get logged (empirically confirmed:
+/// `ws.keepalive.terminated` & friends would lose `connection_id` exactly
+/// when an operator cranks the filter up to investigate). ERROR is the one
+/// level enabled under EVERY filter that still admits any events at all
+/// (a filter stricter than `error` logs nothing for the span to enrich).
+pub(crate) fn connection_span(conn_id: u64, origin_kind: &'static str) -> tracing::Span {
+    tracing::span!(
+        tracing::Level::ERROR,
+        "ws_conn",
+        connection_id = conn_id,
+        origin_kind = origin_kind,
+    )
+}
+
+/// DIAG-01 dual-carrier connection ownership. The `ws_conn` span
+/// ([`connection_span`]) enriches in-connection events under bare /
+/// globally-anchored level filters, but tracing-subscriber disables SPAN
+/// callsites under target-directive-only filters (empirically: even a
+/// matched `freshell_ws=info` directive disables the span while still
+/// admitting that crate's events). An event's own fields ride through ANY
+/// filter that admits the event itself -- so the create-reply join
+/// (connection_id <-> requestId <-> terminal_id) is ALSO emitted as
+/// explicit event fields here, once per `terminal.created` reply path
+/// (`path` says which). Under a filter that silences freshell_ws entirely
+/// (`freshell_ws=off`), nothing in this crate logs at all by the operator's
+/// express choice; the registry's `terminal.created` then joins only via
+/// `terminal_id` (documented in freshell-server's logging.rs schema).
+pub(crate) fn log_create_settled(
+    conn_id: u64,
+    request_id: &str,
+    terminal_id: &str,
+    path: &'static str,
+) {
+    tracing::info!(
+        connection_id = conn_id,
+        request_id = %request_id,
+        terminal_id = %terminal_id,
+        path = path,
+        "ws.terminal.create.settled"
+    );
+}
+
+/// `tokio::task::spawn_blocking` does NOT propagate the caller's tracing
+/// span context across the thread hop (spans are thread-local), which would
+/// silently strip `connection_id` (and any future request-scoped context)
+/// from every event emitted inside the closure -- e.g. the registry's
+/// `terminal.created`, fired from `handle_create`'s blocking PTY spawn
+/// (DIAG-01 connection ownership). This helper carries the CURRENT span
+/// into the blocking closure and enters it for the closure's duration --
+/// the canonical correct use of `Span::enter` (a synchronous guard, never
+/// held across an `.await`).
+fn spawn_blocking_in_span<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        f()
+    })
+}
+
 /// The modes that get a spawn-time pending marker: EXACTLY the modes with a
 /// registered post-spawn identity resolver (codex candidate adoption, the
 /// opencode locator sweep; amplifier's post-spawn locator was deleted —
@@ -130,14 +204,14 @@ fn map_shell(shell: Shell) -> ShellType {
 pub async fn run(
     socket: WebSocket,
     state: &WsState,
-    mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+    bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
 ) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, ws_rx) = socket.split();
 
     // Identify this connection so the registry can key its terminal subscriptions
     // (and sweep them on close).
@@ -153,6 +227,49 @@ pub async fn run(
         "ws.connection.established"
     );
 
+    // DIAG-01 connection ownership: run the whole serve loop inside a
+    // per-connection span, so EVERY event emitted while serving this
+    // connection (same-task or, via the `.instrument(Span::current())` /
+    // `spawn_blocking_in_span` hop sites below, spawned-task and
+    // blocking-pool work) carries `connection_id` + `origin_kind` when the
+    // server-side JsonLayer flattens span fields into the JSONL line. A bare
+    // `span.enter()` held across `.await`s would instead leak the span into
+    // unrelated tasks parked on the same OS thread -- hence `.instrument()`
+    // on the loop future and explicit context hops at thread boundaries.
+    // `connection_span`'s own doc explains why the span is ERROR-level.
+    let span = connection_span(conn_id, origin_kind);
+    run_loop(
+        ws_tx,
+        ws_rx,
+        state,
+        bcast_rx,
+        terminal_output_batch_v1,
+        ui_screenshot_v1,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        conn_id,
+        origin_kind,
+    )
+    .instrument(span)
+    .await;
+}
+
+/// The body of one connection's serve loop (`run` minus the connection-id
+/// mint, the established event, and the span shell above). Everything in
+/// here polls with the `ws_conn` span as the current context.
+#[allow(clippy::too_many_arguments)] // Same connection-scoped plumbing as run().
+async fn run_loop(
+    mut ws_tx: WsSink,
+    mut ws_rx: futures_util::stream::SplitStream<WebSocket>,
+    state: &WsState,
+    mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+    terminal_output_batch_v1: bool,
+    ui_screenshot_v1: bool,
+    pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
+    conn_id: u64,
+    origin_kind: &'static str,
+) {
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
     // FrameSink below); the loop drains it to the socket in FIFO — hence in-order.
@@ -438,16 +555,21 @@ pub async fn run(
     }
 
     // DIAG-01: one summary lifecycle event per connection teardown, whatever
-    // the actual reason -- see `close_reason`/`close_code` above.
+    // the actual reason -- see `close_reason`/`close_code` above. Both
+    // identity fields are EVENT-level (not span-only): the dual-carrier
+    // doctrine — under target-directive-only RUST_LOG filters the ws_conn
+    // span's copies vanish while the event's own fields still land.
     match close_code {
         Some(code) => tracing::info!(
             connection_id = conn_id,
+            origin_kind = origin_kind,
             reason = close_reason,
             code = code,
             "ws.connection.closed"
         ),
         None => tracing::info!(
             connection_id = conn_id,
+            origin_kind = origin_kind,
             reason = close_reason,
             "ws.connection.closed"
         ),
@@ -571,14 +693,24 @@ async fn handle_client_text(
             // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
             // so a resend during any of those windows is answered from here instead
             // of re-entering the create path.
-            match state
-                .create_dedupe
-                .begin(&create.request_id, conn_sink, create.restore, |tid| {
-                    state.registry.is_pty_running(tid)
-                }) {
+            match state.create_dedupe.begin(
+                &create.request_id,
+                conn_sink,
+                create.restore,
+                |tid| state.registry.is_pty_running(tid),
+                conn_id,
+            ) {
                 crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
                     // Re-send the original terminal.created (same requestId,
                     // same terminalId) — never spawn a duplicate.
+                    if let ServerMessage::TerminalCreated(created_terminal) = &created {
+                        log_create_settled(
+                            conn_id,
+                            &created_terminal.request_id,
+                            &created_terminal.terminal_id,
+                            "duplicate_settled",
+                        );
+                    }
                     let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                     return out.send(&created).await;
                 }
@@ -728,16 +860,25 @@ async fn handle_client_text(
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
-                        tokio::spawn(async move { fresh_codex.handle_create(create).await });
+                        tokio::spawn(
+                            async move { fresh_codex.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
-                        tokio::spawn(async move { fresh_claude.handle_create(create).await });
+                        tokio::spawn(
+                            async move { fresh_claude.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
-                        tokio::spawn(async move { fresh_opencode.handle_create(create).await });
+                        tokio::spawn(
+                            async move { fresh_opencode.handle_create(create).await }
+                                .instrument(tracing::Span::current()),
+                        );
                     }
                     _ => {}
                 }
@@ -757,15 +898,24 @@ async fn handle_client_text(
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_attach(attach).await });
+                    tokio::spawn(
+                        async move { fresh_codex.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await });
+                    tokio::spawn(
+                        async move { fresh_claude.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_attach(attach).await });
+                    tokio::spawn(
+                        async move { fresh_opencode.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 _ => {}
             }
@@ -775,16 +925,25 @@ async fn handle_client_text(
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
-                    tokio::spawn(async move { fresh_codex.handle_send(send).await });
+                    tokio::spawn(
+                        async move { fresh_codex.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    tokio::spawn(async move { fresh_claude.handle_send(send).await });
+                    tokio::spawn(
+                        async move { fresh_claude.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    tokio::spawn(async move { fresh_opencode.handle_send(send).await });
+                    tokio::spawn(
+                        async move { fresh_opencode.handle_send(send).await }
+                            .instrument(tracing::Span::current()),
+                    );
                 }
                 // `amplifier` exists on AgentProvider for the TERM-16
                 // terminal.turn.complete broadcast only — there is no
@@ -810,26 +969,44 @@ async fn handle_client_text(
         ClientMessage::FreshAgentInterrupt(interrupt) => {
             if is_codex_provider(interrupt.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await });
+                tokio::spawn(
+                    async move { fresh_codex.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if interrupt.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_interrupt(interrupt).await });
+                tokio::spawn(
+                    async move { fresh_claude.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if interrupt.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await });
+                tokio::spawn(
+                    async move { fresh_opencode.handle_interrupt(interrupt).await }
+                        .instrument(tracing::Span::current()),
+                );
             }
             true
         }
         ClientMessage::FreshAgentKill(kill) => {
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_kill(kill).await });
+                tokio::spawn(
+                    async move { fresh_codex.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if kill.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(async move { fresh_claude.handle_kill(kill).await });
+                tokio::spawn(
+                    async move { fresh_claude.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(async move { fresh_opencode.handle_kill(kill).await });
+                tokio::spawn(
+                    async move { fresh_opencode.handle_kill(kill).await }
+                        .instrument(tracing::Span::current()),
+                );
             }
             true
         }
@@ -975,11 +1152,11 @@ async fn handle_client_text(
             )
             .await
         }
+        // AUTO-01: the connected UI's layout mirror
+        // (`src/store/layoutMirrorMiddleware.ts`) feeds the shared
         // Deliberately inert remainder -- every arm here is unreachable from the
         // frozen client's live surface: `hello` was already consumed by the
-        // pre-loop handshake (`evaluate_hello`); `ui.layout.sync` is not consumed
-        // anywhere in this port yet (documented deferral --
-        // freshell-freshagent/src/pane_ops.rs `resize_pane`); `codingcli.*` has
+        // pre-loop handshake (`evaluate_hello`); `codingcli.*` has
         // no runtime here and the frozen client never sends it (zero senders in
         // `src/`). The user-reachable fresh-agent control frames
         // (approval.respond / question.respond / fork / compact) are answered
@@ -1735,7 +1912,7 @@ async fn gate_wire_resume(
         let mode_for_gate = mode.to_string();
         let rid = resume_session_id.take();
         let intent = *launch_intent;
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_in_span(move || {
             crate::resume_validation::validate_wire_resume(
                 &mode_for_gate,
                 rid,
@@ -1763,8 +1940,8 @@ async fn gate_wire_resume(
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let retire_mode = mode.to_string();
         let stale_id = stale.to_string();
-        let _ = tokio::task::spawn_blocking(move || ledger.retire_missing(&retire_mode, &stale_id))
-            .await;
+        let _ =
+            spawn_blocking_in_span(move || ledger.retire_missing(&retire_mode, &stale_id)).await;
     }
     ResumeGateCarry {
         notice: outcome.notice,
@@ -1907,6 +2084,10 @@ pub(crate) async fn handle_create(
                     create_request_id = %create.request_id,
                     "terminal.create.adopted"
                 );
+                log_create_settled(conn_id, &create.request_id, &existing, "adopted");
+                // Clone before the struct literal moves `create.request_id`
+                // (same discipline as the main spawn path's dedupe locals).
+                let dedupe_request_id = create.request_id.clone();
                 let created = ServerMessage::TerminalCreated(TerminalCreated {
                     created_at: now_ms(),
                     request_id: create.request_id,
@@ -1917,6 +2098,21 @@ pub(crate) async fn handle_create(
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
                 });
+                // An adoption IS a successful create for this requestId:
+                // settle the server-wide dedupe entry exactly like the main
+                // spawn path. Without it, the caller's `clear_if_in_flight`
+                // drops the still-InFlight sentinel and answers any
+                // cross-connection waiters with PTY_SPAWN_FAILED despite the
+                // success — and a later same-requestId resend begins fresh
+                // instead of replaying, letting a NON-negotiated (frozen)
+                // connection's blind resend spawn a duplicate PTY.
+                state.create_dedupe.settle(
+                    &dedupe_request_id,
+                    &existing,
+                    &created,
+                    create.restore,
+                    |tid| state.registry.is_pty_running(tid),
+                );
                 return out.send(&created).await;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
@@ -1972,6 +2168,16 @@ pub(crate) async fn handle_create(
                             session_id = %locator.session_id,
                             "terminal.create.session_ref_attached"
                         );
+                        log_create_settled(
+                            conn_id,
+                            &create.request_id,
+                            &terminal_id,
+                            "session_ref_attached",
+                        );
+                        // Clone before the struct literal moves
+                        // `create.request_id` (same discipline as the main
+                        // spawn path's dedupe locals).
+                        let dedupe_request_id = create.request_id.clone();
                         let created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
@@ -1985,6 +2191,22 @@ pub(crate) async fn handle_create(
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
                         });
+                        // Attaching to the winner IS a successful create for
+                        // this requestId: settle the dedupe entry exactly
+                        // like the §5.4 adopt path above and the main spawn
+                        // path — otherwise the caller's `clear_if_in_flight`
+                        // errors any same-requestId waiters with
+                        // PTY_SPAWN_FAILED despite the success, and a later
+                        // resend on a NON-negotiated connection re-enters
+                        // handle_create and spawns a duplicate PTY for the
+                        // session.
+                        state.create_dedupe.settle(
+                            &dedupe_request_id,
+                            &terminal_id,
+                            &created,
+                            create.restore,
+                            |tid| state.registry.is_pty_running(tid),
+                        );
                         return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
@@ -2692,7 +2914,7 @@ pub(crate) async fn handle_create(
             let write_cwd = spec.cwd.clone();
             let write_request_id = create.request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: "claude",
                     session_id: &write_session_id,
@@ -2721,7 +2943,7 @@ pub(crate) async fn handle_create(
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = create.request_id.clone();
     // PIN2_PTY_SPAWN_ANCHOR: the spawn makes preallocated identity observable.
-    let create_result = match tokio::task::spawn_blocking(move || {
+    let create_result = match spawn_blocking_in_span(move || {
         registry.create(
             &spawn_spec,
             &child_env,
@@ -2757,7 +2979,7 @@ pub(crate) async fn handle_create(
             if let Some(session_id) = resume_session_id.as_deref() {
                 let ledger = std::sync::Arc::clone(&state.pane_ledger);
                 let delete_session_id = session_id.to_string();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = spawn_blocking_in_span(move || {
                     ledger.delete_binding("claude", &delete_session_id)
                 })
                 .await
@@ -2917,7 +3139,7 @@ pub(crate) async fn handle_create(
         // stream, so the locator never ARMS for them (suppressed inside
         // `maybe_arm` -- never via `locator.disarm`).
         let managed_codex = codex_remote_ws_url.is_some();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             crate::codex_association::maybe_arm(
                 &state,
                 &terminal_id,
@@ -3011,7 +3233,7 @@ pub(crate) async fn handle_create(
             let write_cwd = record.cwd.clone();
             let write_request_id = create.request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
@@ -3038,7 +3260,7 @@ pub(crate) async fn handle_create(
         let write_mode = mode.clone();
         let write_cwd = spec.cwd.clone();
         let now = now_ms();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_in_span(move || {
             ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
         })
         .await
@@ -3128,6 +3350,7 @@ pub(crate) async fn handle_create(
         dedupe_restore,
         |tid| state.registry.is_pty_running(tid),
     );
+    log_create_settled(conn_id, &dedupe_request_id, &dedupe_terminal_id, "spawned");
     let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
@@ -3243,7 +3466,7 @@ pub async fn respawn_agent_terminal(
         let probe = state.session_existence.clone();
         let gate_mode = mode.clone();
         let sid = Some(req.session_id.clone());
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_in_span(move || {
             crate::resume_validation::validate_wire_resume(
                 &gate_mode,
                 sid,
@@ -3268,10 +3491,9 @@ pub async fn respawn_agent_terminal(
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
             let retire_provider = req.provider.clone();
             let stale_id = stale.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                ledger.retire_missing(&retire_provider, &stale_id)
-            })
-            .await;
+            let _ =
+                spawn_blocking_in_span(move || ledger.retire_missing(&retire_provider, &stale_id))
+                    .await;
         }
         // Headless path: no per-create `out` sink. Broadcast the existing
         // Recovering status frame (precedent: auto_resume.rs emit_recovering)
@@ -3538,7 +3760,7 @@ pub async fn respawn_agent_terminal(
     let spawn_mode = mode.clone();
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = req.create_request_id.clone();
-    let create_result = match tokio::task::spawn_blocking(move || {
+    let create_result = match spawn_blocking_in_span(move || {
         registry.create(
             &spawn_spec,
             &child_env,
@@ -3633,7 +3855,7 @@ pub async fn respawn_agent_terminal(
         // stream, so the locator never ARMS for them (suppressed inside
         // `maybe_arm` -- never via `locator.disarm`).
         let managed_codex = codex_remote_ws_url.is_some();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             crate::codex_association::maybe_arm(
                 &state,
                 &terminal_id,
@@ -3677,7 +3899,7 @@ pub async fn respawn_agent_terminal(
             let write_cwd = record.cwd.clone();
             let write_request_id = req.create_request_id.clone();
             let now = now_ms();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
@@ -4550,7 +4772,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let tid = kill.terminal_id.clone();
         let now = now_ms();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_in_span(move || {
             if let Some(sref) = sref {
                 if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
                     tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
@@ -4686,7 +4908,7 @@ async fn process_tabs_push(
     // the small `&str` args as `String`s and move the whole call into
     // `spawn_blocking` (`TabsRegistry` is `Clone`/`Arc`-backed; `records` is
     // already owned).
-    let joined = tokio::task::spawn_blocking(move || {
+    let joined = spawn_blocking_in_span(move || {
         reg.replace_client_snapshot(
             &server_instance_id,
             &device_id,
@@ -5524,26 +5746,8 @@ mod terminals_changed_tests {
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
-            settings: Arc::new(
-                serde_json::from_value(serde_json::json!({
-                    "ai": {},
-                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-                    "editor": { "externalEditor": "auto" },
-                    "extensions": { "disabled": [] },
-                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-                    "logging": { "debug": false },
-                    "network": { "configured": true, "host": "127.0.0.1" },
-                    "panes": { "defaultNewPane": "ask" },
-                    "safety": { "autoKillIdleMinutes": 15 },
-                    "sidebar": {
-                        "autoGenerateTitles": true,
-                        "excludeFirstChatMustStart": false,
-                        "excludeFirstChatSubstrings": []
-                    },
-                    "terminal": { "scrollback": 10000 }
-                }))
-                .unwrap(),
-            ),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
@@ -5772,26 +5976,10 @@ mod terminal_meta_created_tests {
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
             boot_id: std::sync::Arc::new("boot-2222".to_string()),
-            settings: std::sync::Arc::new(
-                serde_json::from_value(serde_json::json!({
-                    "ai": {},
-                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-                    "editor": { "externalEditor": "auto" },
-                    "extensions": { "disabled": [] },
-                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-                    "logging": { "debug": false },
-                    "network": { "configured": true, "host": "127.0.0.1" },
-                    "panes": { "defaultNewPane": "ask" },
-                    "safety": { "autoKillIdleMinutes": 15 },
-                    "sidebar": {
-                        "autoGenerateTitles": true,
-                        "excludeFirstChatMustStart": false,
-                        "excludeFirstChatSubstrings": []
-                    },
-                    "terminal": { "scrollback": 10000 }
-                }))
-                .unwrap(),
-            ),
+            settings: std::sync::Arc::new(crate::test_settings()),
+            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::test_settings(),
+            )),
             broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
@@ -6072,5 +6260,231 @@ mod terminal_dims_range_tests {
                 "terminalId": "t-gone",
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_span_filter_tests {
+    //! Regression for the fresh-eyes review finding: the `ws_conn` span is
+    //! context infrastructure, so its fields must survive ANY operator level
+    //! filter (`RUST_LOG`) that still admits events. An INFO-level span is
+    //! silently disabled by `warn`/`error` filters, stripping `connection_id`
+    //! from the very in-connection WARN/ERROR events an operator cranks the
+    //! filter up to inspect -- empirically confirmed during review with an
+    //! info-level probe (empty field set under a `warn` EnvFilter), then
+    //! fixed by creating the span at ERROR level (`connection_span`).
+
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    struct Captured {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct Visitor {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for Visitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct SpanFields(BTreeMap<String, String>);
+
+    struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl<S> Layer<S> for Capture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            attrs.record(&mut visitor);
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(SpanFields(visitor.fields));
+            }
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            let mut fields = BTreeMap::new();
+            if let Some(scope) = ctx.event_scope(event) {
+                for span in scope.from_root() {
+                    let extensions = span.extensions();
+                    if let Some(SpanFields(span_fields)) = extensions.get::<SpanFields>() {
+                        for (k, v) in span_fields {
+                            fields.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            for (k, v) in visitor.fields {
+                fields.insert(k, v);
+            }
+            self.events.lock().expect("capture lock").push(Captured {
+                message: visitor.message,
+                fields,
+            });
+        }
+    }
+
+    #[test]
+    fn ws_conn_span_fields_survive_every_operator_level_filter() {
+        // Any filter admitting events: error/warn admit WARN, INFO and finer
+        // admit INFO. A filter that admits nothing (`off`) has nothing to
+        // enrich and is out of scope by construction.
+        for filter_level in ["error", "warn", "info", "debug", "trace"] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter = tracing_subscriber::EnvFilter::new(filter_level);
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                match filter_level {
+                    "error" => tracing::error!("probe_event"),
+                    "warn" => tracing::warn!("probe_event"),
+                    _ => tracing::info!("probe_event"),
+                }
+            });
+            let captured = events.lock().unwrap().clone();
+            let probe = captured
+                .iter()
+                .find(|e| e.message == "probe_event")
+                .unwrap_or_else(|| {
+                    panic!("probe event must be captured under a {filter_level} filter")
+                });
+            assert_eq!(
+                probe.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "connection_id must survive a RUST_LOG={filter_level} filter"
+            );
+            assert_eq!(
+                probe.fields.get("origin_kind").map(String::as_str),
+                Some("same-origin"),
+                "origin_kind must survive a RUST_LOG={filter_level} filter"
+            );
+        }
+    }
+
+    /// Target-directive behavior, empirically mapped (probe, 2026-08-09) —
+    /// review round 2's finding. tracing-subscriber disables SPAN callsites
+    /// under TARGET-DIRECTIVE-ONLY filters, even when a directive names the
+    /// span's own component at an admitting level (`freshell_ws=info`
+    /// still kills the span). Under GLOBALLY-ANCHORED mixes (`info,
+    /// freshell_terminal=debug`) the span is enabled fine. This test
+    /// therefore pins the guarantees, not the pathologies:
+    ///   (a) a globally-anchored target mix keeps the span enriching a
+    ///       cross-crate in-connection event;
+    ///   (b) under a target-directive-only mix, the ws-side settle event
+    ///       ([`super::log_create_settled`]) still carries the join as
+    ///       EVENT fields, which no filter config can strip. (Empirically
+    ///       the span's fields are absent in this scenario; that absence is
+    ///       tracing-subscriber's per-callsite span-interest behavior, NOT
+    ///       a guarantee of ours, so it is documented here but not
+    ///       asserted.)
+    ///   (c) A filter silencing freshell_ws (`freshell_ws=off`) is the
+    ///       documented boundary: nothing in this crate logs at all then,
+    ///       by the operator's express choice.
+    #[test]
+    fn ws_conn_context_guarantee_envelope_across_filter_shapes() {
+        // (a) globally-anchored target mix: span fields merge onto a
+        // cross-crate in-connection event admitted at info.
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter = tracing_subscriber::EnvFilter::new("info,freshell_terminal=debug");
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                tracing::info!(target: "freshell_terminal::registry", "probe_event");
+            });
+            let captured = events.lock().unwrap().clone();
+            let probe = captured
+                .iter()
+                .find(|e| e.message == "probe_event")
+                .expect("probe event captured under globally-anchored mix");
+            assert_eq!(
+                probe.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "globally-anchored mixes keep span-based context"
+            );
+        }
+        // (b) target-directive-only mix: the event-level dual carrier
+        // survives where span context does not.
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = Capture {
+                events: Arc::clone(&events),
+            };
+            let filter =
+                tracing_subscriber::EnvFilter::new("freshell_ws=info,freshell_terminal=debug");
+            let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = super::connection_span(7u64, "same-origin");
+                let _e = span.enter();
+                super::log_create_settled(7u64, "req-123", "term-xyz", "spawned");
+            });
+            let captured = events.lock().unwrap().clone();
+            let settled = captured
+                .iter()
+                .find(|e| e.message == "ws.terminal.create.settled")
+                .expect("settle event captured under target-directive-only mix");
+            assert_eq!(
+                settled.fields.get("connection_id").map(String::as_str),
+                Some("7"),
+                "event-level connection_id rides through ANY filter admitting the event"
+            );
+            assert_eq!(
+                settled.fields.get("request_id").map(String::as_str),
+                Some("req-123")
+            );
+            assert_eq!(
+                settled.fields.get("terminal_id").map(String::as_str),
+                Some("term-xyz")
+            );
+        }
     }
 }

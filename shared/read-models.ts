@@ -65,6 +65,13 @@ export const SessionDirectoryPageSchema = z.object({
   revision: z.number().int().nonnegative(),
   partial: z.boolean().optional(),
   partialReason: z.enum(['budget', 'io_error']).optional(),
+  // SESSION-05 (project colors): the resolved per-project color map,
+  // present only when at least one color is configured. This page is the
+  // channel the client's refetch-after-`sessions.changed` reads to recolor
+  // History project headers (both servers emit it — Node:
+  // `server/session-directory/service.ts`; Rust:
+  // `crates/freshell-server/src/session_directory.rs`).
+  projectColors: z.record(z.string(), z.string()).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({

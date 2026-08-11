@@ -46,7 +46,6 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
@@ -111,11 +110,15 @@ pub fn compute_scrollback_max_bytes(scrollback_lines: i64) -> i64 {
 }
 
 /// `Date.now()` — epoch milliseconds.
+///
+/// HARNESS-14: routed through the shared, env-gated test clock
+/// (`freshell_platform::clock`). Gate OFF (every normal build/run) the call
+/// is an identity passthrough to `SystemTime::now()`, so production behavior
+/// is byte-identical; gate ON (a `FRESHELL_TEST_CLOCK=1` test boot) every
+/// activity stamp AND the `enforce_idle_kills` threshold math move with the
+/// one clock a spec can advance/freeze without wall-clock sleeps.
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    freshell_platform::clock::now_ms()
 }
 
 /// One attached connection's subscription to a terminal's live stream.

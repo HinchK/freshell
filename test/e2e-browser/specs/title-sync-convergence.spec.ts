@@ -177,7 +177,7 @@ function sidebarRow(page: import('@playwright/test').Page, sessionId: string) {
 /** The active tab's pane header -- inactive tabs' panes are hidden, so the
  * `:visible` filter selects exactly the pane under test (single-pane tabs). */
 function visiblePaneHeader(page: import('@playwright/test').Page) {
-  return page.locator('.pane-header:visible').first()
+  return page.locator('[data-context="pane-header"]:visible').first()
 }
 
 /** Sidebar-click resume of a dedicated seeded session (the WS create path,

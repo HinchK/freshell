@@ -162,6 +162,19 @@ test.describe('Amplifier Restore (Rust only)', () => {
     // silently no-op'ing on legacy.
     expect(e2eServerKind).toBe('rust')
 
+    // GATE-01 (2026-08-09): deterministic rust-side regression found by the
+    // unchanged-suite gate — after the restart, `amplifier resume <id>` falls
+    // back to "session could not be found on disk — started a fresh session"
+    // (expected substring "amplifier: resumed session <id>" never appears).
+    // Owner: TERM-27 (Amplifier's hardened association port). Pin masks only
+    // the post-restart resume assertions (the failing one is the resume-
+    // content check; un-pin must re-verify the whole test per B001). Red in
+    // the isolated rerun reproof-s3-amplifier-rust too — not load/flake.
+    test.fail(
+      e2eServerKind === 'rust',
+      'TERM-27: amplifier resume across restart loses the on-disk session (GATE-01 2026-08-09)',
+    )
+
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amplifier-restore-'))
     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')
     try {

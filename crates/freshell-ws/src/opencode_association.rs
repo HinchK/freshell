@@ -413,26 +413,8 @@ mod tests {
             auth_token: StdArc::clone(&auth_token),
             server_instance_id: StdArc::new("srv-1111".to_string()),
             boot_id: StdArc::new("boot-2222".to_string()),
-            settings: StdArc::new(
-                serde_json::from_value(serde_json::json!({
-                    "ai": {},
-                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-                    "editor": { "externalEditor": "auto" },
-                    "extensions": { "disabled": [] },
-                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-                    "logging": { "debug": false },
-                    "network": { "configured": true, "host": "127.0.0.1" },
-                    "panes": { "defaultNewPane": "ask" },
-                    "safety": { "autoKillIdleMinutes": 15 },
-                    "sidebar": {
-                        "autoGenerateTitles": true,
-                        "excludeFirstChatMustStart": false,
-                        "excludeFirstChatSubstrings": []
-                    },
-                    "terminal": { "scrollback": 10000 }
-                }))
-                .unwrap(),
-            ),
+            settings: StdArc::new(crate::test_settings()),
+            handshake_settings: StdArc::new(tokio::sync::RwLock::new(crate::test_settings())),
             broadcast_tx: StdArc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),

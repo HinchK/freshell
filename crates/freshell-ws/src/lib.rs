@@ -100,8 +100,27 @@ pub struct WsState {
     pub server_instance_id: Arc<String>,
     /// `boot-<uuid>` — stable for the life of this server process.
     pub boot_id: Arc<String>,
-    /// The default server settings tree emitted in `settings.updated`.
+    /// The default server settings tree. Boot-frozen snapshot, consumed ONLY
+    /// by `terminal.rs`'s create-time derivations (`cli_provider_settings`,
+    /// the codex launch plan, `resolve_create_cwd`'s `defaultCwd` fallback).
+    /// CFG-06 owns making those NEW-OPERATION consumers resolve live values;
+    /// do NOT repoint this field at [`WsState::handshake_settings`] — the
+    /// per-consumer proof obligations are CFG-06's, and the boundary is
+    /// pinned by `handshake_settings_updated_reflects_live_writes_between_
+    /// connections`.
     pub settings: Arc<ServerSettings>,
+    /// CFG-12: the LIVE server-settings tree, resolved on EVERY `/ws`
+    /// connection for the handshake's `settings.updated` frame (legacy
+    /// parity: the original's `handshakeSnapshotProvider` awaits
+    /// `configStore.getSettings()` per connection (`server/index.ts:415-427`,
+    /// sent via `ws-handler.ts:1815-1845`). Freshell-server wires
+    /// `SettingsStore::shared_settings_lock()` in here, so a value committed
+    /// by `PATCH /api/settings` is exactly what the next (re)connecting
+    /// client's handshake carries — with the client's last-write-wins
+    /// application of that frame, a boot-frozen copy here would erase the
+    /// fresh value `/api/bootstrap` already delivered. Read-only from this
+    /// crate's perspective: the owning `SettingsStore` is the only writer.
+    pub handshake_settings: Arc<tokio::sync::RwLock<ServerSettings>>,
     /// GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
     /// notice, if the primary configuration needed to fall back (corrupt
     /// primary -> backup restore or defaults) at boot -- `None` for a
@@ -408,6 +427,34 @@ pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// The shared minimal-but-structurally-valid `ServerSettings` fixture every
+/// in-crate unit test seeds `WsState` from (the exact default tree is pinned
+/// by freshell-server's fixture test; here we only need SOMETHING to emit).
+/// Crate-visible so `terminal.rs` / `*_association.rs` / `codex_proxy_route.rs`
+/// test modules build from ONE literal instead of five byte-identical copies
+/// (hoisted when CFG-12 gave `WsState` a second settings-carrying field).
+#[cfg(test)]
+pub(crate) fn test_settings() -> ServerSettings {
+    serde_json::from_value(serde_json::json!({
+        "ai": {},
+        "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+        "editor": { "externalEditor": "auto" },
+        "extensions": { "disabled": [] },
+        "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+        "logging": { "debug": false },
+        "network": { "configured": true, "host": "127.0.0.1" },
+        "panes": { "defaultNewPane": "ask" },
+        "safety": { "autoKillIdleMinutes": 15 },
+        "sidebar": {
+            "autoGenerateTitles": true,
+            "excludeFirstChatMustStart": false,
+            "excludeFirstChatSubstrings": []
+        },
+        "terminal": { "scrollback": 10000 }
+    }))
+    .unwrap()
+}
+
 /// Run `f` on a repeating `interval` cadence, forever, on a spawned tokio task.
 /// The generic scheduling primitive behind `spawn_idle_monitor` -- split out so
 /// the ticker cadence itself (the actual new logic: a `tokio::time::interval`
@@ -456,8 +503,8 @@ pub fn spawn_idle_monitor(
 /// treating its persisted terminals as dead (`clearDeadTerminals` → recreate, which
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
-pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false)
+pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
+    build_handshake_with_capabilities(state, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -465,7 +512,14 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
 /// `ready.capabilities` advertisement is emitted **only when the client's
 /// `hello` opted in** — today's frozen client doesn't, so the emitted
 /// handshake stays byte-for-byte identical to the pinned clean-boot shape.
-pub fn build_handshake_with_capabilities(
+///
+/// CFG-12: `settings.updated` resolves [`WsState::handshake_settings`] — the
+/// LIVE tree — fresh on every call (one call per `/ws` connection), matching
+/// the original's per-connection snapshot provider. On a clean boot the lock
+/// contents equal the old frozen snapshot, so the emitted bytes are
+/// unchanged; what changes is that a PATCH committed after boot now reaches
+/// the NEXT connection.
+pub async fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
@@ -484,7 +538,7 @@ pub fn build_handshake_with_capabilities(
             ),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
-            settings: state.settings.as_ref().clone(),
+            settings: state.handshake_settings.read().await.clone(),
         }),
         ServerMessage::PerfLogging(PerfLogging { enabled: false }),
     ];
@@ -694,9 +748,12 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Authenticated: emit the ordered handshake.
+    // Authenticated: emit the ordered handshake. CFG-12: the builder is
+    // async + per-connection so its `settings.updated` frame resolves the
+    // LIVE settings tree (see `build_handshake_with_capabilities`).
     for msg in
         build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
+            .await
     {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
@@ -800,29 +857,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn test_settings() -> ServerSettings {
-        // Minimal but structurally valid; the exact default tree is pinned by
-        // freshell-server's fixture test. Here we only need SOMETHING to emit.
-        serde_json::from_value(json!({
-            "ai": {},
-            "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-            "editor": { "externalEditor": "auto" },
-            "extensions": { "disabled": [] },
-            "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-            "logging": { "debug": false },
-            "network": { "configured": true, "host": "127.0.0.1" },
-            "panes": { "defaultNewPane": "ask" },
-            "safety": { "autoKillIdleMinutes": 15 },
-            "sidebar": {
-                "autoGenerateTitles": true,
-                "excludeFirstChatMustStart": false,
-                "excludeFirstChatSubstrings": []
-            },
-            "terminal": { "scrollback": 10000 }
-        }))
-        .unwrap()
-    }
-
     fn state() -> WsState {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
@@ -835,6 +869,7 @@ mod tests {
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
             settings: Arc::new(test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
@@ -926,31 +961,31 @@ mod tests {
     /// ONLY for a hello that opted in — the default handshake stays
     /// byte-identical to the pinned clean-boot shape (frozen-client inertness
     /// at the source).
-    #[test]
-    fn handshake_advertises_pane_reconcile_only_when_negotiated() {
+    #[tokio::test]
+    async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false);
+        let negotiated = build_handshake_with_capabilities(&s, true, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
             serde_json::json!({ "paneReconcileV1": true })
         );
 
-        let default = build_handshake(&s);
+        let default = build_handshake(&s).await;
         let ready = serde_json::to_value(&default[0]).unwrap();
         assert!(
             ready.get("capabilities").is_none(),
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false);
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }
 
-    #[test]
-    fn handshake_is_ordered_with_shared_bootid() {
-        let msgs = build_handshake(&state());
+    #[tokio::test]
+    async fn handshake_is_ordered_with_shared_bootid() {
+        let msgs = build_handshake(&state()).await;
         let wire: Vec<serde_json::Value> = msgs
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -985,14 +1020,14 @@ mod tests {
     /// back, `config.fallback` slots into the ordered handshake right after
     /// `perf.logging` and before `terminal.inventory` -- mirrors the
     /// original's exact ordering (`ws-handler.ts:1730-1735`).
-    #[test]
-    fn handshake_includes_config_fallback_when_boot_fell_back_and_in_correct_order() {
+    #[tokio::test]
+    async fn handshake_includes_config_fallback_when_boot_fell_back_and_in_correct_order() {
         let mut s = state();
         s.config_fallback = Some(freshell_protocol::ConfigFallback {
             reason: freshell_protocol::ConfigFallbackReason::ParseError,
             backup_exists: true,
         });
-        let msgs = build_handshake(&s);
+        let msgs = build_handshake(&s).await;
         let wire: Vec<serde_json::Value> = msgs
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1017,9 +1052,9 @@ mod tests {
     /// identical to before this fix (proves `handshake_is_ordered_with_
     /// shared_bootid` above, asserting the 4-message shape, keeps passing
     /// unchanged).
-    #[test]
-    fn handshake_omits_config_fallback_when_boot_was_healthy() {
-        let msgs = build_handshake(&state());
+    #[tokio::test]
+    async fn handshake_omits_config_fallback_when_boot_was_healthy() {
+        let msgs = build_handshake(&state()).await;
         assert!(
             !msgs
                 .iter()
@@ -1035,19 +1070,19 @@ mod tests {
     /// original achieves late-connect delivery too (per-connection
     /// `sendHandshakeSnapshot`, `ws-handler.ts:1723-1749`, recomputed on
     /// every hello rather than broadcast once at boot).
-    #[test]
-    fn handshake_delivers_config_fallback_identically_across_multiple_connections() {
+    #[tokio::test]
+    async fn handshake_delivers_config_fallback_identically_across_multiple_connections() {
         let mut s = state();
         s.config_fallback = Some(freshell_protocol::ConfigFallback {
             reason: freshell_protocol::ConfigFallbackReason::Enoent,
             backup_exists: false,
         });
 
-        let first_connection = build_handshake(&s);
-        // Simulate a client connecting much later: the SAME frozen WsState
-        // (nothing mutates it between connections) produces an identical
+        let first_connection = build_handshake(&s).await;
+        // Simulate a client connecting much later: with no settings mutation
+        // between connections, the live resolution produces an identical
         // handshake on a second, independent call.
-        let late_connection = build_handshake(&s);
+        let late_connection = build_handshake(&s).await;
 
         // DEFLAKE (f3wp): `ready.timestamp` is wall-clock at build time, so
         // two handshakes built across a millisecond boundary legitimately
@@ -1082,6 +1117,59 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ServerMessage::ConfigFallback(_))),
             "a late-connecting client must still receive the config.fallback notice"
+        );
+    }
+
+    /// CFG-12 RED/GREEN target: the handshake's `settings.updated` frame
+    /// resolves the LIVE settings tree per connection (the original's
+    /// per-connection `handshakeSnapshotProvider` awaits
+    /// `configStore.getSettings()` on EVERY `/ws` hello, `server/index.ts:
+    /// 415-427` + `ws-handler.ts:1815-1845`). A settings write committed
+    /// after boot (the PATCH path's committed value) must reach the NEXT
+    /// connection's handshake; a boot-frozen snapshot would leave every
+    /// later (re)connecting client resolving the pre-PATCH tree, and the
+    /// client's last-write-wins application of that frame erases the correct
+    /// value it already learned from `/api/bootstrap`.
+    #[tokio::test]
+    async fn handshake_settings_updated_reflects_live_writes_between_connections() {
+        let s = state();
+        let settings_of = |msgs: &Vec<ServerMessage>| -> serde_json::Value {
+            serde_json::to_value(
+                msgs.iter()
+                    .find_map(|m| match m {
+                        ServerMessage::SettingsUpdated(u) => Some(u),
+                        _ => None,
+                    })
+                    .expect("handshake carries settings.updated"),
+            )
+            .unwrap()
+        };
+
+        let first = build_handshake(&s).await;
+        assert!(
+            settings_of(&first)["settings"].get("defaultCwd").is_none(),
+            "the clean-boot fixture has no defaultCwd"
+        );
+
+        // The PATCH-committed write lands in the SAME live tree the handshake
+        // reads (freshell-server wires `SettingsStore::shared_settings_lock()`
+        // here -- one lock, no copies).
+        s.handshake_settings.write().await.default_cwd = Some("/tmp/shared-cwd".to_string());
+
+        let second = build_handshake(&s).await;
+        assert_eq!(
+            settings_of(&second)["settings"]["defaultCwd"],
+            json!("/tmp/shared-cwd"),
+            "a later connection's handshake must resolve the live tree, not the boot snapshot"
+        );
+
+        // Boundary pin (CFG-06 ownership): the create-time view stays
+        // boot-scoped -- `terminal.rs`'s create derivations keep reading the
+        // frozen field; merging the two fields is CFG-06's separate,
+        // per-consumer-proven move, not a side effect of this fix.
+        assert!(
+            s.settings.default_cwd.is_none(),
+            "the frozen create-time settings view must NOT follow the live lock"
         );
     }
 

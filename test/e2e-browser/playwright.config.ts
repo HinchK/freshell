@@ -13,7 +13,25 @@ import { defineConfig, devices } from '@playwright/test'
 export const MATRIX_SPECS = [
   /server-restart-recovery\.spec\.ts$/,
   /settings-persistence-split\.spec\.ts$/,
+  // HARNESS-03 — deterministic provider-fixture contract (fixture-only:
+  // boots NO server; both matrix legs run the identical assertions, which is
+  // itself the proof the fixtures are server-kind-independent).
+  /harness-03-provider-fixtures\.spec\.ts$/,
+  // CFG-04 — legacy browser-preference seeding (one-shot consume + marker).
+  // Authored under the df1 deferred-Playwright policy (worker-authored,
+  // close-out-campaign-executed); see docs/plans/df1-evidence/CFG-04.md.
+  /cfg04-legacy-browser-seed\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
+  // HARNESS-14 — controllable server clock: advance/freeze/resume/reset the
+  // shared server clock from one serial spec, deterministic fixture-timer
+  // ordering (idle cleanup) with zero wall sleeps, and the normal-build
+  // absence proof. Legacy is a true parity control (identical surface).
+  /harness-14-server-clock\.spec\.ts$/,
+  // HARNESS-04 — multi-provider session corpus builder contract: fixture-only
+  // manifest/hash proof + legacy-open session-directory semantics + sidebar
+  // spot-check. The server leg pins kind:'legacy' under both projects (Rust
+  // indexing of this corpus is owed by later SESSION-* items).
+  /harness-04-session-corpus\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
   // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
   // categories (settings, session, terminal, browser-pane, multi-client).
@@ -23,6 +41,20 @@ export const MATRIX_SPECS = [
   /browser-pane\.spec\.ts$/,
   /multi-client\.spec\.ts$/,
   /session-directory-matrix\.spec\.ts$/,
+  // SESSION-16 — malformed/partial provider-data tolerance: quarantine classes never
+  // render, tolerated classes (valid-prefix truncation, invalid UTF-8) do, and a
+  // completed partial record lands as exactly one live addition. Runs against BOTH
+  // server kinds (legacy is the behavioral control — incl. the amplifier legs, wired
+  // since the provider exists on this base). Deferred-policy probe spec; see
+  // docs/plans/df1-evidence/SESSION-16.md for the per-leg probe classification.
+  /session-malformed-data\.spec\.ts$/,
+  // SESSION-13 — server-wide first-chat exclusion controls: edit both knobs via
+  // the real Settings UI in profile A, exact sidebar membership across providers
+  // (claude/codex/amplifier + the firstUserMessage-less opencode control) in A
+  // AND a fresh isolated profile B, then reload + server restart persistence.
+  // Deferred-with-probe policy spec; per-leg probe classification lives in
+  // docs/plans/df1-evidence/SESSION-13.md.
+  /session-13-first-chat-exclusions\.spec\.ts$/,
   // Bulletproof-restore acceptance suite: terminal reload/restart, FreshCodex
   // reload (no new session minted), historical session open (pane title +
   // non-blank content), and mid-life exit surfacing. Restore is a core
@@ -51,6 +83,12 @@ export const MATRIX_SPECS = [
   // kinds. See term13-scrollback-boundary.spec.ts.
   /term13-scrollback-boundary\.spec\.ts$/,
   /ws-ping-pong-matrix\.spec\.ts$/,
+  // BROWSER-01 — same-origin HTTP reverse proxy: CSP/XFO fixture renders in a
+  // Browser pane, frameLocator GET/POST/streaming, exact upstream inputs
+  // (raw path+query, urlencoded body, cookie auth) + visible responses.
+  // Legacy is a true parity control (identical contract). See
+  // specs/browser01-proxy.spec.ts and docs/plans/df1/BROWSER-01.md.
+  /browser01-proxy\.spec\.ts$/,
   // SYNC-06 -- resume-by-id parity: the pinned sidebar Resume button and the
   // paste-then-Enter resume path against BOTH servers (POST /api/sessions/resolve
   // + sessionResolve flag now exist on the Rust server too, with the hardened
@@ -79,6 +117,50 @@ export const MATRIX_SPECS = [
   // checkpoint routes and the fresh-agent checkpoint UI are shared code
   // paths, not a Rust-only feature. See agent-checkpoint-rewind.spec.ts.
   /agent-checkpoint-rewind\.spec\.ts$/,
+  // SESSION-05 -- project colors on History project headers: real color
+  // gesture in one browser, broadcast-driven update in a second context,
+  // reload/restart persistence, unrelated project unchanged. Legacy is a
+  // true parity control (same additive page `projectColors` channel on
+  // both servers). See project-colors-matrix.spec.ts.
+  /project-colors-matrix\.spec\.ts$/,
+  // HARNESS-05 — raw HTTP/WS clients self-verify: deterministic echo/error
+  // fixture legs + capability legs (delayed hello, malformed-frame
+  // termination, slow-consumer pause, raw orchestration REST) against BOTH
+  // server kinds. See docs/plans/df1/HARNESS-05.md.
+  /harness-05-raw-clients\.spec\.ts$/,
+  // HARNESS-06 -- deterministic misc-fixture smoke (HTTP/WS/hot-reload
+  // target, file/SMB trees, fake editor, fake Gemini, fake Kilroy runtime,
+  // signed update feed, trusted HTTPS). Server-kind-agnostic: the spec
+  // requests only Playwright base fixtures (the worker-lazy `testServer`
+  // never boots), so it runs identically under all three projects. See
+  // harness-06-misc-fixtures.spec.ts + docs/plans/df1-evidence/HARNESS-06.md.
+  /harness-06-misc-fixtures\.spec\.ts$/,
+  // TERM-04 — terminal.create requestId dedupe (retry/reconnect/lost-reply/
+  // two-clients → one PTY/one terminalId/one pane owner/one fixture launch).
+  // Serviced by BOTH server kinds (legacy's server-global
+  // `createdTerminalByRequestId` settled cache is the parity source), so
+  // legacy-chromium runs as a true parity control; the default `chromium`
+  // match-all project also picks it up (with the fixture-default legacy
+  // server) — browser-independent content, standard for MATRIX_SPECS. See
+  // docs/plans/df1-evidence/TERM-04.md.
+  /terminal-create-dedupe\.spec\.ts$/,
+  // HARNESS-12 — leak/resource measurement gate: a bounded create/send/close
+  // loop + restart + stop must return to a bounded baseline (no listening-port,
+  // fd-handle, process, RSS, or socket-queue leaks) on BOTH server kinds; the
+  // collector logic itself is unit-tested fixture-driven in
+  // helpers/leak-metrics.test.ts. See leak-metrics.spec.ts and
+  // docs/plans/df1-evidence/HARNESS-12.md.
+  /leak-metrics\.spec\.ts$/,
+  // AUTO-01 — ui.layout.sync authoritative: visible-UI-driven mutations read
+  // back exactly through /api/layout/snapshot (+ raw-frame normalization
+  // leg). Legacy is a true parity control (identical LayoutStore semantics).
+  // The default `chromium` match-all project also picks it up (fixture-
+  // default legacy server): test 2 re-asserts its synthetic ui.layout.sync
+  // per poll iteration because the store is whole-snapshot last-write-wins
+  // and the page's real client mirror keeps syncing — so all three projects
+  // are deterministic. Authored under the df1 deferred-Playwright policy; see
+  // docs/plans/df1-evidence/AUTO-01.md.
+  /layout-sync-authoritative\.spec\.ts$/,
   // Task 21 (naming-persistence sweep) -- cross-surface title convergence
   // (pane header / sidebar / History / Overview / automation PATCH renames
   // must converge on both surfaces). Pins EDEV-09; the client fixes are
@@ -89,6 +171,8 @@ export const MATRIX_SPECS = [
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
+// Exported (no behavior change) so test/e2e-browser/playwright.gate01.config.ts
+// (GATE-01) can testIgnore the SAME array instead of drifting a copy.
 export const RUST_ONLY_SPECS = [
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
@@ -171,6 +255,12 @@ export const RUST_ONLY_SPECS = [
   /freshclaude-identity-persistence-rust\.spec\.ts$/,
   // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
   /opencode-rebind-rust\.spec\.ts$/,
+  // CFG-01 — lossless config.json writes: seed-sentinels/deep-compare per
+  // writer. Rust-only: the acceptance is PW-RUST and the Rust writer is a
+  // deliberate strict superset of legacy (legacy's normalization rebuild
+  // drops sibling serverSecrets; Rust preserves them). See
+  // specs/cfg01-lossless-writes.spec.ts and docs/plans/df1-evidence/CFG-01.md.
+  /cfg01-lossless-writes\.spec\.ts$/,
   // Task 21 -- auto-title pipeline + settings split boot OWNED RustServers
   // directly (per-test fake-Gemini seams / restart legs), so they only ever
   // run under the rust-chromium project.
@@ -378,6 +468,11 @@ export default defineConfig({
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
         // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
         /opencode-rebind-rust\.spec\.ts$/,
+        // CFG-01 — lossless config.json writes: seed sentinels + deep-compare
+        // after every writer action/restart. Rust-only (superset guarantee —
+        // see RUST_ONLY_SPECS entry + the spec's doc comment). Authored under
+        // the df1 deferred-Playwright policy; see docs/plans/df1-evidence/CFG-01.md.
+        /cfg01-lossless-writes\.spec\.ts$/,
         // Sidebar opencode rail fixes (Bug 1 + Bug 2): runs in BOTH matrix
         // projects — Node parity is part of the fix.
         /sidebar-opencode-rail\.spec\.ts$/,

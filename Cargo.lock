@@ -1298,6 +1298,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-extensions"
+version = "0.1.0"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [
@@ -1310,6 +1319,7 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1358,6 +1368,7 @@ dependencies = [
  "dotenvy",
  "freshell-api",
  "freshell-codex",
+ "freshell-extensions",
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",

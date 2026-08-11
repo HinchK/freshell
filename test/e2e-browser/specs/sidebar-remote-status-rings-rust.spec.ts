@@ -272,10 +272,8 @@ async function expectNoRemoteStatusRing(row: ReturnType<typeof seededRow>): Prom
 
 async function expectRing(row: ReturnType<typeof seededRow>, kind: 'busy' | 'open', timeoutMs = 30_000): Promise<void> {
   await expect(row).toHaveAttribute('data-remote-status', kind, { timeout: timeoutMs })
-  // The icon ring span (aria-hidden, rounded-full) carries the color class.
-  const ringSpan = kind === 'busy'
-    ? row.locator('span[aria-hidden="true"].rounded-full.border-blue-500')
-    : row.locator('span[aria-hidden="true"].rounded-full.border-success')
+  // The icon ring span (aria-hidden, carries the ring color class).
+  const ringSpan = row.locator(`span[data-remote-status-ring="${kind}"]`)
   await expect(ringSpan).toHaveCount(1)
 }
 

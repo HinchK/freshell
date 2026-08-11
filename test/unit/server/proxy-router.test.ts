@@ -82,6 +82,12 @@ describe('createProxyRouter', () => {
         res.set('X-Custom-Header', 'keep-me')
         res.send('no frame headers')
       })
+      targetApp.get('/capture-headers', (req, res) => {
+        res.json({
+          cookie: req.headers.cookie ?? null,
+          xAuthToken: req.headers['x-auth-token'] ?? null,
+        })
+      })
       targetServer = await new Promise((resolve) => {
         const server = targetApp.listen(0, '127.0.0.1', () => resolve(server))
       })
@@ -105,6 +111,23 @@ describe('createProxyRouter', () => {
 
       expect(res.status).toBe(200)
       expect(res.text).toBe('hello from target')
+    })
+
+    // Wrap-review r3 security pin (both servers): the proxy gate's own
+    // credentials never reach the upstream; the app's own cookies do.
+    it('withholds Freshell gate credentials but forwards app cookies', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/capture-headers`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .set('cookie', `freshell-auth=${TEST_AUTH_TOKEN}; app-cookie=kept`)
+
+      expect(res.status).toBe(200)
+      expect(res.body.xAuthToken).toBeNull()
+      expect(res.body.cookie).toBe('app-cookie=kept')
     })
 
     it('proxies deep paths', async () => {

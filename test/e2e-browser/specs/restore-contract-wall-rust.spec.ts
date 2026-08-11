@@ -39,6 +39,12 @@ import { fileURLToPath } from 'node:url'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
+// RESTORE-01: the contract wall ASSERTS the recovery panel's own behavior at
+// boot (e.g. the SIGKILL-within-5s leg below), and its tests use the default
+// `page` fixture — the harness auto-decline watcher (fixtures.js `context`
+// override) must not race those assertions.
+test.use({ recoveryOfferHandling: 'manual' })
+
 const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode-terminal.mjs')
 const FAKE_OPENCODE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')

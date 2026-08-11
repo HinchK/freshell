@@ -146,6 +146,17 @@ test.describe('Sidebar Click Resume', () => {
     //     restart leg, and `crates/freshell-ws/tests/codex_session_ref_resume.rs`).
     test.fixme(e2eServerKind === 'legacy', 'Legacy leg only -- see the legacy-chromium DISCOVERED finding above (frozen server/ tree settles this create into status:error).')
 
+    // GATE-01 (2026-08-09): rust leg regressed on the df1/integration tip —
+    // the sidebar click-resume settles with `content.terminalId` null (20 s
+    // expect.poll at :244 times out), the SAME failure family as
+    // codex-terminal-bounce-rust.spec.ts (also pinned this gate). Red in
+    // slice-7 AND isolated rerun reproof-s7-sideclick. Owner: TERM-22.
+    // Pin masks assertions after :244 (B001: un-pin must re-verify all).
+    test.fail(
+      e2eServerKind === 'rust',
+      'TERM-22: sidebar codex click-resume never assigns terminalId (GATE-01 2026-08-09; same family as codex-terminal-bounce)',
+    )
+
     const CODEX_SESSION_ID = 'codex-click-resume-0001'
     const SESSION_TITLE = 'sidebar-click-resume codex session'
 

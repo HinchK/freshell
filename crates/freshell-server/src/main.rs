@@ -29,11 +29,13 @@ mod extensions;
 mod files;
 mod identity_sink;
 mod instance_id;
+mod legacy_local_seed;
 mod logging;
 mod managed_ports;
 mod migrations;
 mod net_bind;
 mod network;
+mod project_colors;
 mod proxy;
 mod rate_limit;
 mod recovery_inventory;
@@ -51,6 +53,9 @@ mod settings_store;
 mod shutdown_forensics;
 mod tabs_snapshots;
 mod terminals;
+#[cfg(test)]
+pub(crate) mod test_clock_gate;
+mod test_clock_router;
 mod updater;
 
 use std::net::IpAddr;
@@ -168,13 +173,28 @@ async fn main() -> ExitCode {
     let port = resolve_port();
     let home = resolve_home();
 
+    // The app version string, resolved ONCE here (before logging init, which
+    // stamps it onto every line) and shared (Arc::clone) into BOTH
+    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`),
+    // so the two endpoints can never disagree. Overridable via
+    // `FRESHELL_APP_VERSION`. Pure env read + constant -- no dependency on
+    // anything built later, so it is safe to resolve this early.
+    let app_version =
+        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
+
     // DIAG-01/DIAG-03: structured JSONL logging to
     // `<home>/.freshell/logs/rust-server.jsonl`, redacted from the first
     // byte (the live AUTH_TOKEN is the ONE secret this process itself
-    // knows verbatim). A failure here (e.g. an unwritable log dir) must
-    // never prevent boot -- the pre-existing stderr "listening on" line
-    // below still gets the operator to a running server either way.
-    let logging_config = logging::resolve_config(home.as_deref(), auth_token.as_str().to_string());
+    // knows verbatim) and stamped per-line with the app version + server
+    // pid (DIAG-01's app-version / process-ownership fields). A failure
+    // here (e.g. an unwritable log dir) must never prevent boot -- the
+    // pre-existing stderr "listening on" line below still gets the
+    // operator to a running server either way.
+    let logging_config = logging::resolve_config(
+        home.as_deref(),
+        auth_token.as_str().to_string(),
+        app_version.as_str().to_string(),
+    );
     if let Err(err) = logging::init(logging_config) {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
@@ -224,12 +244,6 @@ async fn main() -> ExitCode {
     // changed `bootId` on reconnect means the server restarted), never by
     // `server_instance_id`.
     let boot_id = Arc::new(format!("boot-{}", Uuid::new_v4()));
-
-    // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
-    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`), so
-    // the two endpoints can never disagree. Overridable via `FRESHELL_APP_VERSION`.
-    let app_version =
-        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
 
     // The server-start timestamp, captured once here as an ISO-8601 string
     // (millisecond precision + `Z`, matching JS `Date.toISOString()` in
@@ -439,7 +453,16 @@ async fn main() -> ExitCode {
     // or lowered it from the default had no effect). See
     // `freshell_ws::spawn_idle_monitor` for the periodic sweep this feeds.
     registry.set_auto_kill_idle_minutes(settings.safety.auto_kill_idle_minutes);
-    freshell_ws::spawn_idle_monitor(registry.clone(), std::time::Duration::from_secs(30));
+    // HARNESS-14: under the env-gated test clock the sweep cadence shrinks
+    // to 250ms so tests observe an advanced clock promptly (the sweep still
+    // ticks on real time; only the threshold math follows the virtual one).
+    // Production (gate off) keeps the legacy 30s cadence exactly.
+    let idle_sweep_interval = if freshell_platform::clock::enabled() {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_secs(30)
+    };
+    freshell_ws::spawn_idle_monitor(registry.clone(), idle_sweep_interval);
     // e2e knob (kata znhn item 2): sub-second flap cycles would trip the
     // registry generation cap (3 per 30s liveness window) before the hub's
     // circuit breaker can ever fire. Production default unchanged.
@@ -932,8 +955,16 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
-        boot_id,
+        // Shared (not moved) so the DIAG-01 `server.started` lifecycle event
+        // (emitted after the listener binds, below) can log the SAME boot id.
+        boot_id: Arc::clone(&boot_id),
         settings: Arc::clone(&settings),
+        // CFG-12: the /ws handshake's `settings.updated` resolves the LIVE
+        // store per connection (legacy parity: per-connection
+        // `handshakeSnapshotProvider` -> `configStore.getSettings()`), so a
+        // PATCH committed after boot reaches the next (re)connecting client.
+        // `settings` above stays the boot-frozen create-time view (CFG-06).
+        handshake_settings: settings_store.shared_settings_lock(),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
@@ -1394,7 +1425,7 @@ async fn main() -> ExitCode {
     // derivation of these defaults and the deliberate global-vs-per-IP scope
     // decision).
     let rate_limiter =
-        rate_limit::RateLimiter::new_system(rate_limit::RateLimitConfig::default_api());
+        rate_limit::RateLimiter::new_gate_aware(rate_limit::RateLimitConfig::default_api());
 
     // DIAG-05: `/api/server-info`, `/api/debug`, `/api/perf` -- shares the
     // live settings store, terminal registry, tabs registry, and session
@@ -1494,6 +1525,16 @@ async fn main() -> ExitCode {
             gemini: gemini.clone(),
             index: sessions_state_index,
         }))
+        .merge(project_colors::router(project_colors::ProjectColorsState {
+            auth_token: Arc::clone(&auth_token),
+            settings: settings_store.clone(),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            // SESSION-05: a project-color write broadcasts `sessions.changed`
+            // on the SAME unified revision sequence as the override-write/
+            // sweep producers (the sweep is structurally blind to this
+            // config-only change; see `sessions::SessionsState::sessions_revision`).
+            sessions_revision: Arc::clone(&sessions_revision),
+        }))
         .merge(resolve::router(resolve::ResolveState {
             auth_token: Arc::clone(&auth_token),
             // SYNC-06 deleted-override filter: the SAME settings store the
@@ -1592,6 +1633,15 @@ async fn main() -> ExitCode {
         .merge(terminals::router(terminals_state))
         .merge(proxy::router(proxy_state))
         .merge(screenshots::router(screenshots_state))
+        // HARNESS-14: the test-clock control surface exists ONLY when
+        // `FRESHELL_TEST_CLOCK` enabled the clock at boot (and its handlers
+        // re-check the gate, so even a misplaced merge could never expose
+        // it). A normal build answers 404 like any unmatched `/api/*`.
+        .merge(test_clock_router::router(
+            test_clock_router::TestClockState {
+                auth_token: Arc::clone(&auth_token),
+            },
+        ))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
             move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
@@ -1659,6 +1709,22 @@ async fn main() -> ExitCode {
             &diag::iso8601_utc(now_secs),
         )
     );
+    // DIAG-01 lifecycle context: the ONE authoritative STRUCTURED boot
+    // record (the stderr line above is for terminal tails; this event is
+    // what log parses key on). `app_version`/`server_pid` are stamped on
+    // every line by the logging layer, so the boot record carries the
+    // per-installation identity (`instance_id`, CFG-07), the per-boot
+    // restart signal (`boot_id`), and build provenance (`commit`/`dirty`,
+    // the same values `GET /api/server-info` reports).
+    tracing::info!(
+        bind = %boot_ip,
+        port,
+        boot_id = %boot_id.as_str(),
+        instance_id = %server_instance_id.as_str(),
+        commit = diag::build_commit(),
+        dirty = diag::build_dirty_str(),
+        "server.started"
+    );
 
     // Block until SIGTERM/SIGINT (the same graceful-shutdown trigger the old
     // `axum::serve(...).with_graceful_shutdown(...)` used), then drain the
@@ -1718,6 +1784,13 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    // DIAG-01 lifecycle context: the terminal "we are done" marker. Every
+    // owner above has run (WS drain, registry kill_all, all three fresh-agent
+    // sidecar reapers, the codex launch manager); the logging writer flushes
+    // synchronously per line, so this line is guaranteed on disk before the
+    // process exits -- the DIAG-03 "final shutdown event is flushed" clause
+    // holds by construction here.
+    tracing::info!("server.stopped");
     ExitCode::SUCCESS
 }
 
@@ -1774,6 +1847,11 @@ async fn shutdown_signal(
         _ = terminate => "SIGTERM",
         _ = hangup => "SIGHUP",
     };
+
+    // DIAG-01 lifecycle context: the clean "we are going down" marker, FIRST
+    // (before the drain below), so a log tail always answers "did this
+    // server stop intentionally, and on which signal".
+    tracing::info!(signal = signal_name, "server.stopping");
 
     // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
     // creates consult this flag around registry.create.

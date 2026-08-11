@@ -48,19 +48,44 @@ GCP_REGION="${FRESHELL_GCP_REGION:-us-west1}"
 GCP_REPO="${FRESHELL_GCP_REPO:-freshell-e2e}"
 GCP_JOB="${FRESHELL_GCP_JOB:-freshell-e2e}"
 
-IMAGE_LOCAL="freshell-e2e:latest"
-IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+IMAGE_NAME="freshell-e2e"
+IMAGE_LOCAL="${IMAGE_NAME}:latest"
+IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:latest"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
-# Docker when pushing to Artifact Registry).
-if command -v gcloud &>/dev/null; then
-  GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
-  if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
-    export PATH="$GCLOUD_BIN:$PATH"
+# Commit-addressed image tag (wrap-review r3): a cloud run must execute the
+# code at the CURRENT HEAD — with only a mutable :latest tag, `run` would
+# happily execute whatever source was last pushed and the "cloud e2e gate"
+# could pass against STALE code. `:latest` is still built/pushed (human
+# convenience pointer + layer-cache anchor) but the run path never uses it.
+# A dirty tree gets a non-addressable `-dirty` SENTINEL tag so a build of
+# uncommitted code can never masquerade as the clean commit (untracked files
+# count as dirty — the image bakes the working tree); `-dirty` tags are not
+# content-addressable, so the run path ALWAYS rebuilds on a dirty tree
+# instead of reusing a stale `-dirty` image (wrap-review r4).
+image_tag_for_head() {
+  local sha
+  sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    sha="${sha}-dirty"
   fi
+  echo "$sha"
+}
+
+# Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
+# Docker when pushing to Artifact Registry). Guarded: local runs, `help`,
+# and machines without gcloud must get past this section — a failing
+# `gcloud info` inside a bare assignment's command substitution would trip
+# `set -e` before ANY subcommand dispatch (a silent 127 with stderr
+# suppressed). Only the cloud paths below actually require gcloud.
+GCLOUD_SDK_ROOT=""
+if command -v gcloud >/dev/null 2>&1; then
+  GCLOUD_SDK_ROOT="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null || true)"
+fi
+if [ -n "$GCLOUD_SDK_ROOT" ] && [ -d "$GCLOUD_SDK_ROOT/bin" ] && ! echo "$PATH" | grep -q "$GCLOUD_SDK_ROOT/bin"; then
+  export PATH="$GCLOUD_SDK_ROOT/bin:$PATH"
 fi
 
 # ---------------------------------------------------------------------------
@@ -142,23 +167,28 @@ cmd_build() {
     esac
   done
 
-  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+  # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
+  local tag remote_base
+  tag="$(image_tag_for_head)"
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
 
   if $local_build; then
-    echo "[e2e-cloud] Building Docker image locally..."
-    docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
-    echo "[e2e-cloud] Image built: $IMAGE_LOCAL"
+    echo "[e2e-cloud] Building Docker image locally (tag: $tag)..."
+    docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+      -t "$IMAGE_LOCAL" \
+      -t "${IMAGE_NAME}:${tag}" \
+      "$ROOT"
+    echo "[e2e-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
     cmd_push
   else
-    echo "[e2e-cloud] Building Docker image via Cloud Build..."
+    echo "[e2e-cloud] Building Docker image via Cloud Build (tag: $tag)..."
     gcloud builds submit \
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
       --account="$GCP_ACCOUNT" \
       --project="$GCP_PROJECT" \
-      --substitutions=_IMAGE="$IMAGE_REMOTE" \
+      --substitutions=_IMAGE="${remote_base}:${tag}" \
       "$ROOT"
-    echo "[e2e-cloud] Cloud Build complete: $IMAGE_REMOTE"
+    echo "[e2e-cloud] Cloud Build complete: ${remote_base}:${tag}"
   fi
 }
 
@@ -181,9 +211,19 @@ cmd_push() {
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
-  docker tag "$IMAGE_LOCAL" "$IMAGE_REMOTE"
-  docker push "$IMAGE_REMOTE"
-  echo "[e2e-cloud] Pushed: $IMAGE_REMOTE"
+  # Push BOTH refs explicitly: the commit-addressed tag (what `run`
+  # resolves) and :latest (human convenience pointer + cache anchor; `run`
+  # never consumes it). Never read the mutable $IMAGE_REMOTE global here —
+  # the standalone `push` subcommand path still has it at :latest while the
+  # run path has repointed it at the HEAD tag.
+  local tag remote_base
+  tag="$(image_tag_for_head)"
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:latest"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:${tag}"
+  docker push "${remote_base}:${tag}"
+  docker push "${remote_base}:latest"
+  echo "[e2e-cloud] Pushed: ${remote_base}:${tag} (+ ${remote_base}:latest)"
 }
 
 # ---------------------------------------------------------------------------
@@ -251,6 +291,38 @@ cmd_run() {
     esac
   done
 
+  # Normalize split-form Playwright value flags ("--grep foo" ->
+  # "--grep=foo") BEFORE either backend consumes pw_args. The cloud path
+  # serializes the args one per line and the container entrypoint
+  # classifies entries by shape (dash-prefixed => flag, else positional
+  # spec filter), which is only correct when every value-carrying flag is
+  # a SINGLE token: a split-form value would be reclassified as a spec
+  # filter and silently REORDERED behind the remaining flags
+  # ("--project chromium --grep 'auth modal'" became
+  # "--project --grep chromium 'auth modal'"). Playwright binds =form
+  # identically to split form, so local runs are unaffected. Only the
+  # documented value-taking flags are rewritten; boolean switches and the
+  # optional-value --update-snapshots are never split-form here.
+  local -a value_flags=(--grep --grep-invert --project --reporter --retries --workers --timeout --global-timeout --max-failures --repeat-each --output)
+  local -a normalized=()
+  local i arg vf matched
+  for ((i = 0; i < ${#pw_args[@]}; i++)); do
+    arg="${pw_args[i]}"
+    matched=false
+    for vf in "${value_flags[@]}"; do
+      if [ "$arg" = "$vf" ] && [ $((i + 1)) -lt ${#pw_args[@]} ]; then
+        normalized+=("$vf=${pw_args[i + 1]}")
+        i=$((i + 1))
+        matched=true
+        break
+      fi
+    done
+    if [ "$matched" = false ]; then
+      normalized+=("$arg")
+    fi
+  done
+  pw_args=("${normalized[@]}")
+
   # Resolve backend: explicit flags override env var; env var defaults to local.
   if $cloud_mode; then
     local_mode=false
@@ -270,8 +342,13 @@ cmd_run() {
       "${pw_args[@]}"
   fi
 
-  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+  # Recompute the remote ref with potentially overridden GCP settings —
+  # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
+  # job must run THIS HEAD's code or fail loudly, never pass on a stale
+  # image.
+  local image_tag
+  image_tag="$(image_tag_for_head)"
+  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
 
   # Cloud mode
   if $force_build; then
@@ -280,13 +357,26 @@ cmd_run() {
     else
       cmd_build
     fi
-  fi
-
-  # Ensure image exists in remote registry
-  if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
+  elif [[ "$image_tag" == *-dirty ]]; then
+    # A dirty tree has NO addressable content: a stored `<sha>-dirty` tag can
+    # only ever name whatever the FIRST dirty build contained, so reusing it
+    # would silently run stale source (wrap-review r4). Always rebuild+push;
+    # docker's layer cache keeps an unchanged tree cheap.
+    echo "[e2e-cloud] Dirty worktree — rebuilding the image (uncommitted tree has no addressable tag)..."
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
+  elif ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
       --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
-    echo "[e2e-cloud] Remote image not found, building and pushing..."
-    cmd_build
+    # Clean tree: the HEAD tag genuinely addresses this image's content.
+    echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
   fi
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
@@ -298,11 +388,22 @@ cmd_run() {
   # Build a YAML env-vars file for the Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
   # --set-env-vars splits on spaces, breaking PLAYWRIGHT_ARGS.
+  # PLAYWRIGHT_ARGS is NEWLINE-delimited (one arg per line, YAML literal
+  # block scalar) so args CONTAINING spaces (e.g. --grep "foo bar") or YAML
+  # metacharacters survive verbatim — a space-joined quoted scalar would be
+  # re-split on spaces by the entrypoint and quotes could corrupt the YAML.
   # Note: CLOUD_RUN_TASK_COUNT and CLOUD_RUN_TASK_INDEX are reserved env vars
   # set automatically by Cloud Run when --tasks > 1 — do NOT set them here.
   local env_file
   env_file=$(mktemp /tmp/e2e-env-vars.XXXXXX.yaml)
-  echo "PLAYWRIGHT_ARGS: \"${pw_args[*]}\"" > "$env_file"
+  if [ "${#pw_args[@]}" -gt 0 ]; then
+    {
+      echo "PLAYWRIGHT_ARGS: |-"
+      printf '  %s\n' "${pw_args[@]}"
+    } > "$env_file"
+  else
+    echo 'PLAYWRIGHT_ARGS: ""' > "$env_file"
+  fi
 
   # Create or update the Cloud Run Job (create fails if it already exists,
   # fall back to update).
@@ -336,7 +437,10 @@ cmd_run() {
 
   # Extract the execution ID from the execute output (format: "Execution NAME")
   local execution_id
-  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1)
+  # (`|| true`: grep no-match must not kill set -eo pipefail before the
+  # fall-back latest-execution lookup; real gcloud prints "Execution NAME ...",
+  # stubs/minimal CLIs may print nothing.)
+  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1 || true)
   if [ -z "$execution_id" ]; then
     # Fallback: query the latest execution (may race with concurrent agents)
     echo "[e2e-cloud] WARNING: could not capture execution ID, falling back to latest"
@@ -393,10 +497,16 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
+  # `logs read` takes an EXECUTION name, not the job name — resolve the
+  # latest execution exactly like cmd_run does before fetching its logs.
   local execution_id
-  execution_id=$(gcloud run jobs executions list $(gcloud_flags) --job="$GCP_JOB" --sort-by="~metadata.creationTimestamp" --format="value(name)" --limit=1)
+  execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
+    --job="$GCP_JOB" \
+    --sort-by="~metadata.creationTimestamp" \
+    --format="value(name)" \
+    --limit=1)
   if [ -z "$execution_id" ]; then
-    echo "[e2e-cloud] No executions found for job $GCP_JOB"
+    echo "[e2e-cloud] No executions found for job $GCP_JOB" >&2
     exit 1
   fi
   gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" "$@"

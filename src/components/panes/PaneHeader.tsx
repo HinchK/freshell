@@ -7,6 +7,7 @@ import type { PaneContent } from '@/store/paneTypes'
 import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { useAppSelector } from '@/store/hooks'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
@@ -124,6 +125,7 @@ export default function PaneHeader({
           ? 'bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30'
           : isActive ? 'bg-muted' : 'bg-muted/50 text-muted-foreground'
       )}
+      data-context={ContextIds.PaneHeader}
       onDoubleClick={isRenaming ? undefined : onDoubleClick}
       role="banner"
       aria-label={`Pane: ${title}`}

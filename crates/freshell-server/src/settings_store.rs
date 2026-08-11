@@ -77,6 +77,18 @@ pub struct SettingsStore {
     session_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The `terminal_overrides` analog of `session_overrides_dirty`.
     terminal_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `config.projectColors` (`config-store.ts:66, 549-562`): per-project
+    /// path → CSS color string map the `PUT /api/project-colors` route
+    /// writes (legacy `setProjectColor`) and the session-directory read
+    /// model embeds in each page (legacy `getProjectColors`). std `Mutex`
+    /// (not tokio) so the sync `persist` path can snapshot it (same as the
+    /// override maps above).
+    project_colors: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
+    /// The `project_colors` analog of `session_overrides_dirty`: color
+    /// keys written via [`SettingsStore::set_project_color`] THIS boot
+    /// always win over disk; keys never touched defer to disk (side-by-side
+    /// bake-in: the legacy Node server writing the same `config.json`).
+    project_colors_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Throttled mtime-check state backing the freshness reload
     /// (`maybe_reload_overrides`) on the override READ path
     /// (`session_overrides()`/`terminal_overrides()`).
@@ -100,6 +112,14 @@ pub struct SettingsStore {
     /// fields, no heap data) -- matches the struct's own "Cheap to clone"
     /// contract, so no `Arc` wrapper is needed.
     config_fallback: Option<ConfigFallback>,
+    /// CFG-04: the boot-extracted/merged `legacyLocalSettingsSeed`
+    /// (`crate::legacy_local_seed`), served ONLY via `/api/bootstrap`
+    /// (`boot.rs`) and written to (or removed from) `config.json` on every
+    /// persist. Computed once during [`SettingsStore::load`] and never
+    /// mutated afterwards — mirroring the legacy `ConfigStore`'s cached copy
+    /// (`config-store.ts:337-347,459-462`) — so it needs no lock and is
+    /// cloned out per request, like `config_fallback`.
+    legacy_local_settings_seed: Option<Value>,
 }
 
 /// Throttle + change-detection state for [`SettingsStore::maybe_reload_overrides`].
@@ -177,6 +197,19 @@ impl SettingsStore {
         }
         let mut settings = load_full_settings(home);
 
+        // CFG-04: extract + merge the legacy local-settings seed from the raw
+        // document (`config-store.ts#loadInternal`: local-only keys move out
+        // of `settings` into a top-level `legacyLocalSettingsSeed`; a stored
+        // seed wins on conflict but merges with freshly-extracted strays).
+        // This runs AFTER `maybe_restore_config_from_backup`, so the read
+        // below sees the same recovered document as every other tolerant
+        // loader. `seed_normalization_persist` is the seed-scoped half of the
+        // original's `shouldPersistNormalizedConfig` (config-store.ts:364-366):
+        // true when local keys were stripped out of `settings`, or the merged
+        // seed differs from the raw stored key (incl. garbage → removal).
+        let (legacy_local_settings_seed, seed_normalization_persist) =
+            load_legacy_local_settings_seed(home);
+
         // (1) Legacy default-enabled migration (`settings-migrate.ts:17-49`).
         let mut migrated_legacy = false;
         {
@@ -246,6 +279,7 @@ impl SettingsStore {
         let codex_display_id_secret = load_or_mint_codex_display_id_secret(home);
         let terminal_overrides = load_terminal_overrides(home);
         let session_overrides = load_session_overrides(home);
+        let project_colors = load_project_colors(home);
         let store = Self {
             inner: Arc::new(RwLock::new(settings.clone())),
             home: home.map(|p| Arc::new(p.to_path_buf())),
@@ -253,16 +287,19 @@ impl SettingsStore {
             codex_display_id_secret: Arc::new(codex_display_id_secret),
             terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
             session_overrides: Arc::new(std::sync::Mutex::new(session_overrides)),
+            project_colors: Arc::new(std::sync::Mutex::new(project_colors)),
             // Nothing is dirty yet at boot -- every key we just loaded came
             // straight from disk, so it defers to disk until THIS process
             // actually patches it.
             session_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             terminal_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
+            project_colors_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
             reload_throttle_window: std::time::Duration::from_secs(1),
             config_fallback,
+            legacy_local_settings_seed,
         };
-        if needs_persist {
+        if needs_persist || seed_normalization_persist {
             // GAP2 legacy parity (`config-store.ts:367-374`): a failed
             // BOOT-time normalization/seed-migration persist logs a warning
             // and keeps running on the in-memory value -- there is no HTTP
@@ -285,6 +322,20 @@ impl SettingsStore {
         self.inner.read().await.clone()
     }
 
+    /// CFG-12: share the ONE live settings tree by lock so the `/ws`
+    /// connect handshake (`freshell_ws::WsState::handshake_settings` →
+    /// `build_handshake_with_capabilities`) resolves CURRENT values on every
+    /// connection — the original's per-connection `handshakeSnapshotProvider`
+    /// (`server/index.ts:415-427` awaits `configStore.getSettings()`; the
+    /// frame goes out via `ws-handler.ts:1815-1845`). Because this vends THIS
+    /// store's inner lock (never a copy), a value committed by [`Self::patch`]
+    /// is precisely what the next (re)connecting client's `settings.updated`
+    /// carries — closing the boot-frozen-snapshot gap behind the CFG-12 e2e
+    /// red (a PATCHed `defaultCwd` never reached a second browser context).
+    pub fn shared_settings_lock(&self) -> Arc<RwLock<ServerSettings>> {
+        Arc::clone(&self.inner)
+    }
+
     /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
     /// — the resolve route's unsearched-provider computation and snapshot
     /// provider gate read this (`resolve.rs`). Async because the settings
@@ -303,6 +354,17 @@ impl SettingsStore {
         self.config_fallback.clone()
     }
 
+    /// CFG-04: the boot-extracted `legacyLocalSettingsSeed`
+    /// (`config-store.ts#getLegacyLocalSettingsSeed`, `config-store.ts:459-462`).
+    /// Served ONLY by `/api/bootstrap` — the seed is a bootstrap-time
+    /// migration bridge for fresh browser/WebView profiles, never part of the
+    /// live settings tree, `/api/settings`, or any WS message. Immutable after
+    /// boot (the legacy store likewise never mutates it post-load), so this is
+    /// a plain clone-out accessor.
+    pub fn legacy_local_settings_seed(&self) -> Option<Value> {
+        self.legacy_local_settings_seed.clone()
+    }
+
     /// Deep-merge `patch_body` into the live settings (R1: same handler for
     /// PUT and PATCH), persist to `config.json` (R2), and return the merged
     /// tree. `Err` carries the `(status, body)` to answer with on a validation
@@ -319,16 +381,33 @@ impl SettingsStore {
                 ));
             }
         }
-        if let Some(details) = validate_patch(patch_body, &self.valid_cli_providers) {
+        // The legacy strip/validate/merge stages all operate on private mutable
+        // copies of the request body (`{...value}` spreads in
+        // `stripDeprecatedSettingsPatchAliases`, `normalizeSettingsPatch`),
+        // never the caller's object \u2014 mirror that with one clone up front.
+        let mut patch_body = patch_body.clone();
+        // SESSION-13: `stripDeprecatedSettingsPatchAliases`
+        // (`settings-router.ts:23-36`) runs BEFORE the strict schema, so a
+        // sidebar carrying only the deprecated alias is a no-op, not an
+        // unrecognized-key rejection.
+        strip_deprecated_settings_patch_aliases(&mut patch_body);
+        if let Some(details) = validate_patch(&patch_body, &self.valid_cli_providers) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Invalid request", "details": details }),
             ));
         }
+        // SESSION-13: legacy zod's `z.coerce.boolean()` (validation stage) and
+        // `mergeServerSettings`' `normalizeTrimmedStringList` (merge stage)
+        // both fire before the base tree is touched; normalizing the private
+        // patch copy here is observationally identical, since a PRESENT
+        // sidebar key always REPLACES the base value (`hasOwn` semantics,
+        // `shared/settings.ts:1276-1285`).
+        normalize_sidebar_patch(&mut patch_body);
 
         let guard = self.inner.write().await;
         let mut value = serde_json::to_value(&*guard).unwrap_or_else(|_| json!({}));
-        deep_merge(&mut value, patch_body);
+        deep_merge(&mut value, &patch_body);
         // NOTE: `knownProviders` is regular patchable, persisted state in the
         // original (pinned live 2026-07-12: PATCH `{codingCli:{knownProviders:
         // ["claude"]}}` replaces and persists it); names are validated against
@@ -445,6 +524,20 @@ impl SettingsStore {
             "settings".to_string(),
             serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
         );
+        // CFG-04 owned key: the boot-extracted `legacyLocalSettingsSeed`.
+        // Written from memory when present; REMOVED when `None` — JS parity:
+        // the legacy config object carries `legacyLocalSettingsSeed:
+        // undefined` in that case, and `JSON.stringify` omits `undefined`
+        // object members, so "absent" (never "null") is the legacy on-disk
+        // shape.
+        match &self.legacy_local_settings_seed {
+            Some(seed) => {
+                map.insert("legacyLocalSettingsSeed".to_string(), seed.clone());
+            }
+            None => {
+                map.remove("legacyLocalSettingsSeed");
+            }
+        }
 
         // ADOPT-FROM-DISK MERGE (Batch B hardening): fresh disk read,
         // overlaid with ONLY the keys this process marked dirty. A key
@@ -492,6 +585,29 @@ impl SettingsStore {
             Value::Object(merged_terminal_overrides),
         );
 
+        // `projectColors` gets the SAME adopt-from-disk + dirty-overlay
+        // treatment (SESSION-05): fresh disk read overlaid with only the
+        // color keys THIS process wrote this boot. Pre-SESSION-05 this key
+        // fell through to the passthrough below (`map.entry(...)`), which
+        // preserved it but could never accept a Rust-originated write.
+        let disk_project_colors = map
+            .get("projectColors")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let merged_project_colors = {
+            let memory = self.project_colors.lock().expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            overlay_dirty_keys(disk_project_colors, &memory, &dirty)
+        };
+        map.insert(
+            "projectColors".to_string(),
+            Value::Object(merged_project_colors),
+        );
+
         // `serverSecrets` is overlaid onto whatever was already there (not
         // replaced wholesale), so a sibling secret this store doesn't know
         // about would survive too.
@@ -507,10 +623,12 @@ impl SettingsStore {
         map.insert("serverSecrets".to_string(), Value::Object(secrets));
 
         // Everything else -- `completedMigrations`, `recentDirectories`,
-        // `projectColors`, any unrecognized top-level key -- is left exactly
-        // as loaded above. Only seed the original's first-write defaults
-        // when truly absent (`config-store.ts:356-360`).
-        map.entry("projectColors").or_insert_with(|| json!({}));
+        // any unrecognized top-level key -- is left exactly as loaded
+        // above. Only seed the original's first-write defaults when truly
+        // absent (`config-store.ts:356-360`). (`projectColors` moved out of
+        // this passthrough into the adopt-from-disk overlay above for
+        // SESSION-05; the seed-default-if-absent effect is preserved there:
+        // a fresh disk read of a missing key starts from empty.)
         map.entry("recentDirectories").or_insert_with(|| json!([]));
 
         let text = serde_json::to_string_pretty(&doc)
@@ -582,6 +700,16 @@ impl SettingsStore {
         };
         if !changed {
             return;
+        }
+
+        let disk_colors = load_project_colors(Some(home));
+        {
+            let mut memory = self.project_colors.lock().expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            *memory = overlay_dirty_keys(disk_colors, &memory, &dirty);
         }
 
         let disk_session = load_session_overrides(Some(home));
@@ -866,6 +994,96 @@ impl SettingsStore {
             let _ = self.persist(&settings);
         }
         next
+    }
+
+    /// A snapshot of `config.projectColors` (the `PUT /api/project-colors`
+    /// route writes it; the session-directory read model embeds it in each
+    /// page — `getProjectColors`, `config-store.ts:561-563`). Same
+    /// mtime-checked freshness reload as the override maps (`freshness
+    /// reload` above), so a bake-in partner's color write shows up on the
+    /// next read without a restart.
+    pub fn project_colors(&self) -> serde_json::Map<String, Value> {
+        self.maybe_reload_overrides();
+        self.project_colors
+            .lock()
+            .expect("project colors lock")
+            .clone()
+    }
+
+    /// `configStore.setProjectColor(projectPath, color)`
+    /// (`config-store.ts:549-558`): `projectColors = {...cfg.projectColors,
+    /// [projectPath]: color}` then save. Additive (other paths preserved),
+    /// overwrites an existing path's color, persists the whole config
+    /// atomically, and marks the path dirty for the boot (side-by-side:
+    /// this process's write wins over a concurrent external edit to the
+    /// same path; untouched paths adopt disk values — see
+    /// [`overlay_dirty_keys`]).
+    ///
+    /// Unlike the override patchers, the persist failure surfaces to the
+    /// caller: the legacy route AWAITS the save
+    /// (`project-colors-router.ts:24`, `await configStore.setProjectColor`)
+    /// before responding, so a failed write is a failed request — and an
+    /// axum handler can translate that error, which the original's
+    /// unwrapped express-4 async handler cannot do gracefully.
+    ///
+    /// FAILURE SEMANTICS (legacy parity): `ConfigStore.saveInternal`
+    /// assigns `this.cache = cfg` only AFTER the atomic write succeeds
+    /// (`config-store.ts:424-435`), so a failed persist leaves the legacy
+    /// in-memory map untouched. We must therefore install the new value
+    /// first (the persisted settings tree is derived from the in-memory
+    /// map via [`overlay_dirty_keys`]), but ROLL BACK on failure —
+    /// restoring the prior value and prior dirty-set membership so
+    /// `project_colors()` keeps serving the last-successfully-persisted
+    /// state and the freshness reload can still adopt a later external
+    /// disk edit (a stale dirty mark would tombstone it). The rollback
+    /// only fires while the installed value is still ours: a concurrent
+    /// same-path write that raced us is left alone (last-writer-wins,
+    /// exactly like two Legacy writers). Pinned by
+    /// `set_project_color_rolls_back_in_memory_state_when_persist_fails`.
+    pub async fn set_project_color(&self, path: &str, color: &str) -> std::io::Result<()> {
+        let (prior_value, prior_dirty) = {
+            let all = self.project_colors.lock().expect("project colors lock");
+            let dirty = self
+                .project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock");
+            (all.get(path).cloned(), dirty.contains(path))
+        };
+        {
+            let mut all = self.project_colors.lock().expect("project colors lock");
+            all.insert(path.to_string(), json!(color));
+            self.project_colors_dirty
+                .lock()
+                .expect("project colors dirty lock")
+                .insert(path.to_string());
+        }
+        let settings = self.get().await;
+        match self.persist(&settings) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let mut all = self.project_colors.lock().expect("project colors lock");
+                if all.get(path) == Some(&json!(color)) {
+                    match prior_value {
+                        Some(value) => {
+                            all.insert(path.to_string(), value);
+                        }
+                        None => {
+                            all.remove(path);
+                        }
+                    }
+                    let mut dirty = self
+                        .project_colors_dirty
+                        .lock()
+                        .expect("project colors dirty lock");
+                    if prior_dirty {
+                        dirty.insert(path.to_string());
+                    } else {
+                        dirty.remove(path);
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 }
 
@@ -1334,6 +1552,36 @@ fn load_terminal_overrides(home: Option<&Path>) -> serde_json::Map<String, Value
         .unwrap_or_default()
 }
 
+/// Load `config.projectColors` from `<home>/.freshell/config.json`
+/// (tolerant: any read/parse error or a non-object field degrades to
+/// empty — matching the original's load normalization
+/// `projectColors: existing.projectColors || {}`, `config-store.ts:358`,
+/// and `readConfigFile`'s tolerance). Entries with NON-STRING values are
+/// dropped on load (normalization, not a disk rewrite — the file keeps its
+/// junk until the next persist): the wire schema and the client both model
+/// the map as string-valued (`z.record(z.string(), z.string())` in
+/// `shared/read-models.ts`, `typeof` checks in `normalizeProjects`), so a
+/// hand-edited junk entry must not flow to the session-directory page.
+fn load_project_colors(home: Option<&Path>) -> serde_json::Map<String, Value> {
+    let Some(home) = home else {
+        return serde_json::Map::new();
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return serde_json::Map::new();
+    };
+    let Some(obj) = doc.get("projectColors").and_then(Value::as_object) else {
+        return serde_json::Map::new();
+    };
+    obj.iter()
+        .filter(|(_, v)| v.is_string())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Load `config.sessionOverrides` from `<home>/.freshell/config.json` (tolerant:
 /// any read/parse error or non-object degrades to empty, matching
 /// `config-store.ts#readConfigFile`).
@@ -1377,6 +1625,48 @@ fn load_full_settings(home: Option<&Path>) -> ServerSettings {
     let mut merged = serde_json::to_value(&defaults).unwrap_or_else(|_| json!({}));
     deep_merge(&mut merged, persisted);
     serde_json::from_value(merged).unwrap_or(defaults)
+}
+
+/// CFG-04: replicate the seed half of `config-store.ts#loadInternal`. Reads
+/// the raw `config.json` once (tolerantly — any read/parse failure degrades to
+/// "no seed", like every other loader in this module) and returns:
+///
+/// * the seed itself: `extractLegacyLocalSettingsSeed(rawSettings)` merged
+///   with the stored top-level key via `mergeLocalSettings(extracted,
+///   stored)`-when-stored semantics (`stored` wins on conflict;
+///   `config-store.ts:333-339`). A non-object stored key counts as absent for
+///   the merge but still schedules a normalization persist below, matching the
+///   original's raw-vs-normalized `JSON.stringify` comparison;
+/// * whether the seed machinery requires the boot normalization persist:
+///   `extracted.is_some()` (local keys were inside `settings`, which the typed
+///   `ServerSettings` round-trip strips on the next write — the original's
+///   first `shouldPersistNormalizedConfig` clause, seed-scoped) OR the merged
+///   seed differs from the RAW stored key (`config-store.ts:366`), including
+///   `Some`↔`None` transitions (garbage or un-normalizable stored content gets
+///   dropped from disk).
+fn load_legacy_local_settings_seed(home: Option<&Path>) -> (Option<Value>, bool) {
+    let Some(home) = home else {
+        return (None, false);
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return (None, false);
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return (None, false);
+    };
+
+    let extracted = doc
+        .get("settings")
+        .and_then(crate::legacy_local_seed::extract_legacy_local_settings_seed);
+    let stored_raw = doc.get("legacyLocalSettingsSeed");
+    let stored = stored_raw
+        .filter(|v| v.is_object())
+        .and_then(crate::legacy_local_seed::extract_legacy_local_settings_seed);
+    let merged = crate::legacy_local_seed::merge_legacy_seeds(extracted.as_ref(), stored.as_ref());
+
+    let seed_changed = merged.as_ref() != stored_raw;
+    (merged, extracted.is_some() || seed_changed)
 }
 
 /// Read an existing `serverSecrets.codexDisplayIdSecret` from `config.json`
@@ -1452,6 +1742,12 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
             issues.push(enum_issue(&["panes", "defaultNewPane"], VALID));
         }
     }
+    // SESSION-13: the sidebar patch object (`shared/settings.ts:796-800`
+    // `.strict()`) — between `panes` and `codingCli`, matching the legacy
+    // zod schema's field order for multi-issue patches.
+    if let Some(v) = map.get("sidebar") {
+        validate_sidebar_patch(v, &mut issues);
+    }
     if let Some(cli) = map.get("codingCli") {
         validate_coding_cli_patch(cli, valid_cli_providers, &mut issues);
     }
@@ -1492,6 +1788,115 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
         None
     } else {
         Some(Value::Array(issues))
+    }
+}
+
+/// SESSION-13: the legacy sidebar patch sub-schema
+/// (`buildServerSettingsPatchSchema`, `shared/settings.ts:796-800`):
+/// `{excludeFirstChatSubstrings?: string[], excludeFirstChatMustStart?:
+/// z.coerce.boolean(), autoGenerateTitles?: z.coerce.boolean()}.strict()`.
+/// The two boolean keys are never type-rejected — `z.coerce.boolean()`
+/// accepts ANY JSON value (JS `Boolean()` truthiness), coercion happens in
+/// [`normalize_sidebar_patch`]. Per-field type issues first, then ONE
+/// strict unknown-keys issue carrying all unknown subkeys (mirroring this
+/// module's top-level/`codingCli` ordering convention).
+fn validate_sidebar_patch(sidebar: &Value, issues: &mut Vec<Value>) {
+    let Value::Object(sb) = sidebar else {
+        issues.push(invalid_type_issue("object", &json!(["sidebar"]), sidebar));
+        return;
+    };
+    if let Some(subs) = sb.get("excludeFirstChatSubstrings") {
+        match subs {
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if !item.is_string() {
+                        issues.push(invalid_type_issue(
+                            "string",
+                            &json!(["sidebar", "excludeFirstChatSubstrings", i]),
+                            item,
+                        ));
+                    }
+                }
+            }
+            other => issues.push(invalid_type_issue(
+                "array",
+                &json!(["sidebar", "excludeFirstChatSubstrings"]),
+                other,
+            )),
+        }
+    }
+    const SIDEBAR_KEYS: &[&str] = &[
+        "excludeFirstChatSubstrings",
+        "excludeFirstChatMustStart",
+        "autoGenerateTitles",
+    ];
+    let unknown: Vec<&str> = sb
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !SIDEBAR_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        issues.push(unrecognized_keys_issue(&unknown, &json!(["sidebar"])));
+    }
+}
+
+/// SESSION-13: `stripDeprecatedSettingsPatchAliases`
+/// (`server/settings-router.ts:23-36`) — the `sidebar` alias
+/// `ignoreCodexSubagentSessions` (browser-local since the settings split,
+/// CFG-04/CFG-12) is deleted BEFORE the strict schema runs on the legacy
+/// PATCH path; this port runs it before [`validate_patch`].
+fn strip_deprecated_settings_patch_aliases(patch: &mut Value) {
+    if let Some(sb) = patch.get_mut("sidebar").and_then(Value::as_object_mut) {
+        sb.remove("ignoreCodexSubagentSessions");
+    }
+}
+
+/// SESSION-13: the value normalization of the legacy sidebar PATCH write
+/// path, applied to the private patch copy before `deep_merge`:
+///
+/// * `excludeFirstChatMustStart` / `autoGenerateTitles` — legacy
+///   `z.coerce.boolean()` coerces at schema time (before merge), via JS
+///   `Boolean()` truthiness: `""`, `0`, `null` are false; every non-empty
+///   string (even `"false"`), non-zero number, array, and object is true.
+/// * `excludeFirstChatSubstrings` — `mergeServerSettings` runs
+///   `normalizeTrimmedStringList` (`shared/string-list.ts`): keep strings,
+///   trim, drop empties, dedupe first-occurrence-wins. The string filter is
+///   dead code here post-validation (all elements are strings) but kept as
+///   the `sanitizeServerSettingsPatch` mirror.
+fn normalize_sidebar_patch(patch: &mut Value) {
+    let Some(sb) = patch.get_mut("sidebar").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in ["excludeFirstChatMustStart", "autoGenerateTitles"] {
+        if let Some(v) = sb.get_mut(key) {
+            let coerced = js_truthiness(v);
+            *v = Value::Bool(coerced);
+        }
+    }
+    if let Some(slot) = sb.get_mut("excludeFirstChatSubstrings") {
+        if let Value::Array(items) = slot {
+            let strings: Vec<String> = items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect();
+            let normalized = normalize_trimmed_string_list(&strings);
+            *slot = json!(normalized);
+        }
+    }
+}
+
+/// JS `Boolean(x)` — the coercion `z.coerce.boolean()` applies
+/// (`shared/settings.ts:798-799`).
+fn js_truthiness(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        // JSON has no NaN/-0 distinctness: `Boolean(0)`/`Boolean(-0)` are the
+        // only false numbers; every other number coerces true.
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        // `Boolean([])` and `Boolean({})` are both true in JS.
+        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -2446,6 +2851,242 @@ mod tests {
             .replace([':', '.', ' '], "-")
     }
 
+    // ── CFG-04: legacyLocalSettingsSeed ─────────────────────────────────────
+
+    /// A pre-settings-split legacy `config.json`: browser-local preferences
+    /// still live INSIDE `settings` (theme/scale/terminal font/sidebar
+    /// presentation/sound — the five categories CFG-04 names), alongside the
+    /// server-backed `sidebar.excludeFirstChat*` knobs (SESSION-13's surface,
+    /// which must NOT move).
+    fn write_legacy_mixed_config(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{
+  "version": 1,
+  "settings": {
+    "network": { "configured": true, "host": "127.0.0.1" },
+    "theme": "light",
+    "uiScale": 1.25,
+    "terminal": { "scrollback": 4000, "fontSize": 18, "fontFamily": "Fira Code" },
+    "sidebar": {
+      "excludeFirstChatSubstrings": ["welcome"],
+      "excludeFirstChatMustStart": false,
+      "sortMode": "project",
+      "width": 280,
+      "collapsed": true
+    },
+    "notifications": { "soundEnabled": false }
+  }
+}"#,
+        )
+        .unwrap();
+    }
+
+    /// The exact seed the legacy Node server extracts from
+    /// `write_legacy_mixed_config` (matches `extractLegacyLocalSettingsSeed`'s
+    /// real output — byte-pinned in `legacy_local_seed.rs`'s own tests).
+    fn expected_mixed_seed() -> Value {
+        json!({
+            "theme": "light",
+            "uiScale": 1.25,
+            "terminal": { "fontSize": 18, "fontFamily": "Fira Code" },
+            "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+            "notifications": { "soundEnabled": false }
+        })
+    }
+
+    fn read_disk_config(dir: &Path) -> Value {
+        let text = std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Boot extraction: the seed is extracted out of the legacy mixed
+    /// `settings`, holds all five CFG-04 categories, is stripped from the live
+    /// server-settings tree, and the server-backed exclusion knobs stay put.
+    #[tokio::test]
+    async fn legacy_mixed_config_seeds_and_strips_at_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+
+        let store = store_at(&dir);
+        assert_eq!(
+            store.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+
+        let live = store.get().await;
+        // Server-backed settings survive untouched (SESSION-13 boundary).
+        assert_eq!(live.terminal.scrollback, 4000);
+        assert_eq!(
+            live.sidebar.exclude_first_chat_substrings,
+            vec!["welcome".to_string()]
+        );
+        assert!(!live.sidebar.exclude_first_chat_must_start);
+        // The live tree cannot carry local keys at all (typed struct) — the
+        // disk assertion below proves they were stripped, not silently kept.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The boot normalization persist moves local keys out of `settings` and
+    /// writes the merged top-level seed, exactly like the legacy
+    /// `shouldPersistNormalizedConfig` re-persist.
+    #[tokio::test]
+    async fn boot_persist_strips_local_keys_and_writes_seed() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+        let _store = store_at(&dir);
+
+        let disk = read_disk_config(&dir);
+        assert_eq!(disk["legacyLocalSettingsSeed"], expected_mixed_seed());
+        let settings = disk["settings"].as_object().unwrap();
+        assert!(!settings.contains_key("theme"));
+        assert!(!settings.contains_key("uiScale"));
+        assert!(!settings.contains_key("notifications"));
+        let terminal = settings["terminal"].as_object().unwrap();
+        assert!(!terminal.contains_key("fontSize"));
+        assert!(!terminal.contains_key("fontFamily"));
+        assert_eq!(terminal["scrollback"], json!(4000));
+        let sidebar = settings["sidebar"].as_object().unwrap();
+        assert!(!sidebar.contains_key("sortMode"));
+        assert!(!sidebar.contains_key("width"));
+        assert!(!sidebar.contains_key("collapsed"));
+        assert_eq!(sidebar["excludeFirstChatSubstrings"], json!(["welcome"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second boot over the normalized file must rewrite NOTHING: the seed
+    /// change-check converges (merged == stored), and no other boot migration
+    /// fires — the file is byte-stable (side-by-side bake-in safety with the
+    /// legacy server reading the same home).
+    #[tokio::test]
+    async fn seeded_boot_is_byte_stable_on_second_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        let discovered = vec!["claude".to_string(), "codex".to_string()];
+        write_legacy_mixed_config(&dir);
+        let store1 = SettingsStore::load(Some(&dir), discovered.clone());
+        assert_eq!(
+            store1.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+        drop(store1);
+        let bytes1 = std::fs::read(dir.join(".freshell").join("config.json")).unwrap();
+
+        let store2 = SettingsStore::load(Some(&dir), discovered);
+        assert_eq!(
+            store2.legacy_local_settings_seed(),
+            Some(expected_mixed_seed())
+        );
+        drop(store2);
+        let bytes2 = std::fs::read(dir.join(".freshell").join("config.json")).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&bytes1),
+            String::from_utf8_lossy(&bytes2),
+            "second boot rewrote the normalized config"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `config-store.ts:337-339`: `stored ? mergeLocalSettings(extracted,
+    /// stored) : extracted` — a pre-existing top-level seed wins on conflict
+    /// while extracted-only sections still join the merged seed.
+    #[tokio::test]
+    async fn stored_seed_wins_over_stray_local_keys_at_boot() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{
+  "version": 1,
+  "settings": { "terminal": { "fontSize": 22 } },
+  "legacyLocalSettingsSeed": { "theme": "dark" }
+}"#,
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+        assert_eq!(
+            store.legacy_local_settings_seed(),
+            Some(json!({
+                "terminal": { "fontSize": 22 },
+                "theme": "dark"
+            }))
+        );
+        let disk = read_disk_config(&dir);
+        assert_eq!(
+            disk["legacyLocalSettingsSeed"],
+            json!({ "terminal": { "fontSize": 22 }, "theme": "dark" })
+        );
+        assert!(disk["settings"]["terminal"].get("fontSize").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every writer keeps the seed: an unrelated PATCH must not lose the
+    /// seeded `legacyLocalSettingsSeed` from `config.json` (the CFG-01
+    /// losslessness clause applied to this store's owned key).
+    #[tokio::test]
+    async fn seed_survives_unrelated_patch() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        write_legacy_mixed_config(&dir);
+        let store = store_at(&dir);
+        store
+            .patch(&json!({ "logging": { "debug": true } }))
+            .await
+            .expect("patch succeeds");
+
+        let disk = read_disk_config(&dir);
+        assert_eq!(disk["legacyLocalSettingsSeed"], expected_mixed_seed());
+        assert_eq!(disk["settings"]["logging"]["debug"], json!(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fresh install: no seed is synthesized, no seed key is ever written —
+    /// not at boot, not after an unrelated PATCH.
+    #[tokio::test]
+    async fn fresh_install_has_no_seed_and_never_writes_one() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+        let store = store_at(&dir);
+        assert_eq!(store.legacy_local_settings_seed(), None);
+        store
+            .patch(&json!({ "logging": { "debug": true } }))
+            .await
+            .expect("patch succeeds");
+        let disk = read_disk_config(&dir);
+        assert!(
+            disk.get("legacyLocalSettingsSeed").is_none(),
+            "unexpected seed key on disk: {disk}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A garbage stored seed (non-object, or object with nothing valid) is
+    /// normalized away and removed from disk at boot, exactly like the legacy
+    /// `JSON.stringify(existing) !== JSON.stringify(normalized)` re-persist.
+    #[tokio::test]
+    async fn garbage_stored_seed_is_dropped_at_boot() {
+        for raw_seed in [r#""nope""#, r#"{"theme":"neon"}"#] {
+            let dir = std::env::temp_dir().join(format!("frs-cfg04-{}", uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            std::fs::write(
+                dir.join(".freshell").join("config.json"),
+                format!(
+                    r#"{{"version":1,"settings":{{"network":{{"configured":true,"host":"127.0.0.1"}}}},"legacyLocalSettingsSeed":{raw_seed}}}"#
+                ),
+            )
+            .unwrap();
+
+            let store = store_at(&dir);
+            assert_eq!(store.legacy_local_settings_seed(), None, "raw: {raw_seed}");
+            let disk = read_disk_config(&dir);
+            assert!(
+                disk.get("legacyLocalSettingsSeed").is_none(),
+                "garbage seed key survived on disk (raw: {raw_seed}): {disk}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     /// The real acceptance for the settings model: default settings + the
     /// isolated-boot network overlay must serialize BYTE-FOR-BYTE to the
     /// `settings.updated` payload captured from the ORIGINAL node server. If the
@@ -2677,9 +3318,14 @@ mod tests {
     /// Seeds a `config.json` shaped like a real staged incident: known
     /// managed keys (`settings`, overrides) PLUS keys this store never
     /// manages (`completedMigrations`, `recentDirectories`, a hypothetical
-    /// future top-level key). `store_at` is given `discovered_cli_names` and
-    /// a seed `codingCli.knownProviders`/`enabledProviders` that exactly
-    /// match, so `SettingsStore::load` does not itself trigger a persist
+    /// future top-level key), a stored `legacyLocalSettingsSeed` (CFG-04
+    /// owned key), and BOTH the codex secret and a hypothetical sibling
+    /// secret this build doesn't know about. `store_at` is given
+    /// `discovered_cli_names` and a seed `codingCli.knownProviders`/
+    /// `enabledProviders` that exactly match, and the stored seed is in the
+    /// exact legacy normalize assignment order (the shape
+    /// `seeded_boot_is_byte_stable_on_second_boot` proves merges back to
+    /// itself), so `SettingsStore::load` does not itself trigger a persist
     /// (no seed/legacy-migration path fires) -- the ONLY write in each test
     /// below is the one explicit patch under test.
     fn lossless_fixture_text() -> &'static str {
@@ -2695,7 +3341,17 @@ mod tests {
             },
             "completedMigrations": ["ai-title-shadow-cleanup"],
             "recentDirectories": ["/a", "/b", "/c"],
-            "serverSecrets": { "codexDisplayIdSecret": "seed-secret-value" },
+            "serverSecrets": {
+                "codexDisplayIdSecret": "seed-secret-value",
+                "futureSiblingSecret": "sibling-sentinel-value"
+            },
+            "legacyLocalSettingsSeed": {
+                "theme": "light",
+                "uiScale": 1.25,
+                "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                "notifications": { "soundEnabled": false }
+            },
             "zzFutureKey": { "a": 1 },
             "sessionOverrides": {},
             "terminalOverrides": {},
@@ -2718,6 +3374,22 @@ mod tests {
             cfg["serverSecrets"]["codexDisplayIdSecret"],
             json!("seed-secret-value"),
             "serverSecrets must round-trip"
+        );
+        assert_eq!(
+            cfg["serverSecrets"]["futureSiblingSecret"],
+            json!("sibling-sentinel-value"),
+            "a sibling secret this build doesn't manage must round-trip (overlaid, not rebuilt)"
+        );
+        assert_eq!(
+            cfg["legacyLocalSettingsSeed"],
+            json!({
+                "theme": "light",
+                "uiScale": 1.25,
+                "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                "notifications": { "soundEnabled": false }
+            }),
+            "the stored legacyLocalSettingsSeed must survive every unrelated writer"
         );
         assert_eq!(
             cfg["zzFutureKey"],
@@ -2756,6 +3428,499 @@ mod tests {
         assert_eq!(cfg["settings"]["logging"]["debug"], json!(false));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CFG-12 RED/GREEN target (Arc identity): `shared_settings_lock()` must
+    /// vend the store's ONE live tree, so a PATCH-committed value is exactly
+    /// what the next `/ws` connection's handshake resolves
+    /// (`server/index.ts:415-427` per-connection `configStore.getSettings()`
+    /// parity). If this ever vended a copy/divergent handle, the handshake
+    /// would silently freeze again while every REST surface stayed live.
+    #[tokio::test]
+    async fn patch_is_visible_through_shared_settings_lock() {
+        let dir = std::env::temp_dir().join(format!("frs-sharedlk-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let shared = store.shared_settings_lock();
+
+        assert!(shared.read().await.default_cwd.is_none());
+        store
+            .patch(&json!({ "defaultCwd": "/tmp/replicated-cwd" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            shared.read().await.default_cwd.as_deref(),
+            Some("/tmp/replicated-cwd"),
+            "the handshake's live source must observe the committed PATCH tree"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CFG-12 (restart half of the checklist validation text): a PATCHed
+    /// `defaultCwd` is durable -- it survives a full store reload from disk
+    /// (the e2e restart leg boots a second process over the same home).
+    #[tokio::test]
+    async fn patched_default_cwd_survives_reload_from_disk() {
+        let dir = std::env::temp_dir().join(format!("frs-cwdreload-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        store
+            .patch(&json!({ "defaultCwd": "/tmp/durable-cwd" }))
+            .await
+            .unwrap();
+        drop(store);
+
+        let reloaded = store_at(&dir);
+        assert_eq!(
+            reloaded.get().await.default_cwd.as_deref(),
+            Some("/tmp/durable-cwd")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── SESSION-13: server-wide first-chat exclusion controls ────────────
+    //
+    // The legacy PATCH write path for the `sidebar` patch object is
+    // `server/settings-router.ts:127-147` (alias strip -> zod4 strict
+    // sidebar schema, `shared/settings.ts:796-800`) ->
+    // `configStore.patchSettings` -> `mergeServerSettings`
+    // (`shared/settings.ts:1261+`, sidebar keys at :1276-1285) with
+    // `normalizeTrimmedStringList` (`shared/string-list.ts`). Every
+    // expectation in this section was produced by executing those REAL
+    // legacy functions under tsx on this checkout (19-case oracle battery;
+    // see docs/plans/df1/SESSION-13.md for the table).
+
+    /// Strict-object parity: an unknown `sidebar` subkey is a 400-class
+    /// `unrecognized_keys` issue at path `["sidebar"]`, byte-matched to zod4
+    /// (legacy: `{sidebar:{bogus:1}}` -> `Unrecognized key: "bogus"`).
+    #[test]
+    fn validate_patch_sidebar_unknown_key_rejected() {
+        let details = validate_patch(&json!({ "sidebar": { "bogus": 1 } }), &valid5()).unwrap();
+        assert_eq!(details.as_array().unwrap().len(), 1);
+        assert_eq!(details[0]["code"], "unrecognized_keys");
+        assert_eq!(details[0]["keys"], json!(["bogus"]));
+        assert_eq!(details[0]["path"], json!(["sidebar"]));
+        assert_eq!(details[0]["message"], "Unrecognized key: \"bogus\"");
+    }
+
+    /// Legacy zod: `sidebar` must be an object when present — a bare string
+    /// is `invalid_type` expected `object` at path `["sidebar"]`.
+    #[test]
+    fn validate_patch_sidebar_not_an_object_rejected() {
+        let details = validate_patch(&json!({ "sidebar": "nope" }), &valid5()).unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "object");
+        assert_eq!(details[0]["path"], json!(["sidebar"]));
+    }
+
+    /// Legacy zod: `excludeFirstChatSubstrings` must be an array —
+    /// `invalid_type` expected `array` at the full nested path.
+    #[test]
+    fn validate_patch_sidebar_substrings_wrong_type_rejected() {
+        let details = validate_patch(
+            &json!({ "sidebar": { "excludeFirstChatSubstrings": "nope" } }),
+            &valid5(),
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "array");
+        assert_eq!(
+            details[0]["path"],
+            json!(["sidebar", "excludeFirstChatSubstrings"])
+        );
+    }
+
+    /// Legacy zod: each substring element must be a string — the issue
+    /// carries the ELEMENT index in its path (`[1,"a"]` fails at index 0).
+    #[test]
+    fn validate_patch_sidebar_substring_element_type_rejected() {
+        let details = validate_patch(
+            &json!({ "sidebar": { "excludeFirstChatSubstrings": [1, "a"] } }),
+            &valid5(),
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[0]["expected"], "string");
+        assert_eq!(
+            details[0]["path"],
+            json!(["sidebar", "excludeFirstChatSubstrings", 0])
+        );
+    }
+
+    /// Ordering parity (`settings-router.ts:23-36` runs BEFORE the strict
+    /// schema): the deprecated `ignoreCodexSubagentSessions` alias is
+    /// stripped pre-validation, so an alias-only sidebar patch is accepted
+    /// as a no-op instead of tripping the strict unknown-key check, and a
+    /// mixed alias+unknown patch reports ONLY the unknown key (proving the
+    /// strip ran before the strict check, at `patch()` entry).
+    #[tokio::test]
+    async fn patch_sidebar_deprecated_alias_stripped_before_validation() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-alias-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        let merged = store
+            .patch(&json!({ "sidebar": { "ignoreCodexSubagentSessions": true } }))
+            .await
+            .expect("alias-only sidebar patch must be accepted as a no-op");
+        assert!(merged.sidebar.exclude_first_chat_substrings.is_empty());
+        assert!(!merged.sidebar.exclude_first_chat_must_start);
+
+        let (_status, body) = store
+            .patch(&json!({ "sidebar": { "ignoreCodexSubagentSessions": true, "bogus": 1 } }))
+            .await
+            .unwrap_err();
+        let details = &body["details"];
+        assert_eq!(details[0]["code"], "unrecognized_keys");
+        assert_eq!(
+            details[0]["keys"],
+            json!(["bogus"]),
+            "the alias itself must NOT appear among the rejected keys"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `z.coerce.boolean()` parity: the legacy schema coerces ANY JSON value
+    /// for `excludeFirstChatMustStart` via JS `Boolean()` truthiness —
+    /// oracle table rows: "yes"→true, "false"→true, 1→true, {}→true,
+    /// []→true, ""→false, 0→false, null→false.
+    #[tokio::test]
+    async fn patch_coerces_exclude_first_chat_must_start_truthiness() {
+        for (input, expected) in [
+            (json!("yes"), true),
+            (json!("false"), true),
+            (json!(1), true),
+            (json!({}), true),
+            (json!([]), true),
+            (json!(""), false),
+            (json!(0), false),
+            (Value::Null, false),
+        ] {
+            let dir = std::env::temp_dir().join(format!("frs-s13-coerce-{}", uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            let store = store_at(&dir);
+            let merged = store
+                .patch(&json!({ "sidebar": { "excludeFirstChatMustStart": input } }))
+                .await
+                .unwrap_or_else(|_| panic!("legacy accepts this coercion"));
+            assert_eq!(
+                merged.sidebar.exclude_first_chat_must_start, expected,
+                "z.coerce.boolean() truthiness parity"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `normalizeTrimmedStringList` parity (`shared/string-list.ts`): trim,
+    /// drop empties, dedupe first-occurrence-wins; a PRESENT key always
+    /// replaces (an explicit `[]` clears), an ABSENT key keeps the base.
+    #[tokio::test]
+    async fn patch_normalizes_exclude_first_chat_substrings() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-norm-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        store
+            .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": ["keep"] } }))
+            .await
+            .unwrap();
+        let merged = store
+            .patch(
+                &json!({ "sidebar": { "excludeFirstChatSubstrings": [" a ", "a", "", " b ", "b"] } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.sidebar.exclude_first_chat_substrings,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Present-but-empty replaces (clears) — legacy `hasOwn` semantics.
+        let cleared = store
+            .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": [] } }))
+            .await
+            .unwrap();
+        assert!(cleared.sidebar.exclude_first_chat_substrings.is_empty());
+        // Absent key preserves the base.
+        let untouched = store
+            .patch(&json!({ "sidebar": { "autoGenerateTitles": false } }))
+            .await
+            .unwrap();
+        assert!(untouched.sidebar.exclude_first_chat_substrings.is_empty());
+        assert!(!untouched.sidebar.auto_generate_titles);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Full-route write-through: PATCH via the REAL `patch_settings` handler
+    /// returns the normalized tree, persists it to `config.json`, broadcasts
+    /// it to connected clients in the `settings.updated` frame, and a store
+    /// reload (the restart leg) sees the same normalized values.
+    #[tokio::test]
+    async fn sidebar_patch_write_through_persists_normalized_disk_broadcast_and_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-route-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        // Build the router state by hand (keeping the broadcast receiver —
+        // `router_state_at` drops it).
+        let auth_token = Arc::new("tok".to_string());
+        let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let state = SettingsRouterState {
+            store: store_at(&dir),
+            auth_token: Arc::clone(&auth_token),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            ai_key: crate::ai_title::AiKeyCell::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                json!({}),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+        };
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({
+                "sidebar": {
+                    "excludeFirstChatSubstrings": [" __S13AUTO__ ", "__S13AUTO__", "canary"],
+                    "excludeFirstChatMustStart": true,
+                }
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(body["sidebar"]["excludeFirstChatMustStart"], json!(true));
+
+        // The broadcast frame carries the same normalized tree.
+        let frame = broadcast_rx.try_recv().expect("a settings.updated frame");
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], "settings.updated");
+        assert_eq!(
+            frame["settings"]["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(
+            frame["settings"]["sidebar"]["excludeFirstChatMustStart"],
+            json!(true)
+        );
+
+        // config.json on disk holds the normalized values.
+        let disk = read_disk_config(&dir);
+        assert_eq!(
+            disk["settings"]["sidebar"]["excludeFirstChatSubstrings"],
+            json!(["__S13AUTO__", "canary"])
+        );
+        assert_eq!(
+            disk["settings"]["sidebar"]["excludeFirstChatMustStart"],
+            json!(true)
+        );
+
+        // Restart leg: a fresh store over the same home sees them.
+        drop(state);
+        let reloaded = store_at(&dir);
+        let after = reloaded.get().await;
+        assert_eq!(
+            after.sidebar.exclude_first_chat_substrings,
+            vec!["__S13AUTO__".to_string(), "canary".to_string()]
+        );
+        assert!(after.sidebar.exclude_first_chat_must_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SESSION-13 replication leg at store level: a sidebar PATCH is visible
+    /// through the SAME shared lock the CFG-12 per-connection handshake
+    /// resolves (`WsState::handshake_settings`) — a freshly-connecting client
+    /// receives the new exclusion controls in its handshake `settings`.
+    #[tokio::test]
+    async fn sidebar_patch_visible_through_shared_settings_lock() {
+        let dir = std::env::temp_dir().join(format!("frs-s13-lock-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let shared = store.shared_settings_lock();
+
+        assert!(shared
+            .read()
+            .await
+            .sidebar
+            .exclude_first_chat_substrings
+            .is_empty());
+        store
+            .patch(&json!({
+                "sidebar": {
+                    "excludeFirstChatSubstrings": ["a"],
+                    "excludeFirstChatMustStart": true,
+                }
+            }))
+            .await
+            .unwrap();
+        let seen = shared.read().await;
+        assert_eq!(
+            seen.sidebar.exclude_first_chat_substrings,
+            vec!["a".to_string()],
+            "the handshake's live source must observe the committed sidebar PATCH"
+        );
+        assert!(seen.sidebar.exclude_first_chat_must_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The 19-row oracle battery, produced by executing the REAL legacy
+    /// `buildServerSettingsPatchSchema(...).safeParse(strip(body))` +
+    /// `mergeServerSettings(base, parsed.data)` under tsx on this checkout
+    /// (see docs/plans/df1/SESSION-13.md). Each row replays one PATCH at
+    /// store level and asserts identical accept/reject and an identical
+    /// merged sidebar (key order fixed by `SettingsSidebar`'s serde:
+    /// autoGenerateTitles, excludeFirstChatMustStart, excludeFirstChatSubstrings).
+    #[tokio::test]
+    async fn sidebar_patch_oracle_byte_parity_battery() {
+        // (patch, accepted?, resulting sidebar JSON when accepted) — base
+        // fixture: substrings ["keep"], mustStart false, autoGenerateTitles true.
+        let rows: &[(Value, bool, Option<&str>)] = &[
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":"yes"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":""}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":"false"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":0}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":1}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":null}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":{}}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatMustStart":[]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":true,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[" a ","a",""," b ","b"]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["a","b"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":"nope"}}),
+                false,
+                None,
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[1,"a"]}}),
+                false,
+                None,
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":["x"],"excludeFirstChatMustStart":true,"bogus":1}}),
+                false,
+                None,
+            ),
+            (json!({"sidebar":{"bogus":1}}), false, None),
+            (json!({"sidebar":"nope"}), false, None),
+            (
+                json!({"sidebar":{"ignoreCodexSubagentSessions":true}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"autoGenerateTitles":"yes"}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"autoGenerateTitles":0}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":false,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":["keep"]}"#,
+                ),
+            ),
+            (
+                json!({"sidebar":{"excludeFirstChatSubstrings":[]}}),
+                true,
+                Some(
+                    r#"{"autoGenerateTitles":true,"excludeFirstChatMustStart":false,"excludeFirstChatSubstrings":[]}"#,
+                ),
+            ),
+        ];
+        for (i, (patch, accepted, sidebar_json)) in rows.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("frs-s13-oracle-{}-{}", i, uuid_like()));
+            std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+            let store = store_at(&dir);
+            // Base fixture: substrings ["keep"] (the oracle battery's base).
+            store
+                .patch(&json!({ "sidebar": { "excludeFirstChatSubstrings": ["keep"] } }))
+                .await
+                .unwrap();
+            match store.patch(patch).await {
+                Ok(merged) => {
+                    assert!(accepted, "row {i}: legacy REJECTS this patch");
+                    let sidebar = serde_json::to_string(&merged.sidebar).unwrap();
+                    assert_eq!(&sidebar, sidebar_json.unwrap(), "row {i} byte parity");
+                }
+                Err((_status, _body)) => {
+                    assert!(!accepted, "row {i}: legacy ACCEPTS this patch");
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// Same document-preservation guarantee through the terminal-override
@@ -2811,6 +3976,187 @@ mod tests {
             cfg["sessionOverrides"]["claude:abc"]["archived"],
             json!(true)
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the project-color persist
+    /// path (`set_project_color` — `PUT /api/project-colors`). The
+    /// project-color family below uses reduced fixtures; THIS test pins the
+    /// full CFG-01 sentinel set through the color writer specifically.
+    #[tokio::test]
+    async fn project_color_write_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            lossless_fixture_text(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/x", "#c0ffee").await.unwrap();
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(cfg["projectColors"]["/proj/x"], json!("#c0ffee"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the BOOT-TIME
+    /// normalization persist (`SettingsStore::load`'s provider-seed branch):
+    /// a config missing `codingCli.knownProviders` is seeded + persisted at
+    /// boot (the original always `patchSettings` here,
+    /// `server/index.ts:276-299`) -- and that write must not drop a single
+    /// sentinel. This fixture deliberately OMITS `knownProviders` (unlike
+    /// `lossless_fixture_text`, where the whole point is that NO boot write
+    /// fires).
+    #[tokio::test]
+    async fn boot_provider_seed_persist_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-boot-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r##"{
+                "version": 1,
+                "settings": {
+                    "codingCli": {
+                        "enabledProviders": ["claude", "codex"],
+                        "providers": {},
+                        "mcpServer": true
+                    }
+                },
+                "completedMigrations": ["ai-title-shadow-cleanup"],
+                "recentDirectories": ["/a", "/b", "/c"],
+                "serverSecrets": {
+                    "codexDisplayIdSecret": "seed-secret-value",
+                    "futureSiblingSecret": "sibling-sentinel-value"
+                },
+                "legacyLocalSettingsSeed": {
+                    "theme": "light",
+                    "uiScale": 1.25,
+                    "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                    "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                    "notifications": { "soundEnabled": false }
+                },
+                "zzFutureKey": { "a": 1 },
+                "sessionOverrides": { "claude:keep": { "archived": true } },
+                "terminalOverrides": { "term-keep": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/keep": "#123123" }
+            }"##,
+        )
+        .unwrap();
+
+        // Boot IS the write under test: knownProviders is seeded + persisted.
+        let _store = store_at(&dir);
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude", "codex"]),
+            "the boot provider seed must land"
+        );
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:keep"]["archived"],
+            json!(true),
+            "pre-existing override entries must survive the boot persist"
+        );
+        assert_eq!(
+            cfg["terminalOverrides"]["term-keep"]["titleOverride"],
+            json!("KeepMe")
+        );
+        assert_eq!(cfg["projectColors"]["/proj/keep"], json!("#123123"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same guarantee through the OTHER boot-time normalization trigger:
+    /// stray browser-local keys inside `settings` are stripped into
+    /// `legacyLocalSettingsSeed` and persisted at boot (CFG-04,
+    /// `load_internal`'s `seed_normalization_persist`). Unrelated document
+    /// state must survive that write too.
+    #[tokio::test]
+    async fn boot_seed_strip_persist_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-boot-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r##"{
+                "version": 1,
+                "settings": {
+                    "theme": "dark",
+                    "uiScale": 1.5,
+                    "codingCli": {
+                        "enabledProviders": ["claude", "codex"],
+                        "knownProviders": ["claude", "codex"],
+                        "providers": {},
+                        "mcpServer": true
+                    }
+                },
+                "completedMigrations": ["ai-title-shadow-cleanup"],
+                "recentDirectories": ["/a", "/b", "/c"],
+                "serverSecrets": {
+                    "codexDisplayIdSecret": "seed-secret-value",
+                    "futureSiblingSecret": "sibling-sentinel-value"
+                },
+                "zzFutureKey": { "a": 1 },
+                "sessionOverrides": { "claude:keep": { "archived": true } },
+                "terminalOverrides": { "term-keep": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/keep": "#123123" }
+            }"##,
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        // Unmanaged state (minus the seed, which this boot legitimately
+        // WRITES — that is the writer's intended path).
+        assert_eq!(
+            cfg["completedMigrations"],
+            json!(["ai-title-shadow-cleanup"])
+        );
+        assert_eq!(cfg["recentDirectories"], json!(["/a", "/b", "/c"]));
+        assert_eq!(
+            cfg["serverSecrets"]["codexDisplayIdSecret"],
+            json!("seed-secret-value")
+        );
+        assert_eq!(
+            cfg["serverSecrets"]["futureSiblingSecret"],
+            json!("sibling-sentinel-value")
+        );
+        assert_eq!(cfg["zzFutureKey"], json!({ "a": 1 }));
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:keep"]["archived"],
+            json!(true)
+        );
+        assert_eq!(
+            cfg["terminalOverrides"]["term-keep"]["titleOverride"],
+            json!("KeepMe")
+        );
+        assert_eq!(cfg["projectColors"]["/proj/keep"], json!("#123123"));
+        // The strip itself: stray local keys left `settings`, landed in the seed.
+        let seed = store
+            .legacy_local_settings_seed()
+            .expect("stray local keys must extract into the seed");
+        assert_eq!(seed["theme"], json!("dark"));
+        assert_eq!(seed["uiScale"], json!(1.5));
+        assert!(
+            cfg["settings"].get("theme").is_none(),
+            "the boot persist must strip the stray local key out of settings"
+        );
+        assert_eq!(cfg["legacyLocalSettingsSeed"]["theme"], json!("dark"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3726,6 +5072,446 @@ mod tests {
         // Restore permissions so cleanup (and any other test running
         // concurrently against a colliding tmp dir name) can proceed.
         std::fs::set_permissions(&freshell, original_perms).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // SESSION-05 (project colors): `config.projectColors`
+    // (`config-store.ts:549-562`) — the legacy config-store exposes
+    // `setProjectColor`/`getProjectColors` over a top-level
+    // `Record<string,string>` map; the Rust store must hold the same map
+    // in memory with the SAME side-by-side adopt-from-disk discipline as
+    // the override maps (dirty keys win; untouched keys defer to disk).
+    // ------------------------------------------------------------------
+
+    /// PERSIST-FAILURE ROLLBACK (legacy parity): a failed
+    /// `set_project_color` must leave the in-memory map AND the dirty set
+    /// exactly as they were before the attempt — mirroring
+    /// `ConfigStore.saveInternal`, which assigns `this.cache = cfg` only
+    /// AFTER the atomic write succeeds (`config-store.ts:424-435`). Covers
+    /// both shapes: overwriting an existing key (prior value restored) and
+    /// inserting a brand-new key (key absent afterwards), plus the
+    /// dirty-set consequence: a later external disk edit to the failed key
+    /// must still be adopted by the freshness reload (a stale dirty mark
+    /// would tombstone it in [`overlay_dirty_keys`]).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_project_color_rolls_back_in_memory_state_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": { "/proj/alpha": "#aaaaaa" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Zero-width throttle window: every read re-stats (test-scaled).
+        let store = store_at(&dir).with_reload_throttle_window(std::time::Duration::ZERO);
+
+        // `.freshell` read+execute only: persist()'s tmp-file create fails.
+        let original_perms = std::fs::metadata(&freshell).unwrap().permissions();
+        std::fs::set_permissions(&freshell, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Overwrite an EXISTING key: must Err, and the prior value must be
+        // restored — never the failed write.
+        store
+            .set_project_color("/proj/alpha", "#bbbbbb")
+            .await
+            .expect_err("a read-only config dir must fail the write");
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#aaaaaa"),
+            "a failed overwrite must restore the last-persisted value"
+        );
+
+        // Insert a NEW key: must Err, and the key must not be visible.
+        store
+            .set_project_color("/proj/beta", "#00ff00")
+            .await
+            .expect_err("a read-only config dir must fail the write");
+        let colors = store.project_colors();
+        assert!(
+            !colors.contains_key("/proj/beta"),
+            "a failed insert must not leak into project_colors(): {colors:?}"
+        );
+
+        // Dirty-set rollback: a later EXTERNAL disk edit to the failed key
+        // must be adopted by the freshness reload (20ms so the write lands
+        // on a later mtime tick — same pattern as
+        // `project_colors_external_write_becomes_visible_without_restart`).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/beta"] = json!("#123456");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#123456"),
+            "a stale dirty mark must not tombstone the external edit"
+        );
+
+        // Restore permissions; a retry now succeeds and persists.
+        std::fs::set_permissions(&freshell, original_perms).unwrap();
+        store
+            .set_project_color("/proj/alpha", "#bbbbbb")
+            .await
+            .expect("a writable config dir must persist");
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["projectColors"]["/proj/alpha"], json!("#bbbbbb"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LOAD + ROUND-TRIP: a boot-time `projectColors` map is readable via
+    /// `project_colors()`; `set_project_color` persists so the color is
+    /// visible to a FRESH `SettingsStore::load` without clobbering either
+    /// the boot-seeded color, an unrelated unknown top-level key, or the
+    /// seeded empty defaults (`sessionOverrides`/`terminalOverrides`).
+    #[tokio::test]
+    async fn project_colors_round_trip_preserves_existing_entries_and_unrelated_keys() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": { "claude:s1": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/alpha": "#ff0000" },
+                "customPluginState": { "anything": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000"),
+            "a boot-seeded project color must be visible without any write"
+        );
+
+        store
+            .set_project_color("/proj/beta", "#00ff00")
+            .await
+            .expect("set_project_color must succeed on a writable config dir");
+
+        // The in-memory reader reflects the write immediately.
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#00ff00")
+        );
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000")
+        );
+
+        // On disk: both colors plus every unrelated key.
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["projectColors"]["/proj/alpha"], json!("#ff0000"));
+        assert_eq!(cfg["projectColors"]["/proj/beta"], json!("#00ff00"));
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:s1"]["titleOverride"],
+            json!("KeepMe"),
+            "unrelated session overrides must survive a color write"
+        );
+        assert_eq!(
+            cfg["customPluginState"]["anything"],
+            json!(true),
+            "unknown top-level keys must round-trip through a color write"
+        );
+
+        // A fresh process (another load) sees both colors.
+        let reloaded = store_at(&dir);
+        let colors = reloaded.project_colors();
+        assert_eq!(
+            colors.get("/proj/alpha").and_then(Value::as_str),
+            Some("#ff0000")
+        );
+        assert_eq!(
+            colors.get("/proj/beta").and_then(Value::as_str),
+            Some("#00ff00")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// OVERWRITE + ADDITIVE: setting a second color must never clobber the
+    /// first, and re-setting the same path replaces its value.
+    #[tokio::test]
+    async fn project_colors_set_is_additive_and_overwrites_same_path() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/a", "#111111").await.unwrap();
+        store.set_project_color("/proj/b", "#222222").await.unwrap();
+        store.set_project_color("/proj/a", "#333333").await.unwrap();
+
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/a").and_then(Value::as_str),
+            Some("#333333")
+        );
+        assert_eq!(
+            colors.get("/proj/b").and_then(Value::as_str),
+            Some("#222222")
+        );
+        assert_eq!(colors.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FRESH-INSTALL SEED: with no config at all, the first persist still
+    /// writes the legacy first-write defaults (`projectColors: {}` —
+    /// `config-store.ts:356-360, 394`).
+    #[tokio::test]
+    async fn project_colors_seeds_empty_map_on_first_write_like_the_original() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let store = store_at(&dir);
+
+        store
+            .set_project_color("/proj/only", "#abcdef")
+            .await
+            .unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert!(
+            cfg["projectColors"].is_object(),
+            "projectColors must be an object"
+        );
+        assert_eq!(cfg["projectColors"]["/proj/only"], json!("#abcdef"));
+        assert!(
+            cfg["sessionOverrides"].is_object(),
+            "the legacy first-write defaults still seed alongside"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// EXTERNAL-WRITER SURVIVAL (project colors): an external writer's new
+    /// color key AND edit to a color key Rust never touched this boot both
+    /// survive a Rust persist for a DIFFERENT color (same discipline as
+    /// `external_writer_edits_survive_a_rust_persist_of_a_different_key`).
+    #[tokio::test]
+    async fn project_colors_external_writer_edits_survive_a_rust_persist_of_a_different_color() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": { "/proj/orig": "#aaaaaa" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        // External writer (the legacy Node server, or another Rust
+        // process): edits the EXT pre-existing key and adds a new one.
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {
+                    "/proj/orig": "#bbbbbb",
+                    "/proj/external": "#cccccc"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Rust colors a DIFFERENT project -- triggers a persist.
+        store
+            .set_project_color("/proj/ours", "#dddddd")
+            .await
+            .unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["projectColors"]["/proj/orig"],
+            json!("#bbbbbb"),
+            "external edit to a key Rust never touched this boot must survive"
+        );
+        assert_eq!(
+            cfg["projectColors"]["/proj/external"],
+            json!("#cccccc"),
+            "a brand-new external color key must survive"
+        );
+        assert_eq!(cfg["projectColors"]["/proj/ours"], json!("#dddddd"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DIRTY-KEY WINS (project colors): once THIS process has set a color,
+    /// a concurrent external edit to the SAME path must not survive a later
+    /// Rust persist (same rule as `session_overrides_dirty`).
+    #[tokio::test]
+    async fn project_colors_dirty_key_wins_over_a_concurrent_external_edit() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let freshell = dir.join(".freshell");
+        let store = store_at(&dir);
+
+        store
+            .set_project_color("/proj/hot", "#111111")
+            .await
+            .unwrap();
+
+        // External writer overwrites the SAME path.
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/hot"] = json!("#999999");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        // A persist for ANY other reason (here: another color write).
+        store
+            .set_project_color("/proj/cold", "#222222")
+            .await
+            .unwrap();
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["projectColors"]["/proj/hot"],
+            json!("#111111"),
+            "a key this process touched must reflect Rust's last write"
+        );
+        assert_eq!(cfg["projectColors"]["/proj/cold"], json!("#222222"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// JUNK TOLERANCE: a hand-edited `projectColors` entry with a
+    /// non-string VALUE is dropped from the reader (the wire schema is
+    /// `z.record(z.string(), z.string())` and the client `typeof`-guards —
+    /// a junk value must never flow to the page or it would fail client
+    /// parse of the whole fetch). The disk file itself is left alone.
+    #[tokio::test]
+    async fn project_colors_drops_non_string_values_but_keeps_disk_asis() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {
+                    "/proj/good": "#ff0000",
+                    "/proj/junk": 42
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/good").and_then(Value::as_str),
+            Some("#ff0000")
+        );
+        assert!(
+            !colors.contains_key("/proj/junk"),
+            "a non-string color value must be normalized away, got: {colors:?}"
+        );
+
+        // The write path for a SIBLING key must not resurrect the junk
+        // into memory... and the persisted file keeps the original junk
+        // value for the untouched key only if it was never written
+        // (adopt-from-disk passes the disk map through).
+        store
+            .set_project_color("/proj/other", "#00ff00")
+            .await
+            .unwrap();
+        let colors = store.project_colors();
+        assert!(!colors.contains_key("/proj/junk"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FRESHNESS RELOAD reads project colors too: an external write becomes
+    /// visible via `project_colors()` without a restart (the mtime-checked
+    /// reload applied to the override maps must cover colors, so a bake-in
+    /// partner's color write shows up on the next directory read).
+    #[tokio::test]
+    async fn project_colors_external_write_becomes_visible_without_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-project-colors-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "projectColors": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Zero-width throttle window: every read re-stats (test-scaled).
+        let store = store_at(&dir).with_reload_throttle_window(std::time::Duration::ZERO);
+        assert!(store.project_colors().is_empty());
+
+        // Ensure the external write lands on a LATER mtime tick than the
+        // boot load's initial `last_known_mtime` stamp.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        cfg["projectColors"]["/proj/later"] = json!("#fedcba");
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let colors = store.project_colors();
+        assert_eq!(
+            colors.get("/proj/later").and_then(Value::as_str),
+            Some("#fedcba"),
+            "an external color write must be adopted by the freshness reload"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

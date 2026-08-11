@@ -34,6 +34,36 @@ function stripIframeBlockingHeaders(
   return cleaned
 }
 
+/**
+ * Wrap-review r3 security hardening (applied on BOTH servers — the Rust
+ * port strips the same fields in `crates/freshell-server/src/proxy.rs`):
+ * never forward Freshell's own gate credentials to a proxied loopback app.
+ * The original design passed `x-auth-token` and the `freshell-auth` cookie
+ * straight through, handing any dev server opened in a browser pane a
+ * bearer token that drives every authenticated API/WS surface. The proxied
+ * app keeps its OWN cookies — only our pairs are withheld (pair-level
+ * filtering so `freshell-auth=…; app=…` forwards `app=…`).
+ * `headers` is mutated in place (the callers already own a fresh copy).
+ */
+function stripProxyAuthHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): void {
+  delete headers['x-auth-token']
+  const cookie = headers.cookie
+  if (typeof cookie === 'string') {
+    const kept = cookie
+      .split(';')
+      .map((pair) => pair.trim())
+      .filter((pair) => pair.length > 0)
+      .filter((pair) => pair.split('=')[0].trim() !== 'freshell-auth')
+    if (kept.length === 0) {
+      delete headers.cookie
+    } else {
+      headers.cookie = kept.join('; ')
+    }
+  }
+}
+
 export interface ProxyRouterDeps {
   portForwardManager: PortForwardManager
 }
@@ -91,6 +121,9 @@ export function createProxyRouter(deps: ProxyRouterDeps): Router {
     headers.host = `127.0.0.1:${targetPort}`
     delete headers['transfer-encoding']
     delete headers['connection']
+    // Withhold our gate credentials from the upstream (see
+    // `stripProxyAuthHeaders`' comment).
+    stripProxyAuthHeaders(headers)
 
     const proxyReq = http.request(
       {
@@ -188,9 +221,13 @@ export function attachProxyUpgradeHandler(server: http.Server): void {
 
     // Connect to the target and relay the upgrade handshake
     const proxySocket = net.connect(targetPort, '127.0.0.1', () => {
-      // Reconstruct the HTTP upgrade request for the target
+      // Reconstruct the HTTP upgrade request for the target — withholding
+      // our gate credentials exactly like the HTTP leg (see
+      // `stripProxyAuthHeaders`).
+      const forwardHeaders: Record<string, string | string[] | undefined> = { ...req.headers }
+      stripProxyAuthHeaders(forwardHeaders)
       const reqLine = `${req.method} ${targetPath} HTTP/1.1\r\n`
-      const headers = Object.entries(req.headers)
+      const headers = Object.entries(forwardHeaders)
         .filter(([k]) => k !== 'host')
         .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`)
         .concat([`host: 127.0.0.1:${targetPort}`])

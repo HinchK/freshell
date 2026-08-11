@@ -71,28 +71,35 @@ async function getBrowserPreferences(page: any) {
 }
 
 test.describe('Settings Persistence Split', () => {
-  // HARNESS-02 Finding 2 -- this scenario depends on `legacyLocalSettingsSeed`
-  // (seeded into `.freshell/config.json` by this file's `testServer`
-  // override above and asserted back out of the persisted config at the end
-  // of the test) round-tripping through the server's settings-load path. The
-  // Rust server does not implement `legacyLocalSettingsSeed` at all yet --
-  // grep evidence: `crates/freshell-server` has no match for
-  // `legacyLocalSettingsSeed` or `legacy_local_settings_seed` anywhere in the
-  // crate (confirmed via `grep -rn legacyLocalSettingsSeed crates/` and
-  // `grep -rn legacy_local_settings_seed crates/` both returning zero
-  // matches, whereas `server/config.ts`/`server/settings-router.ts` on the
-  // Node side load and merge it) -- tracked as CFG-04/SESSION-13. Scoped to
-  // the `rust` project via the `e2eServerKind` worker option so
-  // `legacy-chromium` continues to run and pass this spec normally, and a
-  // future Rust implementation of CFG-04/SESSION-13 will flip this back to
-  // an (expected) pass, which Playwright reports as an unexpected-pass
-  // failure that flags the annotation for removal.
-  test.fail(
-    ({ e2eServerKind }) => e2eServerKind === 'rust',
-    'CFG-04/SESSION-13: legacyLocalSettingsSeed not implemented in Rust',
-  )
-
-  test('browser-local settings stay local while server-backed settings replicate', async ({ browser, serverInfo }) => {
+  // HARNESS-02 Finding 2 -- the seed half of this scenario depends on
+  // `legacyLocalSettingsSeed` (seeded into `.freshell/config.json` by this
+  // file's `testServer` override above and asserted back out of the
+  // persisted config at the end of each test) round-tripping through the
+  // server's settings-load path.
+  // HISTORY: the Rust server originally lacked `legacyLocalSettingsSeed`
+  // entirely, AND did not surface a PATCHed server-shared `defaultCwd`
+  // through its WS/bootstrap settings resolution -- this spec's rust leg
+  // carried a committed describe-wide `test.fail` citing CFG-04/SESSION-13
+  // for both gaps together. CFG-04 (df1, merge b6aa86d79) ported the seed
+  // extraction/merge/persist/bootstrap-return into the Rust server
+  // (`crates/freshell-server/src/legacy_local_seed.rs` + `settings_store.rs`
+  // + `boot.rs`) and flipped the whole leg to expected-pass, which exposed
+  // the still-open second gap. This spec therefore splits its expectations
+  // per-test (Playwright's `test.fail` granularity is per `test(...)`):
+  //   - seed/browser-local test below: expected-PASS on BOTH projects (the
+  //     deeper one-shot-consumption acceptance lives in
+  //     `cfg04-legacy-browser-seed.spec.ts`; triage entry point for a seed
+  //     regression is docs/plans/df1-evidence/CFG-04.md);
+  //   - defaultCwd replication test at the bottom: expected-PASS on BOTH
+  //     projects. This was pinned `test.fail` on `rust-chromium` with owner
+  //     CFG-12; CFG-12 (df1) then made the rust `/ws` connect handshake
+  //     resolve the LIVE settings store per connection
+  //     (`crates/freshell-ws/src/lib.rs` `WsState::handshake_settings` +
+  //     `SettingsStore::shared_settings_lock()`, mirroring the original's
+  //     per-connection `handshakeSnapshotProvider`, `server/index.ts:415-427`)
+  //     and the pin was deleted; triage entry point for a replication
+  //     regression is docs/plans/df1-evidence/CFG-12.md.
+  test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo }) => {
     const contextA = await browser.newContext()
     const pageA = await contextA.newPage()
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -135,6 +142,31 @@ test.describe('Settings Persistence Split', () => {
     const preferencesB = await getBrowserPreferences(pageB)
     expect(preferencesB?.settings?.theme).toBe('light')
 
+    // Server-side proof the browser-local override stayed local: the theme
+    // never lands in `settings`, and the original seed survives verbatim
+    // for future fresh profiles.
+    const configPath = path.join(serverInfo.homeDir, '.freshell', 'config.json')
+    const config = JSON.parse(await fs.readFile(configPath, 'utf8'))
+    expect(config.legacyLocalSettingsSeed).toMatchObject({
+      theme: 'light',
+    })
+    expect(config.settings.theme).toBeUndefined()
+
+    await contextB.close()
+    await contextA.close()
+  })
+
+  test('server-shared defaultCwd set by one profile replicates to another and persists to config.json', async ({ browser, serverInfo }) => {
+    const contextA = await browser.newContext()
+    const pageA = await contextA.newPage()
+    await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await waitForReady(pageA)
+
+    const contextB = await browser.newContext()
+    const pageB = await contextB.newPage()
+    await pageB.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await waitForReady(pageB)
+
     const sharedDefaultCwd = path.join(serverInfo.homeDir, 'shared-default-cwd')
     await fs.mkdir(sharedDefaultCwd, { recursive: true })
 
@@ -165,10 +197,6 @@ test.describe('Settings Persistence Split', () => {
     const configPath = path.join(serverInfo.homeDir, '.freshell', 'config.json')
     const config = JSON.parse(await fs.readFile(configPath, 'utf8'))
     expect(config.settings.defaultCwd).toBe(sharedDefaultCwd)
-    expect(config.legacyLocalSettingsSeed).toMatchObject({
-      theme: 'light',
-    })
-    expect(config.settings.theme).toBeUndefined()
 
     await contextB.close()
     await contextA.close()

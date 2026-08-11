@@ -1,0 +1,10 @@
+{
+  "//": "BROWSER-01 item-scoped typecheck gate (same pattern as tsconfig.raw-clients-check.json). The repo-owned typecheck configs deliberately exclude test/, so this gives the proxy spec an executable, file-attributed gate: run tsc -p on this file, then require zero error lines attributed to the BROWSER-01 spec. Errors in pre-existing dependency files (e.g. helpers/fixtures.ts) reproduce identically on the base commit and are out of scope.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": ["specs/browser01-proxy.spec.ts"]
+}

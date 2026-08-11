@@ -102,27 +102,65 @@ async fn bootstrap(State(state): State<BootState>, headers: HeaderMap) -> Respon
         return unauthorized();
     }
     let settings = state.settings.get().await;
-    // `shell`: `server/index.ts:191` wires `getShellTaskStatus` to
-    // `startupState.snapshot().tasks`; the original registers exactly two
-    // startup tasks (`sessionRepairService` @ index.ts:886, `codingCliIndexer`
-    // @ index.ts:901 — key order as observed live) and `ready` is
-    // `Object.values(tasks).every(Boolean)`. The port performs its equivalent
-    // init before binding the listener, so the steady-state snapshot (all
-    // true) is the faithful response for every observable request.
-    // `perf`: `getPerfLogging` (`index.ts:192`) → `{ logging: perfConfig.enabled }`,
-    // where enabled = parseBoolean(PERF_LOGGING) || parseBoolean(PERF_DEBUG)
-    // (`server/perf-logger.ts:33-35`).
-    Json(json!({
-        "settings": settings,
-        "platform": &*state.platform,
-        "shell": {
+    // CFG-04: the boot-extracted legacy local-settings seed rides the
+    // bootstrap payload (bootstrap-only, mirroring
+    // `server/shell-bootstrap-router.ts:34-36,75` — it appears here and
+    // nowhere else: not in `/api/settings`, not in any WS frame).
+    let legacy_local_settings_seed = state.settings.legacy_local_settings_seed();
+    Json(bootstrap_payload(
+        &settings,
+        legacy_local_settings_seed,
+        &state.platform,
+    ))
+    .into_response()
+}
+
+/// The bootstrap payload assembly, extracted as a pure function so the
+/// seed-carrying contract is unit-testable without a live `BootState`.
+///
+/// `shell`: `server/index.ts:191` wires `getShellTaskStatus` to
+/// `startupState.snapshot().tasks`; the original registers exactly two
+/// startup tasks (`sessionRepairService` @ index.ts:886, `codingCliIndexer`
+/// @ index.ts:901 — key order as observed live) and `ready` is
+/// `Object.values(tasks).every(Boolean)`. The port performs its equivalent
+/// init before binding the listener, so the steady-state snapshot (all
+/// true) is the faithful response for every observable request.
+/// `perf`: `getPerfLogging` (`index.ts:192`) → `{ logging: perfConfig.enabled }`,
+/// where enabled = parseBoolean(PERF_LOGGING) || parseBoolean(PERF_DEBUG)
+/// (`server/perf-logger.ts:33-35`).
+///
+/// Key order mirrors the original's payload literal
+/// (`shell-bootstrap-router.ts:73-80`): `settings`, then
+/// `legacyLocalSettingsSeed` — present ONLY when a seed exists (the
+/// original's conditional spread `...(seed ? { legacyLocalSettingsSeed } : {})`;
+/// absent, never `null`) — then `platform`, `shell`, `perf`.
+fn bootstrap_payload(
+    settings: &freshell_protocol::ServerSettings,
+    legacy_local_settings_seed: Option<Value>,
+    platform: &Value,
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "settings".to_string(),
+        serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
+    );
+    if let Some(seed) = legacy_local_settings_seed {
+        payload.insert("legacyLocalSettingsSeed".to_string(), seed);
+    }
+    payload.insert("platform".to_string(), platform.clone());
+    payload.insert(
+        "shell".to_string(),
+        json!({
             "authenticated": true,
             "ready": true,
             "tasks": { "sessionRepairService": true, "codingCliIndexer": true },
-        },
-        "perf": { "logging": perf_logging_enabled() },
-    }))
-    .into_response()
+        }),
+    );
+    payload.insert(
+        "perf".to_string(),
+        json!({ "logging": perf_logging_enabled() }),
+    );
+    Value::Object(payload)
 }
 
 /// `parseBoolean(env.PERF_LOGGING) || parseBoolean(env.PERF_DEBUG)`
@@ -888,5 +926,74 @@ mod tests {
         let other = Router::new().route("/api/settings", patch(|| async { "patch" }));
         // Would panic on an overlapping-method conflict; GET+PATCH is allowed.
         let _merged: Router = boot.merge(other);
+    }
+
+    // ── CFG-04: bootstrap carries the legacyLocalSettingsSeed ──────────────
+
+    /// The seed rides the bootstrap payload when (and only when) one was
+    /// extracted at boot — `server/shell-bootstrap-router.ts:75`'s
+    /// `...(legacyLocalSettingsSeed ? { legacyLocalSettingsSeed } : {})`, in
+    /// the original's key order (settings, seed, platform, shell, perf).
+    #[test]
+    fn bootstrap_payload_includes_seed_in_legacy_key_order() {
+        let settings = crate::settings::default_server_settings();
+        let seed = json!({
+            "theme": "light",
+            "sidebar": { "sortMode": "project" },
+            "notifications": { "soundEnabled": false }
+        });
+        let platform = json!({ "platform": "linux", "hostName": "testbox" });
+
+        let payload = bootstrap_payload(&settings, Some(seed.clone()), &platform);
+
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "settings",
+                "legacyLocalSettingsSeed",
+                "platform",
+                "shell",
+                "perf"
+            ]
+        );
+        assert_eq!(payload["legacyLocalSettingsSeed"], seed);
+        assert_eq!(
+            payload["settings"],
+            serde_json::to_value(&settings).expect("serializable")
+        );
+        assert_eq!(payload["platform"], platform);
+        // The pre-existing shape is untouched (handler-comment contract).
+        assert_eq!(payload["shell"]["authenticated"], json!(true));
+        assert_eq!(payload["shell"]["ready"], json!(true));
+        assert_eq!(
+            payload["shell"]["tasks"]["sessionRepairService"],
+            json!(true)
+        );
+        assert!(payload["perf"]["logging"].is_boolean());
+    }
+
+    /// No seed extracted at boot (fresh install / already-migrated profile)
+    /// → the key is ABSENT from the payload — never `null`
+    /// (`shell-bootstrap-router.ts`'s conditional spread).
+    #[test]
+    fn bootstrap_payload_omits_seed_when_absent() {
+        let settings = crate::settings::default_server_settings();
+        let payload = bootstrap_payload(&settings, None, &json!({ "platform": "linux" }));
+        assert!(
+            payload.get("legacyLocalSettingsSeed").is_none(),
+            "seed key leaked into a seedless payload: {payload}"
+        );
+        assert!(!serde_json::to_string(&payload)
+            .unwrap()
+            .contains("legacyLocalSettingsSeed"));
+        // Everything else is still there.
+        assert!(payload.get("settings").is_some());
+        assert!(payload.get("shell").is_some());
     }
 }

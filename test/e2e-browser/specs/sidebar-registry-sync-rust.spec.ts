@@ -15,8 +15,12 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// NOTE (RESTORE-01): this spec imports `test` from '@playwright/test'
+// directly (not the shared helpers/fixtures.js chain), so the harness
+// auto-decline watcher never attaches to its pages — its own decline idiom
+// below stays the sole authority over panel interactions. No opt-out needed.
 
 const SEEDED_CLAUDE_ID = randomUUID()
 const PROJECT_DIR = '/tmp/p114-sidebar-project'

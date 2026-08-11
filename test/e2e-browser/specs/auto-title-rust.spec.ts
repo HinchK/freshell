@@ -394,10 +394,10 @@ test.describe('Auto-title pipeline (rust)', () => {
       ).toBeVisible({ timeout: 10_000 })
 
       // The PANE header converged too (terminal.title.updated push). Same
-      // `.pane-header` element every pane renders (PaneHeader.tsx:100); the
+      // pane-header element every pane renders (PaneHeader.tsx); the
       // active tab's header is the visible one.
       await expect(
-        page.locator('.pane-header:visible').first(),
+        page.locator('[data-context="pane-header"]:visible').first(),
       ).toContainText('Repair the flux', { timeout: 10_000 })
     } finally {
       await cleanup(booted)

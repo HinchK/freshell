@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { testClockNowMs } from './test-clock.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
@@ -2431,7 +2432,9 @@ export class WsHandler {
 
               // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
               if (!m.restore) {
-                const now = Date.now()
+                // HARNESS-14: the shared, env-gated test clock (identity
+                // passthrough to Date.now() when FRESHELL_TEST_CLOCK is off).
+                const now = testClockNowMs()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
                   (t) => now - t < this.config.terminalCreateRateWindowMs
                 )

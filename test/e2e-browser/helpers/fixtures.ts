@@ -3,6 +3,10 @@ import { type TestServerInfo } from './test-server.js'
 import { TestHarness } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle, type E2eServerKind } from './external-target.js'
+import {
+  installRecoveryOfferAutoDeclineOnContext,
+  type RecoveryOfferHandling,
+} from './recovery-offer.js'
 
 /**
  * Select a shell from the PanePicker, handling the race condition where
@@ -58,12 +62,24 @@ async function selectShellFromPicker(page: Page): Promise<void> {
  * - freshellPage: A page pre-navigated to Freshell with harness ready
  */
 export const test = base.extend<{
-  testServer: E2eServerHandle
   serverInfo: TestServerInfo
   harness: TestHarness
   terminal: TerminalHelper
   freshellPage: Page
+  /**
+   * RESTORE-01 — whether the harness answers the rust server's designed
+   * recover-my-panes offer on fresh-context boots. Default 'auto-decline'
+   * clicks the real "Not now" button (docs/plans/df1/RESTORE-01.md). Specs
+   * that OWN panel assertions opt out: test.use({ recoveryOfferHandling: 'manual' }).
+   */
+  recoveryOfferHandling: RecoveryOfferHandling
 }, {
+  // NOTE: testServer is worker-scoped, so its TYPE belongs in the
+  // worker-scope generic group — declaring it in the test-scope group used to
+  // produce the TS2322 "worker-scope tuple" noise (and cascaded the whole
+  // extended type to a degraded map, hiding genuine option keys from
+  // test.use). Type-level correction; the fixture object below is unchanged.
+  testServer: E2eServerHandle
   // HARNESS-02 -- a worker-scoped Playwright PROJECT OPTION selecting which
   // real server implementation `testServer` should boot: the legacy Node
   // server or the owned Rust binary. Projects set this via `use:
@@ -74,6 +90,24 @@ export const test = base.extend<{
   e2eServerKind: E2eServerKind
 }>({
   e2eServerKind: ['legacy', { option: true, scope: 'worker' }],
+
+  recoveryOfferHandling: ['auto-decline', { option: true }],
+
+  // RESTORE-01 — on rust legs, every page of the default context carries the
+  // recovery-offer auto-decline watcher (the harness answering a designed
+  // offer like a user; see recovery-offer.ts header). Legacy legs install
+  // NOTHING (the route is absent there — byte-identical behavior). The
+  // built-in `context` is overridden, so spec-authored
+  // `browser.newContext()` pages bypass it; those specs adopt
+  // `installRecoveryOfferAutoDeclineOnContext` directly (multi-client,
+  // tabs-client-retire, project-colors-matrix) or opt out via
+  // `recoveryOfferHandling: 'manual'` (panel-owning specs).
+  context: async ({ context, e2eServerKind, recoveryOfferHandling }, use) => {
+    if (e2eServerKind === 'rust' && recoveryOfferHandling === 'auto-decline') {
+      installRecoveryOfferAutoDeclineOnContext(context)
+    }
+    await use(context)
+  },
 
   // The server handle is scoped per-worker for efficiency: each test file
   // shares one server.

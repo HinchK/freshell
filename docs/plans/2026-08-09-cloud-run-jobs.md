@@ -10,6 +10,27 @@
 
 **Tech Stack:** Docker multi-stage build (`rust:1-bookworm` + `node:22-bookworm`), Google Cloud Run Jobs, gcloud CLI, Playwright 1.58.2, bash wrapper script.
 
+> **Shipped deviation (wrap-review correction):** the Goal/Architecture text
+> above and R1 below describe the original REQUEST — "cloud by default."
+> What actually shipped keeps **local as the unset-default**: `npm run
+> test:e2e` resolves `"${FRESHELL_E2E_BACKEND:-local}"` in
+> `scripts/e2e-cloud.sh`, so a fresh clone runs locally; cloud is opt-in via
+> `FRESHELL_E2E_BACKEND=cloud`, the `--cloud` flag, or
+> `npm run test:e2e:cloud`. Pinned by checks 9-11 of
+> `scripts/test/cloud-run-wrapper.test.sh`. (The squash commit `ab8d6ed46`'s
+> "make cloud the default" line likewise describes the request, not the
+> shipped behavior; commit messages are immutable history and are not
+> rewritten.)
+
+> **Executed-plan scope note:** the per-task red/green steps below are the
+> campaign's execution HISTORY, not steps re-runnable at the merged HEAD —
+> each "verify the intended failure" step expected failure only at that
+> point in the execution (after the task's test landed, before its
+> implementation did). Re-running those steps against HEAD succeeds, which
+> is the expected outcome of a completed plan. The section meant to be
+> re-executed today is the validation runbook near the end (updated in
+> wrap-review r4 to select cloud explicitly).
+
 ## Global Constraints
 
 - GCP account: `dan@danshapiro.com`, project: `misc-puttering-project`, region: `us-west1`
@@ -26,7 +47,7 @@
 
 ## Requirements
 
-- **R1 — Cloud default:** `npm run test:e2e` executes the Playwright e2e suite on Google Cloud Run Jobs by default, not locally.
+- **R1 — Cloud default (NOT SHIPPED as written — see the Shipped-deviation note above):** `npm run test:e2e` executes the Playwright e2e suite on Google Cloud Run Jobs by default, not locally. **Shipped behavior:** unset `FRESHELL_E2E_BACKEND` resolves to **local** (`scripts/e2e-cloud.sh` `"${FRESHELL_E2E_BACKEND:-local}"`, pinned by `scripts/test/cloud-run-wrapper.test.sh` checks 9-11); cloud runs only via `FRESHELL_E2E_BACKEND=cloud`, the `--cloud` flag, or `npm run test:e2e:cloud`. Any agent executing steps below must verify against the SHIPPED contract, not this bullet.
 - **R2 — Local fallback:** `npm run test:e2e:local` (and `npm run test:e2e -- --local`) runs the same suite locally via direct Playwright invocation, preserving the pre-change behavior.
 - **R3 — End-to-end validation:** A Cloud Run Job executes a real test run (at minimum `auth.spec.ts`) and returns passing results that match the local baseline.
 - **R4 — Pass-through args:** The cloud execution path supports `--grep`, `--project`, and spec-file filter arguments passed through to Playwright inside the container.
@@ -299,33 +320,33 @@ git commit -m "feat: add e2e-cloud wrapper script, make cloud the default with -
 - No new files. Uses `scripts/e2e-cloud.sh`, `docker/cloud-run/Dockerfile`, `test/e2e-browser/playwright.cloud.config.ts`.
 - Test: manual validation with recorded evidence in `<logs-dir>/reports/cloud-validation.md`
 
-**Test cases:**
+**Test cases:** *(cloud selection must be explicit — see the Shipped-deviation note; `FRESHELL_E2E_BACKEND=cloud` is used below so the commands behave identically regardless of the caller's env)*
 - `scripts/e2e-cloud.sh build` — image builds and pushes successfully
-- `scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line` — 6 passed on Cloud Run
-- `scripts/e2e-cloud.sh run --project=chromium --reporter=line` — full chromium suite passes with similar counts to local baseline
-- `scripts/e2e-cloud.sh run --shards=2 --project=chromium --reporter=line` — sharded run completes, combined results cover all tests
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line` — 6 passed on Cloud Run
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium --reporter=line` — full chromium suite passes with similar counts to local baseline
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --shards=2 --project=chromium --reporter=line` — sharded run completes, combined results cover all tests
 
 - [ ] **Step 1: Build and push the image**
 
 Run: `scripts/e2e-cloud.sh build`
 
-Expected: Docker image builds locally and pushes to `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:latest`.
+Expected: Docker image builds locally and pushes BOTH refs: the commit-addressed `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:<head-sha>` tag (what `run` resolves; a dirty tree tags `<head-sha>-dirty` and always rebuilds) and the rolling `:latest` pointer.
 
 - [ ] **Step 2: Create the Cloud Run Job**
 
-Run: `scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
 
 Expected: Cloud Run Job is created (if first run) and executed. 6 auth tests pass. Exit code 0.
 
 - [ ] **Step 3: Run the full chromium suite**
 
-Run: `scripts/e2e-cloud.sh run --project=chromium --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium --reporter=line`
 
 Expected: Full chromium suite runs. Pass/fail counts are consistent with local baseline (within retry variance). Exit code 0 or 1 (1 if pre-existing failures match local baseline).
 
 - [ ] **Step 4: Test sharding**
 
-Run: `scripts/e2e-cloud.sh run --shards=2 --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --shards=2 --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
 
 Expected: Two Cloud Run tasks execute. Combined, all auth tests are covered. Both tasks exit 0.
 
@@ -345,6 +366,6 @@ git commit -m "test: validate Cloud Run Jobs end-to-end with smoke and full suit
 ## Notes
 
 - The `playwright.config.ts` refactor to export `MATRIX_SPECS` and `RUST_ONLY_SPECS` (Task 2) is a minimal DRY improvement that does not change any behavior. The base config's `export default defineConfig(...)` remains unchanged.
-- The `package.json` change (Task 3) repurposes `test:e2e` from local to cloud. The old behavior is preserved as `test:e2e:local`. This is the user's explicit request: "Make that the new default with a flag For any other options like running locally."
+- The `package.json` change (Task 3) was PLANNED to repurpose `test:e2e` from local to cloud, per the user's explicit request: "Make that the new default with a flag For any other options like running locally." **As shipped, it did not:** `test:e2e` routes through `scripts/e2e-cloud.sh run`, which defaults unset `FRESHELL_E2E_BACKEND` to LOCAL — the old behavior is fully preserved by default and cloud is opt-in (`test:e2e:cloud`, `--cloud`, or the env var). See the Shipped-deviation note at the top of this plan.
 - Cloud Run Jobs have a maximum execution time of 24 hours and a maximum of 256 tasks. The default 1-shard config runs all tests in one task; `--shards=N` splits across N parallel tasks.
 - The Docker image includes the Rust server binary for `rust-chromium` project support. The image will be large (~2-3 GB) due to Playwright browsers + Node deps + Rust binary.

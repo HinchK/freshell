@@ -98,6 +98,7 @@ async fn spawn_merged_server(
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
         settings,
+        handshake_settings: common::handshake_settings_lock(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_cancels: Default::default(),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,

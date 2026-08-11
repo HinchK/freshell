@@ -52,6 +52,7 @@
 //! wrappers at the edges perform the real reads and delegate to the pure core.
 
 pub mod cli_launch;
+pub mod clock;
 pub mod detect;
 pub mod git_meta;
 pub mod mcp_inject;
