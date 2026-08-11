@@ -396,10 +396,19 @@ async fn ui_layout_sync_ingest_never_replies() {
 #[tokio::test]
 async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
     let (url, _registry, state) = spawn_server_with_specs_and_state(vec![]).await;
-    // Mount the fresh-agent REST router against the SAME FreshAgentState the
-    // WS dispatch feeds — the shape freshell-server's main.rs production
-    // composition has (one store per process).
-    let rest_router = freshell_freshagent::router(state.fresh_opencode.fresh_agent().clone());
+    // Mount the fresh-agent REST router against a FreshAgentState sharing the
+    // SAME layout store the WS dispatch feeds — the exact wiring
+    // freshell-server's main.rs production composition has (one store per
+    // process, threaded via `.with_layout(...)`). NOTE: `WsState::state()`
+    // wires `layout: Default::default()` separately from the fresh-agent
+    // state's own store, so mounting `state.fresh_opencode.fresh_agent()`
+    // here would read a DIFFERENT store and this endpoint would answer empty.
+    let rest_state = freshell_freshagent::FreshAgentState::new(
+        state.auth_token.clone(),
+        state.broadcast_tx.clone(),
+    )
+    .with_layout(state.layout.clone());
+    let rest_router = freshell_freshagent::router(rest_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -467,10 +476,11 @@ async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
         serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
     assert_eq!(
         body["data"]["panes"],
-        // Legacy-exact rows: absent fields are OMITTED (never null keys).
+        // Legacy-exact rows: absent fields are OMITTED (never null keys), and
+        // the row shape carries NO tabId (`listPanes`, layout-store.ts:341-355).
         json!([
-            { "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_ws", "title": "Shell", "tabId": "tab_ws" },
-            { "id": "pane_2", "index": 1, "kind": "editor", "title": "ws.md", "tabId": "tab_ws" },
+            { "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_ws", "title": "Shell" },
+            { "id": "pane_2", "index": 1, "kind": "editor", "title": "ws.md" },
         ])
     );
 
