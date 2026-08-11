@@ -244,6 +244,62 @@ describe('ws tabs registry protocol', () => {
     ws.close()
   })
 
+  it('round-trips sessionKeys/busySessionKeys pane payload fields byte-identical through push and query (R5)', async () => {
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const producer = await connect()
+
+    const sessionKeys = ['claude:ring-roundtrip-a', 'claude:ring-roundtrip-alias-b']
+    const busySessionKeys = ['claude:ring-roundtrip-a']
+    producer.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      deviceId: 'producer-device',
+      deviceLabel: 'producer',
+      clientInstanceId: 'producer-window',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'producer:open-1',
+          tabId: 'open-1',
+          status: 'open',
+          panes: [
+            {
+              paneId: 'pane-1',
+              kind: 'terminal',
+              payload: {
+                mode: 'claude',
+                sessionRef: { provider: 'claude', sessionId: 'ring-roundtrip-a' },
+                sessionKeys,
+                busySessionKeys,
+              },
+            },
+          ],
+        }),
+      ],
+    }))
+    const pushAck = await waitForMessage(producer, (msg) => msg.type === 'tabs.sync.ack')
+    expect(pushAck).toMatchObject({ accepted: true, openRecords: 1, closedRecords: 0 })
+
+    const consumer = await connect()
+    consumer.send(JSON.stringify({
+      type: 'tabs.sync.query',
+      requestId: 'ring-roundtrip-query',
+      deviceId: 'consumer-device',
+      clientInstanceId: 'consumer-window',
+      closedTabRetentionDays: 30,
+    }))
+    const snapshot = await waitForMessage(
+      consumer,
+      (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'ring-roundtrip-query',
+    )
+
+    expect(snapshot.data.remoteOpen).toHaveLength(1)
+    const panePayload = snapshot.data.remoteOpen[0].panes[0].payload
+    expect(panePayload.sessionKeys).toEqual(sessionKeys)
+    expect(panePayload.busySessionKeys).toEqual(busySessionKeys)
+    producer.close()
+    consumer.close()
+  })
+
   it('requires clientInstanceId/snapshotRevision and retires only that client snapshot', async () => {
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
     const ws = await connect()
