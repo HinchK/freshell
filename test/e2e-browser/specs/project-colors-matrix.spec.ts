@@ -1,9 +1,10 @@
 import fs from 'fs/promises'
 import path from 'path'
-import type { Page, Response } from '@playwright/test'
+import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 /**
  * SESSION-05 — project colors on History project headers (matrix leg).
@@ -113,57 +114,25 @@ function headerSwatch(page: Page, projectPath: string) {
 }
 
 /**
- * Rust-leg recovery-offer handling (gate B001 fix2). The Rust server alone
- * implements `GET /api/recovery/inventory` (B3/P1.9; legacy 404s and the
- * client's `.catch` stays quiet — a documented KNOWN DIVERGENCE of the
- * matrix). On a FRESH browser boot (empty localStorage, so the D1
- * `hadPersistedLayoutAtBoot` gate cannot suppress it) the client's
- * `RecoveryOfferPanel` fetches the inventory once at mount; when the other
- * context's already-pushed tab snapshot predates this boot's cutoff (A16),
- * the panel opens — a `fixed inset-0` modal overlay that intercepts EVERY
- * pointer event, so its unhandled appearance hangs any later click up to the
- * whole test budget (exactly the B001 rust-leg red; same failure class as
- * sidebar-registry-sync-rust.spec.ts:110-131, whose decline idiom this
- * refines).
- *
- * Discipline: register the response waiter BEFORE the fresh-boot `goto`
- * (the inventory fetch fires at mount, seconds ahead of the harness/WS
- * waits), then branch on the OBSERVED response instead of the server kind —
- * both servers answer the fetch (legacy 404), so no leg pays a blind
- * panel-poll, and a rust offer that renders slowly (f3wp: >10 s under load)
- * is still caught: `recoverable: true` on the wire is followed by a strict
- * panel-visibility assertion before the decline click. Only FIRST boots need
- * this: reloads have a persisted layout (D1 suppresses), and a decisive
- * decline records dismissal + clears the pending offer.
+ * Rust-leg recovery-offer handling (gate B001 fix2 → RESTORE-01): the
+ * per-spec decline dance added by fix2 is RETIRED — the shared harness now
+ * answers the rust server's recover-my-panes offer on every fresh-context
+ * boot through the same deterministic rules (inventory response observed →
+ * panel rendered → real "Not now" click with f3wp-bounded waits): the
+ * default `page` fixture's context gets it from the `context` fixture
+ * override (helpers/fixtures.ts), and the manual `contextB` below adopts it
+ * via `installRecoveryOfferAutoDeclineOnContext`. Reloads never re-offer
+ * (D1: persisted layout present), reconnects never refetch. See
+ * docs/plans/df1/RESTORE-01.md and helpers/recovery-offer.ts's header.
  */
-async function declineRecoveryOfferIfMade(
-  page: Page,
-  inventoryResponse: Promise<Response | null>,
-): Promise<void> {
-  const response = await inventoryResponse
-  if (!response || !response.ok()) return
-  const inventory = await response.json().catch(() => null) as { recoverable?: boolean } | null
-  if (inventory?.recoverable !== true) return
-  const panel = page.getByTestId('recovery-offer-panel')
-  await expect(panel).toBeVisible({ timeout: 30_000 })
-  await page.getByTestId('recovery-decline').click()
-  await expect(panel).toHaveCount(0)
-}
-
-/** Register the inventory waiter, then perform a fresh-context boot. */
 async function bootFreshPage(
   page: Page,
   info: { baseUrl: string; token: string },
 ): Promise<TestHarness> {
-  const inventoryResponse = page.waitForResponse(
-    (r) => r.url().includes('/api/recovery/inventory'),
-    { timeout: 30_000 },
-  ).catch(() => null)
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
   await harness.waitForHarness()
   await harness.waitForConnection()
-  await declineRecoveryOfferIfMade(page, inventoryResponse)
   return harness
 }
 
@@ -223,13 +192,15 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
     const info = await server.start()
 
     const contextB = await browser.newContext()
+    // RESTORE-01: manual contexts bypass the fixtures' `context` override —
+    // adopt the shared recovery auto-decline watcher directly (the default
+    // `page` fixture's context is covered automatically).
+    installRecoveryOfferAutoDeclineOnContext(contextB)
     const pageB = await contextB.newPage()
 
     try {
       // --- Context A + Context B both open, both on the History (Projects)
       // view, BEFORE any color is set: both swatches show the default. ---
-      // Both are FRESH boots (the only boots the rust RecoveryOfferPanel can
-      // appear on — see declineRecoveryOfferIfMade's doc block).
       const harnessA = await bootFreshPage(page, info)
       await openHistoryView(page)
 

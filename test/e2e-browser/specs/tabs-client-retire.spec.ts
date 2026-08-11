@@ -1,5 +1,6 @@
 import type { Browser, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
+import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 const RETIRED_TAB_TITLE = 'Retire endpoint e2e tab'
 const RETIRED_DEVICE_LABEL = 'closing-device-e2e'
@@ -14,6 +15,10 @@ async function newDevicePage(
   },
 ): Promise<Page> {
   const context = await browser.newContext()
+  // RESTORE-01: manual contexts bypass the fixtures' `context` override, so
+  // this spec adopts the shared recovery auto-decline watcher directly
+  // (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
+  installRecoveryOfferAutoDeclineOnContext(context)
   await context.addInitScript((device) => {
     localStorage.setItem('freshell.device-id.v2', device.deviceId)
     localStorage.setItem('freshell.device-label.v2', device.deviceLabel)

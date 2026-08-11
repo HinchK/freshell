@@ -2,8 +2,8 @@
   "schema": 1,
   "item": "GATE-01",
   "generatedBy": "test/e2e-browser/helpers/gate01-collate.ts",
-  "head": "47b3b5dce5ae8bf3b43e68567b0cf45bf3cf67f9",
-  "rustServerBinSha256": "536e7fc9ba00fd294095453c719e183df9c8d8fc26ab27b1d54b8d9c06d1375c",
+  "head": "33fd5b650968c2a10884fd1fe3defbdea5528e44",
+  "rustServerBinSha256": "f0b62d95047fc8af119814d0a6c4bfb0df0a7f45ba752cf2bcc38e66d3aeaa3b",
   "suiteDefinition": {
     "selector": "test/e2e-browser/specs/**/*.spec.ts minus RUST_ONLY_SPECS (the chromium project test selection, playwright.config.ts)",
     "specCount": 69,
@@ -655,9 +655,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 58679,
+          "durationMs": 68619,
           "runs": [
-            "slice-0"
+            "slice-0",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -667,20 +668,32 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 58679
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 68619
             }
           ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 4,
-          "failed": 2,
+          "verdict": "pass",
+          "passed": 6,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 119308,
+          "durationMs": 52479,
           "runs": [
-            "slice-0"
+            "slice-0",
+            "restore01-red",
+            "restore01-green-rust-1",
+            "restore01-disambig-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -690,24 +703,41 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 119308
-            }
-          ],
-          "failures": [
-            {
-              "title": "editor pane has path input and open button",
-              "line": 120,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
             },
             {
-              "title": "editor pane shows empty state with Open File button",
-              "line": 133,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+              "run": "restore01-red",
+              "passed": 2,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 171449
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 5,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 61925
+            },
+            {
+              "run": "restore01-disambig-1",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 57242
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 52479
             }
           ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): waitForTerminal .xterm timeouts float between runs (slice-0: :120/:133; isolated: :83/:133/:193); dialog verified in contexts"
-          }
+          "failures": []
         }
       }
     },
@@ -1263,9 +1293,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 1145,
+          "durationMs": 1711,
           "runs": [
-            "slice-0"
+            "slice-0",
+            "restore01-harness"
           ],
           "runHistory": [
             {
@@ -1275,6 +1306,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 1145
+            },
+            {
+              "run": "restore01-harness",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1711
             }
           ],
           "failures": [],
@@ -1286,9 +1325,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 1120,
+          "durationMs": 1169,
           "runs": [
-            "slice-0"
+            "slice-0",
+            "restore01-harness"
           ],
           "runHistory": [
             {
@@ -1298,6 +1338,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 1120
+            },
+            {
+              "run": "restore01-harness",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 1169
             }
           ],
           "failures": [],
@@ -1314,9 +1362,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 4777,
+          "durationMs": 4976,
           "runs": [
-            "slice-1"
+            "slice-1",
+            "restore01-harness"
           ],
           "runHistory": [
             {
@@ -1326,6 +1375,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 4777
+            },
+            {
+              "run": "restore01-harness",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4976
             }
           ],
           "failures": [],
@@ -1337,9 +1394,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 3507,
+          "durationMs": 4064,
           "runs": [
-            "slice-1"
+            "slice-1",
+            "restore01-harness"
           ],
           "runHistory": [
             {
@@ -1349,6 +1407,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 3507
+            },
+            {
+              "run": "restore01-harness",
+              "passed": 26,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 4064
             }
           ],
           "failures": [],
@@ -1837,9 +1903,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 17137,
+          "durationMs": 52656,
           "runs": [
-            "slice-6"
+            "slice-6",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -1849,6 +1916,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 17137
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 6,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 52656
             }
           ],
           "failures": [],
@@ -1856,13 +1931,16 @@
         },
         "rust": {
           "verdict": "fail",
-          "passed": 4,
-          "failed": 2,
+          "passed": 5,
+          "failed": 1,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 98447,
+          "durationMs": 11329,
           "runs": [
-            "slice-6"
+            "slice-6",
+            "restore01-green-rust-1",
+            "restore01-disambig-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -1872,23 +1950,42 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 98447
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 5,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11886
+            },
+            {
+              "run": "restore01-disambig-1",
+              "passed": 5,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 15360
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 5,
+              "failed": 1,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 11329
             }
           ],
           "failures": [
             {
-              "title": "terminal output appears in both clients",
-              "line": 191,
-              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
-            },
-            {
               "title": "reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output",
-              "line": 217,
-              "error": "TimeoutError: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n  31 |   }\n  32 |\n> 33 |   await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })\n     |                                        ^\n  34 |   await page.waitForFunction(() => {\n  35 |     const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()\n  36 |     return buf !== null && buf !== undefined && buf.length > 0"
+              "line": 227,
+              "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeLessThanOrEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\nExpected: <= \u001b[32m2\u001b[39m\nReceived:    \u001b[31m3\u001b[39m\n\n\u001b[0m \u001b[90m 320 |\u001b[39m     \u001b[90m// named sources, nothing unbounded).\u001b[39m\n \u001b[90m 321 |\u001b[39m     expect(reconnectAttachMessages\u001b[33m.\u001b[39mlength)\u001b[33m.\u001b[39mtoBeGreaterThanOrEqual(\u001b[35m1\u001b[39m)\n\u001b[31m\u001b[1m>\u001b[22m\u001b[39m\u001b[90m 322 |\u001b[39m     expect(reconnectAttachMessages\u001b[33m.\u001b[39mlength)\u001b[33m.\u001b[39mtoBeLessThanOrEqual(\u001b[35m2\u001b[39m)\n \u001b[90m     |\u001b[39m                                            \u001b[31m\u001b[1m^\u001b[22m\u001b[39m\n \u001b[90m 323 |\u001b[39m\n \u001b[90m 324 |\u001b[39m     \u001b[36mawait\u001b[39m executeCommand(page1\u001b[33m,\u001b[39m \u001b[32m'printf \"__PTY_SIZE_AFTER__:%s\\\\n\" \"$(stty size)\"'\u001b[39m)\n \u001b[90m 325 |\u001b[39m     \u001b[36mconst\u001b[39m afterSize \u001b[33m=\u001b[39m \u001b[36mawait\u001b[39m waitForMarkedPtySize(page1\u001b[33m,\u001b[39m \u001b[32m'__PTY_SIZE_AFTER__'\u001b[39m\u001b[33m,\u001b[39m terminalId\u001b[33m!\u001b[39m)\u001b[0m"
             }
           ],
           "attribution": {
             "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 2/2 rust failure ctx show Restore dialog; legacy 6/7->6/6 green; NOTE multi-client:217 class known both-server flake (B002) remains latent, not observed here"
+            "note": "recovered by RESTORE-01 (F1 panel interference eliminated: restore01-green-rust-1/2, disambig-1 show 5/6 green, dialogs gone); RESIDUAL red is a NEWLY-UNMASKED rust parity divergence: reconnect reconnect-shaped terminal.attach count 3 vs spec bound <=2 (probe single-test-on-fresh-server reproduces identically with watcher provably inert). Candidate owner: reconcile/reconnect lane. Evidence: docs/plans/df1-evidence/RESTORE-01.md"
           }
         }
       }
@@ -2470,9 +2567,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 9137,
+          "durationMs": 28947,
           "runs": [
-            "slice-8"
+            "slice-8",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -2482,6 +2580,14 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 9137
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 28947
             }
           ],
           "failures": [],
@@ -2493,9 +2599,11 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 6486,
+          "durationMs": 16064,
           "runs": [
-            "slice-8"
+            "slice-8",
+            "restore01-green-rust-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -2505,6 +2613,22 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 6486
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 5291
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 1,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 16064
             }
           ],
           "failures": [],
@@ -3211,14 +3335,15 @@
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 6,
-          "failed": 1,
+          "verdict": "pass",
+          "passed": 7,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 190562,
+          "durationMs": 62158,
           "runs": [
-            "slice-7"
+            "slice-7",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -3228,19 +3353,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 190562
-            }
-          ],
-          "failures": [
+            },
             {
-              "title": "typing into the sidebar search box filters the session list to matching titles only",
-              "line": 617,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+              "run": "restore01-green-rust-2",
+              "passed": 7,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 62158
             }
           ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 1/1 ctx dialog; legacy 7/7 green"
-          }
+          "failures": []
         }
       }
     },
@@ -3355,9 +3478,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 68312,
+          "durationMs": 85902,
           "runs": [
-            "slice-9"
+            "slice-9",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -3367,20 +3491,31 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 68312
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 85902
             }
           ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 4,
-          "failed": 4,
+          "verdict": "pass",
+          "passed": 8,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 272141,
+          "durationMs": 58795,
           "runs": [
-            "slice-9"
+            "slice-9",
+            "restore01-red",
+            "restore01-green-rust-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -3390,34 +3525,33 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 272141
+            },
+            {
+              "run": "restore01-red",
+              "passed": 4,
+              "failed": 4,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 300371
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 58939
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 58795
             }
           ],
-          "failures": [
-            {
-              "title": "terminal font size input changes setting",
-              "line": 35,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "terminal color scheme selection",
-              "line": 60,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "scrollback lines slider changes setting",
-              "line": 130,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "debug logging toggle",
-              "line": 148,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            }
-          ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 4/4 ctx dialog; legacy 8/8 green same run"
-          }
+          "failures": []
         }
       }
     },
@@ -3575,14 +3709,15 @@
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 5,
-          "failed": 3,
+          "verdict": "pass",
+          "passed": 8,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 237695,
+          "durationMs": 55970,
           "runs": [
-            "slice-8"
+            "slice-8",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -3592,29 +3727,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 237695
-            }
-          ],
-          "failures": [
-            {
-              "title": "sidebar collapse toggle works",
-              "line": 11,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
             },
             {
-              "title": "sidebar search input is functional",
-              "line": 99,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "sidebar view switches: settings and back",
-              "line": 127,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
+              "run": "restore01-green-rust-2",
+              "passed": 8,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 55970
             }
           ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 3/3 ctx dialog; legacy 8/8 green"
-          }
+          "failures": []
         }
       }
     },
@@ -3645,14 +3768,15 @@
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 2,
-          "failed": 3,
+          "verdict": "pass",
+          "passed": 5,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 300434,
+          "durationMs": 37672,
           "runs": [
-            "slice-5"
+            "slice-5",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -3662,29 +3786,17 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 300434
-            }
-          ],
-          "failures": [
-            {
-              "title": "handles 6+ panes simultaneously",
-              "line": 6,
-              "error": "\u001b[31mTest timeout of 120000ms exceeded.\u001b[39m"
             },
             {
-              "title": "handles 10 tabs",
-              "line": 25,
-              "error": "\u001b[31mTest timeout of 120000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "large output does not crash",
-              "line": 68,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
+              "run": "restore01-green-rust-2",
+              "passed": 5,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 37672
             }
           ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 3/3 contexts dialog; stress+load amplifies; legacy 5/5 green same run"
-          }
+          "failures": []
         }
       }
     },
@@ -3757,9 +3869,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 99942,
+          "durationMs": 118930,
           "runs": [
-            "slice-7"
+            "slice-7",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -3769,20 +3882,30 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 99942
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 11,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 118930
             }
           ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 6,
-          "failed": 5,
+          "verdict": "pass",
+          "passed": 11,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 367143,
+          "durationMs": 79721,
           "runs": [
-            "slice-7"
+            "slice-7",
+            "restore01-green-rust-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -3792,39 +3915,25 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 367143
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 11,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 81842
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 11,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 79721
             }
           ],
-          "failures": [
-            {
-              "title": "clicking tab switches to it",
-              "line": 46,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "close tab removes it",
-              "line": 61,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "restored top tabs stay hot across page reload and still switch without replay",
-              "line": 111,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "tab overflow shows scroll controls",
-              "line": 172,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            },
-            {
-              "title": "Ctrl+Shift+brackets follow reordered tab order from a focused terminal",
-              "line": 219,
-              "error": "\u001b[31mTest timeout of 60000ms exceeded.\u001b[39m"
-            }
-          ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 5/5 ctx dialog; legacy 11/11 green"
-          }
+          "failures": []
         }
       }
     },
@@ -4155,9 +4264,10 @@
           "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 124715,
+          "durationMs": 113402,
           "runs": [
-            "slice-2"
+            "slice-2",
+            "restore01-green-legacy"
           ],
           "runHistory": [
             {
@@ -4167,20 +4277,31 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 124715
+            },
+            {
+              "run": "restore01-green-legacy",
+              "passed": 13,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 113402
             }
           ],
           "failures": [],
           "attribution": null
         },
         "rust": {
-          "verdict": "fail",
-          "passed": 6,
-          "failed": 7,
+          "verdict": "pass",
+          "passed": 13,
+          "failed": 0,
           "skipped": 0,
           "expectedFail": 0,
-          "durationMs": 344641,
+          "durationMs": 95939,
           "runs": [
-            "slice-2"
+            "slice-2",
+            "restore01-red",
+            "restore01-green-rust-1",
+            "restore01-green-rust-2"
           ],
           "runHistory": [
             {
@@ -4190,49 +4311,33 @@
               "skipped": 0,
               "expectedFail": 0,
               "durationMs": 344641
+            },
+            {
+              "run": "restore01-red",
+              "passed": 7,
+              "failed": 6,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 316864
+            },
+            {
+              "run": "restore01-green-rust-1",
+              "passed": 13,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 96721
+            },
+            {
+              "run": "restore01-green-rust-2",
+              "passed": 13,
+              "failed": 0,
+              "skipped": 0,
+              "expectedFail": 0,
+              "durationMs": 95939
             }
           ],
-          "failures": [
-            {
-              "title": "creates a terminal on first load",
-              "line": 31,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "typing in terminal sends input",
-              "line": 53,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "terminal survives tab switch and return",
-              "line": 75,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "detached terminal keeps running",
-              "line": 196,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "terminal handles rapid input",
-              "line": 219,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "close tab kills terminal",
-              "line": 248,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            },
-            {
-              "title": "terminal scrollback is preserved",
-              "line": 286,
-              "error": "TimeoutError: locator.waitFor: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.xterm').first() to be visible\u001b[22m\n\n\n   at ../helpers/terminal-helpers.ts:124\n\n  122 |    */\n  123 |   async waitForTerminal(nth = 0, timeout = 15_000): Promise<void> {\n> 124 |     await this.getTerminalContainer(nth).waitFor({ state: 'visible', timeout })\n      |                                          ^\n  125 |   }"
-            }
-          ],
-          "attribution": {
-            "kind": "gap-unscoped",
-            "note": "recovery-offer interference (F1): 7/7 failure contexts contain the Restore dialog; legacy leg 13/13 green in same run"
-          }
+          "failures": []
         }
       }
     },
