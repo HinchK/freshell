@@ -59,7 +59,14 @@ pub struct UiSnapshot {
 struct ClientEntry {
     key: String,
     snapshot: UiSnapshot,
+    /// True once this client's WS connection closed (see [`LayoutStore::remove_client`]).
+    /// Always false on a live sync.
+    stale: bool,
 }
+
+/// Growth safety valve for stale-snapshot retention: at most this many stale
+/// entries are kept; beyond it the OLDEST stale entry is dropped.
+const MAX_STALE_ENTRIES: usize = 4;
 
 /// Snapshot key for server-side bootstrap mutations (`create_tab` on an empty
 /// store). Evicted on the first real client sync — mirroring the old
@@ -81,20 +88,43 @@ const SERVER_CLIENT_KEY: &str = "__server__";
 ///   most-recent-first;
 /// - mutations land in EVERY client snapshot containing the id (same-origin
 ///   windows share localStorage and therefore ids);
-/// - a client's snapshot is evicted when its WS connection closes.
+/// - a client's snapshot is marked STALE (retained, never primary while a
+///   live client exists) when its WS connection closes — the client's layout
+///   mirror is change-gated and never re-syncs on a silent reconnect, so
+///   hard eviction would leave that client's ids unresolvable for an
+///   unbounded window. A stale entry is dropped only when a live sync covers
+///   every one of its pane ids (lossless supersede), or past the stale cap.
 #[derive(Default)]
 struct LayoutInner {
-    /// Most-recent-first: index 0 is the PRIMARY (last writer).
+    /// Most-recent-sync-first. The PRIMARY is the most recently synced LIVE
+    /// entry; if only stale entries remain, the most recent stale one
+    /// (Node-parity post-disconnect reads).
     clients: Vec<ClientEntry>,
 }
 
 impl LayoutInner {
+    /// Index of the PRIMARY entry: the most recently synced LIVE entry, or —
+    /// on a fully-stale store — the most recent stale one. `None` only when
+    /// the store is truly empty.
+    fn primary_index(&self) -> Option<usize> {
+        if self.clients.is_empty() {
+            return None;
+        }
+        Some(
+            self.clients
+                .iter()
+                .position(|entry| !entry.stale)
+                .unwrap_or(0),
+        )
+    }
+
     fn primary(&self) -> Option<&UiSnapshot> {
-        self.clients.first().map(|entry| &entry.snapshot)
+        self.primary_index().map(|i| &self.clients[i].snapshot)
     }
 
     fn primary_mut(&mut self) -> Option<&mut UiSnapshot> {
-        self.clients.first_mut().map(|entry| &mut entry.snapshot)
+        let index = self.primary_index()?;
+        Some(&mut self.clients[index].snapshot)
     }
 
     /// All client snapshots, primary first, then most-recent-first.
@@ -113,9 +143,11 @@ impl LayoutInner {
             self.clients.push(ClientEntry {
                 key: SERVER_CLIENT_KEY.to_string(),
                 snapshot: UiSnapshot::default(),
+                stale: false,
             });
         }
-        &mut self.clients[0].snapshot
+        let index = self.primary_index().expect("clients is non-empty");
+        &mut self.clients[index].snapshot
     }
 }
 
@@ -244,17 +276,34 @@ impl LayoutStore {
                 seed_pane_title(&mut snapshot, &tab_id, &pane_id, &content);
             }
         }
+        let incoming_pane_ids = pane_ids_of(&snapshot);
         let mut inner = self.lock();
         // Re-sync replaces this client's own snapshot; a real client sync also
         // supersedes the server bootstrap entry (old wholesale-replace parity).
-        inner
-            .clients
-            .retain(|entry| entry.key != source_connection_id && entry.key != SERVER_CLIENT_KEY);
+        // SUBSET supersede-eviction: a STALE entry is dropped only when EVERY
+        // pane id in it appears in the incoming live sync — lossless by
+        // construction (every evicted id stays resolvable via the live entry),
+        // so it needs no same-client inference. Mere id overlap is NOT enough:
+        // server-minted agent-API ids are broadcast to EVERY client via
+        // `ui.command{tab.create}`, so a one-id-overlap predicate would let
+        // any live client's next sync discard a DIFFERENT disconnected
+        // client's unique locally-minted ids during exactly the
+        // silent-reconnect window retention protects.
+        inner.clients.retain(|entry| {
+            if entry.key == source_connection_id || entry.key == SERVER_CLIENT_KEY {
+                return false;
+            }
+            !(entry.stale
+                && pane_ids_of(&entry.snapshot)
+                    .iter()
+                    .all(|id| incoming_pane_ids.contains(id)))
+        });
         inner.clients.insert(
             0,
             ClientEntry {
                 key: source_connection_id.to_string(),
                 snapshot,
+                stale: false,
             },
         );
     }
@@ -263,13 +312,12 @@ impl LayoutStore {
         !self.lock().clients.is_empty()
     }
 
-    /// The PRIMARY (most recently synced) client's connection id.
+    /// The PRIMARY (most recently synced live, else most recent stale)
+    /// client's connection id.
     pub fn source_connection_id(&self) -> Option<String> {
-        self.lock()
-            .clients
-            .first()
-            .map(|entry| entry.key.clone())
-            .filter(|key| key != SERVER_CLIENT_KEY)
+        let inner = self.lock();
+        let index = inner.primary_index()?;
+        Some(inner.clients[index].key.clone()).filter(|key| key != SERVER_CLIENT_KEY)
     }
 
     /// Exact Node keys: `tabs`/`activeTabId`/`layouts`/`activePane`/`paneTitles`/
@@ -921,10 +969,46 @@ impl LayoutStore {
         None
     }
 
-    /// Drops the snapshot owned by `client_key` (WS disconnect eviction). The
-    /// primary falls back to the most recently synced remaining client.
+    /// Marks the snapshot owned by `client_key` STALE (WS disconnect) instead
+    /// of dropping it: the client's layout mirror (`layoutMirrorMiddleware.ts`)
+    /// is change-gated and never re-sends on a silent reconnect, so hard
+    /// eviction would leave that client's ids unresolvable until its next
+    /// layout change. The primary falls back to the most recently synced LIVE
+    /// client; by-id reads and mutations keep treating the stale entry like a
+    /// live one. The entry is dropped when a later live sync covers every one
+    /// of its pane ids ([`Self::update_from_ui`]'s subset supersede) or when
+    /// it falls past the stale cap ([`MAX_STALE_ENTRIES`], oldest first).
     pub fn remove_client(&self, client_key: &str) {
-        self.lock().clients.retain(|entry| entry.key != client_key);
+        let mut inner = self.lock();
+        if let Some(entry) = inner
+            .clients
+            .iter_mut()
+            .find(|entry| entry.key == client_key)
+        {
+            entry.stale = true;
+        }
+        // Growth safety valve: the vec is most-recent-first, so the LAST
+        // stale entry is the oldest.
+        while inner.clients.iter().filter(|e| e.stale).count() > MAX_STALE_ENTRIES {
+            let oldest = inner
+                .clients
+                .iter()
+                .rposition(|e| e.stale)
+                .expect("count above cap implies a stale entry exists");
+            inner.clients.remove(oldest);
+        }
+    }
+
+    /// Total retained entries (live + stale) — test/diagnostic probe.
+    pub fn client_entry_count(&self) -> usize {
+        self.lock().clients.len()
+    }
+
+    /// Retained STALE (disconnected) entries — test/diagnostic probe; the WS
+    /// integration test uses this as its disconnect-processed and
+    /// supersede-processed barriers.
+    pub fn stale_entry_count(&self) -> usize {
+        self.lock().clients.iter().filter(|e| e.stale).count()
     }
 
     /// Whether the tab holding `pane_id` has exactly one pane — the
@@ -1030,6 +1114,17 @@ fn nested_bool_map(raw: Option<&Value>) -> HashMap<String, HashMap<String, bool>
 
 fn string_field(content: &Value, key: &str) -> Option<String> {
     content.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Every pane id in every tab layout of one snapshot — the supersede
+/// (subset) check's unit of coverage.
+fn pane_ids_of(snapshot: &UiSnapshot) -> std::collections::HashSet<String> {
+    snapshot
+        .layouts
+        .keys()
+        .flat_map(|tab_id| leaves_of(snapshot, tab_id))
+        .map(|(id, _content)| id)
+        .collect()
 }
 
 /// Depth-first `(paneId, content)` pairs for one tab's layout.

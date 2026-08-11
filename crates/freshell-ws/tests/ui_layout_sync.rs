@@ -8,8 +8,12 @@
 //! ws.connectionId || 'unknown')` (`server/ws-handler.ts:2024-2027`).
 //! Intentional divergence: the store keeps one snapshot PER connection
 //! (Node keeps a single last-writer-wins snapshot), so by-id agent-API
-//! operations resolve pane/tab ids from EVERY connected client, and a
-//! connection's snapshot is evicted when it closes.
+//! operations resolve pane/tab ids from EVERY connected client. A closed
+//! connection's snapshot is marked STALE and RETAINED (never primary while a
+//! live client exists) — the client's layout mirror is change-gated and never
+//! re-syncs on a silent reconnect, so hard eviction would leave that client's
+//! ids unresolvable for an unbounded window. A stale entry is dropped only
+//! when a live sync covers every one of its pane ids (lossless supersede).
 //!
 //! No reply frame exists (Node sends none), so a `ping`/`pong` round-trip on
 //! the SAME connection is the ordering barrier: the serve loop dispatches
@@ -270,11 +274,19 @@ async fn sync_single_pane(ws: &mut TestWs, tab_id: &str, pane_id: &str, ts: i64)
 /// Multi-client layout store (the cross-client pane-rename fix): two REAL WS
 /// connections sync DIFFERENT layouts (pane/tab ids are client-local); the
 /// REST agent surface must resolve pane ids from the NON-last-writer
-/// connection, and closing a connection must evict its snapshot. This
-/// intentionally diverges from Node's single last-writer-wins snapshot
+/// connection, and a closed connection's snapshot must be RETAINED as stale
+/// (silent-reconnect window) until a live sync covers all of its pane ids.
+/// This intentionally diverges from Node's single last-writer-wins snapshot
 /// (`server/agent-api/layout-store.ts`).
+///
+/// The disconnect phase is sequenced around POSITIVE barriers: conn-1 is
+/// re-synced LAST so it is primary, and the close is proven processed by the
+/// primary flipping to conn-2 (stale-never-primary) plus
+/// `stale_entry_count() == 1` — only then is retention asserted. A bare
+/// "`p1` still resolvable" check alone would pass vacuously before the server
+/// even processed the close.
 #[tokio::test]
-async fn two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_evicts() {
+async fn two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_retains_stale() {
     let (url, http, layout) = spawn_server().await;
 
     let mut ws1 = connect_and_hello(&url).await;
@@ -308,29 +320,66 @@ async fn two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_e
     assert_eq!(tabs[0]["id"], serde_json::json!("t2"));
     assert_eq!(active.as_deref(), Some("t2"));
 
-    // Closing ws1 evicts its snapshot (poll: disconnect handling is async).
+    // (1) Re-sync conn-1 LAST so it becomes the primary: `list_tabs()`
+    // answering t1 is the precondition the disconnect barrier flips.
+    sync_single_pane(&mut ws1, "t1", "p1", 300).await;
+    let (tabs, _) = layout.list_tabs();
+    assert_eq!(
+        tabs[0]["id"],
+        serde_json::json!("t1"),
+        "conn-1's re-sync must make it the primary"
+    );
+
+    // (2) Close conn-1 and wait for the POSITIVE disconnect-processed
+    // barriers: its entry goes stale, and — stale-never-primary — the primary
+    // flips back to conn-2's t2 (poll: disconnect handling is async).
     ws1.close(None).await.expect("close ws1");
     drop(ws1);
-    let mut evicted = false;
+    let mut disconnect_processed = false;
     for _ in 0..100u8 {
-        if layout.get_pane_snapshot("p1").is_none() {
-            evicted = true;
+        let (tabs, _) = layout.list_tabs();
+        if layout.stale_entry_count() == 1 && tabs[0]["id"] == serde_json::json!("t2") {
+            disconnect_processed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        evicted,
-        "disconnect must evict the closed client's snapshot"
-    );
-    assert_eq!(
-        layout.rename_pane("p1", "X").message,
-        Some("pane not found"),
-        "evicted panes no longer resolve"
+        disconnect_processed,
+        "the close must mark conn-1's entry stale and flip the primary to t2"
     );
 
-    // The surviving connection keeps working.
+    // (3) Retention: the disconnected client's ids still resolve (the
+    // silent-reconnect window).
+    assert!(
+        layout.get_pane_snapshot("p1").is_some(),
+        "a closed connection's snapshot must be retained as stale"
+    );
+
+    // (4) A THIRD connection (the reconnected client) syncs conn-1's EXACT
+    // layout — covering all of the stale entry's pane ids — which supersedes
+    // it losslessly. (conn-2's sync never contains p1, so under the subset
+    // rule it must NOT be the superseder.)
+    let mut ws3 = connect_and_hello(&url).await;
+    sync_single_pane(&mut ws3, "t1", "p1", 400).await;
+    let mut superseded = false;
+    for _ in 0..100u8 {
+        if layout.stale_entry_count() == 0 {
+            superseded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        superseded,
+        "a live sync covering every stale pane id must evict the stale entry"
+    );
+    assert_eq!(layout.client_entry_count(), 2, "conn-2 + conn-3 remain");
+
+    // Both surviving connections' ids keep resolving; the reconnected client
+    // is the last writer, so default reads answer t1.
+    assert!(layout.get_pane_snapshot("p1").is_some());
     assert!(layout.get_pane_snapshot("p2").is_some());
     let (tabs, _) = layout.list_tabs();
-    assert_eq!(tabs[0]["id"], serde_json::json!("t2"));
+    assert_eq!(tabs[0]["id"], serde_json::json!("t1"));
 }
