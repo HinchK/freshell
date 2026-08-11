@@ -24,12 +24,13 @@ import {
   type SidebarSessionItem,
 } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { getActiveSessionRefForTab } from '@/lib/session-utils'
+import { getActiveSessionRefForTab, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
-import { collectBusySessionKeys } from '@/lib/pane-activity'
+import { collectBusySessionKeys, collectPaneIdentityActivity } from '@/lib/pane-activity'
+import { selectRemoteSessionActivity, selectSameDeviceSessionKeys } from '@/store/selectors/tabsRegistrySelectors'
 import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
@@ -42,6 +43,12 @@ const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+
+/** Non-color carriers for the remote status ring (a11y): tooltip line + sr-only hint. */
+const REMOTE_STATUS_COPY = {
+  busy: { tooltip: 'Busy on another device', srOnly: '(busy on another device)' },
+  open: { tooltip: 'Open on another device', srOnly: '(open on another device)' },
+} as const
 
 function sameSessionRef(
   a?: BackgroundTerminal['sessionRef'],
@@ -376,6 +383,40 @@ export default function Sidebar({
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
+
+  // Remote status rings (R3): a ring appears only when the session is NOT open
+  // on this device. Remote activity comes from other devices' pushed registry
+  // snapshots; the suppression set unions three local identity sources.
+  const remoteActivityBySessionKey = useAppSelector(selectRemoteSessionActivity)
+  const sameDeviceSessionKeys = useAppSelector(selectSameDeviceSessionKeys)
+  const localOpenSessionKeys = useAppSelector((state) => {
+    const keys = new Set<string>()
+    for (const ref of collectSessionRefsFromTabs(
+      state.tabs.tabs,
+      { ...state.panes, layouts: state.panes?.layouts ?? EMPTY_LAYOUTS },
+    )) {
+      keys.add(`${ref.provider}:${ref.sessionId}`)
+    }
+    for (const paneActivity of collectPaneIdentityActivity({
+      tabs: state.tabs.tabs,
+      paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
+      codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
+      claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
+      amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
+      opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
+      paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
+      freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
+    }).values()) {
+      for (const key of paneActivity.sessionKeys) keys.add(key)
+      for (const key of paneActivity.busySessionKeys) keys.add(key)
+    }
+    return Array.from(keys).sort()
+  }, shallowEqual)
+  const localSessionKeys = useMemo(() => {
+    const keys = new Set(localOpenSessionKeys)
+    for (const key of busySessionKeys) keys.add(key)
+    return keys
+  }, [localOpenSessionKeys, busySessionKeys])
 
   // Read activeTabId from the store at call time (not closure) so that
   // handleItemClick has a stable reference and doesn't cause SidebarItem
@@ -892,6 +933,11 @@ export default function Sidebar({
                         item={item}
                         isActiveTab={isActive}
                         isBusy={busySessionKeySet.has(sessionKey)}
+                        remoteStatus={
+                          localSessionKeys.has(sessionKey) || sameDeviceSessionKeys.has(sessionKey)
+                            ? undefined
+                            : remoteActivityBySessionKey[sessionKey]
+                        }
                         showProjectBadge={settings.sidebar?.showProjectBadges}
                         onClick={() => handleItemClick(item)}
                         timestampTick={timestampTick}
@@ -936,6 +982,8 @@ interface SidebarItemProps {
   item: SessionItem
   isActiveTab?: boolean
   isBusy?: boolean
+  /** 'busy' (blue ring) or 'open' (green ring) on another device; absent when no ring. */
+  remoteStatus?: 'busy' | 'open'
   showProjectBadge?: boolean
   onClick: () => void
   /** Changing tick value breaks memo equality to refresh relative timestamps. */
@@ -949,6 +997,7 @@ interface SidebarItemProps {
 function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps): boolean {
   if (prev.isActiveTab !== next.isActiveTab) return false
   if (prev.isBusy !== next.isBusy) return false
+  if (prev.remoteStatus !== next.remoteStatus) return false
   if (prev.showProjectBadge !== next.showProjectBadge) return false
   if (prev.timestampTick !== next.timestampTick) return false
 
@@ -973,7 +1022,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 }
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
-  const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
+  const { item, isActiveTab, isBusy = false, remoteStatus, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
@@ -994,6 +1043,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-is-running={item.isRunning ? 'true' : 'false'}
           data-running-terminal-id={item.runningTerminalId ?? ''}
           data-has-tab={item.hasTab ? 'true' : 'false'}
+          data-remote-status={remoteStatus}
         >
           {/* Provider icon */}
           <div className="flex-shrink-0">
@@ -1004,6 +1054,15 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
                   isBusy ? 'text-blue-500' : item.hasTab ? 'text-success' : 'text-muted-foreground'
                 )}
               />
+              {remoteStatus && (
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    'pointer-events-none absolute -inset-[3px] rounded-full border',
+                    remoteStatus === 'busy' ? 'border-blue-500' : 'border-success'
+                  )}
+                />
+              )}
             </div>
           </div>
 
@@ -1018,6 +1077,9 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               >
                 {item.title}
               </span>
+              {remoteStatus && (
+                <span className="sr-only">{REMOTE_STATUS_COPY[remoteStatus].srOnly}</span>
+              )}
               {item.archived && (
                 <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
               )}
@@ -1038,6 +1100,9 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
       <TooltipContent>
         <div>{sessionLabel}: {item.title}</div>
         <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
+        {remoteStatus && (
+          <div className="text-muted-foreground">{REMOTE_STATUS_COPY[remoteStatus].tooltip}</div>
+        )}
       </TooltipContent>
     </Tooltip>
   )
