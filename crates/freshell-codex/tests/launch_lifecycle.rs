@@ -44,6 +44,7 @@ struct FakeRuntime {
     fail_ensure_ready: AtomicBool,
     shutdown_calls: AtomicU32,
     ownership_updates: Mutex<Vec<(String, u64)>>,
+    noted_session_ids: Mutex<Vec<String>>,
 }
 
 impl FakeRuntime {
@@ -79,6 +80,7 @@ impl FakeRuntime {
             fail_ensure_ready: AtomicBool::new(false),
             shutdown_calls: AtomicU32::new(0),
             ownership_updates: Mutex::new(Vec::new()),
+            noted_session_ids: Mutex::new(Vec::new()),
         })
     }
 }
@@ -109,6 +111,13 @@ impl CodexLaunchRuntime for FakeRuntime {
                 .lock()
                 .unwrap()
                 .push((terminal_id, generation));
+            Ok(())
+        })
+    }
+
+    fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.noted_session_ids.lock().unwrap().push(session_id);
             Ok(())
         })
     }
@@ -184,6 +193,40 @@ async fn resume_plan_sets_session_id_and_disables_candidate_persistence() {
         Some(false)
     );
     launch.sidecar.shutdown().await.unwrap();
+}
+
+/// Task 4: resume launches know their session id at plan time, so
+/// `plan_create` notes it on the runtime; fresh launches have no id yet
+/// (theirs arrives via the proxy's thread candidate), so no call is made.
+#[tokio::test]
+async fn plan_create_notes_the_resume_session_id_on_the_runtime() {
+    let runtime = FakeRuntime::start().await;
+    let planner = planner_for(runtime.clone());
+
+    let resume = planner
+        .plan_create(&CodexLaunchPlanInput {
+            resume_session_id: Some("s-1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.noted_session_ids.lock().unwrap().as_slice(),
+        &["s-1".to_string()],
+        "the resume plan must note its session id on the runtime"
+    );
+    resume.sidecar.shutdown().await.unwrap();
+
+    let fresh = planner
+        .plan_create(&CodexLaunchPlanInput::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.noted_session_ids.lock().unwrap().len(),
+        1,
+        "a fresh plan has no session id at plan time; no note call"
+    );
+    fresh.sidecar.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -985,6 +1028,45 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
     manager.shutdown().await;
 }
 
+/// Task 4: the manager seam forwards a captured session/thread id to the
+/// ADOPTED terminal's runtime; unknown terminal ids are a silent no-op
+/// (mirrors `mark_candidate_persisted`).
+#[tokio::test]
+async fn manager_note_session_id_reaches_adopted_runtime() {
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
+        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
+        .await
+        .unwrap();
+    manager.adopt("term-sid", launch, 0).await.unwrap();
+
+    // Unknown terminal id: silent no-op — nothing reaches the runtime.
+    manager
+        .note_session_id("no-such-terminal", "s-ignored")
+        .await;
+    assert!(
+        runtime.noted_session_ids.lock().unwrap().is_empty(),
+        "an unknown terminal id must not forward to any runtime"
+    );
+
+    manager.note_session_id("term-sid", "s-1").await;
+    assert_eq!(
+        runtime.noted_session_ids.lock().unwrap().as_slice(),
+        &["s-1".to_string()],
+        "the adopted terminal's runtime must see the noted session id"
+    );
+
+    manager.shutdown().await;
+}
+
 // ────── Task 3: durable sidecar records — persist on spawn, scrub on teardown,
 // survive server death (kata ynfn "surviving restarts is a feature") ──────────────
 
@@ -1086,6 +1168,36 @@ async fn update_ownership_metadata_enriches_the_record() {
         records[0].terminal_id.as_deref(),
         Some("term-42"),
         "adopt must enrich the record with the terminal id"
+    );
+
+    runtime
+        .shutdown()
+        .await
+        .expect("shutdown cleans up the child");
+}
+
+/// Task 4: `note_session_id` rewrites the durable record with the codex
+/// session/thread id — the restore-time reattach key (katas ynfn/da92).
+#[tokio::test]
+async fn spawned_runtime_note_session_id_enriches_the_record() {
+    let (_dir, store) = temp_sidecar_store();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    runtime.ensure_ready(None).await.expect("ensure_ready");
+
+    runtime
+        .note_session_id("s-1".to_string())
+        .await
+        .expect("note_session_id");
+
+    let records = store.load_all();
+    assert_eq!(records.len(), 1, "still exactly one record: {records:?}");
+    assert_eq!(
+        records[0].session_id.as_deref(),
+        Some("s-1"),
+        "note_session_id must enrich the record with the session id"
     );
 
     runtime

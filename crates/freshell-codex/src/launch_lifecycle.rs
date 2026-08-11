@@ -93,6 +93,15 @@ pub trait CodexLaunchRuntime: Send + Sync {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Task 4: note the codex session/thread id once it is known — resume
+    /// launches at plan time, fresh launches when the proxy captures the
+    /// thread candidate. Default no-op: only runtimes with a durable sidecar
+    /// record have anything to enrich.
+    fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
+        let _ = session_id;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Tear the app-server down (`runtime.shutdown()`, `launch-planner.ts:302`).
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>>;
 }
@@ -327,6 +336,13 @@ impl CodexLaunchPlanner {
         let started: Result<(CodexRemoteProxy, mpsc::UnboundedReceiver<RemoteProxyEvent>), String> =
             async {
                 let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
+                // Task 4: resume launches know their session id at plan time —
+                // note it so the runtime's durable record carries the
+                // restore-time reattach key. Best-effort (the record write
+                // path logs its own failures); never fails the plan.
+                if let Some(sid) = plan.session_id.clone() {
+                    let _ = runtime.note_session_id(sid).await;
+                }
                 CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
                     ready.ws_url,
                     plan.require_candidate_persistence,
@@ -783,6 +799,25 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Task 4: forward a captured codex session/thread id to an adopted
+    /// terminal's runtime so its durable sidecar record carries the
+    /// restore-time reattach key (katas ynfn/da92). Called by the freshell-ws
+    /// proxy-event router beside [`Self::mark_candidate_persisted`]; resume
+    /// launches get theirs at plan time instead. Unknown terminal ids are a
+    /// silent no-op (the mark_candidate_persisted discipline).
+    pub async fn note_session_id(&self, terminal_id: &str, session_id: &str) {
+        let runtime = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.runtime.clone())
+        };
+        if let Some(runtime) = runtime {
+            let _ = runtime.note_session_id(session_id.to_string()).await;
+        }
+    }
+
     /// S5.c: fail the gate for an adopted terminal (candidate refused).
     pub async fn fail_candidate_capture(&self, terminal_id: &str, message: &str) {
         let sidecar = {
@@ -1180,6 +1215,29 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                         error = %error,
                         "sidecar_record_enrich_failed: adopt proceeds; record keeps \
                          its spawn-time shape (pane-ledger write-failure policy)"
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            // Enrich the durable record with the codex session/thread id
+            // (Task 4): the restore-time reattach key boot reconcile matches
+            // records against. Untracked spawns (no record) are a no-op.
+            let mut state = self.state.lock().await;
+            if let Some(record) = state.as_mut().and_then(|s| s.record.as_mut()) {
+                record.session_id = Some(session_id);
+                record.updated_at = unix_millis();
+                if let Err(error) = self.store.write(record) {
+                    tracing::error!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %record.ownership_id,
+                        error = %error,
+                        "sidecar_record_enrich_failed: session id kept in memory only \
+                         (pane-ledger write-failure policy)"
                     );
                 }
             }
