@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::sidecar_reconcile::SidecarReconciler;
+use crate::launch_lifecycle::CodexLaunchRuntime;
+use crate::sidecar_reconcile::{ReattachedCodexAppServerRuntime, SidecarReconciler};
 use crate::sidecar_store::SidecarRecordState;
 use crate::sidecar_test_support::{
     record_for_child, spawn_own_fake_app_server_with_behavior, spawn_own_shell_child,
@@ -229,6 +230,23 @@ async fn late_restore_after_sweep_reattaches_mid_turn_survivor() {
         None,
         "the survivor is alive for the reattach"
     );
+
+    // Final-review H3a: the adopt-time enrich flips the claimed record back
+    // to Active — a reattached pane's row must not keep reading
+    // Retained{mid-turn} (that would lie to auditors).
+    let runtime = ReattachedCodexAppServerRuntime::new(claimed, Arc::clone(&store));
+    runtime
+        .update_ownership_metadata("term-late-restore".to_string(), 1)
+        .await
+        .expect("adopt-time enrich");
+    let rows = store.load_all();
+    assert_eq!(rows.len(), 1, "one durable row for the reattached survivor");
+    assert_eq!(
+        rows[0].state,
+        SidecarRecordState::Active,
+        "adopt flips a Retained record back to Active"
+    );
+    assert_eq!(rows[0].terminal_id.as_deref(), Some("term-late-restore"));
 
     child
         .kill()
@@ -705,4 +723,104 @@ fn reap_grace_parse_honors_value_zero_and_default() {
     );
     assert_eq!(reap_grace_from_value(None), default);
     assert_eq!(reap_grace_from_value(Some("not-a-number")), default);
+}
+
+#[tokio::test]
+async fn sweep_treats_malformed_loaded_list_as_unreachable_not_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    // A reachable fixture whose thread/loaded/list result is MALFORMED (no
+    // `data` array) via the per-method overrides knob (final review F2):
+    // Ok(vec![]) parsing would read this as "reachable, no loaded threads"
+    // and REAP — the client must surface an error instead, sending the sweep
+    // down the conservative Unreachable → writer-evidence path.
+    let fixture_ownership = "codex-sidecar-f2000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (mut fixture, ws_url) = spawn_own_fake_app_server_with_behavior(
+        fixture_ownership,
+        Some(r#"{"overrides": {"thread/loaded/list": {"result": {"unexpected": true}}}}"#),
+    )
+    .await;
+    // The RECORD's verified pid is a SEPARATE test-owned child holding real
+    // writer evidence (an open rollout .jsonl write fd), while its ws_url
+    // points at the malformed fixture. The outcome discriminates the two
+    // paths deterministically: ReachableIdle would Kill/Reap this record;
+    // the Unreachable arm consults /proc/<pid>/fd and RETAINS it.
+    let rollout = dir.path().join("rollout-t-malformed.jsonl");
+    let script = format!("exec sleep 300 >> '{}'", rollout.display());
+    let writer_child = spawn_own_shell_child("bash", &["-c", &script], &["sleep", "300"]);
+    let ownership_id = "codex-sidecar-f2000002-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let record = CodexSidecarRecord {
+        ws_url,
+        ..record_for_child(ownership_id, writer_child.0.id(), Some(SESSION))
+    };
+    store.write(&record).expect("write record");
+
+    let (reconciler, _report) = SidecarReconciler::boot_reconcile(Arc::clone(&store));
+    let outcomes = reconciler.sweep_unclaimed().await;
+    assert_eq!(
+        outcomes,
+        vec![(ownership_id.to_string(), SweepOutcome::RetainedWriterHeld)],
+        "a malformed loaded-list must take the writer-evidence path, not ReachableIdle"
+    );
+
+    tokio::time::sleep(NEVER_SIGNALLED_GRACE).await;
+    let mut writer_child = writer_child;
+    assert_eq!(
+        writer_child.0.try_wait().expect("try_wait writer child"),
+        None,
+        "the writer-holding survivor must never be signalled on malformed data"
+    );
+
+    fixture
+        .kill()
+        .await
+        .expect("cleanup: kill this test's own fixture");
+}
+
+#[tokio::test]
+async fn kill_tree_root_refusal_skips_captured_descendants() {
+    // Final-review H3b: when the root's PRE-signal re-verify refuses
+    // (Mismatch/Unverifiable), the captured descendants' provenance is in
+    // doubt (they were snapshotted as children of an unproven root) — the
+    // descendant loop must be skipped entirely, nothing signalled. Driven
+    // through the private linux arm directly: the public entry refuses a
+    // Mismatch before ever capturing, so the inner re-verify refusal is the
+    // only reachable shape for this guard.
+    let script = "sleep 300 & sleep 300 & wait";
+    let root = spawn_own_shell_child("bash", &["-c", script], &["bash", "-c", script]);
+    let root_pid = root.0.id() as i32;
+    let children = wait_for_sleep_children(root_pid, 2);
+    let _orphan_guard = OrphanSnapshotGuard(children.clone());
+    // The pid-reuse shape: live pid + starttime, WRONG cmdline.
+    let record = CodexSidecarRecord {
+        cmdline: vec!["codex".to_string(), "app-server".to_string()],
+        ..record_for_child(
+            "codex-sidecar-b3000001-cccc-4ccc-8ccc-cccccccccccc",
+            root.0.id(),
+            Some(SESSION),
+        )
+    };
+
+    let outcome = kill_verified_tree_linux(&record).await;
+    assert_eq!(
+        outcome.outcomes,
+        vec![(record.pid, KillOutcome::SkippedIdentityMismatch)],
+        "a pre-signal root refusal reports ONLY the root; no descendant is processed"
+    );
+
+    // NOTHING was signalled: the root and both captured descendants live on.
+    tokio::time::sleep(NEVER_SIGNALLED_GRACE).await;
+    let mut root = root;
+    assert_eq!(
+        root.0.try_wait().expect("try_wait root"),
+        None,
+        "the mismatched root must never be signalled"
+    );
+    for &(pid, starttime) in &children {
+        assert_eq!(
+            proc_starttime(pid),
+            Some(starttime),
+            "descendants of an unproven root must never be signalled"
+        );
+    }
 }

@@ -17,21 +17,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
-
-use crate::app_server::BoxFuture;
+use crate::app_server::{BoxFuture, CodexAppServerClient};
 use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
-use crate::protocol::{build_request_frame, parse_incoming_frame, IncomingMessage, RequestId};
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict,
     SidecarRecordState,
 };
 use crate::sidecar_sweep::kill_verified_sidecar_tree;
+use crate::transport::TungsteniteTransport;
 
-/// Per-candidate budget for the duplicate-arm writer probe (connect + one
-/// `thread/loaded/list` round trip). Bounded so a wedged survivor cannot
-/// stall a restore; on timeout the candidate is simply NOT the writer.
+/// Per-candidate budget for the duplicate-arm writer probe (connect + the
+/// `initialize`/`initialized` handshake + one `thread/loaded/list` round
+/// trip). Bounded so a wedged survivor cannot stall a restore; on timeout
+/// the candidate is simply NOT the writer.
 const WRITER_PROBE_BUDGET: Duration = Duration::from_millis(1000);
 
 /// Reattach `ensure_ready` probe budget: ONE bounded connect against the
@@ -379,12 +377,18 @@ fn rewrite_index(
 }
 
 /// Bounded writer probe (duplicate arm only): does the candidate's live
-/// sidecar report `session_id` in `thread/loaded/list`? Connect to the
-/// record's ws_url, send one JSON-RPC request, and scan frames for the
-/// response — all under a single [`WRITER_PROBE_BUDGET`]. Any error/timeout
-/// ⇒ NOT the writer (the newest-`updated_at` fallback decides). The positive
-/// arm is exercised by Task 9's fixture-backed tests; this module's own
-/// tests use `sleep` children that speak no ws, so the probe fails fast.
+/// sidecar report `session_id` in `thread/loaded/list`? Reuses the crate's
+/// own client ([`CodexAppServerClient`] over [`TungsteniteTransport`], the
+/// sweep-probe shape, `sidecar_sweep.rs::probe_mid_turn`) so the
+/// `initialize`/`initialized` handshake ALWAYS precedes the list RPC — real
+/// codex gates pre-initialize RPCs, and a hand-rolled first-frame list would
+/// silently degrade every probe to the newest-`updated_at` fallback (final
+/// review F1). All under a single [`WRITER_PROBE_BUDGET`]; any error/timeout
+/// ⇒ NOT the writer (the fallback decides). The positive arm is pinned by
+/// `duplicate_claim_prefers_the_live_writer_over_newer_updated_at` (this
+/// module's tests, against an initialize-gated fixture); the other
+/// duplicate-claim tests use `sleep` children that speak no ws, so their
+/// probes fail fast.
 async fn writer_probe(ws_url: &str, session_id: &str) -> bool {
     tokio::time::timeout(WRITER_PROBE_BUDGET, writer_probe_inner(ws_url, session_id))
         .await
@@ -392,48 +396,20 @@ async fn writer_probe(ws_url: &str, session_id: &str) -> bool {
 }
 
 async fn writer_probe_inner(ws_url: &str, session_id: &str) -> bool {
-    let Ok((stream, _response)) = tokio_tungstenite::connect_async(ws_url).await else {
+    let Ok(transport) = TungsteniteTransport::connect(ws_url).await else {
         return false;
     };
-    let (mut write, mut read) = stream.split();
-    let request_id = RequestId::Int(1);
-    let frame = build_request_frame(&request_id, "thread/loaded/list", &serde_json::json!({}));
-    if write.send(Message::Text(frame)).await.is_err() {
-        return false;
-    }
-    while let Some(frame) = read.next().await {
-        let Ok(message) = frame else {
-            return false;
-        };
-        let text = match message {
-            Message::Text(text) => text,
-            // Tolerate a binary frame as UTF-8 (transport.rs parity).
-            Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            // Ping/Pong/Frame are transport-level noise — keep reading.
-            _ => continue,
-        };
-        match parse_incoming_frame(&text) {
-            Some(IncomingMessage::Response { id, result }) if id == request_id => {
-                return loaded_list_contains(&result, session_id);
-            }
-            Some(IncomingMessage::RpcError { id, .. }) if id == request_id => {
-                return false;
-            }
-            // Notifications / unrelated frames — keep scanning for our id.
-            _ => continue,
-        }
-    }
-    false
-}
-
-/// `thread/loaded/list` result shape: `{ data: string[], nextCursor? }`
-/// (contract-foundation plan §thread/loaded/list; the committed fixture
-/// returns `{ data: behavior.loadedThreadIds }`, fake-app-server.mjs:263).
-fn loaded_list_contains(result: &serde_json::Value, session_id: &str) -> bool {
-    result
-        .get("data")
-        .and_then(|data| data.as_array())
-        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(session_id)))
+    // Keep the notification receiver alive for the probe's lifetime; the
+    // client Drop aborts the background consumer (even on the outer timeout).
+    let (client, _notifications) = CodexAppServerClient::connect(Arc::new(transport));
+    // `list_loaded_threads` runs the initialize/initialized handshake first
+    // (every non-initialize request gates on it, app_server.rs).
+    let is_writer = match client.list_loaded_threads().await {
+        Ok(loaded) => loaded.iter().any(|id| id == session_id),
+        Err(_) => false,
+    };
+    client.close().await;
+    is_writer
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +549,10 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
         })
     }
 
-    /// Adopt-time enrich: rewrite the record (new terminal id, updated_at).
+    /// Adopt-time enrich: rewrite the record (new terminal id, updated_at)
+    /// and flip a claimed `Retained{..}` row back to `Active` — the sidecar
+    /// is pane-owned again; a stale retention reason would lie to auditors
+    /// (final review H3a).
     fn update_ownership_metadata(
         &self,
         terminal_id: String,
@@ -583,6 +562,7 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
             let snapshot = {
                 let mut record = self.record.lock().unwrap();
                 record.terminal_id = Some(terminal_id);
+                record.state = SidecarRecordState::Active;
                 record.updated_at = unix_millis();
                 record.clone()
             };
@@ -591,12 +571,14 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
         })
     }
 
-    /// Session enrich: rewrite the record (new session id, updated_at).
+    /// Session enrich: rewrite the record (new session id, updated_at);
+    /// `Active` for the same H3a reason as `update_ownership_metadata`.
     fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let snapshot = {
                 let mut record = self.record.lock().unwrap();
                 record.session_id = Some(session_id);
+                record.state = SidecarRecordState::Active;
                 record.updated_at = unix_millis();
                 record.clone()
             };

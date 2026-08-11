@@ -278,10 +278,15 @@ impl CodexLaunchSidecar {
         if let Some(proxy) = inner.proxy.take() {
             proxy.close().await;
         }
-        self.runtime.prepare_retention(reason.to_string()).await?;
+        let result = self.runtime.prepare_retention(reason.to_string()).await;
+        // Final-review H3c: the retention DECISION stands even when the
+        // record rewrite fails (prepare_retention already logs loudly): mark
+        // shutdown-complete either way, so a later shutdown() (a double-fired
+        // PTY exit hook, `manager.shutdown()`'s drain) can never kill a
+        // sidecar we chose to retain.
         inner.shutdown_succeeded = true;
         self.planner_active.lock().unwrap().remove(&self.id);
-        Ok(())
+        result
     }
 
     /// `sidecar.shutdown()` (`launch-planner.ts:281-316`): idempotent, single-flight

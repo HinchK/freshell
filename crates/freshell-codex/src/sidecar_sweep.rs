@@ -618,6 +618,29 @@ async fn kill_verified_tree_linux(record: &CodexSidecarRecord) -> KillTreeOutcom
     };
     outcomes.push((record.pid, root_outcome));
 
+    // Final-review H3b: a PRE-signal root refusal (Mismatch/Unverifiable)
+    // throws the whole capture's provenance into doubt — the descendants were
+    // snapshotted as children of a root we can no longer prove is ours, so
+    // NONE of them are processed (nothing is signalled). Post-SIGTERM
+    // outcomes (incl. SigtermSentEscalationRefused) keep the per-descendant
+    // sweep: the tree was captured while the root still verified as ours.
+    if matches!(
+        root_outcome,
+        KillOutcome::SkippedIdentityMismatch | KillOutcome::SkippedUnverifiable
+    ) {
+        if !descendants.is_empty() {
+            tracing::warn!(
+                target: "freshell_codex::sidecar_sweep",
+                ownership_id = %record.ownership_id,
+                pid = record.pid,
+                skipped_descendants = descendants.len(),
+                "sidecar_tree_kill_descendants_skipped: root identity refused \
+                 pre-signal; captured descendants NOT processed"
+            );
+        }
+        return KillTreeOutcome { outcomes };
+    }
+
     for snapshot in &descendants {
         let outcome = kill_captured_descendant(snapshot).await;
         outcomes.push((snapshot.pid as u32, outcome));

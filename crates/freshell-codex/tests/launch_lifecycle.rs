@@ -43,6 +43,7 @@ struct FakeRuntime {
     ws_url: String,
     ensure_ready_calls: Mutex<Vec<Option<String>>>,
     fail_ensure_ready: AtomicBool,
+    fail_prepare_retention: AtomicBool,
     shutdown_calls: AtomicU32,
     ownership_updates: Mutex<Vec<(String, u64)>>,
     noted_session_ids: Mutex<Vec<String>>,
@@ -79,6 +80,7 @@ impl FakeRuntime {
             ws_url,
             ensure_ready_calls: Mutex::new(Vec::new()),
             fail_ensure_ready: AtomicBool::new(false),
+            fail_prepare_retention: AtomicBool::new(false),
             shutdown_calls: AtomicU32::new(0),
             ownership_updates: Mutex::new(Vec::new()),
             noted_session_ids: Mutex::new(Vec::new()),
@@ -119,6 +121,15 @@ impl CodexLaunchRuntime for FakeRuntime {
     fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             self.noted_session_ids.lock().unwrap().push(session_id);
+            Ok(())
+        })
+    }
+
+    fn prepare_retention(&self, _reason: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            if self.fail_prepare_retention.load(Ordering::SeqCst) {
+                return Err("fake runtime: prepare_retention failed".to_string());
+            }
             Ok(())
         })
     }
@@ -1686,6 +1697,40 @@ async fn shutdown_retention_retains_adopted_sidecars_and_records_reason() {
         );
     }
     wait_pid_gone(pid).await;
+}
+
+/// Final-review H3c: even when `prepare_retention` fails (record rewrite
+/// error — retention already logs loudly), the DECISION to retain stands: a
+/// later `shutdown()` (a double-fired PTY exit hook, `manager.shutdown()`'s
+/// drain) must NOT kill the sidecar we chose to retain.
+#[tokio::test]
+async fn retain_failure_still_blocks_a_later_shutdown_kill() {
+    let runtime = FakeRuntime::start().await;
+    runtime.fail_prepare_retention.store(true, Ordering::SeqCst);
+    let planner = planner_for(runtime.clone());
+    let launch = planner
+        .plan_create(&CodexLaunchPlanInput::default())
+        .await
+        .expect("plan");
+
+    launch
+        .sidecar
+        .retain("server-shutdown")
+        .await
+        .expect_err("the prepare_retention failure propagates to the caller");
+
+    // The retention decision stands: shutdown() must no-op via the
+    // idempotence flag, never reaching the runtime's kill path.
+    launch
+        .sidecar
+        .shutdown()
+        .await
+        .expect("post-retain shutdown is an idempotent no-op");
+    assert_eq!(
+        runtime.shutdown_calls.load(Ordering::SeqCst),
+        0,
+        "a sidecar we decided to retain must never be killed by a later shutdown()"
+    );
 }
 
 #[tokio::test]

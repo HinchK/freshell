@@ -16,8 +16,10 @@
 //! `ws_url` points at a loopback port nothing listens on, so the duplicate
 //! arm's probe fails fast (connection refused, bounded by the ~1s budget) and
 //! the newest-`updated_at` fallback decides — deterministic. The probe's
-//! POSITIVE arm is exercised by Task 9's fixture-backed tests. Tests bind
-//! loopback ephemeral ports only; never port 3001.
+//! POSITIVE arm is pinned here by
+//! `duplicate_claim_prefers_the_live_writer_over_newer_updated_at` (an
+//! initialize-gated fixture — the real-codex shape). Tests bind loopback
+//! ephemeral ports only; never port 3001.
 //!
 //! /proc semantics are Linux-only, so these tests are
 //! `#[cfg(target_os = "linux")]` (the sidecar_store_tests precedent).
@@ -29,8 +31,8 @@ use std::sync::Arc;
 use super::*;
 use crate::sidecar_store::CodexSidecarRecord;
 use crate::sidecar_test_support::{
-    record_for_child, spawn_own_fake_app_server, spawn_own_sleep_child, store_in,
-    NEVER_SIGNALLED_GRACE, SESSION,
+    record_for_child, spawn_own_fake_app_server, spawn_own_fake_app_server_with_behavior,
+    spawn_own_sleep_child, store_in, NEVER_SIGNALLED_GRACE, SESSION,
 };
 
 #[test]
@@ -257,6 +259,86 @@ async fn duplicate_session_records_claim_one_keep_the_loser_held() {
         None,
         "the winning candidate's sidecar must not be signalled"
     );
+}
+
+#[tokio::test]
+async fn duplicate_claim_prefers_the_live_writer_over_newer_updated_at() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+
+    // The WRITER candidate: a live fixture reporting this session in
+    // thread/loaded/list, with the OLDER updated_at — writer preference must
+    // beat the newest-updated_at fallback (final review F1: the fallback
+    // tends to pick the NON-writer in exactly this scenario). The fixture
+    // GATES pre-initialize RPCs (requireInitializeBeforeOtherMethods +
+    // requireInitializedNotification, the real-codex shape): a probe that
+    // skipped the initialize/initialized handshake would get -32000, read as
+    // not-writer, and this test would fail on the fallback picking the
+    // newer non-writer.
+    let ownership_writer = "codex-sidecar-f1000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let behavior = format!(
+        r#"{{"loadedThreadIds": ["{SESSION}"], "requireInitializeBeforeOtherMethods": true, "requireInitializedNotification": true}}"#
+    );
+    let (mut fixture, ws_url) =
+        spawn_own_fake_app_server_with_behavior(ownership_writer, Some(&behavior)).await;
+    let writer = CodexSidecarRecord {
+        ws_url: ws_url.clone(),
+        updated_at: 1_700_000_000_001,
+        ..record_for_child(
+            ownership_writer,
+            fixture.id().expect("live fixture pid"),
+            Some(SESSION),
+        )
+    };
+
+    // The NON-writer duplicate: NEWER updated_at, no ws listener (sleep
+    // child + closed loopback port) — the fallback's pick.
+    let mut non_writer_child = spawn_own_sleep_child();
+    let non_writer = CodexSidecarRecord {
+        updated_at: 1_700_000_000_002,
+        ..record_for_child(
+            "codex-sidecar-f1000002-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            non_writer_child.0.id(),
+            Some(SESSION),
+        )
+    };
+    store.write(&writer).expect("write writer");
+    store.write(&non_writer).expect("write non-writer");
+
+    let (reconciler, _report) = SidecarReconciler::boot_reconcile(Arc::clone(&store));
+    assert_eq!(reconciler.unclaimed_len(), 2, "both duplicates held");
+
+    let claimed = reconciler.claim_for_session(SESSION).await;
+    assert_eq!(
+        claimed,
+        Some(writer),
+        "the live WRITER wins the duplicate claim despite the older updated_at"
+    );
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "the non-writer loser STAYS held for the sweep"
+    );
+
+    // Claiming NEVER signals: both candidates are still alive.
+    assert_eq!(
+        non_writer_child
+            .0
+            .try_wait()
+            .expect("try_wait non-writer child"),
+        None,
+        "the losing candidate's sidecar must not be signalled"
+    );
+    assert_eq!(
+        fixture.try_wait().expect("try_wait fixture"),
+        None,
+        "the winning writer's sidecar must not be signalled"
+    );
+
+    fixture
+        .kill()
+        .await
+        .expect("cleanup: kill this test's own fixture");
 }
 
 // ---------------------------------------------------------------------------
