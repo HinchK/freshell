@@ -88,6 +88,16 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
         "completedMigrations": ["m-001", "m-002"],
         "recentDirectories": ["/tmp/a", "/tmp/b"],
         "projectColors": { "/tmp/a": "#123456" },
+        // CFG-01 sentinel breadth: the CFG-04 owned seed key must also be
+        // byte-preserved through the network writer (and the no-op-boot
+        // restart leg below).
+        "legacyLocalSettingsSeed": {
+            "theme": "light",
+            "uiScale": 1.25,
+            "terminal": { "fontSize": 18, "fontFamily": "Net09 Sentinel Mono" },
+            "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+            "notifications": { "soundEnabled": false }
+        },
         "someUnknownFutureKey": { "arbitrary": [1, 2, 3] }
     });
     let cfg_dir = home.path().join(".freshell");
@@ -107,6 +117,7 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
         "completedMigrations",
         "recentDirectories",
         "projectColors",
+        "legacyLocalSettingsSeed",
         "someUnknownFutureKey",
     ];
     let before: std::collections::HashMap<_, _> = watched

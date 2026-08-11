@@ -3196,9 +3196,14 @@ mod tests {
     /// Seeds a `config.json` shaped like a real staged incident: known
     /// managed keys (`settings`, overrides) PLUS keys this store never
     /// manages (`completedMigrations`, `recentDirectories`, a hypothetical
-    /// future top-level key). `store_at` is given `discovered_cli_names` and
-    /// a seed `codingCli.knownProviders`/`enabledProviders` that exactly
-    /// match, so `SettingsStore::load` does not itself trigger a persist
+    /// future top-level key), a stored `legacyLocalSettingsSeed` (CFG-04
+    /// owned key), and BOTH the codex secret and a hypothetical sibling
+    /// secret this build doesn't know about. `store_at` is given
+    /// `discovered_cli_names` and a seed `codingCli.knownProviders`/
+    /// `enabledProviders` that exactly match, and the stored seed is in the
+    /// exact legacy normalize assignment order (the shape
+    /// `seeded_boot_is_byte_stable_on_second_boot` proves merges back to
+    /// itself), so `SettingsStore::load` does not itself trigger a persist
     /// (no seed/legacy-migration path fires) -- the ONLY write in each test
     /// below is the one explicit patch under test.
     fn lossless_fixture_text() -> &'static str {
@@ -3214,7 +3219,17 @@ mod tests {
             },
             "completedMigrations": ["ai-title-shadow-cleanup"],
             "recentDirectories": ["/a", "/b", "/c"],
-            "serverSecrets": { "codexDisplayIdSecret": "seed-secret-value" },
+            "serverSecrets": {
+                "codexDisplayIdSecret": "seed-secret-value",
+                "futureSiblingSecret": "sibling-sentinel-value"
+            },
+            "legacyLocalSettingsSeed": {
+                "theme": "light",
+                "uiScale": 1.25,
+                "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                "notifications": { "soundEnabled": false }
+            },
             "zzFutureKey": { "a": 1 },
             "sessionOverrides": {},
             "terminalOverrides": {},
@@ -3237,6 +3252,22 @@ mod tests {
             cfg["serverSecrets"]["codexDisplayIdSecret"],
             json!("seed-secret-value"),
             "serverSecrets must round-trip"
+        );
+        assert_eq!(
+            cfg["serverSecrets"]["futureSiblingSecret"],
+            json!("sibling-sentinel-value"),
+            "a sibling secret this build doesn't manage must round-trip (overlaid, not rebuilt)"
+        );
+        assert_eq!(
+            cfg["legacyLocalSettingsSeed"],
+            json!({
+                "theme": "light",
+                "uiScale": 1.25,
+                "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                "notifications": { "soundEnabled": false }
+            }),
+            "the stored legacyLocalSettingsSeed must survive every unrelated writer"
         );
         assert_eq!(
             cfg["zzFutureKey"],
@@ -3822,6 +3853,187 @@ mod tests {
             cfg["sessionOverrides"]["claude:abc"]["archived"],
             json!(true)
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the project-color persist
+    /// path (`set_project_color` — `PUT /api/project-colors`). The
+    /// project-color family below uses reduced fixtures; THIS test pins the
+    /// full CFG-01 sentinel set through the color writer specifically.
+    #[tokio::test]
+    async fn project_color_write_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            lossless_fixture_text(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        store.set_project_color("/proj/x", "#c0ffee").await.unwrap();
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(cfg["projectColors"]["/proj/x"], json!("#c0ffee"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the BOOT-TIME
+    /// normalization persist (`SettingsStore::load`'s provider-seed branch):
+    /// a config missing `codingCli.knownProviders` is seeded + persisted at
+    /// boot (the original always `patchSettings` here,
+    /// `server/index.ts:276-299`) -- and that write must not drop a single
+    /// sentinel. This fixture deliberately OMITS `knownProviders` (unlike
+    /// `lossless_fixture_text`, where the whole point is that NO boot write
+    /// fires).
+    #[tokio::test]
+    async fn boot_provider_seed_persist_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-boot-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r##"{
+                "version": 1,
+                "settings": {
+                    "codingCli": {
+                        "enabledProviders": ["claude", "codex"],
+                        "providers": {},
+                        "mcpServer": true
+                    }
+                },
+                "completedMigrations": ["ai-title-shadow-cleanup"],
+                "recentDirectories": ["/a", "/b", "/c"],
+                "serverSecrets": {
+                    "codexDisplayIdSecret": "seed-secret-value",
+                    "futureSiblingSecret": "sibling-sentinel-value"
+                },
+                "legacyLocalSettingsSeed": {
+                    "theme": "light",
+                    "uiScale": 1.25,
+                    "terminal": { "fontSize": 18, "fontFamily": "CFG01 Sentinel Mono" },
+                    "sidebar": { "sortMode": "project", "width": 280, "collapsed": true },
+                    "notifications": { "soundEnabled": false }
+                },
+                "zzFutureKey": { "a": 1 },
+                "sessionOverrides": { "claude:keep": { "archived": true } },
+                "terminalOverrides": { "term-keep": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/keep": "#123123" }
+            }"##,
+        )
+        .unwrap();
+
+        // Boot IS the write under test: knownProviders is seeded + persisted.
+        let _store = store_at(&dir);
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude", "codex"]),
+            "the boot provider seed must land"
+        );
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:keep"]["archived"],
+            json!(true),
+            "pre-existing override entries must survive the boot persist"
+        );
+        assert_eq!(
+            cfg["terminalOverrides"]["term-keep"]["titleOverride"],
+            json!("KeepMe")
+        );
+        assert_eq!(cfg["projectColors"]["/proj/keep"], json!("#123123"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same guarantee through the OTHER boot-time normalization trigger:
+    /// stray browser-local keys inside `settings` are stripped into
+    /// `legacyLocalSettingsSeed` and persisted at boot (CFG-04,
+    /// `load_internal`'s `seed_normalization_persist`). Unrelated document
+    /// state must survive that write too.
+    #[tokio::test]
+    async fn boot_seed_strip_persist_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-boot-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r##"{
+                "version": 1,
+                "settings": {
+                    "theme": "dark",
+                    "uiScale": 1.5,
+                    "codingCli": {
+                        "enabledProviders": ["claude", "codex"],
+                        "knownProviders": ["claude", "codex"],
+                        "providers": {},
+                        "mcpServer": true
+                    }
+                },
+                "completedMigrations": ["ai-title-shadow-cleanup"],
+                "recentDirectories": ["/a", "/b", "/c"],
+                "serverSecrets": {
+                    "codexDisplayIdSecret": "seed-secret-value",
+                    "futureSiblingSecret": "sibling-sentinel-value"
+                },
+                "zzFutureKey": { "a": 1 },
+                "sessionOverrides": { "claude:keep": { "archived": true } },
+                "terminalOverrides": { "term-keep": { "titleOverride": "KeepMe" } },
+                "projectColors": { "/proj/keep": "#123123" }
+            }"##,
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        // Unmanaged state (minus the seed, which this boot legitimately
+        // WRITES — that is the writer's intended path).
+        assert_eq!(
+            cfg["completedMigrations"],
+            json!(["ai-title-shadow-cleanup"])
+        );
+        assert_eq!(cfg["recentDirectories"], json!(["/a", "/b", "/c"]));
+        assert_eq!(
+            cfg["serverSecrets"]["codexDisplayIdSecret"],
+            json!("seed-secret-value")
+        );
+        assert_eq!(
+            cfg["serverSecrets"]["futureSiblingSecret"],
+            json!("sibling-sentinel-value")
+        );
+        assert_eq!(cfg["zzFutureKey"], json!({ "a": 1 }));
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:keep"]["archived"],
+            json!(true)
+        );
+        assert_eq!(
+            cfg["terminalOverrides"]["term-keep"]["titleOverride"],
+            json!("KeepMe")
+        );
+        assert_eq!(cfg["projectColors"]["/proj/keep"], json!("#123123"));
+        // The strip itself: stray local keys left `settings`, landed in the seed.
+        let seed = store
+            .legacy_local_settings_seed()
+            .expect("stray local keys must extract into the seed");
+        assert_eq!(seed["theme"], json!("dark"));
+        assert_eq!(seed["uiScale"], json!(1.5));
+        assert!(
+            cfg["settings"].get("theme").is_none(),
+            "the boot persist must strip the stray local key out of settings"
+        );
+        assert_eq!(cfg["legacyLocalSettingsSeed"]["theme"], json!("dark"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
