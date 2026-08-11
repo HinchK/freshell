@@ -307,6 +307,54 @@ findings only, record MINOR/rejected here.
   recorded across rounds (2 nits in r3, 1 in r5 — all three fixed as
   safely-trivial).
 
+## Round 6 (B005 wrap-batch delta)
+
+Scope this round was the newly merged B005 wrap batch only:
+`git diff 36b7e09b4...HEAD` (HEAD = `aa9f4b7b3`; JAN-88, RESTORE-01,
+SESSION-13, CFG-01 + merge/evidence commits). Same one-round mechanics.
+
+- **Fresh Eyes verdict:** FAILED (`FRESHPID=3624982`, provider gpt) —
+  triage found **zero genuine majors**. Mid-run false `verdict=passed`
+  echo appeared again (pid active, repo marker text in the log); true
+  completion confirmed via `pid_state=missing` (verdict FAILED), per the
+  r2 rule.
+- **Findings: 2 reported as major — 0 majors after triage (1 rejected
+  by-design, 1 minor fixed as safely-trivial):**
+
+  1. **`test/e2e-browser/gate01-baseline.json` — stale `head` field
+     (`33fd5b65…` vs reviewed `aa9f4b7b3`) and verdict flips seemingly
+     contradicting B005-HANDOFF's "left unmerged, zero verdict flips".**
+     **REJECTED (by-design ledger semantics, no real contradiction).**
+     `gate01-collate.ts` defines `head` as provenance of the last collate
+     (`init --head` / `merge [--head]`) — nothing in the tooling asserts
+     it against the current checkout; a ledger's recorded head always lags
+     HEAD. The verdict flips were the explicit, deliberate payload of
+     merge-commit `904b97252` ("Rust tally 37->44 pass — 7 F1 legs flipped
+     green twice-consecutively, stale gap-unscoped F1 attributions
+     removed"). The handoff's residual (4) describes a DIFFERENT artifact:
+     the leftover UNCOMMITTED bookkeeping in the item worktree at wrap
+     time ("run-record appends only, zero verdict flips — inspected; left
+     as found, deliberately unmerged"). Merged-session evidence vs
+     unmerged worktree leftover — both statements are accurate. Baseline
+     is evidence, not a freshness gate; the final gate owns the fresh
+     sweep.
+  2. **`docs/plans/df1/RESTORE-01.md:212 (Task-3 Step 4) — plan still
+     instructs adding `test.use({ recoveryOfferHandling: 'manual' })` to
+     `sidebar-registry-sync-rust.spec.ts`, invalid on its raw
+     `@playwright/test` import.** **MINOR (executed-plan history), fixed
+     as safely-trivial:** the item's own pre-merge review loop found the
+     invalid `test.use` and the shipped artifacts are correct (opt-out on
+     `restore-contract-wall-rust.spec.ts` only; sidebar-registry keeps its
+     idioms) — per B005-HANDOFF and the RESTORE-01 evidence file. Same
+     disposition class as wrap-review r5 finding 2. `cf9b9cc7c` adds an
+     inline superseded-note to the step so no future reader follows it.
+
+- **Majors:** none. **Minors:** 1 (fixed, `cf9b9cc7c`). **Rejected:** 1.
+- **Context note:** the 4 batch items' own per-item verifications ran
+  green pre-merge (B005-WRAP.md / B005-HANDOFF.md), weighed against both
+  findings during triage; committed mid-finalgate — gate-2 gates sha
+  `aa9f4b7b3`, so the r6 doc/`cf9b9cc7c` tip-post delta is attributable.
+
 ## Final state
 
 Branch `df1/integration` in this worktree carries the full campaign delta
