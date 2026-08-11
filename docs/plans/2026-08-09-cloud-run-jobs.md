@@ -22,6 +22,15 @@
 > shipped behavior; commit messages are immutable history and are not
 > rewritten.)
 
+> **Executed-plan scope note:** the per-task red/green steps below are the
+> campaign's execution HISTORY, not steps re-runnable at the merged HEAD —
+> each "verify the intended failure" step expected failure only at that
+> point in the execution (after the task's test landed, before its
+> implementation did). Re-running those steps against HEAD succeeds, which
+> is the expected outcome of a completed plan. The section meant to be
+> re-executed today is the validation runbook near the end (updated in
+> wrap-review r4 to select cloud explicitly).
+
 ## Global Constraints
 
 - GCP account: `dan@danshapiro.com`, project: `misc-puttering-project`, region: `us-west1`
