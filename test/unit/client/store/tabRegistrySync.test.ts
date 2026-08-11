@@ -4,6 +4,8 @@ import {
   CLIENT_LEASE_GRACE_MS,
   getCurrentTabRegistryClientInstanceId,
   HEARTBEAT_INTERVAL_MS,
+  QUERY_INTERVAL_MS,
+  QUERY_STALE_MS,
   startTabRegistrySync,
   SYNC_INTERVAL_MS,
 } from '../../../../src/store/tabRegistrySync'
@@ -1044,5 +1046,123 @@ describe('tabRegistrySync', () => {
 
     expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].updatedAt).toBe(0)
     stop()
+  })
+
+  describe('periodic remote re-query', () => {
+    function snapshotReply(requestId: string) {
+      wsMessageHandlers.forEach((handler) => handler({
+        type: 'tabs.sync.snapshot',
+        requestId,
+        data: { localOpen: [], sameDeviceOpen: [], remoteOpen: [], closed: [], devices: [] },
+      }))
+    }
+
+    function expectSnapshotApplied() {
+      return dispatch.mock.calls.some((call) => call[0]?.type === 'tabRegistry/setTabRegistrySnapshot')
+    }
+
+    it('exposes the query interval constants', () => {
+      expect(QUERY_INTERVAL_MS).toBe(30_000)
+      expect(QUERY_STALE_MS).toBe(90_000)
+    })
+
+    it('re-queries on the query interval once the boot query settles', () => {
+      const stop = startTabRegistrySync(createStore() as any, ws)
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+      const bootRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      snapshotReply(bootRequestId)
+      ws.sendTabsSyncQuery.mockClear()
+
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+      const firstIntervalRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      expect(firstIntervalRequestId).not.toBe(bootRequestId)
+
+      snapshotReply(firstIntervalRequestId)
+      ws.sendTabsSyncQuery.mockClear()
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+      stop()
+    })
+
+    it('never overlaps: the interval skips while a query is outstanding and fresh', () => {
+      const stop = startTabRegistrySync(createStore() as any, ws)
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1) // boot query stays unanswered
+      ws.sendTabsSyncQuery.mockClear()
+
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+      stop()
+    })
+
+    it('replaces a stale outstanding query and ignores a late reply for the old id', () => {
+      const stop = startTabRegistrySync(createStore() as any, ws)
+      const staleRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      ws.sendTabsSyncQuery.mockClear()
+
+      // Inside the fresh window the interval refuses to overlap.
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+
+      // Once the outstanding query is older than QUERY_STALE_MS, the interval
+      // presumes the reply was lost and sends exactly one replacement.
+      vi.advanceTimersByTime(QUERY_STALE_MS - QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+      const replacementRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      expect(replacementRequestId).not.toBe(staleRequestId)
+
+      // A late reply for the superseded id is ignored by the latest-id gate;
+      // the replacement id applies normally.
+      dispatch.mockClear()
+      snapshotReply(staleRequestId)
+      expect(expectSnapshotApplied()).toBe(false)
+      snapshotReply(replacementRequestId)
+      expect(expectSnapshotApplied()).toBe(true)
+      stop()
+    })
+
+    it('reconnect supersedes an outstanding query immediately', () => {
+      const stop = startTabRegistrySync(createStore() as any, ws)
+      const bootRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      ws.sendTabsSyncQuery.mockClear()
+
+      // Outstanding and still fresh: the interval alone would not fire.
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+
+      wsReconnectHandlers.forEach((handler) => handler())
+      expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+      const reconnectRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      expect(reconnectRequestId).not.toBe(bootRequestId)
+
+      // Only the new id resolves; the superseded id is dead.
+      dispatch.mockClear()
+      snapshotReply(bootRequestId)
+      expect(expectSnapshotApplied()).toBe(false)
+      snapshotReply(reconnectRequestId)
+      expect(expectSnapshotApplied()).toBe(true)
+      stop()
+    })
+
+    it('never sends from the interval while the socket is not ready, and stops after teardown', () => {
+      const stop = startTabRegistrySync(createStore() as any, ws)
+      const bootRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+      snapshotReply(bootRequestId)
+      ws.sendTabsSyncQuery.mockClear()
+
+      ws.state = 'connecting'
+      vi.advanceTimersByTime(QUERY_INTERVAL_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+      // Even once no query could be outstanding-and-fresh, a down socket sends nothing.
+      vi.advanceTimersByTime(QUERY_STALE_MS)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+
+      stop()
+      ws.state = 'ready'
+      vi.advanceTimersByTime(QUERY_STALE_MS * 2)
+      expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+    })
   })
 })
