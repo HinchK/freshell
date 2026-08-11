@@ -154,7 +154,11 @@ export const MATRIX_SPECS = [
   // AUTO-01 — ui.layout.sync authoritative: visible-UI-driven mutations read
   // back exactly through /api/layout/snapshot (+ raw-frame normalization
   // leg). Legacy is a true parity control (identical LayoutStore semantics).
-  // Authored under the df1 deferred-Playwright policy; see
+  // The default `chromium` match-all project also picks it up (fixture-
+  // default legacy server): test 2 re-asserts its synthetic ui.layout.sync
+  // per poll iteration because the store is whole-snapshot last-write-wins
+  // and the page's real client mirror keeps syncing — so all three projects
+  // are deterministic. Authored under the df1 deferred-Playwright policy; see
   // docs/plans/df1-evidence/AUTO-01.md.
   /layout-sync-authoritative\.spec\.ts$/,
 ]
