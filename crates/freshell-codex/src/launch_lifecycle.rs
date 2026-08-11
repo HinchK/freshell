@@ -35,6 +35,8 @@
 //!   explicitly.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -42,13 +44,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::app_server::BoxFuture;
-use crate::durability::mint_ownership_id;
+use crate::durability::{default_server_instance_id, mint_ownership_id};
 use crate::launch_plan::{
     codex_sidecar_spawn_spec, plan_codex_launch, plan_codex_launch_retry, CodexLaunchConfigError,
     CodexLaunchPlan, CodexLaunchPlanInput, CodexLaunchRetryDecision,
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
 use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
+use crate::runtime_select::select_codex_runtime;
+use crate::sidecar_reconcile::{codex_sidecar_reconciler, write_record_loudly};
+use crate::sidecar_store::{
+    codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore,
+    SidecarRecordState, SIDECAR_RECORD_VERSION,
+};
 use crate::transport::reap_owned_codex_sidecars;
 
 /// `assertAcceptingPlans` (`launch-planner.ts:199`), byte-identical.
@@ -89,13 +97,50 @@ pub trait CodexLaunchRuntime: Send + Sync {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Task 4: note the codex session/thread id once it is known — resume
+    /// launches at plan time, fresh launches when the proxy captures the
+    /// thread candidate. Default no-op: only runtimes with a durable sidecar
+    /// record have anything to enrich.
+    fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
+        let _ = session_id;
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Task 10: server-shutdown retention — the runtime is asked to KEEP its
+    /// sidecar alive across the restart (record flipped to
+    /// `Retained{reason}`, process never signalled) instead of tearing it
+    /// down. Default no-op `Ok(())` (the `note_session_id` pattern): only
+    /// runtimes with a durable sidecar record have anything to retain. The
+    /// retention gate lives in the real impls — a runtime whose sidecar has
+    /// NO persisted record (disabled store / non-Linux) MUST tear down
+    /// exactly as `shutdown` would; "retaining" a record-less sidecar would
+    /// orphan it silently (the ynfn hole).
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        let _ = reason;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Tear the app-server down (`runtime.shutdown()`, `launch-planner.ts:302`).
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>>;
 }
 
 /// The planner's runtime factory (`CodexLaunchPlanner` ctor `runtimeOrFactory`,
-/// `launch-planner.ts:115-121`): one fresh runtime per plan.
-pub type CodexRuntimeFactory = Box<dyn Fn() -> Arc<dyn CodexLaunchRuntime> + Send + Sync>;
+/// `launch-planner.ts:115-121`): one fresh runtime per plan. Plan-aware and
+/// async (Task 7): the factory receives the S3 pure plan and returns a boxed
+/// future that async [`CodexLaunchPlanner::plan_create`] AWAITS — the
+/// production selection ([`crate::runtime_select::select_codex_runtime`])
+/// must await the reconciler's claim
+/// ([`crate::sidecar_reconcile::SidecarReconciler::claim_for_session`],
+/// whose duplicate arm runs a bounded ws writer probe) before deciding
+/// reattach-vs-spawn.
+pub type CodexRuntimeFactory = Box<
+    dyn for<'a> Fn(
+            &'a CodexLaunchPlan,
+        )
+            -> Pin<Box<dyn Future<Output = Arc<dyn CodexLaunchRuntime>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 // ─── errors ──────────────────────────────────────────────────────────────────────────────
 
@@ -216,6 +261,34 @@ impl CodexLaunchSidecar {
         Ok(())
     }
 
+    /// Task 10 server-shutdown retention: close the proxy (its listener dies
+    /// with this process anyway) and ask the runtime to
+    /// `prepare_retention(reason)` INSTEAD of tearing it down. Marks the
+    /// sidecar shutdown-complete so any late teardown path (a double-fired
+    /// PTY exit hook, `manager.shutdown()`'s drain) no-ops via the
+    /// idempotence flag instead of re-killing the retained survivor. The
+    /// retention GATE lives in the runtime: a record-less runtime tears its
+    /// sidecar down exactly as today.
+    pub async fn retain(&self, reason: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().await;
+        if inner.shutdown_succeeded {
+            return Ok(());
+        }
+        inner.shutdown_started = true;
+        if let Some(proxy) = inner.proxy.take() {
+            proxy.close().await;
+        }
+        let result = self.runtime.prepare_retention(reason.to_string()).await;
+        // Final-review H3c: the retention DECISION stands even when the
+        // record rewrite fails (prepare_retention already logs loudly): mark
+        // shutdown-complete either way, so a later shutdown() (a double-fired
+        // PTY exit hook, `manager.shutdown()`'s drain) can never kill a
+        // sidecar we chose to retain.
+        inner.shutdown_succeeded = true;
+        self.planner_active.lock().unwrap().remove(&self.id);
+        result
+    }
+
     /// `sidecar.shutdown()` (`launch-planner.ts:281-316`): idempotent, single-flight
     /// (concurrent callers serialize on the inner lock and observe the succeeded flag).
     /// Tears down the proxy (listener + socket pairs) and the runtime (spawned child).
@@ -305,7 +378,7 @@ impl CodexLaunchPlanner {
         self.assert_accepting_plans()?;
         let plan = plan_codex_launch(input).map_err(CodexLaunchError::Config)?;
 
-        let runtime = (self.runtime_factory)();
+        let runtime = (self.runtime_factory)(&plan).await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let sidecar = Arc::new(CodexLaunchSidecar {
             id,
@@ -323,6 +396,13 @@ impl CodexLaunchPlanner {
         let started: Result<(CodexRemoteProxy, mpsc::UnboundedReceiver<RemoteProxyEvent>), String> =
             async {
                 let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
+                // Task 4: resume launches know their session id at plan time —
+                // note it so the runtime's durable record carries the
+                // restore-time reattach key. Best-effort (the record write
+                // path logs its own failures); never fails the plan.
+                if let Some(sid) = plan.session_id.clone() {
+                    let _ = runtime.note_session_id(sid).await;
+                }
                 CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
                     ready.ws_url,
                     plan.require_candidate_persistence,
@@ -537,12 +617,23 @@ pub fn set_global_codex_launch_manager_for_tests(manager: CodexTerminalLaunchMan
 pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
-    teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
+    /// Teardown/retention worker feed: the bool is the RETAIN decision,
+    /// made by the sender at hand-off time (Task 10).
+    teardown_tx: OnceLock<mpsc::UnboundedSender<(AdoptedTerminalLaunch, bool)>>,
+    /// Task 10: server-shutdown retention mode — set once by
+    /// [`Self::begin_shutdown_retention`], never cleared (the process is
+    /// exiting).
+    shutdown_retention: AtomicBool,
     plan_budget: Arc<tokio::sync::Semaphore>,
     plan_budget_wait: Duration,
     plan_queue_cap: usize,
     plan_waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// The durable `Retained{reason}` every server-shutdown retention records
+/// (both [`CodexTerminalLaunchManager::shutdown`]'s drain and the retention
+/// arm of the PTY exit hook).
+const SERVER_SHUTDOWN_RETENTION_REASON: &str = "server-shutdown";
 
 impl CodexTerminalLaunchManager {
     pub fn new(runtime_factory: CodexRuntimeFactory) -> Self {
@@ -550,6 +641,7 @@ impl CodexTerminalLaunchManager {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
             teardown_tx: OnceLock::new(),
+            shutdown_retention: AtomicBool::new(false),
             plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
             plan_budget_wait: CODEX_SIDECAR_PLAN_WAIT,
             // The env read MUST live here — `global()` calls `new()`, so
@@ -579,12 +671,24 @@ impl CodexTerminalLaunchManager {
         self.plan_waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
-    /// `CodexLaunchPlanner` per server (`server/index.ts:359`).
+    /// The process-wide manager over the REAL selection — legacy has exactly one
+    /// `CodexLaunchPlanner` per server (`server/index.ts:359`). Task 7: the
+    /// factory dispatches through [`select_codex_runtime`] — a claimable
+    /// verified survivor for a resume plan reattaches
+    /// ([`crate::sidecar_reconcile::ReattachedCodexAppServerRuntime`]); every
+    /// other plan (and a `None` reconciler/store — nothing installed at boot)
+    /// gets the spawn runtime, exactly the pre-Task-7 behavior.
     pub fn global() -> &'static CodexTerminalLaunchManager {
         GLOBAL_MANAGER.get_or_init(|| {
-            CodexTerminalLaunchManager::new(Box::new(|| {
-                Arc::new(SpawnedCodexAppServerRuntime::new()) as Arc<dyn CodexLaunchRuntime>
+            CodexTerminalLaunchManager::new(Box::new(|plan| {
+                Box::pin(async move {
+                    select_codex_runtime(
+                        codex_sidecar_reconciler().as_ref(),
+                        codex_sidecar_store().as_ref(),
+                        plan,
+                    )
+                    .await
+                })
             }))
         })
     }
@@ -779,6 +883,25 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Task 4: forward a captured codex session/thread id to an adopted
+    /// terminal's runtime so its durable sidecar record carries the
+    /// restore-time reattach key (katas ynfn/da92). Called by the freshell-ws
+    /// proxy-event router beside [`Self::mark_candidate_persisted`]; resume
+    /// launches get theirs at plan time instead. Unknown terminal ids are a
+    /// silent no-op (the mark_candidate_persisted discipline).
+    pub async fn note_session_id(&self, terminal_id: &str, session_id: &str) {
+        let runtime = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.runtime.clone())
+        };
+        if let Some(runtime) = runtime {
+            let _ = runtime.note_session_id(session_id.to_string()).await;
+        }
+    }
+
     /// S5.c: fail the gate for an adopted terminal (candidate refused).
     pub async fn fail_candidate_capture(&self, terminal_id: &str, message: &str) {
         let sidecar = {
@@ -793,42 +916,69 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Server-shutdown mode: adopted (terminal-owned) sidecars are RETAINED
+    /// across the restart — proxies close, runtimes are asked to
+    /// prepare_retention(reason) instead of shutdown. Unadopted planner
+    /// sidecars (mid-plan) are still torn down. Call BEFORE registry.kill_all()
+    /// so PTY-exit hooks (notify_terminal_exit) also retain instead of reap.
+    pub fn begin_shutdown_retention(&self) {
+        self.shutdown_retention.store(true, Ordering::SeqCst);
+    }
+
     /// Sync-safe (callable from the PTY exit hook's non-async thread): detach the
     /// terminal's launch and hand it to the teardown worker. No-op for terminals without
-    /// a managed launch.
+    /// a managed launch. Task 10: under server-shutdown retention
+    /// ([`Self::begin_shutdown_retention`] runs BEFORE `registry.kill_all()`,
+    /// so every shutdown-driven exit sees the flag set) the entry is routed
+    /// through retention instead of teardown.
     pub fn notify_terminal_exit(&self, terminal_id: &str) {
         let Some(entry) = self.adopted.lock().unwrap().remove(terminal_id) else {
             return;
         };
+        let retain = self.shutdown_retention.load(Ordering::SeqCst);
         if let Some(tx) = self.teardown_tx.get() {
-            let _ = tx.send(entry);
+            let _ = tx.send((entry, retain));
         }
     }
 
     /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
     /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
-    /// the planner stops accepting plans and tears down its unadopted sidecars — PLUS
-    /// the adopted (terminal-owned) launches this manager keys, since server exit ends
-    /// those terminals too (their exit hooks may also queue teardown; sidecar shutdown
-    /// is idempotent, so both paths are safe).
+    /// the planner stops accepting plans and tears down its unadopted sidecars
+    /// unconditionally (they have no pane to reattach to, and a fresh-plan proxy may
+    /// hold the candidate timer) — PLUS the adopted (terminal-owned) launches this
+    /// manager keys. Task 10: with [`Self::begin_shutdown_retention`] set, adopted
+    /// entries get proxy-close + `prepare_retention("server-shutdown")` instead of
+    /// teardown (kata ynfn: surviving restarts is a feature); the runtime-level
+    /// retention gate still tears down record-less sidecars exactly as today. Exit
+    /// hooks may also route the same entries; retain/shutdown share the sidecar's
+    /// idempotence flag, so both paths stay safe.
     pub async fn shutdown(&self) {
         self.planner.shutdown().await;
+        let retain = self.shutdown_retention.load(Ordering::SeqCst);
         let adopted: Vec<AdoptedTerminalLaunch> = {
             let mut map = self.adopted.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
         };
         for entry in adopted {
-            let _ = entry.sidecar.shutdown().await;
+            if retain {
+                let _ = entry.sidecar.retain(SERVER_SHUTDOWN_RETENTION_REASON).await;
+            } else {
+                let _ = entry.sidecar.shutdown().await;
+            }
             entry.drain.abort();
         }
     }
 
     fn ensure_teardown_worker(&self) {
         self.teardown_tx.get_or_init(|| {
-            let (tx, mut rx) = mpsc::unbounded_channel::<AdoptedTerminalLaunch>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<(AdoptedTerminalLaunch, bool)>();
             tokio::spawn(async move {
-                while let Some(entry) = rx.recv().await {
-                    let _ = entry.sidecar.shutdown().await;
+                while let Some((entry, retain)) = rx.recv().await {
+                    if retain {
+                        let _ = entry.sidecar.retain(SERVER_SHUTDOWN_RETENTION_REASON).await;
+                    } else {
+                        let _ = entry.sidecar.shutdown().await;
+                    }
                     entry.drain.abort();
                 }
             });
@@ -843,6 +993,9 @@ struct SpawnedSidecar {
     ws_url: String,
     ownership_id: String,
     child: tokio::process::Child,
+    /// The durable record written at spawn (tracked spawns only) — kept so
+    /// `update_ownership_metadata` can enrich + rewrite it without a re-read.
+    record: Option<CodexSidecarRecord>,
 }
 
 /// The real [`CodexLaunchRuntime`]: spawns `codex -c features.apps=false app-server
@@ -855,6 +1008,12 @@ struct SpawnedSidecar {
 pub struct SpawnedCodexAppServerRuntime {
     codex_command: Option<String>,
     start_budget: Duration,
+    /// Durable sidecar record store (Task 3). Production resolves the
+    /// process-global handle ([`crate::sidecar_store::set_codex_sidecar_store`],
+    /// wired at boot in Task 10); absent global ⇒ disabled store ⇒ behavior
+    /// identical to the pre-store world (attached `kill_on_drop(true)` spawn,
+    /// no record).
+    store: Arc<CodexSidecarStore>,
     state: tokio::sync::Mutex<Option<SpawnedSidecar>>,
     adopted_metadata: Mutex<Option<(String, u64)>>,
 }
@@ -867,11 +1026,13 @@ impl Default for SpawnedCodexAppServerRuntime {
 
 impl SpawnedCodexAppServerRuntime {
     /// Command from `CODEX_CMD` (whitespace-split, matching `codex.rs::spawn_sidecar`'s
-    /// interpreter-plus-script support) falling back to `codex`.
+    /// interpreter-plus-script support) falling back to `codex`. The record
+    /// store resolves from the process-global handle; absent ⇒ disabled.
     pub fn new() -> Self {
         Self {
             codex_command: None,
             start_budget: SIDECAR_START_BUDGET,
+            store: codex_sidecar_store().unwrap_or_else(|| Arc::new(CodexSidecarStore::disabled())),
             state: tokio::sync::Mutex::new(None),
             adopted_metadata: Mutex::new(None),
         }
@@ -882,6 +1043,19 @@ impl SpawnedCodexAppServerRuntime {
     pub fn with_command(command: impl Into<String>) -> Self {
         Self {
             codex_command: Some(command.into()),
+            ..Self::new()
+        }
+    }
+
+    /// Explicit command AND store injection (tests: a lock-free store over a
+    /// tempdir) — per-instance, never the process-global handle.
+    pub fn with_command_and_store(
+        command: impl Into<String>,
+        store: Arc<CodexSidecarStore>,
+    ) -> Self {
+        Self {
+            codex_command: Some(command.into()),
+            store,
             ..Self::new()
         }
     }
@@ -904,6 +1078,29 @@ impl SpawnedCodexAppServerRuntime {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "codex".to_string())
     }
+
+    /// Remove the durable record after teardown/failure reaping. Idempotent
+    /// (missing rows are `Ok`); failures are logged loudly, never propagated —
+    /// the reap already happened, so the worst case is a stale row the boot
+    /// reconciler re-verifies (and finds Dead) later.
+    fn scrub_record(&self, ownership_id: &str) {
+        if let Err(error) = self.store.remove(ownership_id) {
+            tracing::error!(
+                target: "freshell_codex::launch",
+                ownership_id = %ownership_id,
+                error = %error,
+                "sidecar_record_remove_failed: stale row left for boot reconcile"
+            );
+        }
+    }
+}
+
+/// Wall-clock unix millis for record `created_at`/`updated_at` stamps.
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Allocate a loopback ephemeral port (`allocateLocalhostPort`-shaped: bind
@@ -971,7 +1168,28 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            cmd.kill_on_drop(true);
+
+            // Detach CONDITIONALLY — only when the sidecar will actually be
+            // TRACKED (kata ynfn: "surviving restarts is a feature"; Node
+            // parity: `detached: true`, runtime.ts:1828-1843). The store
+            // record now plays the safety-net role kill_on_drop played: an
+            // unclean server death leaves a tracked record for boot
+            // reconciliation (Tasks 5/9). A sidecar with NO record must keep
+            // the kill_on_drop backstop — detaching it would be the
+            // silently-orphaned ynfn hole with no reconcile path — and
+            // non-Linux identity can never be /proc-verified, so a detached
+            // sidecar there would be untracked AND unreapable.
+            let detach = cfg!(target_os = "linux") && self.store.is_enabled();
+            if detach {
+                cmd.kill_on_drop(false);
+                // `tokio::process::Command::process_group` is Unix-only, so
+                // the call must stay cfg-gated even though detach is
+                // Linux-only today — keeps any non-Unix build compiling.
+                #[cfg(unix)]
+                cmd.process_group(0);
+            } else {
+                cmd.kill_on_drop(true);
+            }
 
             let mut child = cmd
                 .spawn()
@@ -1009,6 +1227,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 };
                 if let Ok(Some(status)) = child.try_wait() {
                     reap_owned_codex_sidecars(&ownership_id);
+                    self.scrub_record(&ownership_id);
                     return Err(format!(
                         "codex app-server exited before listening: {status}"
                     ));
@@ -1016,15 +1235,72 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 if tokio::time::Instant::now() >= deadline {
                     let _ = child.start_kill();
                     reap_owned_codex_sidecars(&ownership_id);
+                    self.scrub_record(&ownership_id);
                     return Err(format!("codex app-server WS never came up: {probe_error}"));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Persist the durable record for TRACKED spawns (Task 3): the
+            // listener is up, so capture the child's /proc identity evidence
+            // and write the row a restarted server reconciles against.
+            // Untracked spawns (detach == false) skip the write — they keep
+            // the kill_on_drop backstop and need no reconcile row.
+            let mut record = None;
+            if detach {
+                match child.id() {
+                    Some(pid) => {
+                        // Fall back to the constructed argv if /proc is
+                        // momentarily unreadable; a starttime of 0 can never
+                        // match a live process, so the worst outcome is the
+                        // conservative Mismatch (never signalled), not a
+                        // wrong kill.
+                        let constructed_cmdline: Vec<String> = std::iter::once(program.clone())
+                            .chain(leading_args.iter().cloned())
+                            .chain(spec.args.iter().cloned())
+                            .collect();
+                        let now = unix_millis();
+                        let row = CodexSidecarRecord {
+                            record_version: SIDECAR_RECORD_VERSION,
+                            ownership_id: ownership_id.clone(),
+                            pid,
+                            starttime: proc_starttime(pid as i32).unwrap_or(0),
+                            cmdline: proc_cmdline(pid as i32).unwrap_or(constructed_cmdline),
+                            ws_url: ws_url.clone(),
+                            session_id: None,
+                            terminal_id: None,
+                            server_instance_id: default_server_instance_id(),
+                            created_at: now,
+                            updated_at: now,
+                            state: SidecarRecordState::Active,
+                        };
+                        // Write failures are logged LOUDLY, never abort the
+                        // launch (the pane-ledger write-failure policy).
+                        if let Err(error) = self.store.write(&row) {
+                            tracing::error!(
+                                target: "freshell_codex::launch",
+                                ownership_id = %row.ownership_id,
+                                pid = row.pid,
+                                error = %error,
+                                "sidecar_record_write_failed: spawn proceeds UNTRACKED \
+                                 (detached; boot reconcile cannot see this sidecar)"
+                            );
+                        }
+                        record = Some(row);
+                    }
+                    None => tracing::error!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %ownership_id,
+                        "sidecar_record_skipped: child pid unavailable after probe success"
+                    ),
+                }
             }
 
             *state = Some(SpawnedSidecar {
                 ws_url: ws_url.clone(),
                 ownership_id,
                 child,
+                record,
             });
             Ok(CodexRuntimeReady { ws_url })
         })
@@ -1036,8 +1312,93 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            *self.adopted_metadata.lock().unwrap() = Some((terminal_id, generation));
+            *self.adopted_metadata.lock().unwrap() = Some((terminal_id.clone(), generation));
+            // Enrich the durable record at adopt (Task 3): the terminal id is
+            // what boot reconcile reports a surviving sidecar under.
+            let mut state = self.state.lock().await;
+            if let Some(record) = state.as_mut().and_then(|s| s.record.as_mut()) {
+                record.terminal_id = Some(terminal_id);
+                record.updated_at = unix_millis();
+                if let Err(error) = self.store.write(record) {
+                    tracing::error!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %record.ownership_id,
+                        error = %error,
+                        "sidecar_record_enrich_failed: adopt proceeds; record keeps \
+                         its spawn-time shape (pane-ledger write-failure policy)"
+                    );
+                }
+            }
             Ok(())
+        })
+    }
+
+    fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            // Enrich the durable record with the codex session/thread id
+            // (Task 4): the restore-time reattach key boot reconcile matches
+            // records against. Untracked spawns (no record) are a no-op.
+            let mut state = self.state.lock().await;
+            if let Some(record) = state.as_mut().and_then(|s| s.record.as_mut()) {
+                record.session_id = Some(session_id);
+                record.updated_at = unix_millis();
+                if let Err(error) = self.store.write(record) {
+                    tracing::error!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %record.ownership_id,
+                        error = %error,
+                        "sidecar_record_enrich_failed: session id kept in memory only \
+                         (pane-ledger write-failure policy)"
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Task 10: server-shutdown retention. Tracked spawns (persisted record;
+    /// `kill_on_drop(false)`, Task 3) flip their record to `Retained{reason}`
+    /// and DROP the `Child` handle without a signal — the sidecar outlives
+    /// this process and the record is what the next generation reconciles
+    /// against. The retention GATE: a record-less spawn (disabled store /
+    /// non-Linux ⇒ `kill_on_drop(true)`, NO record) is torn down exactly as
+    /// [`Self::shutdown`] would — "retaining" it would orphan it silently
+    /// with no reconcile path (the ynfn hole).
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            let Some(mut spawned) = state.take() else {
+                return Ok(()); // never spawned / already torn down
+            };
+            match spawned.record.as_mut() {
+                Some(record) => {
+                    record.state = SidecarRecordState::Retained { reason };
+                    record.updated_at = unix_millis();
+                    // Write failures log loudly, never propagate (pane-ledger
+                    // policy): the row stays Active on disk and boot
+                    // reconcile still finds + re-verifies the survivor.
+                    write_record_loudly(&self.store, record);
+                    tracing::info!(
+                        target: "freshell_codex::launch",
+                        ownership_id = %record.ownership_id,
+                        pid = record.pid,
+                        "sidecar_retained: tracked sidecar left running across \
+                         server shutdown (kata ynfn); record state = Retained"
+                    );
+                    // `spawned` drops at scope end: kill_on_drop is false for
+                    // tracked spawns, so the child is released untouched.
+                    Ok(())
+                }
+                None => {
+                    // Record-less: the ynfn gate — teardown exactly as today.
+                    let _ = spawned.child.start_kill();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                    reap_owned_codex_sidecars(&spawned.ownership_id);
+                    self.scrub_record(&spawned.ownership_id);
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -1048,6 +1409,9 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 let _ = spawned.child.start_kill();
                 let _ = tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
                 reap_owned_codex_sidecars(&spawned.ownership_id);
+                // Explicit teardown scrubs the record (Task 3): a cleanly
+                // shut-down sidecar must leave nothing for boot reconcile.
+                self.scrub_record(&spawned.ownership_id);
             }
             Ok(())
         })

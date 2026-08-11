@@ -34,6 +34,10 @@ default = []
 real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
+# Derive for the durable sidecar record rows (`sidecar_store`) — the versioned
+# camelCase JSON schema a restarted server reads back (BindingRow precedent,
+# pane_ledger.rs:93-130).
+serde = { workspace = true }
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` params/result model
 # (JSON.parse parity, corruption-tolerant). preserve_order matches the wire object model.
 serde_json = { workspace = true }
@@ -57,3 +61,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # FRESHELL_CODEX_SIDECAR_ID tag (runtime.ts:494) so no orphan survives (the oracle
 # `ownership.cleanup` invariant). Only needed by the real transport.
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Tempdirs for the sidecar-store unit tests — no global state, nothing outside
+# each test's own temp dir (never `~/.freshell/`).
+tempfile = "3"

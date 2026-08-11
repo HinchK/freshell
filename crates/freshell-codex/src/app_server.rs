@@ -413,6 +413,31 @@ impl CodexAppServerClient {
         .await
     }
 
+    /// `thread/loaded/list` — the ids of threads this app-server currently
+    /// has loaded in memory (result shape `{ data: string[], nextCursor? }`,
+    /// contract-foundation plan §thread/loaded/list; the committed fixture
+    /// returns `{ data: behavior.loadedThreadIds }`). NOTE: `loaded` alone
+    /// does NOT mean mid-turn — idle threads stay loaded forever
+    /// (reports/V1.md); pair with [`Self::read_thread`]'s status. Added for
+    /// Task 9's sweep probe.
+    pub async fn list_loaded_threads(&self) -> Result<Vec<String>, CodexAppServerError> {
+        let result = self.request("thread/loaded/list", json!({})).await?;
+        // Absent/non-array `data` is NOT an empty list: the sweep probe reads
+        // Ok(vec![]) as proof of "reachable, no loaded threads" and may REAP
+        // on it — a malformed payload must fail loudly instead, sending the
+        // caller down the conservative writer-evidence path (final review F2).
+        let Some(ids) = result.get("data").and_then(Value::as_array) else {
+            return Err(CodexAppServerError::InvalidResponse {
+                method: "thread/loaded/list".to_string(),
+                detail: format!("expected result.data to be an array, got: {result}"),
+            });
+        };
+        Ok(ids
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Send a notification frame (no response awaited) — `notify`, `client.ts:805-808`.
     pub async fn notify(
         &self,

@@ -17,6 +17,20 @@
 //! target, and reaping is only meaningful at OS-process granularity anyway
 //! -- there is no in-process way to observe "did the child process actually
 //! die" other than asking the OS.
+//!
+//! DELIBERATE DEVIATION (Task 10, kata ynfn): the parity checklist's
+//! acceptance text "terminate exact terminal/provider/extension trees"
+//! (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:615`)
+//! is deliberately INVERTED for TRACKED codex terminal-pane sidecars — the
+//! launch manager's adopted, record-bearing spawns are now RETAINED across a
+//! graceful shutdown ("killing sidecars at shutdown is NOT acceptable —
+//! surviving restarts is a feature"). This suite's coverage is untouched by
+//! that: its codex leg is a freshagent-lane sidecar (`freshAgent.create
+//! {sessionType:"freshcodex"}`) plus a shell PTY, both OUTSIDE the retention
+//! scope, so it doubles as the tripwire that retention did not leak into the
+//! freshagent lane or shell-PTY reaping. The retention behavior itself is
+//! pinned by `crates/freshell-codex/tests/launch_lifecycle.rs`'s Task 10
+//! section.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

@@ -416,11 +416,12 @@ fn storm_controls() -> &'static Arc<StormControls> {
         let factory_controls = controls.clone();
         let manager =
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
-                Box::new(move || {
-                    Arc::new(StormRuntime {
+                Box::new(move |_plan| {
+                    let rt = Arc::new(StormRuntime {
                         c: factory_controls.clone(),
                     })
-                        as Arc<dyn freshell_codex::launch_lifecycle::CodexLaunchRuntime>
+                        as Arc<dyn freshell_codex::launch_lifecycle::CodexLaunchRuntime>;
+                    Box::pin(async move { rt })
                 }),
                 2,
                 std::time::Duration::from_secs(30),

@@ -178,6 +178,12 @@ async fn route_candidate(
         CodexTerminalLaunchManager::global()
             .mark_candidate_persisted(terminal_id)
             .await;
+        // Task 4: the captured thread id is the durable sidecar record's
+        // restore-time reattach key — note it beside the persistence release.
+        // No-op without an adopted spawned runtime + enabled store.
+        CodexTerminalLaunchManager::global()
+            .note_session_id(terminal_id, &candidate.thread.id)
+            .await;
         // D-FORK: give managed panes the disk fork watch resume panes get.
         // `watch_fork` snapshots the sessions tree (bounded fs walk), so it
         // runs on the blocking pool like the association sweep's lane -- a

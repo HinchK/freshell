@@ -250,12 +250,20 @@ function successResult(method, params) {
     return {}
   }
   if (method === 'thread/read') {
-    return {
-      thread: makeThread(params?.threadId, {
-        ...params,
-        includeTurns: params?.includeTurns === true,
-      }),
+    const thread = makeThread(params?.threadId, {
+      ...params,
+      includeTurns: params?.includeTurns === true,
+    })
+    // Task 9 knob: per-thread scriptable status, consulted by thread/read only.
+    // threadStatuses: {"<threadId>": "active"|"idle"} — an absent knob or an
+    // unlisted thread id keeps makeThread's hardcoded { type: 'idle' }, so all
+    // existing fixture consumers are untouched. (The `overrides` knob is a
+    // per-METHOD blanket and cannot express per-thread status.)
+    const scriptedStatus = behavior.threadStatuses?.[thread.id]
+    if (typeof scriptedStatus === 'string') {
+      thread.status = { type: scriptedStatus }
     }
+    return { thread }
   }
   if (method === 'thread/turns/list') {
     return makeThreadTurnsPage(params)

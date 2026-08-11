@@ -52,6 +52,18 @@ pub mod launch_lifecycle;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]
+pub mod runtime_select;
+#[cfg(feature = "real-transport")]
+pub mod sidecar_reconcile;
+#[cfg(feature = "real-transport")]
+pub mod sidecar_store;
+#[cfg(feature = "real-transport")]
+pub mod sidecar_sweep;
+// Shared helpers for the sidecar lifecycle test suites (never shipped;
+// Linux-only like the suites themselves — they read `/proc` evidence).
+#[cfg(all(test, target_os = "linux", feature = "real-transport"))]
+pub(crate) mod sidecar_test_support;
+#[cfg(feature = "real-transport")]
 pub mod transport;
 
 pub use app_server::{
@@ -72,6 +84,22 @@ pub use model::{
     CodexEffortError, CHEAPEST_T2_MODEL, FRESHCODEX_DEFAULT_EFFORT, FRESHCODEX_DEFAULT_MODEL,
     FRESHCODEX_EFFORTS_VERBATIM,
 };
+#[cfg(feature = "real-transport")]
+pub use runtime_select::select_codex_runtime;
+#[cfg(feature = "real-transport")]
+pub use sidecar_reconcile::{
+    codex_sidecar_reconciler, set_codex_sidecar_reconciler, BootReconcileReport,
+    ReattachedCodexAppServerRuntime, SidecarReconciler,
+};
+#[cfg(feature = "real-transport")]
+pub use sidecar_store::{
+    proc_cmdline, proc_starttime, set_codex_sidecar_store, verify_sidecar_identity,
+    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarRecordState,
+    SIDECAR_RECORD_VERSION,
+};
+#[cfg(feature = "real-transport")]
+pub use sidecar_sweep::{kill_verified_sidecar_tree, KillOutcome, KillTreeOutcome};
+
 pub use protocol::{
     build_notification_frame, build_request_frame, classify_notification,
     extract_turn_notification_event, parse_client_frame, parse_incoming_frame, turn_status,

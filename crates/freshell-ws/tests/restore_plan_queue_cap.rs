@@ -289,10 +289,12 @@ async fn plan_queue_overflow_maps_to_rate_limited_on_the_ws_restore_door() {
     let plans_started = Arc::new(AtomicU64::new(0));
     let factory_counter = Arc::clone(&plans_started);
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
-        Box::new(move || {
-            Arc::new(NeverRuntime {
+        Box::new(move |_plan| {
+            let rt = Arc::new(NeverRuntime {
                 plans_started: factory_counter.clone(),
-            }) as Arc<dyn freshell_codex::launch_lifecycle::CodexLaunchRuntime>
+            })
+                as Arc<dyn freshell_codex::launch_lifecycle::CodexLaunchRuntime>;
+            Box::pin(async move { rt })
         }),
         0,
         Duration::from_millis(50),
