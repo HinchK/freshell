@@ -124,9 +124,22 @@ the 3-tier Rust test approach), cargo fmt/clippy pinned toolchain 1.96.0.
   deterministic failures** in `tests/auto_resume_e2e.rs`
   (`crashing_agent_is_resumed_twice_then_settles_exited`,
   `reconcile_after_replacement_attaches_to_the_new_terminal` — both time out
-  waiting for a terminal.created frame; reproduced 2/2). "Baseline-identical"
-  for freshell-ws means: exactly these 2 and only these 2 fail. Do not chase
-  them. `freshell-freshagent` was not baselined (known environmental e2e
+  waiting for a terminal.created frame; reproduced 2/2). Do not chase them.
+  **Fail-fast caveat:** that measured run aborted at `auto_resume_e2e`
+  (cargo's default fail-fast across test binaries), so the 490-passed figure
+  covers only the lib target plus 2 of ~44 freshell-ws test binaries — the
+  full ws suite was NOT baselined at plan time. Therefore: (a) every
+  whole-package `cargo test -p freshell-ws` gate in this plan runs with
+  `--no-fail-fast` (per-binary `--test <name>` runs are unaffected); (b)
+  before Task 1's first edit, run
+  `cargo test -p freshell-ws --no-fail-fast` on the unmodified tree and
+  record the complete failure set to
+  `.worktrees/.the-usual-logs/codex-sidecar-lifecycle/baseline-test-ws-full.log`;
+  (c) "Baseline-identical" for freshell-ws means: with `--no-fail-fast`, the
+  failure set equals that recorded full-suite baseline (expected: exactly
+  the 2 `auto_resume_e2e` failures; any additional pre-existing failures the
+  full baseline reveals are recorded there and likewise not chased).
+  `freshell-freshagent` was not baselined (known environmental e2e
   failures; baseline before/after only if a task must run it).
 - The worktree has NO node_modules of its own: the fixture's `ws` import
   resolves via the PARENT checkout's `/home/dan/code/freshell/node_modules`
@@ -595,7 +608,10 @@ pub trait CodexLaunchRuntime: Send + Sync {
   `spawned_runtime_launches_…` test must still pass (explicit `shutdown()`
   still kills; only *drop-without-shutdown* semantics changed).
 - [ ] **Step 5: Cross-crate check** (consumers of the changed spawn):
-  `cargo test -p freshell-ws --test codex_managed_launch_e2e` and
+  `cargo test -p freshell-ws --test codex_managed_launch_e2e -- --ignored --test-threads=1`
+  (the binary's only test is an `#[ignore]`-gated host e2e — without
+  `--ignored` it runs zero tests and passes vacuously; `--test-threads=1`
+  per the file's own header, it mutates process env) and
   `cargo test -p freshell-ws --test restore_storm` — baseline-identical.
 - [ ] **Step 6: Gates:** `cargo fmt --all --check`;
   `cargo clippy --workspace --all-targets -- -D warnings`;
@@ -681,7 +697,9 @@ captures the thread candidate.
     `codex_identity.rs:182-227`).
 - [ ] **Step 4: ws-side check:** run the candidate-path suites that drive that
   router — `cargo test -p freshell-ws --test codex_candidate_inert` and
-  `cargo test -p freshell-ws --test codex_managed_launch_e2e` —
+  `cargo test -p freshell-ws --test codex_managed_launch_e2e -- --ignored --test-threads=1`
+  (as in Task 3 Step 5: its only test is `#[ignore]`-gated; without
+  `--ignored --test-threads=1` the run is vacuous) —
   baseline-identical (the new call is a no-op without an adopted spawned
   runtime + store; full ws-side proof of fresh-launch enrichment rides Task 8's
   harness).
@@ -1003,7 +1021,8 @@ codex_sidecar_store().as_ref(), plan).await }))`.
   `select_codex_runtime`, update `global()`.
 - [ ] **Step 4: Whole-workspace compile + affected suites:**
   `cargo test -p freshell-codex --features real-transport` and
-  `cargo test -p freshell-ws` (factory closures in ws tests updated;
+  `cargo test -p freshell-ws --no-fail-fast` (factory closures in ws tests
+  updated; compare the failure set against the recorded full-suite baseline —
   behavior baseline-identical since no reconciler global is installed there).
 - [ ] **Step 5: Gates:** fmt; `cargo clippy --workspace --all-targets -- -D warnings`;
   the two `real-transport` clippy legs.
@@ -1402,12 +1421,14 @@ in files this plan already touched.
   tauri's GTK deps):
   ```bash
   cargo test -p freshell-codex --features real-transport
-  cargo test -p freshell-ws
+  cargo test -p freshell-ws --no-fail-fast
   cargo test -p freshell-server
   cargo test -p freshell-platform
   cargo test -p freshell-freshagent   # baseline the known environmental e2e failures before/after
   ```
-  Record pass counts; `freshell-freshagent` must be baseline-identical.
+  Record pass counts (freshell-ws: compare the full failure set against the
+  recorded full-suite baseline); `freshell-freshagent` must be
+  baseline-identical.
 - [ ] **Step 2: Mirror CI exactly:**
   ```bash
   cargo fmt --all --check
@@ -1609,3 +1630,37 @@ hardcoded-idle at `fake-app-server.mjs:252-259` and factory alias at
 invariant coverage unchanged (five fates incl. the duplicate loser; retained
 rows stay claimable); process-safety unchanged (no new signal paths); scope
 decisions unchanged.
+
+## Fresh-eyes review pass (iteration 2)
+
+A second independent zero-context cross-model review (same log) found two
+blocking verification-gate defects, both fixed above:
+
+- **Vacuous `codex_managed_launch_e2e` gates (Tasks 3/4).** The binary's
+  only test is `#[ignore]`-gated (host e2e,
+  `codex_managed_launch_e2e.rs:312`), so the plan's
+  `--test codex_managed_launch_e2e` commands ran zero tests and passed
+  unconditionally — while being the only ws-side exercise of the exact spawn
+  semantics Task 3 changes. Fixed: both gates now pass
+  `-- --ignored --test-threads=1` (single-threaded per the file's own
+  header).
+- **Fail-fast made every `cargo test -p freshell-ws` gate unverifiable.**
+  The measured 490-passed baseline aborted at `auto_resume_e2e` (3rd of ~44
+  test binaries), so the "exactly these 2 fail" definition could not be
+  checked and the suites this plan touches never ran under those gates.
+  Fixed: the Global-Constraints baseline bullet now mandates
+  `--no-fail-fast` on every whole-package ws gate, a pre-Task-1 full-suite
+  baseline recording (`baseline-test-ws-full.log` in the logs dir), and
+  redefines "baseline-identical" as failure-set equality against that
+  recording; Task 7 Step 4 and Task 11 Step 1 updated accordingly.
+
+Self-review re-run over the edited sections (Global Constraints baseline,
+Tasks 3, 4, 7, 11): failing-test-first ordering untouched (only
+verification commands and the baseline definition changed — no
+test-creation steps moved); paths/symbols grounded (the `#[ignore]` gate at
+`codex_managed_launch_e2e.rs:312` and the 3-binary fail-fast abort in
+`baseline-test-ws.log` are reviewer-verified against the worktree);
+invariant coverage unchanged (five fates incl. the duplicate loser);
+process-safety unchanged (no new signal paths); scope decisions unchanged
+(verification-only amendments; no new files enter the plan's task file
+set, so Task 11 Step 3's binding files audit is unaffected).
