@@ -164,6 +164,7 @@ case "$args" in
   *"artifacts docker images describe"*) echo "$args" >> "$STUB_CAPTURE/describe.args"; exit 1 ;;
   *"run jobs create"*) echo "$args" >> "$STUB_CAPTURE/create.args"; exit 0 ;;
   *"run jobs update"*) echo "$args" >> "$STUB_CAPTURE/update.args"; exit 0 ;;
+  *"builds submit"*) echo "$args" >> "$STUB_CAPTURE/builds.args"; exit 0 ;;
   *"run jobs execute"*) exit 0 ;;
   *"executions list"*) echo "exec-stub"; exit 0 ;;
   *"executions describe"*)
@@ -215,9 +216,14 @@ if grep -q -- "--image=[^ ]*freshell-e2e:latest" "$STUB_CAPTURE/create.args" 2>/
   rm -rf "$STUB_DIR"
   exit 1
 fi
-if ! grep -q "push [^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/docker.args" 2>/dev/null; then
-  echo "FAIL: the HEAD-addressed image was never pushed by the build fallback"
+# The HEAD-addressed tag must be PUBLISHED by the build path taken:
+# local-docker (`docker push …:TAG` — `--local-build` leg) or Cloud Build
+# (`gcloud builds submit --substitutions=_IMAGE=…:TAG` — the default).
+if ! { grep -q "push [^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/docker.args" 2>/dev/null \
+     || grep -q "_IMAGE=[^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/builds.args" 2>/dev/null; }; then
+  echo "FAIL: the HEAD-addressed image was never published by the build path"
   echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
+  echo "builds args: $(cat "$STUB_CAPTURE/builds.args" 2>/dev/null || echo '<none>')"
   rm -rf "$STUB_DIR"
   exit 1
 fi
@@ -227,9 +233,11 @@ fi
 # asserted here. (This suite commonly runs on a dirty tree, making this a
 # live pin in practice.)
 if [ -n "$(git status --porcelain)" ]; then
-  if ! grep -qE "^build " "$STUB_CAPTURE/docker.args" 2>/dev/null; then
+  if ! { grep -qE "^build " "$STUB_CAPTURE/docker.args" 2>/dev/null \
+       || grep -qE "^builds submit" "$STUB_CAPTURE/builds.args" 2>/dev/null; }; then
     echo "FAIL: dirty tree but the cloud path did NOT rebuild the image"
     echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
+    echo "builds args: $(cat "$STUB_CAPTURE/builds.args" 2>/dev/null || echo '<none>')"
     rm -rf "$STUB_DIR"
     exit 1
   fi

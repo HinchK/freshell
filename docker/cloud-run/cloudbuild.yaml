@@ -1,0 +1,34 @@
+steps:
+  # Create a buildx builder that supports registry cache export.
+  # The default docker driver does not support --cache-to type=registry.
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker buildx create --use --name cloud-builder --driver docker-container || docker buildx use cloud-builder']
+  # Pull existing cache image for layer caching (exit 0 if not found yet).
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker pull ${_IMAGE}-cache || exit 0']
+    env:
+      - 'DOCKER_BUILDKIT=1'
+  # Build with BuildKit + mode=max registry cache to preserve intermediate
+  # stage layers (rust-builder, node-builder), not just the final image.
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'buildx'
+      - 'build'
+      - '-f'
+      - 'docker/cloud-run/Dockerfile'
+      - '-t'
+      - '${_IMAGE}'
+      - '--cache-from'
+      - 'type=registry,ref=${_IMAGE}-cache'
+      - '--cache-to'
+      - 'type=registry,ref=${_IMAGE}-cache,mode=max'
+      - '--push'
+      - '.'
+    env:
+      - 'DOCKER_BUILDKIT=1'
+options:
+  machineType: 'E2_HIGHCPU_32'
+  diskSizeGb: 200
+timeout: '3600s'

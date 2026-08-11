@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { shouldKeepClosedTab, collectPaneSnapshots, buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
+import { shouldKeepClosedTab, collectPaneSnapshots, buildOpenTabRegistryRecord, buildClosedTabRegistryRecord } from '@/lib/tab-registry-snapshot'
+import { collectPaneIdentityActivity } from '@/lib/pane-activity'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import type { PaneNode } from '@/store/paneTypes'
+import type { Tab } from '@/store/types'
 
 describe('shouldKeepClosedTab', () => {
   it('keeps when open for more than 5 minutes', () => {
@@ -280,6 +282,165 @@ describe('collectPaneSnapshots', () => {
 
       expect(snapshots[0].title).toBe('My Extension Pane')
     })
+  })
+})
+
+describe('pane identity stamping', () => {
+  function baseRecordInput(layout: PaneNode) {
+    return {
+      tab: {
+        id: 'tab-1',
+        createRequestId: 'req-tab-1',
+        title: 'Tab 1',
+        status: 'running',
+        mode: 'shell',
+        createdAt: 1,
+      } as never,
+      layout,
+      serverInstanceId: 'srv',
+      deviceId: 'device-1',
+      deviceLabel: 'Device 1',
+      updatedAt: 1,
+      revision: 0,
+    }
+  }
+
+  it('stamps sessionKeys and busySessionKeys onto open-record pane payloads via paneIdentityActivity', () => {
+    const layout: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        {
+          type: 'leaf',
+          id: 'pane-claude',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-claude',
+            status: 'running',
+            mode: 'claude',
+            shell: 'system',
+            terminalId: 'term-claude',
+            resumeSessionId: '11111111-1111-4111-8111-111111111111',
+          },
+        },
+        {
+          type: 'leaf',
+          id: 'pane-shell',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            terminalId: 'term-shell',
+          },
+        },
+      ],
+    }
+    const paneIdentityActivity = new Map([
+      ['pane-claude', {
+        sessionKeys: ['claude:11111111-1111-4111-8111-111111111111', 'claude:terminal:term-claude'],
+        busySessionKeys: ['claude:11111111-1111-4111-8111-111111111111'],
+      }],
+    ])
+
+    const record = buildOpenTabRegistryRecord({
+      ...baseRecordInput(layout),
+      paneIdentityActivity,
+    })
+
+    expect(record.panes[0].payload.sessionKeys).toEqual([
+      'claude:11111111-1111-4111-8111-111111111111',
+      'claude:terminal:term-claude',
+    ])
+    expect(record.panes[0].payload.busySessionKeys).toEqual(['claude:11111111-1111-4111-8111-111111111111'])
+    // Sessionless panes carry neither field.
+    expect(record.panes[1].payload).not.toHaveProperty('sessionKeys')
+    expect(record.panes[1].payload).not.toHaveProperty('busySessionKeys')
+  })
+
+  it('stamps every alias in sessionKeys but only the effective identity in busySessionKeys', () => {
+    const explicitId = '66666666-6666-4666-8666-666666666666'
+    const resumeId = '77777777-7777-4777-8777-777777777777'
+    const tab = {
+      id: 'tab-1',
+      createRequestId: 'req-tab-1',
+      title: 'Tab 1',
+      status: 'running',
+      mode: 'claude',
+      createdAt: 1,
+    } as unknown as Tab
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-alias',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-alias',
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        terminalId: 'term-alias',
+        sessionRef: { provider: 'claude', sessionId: explicitId },
+        resumeSessionId: resumeId,
+      },
+    }
+    const paneIdentityActivity = collectPaneIdentityActivity({
+      tabs: [tab],
+      paneLayouts: { 'tab-1': layout },
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {
+        'term-alias': { terminalId: 'term-alias', phase: 'busy', updatedAt: 1 },
+      },
+      amplifierActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+    })
+
+    const record = buildOpenTabRegistryRecord({
+      ...baseRecordInput(layout),
+      paneIdentityActivity,
+    })
+
+    expect(record.panes[0].payload.sessionKeys).toEqual([
+      `claude:${explicitId}`,
+      `claude:${resumeId}`,
+    ])
+    expect(record.panes[0].payload.busySessionKeys).toEqual([`claude:${explicitId}`])
+  })
+
+  it('never stamps identity fields onto closed/tombstone records even when given a nonempty map', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-claude',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-claude',
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        terminalId: 'term-claude',
+        resumeSessionId: '11111111-1111-4111-8111-111111111111',
+      },
+    }
+    const paneIdentityActivity = new Map([
+      ['pane-claude', {
+        sessionKeys: ['claude:11111111-1111-4111-8111-111111111111'],
+        busySessionKeys: ['claude:11111111-1111-4111-8111-111111111111'],
+      }],
+    ])
+
+    const record = buildClosedTabRegistryRecord({
+      ...baseRecordInput(layout),
+      paneIdentityActivity,
+    })
+
+    expect(record.status).toBe('closed')
+    for (const pane of record.panes) {
+      expect(pane.payload).not.toHaveProperty('sessionKeys')
+      expect(pane.payload).not.toHaveProperty('busySessionKeys')
+    }
   })
 })
 

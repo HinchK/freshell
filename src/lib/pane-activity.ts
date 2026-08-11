@@ -1,6 +1,8 @@
 import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
+import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { extractSessionLocators } from '@/lib/session-utils'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type {
   FreshAgentPaneContent,
@@ -308,49 +310,141 @@ export function getBusyPaneIdsForTab(input: {
     .map((entry) => entry.paneId)
 }
 
-export function collectBusySessionKeys(input: {
-  tabs: Tab[]
-  paneLayouts: Record<string, PaneNode | undefined>
+type PaneActivityMaps = {
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
-}): string[] {
-  const busySessionKeys = new Set<string>()
+}
+
+function lookupLiveFreshAgentSession(
+  content: FreshAgentPaneContent,
+  freshAgentSessions?: Record<string, FreshAgentSessionState>,
+): FreshAgentSessionState | undefined {
+  if (!content.sessionId) return undefined
+  return freshAgentSessions?.[makeFreshAgentSessionKey({
+    sessionType: content.sessionType,
+    provider: content.provider,
+    sessionId: content.sessionId,
+  })]
+}
+
+/**
+ * A pane's ONE effective busy identity, or undefined when the pane is not
+ * busy (per resolvePaneActivity) or has no canonical identity. Shared by
+ * collectBusySessionKeys and collectPaneIdentityActivity so both always agree
+ * on which single session key a busy pane claims.
+ */
+function resolveBusyPaneSessionKey(input: PaneActivityMaps & {
+  paneId: string
+  content: PaneContent
+  tabMode?: Tab['mode']
+  tabSessionRef?: Tab['sessionRef']
+  tabResumeSessionId?: string
+  isOnlyPane: boolean
+}): string | undefined {
+  const busy = resolvePaneActivity({
+    paneId: input.paneId,
+    content: input.content,
+    tabMode: input.tabMode,
+    isOnlyPane: input.isOnlyPane,
+    codexActivityByTerminalId: input.codexActivityByTerminalId,
+    opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
+    claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+    amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+    paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
+    freshAgentSessions: input.freshAgentSessions,
+  }).isBusy
+  if (!busy) return undefined
+
+  if (input.content.kind === 'fresh-agent') {
+    return resolveFreshAgentSessionKey(
+      input.content,
+      lookupLiveFreshAgentSession(input.content, input.freshAgentSessions),
+    )
+  }
+  if (input.content.kind === 'terminal') {
+    return resolveTerminalSessionKey(input.content, input.tabSessionRef, input.tabResumeSessionId, input.tabMode)
+  }
+  return undefined
+}
+
+/**
+ * Fabricated Sidebar fallback row key for a terminal pane (mirrors the
+ * live-terminal fallback loop in sidebarSelectors.buildSessionItems): a
+ * running non-shell terminal with no bound sessionRef — and, for Codex, no
+ * durability thread id — appears in the Sidebar as a fabricated
+ * `<mode>:terminal:<terminalId>` row. Stamping that key lets remote devices
+ * ring the same row.
+ */
+function resolveTerminalFallbackRowKey(content: TerminalPaneContent): string | undefined {
+  if (content.status !== 'running') return undefined
+  if (content.sessionRef) return undefined
+  if (!isNonShellMode(content.mode)) return undefined
+  if (!content.terminalId) return undefined
+  if (content.mode === 'codex') {
+    const codexSessionId = content.codexDurability?.durableThreadId
+      ?? content.codexDurability?.candidate?.candidateThreadId
+    if (codexSessionId) return undefined
+  }
+  return `${content.mode}:terminal:${content.terminalId}`
+}
+
+export type PaneIdentityActivity = {
+  sessionKeys: string[]
+  busySessionKeys: string[]
+}
+
+/**
+ * Per-leaf-pane session identity + busy stamping for the tab registry push.
+ * `sessionKeys` holds every identity a remote Sidebar row could join on:
+ * the pane's canonical locators (same rules as the local green/hasTab join),
+ * the live fresh-agent canonical key when a live session exists, and the
+ * fabricated terminal fallback row key. `busySessionKeys` holds the pane's ONE
+ * effective busy identity when the pane is busy per resolvePaneActivity
+ * (mirroring collectBusySessionKeys' per-entry resolution), empty otherwise.
+ *
+ * Layout-less tabs contribute nothing: registry records are only built for
+ * tabs with a pane layout.
+ */
+export function collectPaneIdentityActivity(input: PaneActivityMaps & {
+  tabs: Tab[]
+  paneLayouts: Record<string, PaneNode | undefined>
+}): Map<string, PaneIdentityActivity> {
+  const activityByPaneId = new Map<string, PaneIdentityActivity>()
 
   for (const tab of input.tabs) {
     const layout = input.paneLayouts[tab.id]
-    if (!layout) {
-      const syntheticContent = buildSyntheticTerminalContent(tab)
-      if (!syntheticContent) continue
-
-      const busy = resolvePaneActivity({
-        paneId: tab.id,
-        content: syntheticContent,
-        tabMode: tab.mode,
-        isOnlyPane: true,
-        codexActivityByTerminalId: input.codexActivityByTerminalId,
-        opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
-        claudeActivityByTerminalId: input.claudeActivityByTerminalId,
-        amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
-        paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
-        freshAgentSessions: input.freshAgentSessions,
-      }).isBusy
-      if (!busy) continue
-
-      const sessionKey = resolveTerminalSessionKey(syntheticContent, tab.sessionRef, tab.resumeSessionId, tab.mode)
-      if (sessionKey) busySessionKeys.add(sessionKey)
-      continue
-    }
+    if (!layout) continue
 
     const isOnlyPane = layout.type === 'leaf'
     for (const entry of collectPaneEntries(layout)) {
-      const busy = resolvePaneActivity({
+      const content = entry.content
+
+      const sessionKeySet = new Set<string>()
+      for (const locator of extractSessionLocators(content)) {
+        sessionKeySet.add(`${locator.provider}:${locator.sessionId}`)
+      }
+      if (content.kind === 'fresh-agent') {
+        const liveSession = lookupLiveFreshAgentSession(content, input.freshAgentSessions)
+        if (liveSession) {
+          const liveKey = resolveFreshAgentSessionKey(content, liveSession)
+          if (liveKey) sessionKeySet.add(liveKey)
+        }
+      }
+      if (content.kind === 'terminal') {
+        const fallbackKey = resolveTerminalFallbackRowKey(content)
+        if (fallbackKey) sessionKeySet.add(fallbackKey)
+      }
+
+      const busyKey = resolveBusyPaneSessionKey({
         paneId: entry.paneId,
-        content: entry.content,
+        content,
         tabMode: tab.mode,
+        tabSessionRef: tab.sessionRef,
+        tabResumeSessionId: tab.resumeSessionId,
         isOnlyPane,
         codexActivityByTerminalId: input.codexActivityByTerminalId,
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
@@ -358,23 +452,64 @@ export function collectBusySessionKeys(input: {
         amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         freshAgentSessions: input.freshAgentSessions,
-      }).isBusy
-      if (!busy) continue
+      })
+      const busySessionKeys = busyKey ? [busyKey] : []
 
-      const sessionKey = entry.content.kind === 'fresh-agent'
-        ? resolveFreshAgentSessionKey(
-            entry.content,
-            entry.content.sessionId
-              ? input.freshAgentSessions?.[makeFreshAgentSessionKey({
-                sessionType: entry.content.sessionType,
-                provider: entry.content.provider,
-                sessionId: entry.content.sessionId,
-              })]
-              : undefined,
-          )
-        : entry.content.kind === 'terminal'
-          ? resolveTerminalSessionKey(entry.content, tab.sessionRef, tab.resumeSessionId, tab.mode)
-          : undefined
+      if (sessionKeySet.size === 0 && busySessionKeys.length === 0) continue
+      activityByPaneId.set(entry.paneId, {
+        sessionKeys: Array.from(sessionKeySet),
+        busySessionKeys,
+      })
+    }
+  }
+
+  return activityByPaneId
+}
+
+export function collectBusySessionKeys(input: PaneActivityMaps & {
+  tabs: Tab[]
+  paneLayouts: Record<string, PaneNode | undefined>
+}): string[] {
+  const busySessionKeys = new Set<string>()
+  const maps: PaneActivityMaps = {
+    codexActivityByTerminalId: input.codexActivityByTerminalId,
+    opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
+    claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+    amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+    paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
+    freshAgentSessions: input.freshAgentSessions,
+  }
+
+  for (const tab of input.tabs) {
+    const layout = input.paneLayouts[tab.id]
+    if (!layout) {
+      const syntheticContent = buildSyntheticTerminalContent(tab)
+      if (!syntheticContent) continue
+
+      const sessionKey = resolveBusyPaneSessionKey({
+        ...maps,
+        paneId: tab.id,
+        content: syntheticContent,
+        tabMode: tab.mode,
+        tabSessionRef: tab.sessionRef,
+        tabResumeSessionId: tab.resumeSessionId,
+        isOnlyPane: true,
+      })
+      if (sessionKey) busySessionKeys.add(sessionKey)
+      continue
+    }
+
+    const isOnlyPane = layout.type === 'leaf'
+    for (const entry of collectPaneEntries(layout)) {
+      const sessionKey = resolveBusyPaneSessionKey({
+        ...maps,
+        paneId: entry.paneId,
+        content: entry.content,
+        tabMode: tab.mode,
+        tabSessionRef: tab.sessionRef,
+        tabResumeSessionId: tab.resumeSessionId,
+        isOnlyPane,
+      })
       if (sessionKey) busySessionKeys.add(sessionKey)
     }
   }

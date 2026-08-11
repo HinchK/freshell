@@ -10,6 +10,7 @@ import {
   setTabRegistrySyncError,
 } from './tabRegistrySlice'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
+import { collectPaneIdentityActivity } from '@/lib/pane-activity'
 import type { PaneNode } from './paneTypes'
 import {
   TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY,
@@ -20,6 +21,8 @@ import { deriveTabRecencyAt } from '@/lib/tab-recency'
 export const SYNC_INTERVAL_MS = 5000
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 export const CLIENT_LEASE_GRACE_MS = 50
+export const QUERY_INTERVAL_MS = 30_000
+export const QUERY_STALE_MS = 90_000
 
 type AppStore = Store<RootState>
 type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanceId'> & {
@@ -183,6 +186,16 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
     return closedAt >= closedCutoff
   })
   const retainedClosedTabKeys = new Set(retainedClosedRecords.map((closed) => closed.tabKey))
+  const paneIdentityActivity = collectPaneIdentityActivity({
+    tabs: state.tabs.tabs,
+    paneLayouts: state.panes.layouts,
+    codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? {},
+    claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? {},
+    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? {},
+    opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? {},
+    paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? {},
+    freshAgentSessions: state.freshAgent?.sessions,
+  })
 
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
@@ -202,6 +215,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       deviceLabel,
       revision: 0,
       updatedAt,
+      paneIdentityActivity,
     })
     if (retainedClosedTabKeys.has(recordBase.tabKey)) continue
     const version = nextRecordVersion(recordBase, revisions, now)
@@ -290,18 +304,19 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   let queuedPush = false
   let queuedForcedPush = false
   let latestQueryRequestId = ''
+  let lastQuerySentAt = 0
 
-  const querySnapshot = (closedTabRetentionDays?: number) => {
-    if (!leaseSettled) {
-      queuedQuery = true
-      return
-    }
-    if (ws.state !== 'ready') return
+  // Single send path for every query trigger. Each send supersedes any
+  // outstanding request (in-flight memory stays bounded to one), moves the
+  // reply gate to the new id, and stamps freshness for the interval guard.
+  const sendQueryNow = (closedTabRetentionDays?: number) => {
     const state = store.getState()
     const retentionDays = Math.min(30, Math.max(1, closedTabRetentionDays ?? selectedClosedRetentionDays(state)))
     const requestId = `tabs-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    pendingRequests.clear()
     pendingRequests.add(requestId)
     latestQueryRequestId = requestId
+    lastQuerySentAt = Date.now()
     store.dispatch(setTabRegistryLoading(true))
     sendTabsSyncQuery({
       requestId,
@@ -309,6 +324,27 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
       clientInstanceId,
       closedTabRetentionDays: retentionDays,
     })
+  }
+
+  // Event triggers (startup, WS ready, reconnect, retention-days change,
+  // lease settle) always send immediately, superseding any outstanding
+  // request — a query whose socket died must not delay the reconnect query.
+  const querySnapshot = (closedTabRetentionDays?: number) => {
+    if (!leaseSettled) {
+      queuedQuery = true
+      return
+    }
+    if (ws.state !== 'ready') return
+    sendQueryNow(closedTabRetentionDays)
+  }
+
+  // Interval trigger: never overlaps. A fresher-than-QUERY_STALE_MS
+  // outstanding query means the channel is alive, so skip; an older one is
+  // presumed dead (server unreachable / reply lost) and is superseded by the
+  // normal send path, so a silently dead query channel self-heals.
+  const querySnapshotOnInterval = () => {
+    if (pendingRequests.size > 0 && Date.now() - lastQuerySentAt < QUERY_STALE_MS) return
+    querySnapshot()
   }
 
   const pushNow = (force = false) => {
@@ -475,6 +511,9 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   const heartbeatInterval = globalThis.setInterval(() => {
     pushNow(true)
   }, HEARTBEAT_INTERVAL_MS)
+  const queryInterval = globalThis.setInterval(() => {
+    querySnapshotOnInterval()
+  }, QUERY_INTERVAL_MS)
 
   const unsubscribeStore = store.subscribe(() => {
     const state = store.getState()
@@ -528,6 +567,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     unsubscribeStore()
     globalThis.clearInterval(interval)
     globalThis.clearInterval(heartbeatInterval)
+    globalThis.clearInterval(queryInterval)
     if (leaseSettleTimer) globalThis.clearTimeout(leaseSettleTimer)
     globalThis.removeEventListener?.('pagehide', retire)
     globalThis.removeEventListener?.('beforeunload', retire)

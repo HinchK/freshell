@@ -77,19 +77,25 @@ export function collectPaneSnapshots(
   node: PaneNode | undefined,
   serverInstanceId: string,
   paneTitles?: Record<string, string>,
+  annotatePayload?: (paneId: string) => { sessionKeys?: string[]; busySessionKeys?: string[] } | undefined,
 ): RegistryPaneSnapshot[] {
   if (!node) return []
   if (node.type === 'leaf') {
+    const annotation = annotatePayload?.(node.id)
     return [{
       paneId: node.id,
       kind: node.content.kind,
       title: paneTitles?.[node.id],
-      payload: stripPanePayload(node.content, serverInstanceId),
+      payload: {
+        ...stripPanePayload(node.content, serverInstanceId),
+        ...(annotation?.sessionKeys?.length ? { sessionKeys: annotation.sessionKeys } : {}),
+        ...(annotation?.busySessionKeys?.length ? { busySessionKeys: annotation.busySessionKeys } : {}),
+      },
     }]
   }
   return [
-    ...collectPaneSnapshots(node.children[0], serverInstanceId, paneTitles),
-    ...collectPaneSnapshots(node.children[1], serverInstanceId, paneTitles),
+    ...collectPaneSnapshots(node.children[0], serverInstanceId, paneTitles, annotatePayload),
+    ...collectPaneSnapshots(node.children[1], serverInstanceId, paneTitles, annotatePayload),
   ]
 }
 
@@ -103,10 +109,19 @@ type SnapshotRecordInput = {
   deviceLabel: string
   updatedAt: number
   revision: number
+  paneIdentityActivity?: ReadonlyMap<string, { sessionKeys: string[]; busySessionKeys: string[] }>
 }
 
 export function buildOpenTabRegistryRecord(input: SnapshotRecordInput): RegistryTabRecord {
-  const paneSnapshots = collectPaneSnapshots(input.layout, input.serverInstanceId, input.paneTitles)
+  const paneIdentityActivity = input.paneIdentityActivity
+  const paneSnapshots = collectPaneSnapshots(
+    input.layout,
+    input.serverInstanceId,
+    input.paneTitles,
+    paneIdentityActivity
+      ? (paneId) => paneIdentityActivity.get(paneId)
+      : undefined,
+  )
   return {
     tabKey: `${input.deviceId}:${input.tab.id}`,
     tabId: input.tab.id,
@@ -126,6 +141,9 @@ export function buildOpenTabRegistryRecord(input: SnapshotRecordInput): Registry
 }
 
 export function buildClosedTabRegistryRecord(input: SnapshotRecordInput): RegistryTabRecord {
+  // Closed/tombstone records are never stamped with pane identity activity:
+  // input.paneIdentityActivity is accepted by the shared input shape but
+  // deliberately not forwarded (rings are an open-tab concern).
   const paneSnapshots = collectPaneSnapshots(input.layout, input.serverInstanceId, input.paneTitles)
   return {
     tabKey: `${input.deviceId}:${input.tab.id}`,

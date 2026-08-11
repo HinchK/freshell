@@ -1,1059 +1,716 @@
-//! Port anchors: `test/unit/server/agent-layout-store.test.ts` (read surface).
-
-use serde_json::json;
+//! Tests for [`crate::layout_store`] (split out per this branch's precedent to
+//! keep `layout_store.rs` under the 1,000-line ceiling).
 
 use super::*;
+use freshell_protocol::UiLayoutSync;
+use serde_json::{json, Value};
 
-fn sync(
-    tabs: serde_json::Value,
-    layouts: serde_json::Value,
-    active_pane: serde_json::Value,
-    active_tab_id: Option<&str>,
-    pane_titles: Option<serde_json::Value>,
-    pane_title_set_by_user: Option<serde_json::Value>,
+fn sync_from(v: Value) -> UiLayoutSync {
+    serde_json::from_value(v).expect("UiLayoutSync parses")
+}
+
+fn leaf(id: &str, content: Value) -> Value {
+    json!({ "type": "leaf", "id": id, "content": content })
+}
+
+fn split(id: &str, direction: &str, sizes: [i64; 2], a: Value, b: Value) -> Value {
+    json!({
+        "type": "split",
+        "id": id,
+        "direction": direction,
+        "sizes": sizes,
+        "children": [a, b],
+    })
+}
+
+/// One tab `t1`, single claude-terminal leaf `p1`.
+fn single_pane_sync(
+    pane_titles: Option<Value>,
+    set_by_user: Option<Value>,
     timestamp: i64,
 ) -> UiLayoutSync {
-    UiLayoutSync {
-        tabs: serde_json::from_value(tabs).expect("tabs parse"),
-        layouts,
-        active_pane: serde_json::from_value(active_pane).expect("active_pane parses"),
-        timestamp,
-        active_tab_id: active_tab_id.map(|s| Some(s.to_string())),
-        pane_title_set_by_user,
-        pane_titles,
-    }
-}
-
-/// The `snapshot` fixture from agent-layout-store.test.ts.
-fn basic_snapshot(ts: i64) -> UiLayoutSync {
-    sync(
-        json!([{ "id": "tab_a", "title": "alpha" }]),
-        json!({
-            "tab_a": {
-                "type": "leaf",
-                "id": "pane_1",
-                "content": { "kind": "terminal", "terminalId": "term_1" },
-            }
-        }),
-        json!({ "tab_a": "pane_1" }),
-        Some("tab_a"),
-        None,
-        None,
-        ts,
-    )
-}
-
-#[test]
-fn never_fed_snapshot_is_the_legacy_six_key_empty_shape() {
-    let store = LayoutStore::new();
-    let snap = store.get_normalized_snapshot(None);
-    // Legacy emptySnapshot(): exactly these six keys, no `timestamp`.
-    assert_eq!(
-        snap,
-        json!({
-            "tabs": [],
-            "activeTabId": null,
-            "layouts": {},
-            "activePane": {},
-            "paneTitles": {},
-            "paneTitleSetByUser": {},
-        })
-    );
-}
-
-#[test]
-fn update_from_ui_then_full_snapshot_echoes_everything() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1_720_000_000_000), "conn1");
-    assert_eq!(
-        store.get_normalized_snapshot(None),
-        json!({
-            "tabs": [{ "id": "tab_a", "title": "alpha" }],
-            "activeTabId": "tab_a",
-            "layouts": {
-                "tab_a": {
-                    "type": "leaf",
-                    "id": "pane_1",
-                    "content": { "kind": "terminal", "terminalId": "term_1" },
-                }
-            },
-            "activePane": { "tab_a": "pane_1" },
-            // updateFromUi SEEDS derived titles (modeless terminal => "Shell"),
-            // creating both per-tab maps (legacy seedPaneTitle).
-            "paneTitles": { "tab_a": { "pane_1": "Shell" } },
-            "paneTitleSetByUser": { "tab_a": {} },
-            "timestamp": 1_720_000_000_000_i64,
-        })
-    );
-}
-
-#[test]
-fn filtered_snapshot_narrows_to_one_tab_with_timestamp() {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_a", "title": "alpha" }, { "id": "tab_b", "title": "beta" }]),
-            json!({
-                "tab_a": { "type": "leaf", "id": "pane_a", "content": { "kind": "terminal", "terminalId": "term_a" } },
-                "tab_b": { "type": "leaf", "id": "pane_b", "content": { "kind": "terminal", "terminalId": "term_b" } },
-            }),
-            json!({ "tab_a": "pane_a", "tab_b": "pane_b" }),
-            Some("tab_b"),
-            Some(json!({ "tab_a": { "pane_a": "Alpha pane" }, "tab_b": { "pane_b": "Beta pane" } })),
-            Some(json!({ "tab_a": { "pane_a": true }, "tab_b": { "pane_b": true } })),
-            42,
-        ),
-        "conn1",
-    );
-    assert_eq!(
-        store.get_normalized_snapshot(Some("tab_b")),
-        json!({
-            "tabs": [{ "id": "tab_b", "title": "beta" }],
-            "activeTabId": "tab_b",
-            "layouts": {
-                "tab_b": { "type": "leaf", "id": "pane_b", "content": { "kind": "terminal", "terminalId": "term_b" } },
-            },
-            "activePane": { "tab_b": "pane_b" },
-            "paneTitles": { "tab_b": { "pane_b": "Beta pane" } },
-            "paneTitleSetByUser": { "tab_b": { "pane_b": true } },
-            "timestamp": 42,
-        })
-    );
-}
-
-#[test]
-fn filtered_snapshot_for_missing_tab_is_empty_shape_but_keeps_timestamp() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(7), "conn1");
-    // Legacy: the filtered form always carries `timestamp` when the fed
-    // snapshot has one (`layout-store.ts:208`), even when the tab is missing.
-    assert_eq!(
-        store.get_normalized_snapshot(Some("missing")),
-        json!({
-            "tabs": [],
-            "activeTabId": null,
-            "layouts": {},
-            "activePane": {},
-            "paneTitles": {},
-            "paneTitleSetByUser": {},
-            "timestamp": 7,
-        })
-    );
-}
-
-#[test]
-fn returned_snapshots_are_detached_clones() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    let mut first = store.get_normalized_snapshot(None);
-    first["tabs"][0]["title"] = json!("mutated");
-    first["layouts"]["tab_a"]["content"]["kind"] = json!("mutated");
-    let second = store.get_normalized_snapshot(None);
-    assert_eq!(second["tabs"][0]["title"], json!("alpha"));
-    assert_eq!(
-        second["layouts"]["tab_a"]["content"]["kind"],
-        json!("terminal")
-    );
-}
-
-#[test]
-fn source_connection_id_tracks_last_writer() {
-    let store = LayoutStore::new();
-    assert_eq!(store.source_connection_id(), None);
-    store.update_from_ui(&basic_snapshot(1), "conn-abc");
-    assert_eq!(store.source_connection_id().as_deref(), Some("conn-abc"));
-    store.update_from_ui(&basic_snapshot(2), "conn-def");
-    assert_eq!(store.source_connection_id().as_deref(), Some("conn-def"));
-}
-
-#[test]
-fn last_write_wins_replace_not_merge() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    // A second sync with a DIFFERENT shape replaces the first wholesale.
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_z", "title": "zed" }]),
-            json!({ "tab_z": { "type": "leaf", "id": "pane_z", "content": { "kind": "picker" } } }),
-            json!({ "tab_z": "pane_z" }),
-            Some("tab_z"),
-            None,
-            None,
-            2,
-        ),
-        "conn1",
-    );
-    let snap = store.get_normalized_snapshot(None);
-    assert_eq!(snap["tabs"], json!([{ "id": "tab_z", "title": "zed" }]));
-    assert!(snap["layouts"].get("tab_a").is_none());
-}
-
-#[test]
-fn list_tabs_and_panes_from_snapshot() {
-    let store = LayoutStore::new();
-    assert!(store.list_tabs().is_empty());
-    assert!(store.list_panes(None).is_empty());
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    assert_eq!(
-        serde_json::to_value(store.list_tabs()).expect("list_tabs serializes"),
-        json!([{ "id": "tab_a", "title": "alpha", "activePaneId": "pane_1" }])
-    );
-    assert_eq!(
-        serde_json::to_value(store.list_panes(Some("tab_a"))).expect("list_panes serializes"),
-        json!([{ "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_1", "title": "Shell" }])
-    );
-}
-
-// ── Task 2: normalization port (`shared/fresh-agent.ts`, legacy schema tests) ──
-
-/// Full-JSON equality asserts (the migration is exact-shape, not subset).
-fn migrate(content: serde_json::Value) -> serde_json::Value {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_x", "title": "x" }]),
-            json!({ "tab_x": { "type": "leaf", "id": "pane_x", "content": content } }),
-            json!({ "tab_x": "pane_x" }),
-            Some("tab_x"),
-            None,
-            None,
-            1,
-        ),
-        "conn",
-    );
-    store.get_normalized_snapshot(Some("tab_x"))["layouts"]["tab_x"]["content"].clone()
-}
-
-#[test]
-fn agent_chat_freshclaude_provider_becomes_fresh_agent_with_session_ref() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "agent-chat",
-            "provider": "freshclaude",
-            "sessionId": "live-1",
-            "createRequestId": "req-1",
-            "status": "idle",
-            "resumeSessionId": "00000000-0000-4000-8000-000000000001",
-            "initialCwd": "/work",
-            "permissionMode": "acceptEdits",
-            "effort": "high",
-            "plugins": ["/tmp/plugin"],
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "sessionId": "live-1",
-            "createRequestId": "req-1",
-            "status": "idle",
-            "resumeSessionId": "00000000-0000-4000-8000-000000000001",
-            "initialCwd": "/work",
-            "permissionMode": "acceptEdits",
-            "effort": "high",
-            "plugins": ["/tmp/plugin"],
-            "sessionRef": { "provider": "claude", "sessionId": "00000000-0000-4000-8000-000000000001" },
-        })
-    );
-}
-
-#[test]
-fn agent_chat_claude_provider_with_canonical_resume_gets_session_ref() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "agent-chat",
-            "provider": "claude",
-            "createRequestId": "req-old",
-            "status": "idle",
-            "resumeSessionId": "00000000-0000-4000-8000-000000000123",
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-old",
-            "status": "idle",
-            "resumeSessionId": "00000000-0000-4000-8000-000000000123",
-            "sessionRef": { "provider": "claude", "sessionId": "00000000-0000-4000-8000-000000000123" },
-        })
-    );
-}
-
-#[test]
-fn agent_chat_named_alias_resume_becomes_restore_error() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "agent-chat",
-            "provider": "claude",
-            "createRequestId": "req-bad",
-            "status": "idle",
-            "resumeSessionId": "named-alias",
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-bad",
-            "status": "idle",
-            "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" },
-        })
-    );
-}
-
-#[test]
-fn agent_chat_alias_session_ref_dropped_and_errored() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "agent-chat",
-            "provider": "claude",
-            "createRequestId": "req-alias",
-            "status": "idle",
-            "sessionRef": { "provider": "claude", "sessionId": "named-alias" },
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-alias",
-            "status": "idle",
-            "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" },
-        })
-    );
-}
-
-#[test]
-fn alias_session_ref_wins_over_canonical_resume_id_both_dropped() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "agent-chat",
-            "provider": "freshclaude",
-            "createRequestId": "req-alias-with-resume",
-            "status": "idle",
-            "sessionRef": { "provider": "claude", "sessionId": "named-alias" },
-            "resumeSessionId": "00000000-0000-4000-8000-000000000777",
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-alias-with-resume",
-            "status": "idle",
-            "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" },
-        })
-    );
-}
-
-#[test]
-fn fresh_agent_alias_session_ref_becomes_restore_error() {
-    assert_eq!(
-        migrate(json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-fresh-alias",
-            "status": "idle",
-            "sessionRef": { "provider": "claude", "sessionId": "named-alias" },
-            "initialCwd": "/work",
-            "showTools": true,
-        })),
-        json!({
-            "kind": "fresh-agent",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "createRequestId": "req-fresh-alias",
-            "status": "idle",
-            "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" },
-            "initialCwd": "/work",
-            "showTools": true,
-        })
-    );
-}
-
-#[test]
-fn display_overrides_survive_migration() {
-    let out = migrate(json!({
-        "kind": "agent-chat",
-        "provider": "freshclaude",
-        "createRequestId": "req-display",
-        "status": "idle",
-        "showThinking": false,
-        "showTools": true,
-        "showTimecodes": true,
-        "resumeSessionId": "00000000-0000-4000-8000-000000000456",
-    }));
-    assert_eq!(out["showThinking"], json!(false));
-    assert_eq!(out["showTools"], json!(true));
-    assert_eq!(out["showTimecodes"], json!(true));
-}
-
-#[test]
-fn timeline_session_id_is_the_resume_fallback() {
-    let out = migrate(json!({
-        "kind": "agent-chat",
-        "provider": "claude",
-        "createRequestId": "req-timeline",
-        "status": "idle",
-        "timelineSessionId": "00000000-0000-4000-8000-000000000abc",
-    }));
-    assert_eq!(
-        out["sessionRef"],
-        json!({ "provider": "claude", "sessionId": "00000000-0000-4000-8000-000000000abc" })
-    );
-    assert!(out.get("timelineSessionId").is_none());
-    // resumeSessionId only echoes when the INPUT had a string resumeSessionId.
-    assert!(out.get("resumeSessionId").is_none());
-}
-
-#[test]
-fn opencode_agent_chat_maps_to_freshopencode() {
-    let out = migrate(json!({
-        "kind": "agent-chat",
-        "provider": "freshopencode",
-        "createRequestId": "req-oc",
-        "status": "idle",
-        "resumeSessionId": "ses_abc123",
-    }));
-    assert_eq!(out["sessionType"], json!("freshopencode"));
-    assert_eq!(out["provider"], json!("opencode"));
-    assert_eq!(
-        out["sessionRef"],
-        json!({ "provider": "opencode", "sessionId": "ses_abc123" })
-    );
-}
-
-#[test]
-fn unrecognizable_agent_chat_gets_restore_error_with_defaults() {
-    // No provider/sessionType and no usable identity: legacy still converts,
-    // defaulting to freshclaude/claude with the restore error
-    // (shared/fresh-agent.ts:317-333).
-    let out = migrate(json!({
-        "kind": "agent-chat",
-        "createRequestId": "req-unknown",
-        "status": "idle",
-    }));
-    assert_eq!(out["kind"], json!("fresh-agent"));
-    assert_eq!(out["sessionType"], json!("freshclaude"));
-    assert_eq!(out["provider"], json!("claude"));
-    assert_eq!(
-        out["restoreError"],
-        json!({ "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" })
-    );
-}
-
-#[test]
-fn fresh_agent_with_unresolvable_identity_is_returned_unchanged() {
-    // shared/fresh-agent.ts:214-216 — neither sessionType nor provider can be
-    // resolved: legacy returns the input as-is.
-    let input = json!({
-        "kind": "fresh-agent",
-        "createRequestId": "req-passthrough",
-        "status": "idle",
+    let mut payload = json!({
+        "tabs": [{ "id": "t1", "title": "First" }],
+        "activeTabId": "t1",
+        "layouts": { "t1": leaf("p1", json!({ "kind": "terminal", "mode": "claude" })) },
+        "activePane": { "t1": "p1" },
+        "timestamp": timestamp,
     });
-    let out = migrate(input.clone());
-    assert_eq!(out, input);
-}
-
-#[test]
-fn non_agent_kinds_pass_through_untouched() {
-    for input in [
-        json!({ "kind": "terminal", "createRequestId": "r", "status": "running", "mode": "shell" }),
-        json!({ "kind": "browser", "url": "https://example.com", "devToolsOpen": false }),
-        json!({ "kind": "picker" }),
-        json!({ "kind": "something-future", "extra": 1 }),
-    ] {
-        let out = migrate(input.clone());
-        assert_eq!(out, input);
+    if let Some(titles) = pane_titles {
+        payload["paneTitles"] = titles;
     }
+    if let Some(flags) = set_by_user {
+        payload["paneTitleSetByUser"] = flags;
+    }
+    sync_from(payload)
 }
 
 #[test]
-fn nested_splits_are_migrated_recursively_and_agent_chat_is_gone() {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_n", "title": "nested" }]),
-            json!({
-                "tab_n": {
-                    "type": "split",
-                    "id": "split_root",
-                    "direction": "horizontal",
-                    "sizes": [55, 45],
-                    "children": [
-                        {
-                            "type": "leaf",
-                            "id": "pane_agent",
-                            "content": {
-                                "kind": "agent-chat",
-                                "provider": "claude",
-                                "createRequestId": "req_agent",
-                                "resumeSessionId": "11111111-1111-4111-8111-111111111111",
-                            },
-                        },
-                        {
-                            "type": "split",
-                            "id": "split_nested",
-                            "direction": "vertical",
-                            "sizes": [50, 50],
-                            "children": [
-                                {
-                                    "type": "leaf",
-                                    "id": "pane_agent_nested",
-                                    "content": {
-                                        "kind": "agent-chat",
-                                        "provider": "freshclaude",
-                                        "createRequestId": "req_nested",
-                                        "sessionId": "legacy-live",
-                                        "resumeSessionId": "11111111-1111-4111-8111-111111111111",
-                                    },
-                                },
-                                {
-                                    "type": "leaf",
-                                    "id": "pane_shell",
-                                    "content": { "kind": "terminal", "createRequestId": "req_shell", "status": "idle", "mode": "shell" },
-                                },
-                            ],
-                        },
-                    ],
-                }
-            }),
-            json!({ "tab_n": "pane_agent" }),
-            Some("tab_n"),
-            None,
-            None,
-            1,
+fn update_from_ui_replaces_snapshot_and_seeds_nonsticky_titles() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&single_pane_sync(None, None, 1000), "conn-1");
+
+    assert!(store.has_snapshot());
+    assert_eq!(store.source_connection_id().as_deref(), Some("conn-1"));
+
+    // No paneTitles in the sync -> derived title seeded, non-sticky
+    // (layout-store.ts:161-181).
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["paneTitles"]["t1"]["p1"], json!("Claude CLI"));
+    assert!(
+        snap["paneTitleSetByUser"]["t1"].get("p1").is_none(),
+        "set_by_user stays false"
+    );
+    assert_eq!(snap["timestamp"], json!(1000));
+    assert_eq!(snap["activeTabId"], json!("t1"));
+
+    // Second sync with a sticky user title -> preserved (seed skips sticky panes).
+    let sync2 = single_pane_sync(
+        Some(json!({ "t1": { "p1": "My Pane" } })),
+        Some(json!({ "t1": { "p1": true } })),
+        2000,
+    );
+    store.update_from_ui(&sync2, "conn-2");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["paneTitles"]["t1"]["p1"], json!("My Pane"));
+    assert_eq!(snap["paneTitleSetByUser"]["t1"]["p1"], json!(true));
+    assert_eq!(
+        snap["timestamp"],
+        json!(2000),
+        "snapshot REPLACED, not merged"
+    );
+    assert_eq!(store.source_connection_id().as_deref(), Some("conn-2"));
+
+    // Tab-filtered normalized snapshot (layout-store.ts:196-209).
+    let filtered = store.get_normalized_snapshot(Some("t1"));
+    assert_eq!(filtered["tabs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(filtered["activeTabId"], json!("t1"));
+    let missing = store.get_normalized_snapshot(Some("zzz"));
+    assert_eq!(missing["tabs"], json!([]));
+    assert_eq!(missing["activeTabId"], Value::Null);
+}
+
+#[test]
+fn rename_pane_mirrors_to_tab_when_single_pane_and_reports_tab_renamed() {
+    let store = LayoutStore::default();
+    store.update_from_ui(&single_pane_sync(None, None, 1), "c");
+
+    let out = store.rename_pane("p1", "Renamed");
+    assert_eq!(
+        out.tab_id.as_deref(),
+        Some("t1"),
+        "RenameOutcome carries tab_id"
+    );
+    assert_eq!(out.pane_id.as_deref(), Some("p1"));
+    assert_eq!(out.message, None);
+
+    let (rows, _) = store.list_tabs();
+    assert_eq!(
+        rows[0]["title"],
+        json!("Renamed"),
+        "single-pane rename mirrors onto tab.title"
+    );
+
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["paneTitles"]["t1"]["p1"], json!("Renamed"));
+    assert_eq!(
+        snap["paneTitleSetByUser"]["t1"]["p1"],
+        json!(true),
+        "rename is sticky"
+    );
+
+    assert_eq!(
+        store.rename_pane("missing", "X").message,
+        Some("pane not found")
+    );
+}
+
+#[test]
+fn rename_tab_mirrors_to_pane_only_when_single_pane() {
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": leaf("p1", json!({ "kind": "picker" })),
+            "t2": split(
+                "s1",
+                "horizontal",
+                [50, 50],
+                leaf("p2", json!({ "kind": "picker" })),
+                leaf("p3", json!({ "kind": "picker" })),
+            ),
+        },
+        "activePane": { "t1": "p1", "t2": "p2" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    // Single-pane tab: mirror is sticky (layout-store.ts:542-556).
+    let out = store.rename_tab("t1", "Solo");
+    assert_eq!(out.tab_id.as_deref(), Some("t1"));
+    assert_eq!(out.message, None);
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["paneTitles"]["t1"]["p1"], json!("Solo"));
+    assert_eq!(snap["paneTitleSetByUser"]["t1"]["p1"], json!(true));
+
+    // Two-pane tab: tab title changes, pane_titles untouched.
+    let out = store.rename_tab("t2", "Duo");
+    assert_eq!(out.tab_id.as_deref(), Some("t2"));
+    let snap = store.get_normalized_snapshot(None);
+    let (rows, _) = store.list_tabs();
+    assert_eq!(rows[1]["title"], json!("Duo"));
+    assert!(
+        snap["paneTitles"].get("t2").is_none(),
+        "no pane mirror for multi-pane tabs"
+    );
+
+    assert_eq!(store.rename_tab("zzz", "X").message, Some("tab not found"));
+}
+
+#[test]
+fn next_prev_cycle_ordered_tabs_modulo_len() {
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }, { "id": "t3" }],
+        "activeTabId": "t3",
+        "layouts": {},
+        "activePane": {},
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    assert_eq!(
+        store.select_next_tab().as_deref(),
+        Some("t1"),
+        "next wraps t3 -> t1"
+    );
+    assert_eq!(
+        store.select_prev_tab().as_deref(),
+        Some("t3"),
+        "prev wraps t1 -> t3"
+    );
+    assert_eq!(store.select_next_tab().as_deref(), Some("t1"));
+    assert_eq!(store.select_next_tab().as_deref(), Some("t2"));
+
+    let empty = LayoutStore::default();
+    assert_eq!(empty.select_next_tab(), None);
+    assert_eq!(empty.select_prev_tab(), None);
+}
+
+#[test]
+fn mutations_without_snapshot_report_no_layout_snapshot_but_create_tab_bootstraps() {
+    let store = LayoutStore::default();
+    assert!(!store.has_snapshot());
+    assert_eq!(store.list_tabs(), (Vec::new(), None));
+    assert!(!store.has_tab("t1"));
+
+    let out = store.rename_tab("t1", "X");
+    assert_eq!(out.message, Some("no layout snapshot"));
+    assert!(out.tab_id.is_none());
+    assert_eq!(
+        store.rename_pane("p1", "X").message,
+        Some("no layout snapshot")
+    );
+    assert_eq!(store.close_tab("t1").message, Some("no layout snapshot"));
+    assert_eq!(store.close_pane("p1"), Err("no layout snapshot"));
+    assert_eq!(store.swap_pane(None, "a", "b"), Err("no layout snapshot"));
+    assert_eq!(store.select_pane(None, "p1"), Err("no layout snapshot"));
+    assert_eq!(store.list_panes(None), Err("no layout snapshot"));
+
+    // create_tab bootstraps via ensureSnapshot (layout-store.ts:212-217, 431-460).
+    let (tab_id, pane_id) = store.create_tab(Some("Boot"));
+    assert!(store.has_snapshot());
+    let (rows, active) = store.list_tabs();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], json!(tab_id.clone()));
+    assert_eq!(rows[0]["title"], json!("Boot"));
+    assert_eq!(rows[0]["activePaneId"], json!(pane_id.clone()));
+    assert_eq!(active.as_deref(), Some(tab_id.as_str()));
+    assert!(store.has_tab(&tab_id));
+    assert!(store.has_tab("Boot"), "has_tab matches title too");
+
+    // The bootstrapped terminal pane seeds the derived "Shell" title.
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(
+        snap["paneTitles"][tab_id.as_str()][pane_id.as_str()],
+        json!("Shell")
+    );
+
+    // Untitled tab rows fall back to the id (layout-store.ts:331).
+    let (tab2, _) = store.create_tab(None);
+    let (rows, _) = store.list_tabs();
+    assert_eq!(rows[1]["title"], json!(tab2.clone()));
+
+    // close_tab purges layouts/activePane/title maps (layout-store.ts:577-587, 87-91).
+    let out = store.close_tab(&tab_id);
+    assert_eq!(out.tab_id.as_deref(), Some(tab_id.as_str()));
+    let snap = store.get_normalized_snapshot(None);
+    assert!(snap["layouts"].get(tab_id.as_str()).is_none());
+    assert!(snap["activePane"].get(tab_id.as_str()).is_none());
+    assert!(snap["paneTitles"].get(tab_id.as_str()).is_none());
+    assert_eq!(snap["activeTabId"], json!(tab2));
+}
+
+#[test]
+fn swap_pane_exchanges_content_and_title_maps() {
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": split(
+                "s1",
+                "horizontal",
+                [50, 50],
+                leaf("p1", json!({ "kind": "terminal", "mode": "claude", "terminalId": "term-1" })),
+                leaf("p2", json!({ "kind": "picker" })),
+            ),
+        },
+        "activePane": { "t1": "p1" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+    store.rename_pane("p1", "Mine"); // sticky title on p1; p2 has no entries
+
+    assert_eq!(
+        store.swap_pane(Some("t1"), "p1", "p2"),
+        Ok("t1".to_string())
+    );
+
+    // Contents exchanged.
+    let p1 = store.get_pane_snapshot("p1").expect("p1 exists");
+    assert_eq!(p1.kind.as_deref(), Some("picker"));
+    assert_eq!(p1.terminal_id, None);
+    let p2 = store.get_pane_snapshot("p2").expect("p2 exists");
+    assert_eq!(p2.kind.as_deref(), Some("terminal"));
+    assert_eq!(p2.terminal_id.as_deref(), Some("term-1"));
+
+    // Title map entries exchanged with delete-when-missing semantics
+    // (layout-store.ts:625-652).
+    let snap = store.get_normalized_snapshot(None);
+    assert!(snap["paneTitles"]["t1"].get("p1").is_none());
+    assert_eq!(snap["paneTitles"]["t1"]["p2"], json!("Mine"));
+    assert!(snap["paneTitleSetByUser"]["t1"].get("p1").is_none());
+    assert_eq!(snap["paneTitleSetByUser"]["t1"]["p2"], json!(true));
+
+    assert_eq!(store.swap_pane(None, "p1", "zzz"), Err("panes not found"));
+}
+
+#[test]
+fn close_pane_guards_only_pane_and_purges_metadata() {
+    // Single-pane tab: guard.
+    let store = LayoutStore::default();
+    store.update_from_ui(&single_pane_sync(None, None, 1), "c");
+    assert_eq!(store.close_pane("p1"), Err("cannot close only pane"));
+    assert_eq!(store.close_pane("zzz"), Err("pane not found"));
+
+    // Two-pane tab: closing p1 collapses to a single leaf and purges p1 metadata.
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": split(
+                "s1",
+                "horizontal",
+                [50, 50],
+                leaf("p1", json!({ "kind": "terminal" })),
+                leaf("p2", json!({ "kind": "terminal" })),
+            ),
+        },
+        "activePane": { "t1": "p1" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    // Pre-close PaneRow shape sanity (layout-store.ts:341-355).
+    let rows = store.list_panes(None).expect("panes list");
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].id.as_str(), rows[0].index), ("p1", 0));
+    assert_eq!((rows[1].id.as_str(), rows[1].index), ("p2", 1));
+    assert_eq!(rows[0].kind.as_deref(), Some("terminal"));
+    assert_eq!(rows[0].title.as_deref(), Some("Shell"));
+
+    assert_eq!(store.close_pane("p1"), Ok("t1".to_string()));
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"]["t1"]["type"], json!("leaf"));
+    assert_eq!(snap["layouts"]["t1"]["id"], json!("p2"));
+    assert_eq!(
+        snap["activePane"]["t1"],
+        json!("p2"),
+        "last remaining pane becomes active"
+    );
+    assert!(
+        snap["paneTitles"]["t1"].get("p1").is_none(),
+        "p1 metadata purged"
+    );
+    assert_eq!(snap["paneTitles"]["t1"]["p2"], json!("Shell"));
+    assert_eq!(store.get_single_pane_id("t1").as_deref(), Some("p2"));
+}
+
+#[test]
+fn normalize_pair_to_hundred_and_percent_bounds() {
+    assert_eq!(normalize_pair_to_hundred(30.0, 30.0), [50.0, 50.0]);
+    assert_eq!(normalize_pair_to_hundred(25.0, 75.0), [25.0, 75.0]);
+    // Clamped to 1..=99 before normalizing (router.ts:608-619).
+    assert_eq!(normalize_pair_to_hundred(0.0, 200.0), [1.0, 99.0]);
+    assert_eq!(normalize_pair_to_hundred(200.0, 0.0), [99.0, 1.0]);
+
+    assert!(is_valid_percent(1.0));
+    assert!(is_valid_percent(50.5));
+    assert!(is_valid_percent(99.0));
+    assert!(!is_valid_percent(0.0));
+    assert!(!is_valid_percent(0.9));
+    assert!(!is_valid_percent(100.0));
+    assert!(!is_valid_percent(f64::NAN));
+    assert!(!is_valid_percent(f64::INFINITY));
+}
+
+#[test]
+fn derive_pane_title_full_matrix() {
+    // editor -> basename | "Editor" (layout-store.ts:96-100)
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "editor", "filePath": "/home/u/notes.md" })),
+        "notes.md"
+    );
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "editor", "filePath": "C:\\dir\\main.rs" })),
+        "main.rs"
+    );
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "editor", "filePath": "" })),
+        "Editor"
+    );
+    assert_eq!(derive_pane_title(&json!({ "kind": "editor" })), "Editor");
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "editor", "filePath": "/dir/" })),
+        "Editor"
+    );
+
+    // browser -> hostname | "Browser" (layout-store.ts:102-110)
+    assert_eq!(
+        derive_pane_title(
+            &json!({ "kind": "browser", "url": "https://user:pw@Example.COM:8443/path?q#f" })
         ),
-        "conn1",
-    );
-    let snap = store.get_normalized_snapshot(Some("tab_n"));
-    let serialized = serde_json::to_string(&snap).expect("serializes");
-    assert!(serialized.contains("\"fresh-agent\""), "{serialized}");
-    assert!(!serialized.contains("\"agent-chat\""), "{serialized}");
-    let layouts = &snap["layouts"]["tab_n"];
-    assert_eq!(layouts["type"], json!("split"));
-    assert_eq!(layouts["sizes"], json!([55, 45]));
-    assert_eq!(
-        layouts["children"][0]["content"]["sessionRef"],
-        json!({ "provider": "claude", "sessionId": "11111111-1111-4111-8111-111111111111" })
+        "example.com"
     );
     assert_eq!(
-        layouts["children"][1]["children"][0]["content"]["sessionRef"],
-        json!({ "provider": "claude", "sessionId": "11111111-1111-4111-8111-111111111111" })
+        derive_pane_title(&json!({ "kind": "browser", "url": "notaurl" })),
+        "Browser"
     );
-    assert_eq!(
-        layouts["children"][1]["children"][1]["content"],
-        json!({ "kind": "terminal", "createRequestId": "req_shell", "status": "idle", "mode": "shell" })
-    );
-}
+    assert_eq!(derive_pane_title(&json!({ "kind": "browser" })), "Browser");
 
-// ── Task 3: title seeding + mutation ops + helper reads ──
-// Port anchors: test/unit/server/agent-layout-store-write.test.ts +
-// layout-store.ts::derivePaneTitle.
-
-#[test]
-fn derive_pane_title_terminal_modes_shells_and_fallbacks() {
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "mode": "codex" })),
-        Some("Codex CLI".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "mode": "claude" })),
-        Some("Claude CLI".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "mode": "opencode" })),
-        Some("OpenCode".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "shell": "powershell" })),
-        Some("PowerShell".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "shell": "cmd" })),
-        Some("Command Prompt".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "shell": "wsl" })),
-        Some("WSL".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal" })),
-        Some("Shell".to_string())
-    );
-    assert_eq!(
-        derive_pane_title(&json!({ "kind": "terminal", "shell": "system" })),
-        Some("Shell".to_string())
-    );
-    assert_eq!(derive_pane_title(&json!({ "kind": "picker" })), None);
+    // fresh-agent by sessionType (layout-store.ts:112-125)
     assert_eq!(
         derive_pane_title(&json!({ "kind": "fresh-agent", "sessionType": "freshclaude" })),
-        Some("Freshclaude".to_string())
+        "Freshclaude"
     );
-    // Legacy quirk: freshopencode derives "OpenCode" (not "Freshopencode").
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "fresh-agent", "sessionType": "freshcodex" })),
+        "Freshcodex"
+    );
     assert_eq!(
         derive_pane_title(&json!({ "kind": "fresh-agent", "sessionType": "freshopencode" })),
-        Some("OpenCode".to_string())
+        "OpenCode"
     );
     assert_eq!(
         derive_pane_title(&json!({ "kind": "fresh-agent", "sessionType": "kilroy" })),
-        Some("Kilroy".to_string())
+        "Kilroy"
+    );
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "fresh-agent", "sessionType": "other" })),
+        "Fresh Agent"
     );
     assert_eq!(
         derive_pane_title(&json!({ "kind": "fresh-agent" })),
-        Some("Fresh Agent".to_string())
+        "Fresh Agent"
+    );
+
+    // extension -> extensionName | "Extension" (layout-store.ts:127-131)
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "extension", "extensionName": "My Ext" })),
+        "My Ext"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "extension", "extensionName": "notes" })),
-        Some("notes".to_string())
+        derive_pane_title(&json!({ "kind": "extension", "extensionName": "" })),
+        "Extension"
     );
     assert_eq!(
         derive_pane_title(&json!({ "kind": "extension" })),
-        Some("Extension".to_string())
+        "Extension"
+    );
+
+    // terminal by mode (layout-store.ts:135-146)
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "claude" })),
+        "Claude CLI"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "editor", "filePath": "/tmp/dir/example.txt" })),
-        Some("example.txt".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "codex" })),
+        "Codex CLI"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "editor", "filePath": "C:\\docs\\note.md" })),
-        Some("note.md".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "gemini" })),
+        "Gemini"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "editor" })),
-        Some("Editor".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "opencode" })),
+        "OpenCode"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "browser", "url": "https://docs.example.com/a/b" })),
-        Some("docs.example.com".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "kimi" })),
+        "Kimi"
+    );
+
+    // ...else by shell (layout-store.ts:147-157)
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "terminal", "shell": "powershell" })),
+        "PowerShell"
     );
     assert_eq!(
-        derive_pane_title(
-            &json!({ "kind": "browser", "url": "https://user:pw@host.example:8443/x" })
-        ),
-        Some("host.example".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "shell": "cmd" })),
+        "Command Prompt"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "browser", "url": "not a url" })),
-        Some("Browser".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "shell": "wsl" })),
+        "WSL"
     );
     assert_eq!(
-        derive_pane_title(&json!({ "kind": "browser" })),
-        Some("Browser".to_string())
+        derive_pane_title(&json!({ "kind": "terminal", "shell": "system" })),
+        "Shell"
+    );
+    assert_eq!(derive_pane_title(&json!({ "kind": "terminal" })), "Shell");
+
+    // non-terminal unknown kinds and non-objects -> no title (Node: undefined)
+    assert_eq!(derive_pane_title(&json!({ "kind": "picker" })), "");
+    assert_eq!(derive_pane_title(&json!(null)), "");
+    assert_eq!(derive_pane_title(&json!("x")), "");
+}
+
+#[test]
+fn resolve_resize_target_split_id_first_then_pane_parent_split() {
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": split(
+                "s1",
+                "horizontal",
+                [40, 60],
+                leaf("p1", json!({ "kind": "terminal" })),
+                leaf("p2", json!({ "kind": "picker" })),
+            ),
+        },
+        "activePane": { "t1": "p1" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    // splitId-first (router.ts:621-647).
+    assert_eq!(
+        store.resolve_resize_target("s1", None),
+        Ok(("t1".to_string(), "s1".to_string(), [40.0, 60.0]))
+    );
+    assert_eq!(
+        store.resolve_resize_target("s1", Some("t1")),
+        Ok(("t1".to_string(), "s1".to_string(), [40.0, 60.0]))
+    );
+    // pane -> parent split.
+    assert_eq!(
+        store.resolve_resize_target("p2", None),
+        Ok(("t1".to_string(), "s1".to_string(), [40.0, 60.0]))
+    );
+    assert_eq!(
+        store.resolve_resize_target("zzz", None),
+        Err("split not found")
+    );
+
+    assert!(store.resize_split("t1", "s1", [25.0, 75.0]));
+    assert!(!store.resize_split("t1", "missing", [25.0, 75.0]));
+    assert_eq!(
+        store
+            .resolve_resize_target("s1", None)
+            .map(|(_, _, sizes)| sizes),
+        Ok([25.0, 75.0])
+    );
+
+    // Ambiguous pane-title target propagates the 409 message (router.ts:634-636).
+    let dup = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": split(
+                "sA",
+                "horizontal",
+                [50, 50],
+                leaf("a1", json!({ "kind": "picker" })),
+                leaf("a2", json!({ "kind": "picker" })),
+            ),
+            "t2": split(
+                "sB",
+                "horizontal",
+                [50, 50],
+                leaf("b1", json!({ "kind": "picker" })),
+                leaf("b2", json!({ "kind": "picker" })),
+            ),
+        },
+        "activePane": { "t1": "a1", "t2": "b1" },
+        "paneTitles": { "t1": { "a1": "Dup" }, "t2": { "b1": "Dup" } },
+        "timestamp": 1,
+    }));
+    dup.update_from_ui(&sync, "c");
+    assert_eq!(
+        dup.resolve_resize_target("Dup", None),
+        Err("pane target is ambiguous; use pane id or tab.pane index")
+    );
+
+    assert_eq!(
+        LayoutStore::default().resolve_resize_target("s1", None),
+        Err("split not found")
     );
 }
 
 #[test]
-fn sync_seeds_titles_for_unnamed_panes_only() {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_a", "title": "alpha" }]),
-            json!({
-                "tab_a": {
-                    "type": "split",
-                    "id": "split_1",
-                    "direction": "horizontal",
-                    "sizes": [50, 50],
-                    "children": [
-                        { "type": "leaf", "id": "pane_1", "content": { "kind": "terminal", "mode": "codex" } },
-                        { "type": "leaf", "id": "pane_2", "content": { "kind": "editor", "filePath": "/tmp/e.txt" } },
-                    ],
-                },
-            }),
-            json!({ "tab_a": "pane_1" }),
-            Some("tab_a"),
-            Some(json!({ "tab_a": { "pane_1": "user name" } })),
-            Some(json!({ "tab_a": { "pane_1": true } })),
-            1,
-        ),
-        "conn1",
+fn split_pane_select_pane_and_attach_content_reseed_derived_titles() {
+    let store = LayoutStore::default();
+    let (tab_id, pane_id) = store.create_tab(Some("Work"));
+    assert_eq!(
+        store.get_single_pane_id(&tab_id).as_deref(),
+        Some(pane_id.as_str())
+    );
+
+    let (split_tab, new_pane) = store.split_pane(&pane_id, "vertical").expect("split works");
+    assert_eq!(split_tab, tab_id);
+    assert!(store.get_single_pane_id(&tab_id).is_none());
+
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"][tab_id.as_str()]["type"], json!("split"));
+    assert_eq!(
+        snap["layouts"][tab_id.as_str()]["direction"],
+        json!("vertical")
+    );
+    assert_eq!(snap["layouts"][tab_id.as_str()]["sizes"], json!([50, 50]));
+    assert_eq!(snap["activePane"][tab_id.as_str()], json!(new_pane.clone()));
+    assert_eq!(
+        snap["paneTitles"][tab_id.as_str()][new_pane.as_str()],
+        json!("Shell")
+    );
+
+    assert_eq!(
+        store.select_pane(None, &pane_id),
+        Ok((tab_id.clone(), pane_id.clone()))
     );
     let snap = store.get_normalized_snapshot(None);
-    // User-set title survives; the unnamed editor pane got its derived title.
-    assert_eq!(snap["paneTitles"]["tab_a"]["pane_1"], json!("user name"));
-    assert_eq!(snap["paneTitles"]["tab_a"]["pane_2"], json!("e.txt"));
-}
+    assert_eq!(snap["activePane"][tab_id.as_str()], json!(pane_id.clone()));
+    assert!(
+        store.select_pane(Some(&tab_id), "ghost").is_ok(),
+        "Node trusts pane id when tab exists"
+    );
+    assert_eq!(store.select_pane(None, "ghost"), Err("pane not found"));
 
-#[test]
-fn create_tab_records_and_seeds_title() {
-    let store = LayoutStore::new();
-    store.create_tab(
-        "tab_1",
-        "pane_1",
-        Some("alpha".to_string()),
-        json!({ "kind": "terminal" }),
+    // attach re-seeds the derived title, non-sticky (layout-store.ts:680-694).
+    let out = store.attach_pane_content(
+        &tab_id,
+        &new_pane,
+        json!({ "kind": "browser", "url": "https://example.com/x", "devToolsOpen": false }),
     );
-    assert_eq!(
-        store.get_normalized_snapshot(None),
-        json!({
-            "tabs": [{ "id": "tab_1", "title": "alpha" }],
-            "activeTabId": "tab_1",
-            "layouts": { "tab_1": { "type": "leaf", "id": "pane_1", "content": { "kind": "terminal" } } },
-            "activePane": { "tab_1": "pane_1" },
-            "paneTitles": { "tab_1": { "pane_1": "Shell" } },
-            // Legacy seedPaneTitle goes through getPaneTitleMaps, which creates
-            // BOTH per-tab maps — the setByUser inner map therefore exists.
-            "paneTitleSetByUser": { "tab_1": {} },
-        })
-    );
-}
-
-#[test]
-fn split_pane_replaces_leaf_in_place_and_seeds_new_pane() {
-    let store = LayoutStore::new();
-    store.create_tab(
-        "tab_1",
-        "pane_1",
-        None,
-        json!({ "kind": "terminal", "terminalId": "term_1" }),
-    );
-    let tab = store
-        .split_pane(
-            "pane_1",
-            "horizontal",
-            "pane_2",
-            json!({ "kind": "editor", "filePath": "/tmp/example.txt" }),
-        )
-        .expect("split resolves");
-    assert_eq!(tab, "tab_1");
-    let snap = store.get_normalized_snapshot(Some("tab_1"));
-    let node = &snap["layouts"]["tab_1"];
-    assert_eq!(node["type"], json!("split"));
-    assert_eq!(node["direction"], json!("horizontal"));
-    assert_eq!(node["sizes"], json!([50.0, 50.0]));
-    assert_eq!(node["children"][0]["id"], json!("pane_1"));
-    assert_eq!(
-        node["children"][0]["content"],
-        json!({ "kind": "terminal", "terminalId": "term_1" })
-    );
-    assert_eq!(node["children"][1]["id"], json!("pane_2"));
-    assert!(node["id"].as_str().is_some_and(|s| !s.is_empty()));
-    assert_eq!(snap["activePane"]["tab_1"], json!("pane_2"));
-    let panes = store.list_panes(Some("tab_1"));
-    assert_eq!(panes.len(), 2);
-    assert_eq!(panes[0].title.as_deref(), Some("Shell"));
-    assert_eq!(panes[1].title.as_deref(), Some("example.txt"));
-}
-
-#[test]
-fn split_of_unknown_pane_is_not_found() {
-    let store = LayoutStore::new();
-    store.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal" }));
-    assert_eq!(
-        store.split_pane("nope", "vertical", "p2", json!({"kind":"terminal"})),
-        None
-    );
-}
-
-#[test]
-fn close_pane_guards_last_pane_then_rebuilds_grid() {
-    let store = LayoutStore::new();
-    store.create_tab("tab_1", "p1", None, json!({ "kind": "terminal" }));
-    assert_eq!(store.close_pane("p1"), ClosePaneOutcome::LastPane);
-    store
-        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
-        .unwrap();
-    store
-        .split_pane(
-            "p2",
-            "vertical",
-            "p3",
-            json!({ "kind": "editor", "filePath": "/x" }),
-        )
-        .unwrap();
-    assert_eq!(store.close_pane("nope"), ClosePaneOutcome::NotFound);
-    assert_eq!(
-        store.close_pane("p1"),
-        ClosePaneOutcome::Closed("tab_1".to_string())
-    );
-    // Legacy buildGridLayout(2) = horizontal 50/50 split of the remaining two.
-    let snap = store.get_normalized_snapshot(Some("tab_1"));
-    let node = &snap["layouts"]["tab_1"];
-    assert_eq!(node["type"], json!("split"));
-    assert_eq!(node["direction"], json!("horizontal"));
-    assert_eq!(node["sizes"], json!([50.0, 50.0]));
-    assert_eq!(node["children"][0]["id"], json!("p2"));
-    assert_eq!(node["children"][1]["id"], json!("p3"));
-    // Active pane = LAST remaining leaf (legacy closePane).
-    assert_eq!(snap["activePane"]["tab_1"], json!("p3"));
-    // The closed pane's derived title metadata is gone (incl. empty-map cleanup).
-    let titles = &snap["paneTitles"]["tab_1"];
-    assert!(titles.get("p1").is_none());
-}
-
-#[test]
-fn close_pane_three_remaining_builds_two_row_grid() {
-    let store = LayoutStore::new();
-    store.create_tab("t", "p1", None, json!({ "kind": "terminal" }));
-    store
-        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
-        .unwrap();
-    store
-        .split_pane("p2", "horizontal", "p3", json!({ "kind": "terminal" }))
-        .unwrap();
-    store
-        .split_pane("p3", "horizontal", "p4", json!({ "kind": "terminal" }))
-        .unwrap();
-    assert_eq!(
-        store.close_pane("p1"),
-        ClosePaneOutcome::Closed("t".to_string())
-    );
-    let node = store.get_normalized_snapshot(Some("t"))["layouts"]["t"].clone();
-    // buildGridLayout(3): vertical split; top row = buildHorizontalRow(ceil(3/2)=2).
-    assert_eq!(node["direction"], json!("vertical"));
-    assert_eq!(node["children"][0]["direction"], json!("horizontal"));
-    assert_eq!(node["children"][0]["children"][0]["id"], json!("p2"));
-    assert_eq!(node["children"][0]["children"][1]["id"], json!("p3"));
-    assert_eq!(
-        node["children"][1],
-        json!({ "type": "leaf", "id": "p4", "content": { "kind": "terminal" } })
-    );
-}
-
-#[test]
-fn select_pane_with_invalid_tab_id_falls_back_to_owning_tab() {
-    let store = LayoutStore::new();
-    store.create_tab(
-        "tab_1",
-        "pane_1",
-        Some("alpha".to_string()),
-        json!({ "kind": "terminal" }),
-    );
-    let (tab, pane) = store
-        .select_pane(Some("missing_tab"), "pane_1")
-        .expect("resolved");
-    assert_eq!((tab.as_str(), pane.as_str()), ("tab_1", "pane_1"));
-    assert_eq!(store.active_tab_id().as_deref(), Some("tab_1"));
-    assert_eq!(
-        store.list_tabs()[0].active_pane_id.as_deref(),
-        Some("pane_1")
-    );
-}
-
-#[test]
-fn rename_pane_sets_title_and_cascades_to_single_pane_tab() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    assert_eq!(
-        store.rename_pane("pane_1", "Logs"),
-        Some(("tab_a".to_string(), "pane_1".to_string()))
-    );
+    assert_eq!(out.tab_id.as_deref(), Some(tab_id.as_str()));
+    assert_eq!(out.pane_id.as_deref(), Some(new_pane.as_str()));
+    assert_eq!(out.message, None);
+    let pane = store.get_pane_snapshot(&new_pane).expect("pane snapshot");
+    assert_eq!(pane.tab_id, tab_id);
+    assert_eq!(pane.kind.as_deref(), Some("browser"));
     let snap = store.get_normalized_snapshot(None);
-    assert_eq!(snap["paneTitles"]["tab_a"]["pane_1"], json!("Logs"));
-    assert_eq!(snap["paneTitleSetByUser"]["tab_a"]["pane_1"], json!(true));
-    assert_eq!(snap["tabs"][0]["title"], json!("Logs"));
-    assert_eq!(store.rename_pane("missing", "x"), None);
-}
+    assert_eq!(
+        snap["paneTitles"][tab_id.as_str()][new_pane.as_str()],
+        json!("example.com")
+    );
+    assert!(snap["paneTitleSetByUser"][tab_id.as_str()]
+        .get(new_pane.as_str())
+        .is_none());
 
-#[test]
-fn rename_tab_cascades_into_only_pane() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    assert!(store.rename_tab("tab_a", Some("Docs".to_string())));
-    let snap = store.get_normalized_snapshot(None);
-    assert_eq!(snap["tabs"][0]["title"], json!("Docs"));
-    assert_eq!(snap["paneTitles"]["tab_a"]["pane_1"], json!("Docs"));
-    assert_eq!(snap["paneTitleSetByUser"]["tab_a"]["pane_1"], json!(true));
-    assert!(!store.rename_tab("missing", None));
-}
-
-#[test]
-fn lists_pane_titles_from_pane_snapshot() {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_a", "title": "Alpha" }]),
-            json!({ "tab_a": { "type": "leaf", "id": "pane_1", "content": { "kind": "terminal", "terminalId": "term_1" } } }),
-            json!({ "tab_a": "pane_1" }),
-            Some("tab_a"),
-            Some(json!({ "tab_a": { "pane_1": "Logs" } })),
-            Some(json!({ "tab_a": { "pane_1": true } })),
-            1,
-        ),
-        "conn1",
+    assert_eq!(
+        store.split_pane("missing", "horizontal"),
+        Err("pane not found")
     );
     assert_eq!(
-        serde_json::to_value(store.list_panes(Some("tab_a"))).expect("serializes"),
-        json!([{ "id": "pane_1", "index": 0, "kind": "terminal", "terminalId": "term_1", "title": "Logs" }])
+        store
+            .attach_pane_content("nope", &new_pane, json!({ "kind": "picker" }))
+            .message,
+        Some("tab not found")
     );
 }
 
 #[test]
-fn attach_replaces_content_and_reseeds_only_untouched_titles() {
-    let store = LayoutStore::new();
-    store.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal" }));
-    store.rename_pane("pane_1", "Ops desk");
-    assert!(store.attach_pane_content("tab_1", "pane_1", json!({ "kind": "browser", "url": "https://docs.example.com/runbook", "devToolsOpen": false })));
-    let panes = store.list_panes(Some("tab_1"));
-    assert_eq!(panes[0].kind.as_deref(), Some("browser"));
-    assert_eq!(panes[0].title.as_deref(), Some("Ops desk"));
-    // Untouched title: reseeds from the NEW content.
-    let store2 = LayoutStore::new();
-    store2.create_tab("tab_1", "pane_1", None, json!({ "kind": "terminal" }));
-    assert!(store2.attach_pane_content(
-        "tab_1",
-        "pane_1",
-        json!({ "kind": "terminal", "terminalId": "term_2", "mode": "codex" })
-    ));
-    assert_eq!(
-        store2.list_panes(Some("tab_1"))[0].title.as_deref(),
-        Some("Codex CLI")
-    );
-    assert!(!store2.attach_pane_content("missing_tab", "pane_1", json!({"kind":"terminal"})));
-}
+fn update_from_ui_migrates_legacy_agent_chat_and_fresh_agent_content() {
+    const CANONICAL: &str = "123e4567-e89b-42d3-a456-426614174000";
 
-#[test]
-fn swap_pane_swaps_content_and_titles() {
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_a", "title": "Alpha" }]),
-            json!({
-                "tab_a": {
-                    "type": "split",
-                    "id": "split_1",
-                    "direction": "horizontal",
-                    "sizes": [50, 50],
-                    "children": [
-                        { "type": "leaf", "id": "pane_1", "content": { "kind": "terminal", "terminalId": "term_1", "mode": "codex", "shell": "system" } },
-                        { "type": "leaf", "id": "pane_2", "content": { "kind": "editor", "filePath": "/tmp/example.txt", "readOnly": false, "content": "", "viewMode": "source" } },
-                    ],
-                },
-            }),
-            json!({ "tab_a": "pane_1" }),
-            Some("tab_a"),
-            Some(json!({ "tab_a": { "pane_1": "Codex", "pane_2": "Editor" } })),
-            Some(json!({ "tab_a": { "pane_1": true, "pane_2": true } })),
-            1,
-        ),
-        "conn1",
-    );
-    assert_eq!(
-        store.swap_pane(Some("tab_a"), "pane_1", "pane_2"),
-        Some("tab_a".to_string())
-    );
-    let panes = store.list_panes(Some("tab_a"));
-    assert_eq!(panes[0].kind.as_deref(), Some("editor"));
-    assert_eq!(panes[0].title.as_deref(), Some("Editor"));
-    assert_eq!(panes[1].terminal_id.as_deref(), Some("term_1"));
-    assert_eq!(panes[1].title.as_deref(), Some("Codex"));
-    // Cross-tab and unknown pairs are None ("panes not found").
-    assert_eq!(store.swap_pane(Some("tab_a"), "pane_1", "nope"), None);
-}
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": leaf("p1", json!({ "kind": "agent-chat", "provider": "claude", "resumeSessionId": CANONICAL })),
+            "t2": leaf("p2", json!({ "kind": "fresh-agent", "sessionType": "freshopencode", "timelineSessionId": "ses_123" })),
+        },
+        "activePane": { "t1": "p1", "t2": "p2" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "conn");
 
-#[test]
-fn close_tab_falls_forward_active_and_clears_metadata() {
-    let store = LayoutStore::new();
-    store.create_tab("tab_1", "p1", None, json!({ "kind": "terminal" }));
-    store.create_tab(
-        "tab_2",
-        "p2",
-        None,
-        json!({ "kind": "browser", "url": "https://x.io", "devToolsOpen": false }),
+    // agent-chat + canonical claude resume -> fresh-agent with sessionRef
+    // (shared/fresh-agent.ts:279-334).
+    let p1 = store
+        .get_pane_snapshot("p1")
+        .expect("p1")
+        .pane_content
+        .expect("content");
+    assert_eq!(p1["kind"], json!("fresh-agent"));
+    assert_eq!(p1["sessionType"], json!("freshclaude"));
+    assert_eq!(p1["provider"], json!("claude"));
+    assert_eq!(
+        p1["sessionRef"],
+        json!({ "provider": "claude", "sessionId": CANONICAL })
     );
-    assert_eq!(store.active_tab_id().as_deref(), Some("tab_2"));
-    assert!(store.close_tab("tab_2"));
-    assert!(!store.close_tab("tab_2"));
-    // Legacy: activeTabId = nextTabs[0]?.id || null.
-    assert_eq!(store.active_tab_id().as_deref(), Some("tab_1"));
-    let snap = store.get_normalized_snapshot(None);
-    assert!(snap["layouts"].get("tab_2").is_none());
-    assert!(snap["paneTitles"].get("tab_2").is_none());
-    assert!(snap["activePane"].get("tab_2").is_none());
-    assert!(store.close_tab("tab_1"));
-    assert_eq!(store.active_tab_id(), None);
-}
+    assert_eq!(p1["resumeSessionId"], json!(CANONICAL));
+    assert!(p1.get("restoreError").is_none());
 
-#[test]
-fn has_tab_matches_id_or_title() {
-    let store = LayoutStore::new();
-    assert!(!store.has_tab("anything"));
-    store.create_tab(
-        "tab_1",
-        "p1",
-        Some("Alpha".to_string()),
-        json!({ "kind": "terminal" }),
+    // fresh-agent with legacy timelineSessionId -> sessionRef, legacy key stripped
+    // (shared/fresh-agent.ts:199-277).
+    let p2 = store
+        .get_pane_snapshot("p2")
+        .expect("p2")
+        .pane_content
+        .expect("content");
+    assert_eq!(p2["provider"], json!("opencode"));
+    assert_eq!(
+        p2["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": "ses_123" })
     );
-    assert!(store.has_tab("tab_1"));
-    assert!(store.has_tab("Alpha"));
-    assert!(!store.has_tab("nope"));
-}
+    assert!(p2.get("timelineSessionId").is_none(), "legacy key stripped");
+    assert!(p2.get("resumeSessionId").is_none());
 
-#[test]
-fn resize_pane_sets_split_sizes() {
-    let store = LayoutStore::new();
-    store.create_tab("t", "p1", None, json!({ "kind": "terminal" }));
-    store
-        .split_pane("p1", "horizontal", "p2", json!({ "kind": "terminal" }))
-        .unwrap();
-    let split_id = store.get_normalized_snapshot(None)["layouts"]["t"]["id"]
-        .as_str()
-        .expect("split id")
-        .to_string();
-    // No-tab filter resolution + sizes write.
+    // Non-canonical claude resume -> restoreError, no sessionRef/resumeSessionId.
+    let store2 = LayoutStore::default();
+    let sync2 = sync_from(json!({
+        "tabs": [{ "id": "t1" }],
+        "layouts": { "t1": leaf("p1", json!({ "kind": "agent-chat", "provider": "claude", "resumeSessionId": "not-a-uuid" })) },
+        "activePane": {},
+        "timestamp": 1,
+    }));
+    store2.update_from_ui(&sync2, "c");
+    let p = store2
+        .get_pane_snapshot("p1")
+        .expect("p1")
+        .pane_content
+        .expect("content");
     assert_eq!(
-        store.resize_pane(None, &split_id, [30.0, 70.0]),
-        Some("t".to_string())
+        p["restoreError"],
+        json!({ "code": "RESTORE_UNAVAILABLE", "reason": "invalid_legacy_restore_target" })
     );
-    assert_eq!(
-        store.get_split_sizes(Some("t"), &split_id),
-        Some((30.0, 70.0))
-    );
-    // Unknown split / wrong-length sizes.
-    assert_eq!(store.get_split_sizes(None, "missing"), None);
-    assert_eq!(store.resize_pane(None, "missing", [1.0, 2.0]), None);
-}
-
-#[test]
-fn helper_lookups_find_panes_and_terminal_ids() {
-    let store = LayoutStore::new();
-    store.update_from_ui(&basic_snapshot(1), "conn1");
-    let snap = store.get_pane_snapshot("pane_1").expect("found");
-    assert_eq!(snap.tab_id, "tab_a");
-    assert_eq!(snap.pane_id, "pane_1");
-    assert_eq!(snap.index, 0);
-    assert_eq!(
-        snap.pane_content.expect("content")["terminalId"],
-        json!("term_1")
-    );
-    assert_eq!(store.get_pane_snapshot("nope"), None);
-    assert_eq!(
-        store.resolve_pane_to_terminal("pane_1").as_deref(),
-        Some("term_1")
-    );
-    assert_eq!(store.resolve_pane_to_terminal("nope"), None);
-    assert_eq!(
-        store.find_pane_by_terminal_id("term_1"),
-        Some(("tab_a".to_string(), "pane_1".to_string()))
-    );
-    // After a split, the parent split is findable.
-    store.create_tab("tab_b", "p1", None, json!({ "kind": "terminal" }));
-    store
-        .split_pane("p1", "vertical", "p2", json!({ "kind": "terminal" }))
-        .unwrap();
-    let (tab, split_id) = store.find_split_for_pane("p2").expect("parent split");
-    assert_eq!(tab, "tab_b");
-    assert_eq!(
-        store.get_split_sizes(Some("tab_b"), &split_id),
-        Some((50.0, 50.0))
-    );
-    assert_eq!(store.find_split_for_pane("pane_1"), None);
-}
-
-#[test]
-fn list_tabs_empty_string_title_falls_back_to_id_like_legacy() {
-    // Review finding (fresheyes #1 minor): legacy `t.title || t.id` is falsy
-    // for "" — the fallback must fire for empty strings too.
-    let store = LayoutStore::new();
-    store.update_from_ui(
-        &sync(
-            json!([{ "id": "tab_e", "title": "" }]),
-            json!({ "tab_e": { "type": "leaf", "id": "p1", "content": { "kind": "terminal" } } }),
-            json!({ "tab_e": "p1" }),
-            Some("tab_e"),
-            None,
-            None,
-            1,
-        ),
-        "c",
-    );
-    assert_eq!(store.list_tabs()[0].title, "tab_e");
+    assert!(p.get("sessionRef").is_none());
+    assert!(p.get("resumeSessionId").is_none());
 }

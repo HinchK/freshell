@@ -151,6 +151,35 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
   run test/integration/real/ --config config/vitest/vitest.server.config.ts
 ```
 
+### Vitest Test Backend (Cloud Run Jobs)
+
+Vitest unit/server test suites can run locally or on Google Cloud Run Jobs. The `FRESHELL_VITEST_BACKEND` environment variable controls the default:
+- **Unset or `"local"`**: run locally (the safe default for new clones)
+- **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~5 min local, ~$0.02/run)
+
+```bash
+npm run test:cloud          # Run vitest on Cloud Run Jobs (client + server suites)
+npm run test:cloud:build    # Build and push the Docker image to Artifact Registry
+```
+
+**If `FRESHELL_VITEST_BACKEND` is not set, ask the user which way to set it** before running cloud vitest tests. Explain that cloud is faster (parallel shards, ~2-3 min vs ~5 min) but is a paid Google Cloud service (~$0.02/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
+
+**Note:** The electron suite always runs locally even in cloud mode (it needs a display and native modules not available in the container).
+
+### E2E Test Backend (Cloud Run Jobs)
+
+Playwright e2e tests can run locally or on Google Cloud Run Jobs. The `FRESHELL_E2E_BACKEND` environment variable controls the default:
+- **Unset or `"local"`**: run locally (the safe default for new clones)
+- **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~28 min local, ~$0.03/run)
+
+```bash
+npm run test:e2e            # Uses FRESHELL_E2E_BACKEND (default: local)
+npm run test:e2e:local      # Force local
+npm run test:e2e:cloud      # Force cloud
+```
+
+**If `FRESHELL_E2E_BACKEND` is not set, ask the user which way to set it** before running e2e tests. Explain that cloud is much faster (parallel shards, ~2-3 min vs ~28 min) but is a paid Google Cloud service (~$0.03/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
+
 ## Architecture
 
 ### Tech Stack
@@ -185,7 +214,7 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
 
 **Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
 
-**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated]
+**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated] Separately, the sidebar shows cross-device remote status rings around a session row's icon: a green ring means the session is open on another device, a blue ring means it is busy on another device (blue wins over green), and rings are suppressed entirely when the session is open on this device (derived from `tabs.sync` registry snapshots — producing clients stamp pane payloads with `sessionKeys`/`busySessionKeys`, consumers re-query remote snapshots on a 30s interval, and the server partitions same-device records into `sameDeviceOpen`, which never produces rings).
 
 **Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider.
 

@@ -21,6 +21,7 @@
 #   --local           Run locally (overrides FRESHELL_E2E_BACKEND)
 #   --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
 #   --build           Force image rebuild + push before running
+#   --local-build     Build locally with Docker instead of Cloud Build
 #   --shards=N        Number of parallel Cloud Run tasks (default: 1)
 #   --timeout=DURATION Cloud Run task timeout (default: 60m)
 #   --grep=PATTERN    Pass --grep=PATTERN to Playwright
@@ -114,6 +115,7 @@ Flags:
   --local           Run locally (overrides FRESHELL_E2E_BACKEND)
   --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
   --build           Force image rebuild + push before running
+  --local-build     Build locally with Docker instead of Cloud Build
   --shards=N        Number of parallel Cloud Run tasks (default: 1)
   --timeout=DURATION Cloud Run task timeout (default: 60m)
   --grep=PATTERN    Pass --grep=PATTERN to Playwright
@@ -139,15 +141,55 @@ EOF
 # Subcommand: build
 # ---------------------------------------------------------------------------
 cmd_build() {
-  local tag
+  local local_build=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-build)
+        local_build=true
+        shift
+        ;;
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
+  local tag remote_base
   tag="$(image_tag_for_head)"
-  echo "[e2e-cloud] Building Docker image (tag: $tag)..."
-  docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
-    -t "$IMAGE_LOCAL" \
-    -t "${IMAGE_NAME}:${tag}" \
-    "$ROOT"
-  echo "[e2e-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
-  cmd_push
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+
+  if $local_build; then
+    echo "[e2e-cloud] Building Docker image locally (tag: $tag)..."
+    docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+      -t "$IMAGE_LOCAL" \
+      -t "${IMAGE_NAME}:${tag}" \
+      "$ROOT"
+    echo "[e2e-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
+    cmd_push
+  else
+    echo "[e2e-cloud] Building Docker image via Cloud Build (tag: $tag)..."
+    gcloud builds submit \
+      --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
+      --account="$GCP_ACCOUNT" \
+      --project="$GCP_PROJECT" \
+      --substitutions=_IMAGE="${remote_base}:${tag}" \
+      "$ROOT"
+    echo "[e2e-cloud] Cloud Build complete: ${remote_base}:${tag}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -191,6 +233,7 @@ cmd_run() {
   local local_mode=false
   local cloud_mode=false
   local force_build=false
+  local local_build_flag=false
   local shards=1
   local timeout="60m"
   local -a pw_args=()
@@ -207,6 +250,10 @@ cmd_run() {
         ;;
       --build)
         force_build=true
+        shift
+        ;;
+      --local-build)
+        local_build_flag=true
         shift
         ;;
       --shards=*)
@@ -305,19 +352,31 @@ cmd_run() {
 
   # Cloud mode
   if $force_build; then
-    cmd_build
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
   elif [[ "$image_tag" == *-dirty ]]; then
     # A dirty tree has NO addressable content: a stored `<sha>-dirty` tag can
     # only ever name whatever the FIRST dirty build contained, so reusing it
     # would silently run stale source (wrap-review r4). Always rebuild+push;
     # docker's layer cache keeps an unchanged tree cheap.
     echo "[e2e-cloud] Dirty worktree — rebuilding the image (uncommitted tree has no addressable tag)..."
-    cmd_build
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
   elif ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
       --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
     # Clean tree: the HEAD tag genuinely addresses this image's content.
     echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
-    cmd_build
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
   fi
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
@@ -368,17 +427,29 @@ cmd_run() {
 
   rm -f "$env_file"
 
-  # Execute the job and wait for completion
+  # Execute the job and wait for completion.
+  # Capture the execution ID from the execute output to avoid a race with
+  # concurrent agents updating/executing the same shared job.
   echo "[e2e-cloud] Executing Cloud Run Job..."
-  gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait
+  local execute_output
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait 2>&1) || true
+  echo "$execute_output"
 
-  # Get the latest execution name
+  # Extract the execution ID from the execute output (format: "Execution NAME")
   local execution_id
-  execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
-    --job="$GCP_JOB" \
-    --sort-by="~metadata.creationTimestamp" \
-    --format="value(name)" \
-    --limit=1)
+  # (`|| true`: grep no-match must not kill set -eo pipefail before the
+  # fall-back latest-execution lookup; real gcloud prints "Execution NAME ...",
+  # stubs/minimal CLIs may print nothing.)
+  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1 || true)
+  if [ -z "$execution_id" ]; then
+    # Fallback: query the latest execution (may race with concurrent agents)
+    echo "[e2e-cloud] WARNING: could not capture execution ID, falling back to latest"
+    execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
+      --job="$GCP_JOB" \
+      --sort-by="~metadata.creationTimestamp" \
+      --format="value(name)" \
+      --limit=1)
+  fi
 
   # Fetch logs (requires beta track for logs read).
   # Capture to a variable so we can print the full output AND extract a
@@ -447,7 +518,7 @@ cmd_logs() {
 SUBCOMMAND="${1:-run}"
 case "$SUBCOMMAND" in
   run)
-    shift
+    if [ $# -gt 0 ]; then shift; fi
     cmd_run "$@"
     ;;
   build)

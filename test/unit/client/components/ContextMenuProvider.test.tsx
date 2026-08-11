@@ -12,6 +12,7 @@ import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
+import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -613,6 +614,52 @@ function createStoreWithTerminalPane() {
   })
 }
 
+function createStoreWithTabRegistry() {
+  const store = configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      tabRegistry: tabRegistryReducer,
+    },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          { id: 'tab-1', createRequestId: 'tab-1', title: 'Tab One', status: 'running', mode: 'shell', shell: 'system', createdAt: 1 },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: { layouts: {}, activePane: {}, paneTitles: {} },
+      sessions: { projects: [], expandedProjects: new Set<string>() },
+      connection: { status: 'ready', platform: null },
+    },
+  })
+  store.dispatch(setTabRegistrySnapshot({
+    localOpen: [],
+    remoteOpen: [{
+      tabKey: 'remote:open-1',
+      tabId: 'open-1',
+      serverInstanceId: 'srv-remote',
+      deviceId: 'remote-device',
+      deviceLabel: 'Remote Device',
+      tabName: 'remote open',
+      status: 'open',
+      revision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [],
+    }],
+    closed: [],
+  }))
+  return store
+}
+
 describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
@@ -668,6 +715,27 @@ describe('ContextMenuProvider', () => {
 
     await user.click(screen.getByText('Outside'))
     expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('closes the menu when the user scrolls after the post-open grace period', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // Wait out the 500ms post-open grace window (this suite uses real
+    // timers by design — do not add fake timers to this file).
+    await new Promise((resolve) => setTimeout(resolve, 550))
+
+    act(() => {
+      window.dispatchEvent(new Event('scroll'))
+    })
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
   })
 
   it('respects native menu for input-like elements', async () => {
@@ -2413,5 +2481,80 @@ describe('ContextMenuProvider', () => {
       expect(detachMessages).toHaveLength(1)
     })
 
+  })
+
+  it('opens the tabs-card menu on right click via data-context', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithTabRegistry()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1">
+            remote open card
+          </button>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('remote open card'), keys: '[MouseRight]' })
+
+    expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /Copy tab name/i })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /Jump to tab/i })).toBeNull()
+  })
+
+  it('pull to this device creates a local tab and switches view', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithTabRegistry()
+    const onViewChange = vi.fn()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={onViewChange}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1">
+            remote open card
+          </button>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('remote open card'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: /Pull to this device/i }))
+
+    expect(store.getState().tabs.tabs.some((t) => t.title === 'remote open')).toBe(true)
+    expect(onViewChange).toHaveBeenCalledWith('terminal')
+  })
+
+  it('keyboard navigation focuses menu items with preventScroll', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+    const menu = screen.getByRole('menu')
+
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus')
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    fireEvent.keyDown(menu, { key: 'End' })
+    fireEvent.keyDown(menu, { key: 'Home' })
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+
+    expect(focusSpy).toHaveBeenCalled()
+    for (const call of focusSpy.mock.calls) {
+      expect(call[0]).toEqual({ preventScroll: true })
+    }
+    focusSpy.mockRestore()
   })
 })

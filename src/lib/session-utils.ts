@@ -104,7 +104,7 @@ function extractSessionLocatorLiveHandleHint(content: PaneContent): boolean {
   return false
 }
 
-function extractSessionLocators(content: PaneContent): Array<{
+export function extractSessionLocators(content: PaneContent): Array<{
   provider: CodingCliProviderName
   sessionId: string
 }> {

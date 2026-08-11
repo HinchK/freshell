@@ -21,7 +21,11 @@ coverage/
 .the-usual-logs/
 
 # Application directories not needed for e2e tests
-docs/
+# Note: docs/ is NOT excluded wholesale — docs/skills/testing.md is needed
+# by test/integration/server/test-coordinator.test.ts. Instead, exclude only
+# the docs subdirectories we don't need.
+docs/plans/
+docs/development/
 installers/
 electron/
 examples/
@@ -54,6 +58,11 @@ Thumbs.db
 
 # Documentation (not needed at runtime)
 *.md
+
+# Exceptions: files needed by server-side tests
+!AGENTS.md
+!docs/skills/testing.md
+!docs/lab-notes/2026-04-20-coding-cli-session-contract.md
 
 # Explicitly keep package manifests (harmless; guards against future globs)
 !package.json

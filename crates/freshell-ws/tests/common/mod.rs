@@ -144,6 +144,8 @@ pub async fn spawn_server_with_specs_and_shared_settings(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -220,6 +222,8 @@ pub async fn spawn_server_with_specs(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -298,6 +302,8 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
     let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -380,6 +386,8 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
     let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -459,6 +467,8 @@ pub async fn spawn_server_with_specs_and_state(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -546,6 +556,8 @@ pub async fn spawn_server_with_ledger(
     )));
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -629,6 +641,8 @@ pub async fn spawn_server_with_specs_and_activity(
     registry.set_activity_observer(activity_hub.registry_observer());
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -711,6 +725,8 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
     registry.set_activity_observer(activity_hub.registry_observer());
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
@@ -815,6 +831,8 @@ pub async fn spawn_server_with_create_protect_probes(
     ));
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),

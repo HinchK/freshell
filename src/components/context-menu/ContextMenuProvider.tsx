@@ -13,7 +13,9 @@ import {
   splitPane as splitPaneAction,
   swapSplit,
   updatePaneContent,
+  updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
+import { applySessionRenameCascade } from '@/store/titleSync'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { sendTerminalKill } from '@/lib/terminal-kill'
@@ -42,6 +44,14 @@ import {
   type ReopenPaneSessionTarget,
 } from '@/lib/session-flavor-reopen'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
+import {
+  jumpToRecord as jumpToRecordAction,
+  openPaneInNewTab as openPaneInNewTabAction,
+  openRecordAsUnlinkedCopy as openRecordAsUnlinkedCopyAction,
+  type TabsRegistryGroups,
+} from '@/lib/tab-registry-open'
+import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
@@ -66,6 +76,16 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
+// How long after the menu opens we ignore scroll/resize events. Opening the
+// menu on mobile has mechanical side effects that fire native scroll/resize
+// shortly after open: focus scroll-into-view (next frame) and the on-screen
+// keyboard hiding as focus moves into the menu, whose scroll/resize burst
+// lands ~250-350ms after open on measured platforms — 500ms covers it with
+// margin. These are not user dismissal intent. Genuine user scrolls still
+// close the menu: on touch devices a real scroll begins with a pointerdown
+// outside the menu (which closes it instantly, grace or no grace); on
+// desktop, wheel scrolls close it once the grace window has passed.
+const MENU_OPEN_GRACE_MS = 500
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
@@ -75,6 +95,12 @@ const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+const EMPTY_TAB_REGISTRY_GROUPS: TabsRegistryGroups = {
+  localOpen: [],
+  sameDeviceOpen: [],
+  remoteOpen: [],
+  closed: [],
+}
 
 const log = createLogger('ContextMenuProvider')
 const KNOWN_CONTEXT_IDS = new Set(Object.values(ContextIds) as ContextId[])
@@ -149,6 +175,7 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
+  const localServerInstanceId = useAppSelector((s) => s.connection?.serverInstanceId)
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
@@ -159,12 +186,17 @@ export function ContextMenuProvider({
   const amplifierActivityByTerminalId = useAppSelector((s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
   const paneRuntimeActivityByPaneId = useAppSelector((s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID)
+  const tabRegistryGroups = useAppSelector((s) =>
+    s.tabRegistry ? selectTabsRegistryGroups(s) : EMPTY_TAB_REGISTRY_GROUPS
+  )
+  const registryDeviceId = useAppSelector((s) => s.tabRegistry?.deviceId ?? '')
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
   const suppressNextFocusRestoreRef = useRef(false)
+  const menuOpenedAtRef = useRef(0)
 
   const ws = useMemo(() => getWsClient(), [])
 
@@ -188,6 +220,10 @@ export function ContextMenuProvider({
 
   const openMenu = useCallback((state: MenuState) => {
     previousFocusRef.current = document.activeElement as HTMLElement | null
+    // Kept in a ref (NOT in menuState): the view-change effect below runs
+    // closeMenu() in its cleanup whenever menuState identity changes, so
+    // writing a timestamp into state would self-dismiss the menu.
+    menuOpenedAtRef.current = Date.now()
     setMenuState(state)
   }, [])
 
@@ -460,11 +496,21 @@ export function ContextMenuProvider({
       summary = nextSummary || undefined
     }
     try {
-      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
-      await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
+      const resolvedProvider = provider || info.session.provider || 'claude'
+      const compositeKey = `${resolvedProvider}:${sessionId}`
+      const result = await api.patch<{ cascadedTerminalId?: string | null }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
         titleOverride: title || undefined,
         summaryOverride: summary,
       })
+      if (title) {
+        applySessionRenameCascade({
+          dispatch,
+          provider: resolvedProvider,
+          sessionId,
+          title,
+          cascadedTerminalId: result.cascadedTerminalId,
+        })
+      }
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
@@ -707,6 +753,11 @@ export function ContextMenuProvider({
       const existing = findTabByTerminalId(terminalId)
       if (existing && title) {
         dispatch(updateTab({ id: existing.id, updates: { title } }))
+      }
+      if (title) {
+        // D7: mirror into the pane title so the pane header and
+        // getTabDisplayTitle's pane-title preference both converge.
+        dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: true }))
       }
     } catch {
       // ignore
@@ -976,6 +1027,14 @@ export function ContextMenuProvider({
   }, [])
 
   useEffect(() => {
+    // --- Long-press (touch hold) state ---
+    // Shared by BOTH open paths: the custom 500ms timer below AND the native
+    // `contextmenu` event Android fires mid-gesture. Declared before the
+    // handlers so handleContextMenu can coordinate with the touch session.
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null
+    let touchStartPos: { x: number; y: number } | null = null
+    let suppressNextTouchEnd = false
+
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       const contextEl = findContextElement(target)
@@ -983,12 +1042,41 @@ export function ContextMenuProvider({
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
 
       e.preventDefault()
+
+      // Android race, case A: our long-press timer already opened the menu
+      // for this gesture (suppressNextTouchEnd is armed until touchend).
+      // Swallow the OS contextmenu -- re-opening would jump the menu and
+      // corrupt focus restoration.
+      if (suppressNextTouchEnd) return
+
+      // Android race, case B: a touch gesture is still in flight and the
+      // native contextmenu won the race. Cancel our timer so it cannot
+      // re-fire into the just-opened menu (its elementFromPoint probe would
+      // hit the menu and replace it with the Global fallback), and arm
+      // release suppression for engines that DO synthesize a click from
+      // this gesture (iOS-like; Chromium-Android does not). Prefer the
+      // touch-session start position over the event coords — identical on
+      // Chromium, and it hardens against engines reporting drifted or
+      // degenerate contextmenu coordinates.
+      let position = { x: e.clientX, y: e.clientY }
+      if (touchStartPos !== null || longPressTimer !== null) {
+        if (touchStartPos) {
+          position = { x: touchStartPos.x, y: touchStartPos.y }
+        }
+        if (longPressTimer) {
+          clearTimeout(longPressTimer)
+          longPressTimer = null
+        }
+        touchStartPos = null
+        suppressNextTouchEnd = true
+      }
+
       const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
       const parsed = parseContextTarget(contextId as any, dataset)
       const targetObj = parsed || { kind: 'global' as const }
 
       openMenu({
-        position: { x: e.clientX, y: e.clientY },
+        position,
         target: targetObj,
         contextElement: contextEl,
         clickTarget: target,
@@ -1019,11 +1107,6 @@ export function ContextMenuProvider({
         dataset,
       })
     }
-
-    // --- Long-press (touch hold) detection for mobile ---
-    let longPressTimer: ReturnType<typeof setTimeout> | null = null
-    let touchStartPos: { x: number; y: number } | null = null
-    let suppressNextTouchEnd = false
 
     const handleTouchStart = (e: TouchEvent) => {
       const touch = e.touches[0]
@@ -1120,8 +1203,21 @@ export function ContextMenuProvider({
       closeMenu()
     }
 
-    const handleScroll = () => closeMenu()
-    const handleResize = () => closeMenu()
+    const handleScroll = (e: Event) => {
+      // Scrolls that originate inside the menu (e.g. an overflowing item
+      // list) are interactions with the menu, not dismissal intent.
+      if (e.target instanceof Node && menuRef.current?.contains(e.target)) return
+      // Mechanical scrolls right after open are side effects of opening
+      // (see MENU_OPEN_GRACE_MS). Genuine user scrolls still dismiss.
+      if (Date.now() - menuOpenedAtRef.current < MENU_OPEN_GRACE_MS) return
+      closeMenu()
+    }
+    const handleResize = () => {
+      // Keyboard show/hide can resize the window (older Android WebViews)
+      // right as the menu opens; give resize the same post-open grace.
+      if (Date.now() - menuOpenedAtRef.current < MENU_OPEN_GRACE_MS) return
+      closeMenu()
+    }
     const handleBlur = () => closeMenu()
 
     document.addEventListener('pointerdown', handlePointerDown, true)
@@ -1166,6 +1262,35 @@ export function ContextMenuProvider({
     await copyText(url)
   }, [])
 
+  const jumpToTabRecord = useCallback((record: RegistryTabRecord) => {
+    jumpToRecordAction(record, {
+      dispatch,
+      localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
+      hasLocalTab: (tabId) => appStore.getState().tabs.tabs.some((tab) => tab.id === tabId),
+    })
+  }, [dispatch, localServerInstanceId, onViewChange, appStore])
+
+  const openTabRecordCopy = useCallback((record: RegistryTabRecord) => {
+    openRecordAsUnlinkedCopyAction(record, {
+      dispatch,
+      localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
+    })
+  }, [dispatch, localServerInstanceId, onViewChange])
+
+  const openTabRecordPaneInNewTab = useCallback((record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
+    openPaneInNewTabAction(record, pane, {
+      dispatch,
+      localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
+    })
+  }, [dispatch, localServerInstanceId, onViewChange])
+
+  const copyTabRecordName = useCallback(async (record: RegistryTabRecord) => {
+    await copyText(record.tabName)
+  }, [])
+
   const menuItems = useMemo(() => {
     if (!menuState) return []
     return buildMenuItems(menuState.target, {
@@ -1181,6 +1306,8 @@ export function ContextMenuProvider({
       platform,
       extensions: extensionEntries,
       reopenActivityByPaneId,
+      tabRegistryGroups,
+      registryDeviceId,
       actions: {
         newDefaultTab,
         newTabWithPane,
@@ -1244,6 +1371,10 @@ export function ContextMenuProvider({
         openUrlInTab,
         openUrlInBrowser,
         copyUrl: copyUrlAction,
+        jumpToTabRecord,
+        openTabRecordCopy,
+        openTabRecordPaneInNewTab,
+        copyTabRecordName,
       },
     })
   }, [
@@ -1305,6 +1436,12 @@ export function ContextMenuProvider({
     openUrlInTab,
     openUrlInBrowser,
     copyUrlAction,
+    tabRegistryGroups,
+    registryDeviceId,
+    jumpToTabRecord,
+    openTabRecordCopy,
+    openTabRecordPaneInNewTab,
+    copyTabRecordName,
   ])
 
   return (

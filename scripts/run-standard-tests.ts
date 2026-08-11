@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
@@ -312,6 +312,60 @@ async function runStage(stage: StandardTestRun[], forwardedArgs: string[]): Prom
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const { mode, forwardedArgs } = parseCliArgs(argv)
+
+  // Cloud dispatch: when FRESHELL_VITEST_BACKEND=cloud, run client+server suites
+  // in the cloud via vitest-cloud.sh, then run the electron suite locally.
+  // Git-dependent selectors like --changed require a .git directory (excluded
+  // from the Docker image), so fall back to local execution when detected.
+  if (process.env.FRESHELL_VITEST_BACKEND === 'cloud') {
+    const hasGitDependentArgs = forwardedArgs.some(
+      (arg) => arg.startsWith('--changed') || arg === '--changed'
+    )
+    if (hasGitDependentArgs) {
+      log('warn', 'Git-dependent selectors detected, falling back to local execution', {
+        forwardedArgs,
+      })
+    } else {
+      const cloudScript = process.env.FRESHELL_VITEST_CLOUD_SCRIPT
+        || resolve(repoRoot, 'scripts/vitest-cloud.sh')
+
+      log('info', 'Dispatching client+server suites to cloud vitest', {
+        cloudScript,
+        forwardedArgs,
+      })
+
+      try {
+        execFileSync(cloudScript, ['run', ...forwardedArgs], {
+          stdio: 'inherit',
+          cwd: repoRoot,
+        })
+      } catch {
+        process.exitCode = 1
+        return 1
+      }
+
+      // Run the electron suite locally (needs a display + native modules).
+      const electronArgs = buildVitestArgs({
+        configPath: electronVitestConfig,
+        forwardedArgs,
+      })
+      log('info', 'Running electron suite locally after cloud dispatch', {
+        args: electronArgs,
+      })
+      try {
+        execFileSync(process.execPath, [vitestEntrypoint, ...electronArgs], {
+          stdio: 'inherit',
+          cwd: repoRoot,
+          env: process.env,
+        })
+      } catch {
+        process.exitCode = 1
+        return 1
+      }
+      return 0
+    }
+  }
+
   const plan = createStandardTestPlan({
     availableParallelism: availableParallelism(),
     ci: process.env.CI === 'true' || process.env.CI === '1',

@@ -1,0 +1,70 @@
+# Build artifacts (rebuilt in Docker — never copy from host)
+node_modules/
+dist/
+target/
+test-results/
+playwright-report/
+coverage/
+.nyc_output/
+
+# Version control and CI
+.git/
+.github/
+
+# Agent/tool configuration directories (not needed in the image)
+.agents/
+.amplifier/
+.cargo/
+.claude/
+.codex/
+.discovery/
+.the-usual-logs/
+.worktrees/
+
+# Application directories not needed for e2e tests
+# Note: docs/ is NOT excluded wholesale — docs/skills/testing.md is needed
+# by test/integration/server/test-coordinator.test.ts. Instead, exclude only
+# the docs subdirectories we don't need.
+docs/plans/
+docs/development/
+installers/
+electron/
+examples/
+port/
+assets/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Secrets — NEVER include in the image
+.env
+
+# Caches and temp files
+.eslintcache
+.cache/
+.npm/
+*.log
+*.pid
+
+# Archives and media
+*.tgz
+*.tar.gz
+*.zip
+*.mp4
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed at runtime)
+*.md
+
+# Exceptions: files needed by server-side tests
+!AGENTS.md
+!docs/skills/testing.md
+!docs/lab-notes/2026-04-20-coding-cli-session-contract.md
+
+# Explicitly keep package manifests (harmless; guards against future globs)
+!package.json
+!package-lock.json

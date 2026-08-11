@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { collectBusySessionKeys, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
+import { collectBusySessionKeys, collectPaneIdentityActivity, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { Tab } from '@/store/types'
@@ -477,6 +477,348 @@ describe('pane activity', () => {
     }
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: {} }).isBusy).toBe(false)
+  })
+
+  describe('collectPaneIdentityActivity', () => {
+    const emptyActivity = {
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+    }
+
+    function terminalTab(id: string, overrides: Record<string, unknown> = {}): Tab {
+      return {
+        id,
+        title: id,
+        createRequestId: `req-${id}`,
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        createdAt: 1,
+        ...(overrides as Partial<Tab>),
+      }
+    }
+
+    it('returns an empty map when there are no tabs', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [],
+        paneLayouts: {},
+        ...emptyActivity,
+      })
+
+      expect(activity.size).toBe(0)
+    })
+
+    it('skips layout-less tabs entirely (records are never built for them)', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-no-layout', {
+          resumeSessionId: '11111111-1111-4111-8111-111111111111',
+        })],
+        paneLayouts: {},
+        ...emptyActivity,
+      })
+
+      expect(activity.size).toBe(0)
+    })
+
+    it('stamps the busy identity only for busy panes', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1', { mode: 'codex' })],
+        paneLayouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-busy',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-busy',
+                  status: 'running',
+                  mode: 'codex',
+                  shell: 'system',
+                  terminalId: 'term-busy',
+                  sessionRef: { provider: 'codex', sessionId: 'codex-session-1' },
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-idle',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-idle',
+                  status: 'running',
+                  mode: 'codex',
+                  shell: 'system',
+                  terminalId: 'term-idle',
+                  sessionRef: { provider: 'codex', sessionId: 'codex-session-2' },
+                },
+              },
+            ],
+          },
+        },
+        ...emptyActivity,
+        codexActivityByTerminalId: {
+          'term-busy': { terminalId: 'term-busy', phase: 'busy', updatedAt: 1 },
+        },
+      })
+
+      expect(activity.get('pane-busy')).toEqual({
+        sessionKeys: ['codex:codex-session-1'],
+        busySessionKeys: ['codex:codex-session-1'],
+      })
+      expect(activity.get('pane-idle')).toEqual({
+        sessionKeys: ['codex:codex-session-2'],
+        busySessionKeys: [],
+      })
+    })
+
+    it('resolves fresh-agent identity through the live canonical session during restore gaps', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-fresh', { mode: 'shell' })],
+        paneLayouts: {
+          'tab-fresh': {
+            type: 'leaf',
+            id: 'pane-fresh',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-fresh',
+              sessionId: 'sdk-restore-1',
+              resumeSessionId: 'stale-resume',
+              status: 'running',
+            },
+          },
+        },
+        ...emptyActivity,
+        freshAgentSessions: freshAgentSessionMap(
+          { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-1' },
+          freshAgentSession({ sessionId: 'canonical-session-1' }),
+        ),
+      })
+
+      const entry = activity.get('pane-fresh')
+      // The stale content resumeSessionId is still a locator for the local green
+      // join, and the live canonical identity is unioned in next to it.
+      expect(entry?.sessionKeys).toEqual(['claude:stale-resume', 'claude:canonical-session-1'])
+      expect(entry?.busySessionKeys).toEqual(['claude:canonical-session-1'])
+    })
+
+    it('does not stamp a busy identity while the pane waits for approval', () => {
+      const sessionId = '44444444-4444-4444-8444-444444444444'
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-fresh', { mode: 'shell' })],
+        paneLayouts: {
+          'tab-fresh': {
+            type: 'leaf',
+            id: 'pane-fresh',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-fresh',
+              sessionId: 'sdk-1',
+              sessionRef: { provider: 'claude', sessionId },
+              status: 'running',
+            },
+          },
+        },
+        ...emptyActivity,
+        freshAgentSessions: freshAgentSessionMap(
+          { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-1' },
+          {
+            ...freshAgentSession({ sessionId }),
+            pendingPermissions: { 'perm-1': {} as never },
+          },
+        ),
+      })
+
+      const entry = activity.get('pane-fresh')
+      expect(entry?.sessionKeys).toEqual([`claude:${sessionId}`])
+      expect(entry?.busySessionKeys).toEqual([])
+    })
+
+    it('stamps the explicit sessionRef identity for terminal panes', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1', { mode: 'opencode' })],
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-1',
+              sessionRef: { provider: 'opencode', sessionId: 'opencode-session-1' },
+            },
+          },
+        },
+        ...emptyActivity,
+      })
+
+      expect(activity.get('pane-1')).toEqual({
+        sessionKeys: ['opencode:opencode-session-1'],
+        busySessionKeys: [],
+      })
+    })
+
+    it('stamps the Claude resume identity for terminal panes without a sessionRef', () => {
+      const resumeId = '55555555-5555-4555-8555-555555555555'
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1')],
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'claude',
+              shell: 'system',
+              resumeSessionId: resumeId,
+            },
+          },
+        },
+        ...emptyActivity,
+      })
+
+      expect(activity.get('pane-1')?.sessionKeys).toEqual([`claude:${resumeId}`])
+    })
+
+    it('stamps the Codex durability identity for terminal panes', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1', { mode: 'codex' })],
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'codex',
+              shell: 'system',
+              terminalId: 'term-1',
+              codexDurability: {
+                schemaVersion: 1,
+                state: 'durable',
+                durableThreadId: 'codex-thread-1',
+              } as never,
+            },
+          },
+        },
+        ...emptyActivity,
+      })
+
+      // A Codex terminal WITH a durability identity gets no fabricated terminal:
+      // row in the Sidebar — only the canonical key is stamped.
+      expect(activity.get('pane-1')?.sessionKeys).toEqual(['codex:codex-thread-1'])
+    })
+
+    it('stamps the Sidebar fallback row key for running non-shell terminals without canonical metadata', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1')],
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'claude',
+              shell: 'system',
+              terminalId: 'term-fallback',
+            },
+          },
+        },
+        ...emptyActivity,
+      })
+
+      expect(activity.get('pane-1')).toEqual({
+        sessionKeys: ['claude:terminal:term-fallback'],
+        busySessionKeys: [],
+      })
+    })
+
+    it('omits shell terminals and other identity-less panes from the map', () => {
+      const activity = collectPaneIdentityActivity({
+        tabs: [
+          terminalTab('tab-shell', { mode: 'shell' }),
+          terminalTab('tab-browser', { mode: 'shell' }),
+        ],
+        paneLayouts: {
+          'tab-shell': {
+            type: 'leaf',
+            id: 'pane-shell',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-shell',
+              status: 'running',
+              mode: 'shell',
+              shell: 'system',
+              terminalId: 'term-shell',
+            },
+          },
+          'tab-browser': {
+            type: 'leaf',
+            id: 'pane-browser',
+            content: {
+              kind: 'browser',
+              browserInstanceId: 'browser-1',
+              url: 'https://example.test',
+              devToolsOpen: false,
+            },
+          },
+        },
+        ...emptyActivity,
+      })
+
+      expect(activity.size).toBe(0)
+    })
+
+    it('keeps every alias in sessionKeys but stamps only the effective busy identity', () => {
+      const explicitId = '66666666-6666-4666-8666-666666666666'
+      const resumeId = '77777777-7777-4777-8777-777777777777'
+      const activity = collectPaneIdentityActivity({
+        tabs: [terminalTab('tab-1')],
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'claude',
+              shell: 'system',
+              terminalId: 'term-alias',
+              sessionRef: { provider: 'claude', sessionId: explicitId },
+              resumeSessionId: resumeId,
+            },
+          },
+        },
+        ...emptyActivity,
+        claudeActivityByTerminalId: {
+          'term-alias': { terminalId: 'term-alias', phase: 'busy', updatedAt: 1 },
+        },
+      })
+
+      const entry = activity.get('pane-1')
+      expect(entry?.sessionKeys).toContain(`claude:${explicitId}`)
+      expect(entry?.sessionKeys).toContain(`claude:${resumeId}`)
+      expect(entry?.busySessionKeys).toEqual([`claude:${explicitId}`])
+    })
   })
 
   describe('resolvePaneIdleGreen (persistent green for terminal CLI panes)', () => {

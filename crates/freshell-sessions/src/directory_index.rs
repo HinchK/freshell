@@ -71,9 +71,36 @@ pub struct IndexedSession {
     pub title_provider_generated: bool,
     pub summary: Option<String>,
     pub first_user_message: Option<String>,
+    /// Mirror of Node's ParsedSessionTitleSource for the parsed (pre-override) title.
+    /// The auto-title pipeline only compares against "provider-generated"
+    /// (server/auto-title.ts:88). Mapping per provider:
+    /// - **claude**: `"provider-generated"` if the title came from a provider-authored
+    ///   record (custom-title, agent-name, or generated summary record with `type:'summary'`).
+    ///   `None` otherwise (title derived from first user message).
+    /// - **codex**: `None` (no provider-authored titles in codex transcripts).
+    /// - **amplifier**: `"provider-generated"` if the session has an AI-generated name
+    ///   (Amplifier's own session title). `None` if unnamed.
+    /// - **opencode**: `"provider-generated"` iff the stored session title
+    ///   is a real name -- not blank and not one of opencode's default
+    ///   placeholders (`New session - `/`Child session - ` plus the legacy
+    ///   capital-S `New Session - `, each followed by the 24-char ISO
+    ///   stamp; see `parse::is_opencode_placeholder_title`). opencode
+    ///   names parent sessions itself after the first exchange. `None` for
+    ///   placeholder-titled sessions (those instead carry
+    ///   `first_user_message` for the first-message/AI rungs).
+    pub title_source: Option<String>,
     pub last_activity_at: i64,
     pub created_at: Option<i64>,
     pub cwd: Option<String>,
+    /// Task 18: the transcript-parsed git branch (`ParsedSessionMeta::git_branch`,
+    /// `meta.rs` -- claude/codex record it; opencode's direct lister does not).
+    /// Consumed by `freshell-server`'s auto-title sweep as the FALLBACK under
+    /// the live-git branch when refreshing terminal metadata (Node's
+    /// `applySessionMetadata`: `session.gitBranch ?? current.branch`,
+    /// `terminal-metadata-service.ts:195`). `#[serde(default)]` so any
+    /// pre-Task-18 serialized snapshot still deserializes.
+    #[serde(default)]
+    pub git_branch: Option<String>,
     pub is_subagent: bool,
     pub is_non_interactive: bool,
     /// SESSION-07: the on-disk transcript this session was parsed from, when
@@ -403,9 +430,11 @@ fn item_from_meta(
         title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
+        title_source: meta.title_source.clone(),
         last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
+        git_branch: meta.git_branch.clone(),
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         source_file,
@@ -654,24 +683,41 @@ impl SessionSource for OpencodeSource {
 }
 
 fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSession {
+    // A non-placeholder opencode title is opencode's OWN session name
+    // (opencode retitles sessions itself after the first exchange).
+    // Surface it as provider-generated so the auto-title ladder yields to
+    // it: `should_generate_ai` short-circuits (freshell-server/auto_title.rs)
+    // and the sweep's shadow guard lets it win over stale dir/first-message
+    // override rows (auto_title_sweep.rs::overlay_session_title). Deliberate
+    // mainline deviation from the retired Node reference, which never
+    // populated titleSource or firstUserMessage for opencode.
+    let provider_named = s
+        .title
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty() && !crate::parse::is_opencode_placeholder_title(t));
     IndexedSession {
         session_id: s.session_id,
         provider: "opencode".to_string(),
         project_path: s.project_path,
         title: s.title,
-        // Node's opencode provider never marks a title provider-generated
-        // (no `titleSource` write anywhere in `providers/opencode.ts`).
-        title_provider_generated: false,
-        // The opencode direct-lister never populates a summary or
-        // first-user-message tier (`listSessionsDirect` doesn't read
-        // `message`/`part` content for these fields) — faithful, not a gap.
+        // bool twin of `title_source` -- same predicate, kept consistent
+        // (see parse/claude.rs's identical convention).
+        title_provider_generated: provider_named,
+        // The opencode direct-lister has no text summary to offer (the
+        // session table's summary_* columns are diff stats) -- None.
         summary: None,
-        first_user_message: None,
+        // Populated by the parse layer ONLY for sessions that still need
+        // naming (bounded lookup) -- feeds the first-message/AI rungs.
+        first_user_message: s.first_user_message,
+        title_source: provider_named.then(|| "provider-generated".to_string()),
         last_activity_at: s.last_activity_at,
         created_at: s.created_at,
         // `OpencodeSession::cwd` is always present (`list_sessions` already
         // skips rows without one) — R10b is a structural non-issue here.
         cwd: Some(s.cwd),
+        // The opencode direct-lister reads no git facts from the db -- None,
+        // faithful to `listSessionsDirect`.
+        git_branch: None,
         is_subagent: s.is_subagent.unwrap_or(false),
         is_non_interactive: s.is_non_interactive.unwrap_or(false),
         // SESSION-07: opencode is direct-listed from one sqlite db, not a
@@ -1713,9 +1759,11 @@ mod tests {
             title_provider_generated: false,
             summary: None,
             first_user_message: None,
+            title_source: None,
             last_activity_at,
             created_at: None,
             cwd: Some("/p".to_string()),
+            git_branch: None,
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
@@ -2529,6 +2577,27 @@ mod tests {
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 
+    // Task 4 additive requirement (a): claude fixture with type:'summary' record
+    // must have title_source == Some("provider-generated").
+    #[test]
+    fn indexed_session_carries_first_user_message_and_provider_generated_title_source() {
+        let claude_home = claude_home_with("claudesrc-title-source", &["real-corrupted.jsonl"]);
+        let sessions = ClaudeSource::new(claude_home.clone()).scan();
+        let s = sessions
+            .iter()
+            .find(|s| s.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d")
+            .expect("fixture session must be found");
+        // Fixture has first user message.
+        assert!(s
+            .first_user_message
+            .as_deref()
+            .is_some_and(|m| !m.is_empty()));
+        // Fixture has type:'summary' record, marking title as provider-generated.
+        assert_eq!(s.title_source.as_deref(), Some("provider-generated"));
+        // Verify first_user_message is capped at 4000 chars.
+        assert!(s.first_user_message.as_ref().unwrap().chars().count() <= 4000);
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
     // ── Batch C: CodexSource ─────────────────────────────────────────────
 
     fn codex_fixture() -> String {
@@ -2661,6 +2730,44 @@ mod tests {
         data_home
     }
 
+    /// Seeds `message`/`part` rows (real-schema column shape: id + linkage +
+    /// time as real columns, role/type/text/synthetic in JSON `data`) for a
+    /// fixture db created by `opencode_data_home_with_sessions`.
+    fn seed_opencode_user_message(
+        data_home: &std::path::Path,
+        session_id: &str,
+        msg_id: &str,
+        time_created: i64,
+        role: &str,
+        parts: &[(&str, &str)], // (part_id, data_json)
+    ) {
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message (
+                id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE IF NOT EXISTS part (
+                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                msg_id,
+                session_id,
+                time_created,
+                format!("{{\"role\":\"{role}\"}}")
+            ],
+        )
+        .unwrap();
+        for (part_id, data) in parts {
+            conn.execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![part_id, msg_id, session_id, data],
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn opencode_source_direct_lists_and_maps_fields() {
         let data_home = opencode_data_home_with_sessions(
@@ -2677,10 +2784,83 @@ mod tests {
         assert_eq!(item.title.as_deref(), Some("Session A"));
         assert_eq!(item.created_at, Some(1000));
         assert_eq!(item.last_activity_at, 5000);
-        assert_eq!(item.summary, None);
+        // "Session A" is a real (non-placeholder) opencode name: surfaced as
+        // provider-generated; no message lookup is paid for named sessions.
+        assert_eq!(item.title_source.as_deref(), Some("provider-generated"));
+        assert!(item.title_provider_generated);
         assert_eq!(item.first_user_message, None);
+        assert_eq!(item.summary, None);
         assert!(!item.is_subagent);
         assert!(!item.is_non_interactive);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_placeholder_title_populates_first_user_message() {
+        // Replaces `opencode_source_preserves_none_first_user_message_parity`.
+        // The Node-parity None starved the first-message/AI ladder rungs
+        // forever (the dir placeholder held for every opencode session).
+        // Mainline behavior: placeholder-titled sessions carry their first
+        // user message so freshell's Gemini stage can name them.
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-fum",
+            &[(
+                "ses_fum",
+                "/repo/f",
+                "New session - 2026-08-10T23:47:23.950Z",
+                1000,
+                5000,
+            )],
+        );
+        seed_opencode_user_message(
+            &data_home,
+            "ses_fum",
+            "msg_1",
+            100,
+            "user",
+            &[(
+                "prt_1",
+                r#"{"type":"text","text":"  This is a quick naming test  "}"#,
+            )],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        // normalized (trimmed) via normalize_first_user_message
+        assert_eq!(
+            items[0].first_user_message.as_deref(),
+            Some("This is a quick naming test")
+        );
+        // a placeholder title is NOT a provider name
+        assert_eq!(items[0].title_source, None);
+        assert!(!items[0].title_provider_generated);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_native_title_maps_to_provider_generated_and_skips_message_fetch() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-native",
+            &[("ses_named", "/repo/n", "Fix login flow", 1000, 5000)],
+        );
+        // Message rows exist, but a named session must NOT pay the
+        // per-session lookup (bounded listing cost) -- and must surface
+        // opencode's own name as provider-generated so the AI stage
+        // short-circuits and the sweep's shadow guard lets it win over
+        // stale dir/first-message override rows.
+        seed_opencode_user_message(
+            &data_home,
+            "ses_named",
+            "msg_1",
+            100,
+            "user",
+            &[("prt_1", r#"{"type":"text","text":"hello"}"#)],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.as_deref(), Some("Fix login flow"));
+        assert_eq!(items[0].title_source.as_deref(), Some("provider-generated"));
+        assert!(items[0].title_provider_generated);
+        assert_eq!(items[0].first_user_message, None);
         std::fs::remove_dir_all(&data_home).ok();
     }
 
