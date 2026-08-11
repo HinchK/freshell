@@ -66,9 +66,14 @@ async fn create_registry_terminal(router: Router) -> String {
 /// Seed the shared layout store the way Task 13's WS ingestion does
 /// (`pane_ops_store_tests::seed_layout` pattern).
 fn seed_layout(state: &FreshAgentState, payload: Value) {
+    seed_layout_as(state, payload, "test-conn");
+}
+
+/// Same, but as a SPECIFIC client connection (multi-client layout store).
+fn seed_layout_as(state: &FreshAgentState, payload: Value, conn_id: &str) {
     let sync: freshell_protocol::UiLayoutSync =
         serde_json::from_value(payload).expect("UiLayoutSync parses");
-    state.layout.update_from_ui(&sync, "test-conn");
+    state.layout.update_from_ui(&sync, conn_id);
 }
 
 /// One tab `t1` holding the lone leaf `p1` with the given content — the
@@ -316,5 +321,73 @@ async fn rename_pane_cascades_via_registry_session_binding_without_pane_content_
         *fake.session_calls.lock().unwrap(),
         vec![("claude:sess-a10".to_string(), "A10 Title".to_string())],
         "registry-first resolution must find the association-learned binding"
+    );
+}
+
+// ── multi-client layout store (cross-client pane-id resolution fix) ─────────
+
+/// A pane id known only to a NON-primary client connection must still rename,
+/// and `tabRenamed` must be computed from the snapshot where the pane
+/// resolved — NOT the primary's same-id tab. (Multi-client divergence from
+/// Node's single shared snapshot; Node keeps last-writer-wins.)
+#[tokio::test]
+async fn rename_from_non_primary_client_succeeds_and_tab_renamed_uses_that_snapshot() {
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx);
+
+    // conn-a: tab t1 is a SINGLE-pane tab holding p1.
+    seed_layout_as(
+        &state,
+        lone_pane_layout(json!({ "kind": "terminal" })),
+        "conn-a",
+    );
+    // conn-b (last writer / primary): the SAME tab id t1, but with TWO panes
+    // b1/b2 — a different window's view of the workspace.
+    seed_layout_as(
+        &state,
+        json!({
+            "tabs": [{ "id": "t1", "title": "First" }],
+            "activeTabId": "t1",
+            "layouts": { "t1": {
+                "type": "split", "id": "s1", "direction": "horizontal", "sizes": [50, 50],
+                "children": [
+                    { "type": "leaf", "id": "b1", "content": { "kind": "terminal" } },
+                    { "type": "leaf", "id": "b2", "content": { "kind": "terminal" } },
+                ],
+            } },
+            "activePane": { "t1": "b1" },
+            "paneTitles": {},
+            "paneTitleSetByUser": {},
+            "timestamp": 2,
+        }),
+        "conn-b",
+    );
+
+    // p1 exists ONLY in conn-a's snapshot (conn-a is not the last writer).
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Cross Client").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], json!("ok"));
+    assert_eq!(body["data"]["tabId"], json!("t1"), "{body}");
+    assert_eq!(body["data"]["paneId"], json!("p1"), "{body}");
+    assert_eq!(
+        body["data"]["tabRenamed"],
+        json!(true),
+        "tabRenamed must come from conn-a's snapshot (single-pane t1), not \
+         the primary's two-pane t1: {body}"
+    );
+
+    // The primary's b1 keeps renaming too, and ITS tab is NOT single-pane.
+    let (status, body) = patch_pane(crate::router(state), "b1", "Primary Pane").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["tabId"], json!("t1"));
+    assert_eq!(body["data"]["tabRenamed"], json!(false), "{body}");
+
+    // Both renames broadcast `ui.command{pane.rename}`.
+    let frames = drain_frames(&mut rx);
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(
+        frames[0]["payload"],
+        json!({ "tabId": "t1", "paneId": "p1", "title": "Cross Client" })
     );
 }

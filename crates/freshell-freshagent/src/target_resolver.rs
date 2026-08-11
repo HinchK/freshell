@@ -30,10 +30,30 @@ pub enum ResolvedTarget {
 /// `tab.pane` / `session:window.pane` index form -> bare numeric index into
 /// the active tab -> pane title across all tabs (2+ matches -> Ambiguous) ->
 /// NotFound. An empty store short-circuits to `NotFound("no layout snapshot")`.
+///
+/// Multi-client store: the full ladder runs against the PRIMARY (last-writer)
+/// snapshot first — byte-identical to Node with one client connected — then
+/// against each other client snapshot, most-recent-first, until one resolves.
+/// A primary miss reports the primary's message.
 pub fn resolve_target(store: &LayoutStore, raw: &str) -> ResolvedTarget {
-    let Some(snapshot) = store.snapshot_clone() else {
+    let snapshots = store.snapshots_clone();
+    if snapshots.is_empty() {
         return ResolvedTarget::NotFound("no layout snapshot");
-    };
+    }
+    let mut miss: Option<ResolvedTarget> = None;
+    for snapshot in &snapshots {
+        match resolve_in_snapshot(snapshot, raw) {
+            ResolvedTarget::NotFound(message) => {
+                miss.get_or_insert(ResolvedTarget::NotFound(message));
+            }
+            resolved => return resolved,
+        }
+    }
+    miss.expect("at least one snapshot was checked")
+}
+
+/// The Node resolution ladder against ONE client snapshot.
+fn resolve_in_snapshot(snapshot: &UiSnapshot, raw: &str) -> ResolvedTarget {
     let clean = raw.trim();
     if clean.is_empty() {
         return ResolvedTarget::NotFound("target not resolved");
@@ -136,7 +156,7 @@ pub fn resolve_target(store: &LayoutStore, raw: &str) -> ResolvedTarget {
     let mut title_match: Option<(String, String)> = None;
     for (tab_id, pane_ids) in &panes_by_tab {
         for pane_id in pane_ids {
-            if pane_title(&snapshot, tab_id, pane_id) != Some(clean) {
+            if pane_title(snapshot, tab_id, pane_id) != Some(clean) {
                 continue;
             }
             if title_match.is_some() {
