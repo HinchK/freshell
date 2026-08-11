@@ -37,13 +37,28 @@ path; sessions without `events.jsonl` get no busy/turn signal.
 Amplifier writes a schema-versioned event log per session
 (`~/.amplifier/projects/<slug>/sessions/<id>/events.jsonl`, schema
 `amplifier.log` ver 1.x) carrying `prompt:submit` / `prompt:complete` /
-`session:end` lifecycle records. The tracker
+`orchestrator:complete` / `session:end` lifecycle records. The tracker
 (`server/coding-cli/amplifier-activity-tracker.ts`) runs one state machine per
 terminal:
 
-- `prompt:submit` is the only input that (re)enters busy; `prompt:complete` is
-  the single turn boundary (exactly one `turn.complete` via the
-  `TurnCompletionLedger`); `session:end` also ends a busy turn. PTY Enter is
+- `prompt:submit` is the only input that (re)enters busy. The turn-end
+  boundary set is `prompt:complete`, `session:end`, and root
+  `orchestrator:complete` (null `data.parent_id`): the first boundary record
+  ends the turn (exactly one `turn.complete` via the `TurnCompletionLedger`);
+  later boundary records for the same turn land at idle and are ignored. On
+  provider-error turns the CLI ends at `orchestrator:complete` and never
+  writes `prompt:complete` (2026-08-10 stuck-busy fix,
+  docs/plans/2026-08-10-amplifier-stuck-busy.md); on healthy turns
+  `orchestrator:complete` precedes `prompt:complete`. These
+  `orchestrator:complete` semantics are structural to the `loop-streaming`
+  orchestrator (verified 2026-08-10 at CLI `2026.08.05-5462f1e` / core 1.6.0
+  / schema `amplifier.log` 1.0.0 / loop-streaming module `e5438b4c9`, which
+  the foundation bundle sources `@main` — re-verify on drift); orchestrators
+  that never emit `orchestrator:complete` (e.g. `loop-agent`) simply fall
+  back to the other boundaries. Known residual gaps (pre-existing): a hard
+  cancel or a goal-mode error turn can end with NO boundary record at all —
+  the deadman force-read and PTY-exit handling remain the failsafes. PTY
+  Enter is
   only *provisionally* busy with a 2s grace reversion (one force-read retry,
   then a silent revert — empty-Enter writes no events); PTY output only
   refreshes liveness. The 120s deadman **never fabricates a completion** — it
