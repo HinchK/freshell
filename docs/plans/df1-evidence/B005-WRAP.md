@@ -19,3 +19,18 @@ Items merged in order: JAN-88, RESTORE-01, SESSION-13, CFG-01. Each entry: fresh
 - **Merge: `41aae0e9e`** `df1(B005): JAN-88 fix 3 novel a11y-gate violations in harness-06-misc-fixtures spec` (merge via ort, spec+evidence only — 2 files, +68/−3)
 
 ---
+
+## RESTORE-01 — recover-my-panes offer inert for e2e harness (auto-decline watcher)
+
+- Branch: `df1/restore-01-panel-inert` · attested head `1e4f3162aa883a72f9c40242bfa6f517c3dd6ba4`
+- Freshness: rev-parse = attested ✓. Merge-base with integration = declared base `5521f3aba` ✓. 5 own commits, diff confined to `docs/plans` + `test/e2e-browser` (zero product code) ✓. Branch tests remain: 13 `it(...)` in `test/e2e-browser/helpers/recovery-offer.test.ts`, `recover-my-panes-rust.spec.ts` scenarios 1–3, `tsconfig.restore01-check.json` ✓. Worktree carried uncommitted `gate01-baseline.json` collate bookkeeping (run-record appends matching the verifier's re-runs incl. the known 5p/1f multi-client divergence; head/sha stamp to attested sha; zero verdict/attribution flips — verified by diff inspection) — benign tool output, left uncommitted; stashed aside for the rebase and restored after.
+- Rebase onto `aab9065ed`: clean, no conflicts. New head `5b8b563d53ada0d960aab125a0360cc893e6dc28`. `git range-diff 5521f3aba..1e4f3162 aab9065ed..5b8b563d5` → all 5 commits patch-identical (`=`); attested→new-head file list identical to base-delta file list ✓.
+- Verification (item worktree, `nice -n 19`; pw legs under `pw` lease `df1-b005`, released after):
+  - `FRESHELL_E2E_RUST_SERVER_BIN=$PWD/../../target/release/freshell-server npx playwright test --config playwright.config.ts --project=rust-chromium recover-my-panes-rust.spec.ts` (from `test/e2e-browser`) → **`3 passed (2.1m)`, exit 0** — offer accept/decline/D7 scenarios pin the panel itself.
+  - `npm run test:e2e:helpers` → **`Test Files 20 passed (20)`, `Tests 269 passed (269)`, exit 0** (includes the 13 recovery-offer unit tests).
+  - `npx tsc -p test/e2e-browser/tsconfig.restore01-check.json` → exit 2; per the config's own contract ("zero error lines attributable to the files RESTORE-01 created or edited"), ALL errors are the declared base-reproducible noise: 2× TS2459 `TestServerInfo` in the two rust-only specs (named in evidence) + TS2339/TS2304 in `src/lib/client-logger.ts`, `src/lib/perf-logger.ts`, `src/store/settingsSlice.ts` — pre-existing dependency files byte-identical to base (RESTORE-01 touches no `src/`). **Zero item-attributable errors.**
+  - `npm run typecheck` → **exit 0**
+- KNOWN divergence noted (not failed for): rust reconnect attach multiplicity on `multi-client.spec.ts` "reconnecting second viewer…" (3 reconnect-shaped `terminal.attach` vs bound ≤2; probe-proofed watcher-independent per item evidence; candidate owner: reconcile lane). Also handed off: sidebar-registry-sync-rust case-c pre-existing red at base.
+- **Merge: `d375ae565`** `df1(B005): RESTORE-01 recover-my-panes offer inert for e2e harness (auto-decline watcher)` (ort, 12 files, +1264/−268)
+
+---
