@@ -29,14 +29,17 @@
 
 ## Evidence Base (already gathered — do not re-derive; cite in code comments)
 
-Forensics across real `~/.amplifier/projects/*/sessions/*/events.jsonl` files (62 root sessions / 736 turns segmented; 400 root files + 300 sub-agent files scanned; 6 sessions traced line-by-line around every `provider:error`):
+Forensics across real `~/.amplifier/projects/*/sessions/*/events.jsonl` files (62 root sessions / 736 turns segmented; 400 root files + 300 sub-agent files scanned; 6 sessions traced line-by-line around every `provider:error`), hardened 2026-08-10 by a load-bearing validation pass: a full-corpus census (16,326 files / 55 GB streamed; 2,658 root sessions / 4,718 root turns; 13,616 sub-agent sessions / 14,264 turns) plus a read of the running CLI's actual source (installed uv tool `2026.08.05-5462f1e`, core 1.6.0; loop-streaming orchestrator module byte-identical to upstream commit `e5438b4c9`):
 
-1. **Healthy turns:** `orchestrator:complete` (status `success`) is written on every healthy turn and **always precedes** `prompt:complete` — 724/724 turns containing both, zero exceptions. Canonical tail: `execution:end → orchestrator:complete → cleanup:render_* → prompt:complete`.
-2. **Provider-error turns:** `orchestrator:complete` (status `error`) is written **reliably** — 27/27 error turns, always the very next line after `provider:error`. `prompt:complete` is written in only 1/27 (and that one belongs to a recovered continuation). The verified stuck session (`021b7193-205c-457e-bfd2-4b2426a2c7aa`: 6 submits, 5 completes, 6 orchestrator:completes) ends at `orchestrator:complete` with nothing after.
-3. **`provider:error` is NOT needed as a boundary:** `orchestrator:complete` always follows it (27/27). Keep the change minimal — `provider:error` stays a no-op.
-4. **Sub-agent sessions write their OWN `events.jsonl`** in separate session dirs; every record there carries a non-null `data.parent_id`, and sub-agent files never contain `prompt:complete` (0/300) — they end at `orchestrator:complete` → `session:end`. **Root session files never contain a non-null `data.parent_id` on any record** (400/400 files clean), and zero sub-agent `orchestrator:complete` records leak into root files (323 child sessions cross-correlated). Freshell attaches one tailer per root session file, so sub-agent completions cannot reach the root reducer today. The `parent_id` guard in this plan is cheap defense-in-depth for the spec's stated concern (if Amplifier ever inlines child events, they must not end the root turn).
-5. **Known accepted tradeoff:** in ~0.3% of observed turns (2/736 + 1 traced instance) a stray mid-turn `orchestrator:complete` (status `error`, `parent_id` null) fires while the turn later recovers. With this fix that yields one early completion (pane goes idle early, single chime, later `prompt:complete` swallowed at idle) instead of an eternally stuck-busy pane. No record-level field reliably distinguishes the stray; transitions keep keying on event TYPE only (existing E3 principle — no `status` gate). This tradeoff must be documented in the reducer comments.
+1. **Healthy turns:** `orchestrator:complete` (status `success`) is written on every healthy turn and **always precedes** `prompt:complete` — 724/724 turns containing both, zero exceptions. Canonical tail: `execution:end → orchestrator:complete → cleanup:render_* → prompt:complete`. Census reconfirmation: ordering holds across all 4,411 healthy OC→PC pairs; the gap is median 4.5 ms / p95 365 ms / p99 449 ms (>1 s in only 4 pairs, all OC→`cleanup:render` stalls where the earlier boundary shows idle *sooner* — i.e. more correctly), so moving every turn's boundary earlier is user-invisible.
+2. **Provider-error turns:** `orchestrator:complete` (status `error`) is written **reliably** — 27/27 error turns, always the very next line after `provider:error`. `prompt:complete` is written in only 1/27 (and that one belongs to a recovered continuation). The verified stuck session (`021b7193-205c-457e-bfd2-4b2426a2c7aa`: 6 submits, 5 completes, 6 orchestrator:completes) ends at `orchestrator:complete` with nothing after. Census: **3.3% of ALL root turns end at `orchestrator:complete` with no `prompt:complete` ever** — the PC-only boundary's stuck-busy exposure is far larger than the 27 traced provider-error turns.
+3. **`provider:error` is NOT needed as a boundary:** `orchestrator:complete` always follows it (27/27). Keep the change minimal — `provider:error` stays a no-op. Source-verified (item 7): `provider:error` is emitted only in `except → emit → raise` blocks whose surrounding handler always emits `orchestrator:complete`, and it is **non-terminal in two paths** (max-iterations swallow, goal-evaluator) — ending turns on it would be wrong, not just unnecessary.
+4. **Sub-agent sessions write their OWN `events.jsonl`** in separate session dirs; every record there carries a non-null `data.parent_id`, and sub-agent files never contain `prompt:complete` (0/300; census: 0/14,264 sub-agent turns) — they end at `orchestrator:complete` → `session:end`. **Root session files never contain a non-null `data.parent_id` on any record** (400/400 files clean), and zero sub-agent `orchestrator:complete` records leak into root files (323 child sessions cross-correlated). Freshell attaches one tailer per root session file, so sub-agent completions cannot reach the root reducer today. Source-verified: `parent_id` is **session-scoped** — the kernel stamps `{session_id, parent_id}` defaults into every record at session construction and the log writer routes each record to `sessions/{session_id}/events.jsonl` by that stamp; root `delegate:*` records use a different key (`parent_session_id`), so their null `data.parent_id` does not contradict this. The `parent_id` guard in this plan is cheap defense-in-depth for the spec's stated concern (if Amplifier ever inlines child events, they must not end the root turn).
+5. **Known accepted tradeoff (census-refined):** real stray mid-turn `orchestrator:complete` records (`parent_id` null; turn later recovers via a second OC then PC — a double-OC race with an in-flight llm:response/delegate completion) occur in **3/4,718 root turns (0.064%)**; the other 44/47 mid-turn OC flags are benign cancel teardowns (`OC(cancelled)` → `cancel:completed` → PC within ≤0.64 s). With this fix a stray yields one early completion (pane idle 4–254 s early in the observed cases, single chime, later `prompt:complete` swallowed at idle) instead of an eternally stuck-busy pane. No record-level field reliably distinguishes the stray — a full data-payload diff shows stray and terminal OC records identical in key sets and values, and even `status` fails (observed strays: success×2, error×1; a status gate would still admit the worst 254 s stray while forfeiting OC(success)-ending turns inside the 3.3% OC-no-PC population). Transitions keep keying on event TYPE only (existing E3 principle — no `status` gate). This tradeoff must be documented in the reducer comments.
 6. **The tailer prefilter is a hard blocker:** both tailers admit only `session:` / `prompt:` / `execution:` / `orchestrator:steering` event-name prefixes before `JSON.parse`. `orchestrator:complete` lines are dropped unparsed today; a reducer-only fix is inert in production.
+7. **Source-structural confirmation (2026-08-10 load-bearing validation):** `orchestrator:complete` is emitted from an always-path in the loop-streaming orchestrator's `_execute_one_turn` — it catches all `Exception`s and (literal comment: "Always emit orchestrator complete event") emits OC with status `error`/`cancelled`/`success`/`incomplete` before re-raising — while `prompt:complete` is written only by the app-cli after a successful `session.execute()`. OC-before-PC ordering is therefore **structural**, and PC is unreachable on error paths: the observed contract is not incidental to the corpus build.
+8. **Scope + drift mitigation:** the kernel does NOT enforce OC emission, and the `loop-agent` orchestrator variant never emits it — the boundary set is ADDITIVE, so sessions on such orchestrators simply keep today's behavior (`prompt:complete`/`session:end` still end turns; no regression). The foundation bundle sources loop-streaming `@main`, so the orchestrator can drift without the CLI version changing: the spec text (Task 6) records the verified pins — CLI `2026.08.05-5462f1e`, core 1.6.0, schema `amplifier.log` 1.0.0, loop-streaming module commit `e5438b4c9` — so contract drift is diagnosable, never silent.
+9. **Known residual stuck-busy paths (pre-existing, out of scope, unchanged by this fix):** a hard cancel (immediate `CancelledError`, a `BaseException`) emits NEITHER OC nor PC, and goal-mode error turns can leak the deferred OC (never flushed). No record-keyed boundary can see these; the 120 s deadman force-read and PTY-exit handling remain the failsafes. Documented (Task 6) so nobody reads this fix as eliminating stuck-busy entirely.
 
 Exactly-once needs **no new machinery**: the reducer's `phase !== busy` guard already swallows any second turn-end record of any type, the tracker re-guards on phase, and the ledger's `completionSeq` is monotonic per terminal.
 
@@ -216,18 +219,24 @@ In `server/coding-cli/amplifier-events-reducer.ts`, insert a new case between th
       // unambiguous turn-end record written by the CLI itself.
       //
       // Exactly-once: on healthy turns `orchestrator:complete` precedes
-      // `prompt:complete` (724/724 observed), so this record ends the turn
-      // and the later `prompt:complete` lands at idle and is swallowed by
-      // the phase guard below. Known accepted tradeoff: ~0.3% of observed
-      // turns carry a stray mid-turn `orchestrator:complete(status=error)`
+      // `prompt:complete` (724/724 observed; structural in the CLI source —
+      // the orchestrator always emits it before the app-cli can write
+      // `prompt:complete`), so this record ends the turn and the later
+      // `prompt:complete` lands at idle and is swallowed by the phase guard
+      // below. Known accepted tradeoff: ~0.06% of observed turns (3/4,718,
+      // full-corpus census) carry a stray mid-turn `orchestrator:complete`
       // that the turn recovers from — that now yields one early completion
-      // instead of an eternally stuck-busy pane. Transitions still key on
-      // event TYPE only (E3): no `status` gate.
+      // instead of an eternally stuck-busy pane. No payload field (not even
+      // `status`: observed strays were success×2 / error×1) distinguishes
+      // the stray, so transitions still key on event TYPE only (E3): no
+      // `status` gate.
       //
       // Sub-agent guard: delegated sub-agent sessions write their OWN
       // events.jsonl and root-file records always carry `data.parent_id`
       // null, so a non-null parent_id here can only be a sub-agent record —
-      // it must never end the root session's turn.
+      // it must never end the root session's turn (source-verified:
+      // parent_id is session-scoped, stamped on every child-session record;
+      // this guard is cheap defense-in-depth).
       if (typeof record.data?.parent_id === 'string' && record.data.parent_id.length > 0) {
         return { state: next, effects: [] }
       }
@@ -636,12 +645,14 @@ In `crates/freshell-activity/src/amplifier/reducer.rs`, insert a new arm between
             // fabricated completion (the deadman policy stands).
             //
             // Exactly-once: on healthy turns this record precedes
-            // `prompt:complete` (724/724 observed); the later
-            // `prompt:complete` lands at idle and the phase guard swallows
-            // it. Known accepted tradeoff: rare (~0.3%) stray mid-turn
-            // `orchestrator:complete(status=error)` records now end the turn
-            // early — one early completion beats an eternally stuck pane.
-            // Transitions still key on event TYPE only (E3): no status gate.
+            // `prompt:complete` (724/724 observed; structural in the CLI
+            // source); the later `prompt:complete` lands at idle and the
+            // phase guard swallows it. Known accepted tradeoff: rare
+            // (~0.06%, 3/4,718 census turns) stray mid-turn
+            // `orchestrator:complete` records (status success or error — no
+            // status gate can block them) now end the turn early — one
+            // early completion beats an eternally stuck pane. Transitions
+            // still key on event TYPE only (E3): no status gate.
             //
             // Sub-agent guard: sub-agent sessions write their own
             // events.jsonl and root-file records always carry
@@ -1105,7 +1116,7 @@ bash scripts/e2e-cloud.sh run --local --project=rust-chromium \
   --grep="amplifier events lane" test/e2e-browser/specs/terminal-activity-rust.spec.ts
 ```
 
-Expected: 2 passed (the pre-existing healthy-turn test and the new provider-error test). This builds the Rust server from the worktree; it does NOT touch the live port-3001 server. If the run fails for environmental reasons (e.g. missing Playwright browsers), run `npx playwright install chromium` once and retry; do not weaken the test.
+Expected: 2 passed (the pre-existing healthy-turn test and the new provider-error test). This builds the Rust server from the worktree; it does NOT touch the live port-3001 server. If the run fails for environmental reasons (e.g. missing Playwright browsers), run `npx playwright install chromium` once and retry; do not weaken the test. (Feasibility verified 2026-08-10: `run --local` passes `--project`/`--grep`/spec verbatim to Playwright with no interactive prompts; chromium-1208 matching Playwright 1.58.2 is already installed; `--list` discovery finds the existing amplifier test under `rust-chromium` — the install step should be unnecessary. First run also builds the client/server bundles and `cargo build --release -p freshell-server`; that is expected.)
 
 - [ ] **Step 4: Commit**
 
@@ -1186,16 +1197,16 @@ with:
 Site D — `noteOutput` comment (lines 260–261). Replace:
 
 ```ts
-      // Output only refreshes liveness (feeds the deadman). It never ends a
-      // turn — `prompt:complete` is the only turn boundary.
+    // Output only refreshes liveness (feeds the deadman). It never ends a
+    // turn — `prompt:complete` is the only turn boundary.
 ```
 
 with:
 
 ```ts
-      // Output only refreshes liveness (feeds the deadman). It never ends a
-      // turn — only turn-end records (`prompt:complete` / `session:end` /
-      // root `orchestrator:complete`) do.
+    // Output only refreshes liveness (feeds the deadman). It never ends a
+    // turn — only turn-end records (`prompt:complete` / `session:end` /
+    // root `orchestrator:complete`) do.
 ```
 
 - [ ] **Step 2: Update the living spec `docs/plans/ACTIVITY_TRACKING_SPEC.md`**
@@ -1233,7 +1244,16 @@ terminal:
   provider-error turns the CLI ends at `orchestrator:complete` and never
   writes `prompt:complete` (2026-08-10 stuck-busy fix,
   docs/plans/2026-08-10-amplifier-stuck-busy.md); on healthy turns
-  `orchestrator:complete` precedes `prompt:complete`. PTY Enter is
+  `orchestrator:complete` precedes `prompt:complete`. These
+  `orchestrator:complete` semantics are structural to the `loop-streaming`
+  orchestrator (verified 2026-08-10 at CLI `2026.08.05-5462f1e` / core 1.6.0
+  / schema `amplifier.log` 1.0.0 / loop-streaming module `e5438b4c9`, which
+  the foundation bundle sources `@main` — re-verify on drift); orchestrators
+  that never emit `orchestrator:complete` (e.g. `loop-agent`) simply fall
+  back to the other boundaries. Known residual gaps (pre-existing): a hard
+  cancel or a goal-mode error turn can end with NO boundary record at all —
+  the deadman force-read and PTY-exit handling remain the failsafes. PTY
+  Enter is
 ```
 
 (the rest of the bullet — provisional busy, grace, deadman never fabricates, PTY exit — stays verbatim).
