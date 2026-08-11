@@ -50,3 +50,21 @@ Items merged in order: JAN-88, RESTORE-01, SESSION-13, CFG-01. Each entry: fresh
 - **Merge: `b990df909`** `df1(B005): SESSION-13 legacy-parity PATCH write path for sidebar first-chat exclusions` (ort, 7 files, +1342/−2)
 
 ---
+
+## CFG-01 — lossless config.json writes (sentinel coverage + net09 + PW probe)
+
+- Branch: `df1/cfg-01-lossless-writes` · attested head `c2d909684894f312af601b591ae9ce5b7ba65e03`
+- Freshness: rev-parse = attested ✓. Merge-base with integration = declared base `5521f3aba` ✓. 9 own commits; diff = `settings_store.rs` (test-module only per evidence), `tests/net09_config_preservation.rs`, `docs/plans`, `playwright.config.ts`, `cfg01-lossless-writes.spec.ts`, `tsconfig.cfg01-check.json` — in scope ✓, worktree clean at attested head.
+- Rebase onto `87eeeebf6` (post-SESSION-13 tip): **no conflicts** (SESSION-13 and CFG-01's `settings_store.rs` test-module additions are disjoint regions). New head `90421798552b092ca792fbde3325a3f07470a63d`. `git range-diff 5521f3aba..c2d909684 87eeeebf6..904217985` → all 9 commits patch-identical (`=`); attested→new-head file list identical to base-delta list ✓.
+- Verification (item worktree, `nice -n 19`; TMPDIR=`$HOME/.freshell/df1/tmp/c01-b005` because of the documented stray empty `/tmp/.git` poison; release binary rebuilt at rebased head for the PW leg; leases cargo→pw as `df1-b005`, both released):
+  - `cargo build --release -p freshell-server` → exit 0 (57s)
+  - `cargo test -p freshell-server --bin freshell-server settings_store::` → **first run: 70 passed / 1 failed (exit 101)** — one-off; failure identity not captured on the first run. Classification evidence: rerun green, then 12 further consecutive runs of the identical suite all green (**13 green / 1 one-off**), matching the campaign's documented one-off-under-load flake class (NET-FLAKY-01 pattern; run overlapped with heavy `nice`d builds). Not deterministic → proceeded per the flake-rerun rule. Final suite result: **`71 passed; 0 failed`**.
+  - `cargo test -p freshell-server --bin freshell-server` (full sentinel gate) → **`654 passed; 0 failed; 1 ignored`, exit 0**
+  - `cargo test -p freshell-server --test net09_config_preservation` → **`1 passed; 0 failed`**
+  - `cargo fmt --check` → exit 0 · `cargo clippy -p freshell-server --all-targets -- -D warnings` → exit 0
+  - `npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json` → exit 2; **zero errors in CFG-01 files** — all 7 lines are the pre-existing scoped-config dependency noise (`import.meta.env`/`__PERF_LOGGING__` in `src/lib/client-logger.ts`, `src/lib/perf-logger.ts`, `src/store/settingsSlice.ts`; files untouched by the item). Notably the old `helpers/fixtures.ts` tuple noise is GONE — RESTORE-01's fix landed upstream, confirming merge composition.
+  - `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium cfg01-lossless-writes` (pw lease, `FRESHELL_E2E_RUST_SERVER_BIN` = freshly built binary) → **`2 passed (29.7s)`, exit 0**
+  - `npm run typecheck` → exit 0
+- **Merge: `cd375b5f6`** `df1(B005): CFG-01 lossless config.json writes — sentinel coverage + net09 + PW probe` (ort, 7 files, +1199/−4)
+
+---
