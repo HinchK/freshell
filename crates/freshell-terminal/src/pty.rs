@@ -481,17 +481,19 @@ fn spawn_reader(
     // (harness/capture mode), append to the in-memory capture instead. Never
     // both: `captured` is unread in production and accumulating there was an
     // unbounded write-only leak for the terminal's whole life.
-    let capture_enabled = sink.is_none();
     let mut emit = move |messages: Vec<ServerMessage>| {
         if messages.is_empty() {
             return;
         }
         if let Some(sink) = sink.as_mut() {
-            for message in &messages {
-                sink(message.clone());
+            // Production: the sink takes `ServerMessage` by value, so hand
+            // the frames over by value — cloning here was a redundant deep
+            // copy of every output frame's `data` String in the hot path.
+            for message in messages {
+                sink(message);
             }
-        }
-        if capture_enabled {
+        } else {
+            // Harness/capture mode (no sink): the capture owns the frames.
             captured
                 .lock()
                 .expect("captured mutex")
@@ -667,6 +669,7 @@ mod tests {
     /// `TerminalRegistry::create`), NOTHING may accumulate in `captured`:
     /// before the gate it grew unboundedly for the terminal's whole life
     /// (a multi-GB write-only leak on long-lived terminals).
+    #[cfg(unix)]
     #[test]
     fn spawn_with_sink_does_not_accumulate_captured_messages() {
         let spec = SpawnSpec {
@@ -720,12 +723,121 @@ mod tests {
                 .any(|m| matches!(m, ServerMessage::TerminalOutput(_))),
             "sink must receive the child's terminal.output frames"
         );
+        // By-value forwarding must preserve production order: the reader
+        // thread is the single producer, so frames must arrive at the sink
+        // with non-decreasing seq ranges.
+        let mut last_seq_end = i64::MIN;
+        for message in streamed.iter() {
+            if let ServerMessage::TerminalOutput(frame) = message {
+                assert!(
+                    frame.seq_start >= last_seq_end,
+                    "sink frames arrived out of seq order: seq_start {} after seq_end {}",
+                    frame.seq_start,
+                    last_seq_end
+                );
+                assert!(
+                    frame.seq_end >= frame.seq_start,
+                    "frame seq range inverted: {}..{}",
+                    frame.seq_start,
+                    frame.seq_end
+                );
+                last_seq_end = frame.seq_end;
+            }
+        }
         let captured = terminal.captured_messages();
         assert!(
             captured.is_empty(),
             "with a live sink wired, the in-memory capture must stay empty \
              (unbounded write-only leak otherwise), got {} captured messages",
             captured.len()
+        );
+    }
+
+    /// By-value forwarding must preserve production order across MANY
+    /// frames. The echo test above emits a single frame (its 18-byte
+    /// output arrives in one 8192-byte read), which makes ordering
+    /// assertions vacuous there — so this test forces ~41 KB of output,
+    /// which cannot fit in one fill of the reader's hardcoded 8192-byte
+    /// buffer, guaranteeing multiple frames regardless of the
+    /// env-tunable fragment budget.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_sink_delivers_multi_frame_output_in_seq_order() {
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                // 512 lines x 79 chars (+ \r\n via the pty) ~= 41 KB.
+                "i=0; while [ \"$i\" -lt 512 ]; do echo 0123456789012345678901234567890123456789012345678901234567890123456789012345678; i=$((i+1)); done"
+                    .into(),
+            ],
+            env_overrides: BTreeMap::new(),
+            cwd: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        env.insert(
+            "HOME".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        );
+
+        let sink_messages: Arc<Mutex<Vec<ServerMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_clone = Arc::clone(&sink_messages);
+        let sink: MessageSink = Box::new(move |message| {
+            sink_clone.lock().expect("sink mutex").push(message);
+        });
+
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let on_exit: ExitHook = Box::new(move |code| {
+            let _ = exit_tx.send(code);
+        });
+
+        // Bound to `_terminal` (NOT `let _ = ...`, which drops immediately
+        // and would kill the child mid-stream): keep the terminal alive
+        // until the assertions complete.
+        let _terminal = PtyTerminal::spawn_with_sink(
+            &spec,
+            &env,
+            "t-seq-order",
+            "s-seq-order",
+            None,
+            Some(sink),
+            Some(on_exit),
+        )
+        .expect("spawn succeeds");
+
+        // The exit hook fires on the reader thread only after every
+        // produced byte has been framed and emitted.
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("child exits");
+
+        let streamed = sink_messages.lock().expect("sink mutex");
+        let mut frames = 0usize;
+        let mut last_seq_end = i64::MIN;
+        for message in streamed.iter() {
+            if let ServerMessage::TerminalOutput(frame) = message {
+                frames += 1;
+                assert!(
+                    frame.seq_end >= frame.seq_start,
+                    "frame seq range inverted: {}..{}",
+                    frame.seq_start,
+                    frame.seq_end
+                );
+                assert!(
+                    frame.seq_start >= last_seq_end,
+                    "sink frames arrived out of seq order: seq_start {} after seq_end {}",
+                    frame.seq_start,
+                    last_seq_end
+                );
+                last_seq_end = frame.seq_end;
+            }
+        }
+        assert!(
+            frames >= 2,
+            "expected multi-frame output to exercise cross-frame ordering, got {frames} frame(s)"
         );
     }
 
