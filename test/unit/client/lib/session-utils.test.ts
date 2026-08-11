@@ -3,6 +3,7 @@ import {
   collectSessionLocatorsFromTabs,
   collectSessionRefsFromNode,
   collectSessionRefsFromTabs,
+  extractSessionLocators,
   findPaneForSession,
   findTabIdForSession,
   getActiveSessionRefForTab,
@@ -384,5 +385,13 @@ describe('findPaneForSession', () => {
       tabId: 'tab-1',
       paneId: undefined,
     })
+  })
+})
+
+describe('extractSessionLocators', () => {
+  it('is exported for cross-device registry identity stamping', () => {
+    expect(extractSessionLocators(terminalContent('claude', { resumeSessionId: VALID_SESSION_ID }))).toEqual([
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+    ])
   })
 })

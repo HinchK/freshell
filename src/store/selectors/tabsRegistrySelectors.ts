@@ -6,6 +6,66 @@ import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
 
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
+const EMPTY_REGISTRY_RECORDS: RegistryTabRecord[] = []
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function nonEmptyStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+}
+
+function legacySessionRefKeys(value: unknown): string[] {
+  if (!isRecord(value)) return []
+  const { provider, sessionId } = value
+  if (typeof provider !== 'string' || provider.length === 0) return []
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return []
+  return [`${provider}:${sessionId}`]
+}
+
+/** Defensive per-pane payload key extraction (unknown shapes read as empty). */
+function panePayloadKeys(payload: Record<string, unknown>): { openKeys: string[]; busyKeys: string[] } {
+  const sessionKeys = nonEmptyStrings(payload.sessionKeys)
+  return {
+    // `sessionKeys` is authoritative when present — the producing client
+    // already resolved every identity; the legacy `sessionRef` fallback only
+    // serves snapshots from older clients (open-only, never busy).
+    openKeys: sessionKeys.length > 0 ? sessionKeys : legacySessionRefKeys(payload.sessionRef),
+    busyKeys: nonEmptyStrings(payload.busySessionKeys),
+  }
+}
+
+/**
+ * Fold pane payloads into per-session remote activity. 'busy' wins over
+ * 'open' across panes and records.
+ */
+export function deriveRemoteSessionActivity(
+  records: RegistryTabRecord[] | undefined,
+): Record<string, 'busy' | 'open'> {
+  const activity: Record<string, 'busy' | 'open'> = {}
+  if (!records) return activity
+
+  for (const record of records) {
+    const panes = (record as { panes?: unknown }).panes
+    if (!Array.isArray(panes)) continue
+    for (const pane of panes) {
+      const payload = isRecord(pane) ? (pane as { payload?: unknown }).payload : undefined
+      if (!isRecord(payload)) continue
+
+      const { openKeys, busyKeys } = panePayloadKeys(payload)
+      for (const key of openKeys) {
+        if (!activity[key]) activity[key] = 'open'
+      }
+      for (const key of busyKeys) {
+        activity[key] = 'busy'
+      }
+    }
+  }
+
+  return activity
+}
 
 function sortUpdatedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   return b.updatedAt - a.updatedAt
@@ -36,8 +96,8 @@ const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
 const selectExtensionEntries = (state: RootState) => state.extensions?.entries
-const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceOpen
-const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
+const selectSameDeviceOpen = (state: RootState) => state.tabRegistry?.sameDeviceOpen ?? EMPTY_REGISTRY_RECORDS
+const selectRemoteOpen = (state: RootState) => state.tabRegistry?.remoteOpen ?? EMPTY_REGISTRY_RECORDS
 const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
 const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1, Math.floor(
@@ -92,4 +152,23 @@ export const selectTabsRegistryGroups = createSelector(
     remoteOpen: [...(remoteOpen || [])].sort(sortUpdatedDesc),
     closed,
   }),
+)
+
+/**
+ * Per-session activity across genuinely remote devices only: fed from
+ * `remoteOpen`, which the server partitions by device (see
+ * server/tabs-registry/store.ts), so the same device never produces rings.
+ */
+export const selectRemoteSessionActivity = createSelector(
+  [selectRemoteOpen],
+  (remoteOpen): Record<string, 'busy' | 'open'> => deriveRemoteSessionActivity(remoteOpen),
+)
+
+/**
+ * R3 suppression set: sessions open in other windows of THIS device.
+ * Suppresses rings; never produces them — color is ignored.
+ */
+export const selectSameDeviceSessionKeys = createSelector(
+  [selectSameDeviceOpen],
+  (sameDeviceOpen): Set<string> => new Set(Object.keys(deriveRemoteSessionActivity(sameDeviceOpen))),
 )

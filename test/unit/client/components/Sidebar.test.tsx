@@ -18,9 +18,14 @@ import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
+import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode, Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -106,6 +111,9 @@ function createTestStore(options?: {
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
   opencodeActivity?: Partial<OpencodeActivityState>
+  remoteOpen?: RegistryTabRecord[]
+  sameDeviceOpen?: RegistryTabRecord[]
+  freshAgentSessions?: Record<string, FreshAgentSessionState>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -150,6 +158,8 @@ function createTestStore(options?: {
       codexActivity: codexActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       terminalDirectory: terminalDirectoryReducer,
+      tabRegistry: tabRegistryReducer,
+      freshAgent: freshAgentReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -227,6 +237,15 @@ function createTestStore(options?: {
           },
         },
         searches: {},
+      },
+      tabRegistry: {
+        ...tabRegistryReducer(undefined, { type: '@@test/init' }),
+        remoteOpen: options?.remoteOpen ?? [],
+        sameDeviceOpen: options?.sameDeviceOpen ?? [],
+      } satisfies TabRegistryState,
+      freshAgent: {
+        ...freshAgentReducer(undefined, { type: '@@test/init' }),
+        sessions: options?.freshAgentSessions ?? {},
       },
     },
   })
@@ -4771,6 +4790,417 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await waitFor(() => {
         expect(screen.getByText('Older Session')).toBeInTheDocument()
       })
+    })
+  })
+
+  describe('remote status rings', () => {
+    function makeRegistryPaneRecord(
+      deviceId: string,
+      payload: Record<string, unknown>,
+    ): RegistryTabRecord {
+      return {
+        tabKey: `${deviceId}:tab-remote`,
+        tabId: 'tab-remote',
+        serverInstanceId: 'srv-remote',
+        deviceId,
+        deviceLabel: deviceId,
+        tabName: 'remote',
+        status: 'open',
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [
+          { paneId: 'pane-remote-1', kind: 'terminal', payload },
+        ],
+      }
+    }
+
+    function freshAgentSessionFixture(input: {
+      sessionId: string
+      status?: FreshAgentSessionState['status']
+      streamingActive?: boolean
+    }): FreshAgentSessionState {
+      const sessionType = 'freshclaude'
+      const provider = 'claude'
+      return {
+        sessionType,
+        provider,
+        sessionId: input.sessionId,
+        sessionKey: makeFreshAgentSessionKey({ sessionType, provider, sessionId: input.sessionId }),
+        threadId: input.sessionId,
+        status: input.status ?? 'running',
+        turns: [],
+        historyItems: [],
+        historyBodies: {},
+        streamingText: '',
+        streamingActive: input.streamingActive ?? true,
+        pendingPermissions: {},
+        pendingQuestions: {},
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+      }
+    }
+
+    it('rings a remote busy session that is not open locally', async () => {
+      const remoteSessionId = sessionId('remote-busy-session')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: remoteSessionId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Remote Busy Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${remoteSessionId}`],
+          busySessionKeys: [`claude:${remoteSessionId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Remote Busy Session/ })
+      expect(button).toHaveAttribute('data-remote-status', 'busy')
+      expect(button).toHaveAttribute('data-has-tab', 'false')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toHaveClass('border-blue-500')
+      expect(button.querySelector('svg')).toHaveClass('text-muted-foreground')
+      expect(button.querySelector('.sr-only')).toHaveTextContent('(busy on another device)')
+    })
+
+    it('rings a remote open session that is not open locally', async () => {
+      const remoteSessionId = sessionId('remote-open-session')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: remoteSessionId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Remote Open Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${remoteSessionId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Remote Open Session/ })
+      expect(button).toHaveAttribute('data-remote-status', 'open')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toHaveClass('border-success')
+      expect(button.querySelector('.sr-only')).toHaveTextContent('(open on another device)')
+    })
+
+    it('suppresses the ring when the session is open in a local tab via sessionRef', async () => {
+      const localSessionId = sessionId('local-open-session')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: localSessionId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Locally Open Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        tabs: [{
+          id: 'tab-local-open',
+          sessionRef: { provider: 'claude', sessionId: localSessionId },
+          mode: 'claude',
+          status: 'running',
+        }],
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${localSessionId}`],
+          busySessionKeys: [`claude:${localSessionId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Locally Open Session/ })
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button).toHaveAttribute('data-has-tab', 'true')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+      expect(button.querySelector('svg')).toHaveClass('text-success')
+    })
+
+    it('suppresses the ring for a fresh-agent restore gap when the live identity is busy locally', async () => {
+      const canonicalId = sessionId('restore-gap-canonical-busy')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: canonicalId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Restore Gap Busy Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        tabs: [{ id: 'tab-fresh-gap', mode: 'shell', status: 'running' }],
+        panes: {
+          layouts: {
+            'tab-fresh-gap': {
+              type: 'leaf',
+              id: 'pane-fresh-gap',
+              content: {
+                kind: 'fresh-agent',
+                sessionType: 'freshclaude',
+                provider: 'claude',
+                createRequestId: 'req-fresh-gap',
+                sessionId: 'sdk-restore-gap-busy',
+                resumeSessionId: 'stale-resume-id',
+                status: 'running',
+              },
+            },
+          },
+          activePane: { 'tab-fresh-gap': 'pane-fresh-gap' },
+          paneTitles: {},
+        },
+        freshAgentSessions: {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sdk-restore-gap-busy',
+          })]: freshAgentSessionFixture({ sessionId: canonicalId, status: 'running' }),
+        },
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${canonicalId}`],
+          busySessionKeys: [`claude:${canonicalId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Restore Gap Busy Session/ })
+      // hasTab misses the live restore-gap identity by design; the ring is
+      // suppressed anyway and the icon shows the local busy color.
+      expect(button).toHaveAttribute('data-has-tab', 'false')
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+      expect(button.querySelector('svg')).toHaveClass('text-blue-500')
+    })
+
+    it('suppresses the ring for a fresh-agent restore gap when the remote device merely has it open', async () => {
+      const canonicalId = sessionId('restore-gap-canonical-idle')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: canonicalId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Restore Gap Idle Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        tabs: [{ id: 'tab-fresh-idle', mode: 'shell', status: 'running' }],
+        panes: {
+          layouts: {
+            'tab-fresh-idle': {
+              type: 'leaf',
+              id: 'pane-fresh-idle',
+              content: {
+                kind: 'fresh-agent',
+                sessionType: 'freshclaude',
+                provider: 'claude',
+                createRequestId: 'req-fresh-idle',
+                sessionId: 'sdk-restore-gap-idle',
+                resumeSessionId: 'stale-resume-id',
+                status: 'running',
+              },
+            },
+          },
+          activePane: { 'tab-fresh-idle': 'pane-fresh-idle' },
+          paneTitles: {},
+        },
+        freshAgentSessions: {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sdk-restore-gap-idle',
+          })]: freshAgentSessionFixture({
+            sessionId: canonicalId,
+            status: 'idle',
+            streamingActive: false,
+          }),
+        },
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${canonicalId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Restore Gap Idle Session/ })
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+      expect(button.querySelector('svg')).toHaveClass('text-muted-foreground')
+    })
+
+    it('suppresses the ring when the session is open in another window of the same device', async () => {
+      const sharedSessionId = sessionId('same-device-session')
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            sessionId: sharedSessionId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Same Device Session',
+            cwd: '/home/user/project',
+          }],
+        }],
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`claude:${sharedSessionId}`],
+          busySessionKeys: [`claude:${sharedSessionId}`],
+        })],
+        sameDeviceOpen: [makeRegistryPaneRecord('device-this', {
+          sessionKeys: [`claude:${sharedSessionId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Same Device Session/ })
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+    })
+
+    it('suppresses the ring when a local opencode pane is busy on the same resume identity', async () => {
+      const resumeId = 'oc-resume-identity'
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/home/user/project',
+          sessions: [{
+            provider: 'opencode',
+            sessionId: resumeId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Local Opencode Busy',
+            cwd: '/home/user/project',
+          }],
+        }],
+        tabs: [{
+          id: 'tab-oc-busy',
+          terminalId: 'term-oc-busy',
+          mode: 'opencode',
+          resumeSessionId: resumeId,
+          status: 'running',
+        }],
+        opencodeActivity: {
+          byTerminalId: {
+            'term-oc-busy': {
+              terminalId: 'term-oc-busy',
+              sessionId: resumeId,
+              phase: 'busy',
+              updatedAt: 10,
+            },
+          },
+        },
+        remoteOpen: [makeRegistryPaneRecord('device-remote', {
+          sessionKeys: [`opencode:${resumeId}`],
+          busySessionKeys: [`opencode:${resumeId}`],
+        })],
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Local Opencode Busy/ })
+      // extractSessionLocators ignores opencode resumeSessionId, so only the
+      // collectBusySessionKeys leg of the union covers this identity.
+      expect(button.querySelector('svg')).toHaveClass('text-blue-500')
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+    })
+
+    it('renders without the tabRegistry reducer and shows no rings', async () => {
+      const bareStore = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          panes: panesReducer,
+          sessions: sessionsReducer,
+          terminalDirectory: terminalDirectoryReducer,
+        },
+        middleware: (getDefault) =>
+          getDefault({
+            serializableCheck: {
+              ignoredPaths: ['sessions.expandedProjects'],
+            },
+          }),
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          tabs: { tabs: [], activeTabId: null },
+          panes: { layouts: {}, activePane: {}, paneTitles: {} },
+          sessions: {
+            projects: [{
+              projectPath: '/home/user/project',
+              sessions: [{
+                provider: 'claude',
+                sessionId: sessionId('partial-store-session'),
+                projectPath: '/home/user/project',
+                lastActivityAt: Date.now(),
+                title: 'Partial Store Session',
+                cwd: '/home/user/project',
+              }],
+            }],
+            expandedProjects: new Set<string>(),
+            isLoading: false,
+            error: null,
+            windows: {},
+          },
+        },
+      })
+
+      render(
+        <Provider store={bareStore}>
+          <Sidebar view="terminal" onNavigate={() => undefined} />
+        </Provider>,
+      )
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Partial Store Session/ })
+      expect(button).toBeInTheDocument()
+      expect(button).not.toHaveAttribute('data-remote-status')
+      expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
     })
   })
 })
