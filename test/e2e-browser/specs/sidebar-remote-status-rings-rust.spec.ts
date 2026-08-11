@@ -307,9 +307,16 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
     // Same hook-timeout + prebuild pattern as
     // sidebar-registry-sync-rust.spec.ts:168-172: the first release build of
     // freshell-server can take minutes, and the default 60s hook timeout would
-    // kill server.start() mid-build.
+    // kill server.start() mid-build. Unlike the donor (which is RUST_ONLY_SPECS
+    // and never enters the cloud matrix), this spec runs under the plain
+    // chromium project, so it ALSO runs in cloud images that ship a prebuilt
+    // server binary but no Cargo toolchain: skip the prebuild when the
+    // override is configured; RustServer.start() resolves it fail-closed via
+    // resolveRustServerBin (rust-server.ts:455).
     test.setTimeout(600_000)
-    ensureRustServerBuilt()
+    if (!process.env.FRESHELL_E2E_RUST_SERVER_BIN?.trim()) {
+      ensureRustServerBuilt()
+    }
     sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'remote-status-rings-'))
     const binDir = path.join(sharedRoot, 'bin')
     const fakeClaude = await installFakeCli(binDir, 'claude', 'fake-claude-cli.mjs')
