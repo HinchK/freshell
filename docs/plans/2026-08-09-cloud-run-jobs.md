@@ -311,33 +311,33 @@ git commit -m "feat: add e2e-cloud wrapper script, make cloud the default with -
 - No new files. Uses `scripts/e2e-cloud.sh`, `docker/cloud-run/Dockerfile`, `test/e2e-browser/playwright.cloud.config.ts`.
 - Test: manual validation with recorded evidence in `<logs-dir>/reports/cloud-validation.md`
 
-**Test cases:**
+**Test cases:** *(cloud selection must be explicit — see the Shipped-deviation note; `FRESHELL_E2E_BACKEND=cloud` is used below so the commands behave identically regardless of the caller's env)*
 - `scripts/e2e-cloud.sh build` — image builds and pushes successfully
-- `scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line` — 6 passed on Cloud Run
-- `scripts/e2e-cloud.sh run --project=chromium --reporter=line` — full chromium suite passes with similar counts to local baseline
-- `scripts/e2e-cloud.sh run --shards=2 --project=chromium --reporter=line` — sharded run completes, combined results cover all tests
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line` — 6 passed on Cloud Run
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium --reporter=line` — full chromium suite passes with similar counts to local baseline
+- `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --shards=2 --project=chromium --reporter=line` — sharded run completes, combined results cover all tests
 
 - [ ] **Step 1: Build and push the image**
 
 Run: `scripts/e2e-cloud.sh build`
 
-Expected: Docker image builds locally and pushes to `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:latest`.
+Expected: Docker image builds locally and pushes BOTH refs: the commit-addressed `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:<head-sha>` tag (what `run` resolves; a dirty tree tags `<head-sha>-dirty` and always rebuilds) and the rolling `:latest` pointer.
 
 - [ ] **Step 2: Create the Cloud Run Job**
 
-Run: `scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
 
 Expected: Cloud Run Job is created (if first run) and executed. 6 auth tests pass. Exit code 0.
 
 - [ ] **Step 3: Run the full chromium suite**
 
-Run: `scripts/e2e-cloud.sh run --project=chromium --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --project=chromium --reporter=line`
 
 Expected: Full chromium suite runs. Pass/fail counts are consistent with local baseline (within retry variance). Exit code 0 or 1 (1 if pre-existing failures match local baseline).
 
 - [ ] **Step 4: Test sharding**
 
-Run: `scripts/e2e-cloud.sh run --shards=2 --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
+Run: `FRESHELL_E2E_BACKEND=cloud scripts/e2e-cloud.sh run --shards=2 --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line`
 
 Expected: Two Cloud Run tasks execute. Combined, all auth tests are covered. Both tasks exit 0.
 
