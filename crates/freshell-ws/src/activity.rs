@@ -3143,6 +3143,84 @@ mod tests {
         );
     }
 
+    /// Provider-error turn (2026-08-10 stuck-busy fix): the CLI writes
+    /// provider:error then orchestrator:complete and NEVER prompt:complete.
+    /// The lane must still complete the turn — this is the only Rust test
+    /// that exercises tailer prefilter + reducer + tracker together for the
+    /// error path (a reducer-only fix is invisible here).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn amplifier_events_lane_completes_error_turn_on_orchestrator_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &events_path,
+            [
+                amplifier_line("session:start"),
+                amplifier_line("prompt:submit"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 2_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("provisional busy upsert");
+        assert_eq!(busy["upsert"][0]["terminalId"], "t1");
+
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+        next_frame_matching(&mut rx, "amplifier.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "sess-1"
+        })
+        .await
+        .expect("bind upsert");
+
+        // The turn dies on a provider error: append exactly what the real
+        // CLI writes (provider:error is prefilter noise; orchestrator:complete
+        // must end the turn).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        f.write_all(
+            [
+                amplifier_line("provider:error"),
+                amplifier_line("orchestrator:complete"),
+            ]
+            .concat()
+            .as_bytes(),
+        )
+        .unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("turn.complete driven by orchestrator:complete");
+        assert_eq!(complete["provider"], "amplifier");
+        assert_eq!(complete["sessionId"], "sess-1");
+        assert_eq!(complete["completionSeq"], 1);
+    }
+
     /// Steady-state zero-wake proof: idle tracked terminals arm NO timers and
     /// read NO files. (The 20-agents-idle scenario in miniature.)
     #[tokio::test(flavor = "multi_thread")]
