@@ -27,82 +27,11 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::sidecar_store::{
-    proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore, SidecarRecordState,
-    SIDECAR_RECORD_VERSION,
+use crate::sidecar_store::CodexSidecarRecord;
+use crate::sidecar_test_support::{
+    record_for_child, spawn_own_fake_app_server, spawn_own_sleep_child, store_in,
+    NEVER_SIGNALLED_GRACE, SESSION,
 };
-
-/// Kills and reaps ONLY the guarded child on drop (defer-style guard) — the
-/// test's own `sleep 300`, nothing else on the machine. `kill` on an
-/// already-reaped `Child` is a no-op error inside std (no signal is sent to
-/// a possibly-recycled pid), so double-cleanup is safe.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_own_sleep_child() -> ChildGuard {
-    let guard = ChildGuard(
-        std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawn this test's own sleep child"),
-    );
-    // Wait for exec to complete: immediately after spawn the child may still
-    // be post-fork/pre-exec, so /proc/<pid>/cmdline briefly reads as the TEST
-    // BINARY's argv. Evidence captured in that window verifies as a cmdline
-    // Mismatch at boot/claim time (observed flake). Poll until the child's
-    // cmdline is really `sleep 300`.
-    let pid = guard.0.id() as i32;
-    let want = vec!["sleep".to_string(), "300".to_string()];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while proc_cmdline(pid).as_ref() != Some(&want) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "sleep child failed to exec within 5s"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    guard
-}
-
-/// A loopback `ws://` URL on an ephemeral port NOTHING listens on (bound,
-/// read, dropped) — probe dials fail fast with connection-refused. Never
-/// port 3001.
-fn unused_loopback_ws_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    format!("ws://127.0.0.1:{port}")
-}
-
-/// A record carrying a spawned child's REAL `/proc` evidence.
-fn record_for_child(ownership_id: &str, pid: u32, session_id: Option<&str>) -> CodexSidecarRecord {
-    CodexSidecarRecord {
-        record_version: SIDECAR_RECORD_VERSION,
-        ownership_id: ownership_id.to_string(),
-        pid,
-        starttime: proc_starttime(pid as i32).expect("live child has a starttime"),
-        cmdline: proc_cmdline(pid as i32).expect("live child has a cmdline"),
-        ws_url: unused_loopback_ws_url(),
-        session_id: session_id.map(str::to_string),
-        terminal_id: None,
-        server_instance_id: "srv-prev".to_string(),
-        created_at: 1_700_000_000_000,
-        updated_at: 1_700_000_000_001,
-        state: SidecarRecordState::Active,
-    }
-}
-
-fn store_in(dir: &tempfile::TempDir) -> Arc<CodexSidecarStore> {
-    Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()))
-}
-
-const SESSION: &str = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
 
 #[test]
 fn boot_reconcile_prunes_dead_and_mismatched_records() {
@@ -344,51 +273,6 @@ async fn duplicate_session_records_claim_one_keep_the_loser_held() {
 
 use crate::launch_lifecycle::CodexLaunchRuntime;
 
-fn fake_app_server_fixture() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
-}
-
-/// Spawn THIS TEST'S OWN fake app-server on a loopback ephemeral port and
-/// wait for its WS listener to accept. `kill_on_drop(true)` guarantees
-/// cleanup kills ONLY this recorded child, even on panic.
-async fn spawn_own_fake_app_server(ownership_id: &str) -> (tokio::process::Child, String) {
-    // Allocate a free loopback ephemeral port for the fixture to listen on.
-    let ws_url = unused_loopback_ws_url();
-    let mut child = tokio::process::Command::new("node")
-        .arg(fake_app_server_fixture())
-        .arg("--listen")
-        .arg(&ws_url)
-        .env(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn this test's own fake app-server");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(Ok((probe, _response))) = tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        {
-            drop(probe);
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("fake app-server exited before listening: {status}");
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "fake app-server WS never came up"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    (child, ws_url)
-}
-
 /// Count live processes whose `/proc/<pid>/environ` carries OUR unique
 /// ownership tag — a read-only `/proc` scan keyed on this test's own id,
 /// used to prove a reattach spawned NO new sidecar process.
@@ -416,11 +300,6 @@ fn count_own_tagged_processes(ownership_id: &str) -> usize {
         })
         .count()
 }
-
-/// Grace window before a "never signalled" assertion: long enough for the
-/// fixture's graceful SIGTERM exit to become observable if a signal HAD
-/// (wrongly) been sent.
-const NEVER_SIGNALLED_GRACE: Duration = Duration::from_millis(300);
 
 #[tokio::test]
 async fn reattach_ensure_ready_returns_the_existing_listener() {

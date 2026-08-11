@@ -23,11 +23,10 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::app_server::BoxFuture;
 use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
 use crate::protocol::{build_request_frame, parse_incoming_frame, IncomingMessage, RequestId};
-#[cfg(target_os = "linux")]
-use crate::sidecar_store::{proc_cmdline, proc_starttime};
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict,
 };
+use crate::sidecar_sweep::kill_verified_sidecar_tree;
 
 /// Per-candidate budget for the duplicate-arm writer probe (connect + one
 /// `thread/loaded/list` round trip). Bounded so a wedged survivor cannot
@@ -40,16 +39,6 @@ const WRITER_PROBE_BUDGET: Duration = Duration::from_millis(1000);
 /// must fail FAST into the structural fresh-spawn fallback, never sit out
 /// the 45s spawn budget.
 const REATTACH_PROBE_BUDGET: Duration = Duration::from_secs(3);
-
-/// Poll-gone drain budget per signalled pid: 5s, not 500ms — codex's SIGTERM
-/// handler is a graceful drain (reports/V2.md), so give it time to exit
-/// before escalating to SIGKILL.
-#[cfg(target_os = "linux")]
-const KILL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
-
-/// Poll interval while waiting for a signalled pid to go away.
-#[cfg(target_os = "linux")]
-const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Boot-log summary returned by [`SidecarReconciler::boot_reconcile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,16 +58,18 @@ pub struct BootReconcileReport {
 /// The boot reconciler: holds every surviving record until a restore claims
 /// it (by session id) or the sweep (Task 9) disposes of it.
 pub struct SidecarReconciler {
-    store: Arc<CodexSidecarStore>,
+    /// pub(crate): shared with the [`crate::sidecar_sweep`] sibling (the
+    /// pre-authorized 1,000-line split) — one logical brick, two files.
+    pub(crate) store: Arc<CodexSidecarStore>,
     /// ALL held records, keyed by ownership_id — NOT by session id. Two live
     /// records can legitimately share a session id (a mid-turn survivor
     /// retained at sweep + a later fresh spawn enriched with the same session;
     /// validated reachable — reports/V3.md), and Verified-without-session /
     /// Unverifiable records must also be held for the sweep. Keying by
     /// session_id would silently drop records (a fifth-fate ynfn violation).
-    held: Mutex<HashMap<String /*ownership_id*/, CodexSidecarRecord>>,
+    pub(crate) held: Mutex<HashMap<String /*ownership_id*/, CodexSidecarRecord>>,
     /// Secondary index for restore-time claims.
-    by_session: Mutex<HashMap<String /*session_id*/, Vec<String /*ownership_id*/>>>,
+    pub(crate) by_session: Mutex<HashMap<String /*session_id*/, Vec<String /*ownership_id*/>>>,
 }
 
 /// Outcome of the sync (lock-holding) phase of a claim. The `Claimed` record
@@ -362,7 +353,7 @@ impl SidecarReconciler {
 
 /// Remove a pruned row from the store; a removal failure is logged loudly
 /// (the row will be re-pruned next boot) and never fails the reconcile.
-fn remove_pruned(store: &CodexSidecarStore, ownership_id: &str) {
+pub(crate) fn remove_pruned(store: &CodexSidecarStore, ownership_id: &str) {
     if let Err(error) = store.remove(ownership_id) {
         tracing::error!(
             target: "freshell_codex::sidecar_reconcile",
@@ -652,7 +643,7 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
 /// never propagated (the pane-ledger write-failure policy,
 /// `launch_lifecycle.rs:1211-1219` precedent) — the in-memory record stays
 /// authoritative for teardown.
-fn write_record_loudly(store: &CodexSidecarStore, record: &CodexSidecarRecord) {
+pub(crate) fn write_record_loudly(store: &CodexSidecarStore, record: &CodexSidecarRecord) {
     if let Err(error) = store.write(record) {
         tracing::error!(
             target: "freshell_codex::sidecar_reconcile",
@@ -668,296 +659,11 @@ fn write_record_loudly(store: &CodexSidecarStore, record: &CodexSidecarRecord) {
 /// duplicate of the private `launch_lifecycle::unix_millis`
 /// (`launch_lifecycle.rs:988-993`) — a one-liner not worth a shared-helper
 /// dependency; keep the two bodies in sync.
-fn unix_millis() -> i64 {
+pub(crate) fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-// ---------------------------------------------------------------------------
-// The shared tree-aware kill helper (Task 6; reused by Task 9's sweep).
-// A3 was FALSIFIED (reports/V2.md): sidecars are process TREES (children
-// like `codex-code-mode-host` live in their OWN pgids/sessions, so neither
-// single-pid signalling nor a pgid group-kill covers them), codex's SIGTERM
-// handler is a graceful drain, and SIGKILL provably orphans its children
-// (no PDEATHSIG; cleanup is userspace-only). "Reaped" must mean the whole
-// tree is gone.
-// ---------------------------------------------------------------------------
-
-/// What happened to one pid during [`kill_verified_sidecar_tree`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KillOutcome {
-    /// Gone (exited, reaped, or zombie) within the drain budget after SIGTERM.
-    ExitedAfterSigterm,
-    /// Survived the SIGTERM drain budget; SIGKILL was sent once.
-    SigkilledAfterBudget,
-    /// Already gone before any signal was needed.
-    AlreadyDead,
-    /// Live pid whose evidence no longer matches its snapshot (pid reuse) —
-    /// NEVER signalled.
-    SkippedIdentityMismatch,
-    /// Evidence unreadable / non-Linux — NEVER signalled.
-    SkippedUnverifiable,
-}
-
-/// Per-pid outcomes of one [`kill_verified_sidecar_tree`] call: the root
-/// first, then each captured descendant in capture order.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct KillTreeOutcome {
-    pub outcomes: Vec<(u32, KillOutcome)>,
-}
-
-/// Re-verify (pid, starttime, cmdline); capture the pid's live descendant
-/// set from `/proc` (children recursively via `/proc/<pid>/task/*/children`,
-/// each snapshotted with its own (pid, starttime, cmdline) so nothing is
-/// ever signalled on a stale pid); SIGTERM the root; poll-gone with a
-/// drain-tolerant budget (`KILL_DRAIN_BUDGET` = 5s, not 500ms — codex
-/// drains gracefully); SIGKILL the root once if needed; then SIGTERM →
-/// poll → SIGKILL each captured descendant that survived, re-verified by its
-/// snapshot immediately before each signal. Returns what happened per pid.
-/// Never signals anything whose snapshot no longer matches.
-///
-/// ASYNC (binding): every call site is async on the tokio runtime —
-/// [`ReattachedCodexAppServerRuntime`]'s `ensure_ready` (inside the
-/// user-facing restore path, holding one of the manager's two plan permits),
-/// `shutdown`, and Task 9's `sweep_unclaimed` — and the poll-gone budgets
-/// wait for multi-second intervals. All waits are `tokio::time::sleep`
-/// awaits, never `std::thread::sleep`: a sync fn here would block executor
-/// workers for the whole SIGTERM→poll→SIGKILL sequence (the same
-/// sync/async impedance class the claim path already fixed). Callers must
-/// not hold any `held`/store lock across this await.
-pub async fn kill_verified_sidecar_tree(record: &CodexSidecarRecord) -> KillTreeOutcome {
-    let verdict = verify_sidecar_identity(record);
-    match verdict {
-        IdentityVerdict::Dead => KillTreeOutcome {
-            outcomes: vec![(record.pid, KillOutcome::AlreadyDead)],
-        },
-        IdentityVerdict::Mismatch | IdentityVerdict::Unverifiable => {
-            tracing::warn!(
-                target: "freshell_codex::sidecar_reconcile",
-                ownership_id = %record.ownership_id,
-                pid = record.pid,
-                verdict = ?verdict,
-                "sidecar_tree_kill_skipped: identity not provably ours; NEVER signalled"
-            );
-            let outcome = if verdict == IdentityVerdict::Mismatch {
-                KillOutcome::SkippedIdentityMismatch
-            } else {
-                KillOutcome::SkippedUnverifiable
-            };
-            KillTreeOutcome {
-                outcomes: vec![(record.pid, outcome)],
-            }
-        }
-        IdentityVerdict::Verified => {
-            #[cfg(target_os = "linux")]
-            {
-                kill_verified_tree_linux(record).await
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // Structurally unreachable: non-Linux identity is always
-                // Unverifiable (never Verified). Kept as the conservative
-                // never-signal posture should that ever change.
-                KillTreeOutcome {
-                    outcomes: vec![(record.pid, KillOutcome::SkippedUnverifiable)],
-                }
-            }
-        }
-    }
-}
-
-/// One captured descendant's OWN identity evidence, snapshotted at capture
-/// time — the only thing a descendant is ever verified (and signalled)
-/// against.
-#[cfg(target_os = "linux")]
-struct PidSnapshot {
-    pid: i32,
-    starttime: u64,
-    cmdline: Vec<String>,
-}
-
-/// Does `/proc/<pid>` still hold the process this snapshot captured?
-#[cfg(target_os = "linux")]
-enum SnapshotVerdict {
-    Matches,
-    Gone,
-    /// Live pid, different incarnation or unreadable cmdline — NEVER signal.
-    Mismatch,
-}
-
-#[cfg(target_os = "linux")]
-fn verify_snapshot(snapshot: &PidSnapshot) -> SnapshotVerdict {
-    let Some(starttime) = proc_starttime(snapshot.pid) else {
-        return SnapshotVerdict::Gone;
-    };
-    if starttime != snapshot.starttime {
-        return SnapshotVerdict::Mismatch;
-    }
-    match proc_cmdline(snapshot.pid) {
-        Some(cmdline) if cmdline == snapshot.cmdline => SnapshotVerdict::Matches,
-        // Unreadable or changed — not provably the captured process.
-        _ => SnapshotVerdict::Mismatch,
-    }
-}
-
-/// The Verified arm of [`kill_verified_sidecar_tree`]: capture, then the
-/// root and per-descendant SIGTERM→poll→SIGKILL sequences, each signal
-/// preceded by its own fresh verification.
-#[cfg(target_os = "linux")]
-async fn kill_verified_tree_linux(record: &CodexSidecarRecord) -> KillTreeOutcome {
-    let root_pid = record.pid as i32;
-    // Capture the descendants BEFORE the root is signalled: codex's SIGTERM
-    // drain tears down (some of) its children in userspace and a SIGKILLed
-    // root orphans them — either way the parent links that let /proc find
-    // them are gone once the root dies (reports/V2.md).
-    let descendants = capture_descendants(root_pid);
-    let mut outcomes = Vec::with_capacity(1 + descendants.len());
-
-    // The caller's verify dispatched here, but re-verify immediately before
-    // the signal — nothing is ever signalled on a stale pid.
-    let root_outcome = match verify_sidecar_identity(record) {
-        IdentityVerdict::Verified => {
-            signal_pid(root_pid, libc::SIGTERM);
-            if poll_incarnation_gone(root_pid, record.starttime, KILL_DRAIN_BUDGET).await {
-                KillOutcome::ExitedAfterSigterm
-            } else {
-                // Re-verify immediately before the escalation too.
-                match verify_sidecar_identity(record) {
-                    IdentityVerdict::Verified => {
-                        signal_pid(root_pid, libc::SIGKILL);
-                        KillOutcome::SigkilledAfterBudget
-                    }
-                    IdentityVerdict::Dead => KillOutcome::ExitedAfterSigterm,
-                    IdentityVerdict::Mismatch | IdentityVerdict::Unverifiable => {
-                        KillOutcome::SkippedIdentityMismatch
-                    }
-                }
-            }
-        }
-        IdentityVerdict::Dead => KillOutcome::AlreadyDead,
-        IdentityVerdict::Mismatch => KillOutcome::SkippedIdentityMismatch,
-        IdentityVerdict::Unverifiable => KillOutcome::SkippedUnverifiable,
-    };
-    outcomes.push((record.pid, root_outcome));
-
-    for snapshot in &descendants {
-        let outcome = kill_captured_descendant(snapshot).await;
-        outcomes.push((snapshot.pid as u32, outcome));
-    }
-
-    let result = KillTreeOutcome { outcomes };
-    tracing::info!(
-        target: "freshell_codex::sidecar_reconcile",
-        ownership_id = %record.ownership_id,
-        outcomes = ?result.outcomes,
-        "sidecar_tree_killed: verified sidecar tree torn down"
-    );
-    result
-}
-
-/// SIGTERM → poll-gone → SIGKILL one captured descendant, re-verified by
-/// its OWN snapshot immediately before EACH signal.
-#[cfg(target_os = "linux")]
-async fn kill_captured_descendant(snapshot: &PidSnapshot) -> KillOutcome {
-    match verify_snapshot(snapshot) {
-        SnapshotVerdict::Gone => return KillOutcome::AlreadyDead,
-        SnapshotVerdict::Mismatch => return KillOutcome::SkippedIdentityMismatch,
-        SnapshotVerdict::Matches => {}
-    }
-    signal_pid(snapshot.pid, libc::SIGTERM);
-    if poll_incarnation_gone(snapshot.pid, snapshot.starttime, KILL_DRAIN_BUDGET).await {
-        return KillOutcome::ExitedAfterSigterm;
-    }
-    match verify_snapshot(snapshot) {
-        SnapshotVerdict::Gone => KillOutcome::ExitedAfterSigterm,
-        SnapshotVerdict::Mismatch => KillOutcome::SkippedIdentityMismatch,
-        SnapshotVerdict::Matches => {
-            signal_pid(snapshot.pid, libc::SIGKILL);
-            KillOutcome::SigkilledAfterBudget
-        }
-    }
-}
-
-/// Walk `/proc/<pid>/task/*/children` recursively (a visited set guards
-/// against reparenting races) and snapshot each live descendant's own
-/// evidence. Descendants that are gone — or whose evidence is unreadable —
-/// at capture time are NOT captured: no snapshot ⇒ never signalled.
-#[cfg(target_os = "linux")]
-fn capture_descendants(root_pid: i32) -> Vec<PidSnapshot> {
-    let mut snapshots = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(root_pid);
-    let mut frontier = vec![root_pid];
-    while let Some(pid) = frontier.pop() {
-        for child in proc_children(pid) {
-            if !visited.insert(child) {
-                continue;
-            }
-            frontier.push(child);
-            let Some(starttime) = proc_starttime(child) else {
-                continue; // gone/zombie — nothing to signal
-            };
-            let Some(cmdline) = proc_cmdline(child) else {
-                continue; // unreadable — never signalled
-            };
-            snapshots.push(PidSnapshot {
-                pid: child,
-                starttime,
-                cmdline,
-            });
-        }
-    }
-    snapshots
-}
-
-/// One pid's direct children, from every thread's
-/// `/proc/<pid>/task/<tid>/children` row (space-separated child pids).
-#[cfg(target_os = "linux")]
-fn proc_children(pid: i32) -> Vec<i32> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
-    };
-    for task in tasks.flatten() {
-        let tid = task.file_name();
-        let Some(tid) = tid.to_str() else { continue };
-        let Ok(row) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children")) else {
-            continue;
-        };
-        children.extend(row.split_whitespace().filter_map(|p| p.parse::<i32>().ok()));
-    }
-    children
-}
-
-/// Send one signal to one just-verified pid.
-#[cfg(target_os = "linux")]
-fn signal_pid(pid: i32, signal: libc::c_int) {
-    // SAFETY: kill(2) only dispatches a signal — no memory is touched. The
-    // caller verified the pid's identity evidence immediately before this
-    // call (transport.rs:110 precedent).
-    unsafe {
-        libc::kill(pid, signal);
-    }
-}
-
-/// Poll until `(pid, starttime)` no longer names a live incarnation
-/// (exited, reaped, zombie, or pid reused) or the budget expires. All waits
-/// are `tokio::time::sleep` — never `std::thread::sleep` (the
-/// [`kill_verified_sidecar_tree`] ASYNC contract).
-#[cfg(target_os = "linux")]
-async fn poll_incarnation_gone(pid: i32, starttime: u64, budget: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if proc_starttime(pid) != Some(starttime) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(KILL_POLL_INTERVAL).await;
-    }
 }
 
 // ---------------------------------------------------------------------------
