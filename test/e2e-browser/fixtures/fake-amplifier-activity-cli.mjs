@@ -70,6 +70,11 @@ function record(event, extra = {}) {
 
 const TURN_MS = Number(process.env.FAKE_AMPLIFIER_TURN_MS || 1200)
 
+// Error-turn mode (stuck-busy regression): end the turn the way the real CLI
+// does on a provider error — provider:error then orchestrator:complete, and
+// NEVER prompt:complete.
+const ERROR_TURN = process.env.FAKE_AMPLIFIER_ERROR_TURN === '1'
+
 let eventsPath = null
 let sessionId = null
 let sessionDir = null
@@ -144,9 +149,22 @@ process.stdin.on('data', () => {
   fs.appendFileSync(eventsPath, record('prompt:submit', { session_id: sessionId }))
   process.stdout.write('amplifier: thinking...\r\n')
   setTimeout(() => {
-    fs.appendFileSync(eventsPath, record('prompt:complete', { session_id: sessionId }))
-    stampTurnCount()
-    process.stdout.write('amplifier: turn complete\r\n')
+    if (ERROR_TURN) {
+      fs.appendFileSync(
+        eventsPath,
+        record('provider:error', { session_id: sessionId, data: { parent_id: null } })
+        + record('orchestrator:complete', {
+          session_id: sessionId,
+          status: 'error',
+          data: { parent_id: null },
+        }),
+      )
+      process.stdout.write('amplifier: provider error\r\n')
+    } else {
+      fs.appendFileSync(eventsPath, record('prompt:complete', { session_id: sessionId }))
+      stampTurnCount()
+      process.stdout.write('amplifier: turn complete\r\n')
+    }
   }, TURN_MS)
 })
 process.stdin.resume()

@@ -582,6 +582,10 @@ async fn run_loop(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+    // Multi-client layout store: this connection's mirrored layout snapshot is
+    // gone with it (its pane/tab ids are client-local and unreachable now);
+    // the primary falls back to the most recently synced remaining client.
+    state.layout.remove_client(&conn_id.to_string());
     // Abandon any restore creates still queued on the spawn gate for this
     // connection (RCA hardening: never spawn a PTY for a client that is
     // gone). Redundant with the sender drop at return; explicit for clarity.
@@ -1028,12 +1032,15 @@ async fn handle_client_text(
             true
         }
         // `ui.layout.sync` (AUTO-01 spine, Task 13): the client's layout mirror
-        // REPLACES the shared server-side `LayoutStore` snapshot -- the port of
-        // the dedicated arm's `this.layoutStore.updateFromUi(m, ws.connectionId
-        // || 'unknown')` (`server/ws-handler.ts:1966-1969`). No reply frame
-        // (Node sends none). The Node arm's second half (the
-        // sidebar-open-session-keys recompute, `ws:1970-1979`) is a separate
-        // session-directory concern, out of this task's scope.
+        // REPLACES THIS CONNECTION'S server-side `LayoutStore` snapshot -- the
+        // port of the dedicated arm's `this.layoutStore.updateFromUi(m,
+        // ws.connectionId || 'unknown')` (`server/ws-handler.ts:2024-2027`),
+        // except the store is multi-client keyed by connection id (intentional
+        // divergence: Node keeps ONE last-writer-wins snapshot, which made
+        // other clients' pane ids unresolvable). No reply frame (Node sends
+        // none). The Node arm's second half (the sidebar-open-session-keys
+        // recompute, `ws:2028-2037`) is a separate session-directory concern,
+        // out of this task's scope.
         ClientMessage::UiLayoutSync(sync) => {
             state.layout.update_from_ui(&sync, &conn_id.to_string());
             true

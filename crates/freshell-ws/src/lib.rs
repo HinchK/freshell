@@ -188,16 +188,19 @@ pub struct WsState {
     /// `client-retire` beacon — shares one cross-device tab view. This is what makes
     /// a closed device's tab disappear from other clients' Tabs UI.
     pub tabs: crate::tabs::TabsRegistry,
-    /// The shared server-side layout snapshot (AUTO-01 spine, Task 13):
-    /// `ui.layout.sync` client frames REPLACE it
-    /// (`terminal::handle_client_text`'s `ClientMessage::UiLayoutSync` arm
-    /// -> `LayoutStore::update_from_ui` -- the port of
+    /// The shared server-side layout store (AUTO-01 spine, Task 13):
+    /// `ui.layout.sync` client frames REPLACE the sending CONNECTION'S
+    /// snapshot (`terminal::handle_client_text`'s `ClientMessage::UiLayoutSync`
+    /// arm -> `LayoutStore::update_from_ui` -- the port of
     /// `this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')`,
-    /// `server/ws-handler.ts:1966-1969`). No reply frame (Node sends none).
-    /// `freshell-server`'s `main.rs` constructs ONE store and clones it into
-    /// BOTH this state and `freshell_freshagent::FreshAgentState` (via
-    /// `with_layout`), so the REST automation surface (Tasks 14-16) reads
-    /// the SAME snapshot the socket path ingests.
+    /// `server/ws-handler.ts:2024-2027`; intentional divergence: the store is
+    /// multi-client keyed by connection id, where Node keeps ONE
+    /// last-writer-wins snapshot). A connection's snapshot is evicted on
+    /// close. No reply frame (Node sends none). `freshell-server`'s `main.rs`
+    /// constructs ONE store and clones it into BOTH this state and
+    /// `freshell_freshagent::FreshAgentState` (via `with_layout`), so the
+    /// REST automation surface (Tasks 14-16) reads the SAME snapshots the
+    /// socket path ingests.
     pub layout: freshell_freshagent::layout_store::LayoutStore,
     /// The shared terminal-identity registry (Fix Spec: Session Naming Cluster --
     /// the port-side closure of `TerminalMetadataService`'s provider/sessionId

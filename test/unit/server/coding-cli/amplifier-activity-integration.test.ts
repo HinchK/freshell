@@ -223,6 +223,46 @@ describe('amplifier activity integration', () => {
     expect(completions[0]).toMatchObject({ terminalId: 't1', at: 5000, completionSeq: 1 })
   })
 
+  it('provider-error turn: orchestrator:complete alone ends the turn exactly once (no prompt:complete ever arrives)', async () => {
+    const { tracker, completions, fsStore, watchers, integration } = setup()
+    fsStore.write(
+      EVENTS_PATH,
+      line('session:start', 1000)
+      + line('session:config', 1010, ', "raw": {"working_dir": "/work"}'),
+    )
+    await integration.attachTailer('t1', 'session-1', EVENTS_PATH, 'start')
+    await flush()
+
+    // A live turn begins...
+    fsStore.append(EVENTS_PATH, line('prompt:submit', 2000))
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('busy')
+
+    // ...and dies on a provider error. The real CLI writes provider:error
+    // then orchestrator:complete and NOTHING after (verified against real
+    // session logs; the provider:error line is prefilter noise and never
+    // reaches the reducer — orchestrator:complete must end the turn).
+    fsStore.append(
+      EVENTS_PATH,
+      line('provider:error', 5000)
+      + line('orchestrator:complete', 5001),
+    )
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(completions).toHaveLength(1)
+    expect(completions[0]).toMatchObject({ terminalId: 't1', at: 5001, completionSeq: 1 })
+
+    // A late prompt:complete for the same turn (healthy-turn ordering) is a
+    // no-op: still exactly one completion.
+    fsStore.append(EVENTS_PATH, line('prompt:complete', 5002))
+    watchers[0].fire('change', EVENTS_PATH)
+    await flush()
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(completions).toHaveLength(1)
+  })
+
   it('skips catch-up entirely and attaches at EOF when the backlog exceeds the cap', async () => {
     const { registry, tracker, completions, fsStore, watchers } = setup()
     // Real events files reach hundreds of MB; replaying them at attach would

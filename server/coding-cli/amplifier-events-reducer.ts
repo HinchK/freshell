@@ -9,9 +9,11 @@
  *
  * Contract facts this encodes (plan §2):
  * - `prompt:submit` is the ONLY input that (re)enters busy (E2/E5).
- * - `prompt:complete` is the single turn boundary (E2/E3).
- * - `session:end` while busy ends the turn (E7); while idle it is ignored,
- *   which also makes orphan/duplicate `session:end` records legal (E7/E3).
+ * - Turn-end boundary SET (2026-08-10 amendment): `prompt:complete` (E2/E3),
+ *   `session:end` while busy (E7), and `orchestrator:complete` with a null
+ *   `data.parent_id` (provider-error turns never write `prompt:complete`).
+ *   The FIRST boundary record ends the turn; later ones land at idle and are
+ *   ignored, which also makes orphan/duplicate turn-end records legal (E7/E3).
  * - `session:resume` never implies a phase change (E7).
  * - Transitions key on event TYPE only; timestamps are carried through for
  *   `at` fields but never used to order or gate transitions (E3).
@@ -140,18 +142,50 @@ export function reduceAmplifierEvent(
         effects: [{ kind: 'turn.began', at: record.ts }],
       }
     }
-    case 'prompt:complete': {
-      // The single turn boundary (E2/E3). At idle it is just another
-      // non-prompt:submit record: ignored.
+    case 'prompt:complete':
+    case 'session:end': {
+      // Turn-end boundaries (E2/E3; session:end = turn ended by quit/hangup,
+      // E7). At idle they are just more non-prompt:submit records: ignored
+      // (orphan/duplicate session:end is legal — E7 continue-attach, E3
+      // out-of-order tail).
       if (next.phase !== 'busy') return { state: next, effects: [] }
       return {
         state: { ...next, phase: 'idle' },
         effects: [{ kind: 'turn.completed', at: record.ts }],
       }
     }
-    case 'session:end': {
-      // Turn ended by quit/hangup (E7). Orphan/duplicate session:end at idle
-      // is legal and ignored (E7 continue-attach, E3 out-of-order tail).
+    case 'orchestrator:complete': {
+      // Turn-end boundary (2026-08-10 stuck-busy fix,
+      // docs/plans/2026-08-10-amplifier-stuck-busy.md). On provider-error
+      // turns the CLI writes `provider:error` then `orchestrator:complete`
+      // and NEVER writes `prompt:complete` (verified against real session
+      // logs: 27/27 error turns; the stuck session ended exactly there), so
+      // without this case a pane stays busy forever. This is NOT a
+      // fabricated completion (the deadman policy stands): it is a real,
+      // unambiguous turn-end record written by the CLI itself.
+      //
+      // Exactly-once: on healthy turns `orchestrator:complete` precedes
+      // `prompt:complete` (724/724 observed; structural in the CLI source —
+      // the orchestrator always emits it before the app-cli can write
+      // `prompt:complete`), so this record ends the turn and the later
+      // `prompt:complete` lands at idle and is swallowed by the phase guard
+      // below. Known accepted tradeoff: ~0.06% of observed turns (3/4,718,
+      // full-corpus census) carry a stray mid-turn `orchestrator:complete`
+      // that the turn recovers from — that now yields one early completion
+      // instead of an eternally stuck-busy pane. No payload field (not even
+      // `status`: observed strays were success×2 / error×1) distinguishes
+      // the stray, so transitions still key on event TYPE only (E3): no
+      // `status` gate.
+      //
+      // Sub-agent guard: delegated sub-agent sessions write their OWN
+      // events.jsonl and root-file records always carry `data.parent_id`
+      // null, so a non-null parent_id here can only be a sub-agent record —
+      // it must never end the root session's turn (source-verified:
+      // parent_id is session-scoped, stamped on every child-session record;
+      // this guard is cheap defense-in-depth).
+      if (typeof record.data?.parent_id === 'string' && record.data.parent_id.length > 0) {
+        return { state: next, effects: [] }
+      }
       if (next.phase !== 'busy') return { state: next, effects: [] }
       return {
         state: { ...next, phase: 'idle' },
@@ -171,9 +205,9 @@ export function reduceAmplifierEvent(
       return { state: next, effects: [] }
     default:
       // Everything else (session:start, execution:*, provider:*, llm:*,
-      // tool:*, content_block:*, orchestrator:*, cleanup:*, ...) never
-      // changes phase. Post-complete background naming events are covered
-      // here (E2): never a new turn.
+      // tool:*, content_block:*, cleanup:*, and orchestrator:* other than
+      // orchestrator:complete, ...) never changes phase. Post-complete
+      // background naming events are covered here (E2): never a new turn.
       return { state: next, effects: [] }
   }
 }

@@ -34,7 +34,10 @@ pub const READ_BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Lifecycle event-name prefixes the reducer cares about; lines are checked
 /// with plain substring scans (both `"event":"x` and `"event": "x`).
-const EVENT_PREFIXES: [&str; 4] = ["session:", "prompt:", "execution:", "orchestrator:steering"];
+/// `orchestrator:` covers `orchestrator:complete` (a turn-end boundary since
+/// the 2026-08-10 stuck-busy fix — without this the reducer never sees it)
+/// plus `orchestrator:steering_injected` (~2 extra parses per turn).
+const EVENT_PREFIXES: [&str; 4] = ["session:", "prompt:", "execution:", "orchestrator:"];
 
 fn matches_prefilter(line: &str) -> bool {
     EVENT_PREFIXES.iter().any(|prefix| {
@@ -466,6 +469,47 @@ mod tests {
                     vec!["session:start", "prompt:submit"]
                 );
                 assert_eq!(skipped_lines, 1);
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefilter_admits_orchestrator_complete() {
+        // orchestrator:complete is a turn-end boundary (2026-08-10 stuck-busy
+        // fix): if the prefilter drops it, the reducer arm is dead code.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            [
+                line("session:start"),
+                line("prompt:submit"),
+                line("orchestrator:complete"),
+                line("prompt:complete"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let mut tailer = AmplifierEventsTailer::new(&path);
+        tailer.attach(AttachAt::Start).unwrap();
+        match tailer.read() {
+            TailerReadOutcome::Ok {
+                records,
+                skipped_lines,
+                ..
+            } => {
+                assert_eq!(
+                    records.iter().map(|r| r.event.as_str()).collect::<Vec<_>>(),
+                    vec![
+                        "session:start",
+                        "prompt:submit",
+                        "orchestrator:complete",
+                        "prompt:complete"
+                    ]
+                );
+                assert_eq!(skipped_lines, 0);
             }
             other => panic!("expected ok, got {other:?}"),
         }
