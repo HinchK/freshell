@@ -155,26 +155,6 @@
 
 ---
 
-## Task 4: Restore the quality gate (clippy + fmt) — REMAINING
-
-**Files:**
-- Modify: `crates/freshell-freshagent/src/layout_store.rs` (doc-comment lint + stale Node line refs)
-- Modify: `crates/freshell-freshagent/src/target_resolver.rs` (needless borrow)
-- Modify: `crates/freshell-freshagent/src/layout_store_tests.rs`, `crates/freshell-ws/tests/ui_layout_sync.rs` (rustfmt rewraps)
-
-**Context:** Load-bearing validation re-ran the gates at HEAD: the behavioral suite is fully green (`freshell-freshagent --lib` 420/420; `ui_layout_sync` 2/2; `cargo test --workspace` 3006 passed / 0 failed), but the repo-standard quality gate is RED — `cargo clippy --workspace --all-targets -- -D warnings` exits 101 (`clippy::doc_lazy_continuation` at `layout_store.rs:414`; `clippy::needless_borrow` at `target_resolver.rs:159`) and `cargo fmt --all --check` exits 1 (3 rewraps: `layout_store_tests.rs:699`, `:765`; `ui_layout_sync.rs:319`). All findings are in files added/touched by this branch. Evidence: `.the-usual-logs/multi-client-layout-store/reports/V3.md` (+ logs).
-
-**Steps:**
-
-- [ ] Fix `clippy::doc_lazy_continuation` at `crates/freshell-freshagent/src/layout_store.rs:414` (indent the doc-comment list continuation).
-- [ ] Fix `clippy::needless_borrow` at `crates/freshell-freshagent/src/target_resolver.rs:159` (`&snapshot` → `snapshot`).
-- [ ] While in `layout_store.rs`, correct the stale Node-parity citation in the `LayoutInner` divergence doc comment: `layout-store.ts:44-46` → `server/agent-api/layout-store.ts:48-50` (`updateFromUi` at `:169-181`); likewise correct any `ws-handler.ts:1966-1969` doc references in `crates/freshell-ws` (if present) to `server/ws-handler.ts:2024-2027`.
-- [ ] Run `cargo fmt --all` (expected effect: the 3 rewraps above plus any fallout from the edits; no semantic changes).
-- [ ] Run to verify GREEN: `cargo clippy --workspace --all-targets -- -D warnings` (exit 0), `cargo fmt --all --check` (exit 0), `cargo test -p freshell-freshagent --lib` (420 passed), `cargo test -p freshell-ws --test ui_layout_sync` (2 passed).
-- [ ] Commit (focused, atomic, e.g. `fix(rust-server): restore clippy/fmt gate for multi-client layout store`). No push, no PR (per repo rules and Global Constraints).
-
----
-
 ## Task 4: Close the remaining by-id read gap + gate hygiene (added by Stage-2 load-bearing validation)
 
 **Files:**
@@ -190,7 +170,7 @@
 - [ ] Write the failing test `normalized_snapshot_with_explicit_tab_id_resolves_from_any_client_snapshot` in `layout_store_tests.rs` (reuse the `client_sync` helper): conn-a syncs tab `tA`/pane `pA`; conn-b (primary, last writer) syncs `tB`/`pB`. Assert `get_normalized_snapshot(Some("tA"))` returns conn-a's tab content, and `get_normalized_snapshot(None)` stays primary-only (answers from `tB`).
 - [ ] Run to verify RED: `cargo test -p freshell-freshagent --lib layout_store` — the explicit-tab assertion fails against the primary-only read.
 - [ ] Implement: make `get_normalized_snapshot(Some(tab_id))` search all snapshots primary-first (same pattern as explicit-tab `list_panes`); the default `None` path stays primary-only. Update the method's doc comment with the multi-client note.
-- [ ] Fix the divergence doc-comment anchor at `layout_store.rs:70`: cite `server/agent-api/layout-store.ts` (single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`) instead of `layout-store.ts:44-46`.
+- [ ] Fix the divergence doc-comment anchor at `layout_store.rs:70`: cite `server/agent-api/layout-store.ts` (single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`) instead of `layout-store.ts:44-46`; likewise correct any `ws-handler.ts:1966-1969` doc references in `crates/freshell-ws` (if present) to `server/ws-handler.ts:2024-2027`.
 - [ ] Fix clippy: doc-lazy-continuation at `layout_store.rs:414`; needless borrow at `target_resolver.rs:159`. Run `cargo fmt` (3 known diffs in the two test files above).
 - [ ] Run to verify GREEN: `cargo test -p freshell-freshagent --lib` all pass; `cargo clippy` clean; `cargo fmt --check` clean.
 - [ ] Commit (focused, atomic; no push, no PR).
