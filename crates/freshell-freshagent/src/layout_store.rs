@@ -67,9 +67,10 @@ struct ClientEntry {
 /// server-created state.
 const SERVER_CLIENT_KEY: &str = "__server__";
 
-/// INTENTIONAL DIVERGENCE from Node (`layout-store.ts:44-46`): Node keeps ONE
-/// shared snapshot, wholesale-replaced by whichever client synced last
-/// (last-writer-wins). But pane/tab ids are client-local (`nanoid()` per
+/// INTENTIONAL DIVERGENCE from Node (`server/agent-api/layout-store.ts` —
+/// single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`):
+/// Node keeps ONE shared snapshot, wholesale-replaced by whichever client
+/// synced last (last-writer-wins). But pane/tab ids are client-local (`nanoid()` per
 /// browser/device), so any client that was not the last writer got
 /// `pane not found` from every by-id agent-API operation. This port keeps one
 /// snapshot PER client connection instead:
@@ -274,9 +275,15 @@ impl LayoutStore {
     /// Exact Node keys: `tabs`/`activeTabId`/`layouts`/`activePane`/`paneTitles`/
     /// `paneTitleSetByUser`/`timestamp`; the empty snapshot when none
     /// (`getNormalizedSnapshot`, `layout-store.ts:44-46, 191-210`).
+    ///
+    /// Multi-client store: the default (no tab id) read answers from the
+    /// PRIMARY snapshot only; an EXPLICIT tab id resolves against the first
+    /// client snapshot that knows it (primary first, then most-recent-first,
+    /// same pattern as explicit-tab [`Self::list_panes`]), falling back to
+    /// the primary (empty tab view) when none does.
     pub fn get_normalized_snapshot(&self, tab_id: Option<&str>) -> Value {
         let inner = self.lock();
-        let Some(snapshot) = inner.primary() else {
+        let Some(primary) = inner.primary() else {
             return json!({
                 "tabs": [],
                 "layouts": {},
@@ -287,8 +294,12 @@ impl LayoutStore {
             });
         };
         let Some(tab_id) = tab_id else {
-            return snapshot_value(snapshot);
+            return snapshot_value(primary);
         };
+        let snapshot = inner
+            .snapshots()
+            .find(|s| s.tabs.iter().any(|tab| tab.id == tab_id))
+            .unwrap_or(primary);
         let tab = snapshot.tabs.iter().find(|t| t.id == tab_id);
         let mut out = Map::new();
         out.insert(
@@ -409,8 +420,8 @@ impl LayoutStore {
         (tab_id, pane_id)
     }
 
-    /// Purges layouts/activePane/title maps (`closeTab`, `layout-store.ts:577-587`
-    /// + `removeTabMetadata`, `:87-91`) in EVERY client snapshot containing
+    /// Purges layouts/activePane/title maps (`closeTab`, `layout-store.ts:577-587`,
+    /// plus `removeTabMetadata`, `:87-91`) in EVERY client snapshot containing
     /// the tab.
     pub fn close_tab(&self, tab_id: &str) -> RenameOutcome {
         let mut inner = self.lock();

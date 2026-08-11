@@ -5,7 +5,7 @@
 //! `ClientMessage::UiLayoutSync` dispatch arm must REPLACE that CONNECTION'S
 //! server-side `LayoutStore` snapshot (`update_from_ui`) -- the port of the
 //! dedicated `case 'ui.layout.sync'` arm's `this.layoutStore.updateFromUi(m,
-//! ws.connectionId || 'unknown')` (`server/ws-handler.ts:1966-1969`).
+//! ws.connectionId || 'unknown')` (`server/ws-handler.ts:2024-2027`).
 //! Intentional divergence: the store keeps one snapshot PER connection
 //! (Node keeps a single last-writer-wins snapshot), so by-id agent-API
 //! operations resolve pane/tab ids from EVERY connected client, and a
@@ -319,7 +319,10 @@ async fn two_client_syncs_coexist_rest_resolves_non_primary_ids_and_disconnect_e
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(evicted, "disconnect must evict the closed client's snapshot");
+    assert!(
+        evicted,
+        "disconnect must evict the closed client's snapshot"
+    );
     assert_eq!(
         layout.rename_pane("p1", "X").message,
         Some("pane not found"),

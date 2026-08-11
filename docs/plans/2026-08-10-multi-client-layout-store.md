@@ -169,13 +169,13 @@
 
 **Steps:**
 
-- [ ] Write the failing test `normalized_snapshot_with_explicit_tab_id_resolves_from_any_client_snapshot` in `layout_store_tests.rs` (reuse the `client_sync` helper): conn-a syncs tab `tA`/pane `pA`; conn-b (primary, last writer) syncs `tB`/`pB`. Assert `get_normalized_snapshot(Some("tA"))` returns conn-a's tab content, and `get_normalized_snapshot(None)` stays primary-only (answers from `tB`).
-- [ ] Run to verify RED: `cargo test -p freshell-freshagent --lib layout_store` — the explicit-tab assertion fails against the primary-only read.
-- [ ] Implement: make `get_normalized_snapshot(Some(tab_id))` search all snapshots primary-first (same pattern as explicit-tab `list_panes`); the default `None` path stays primary-only. Update the method's doc comment with the multi-client note.
-- [ ] Fix the divergence doc-comment anchor at `layout_store.rs:70`: cite `server/agent-api/layout-store.ts` (single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`) instead of `layout-store.ts:44-46`; likewise correct any `ws-handler.ts:1966-1969` doc references in `crates/freshell-ws` (if present) to `server/ws-handler.ts:2024-2027`.
-- [ ] Fix clippy: doc-lazy-continuation at `layout_store.rs:414`; needless borrow at `target_resolver.rs:159`. Run `cargo fmt` (3 known diffs in the two test files above).
-- [ ] Run to verify GREEN: `cargo test -p freshell-freshagent --lib` all pass; `cargo clippy` clean; `cargo fmt --check` clean.
-- [ ] Commit (focused, atomic; no push, no PR).
+- [x] Write the failing test `normalized_snapshot_with_explicit_tab_id_resolves_from_any_client_snapshot` in `layout_store_tests.rs` (reuse the `client_sync` helper): conn-a syncs tab `tA`/pane `pA`; conn-b (primary, last writer) syncs `tB`/`pB`. Assert `get_normalized_snapshot(Some("tA"))` returns conn-a's tab content, and `get_normalized_snapshot(None)` stays primary-only (answers from `tB`).
+- [x] Run to verify RED: `cargo test -p freshell-freshagent --lib layout_store` — the explicit-tab assertion fails against the primary-only read. Observed: `snap["tabs"][0]["id"]` was `Null` (the primary, conn-b, has no `tA`; body was the empty tab view), 22 passed / 1 failed.
+- [x] Implement: make `get_normalized_snapshot(Some(tab_id))` search all snapshots primary-first (same pattern as explicit-tab `list_panes`); the default `None` path stays primary-only. Update the method's doc comment with the multi-client note.
+- [x] Fix the divergence doc-comment anchor at `layout_store.rs:70`: cite `server/agent-api/layout-store.ts` (single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`) instead of `layout-store.ts:44-46`; likewise correct any `ws-handler.ts:1966-1969` doc references in `crates/freshell-ws` (if present) to `server/ws-handler.ts:2024-2027`. (Corrected: `terminal.rs:860`, `lib.rs:177`, `tests/ui_layout_sync.rs:8`, plus the same-comment stale sidebar-recompute anchor `ws:1970-1979` → `ws:2028-2037` and the tests-file divergence anchor `layout-store.ts:44-46` → `:49`/`:169-181`. The `layout-store.ts:44-46` cite in `get_normalized_snapshot`'s own doc correctly anchors `emptySnapshot()` and stays.)
+- [x] Fix clippy: doc-lazy-continuation at `layout_store.rs:414`; needless borrow at `target_resolver.rs:159`. Run `cargo fmt` (3 known diffs in the two test files above).
+- [x] Run to verify GREEN: `cargo test -p freshell-freshagent --lib` all pass (421/421); `cargo test -p freshell-ws --test ui_layout_sync` 2/2; `cargo clippy -p freshell-freshagent -p freshell-ws --all-targets` clean (0 warnings); `cargo fmt --check` clean.
+- [x] Commit (focused, atomic; no push, no PR).
 
 ---
 

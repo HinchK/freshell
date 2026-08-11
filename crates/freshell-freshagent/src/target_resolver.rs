@@ -156,7 +156,7 @@ fn resolve_in_snapshot(snapshot: &UiSnapshot, raw: &str) -> ResolvedTarget {
     let mut title_match: Option<(String, String)> = None;
     for (tab_id, pane_ids) in &panes_by_tab {
         for pane_id in pane_ids {
-            if pane_title(&snapshot, tab_id, pane_id) != Some(clean) {
+            if pane_title(snapshot, tab_id, pane_id) != Some(clean) {
                 continue;
             }
             if title_match.is_some() {

@@ -174,7 +174,7 @@ pub struct WsState {
     /// snapshot (`terminal::handle_client_text`'s `ClientMessage::UiLayoutSync`
     /// arm -> `LayoutStore::update_from_ui` -- the port of
     /// `this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')`,
-    /// `server/ws-handler.ts:1966-1969`; intentional divergence: the store is
+    /// `server/ws-handler.ts:2024-2027`; intentional divergence: the store is
     /// multi-client keyed by connection id, where Node keeps ONE
     /// last-writer-wins snapshot). A connection's snapshot is evicted on
     /// close. No reply frame (Node sends none). `freshell-server`'s `main.rs`

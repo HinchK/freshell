@@ -857,12 +857,12 @@ async fn handle_client_text(
         // `ui.layout.sync` (AUTO-01 spine, Task 13): the client's layout mirror
         // REPLACES THIS CONNECTION'S server-side `LayoutStore` snapshot -- the
         // port of the dedicated arm's `this.layoutStore.updateFromUi(m,
-        // ws.connectionId || 'unknown')` (`server/ws-handler.ts:1966-1969`),
+        // ws.connectionId || 'unknown')` (`server/ws-handler.ts:2024-2027`),
         // except the store is multi-client keyed by connection id (intentional
         // divergence: Node keeps ONE last-writer-wins snapshot, which made
         // other clients' pane ids unresolvable). No reply frame (Node sends
         // none). The Node arm's second half (the sidebar-open-session-keys
-        // recompute, `ws:1970-1979`) is a separate session-directory concern,
+        // recompute, `ws:2028-2037`) is a separate session-directory concern,
         // out of this task's scope.
         ClientMessage::UiLayoutSync(sync) => {
             state.layout.update_from_ui(&sync, &conn_id.to_string());
