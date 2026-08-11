@@ -3,6 +3,7 @@ export const ContextIds = {
   Tab: 'tab',
   TabAdd: 'tab-add',
   Pane: 'pane',
+  PaneHeader: 'pane-header',
   PaneDivider: 'pane-divider',
   Terminal: 'terminal',
   Browser: 'browser',

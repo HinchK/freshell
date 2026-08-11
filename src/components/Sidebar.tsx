@@ -1057,6 +1057,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               {remoteStatus && (
                 <span
                   aria-hidden="true"
+                  data-remote-status-ring={remoteStatus}
                   className={cn(
                     'pointer-events-none absolute -inset-[3px] rounded-full border',
                     remoteStatus === 'busy' ? 'border-blue-500' : 'border-success'

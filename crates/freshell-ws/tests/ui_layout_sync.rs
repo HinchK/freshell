@@ -223,8 +223,8 @@ async fn ui_layout_sync_frame_populates_the_shared_layout_store() {
 
 mod common;
 
-use common::{connect_and_capture_inventory, spawn_server_with_specs_and_state};
 use common::TestWs as CommonTestWs;
+use common::{connect_and_capture_inventory, spawn_server_with_specs_and_state};
 use serde_json::json;
 
 fn layout_sync_frame(tabs: serde_json::Value, layouts: serde_json::Value) -> serde_json::Value {
@@ -333,7 +333,10 @@ async fn ui_layout_sync_last_write_wins_across_connections() {
     send_json(&mut ws_a, json!({ "type": "ping" })).await;
     let _ = common::next_frame_of_type(&mut ws_a, "pong").await;
     let store = state.layout.clone();
-    assert_eq!(store.get_normalized_snapshot(None)["activeTabId"], json!("tab_from_a"));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!("tab_from_a")
+    );
     let source_after_a = store.source_connection_id().expect("source recorded");
 
     send_json(
