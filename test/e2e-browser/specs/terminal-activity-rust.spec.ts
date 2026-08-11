@@ -470,4 +470,83 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('amplifier events lane: provider-error turn completes via orchestrator:complete (no prompt:complete)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-amp-err-'))
+    const fakeAmplifier = await installFakeCli(path.join(sharedRoot, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {
+        env: {
+          AMPLIFIER_CMD: fakeAmplifier,
+          FAKE_AMPLIFIER_TURN_MS: '15000',
+          FAKE_AMPLIFIER_ERROR_TURN: '1',
+        },
+        setupHome: async (homeDir) => {
+          const freshellDir = path.join(homeDir, '.freshell')
+          await fs.mkdir(freshellDir, { recursive: true })
+          await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+            version: 1,
+            settings: { codingCli: { enabledProviders: ['amplifier'] } },
+          }, null, 2))
+        },
+      },
+    })
+    const info = await server.start()
+    const capture = new WsCapture(info.baseUrl, info.token)
+    try {
+      await capture.ready()
+      const harness = await bootAndConnect(page, info)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const tabId = await harness.getActiveTabId()
+      expect(tabId).toBeTruthy()
+
+      const terminalId = await openCliPaneAndGetTerminalId(page, harness, tabId!, /Amplifier/i, 'amplifier')
+      await expect.poll(async () => {
+        const buffer = await harness.getTerminalBuffer(terminalId)
+        return typeof buffer === 'string' && buffer.includes('amplifier>')
+      }, { timeout: 15_000 }).toBe(true)
+
+      await typePromptIntoLastPane(page, 'hello amplifier')
+
+      // Busy (blue) while the turn runs...
+      await capture.waitFor(
+        (f) => f.type === 'amplifier.activity.updated'
+          && f.upsert?.some((r: any) => r.terminalId === terminalId && r.phase === 'busy'),
+        10_000,
+        'amplifier busy upsert',
+      )
+      await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+
+      // ...then the turn DIES on a provider error: the fixture writes
+      // provider:error + orchestrator:complete and never prompt:complete.
+      // Before the stuck-busy fix this pane stayed blue forever.
+      const complete = await capture.waitFor(
+        (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
+        45_000,
+        'amplifier terminal.turn.complete (orchestrator:complete boundary)',
+      )
+      expect(complete.provider).toBe('amplifier')
+      expect(complete.completionSeq).toBe(1)
+      expect(String(complete.sessionId ?? '')).toMatch(UUID_RE)
+
+      await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+
+      const idleEdge = await capture.waitFor(
+        (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,
+        10_000,
+        'amplifier terminal.idle',
+      )
+      expect(idleEdge.reason).toBe('grace')
+
+      await page.waitForTimeout(1_000)
+      expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(1)
+    } finally {
+      capture.close()
+      await server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
