@@ -34,3 +34,19 @@ Items merged in order: JAN-88, RESTORE-01, SESSION-13, CFG-01. Each entry: fresh
 - **Merge: `d375ae565`** `df1(B005): RESTORE-01 recover-my-panes offer inert for e2e harness (auto-decline watcher)` (ort, 12 files, +1264/−268)
 
 ---
+
+## SESSION-13 — legacy-parity PATCH write path for sidebar first-chat exclusions
+
+- Branch: `df1/session-13-first-chat-exclusions` · attested head `0124d2dad332d475ff2a86d757a85f610620fff2`
+- Freshness: rev-parse = attested ✓. Merge-base with integration = declared base `5521f3aba` ✓. 3 own commits; diff = `crates/freshell-server/src/{settings_store.rs, session_directory.rs}` + `docs/plans` + `playwright.config.ts` + the item spec + `sidebarSelectors.visibility.test.ts` — in declared scope ✓. Worktree clean at attested head ¶ Item tests remain (spec + unit selector test + 73 settings-scoped crate tests).
+- Rebase onto `8a14230ed`: base delta also touched `settings_store.rs` (project_color rollback, 3 hunks) but disjoint from SESSION-13's PATCH-write-path hunks → **no conflicts**. New head `57bbd0db805c2e1379f2fa210069f0f791e6ec63`. `git range-diff 5521f3aba..0124d2dad 8a14230ed..57bbd0db8` → all 3 commits patch-identical (`=`); attested→new-head file list identical to base-delta list ✓.
+- Verification (item worktree, `nice -n 19`; rust tree changed by rebase → release binary **rebuilt under cargo lease**; TMPDIR=`$HOME/.freshell/df1/tmp/s13-b005` — evidence-documented stray empty `/tmp/.git` poisons default-TMPDIR `repo_icon_git` test; confirmed clean TMPDIR has no git ancestor):
+  - `cargo build --release -p freshell-server` → exit 0 (1m22s)
+  - `cargo test -p freshell-server settings` (cargo lease) → **`73 passed; 0 failed`** (bin target; all other targets 0 matched-fail), exit 0
+  - `npm run test:vitest -- run test/integration/server/settings-api.test.ts --config config/vitest/vitest.server.config.ts` → **`Test Files 1 passed (1)`, `Tests 16 passed (16)`, exit 0**
+  - pw lease → `FRESHELL_E2E_RUST_SERVER_BIN=$PWD/target/release/freshell-server npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/session-13-first-chat-exclusions.spec.ts` → **`1 passed (26.7s)`, exit 0** (harness logged slot binary sha256 4e38f60d…)
+  - `npm run typecheck` → exit 0
+  - Leases `cargo` + `pw` acquired/released as `df1-b005`.
+- **Merge: `b990df909`** `df1(B005): SESSION-13 legacy-parity PATCH write path for sidebar first-chat exclusions` (ort, 7 files, +1342/−2)
+
+---
