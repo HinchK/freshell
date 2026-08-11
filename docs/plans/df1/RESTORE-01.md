@@ -209,7 +209,7 @@ Run a trivial rust-leg of a tiny F1 spec file (harness-02 is the cheap gate spec
 
 - [ ] **Step 3: project-colors-matrix** — DELETE `declineRecoveryOfferIfMade` and the inventory response-waiter inside `bootFreshPage` (collapse it to the plain boot), let the default page ride the fixture watcher, and add `installRecoveryOfferAutoDeclineOnContext(contextB)` at the `browser.newContext()` site (:225). Remove unused `Response` import. Leave a comment pointing at RESTORE-01/replacing SESSION-05 fix2.
 
-- [ ] **Step 4: opt-outs** — add `test.use({ recoveryOfferHandling: 'manual' })` at file top-level to `sidebar-registry-sync-rust.spec.ts` and `restore-contract-wall-rust.spec.ts` (both use the default `page` fixture AND own panel assertions; their existing idioms stay authoritative).
+- [ ] **Step 4: opt-outs** — add `test.use({ recoveryOfferHandling: 'manual' })` at file top-level to `sidebar-registry-sync-rust.spec.ts` and `restore-contract-wall-rust.spec.ts` (both use the default `page` fixture AND own panel assertions; their existing idioms stay authoritative). **Superseded during execution (see evidence):** `sidebar-registry-sync-rust.spec.ts` imports raw `@playwright/test` (not the extended `helpers/fixtures`), so the custom option was invalid there — the opt-out landed on `restore-contract-wall-rust.spec.ts` only, and sidebar-registry keeps its existing idioms.
 
 - [ ] **Step 5: Verify compile of edited specs + commit**
 
