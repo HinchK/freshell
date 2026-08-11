@@ -75,19 +75,24 @@ describe('amplifier events reducer', () => {
       })
     })
 
-    it('turn.completed fires on prompt:complete, not session:end (session:end at idle is ignored)', () => {
+    it('turn.completed fires on orchestrator:complete; the later prompt:complete and session:end at idle are ignored', () => {
       const records = loadFixture('normal-turn.jsonl')
+      const orchestratorIndex = records.findIndex((r) => r.event === 'orchestrator:complete')
       const completeIndex = records.findIndex((r) => r.event === 'prompt:complete')
       const endIndex = records.findIndex((r) => r.event === 'session:end')
-      expect(completeIndex).toBeGreaterThan(0)
+      expect(orchestratorIndex).toBeGreaterThan(0)
+      expect(completeIndex).toBeGreaterThan(orchestratorIndex)
       expect(endIndex).toBeGreaterThan(completeIndex)
 
       let state = createAmplifierReducerState()
       for (const [index, rec] of records.entries()) {
         const result = reduceAmplifierEvent(state, rec)
         state = result.state
-        if (index === completeIndex) {
+        if (index === orchestratorIndex) {
           expect(kinds(result.effects)).toEqual(['turn.completed'])
+        }
+        if (index === completeIndex) {
+          expect(result.effects).toEqual([])
         }
         if (index === endIndex) {
           expect(result.effects).toEqual([])
@@ -198,6 +203,60 @@ describe('amplifier events reducer', () => {
       expect(effects).toEqual([])
       expect(state.phase).toBe('idle')
       expect(state.degraded).toBe(false)
+    })
+  })
+
+  describe('orchestrator:complete boundary (2026-08-10 stuck-busy fix)', () => {
+    it('orchestrator:complete ends a busy turn (provider-error path: prompt:complete never arrives)', () => {
+      const busy = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'prompt:submit' })).state
+      const result = reduceAmplifierEvent(busy, record({ event: 'orchestrator:complete' }))
+      expect(result.state.phase).toBe('idle')
+      expect(kinds(result.effects)).toEqual(['turn.completed'])
+    })
+
+    it('orchestrator:complete followed by a late prompt:complete completes exactly once', () => {
+      const busy = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'prompt:submit' })).state
+      const first = reduceAmplifierEvent(busy, record({
+        event: 'orchestrator:complete',
+        ts: '2026-08-11T00:20:05.808632463+00:00',
+      }))
+      expect(first.state.phase).toBe('idle')
+      expect(first.effects).toEqual([{ kind: 'turn.completed', at: '2026-08-11T00:20:05.808632463+00:00' }])
+      const second = reduceAmplifierEvent(first.state, record({ event: 'prompt:complete' }))
+      expect(second.state.phase).toBe('idle')
+      expect(second.effects).toEqual([])
+    })
+
+    it('prompt:complete followed by orchestrator:complete completes exactly once', () => {
+      const busy = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'prompt:submit' })).state
+      const first = reduceAmplifierEvent(busy, record({ event: 'prompt:complete' }))
+      expect(kinds(first.effects)).toEqual(['turn.completed'])
+      const second = reduceAmplifierEvent(first.state, record({ event: 'orchestrator:complete' }))
+      expect(second.state.phase).toBe('idle')
+      expect(second.effects).toEqual([])
+    })
+
+    it('orchestrator:complete at idle is a no-op (no emission)', () => {
+      const result = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'orchestrator:complete' }))
+      expect(result.state.phase).toBe('idle')
+      expect(result.effects).toEqual([])
+    })
+
+    it('orchestrator:complete with a non-null parent_id (sub-agent record) never ends the root turn', () => {
+      const busy = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'prompt:submit' })).state
+      const result = reduceAmplifierEvent(busy, record({
+        event: 'orchestrator:complete',
+        data: { parent_id: '0000000000000000-59ae93e4abde4aca_the-usual-step-runner' },
+      }))
+      expect(result.state.phase).toBe('busy')
+      expect(result.effects).toEqual([])
+    })
+
+    it('other orchestrator:* records while busy never end the turn', () => {
+      const busy = reduceAmplifierEvent(createAmplifierReducerState(), record({ event: 'prompt:submit' })).state
+      const result = reduceAmplifierEvent(busy, record({ event: 'orchestrator:steering_injected' }))
+      expect(result.state.phase).toBe('busy')
+      expect(result.effects).toEqual([])
     })
   })
 
