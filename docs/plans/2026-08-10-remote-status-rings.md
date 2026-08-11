@@ -6,7 +6,7 @@
 
 **Goal:** A session row in the left panel (Sidebar) that would look green ("open") or blue ("busy") on a *different* device shows a matching green/blue ring around its icon on this device — only when the session is not open on this device.
 
-**Architecture:** Every client already pushes its open-tab registry snapshot every 5s (`tabs.sync.push`); each device now stamps each pane snapshot's opaque payload with `activity: 'busy'` when that pane is busy per the existing `resolvePaneActivity` logic (the same source as the local blue icon). Consumers derive per-session remote state from `state.tabRegistry.remoteOpen` (any busy pane → blue ring; otherwise referenced → green ring), gated on the session not being open locally (`hasTab === false`). A new periodic `tabs.sync.query` (30s) keeps remote snapshots fresh while connected. No server schema change: pane `payload` is a pass-through `z.record` on Node and (verified in Stage 2) the Rust server.
+**Architecture:** Every client already pushes its open-tab registry snapshot every 5s (`tabs.sync.push`); each device now stamps each pane snapshot's opaque payload with `sessionKeys: string[]` (the canonical `provider:sessionId` identities, resolved by the exact same rules the local sidebar uses for its green/`hasTab` join) and `activity: 'busy'` when that pane is busy per the existing `resolvePaneActivity` logic (the same source as the local blue icon). Consumers derive per-session remote state from `state.tabRegistry.remoteOpen` (any busy pane → blue ring; otherwise referenced → green ring; legacy `sessionRef`-only snapshots still work via fallback), suppressed whenever the session is open on this device — in this window (`hasTab`) or another window of the same device (`sameDeviceOpen`). A new periodic `tabs.sync.query` (30s, with bounded single-flight re-send on stale requests) keeps remote snapshots fresh while connected. No server schema change: pane `payload` is a pass-through `z.record` on Node and (verified in Stage 2) the Rust server.
 
 **Tech Stack:** React 18, Redux Toolkit, Tailwind CSS, Vitest + Testing Library, Playwright (e2e against the Rust server).
 
@@ -26,41 +26,45 @@
 
 - **R1 — Outcome (green ring):** When a session entry would render a green icon on a different device (i.e. the session is open in a tab there) and the session is *not* open on this device, the entry's icon gets a green circle ring on this device.
 - **R2 — Outcome (blue ring):** When a session entry would render a blue icon on a different device (i.e. any of its remotely-open panes is busy) and the session is *not* open on this device, the entry's icon gets a blue circle ring. Blue wins over green when both apply (mirrors local `blue > green` precedence).
-- **R3 — Constraint (local wins):** A session open on this device never shows a remote ring; existing solid local coloring (blue busy / green open / grey) is unchanged. Multiple local windows of the *same* device (`sameDeviceOpen`) do not count as "a different device".
+- **R3 — Constraint (local wins):** A session open on this device never shows a remote ring; existing solid local coloring (blue busy / green open / grey) is unchanged. "Open on this device" includes *other windows of the same device*: records the server partitions as `sameDeviceOpen` (same `deviceId`, different `clientInstanceId`) suppress the ring exactly like a locally-open tab, and never count as "a different device" that would *produce* a ring.
 - **R4 — Outcome (liveness):** Ring state reflects remote churn while all clients stay connected — no reconnect or reload required. Producer pushes busy/idle transitions within the existing 5s sync tick; consumers re-query remote snapshots on a 30s interval (previously only on WS ready/reconnect).
 - **R5 — Constraint (compatibility):** The new per-pane `payload.activity` field round-trips through both the Node and Rust servers (validate → store → query reply) with zero server code changes; the existing full test suite and sidebar render-stability contracts stay green.
 
 ---
 
-### Task 1: Producer — stamp per-pane `activity: 'busy'` into pushed registry records
+### Task 1: Producer — stamp per-pane `sessionKeys` + `activity: 'busy'` into pushed registry records
 
-**Requirements served:** R2, R4, R5
+**Requirements served:** R1, R2, R4, R5
 
 **Behavior:**
-- When this device builds its open-tab registry records (existing 5s push in `startTabRegistrySync`), each leaf pane snapshot's `payload` gains `activity: 'busy'` iff that pane is busy according to the existing `resolvePaneActivity` logic (same inputs the Sidebar uses for its blue icon). Non-busy panes omit the key (payload keeps current shape otherwise; `undefined` values are already dropped by JSON serialization and by `stripUndefinedValues` downstream).
-- Closed/tombstone records are never stamped (consumers only read `remoteOpen`; keeping tombstone payloads untouched avoids confusion).
+- When this device builds its open-tab registry records (existing 5s push in `startTabRegistrySync`), each leaf pane snapshot's `payload` gains two fields:
+  - `sessionKeys: string[]` — the canonical `provider:sessionId` identities for the pane, computed with the **same resolution rules the local sidebar uses** for its green/`hasTab` join (`collectSessionRefsFromTabs` in `src/lib/session-utils.ts:294-305`, which covers `content.sessionRef`, Claude `resumeSessionId`, Codex durability identities, and fresh-agent live-session identity — including the no-pane-`sessionRef` restore gap protected by `test/unit/client/lib/pane-activity.test.ts:242`). Stamping the keys (rather than relying consumer-side on `payload.sessionRef`, which `stripPanePayload` omits for several of those identity paths) makes the remote join exact by construction. Omitted when the pane maps to no session.
+  - `activity: 'busy'` — iff that pane is busy according to the existing `resolvePaneActivity` logic (same inputs the Sidebar uses for its blue icon). Non-busy panes omit the key.
+- Closed/tombstone records are never stamped with either field (consumers only read `remoteOpen`; keeping tombstone payloads untouched avoids confusion). This prohibition is enforced and tested even when a busy set is supplied to the closed builder (see test cases).
 - Because `recordFingerprint` (`tabRegistrySync.ts:130-139`) and the push dedupe (`pushNow`, `:329-331`) both include `panes`, a busy→idle or idle→busy transition changes the fingerprint and ships on the next 5s tick.
 
 **Files:**
+- Modify: `src/lib/session-utils.ts` — export a per-pane session-key collector (extract from `collectSessionRefsFromTabs`' leaf logic so there is exactly one identity-resolution implementation; e.g. `collectSessionKeysFromContent(content: PaneContent, tab: Tab, freshAgentSessions?): string[]`).
 - Modify: `src/lib/pane-activity.ts` — add exported `collectBusyPaneIds(input): Set<string>` (same input record as `collectBusySessionKeys` at `:311-383`: `{ tabs, paneLayouts, codexActivityByTerminalId, claudeActivityByTerminalId, amplifierActivityByTerminalId, opencodeActivityByTerminalId, paneRuntimeActivityByPaneId, freshAgentSessions }`), walking every tab's pane tree with the existing `resolvePaneActivity` and returning the set of busy pane ids.
-- Modify: `src/lib/tab-registry-snapshot.ts` — `collectPaneSnapshots(node, serverInstanceId, paneTitles?, busyPaneIds?)` (:76-94) and `stripPanePayload(content, serverInstanceId, busy?)` (:15-74): when `busy === true`, include `activity: 'busy'` in the returned payload (applies to all pane kinds uniformly; sessions are matched consumer-side via `sessionRef`).
-- Modify: `src/store/tabRegistrySync.ts` — `buildRecords` (:176-231) computes `busyPaneIds` once per call from the same state slices (`state.codexActivity?.byTerminalId`, `state.claudeActivity?.byTerminalId`, `state.amplifierActivity?.byTerminalId`, `state.opencodeActivity?.byTerminalId`, `state.paneRuntimeActivity?.byPaneId`, `state.freshAgent?.sessions`) and passes it through `buildOpenTabRegistryRecord` → `collectPaneSnapshots`. Add an optional `busyPaneIds?: ReadonlySet<string>` field to `SnapshotRecordInput` in `tab-registry-snapshot.ts` and forward it. `buildClosedTabRegistryRecord` is not passed the set.
-- Test: `test/unit/client/lib/pane-activity.test.ts`, `test/unit/client/lib/tab-registry-snapshot.test.ts`, `test/unit/client/store/tabRegistrySync.test.ts`
+- Modify: `src/lib/tab-registry-snapshot.ts` — `collectPaneSnapshots` (:76-94) gains an optional per-pane annotation hook argument (e.g. `annotatePayload?: (paneId: string) => { sessionKeys?: string[]; busy?: boolean }`) that `stripPanePayload`-produced payloads are augmented with: `activity: 'busy'` when `busy`, `sessionKeys` when non-empty. Threading via a hook keeps `stripPanePayload`'s per-kind whitelist intact and avoids widening its parameter list twice.
+- Modify: `src/lib/tab-registry-snapshot.ts` — `SnapshotRecordInput` gains optional `busyPaneIds?: ReadonlySet<string>` and `paneSessionKeys?: ReadonlyMap<string, string[]>`; `buildOpenTabRegistryRecord` forwards both into the annotation hook.
+- Modify: `src/store/tabRegistrySync.ts` — `buildRecords` (:176-231) computes `busyPaneIds` (via `collectBusyPaneIds`) and `paneSessionKeys` (via the new session-utils collector over each tab's layout) once per call from the same state slices (`state.codexActivity?.byTerminalId`, `state.claudeActivity?.byTerminalId`, `state.amplifierActivity?.byTerminalId`, `state.opencodeActivity?.byTerminalId`, `state.paneRuntimeActivity?.byPaneId`, `state.freshAgent?.sessions`) and passes them into `buildOpenTabRegistryRecord` only.
+- Test: `test/unit/client/lib/pane-activity.test.ts`, `test/unit/client/lib/tab-registry-snapshot.test.ts`, `test/unit/client/lib/session-utils.test.ts`, `test/unit/client/store/tabRegistrySync.test.ts`
 
 **Interfaces:**
-- Consumes: `resolvePaneActivity` (`src/lib/pane-activity.ts:117-205`), existing `collectBusySessionKeys` input shape, `RegistryPaneSnapshot.payload` (`Record<string, unknown>` free-form, `server/tabs-registry/types.ts:49-54`).
+- Consumes: `resolvePaneActivity` (`src/lib/pane-activity.ts:117-205`), the `collectSessionRefsFromTabs` resolution rules (`src/lib/session-utils.ts:294-305`), existing `collectBusySessionKeys` input shape, `RegistryPaneSnapshot.payload` (`Record<string, unknown>` free-form, `server/tabs-registry/types.ts:49-54`).
 - Produces:
+  - `collectSessionKeysFromContent(content: PaneContent, tab: Tab, freshAgentSessions?): string[]` (session-utils.ts)
   - `collectBusyPaneIds(input: {...same as collectBusySessionKeys}): Set<PaneId>` (pane-activity.ts)
-  - `stripPanePayload(content: PaneContent, serverInstanceId: string, busy?: boolean): Record<string, unknown>` — adds `activity?: 'busy'`
-  - `collectPaneSnapshots(node, serverInstanceId, paneTitles?, busyPaneIds?: ReadonlySet<string>)`
-  - `SnapshotRecordInput.busyPaneIds?: ReadonlySet<string>`
-  - Pushed wire shape per pane: `{ ..., payload: { ..., activity?: 'busy' } }`
+  - `SnapshotRecordInput.busyPaneIds?: ReadonlySet<string>`, `SnapshotRecordInput.paneSessionKeys?: ReadonlyMap<string, string[]>`
+  - Pushed wire shape per pane: `{ ..., payload: { ..., sessionKeys?: string[], activity?: 'busy' } }`
 
 **Test cases:**
 - `collectBusyPaneIds`: a tab containing one terminal pane whose codex/claude activity record has `phase === 'busy'` → set contains that paneId; a second idle pane in the same tab → absent. Empty tabs → empty set.
-- `collectPaneSnapshots` with `busyPaneIds = new Set(['p1'])` → pane `p1` payload has `activity: 'busy'`; pane `p2` payload has no `activity` key.
-- `buildOpenTabRegistryRecord` with `busyPaneIds` → pane payloads stamped; `buildClosedTabRegistryRecord` never stamps even if given a busy set (verify by NOT passing it: the function's signature stays without the field — assert closed record panes have no `activity` when built through `buildRecords` with busy panes present in a different open tab... simplest: assert `buildClosedTabRegistryRecord` output panes lack `activity`).
-- `tabRegistrySync` (existing harness): with a busy pane in state, the records passed to `sendTabsSyncPush` contain `panes[].payload.activity === 'busy'`; after the pane goes idle, a subsequent tick pushes again (payload key removed → fingerprint changed).
+- Session-key collector completeness (the R1 identity join): terminal pane with `sessionRef` → its key; terminal pane with NO `sessionRef` but Claude `resumeSessionId` → `claude:<id>` key; Codex durability identity → key; fresh-agent pane with no `content.sessionRef` but a live session in `freshAgent.sessions` (the restore-gap case) → key; shell terminal → no keys (field omitted).
+- `collectPaneSnapshots` with the annotation hook → busy pane payload has `activity: 'busy'` and `sessionKeys: ['claude:s1']`; idle pane payload has `sessionKeys` but no `activity`; sessionless pane has neither.
+- `buildClosedTabRegistryRecord` given a NONEMPTY `busyPaneIds`/`paneSessionKeys` (pass them deliberately in the test) → closed record panes carry neither `activity` nor `sessionKeys` (the prohibition is behavioral, not "not passed").
+- `tabRegistrySync` (existing harness): with a busy pane in state, the records passed to `sendTabsSyncPush` contain `panes[].payload.activity === 'busy'` and `sessionKeys`; after the pane goes idle, a subsequent tick pushes again (`activity` key removed → fingerprint changed).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -107,26 +111,29 @@ git commit -m "feat(tabs-registry): stamp per-pane busy activity into pushed sna
 
 **Behavior:**
 - `startTabRegistrySync` additionally sends `tabs.sync.query` on a fixed 30s interval (new exported constant `QUERY_INTERVAL_MS = 30_000`) so `remoteOpen` stays fresh while connected. Existing query triggers (WS `ready`, reconnect, retention-days change, startup) are unchanged.
-- Queries respect the existing guards: no send when `ws.state !== 'ready'`; lease-unsettled queries queue once via `queuedQuery`; the existing `latestQueryRequestId`/`pendingRequests` single-flight logic (`:294-312`, `:440-459`) dedupes replies unchanged.
+- Queries respect the existing guards: no send when `ws.state !== 'ready'`; lease-unsettled queries queue once via `queuedQuery`.
+- **New single-flight discipline** (the existing `querySnapshot` has no in-flight guard — every call allocates another request id): the interval callback skips sending while a query is outstanding (`pendingRequests.size > 0`). A bounded stale-replacement also lives inside `querySnapshot` itself, so every caller benefits: track `lastQuerySentAt`; when a query has been outstanding for longer than `QUERY_STALE_MS = 90_000` (3× interval — server unreachable or reply lost), the next call clears `pendingRequests` and sends a replacement. In-flight memory is therefore bounded to one outstanding request at all times, and a silently dead query channel self-heals within 90s.
 - The interval is cleared by the returned teardown function.
 
 **Files:**
-- Modify: `src/store/tabRegistrySync.ts:20-22` (constant), `:472-477` (add interval beside the push interval), `:525-537` (clear in teardown)
+- Modify: `src/store/tabRegistrySync.ts:20-22` (constants), `:294-312` (`querySnapshot` in-flight guard + stale replacement), `:472-477` (add interval beside the push interval), `:525-537` (clear in teardown)
 - Test: `test/unit/client/store/tabRegistrySync.test.ts`
 
 **Interfaces:**
 - Consumes: existing `querySnapshot` closure (:294-312), `SYNC_INTERVAL_MS`/`HEARTBEAT_INTERVAL_MS` pattern (:20-21, :472-477).
-- Produces: `export const QUERY_INTERVAL_MS = 30_000` from `src/store/tabRegistrySync.ts`.
+- Produces: `export const QUERY_INTERVAL_MS = 30_000` and `export const QUERY_STALE_MS = 90_000` from `src/store/tabRegistrySync.ts`.
 
 **Test cases:**
-- Fake timers, ws ready: advancing 30s sends exactly one additional `tabs.sync.query`; advancing 60s sends two total.
+- Fake timers, ws ready: advancing 30s sends exactly one additional `tabs.sync.query`; with replies arriving, advancing 60s sends two total.
+- Outstanding suppression: interval fires while a previous query is still outstanding (no reply) → no second query is sent.
+- Stale replacement: with a query outstanding and no reply, advancing past `QUERY_STALE_MS` → a replacement query IS sent, and the old request id no longer accepts a reply (a late reply for the old id is ignored by the existing `latestQueryRequestId` check).
 - ws not ready (`ws.state !== 'ready'`): advancing interval sends nothing.
 - Teardown: after calling the returned dispose, advancing time sends no further queries.
 - Existing ready/reconnect query behavior still passes (regression).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-In `tabRegistrySync.test.ts` (existing fake-timer harness): start the sync loop with a ready ws double, clear the boot-time `querySnapshot` call count, advance `QUERY_INTERVAL_MS` (import the new constant), assert `sendTabsSyncQuery` called exactly once.
+In `tabRegistrySync.test.ts` (existing fake-timer harness): start the sync loop with a ready ws double, clear the boot-time `querySnapshot` call count, advance `QUERY_INTERVAL_MS`, assert `sendTabsSyncQuery` called exactly once; then suppress the reply, advance another interval, assert still exactly one total send; advance past `QUERY_STALE_MS`, assert the replacement send.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -163,33 +170,41 @@ git commit -m "feat(tabs-registry): re-query remote snapshots on a 30s interval"
 
 ---
 
-### Task 3: Selector — per-session remote activity (`'busy' | 'open'`) from `remoteOpen`
+### Task 3: Selector — per-session remote activity (`'busy' | 'open'`) and same-device suppression keys
 
 **Requirements served:** R1, R2, R3
 
 **Behavior:**
-- New pure function `deriveRemoteSessionActivity(remoteOpen: RegistryTabRecord[]): Record<string, 'busy' | 'open'>` and memoized `selectRemoteSessionActivity(state: RootState)` built on it.
-- For each remote record and each pane with a string-typed `payload.sessionRef` object containing non-empty `provider` and `sessionId` strings, map key `${provider}:${sessionId}` → `'open'`; if the pane's `payload.activity === 'busy'`, upgrade the key to `'busy'`. `'busy'` always wins over `'open'` across panes and across records (R2 precedence). Panes without a well-formed `sessionRef` are ignored. Empty/missing `remoteOpen` → `{}`.
-- Input is only `state.tabRegistry.remoteOpen`, so same-device windows (`sameDeviceOpen`) and own-window records can never contribute (R3, server partition at `server/tabs-registry/store.ts:1240-1296`).
+- New pure function `deriveRemoteSessionActivity(records: RegistryTabRecord[] | undefined): Record<string, 'busy' | 'open'>`, plus memoized selectors built on it.
+- Pane → session keys: read `payload.sessionKeys` when it is an array of non-empty strings (the Task 1 field — the complete identity contract); otherwise fall back to a well-formed single `payload.sessionRef` (`{provider, sessionId}` non-empty strings) so snapshots pushed by older clients still produce green rings. Map each key → `'open'`; if that pane's `payload.activity === 'busy'`, upgrade the key to `'busy'`. `'busy'` always wins over `'open'` across panes and across records (R2 precedence). Panes with no identity are ignored. Empty/missing input → `{}`.
+- `selectRemoteSessionActivity = createSelector([selectRemoteOpen], deriveRemoteSessionActivity)` — fed only from `remoteOpen`, so other devices' records alone *produce* rings (R3; server partition at `server/tabs-registry/store.ts:1240-1296`). Output reference stable between snapshot ingests so `useAppSelector` doesn't churn.
+- `selectSameDeviceSessionKeys = createSelector([selectSameDeviceOpen], (records) => new Set(Object.keys(deriveRemoteSessionActivity(records))))` — the R3 *suppression* set (other windows of this same device). It suppresses rings; it never produces them.
+- Both slice accessors tolerate partial stores: `selectRemoteOpen`/`selectSameDeviceOpen` default via optional-chaining (`state.tabRegistry?.remoteOpen` / `?.sameDeviceOpen`), because several existing Sidebar component harnesses omit the `tabRegistry` reducer entirely — the selector must not throw there.
 
 **Files:**
-- Modify: `src/store/selectors/tabsRegistrySelectors.ts` (add export; `selectRemoteOpen` already exists at :40)
+- Modify: `src/store/selectors/tabsRegistrySelectors.ts` (add exports; make the `selectRemoteOpen` input at :40 and its `sameDeviceOpen` sibling optional-chain tolerant)
 - Test: `test/unit/client/store/tabsRegistrySelectors.test.ts` (create; the existing `tabRegistrySlice.test.ts` keeps slice concerns)
 
 **Interfaces:**
 - Consumes: `RegistryTabRecord` (`@/store/tabRegistryTypes`), `selectRemoteOpen`.
 - Produces:
-  - `deriveRemoteSessionActivity(remoteOpen: RegistryTabRecord[] | undefined): Record<string, 'busy' | 'open'>`
-  - `selectRemoteSessionActivity: (state: RootState) => Record<string, 'busy' | 'open'>` (createSelector on `selectRemoteOpen`; output reference stable between ingests so Sidebar's `useAppSelector(...)` doesn't churn)
+  - `deriveRemoteSessionActivity(records: RegistryTabRecord[] | undefined): Record<string, 'busy' | 'open'>`
+  - `selectRemoteSessionActivity: (state: RootState) => Record<string, 'busy' | 'open'>`
+  - `selectSameDeviceSessionKeys: (state: RootState) => Set<string>`
 
 **Test cases:**
-- One remote record, terminal pane with `sessionRef {provider:'claude', sessionId:'s1'}`, no activity → `{ 'claude:s1': 'open' }`.
+- One remote record, terminal pane with `sessionKeys: ['claude:s1']`, no activity → `{ 'claude:s1': 'open' }`.
 - Same but `payload.activity: 'busy'` → `{ 'claude:s1': 'busy' }`.
+- Legacy record with only `sessionRef {provider:'claude', sessionId:'s1'}` (no `sessionKeys`) → `{ 'claude:s1': 'open' }` (old-client fallback).
+- `sessionKeys` present AND `sessionRef` pointing elsewhere → `sessionKeys` wins (array is the complete contract).
 - Two records from two devices referencing the same session, one busy one not → `'busy'` (cross-device precedence).
 - One record with both a busy pane and an idle pane referencing the same session → `'busy'`.
-- Pane with missing/partial `sessionRef` (no provider, or empty sessionId) → key absent.
-- `undefined`/empty input → `{}`.
+- One pane with multiple `sessionKeys` → every key mapped (a pane can carry explicit + resume identities).
+- Pane with missing/empty `sessionKeys` and missing/partial `sessionRef` → key absent.
+- `undefined`/empty input → `{}`; record with `panes` missing entirely → `{}` (defensive, harness fixtures).
 - Pane with `activity: 'something-else'` (future value) → treated as open, not busy.
+- `selectSameDeviceSessionKeys` over same-device records → Set of keys, including a busy one (suppression ignores busy/open distinction).
+- Selectors against a partial store without the `tabRegistry` slice → `{}` / empty Set, no throw.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -203,7 +218,7 @@ Expected: FAIL because both exports do not exist.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Implement `deriveRemoteSessionActivity` (iterate records → panes → read `payload.sessionRef`/`payload.activity` defensively, fold with busy-wins) and `selectRemoteSessionActivity = createSelector([selectRemoteOpen], deriveRemoteSessionActivity)`.
+Implement `deriveRemoteSessionActivity` (iterate records → panes → read `payload.sessionKeys` with `sessionRef` fallback, `payload.activity` defensively, fold with busy-wins), wire `selectRemoteSessionActivity` and `selectSameDeviceSessionKeys`, and make the two slice-input accessors optional-chain tolerant.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -238,7 +253,7 @@ git commit -m "feat(sidebar): derive per-session remote activity from registry r
 - `SidebarItem` gains optional prop `remoteStatus?: 'busy' | 'open'`. When set, the existing `relative` icon wrapper (`Sidebar.tsx:1000`) additionally renders an absolutely positioned circular ring: `<span aria-hidden="true" className={cn('pointer-events-none absolute -inset-[3px] rounded-full border', remoteStatus === 'busy' ? 'border-blue-500' : 'border-success')} />`. Icon glyph/colors are unchanged (grey when not open locally — the only state where a ring can appear).
 - The row button gains `data-remote-status={remoteStatus}` only when set (attribute absent otherwise, so existing e2e `data-*` pins don't churn).
 - Non-color carriers (a11y): the tooltip gains a line `Busy on another device` / `Open on another device`, and the button content gains `<span className="sr-only">(busy on another device)</span>` / `(open on another device)` next to the title.
-- `Sidebar` computes `remoteActivityBySessionKey` via `useAppSelector(selectRemoteSessionActivity)` and passes `remoteStatus={item.hasTab ? undefined : remoteActivityBySessionKey[sessionKey]}` at `:891-898` (R3 gate).
+- `Sidebar` computes `remoteActivityBySessionKey` via `useAppSelector(selectRemoteSessionActivity)` and `sameDeviceSessionKeys` via `useAppSelector(selectSameDeviceSessionKeys)`, and passes `remoteStatus={item.hasTab || sameDeviceSessionKeys.has(sessionKey) ? undefined : remoteActivityBySessionKey[sessionKey]}` at `:891-898` (R3 gate: suppress when the session is open in this window via `hasTab`, or in another window of the same device via `sameDeviceOpen`).
 - `areSidebarItemPropsEqual` (:949-973) compares `remoteStatus` or rings freeze. `isSessionItemEqual` (:135-158) is intentionally untouched (state arrives as a prop, matching the existing `isBusy` pattern).
 
 **Files:**
@@ -246,19 +261,21 @@ git commit -m "feat(sidebar): derive per-session remote activity from registry r
 - Test: `test/unit/client/components/SidebarItem.remote-status.test.tsx` (create), `test/unit/client/components/Sidebar.test.tsx` (gate case), keep `Sidebar.dom-stability.test.tsx` / `Sidebar.render-stability.test.tsx` green.
 
 **Interfaces:**
-- Consumes: `selectRemoteSessionActivity` (Task 3), existing `SidebarItem`/`busySessionKeySet` patterns.
+- Consumes: `selectRemoteSessionActivity` and `selectSameDeviceSessionKeys` (Task 3), existing `SidebarItem`/`busySessionKeySet` patterns.
 - Produces: `SidebarItemProps.remoteStatus?: 'busy' | 'open'`; DOM contract `data-remote-status="busy"|"open"` (absent when no ring).
 
 **Test cases:**
 - `remoteStatus="busy"` + `hasTab: false` → ring span present with `border-blue-500`; button has `data-remote-status="busy"`; sr-only text present; icon keeps `text-muted-foreground`.
 - `remoteStatus="open"` → `border-success` ring + `data-remote-status="open"`.
 - No `remoteStatus` → no ring span, no `data-remote-status` attribute.
-- Full `Sidebar` with `tabRegistry.remoteOpen` seeded (busy sessionRef) and the session NOT open locally → row shows `data-remote-status="busy"`; same seed but session open locally (`hasTab`) → attribute absent (R3 gate).
+- Full `Sidebar` with `tabRegistry.remoteOpen` seeded (busy `sessionKeys`) and the session NOT open locally → row shows `data-remote-status="busy"`; same seed but session open locally (`hasTab`) → attribute absent (R3 gate).
+- Combined same-device-plus-remote case: `tabRegistry.sameDeviceOpen` ALSO references the session while a remote device is busy → attribute absent (suppression wins over remote production).
+- Partial harness tolerance: existing Sidebar harnesses that omit the `tabRegistry` reducer render unchanged (Step 6 suites stay green without harness edits — Task 3's optional-chaining makes this true).
 - Memo: re-render with only `remoteStatus` changing updates the DOM (guards the comparator edit).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Create `SidebarItem.remote-status.test.tsx` copying the `renderSidebarItem` harness from `SidebarItem.running-state.test.tsx`; add the ring/data-attribute cases above. Add the gate case to `Sidebar.test.tsx` using its existing full-Sidebar store harness (seed `tabRegistry.remoteOpen` directly in the preloaded state).
+Create `SidebarItem.remote-status.test.tsx` copying the `renderSidebarItem` harness from `SidebarItem.running-state.test.tsx`; add the ring/data-attribute cases above. Add the two gate cases to `Sidebar.test.tsx` using its existing full-Sidebar store harness (seed `tabRegistry.remoteOpen` / `tabRegistry.sameDeviceOpen` directly in the preloaded state).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -300,7 +317,7 @@ git commit -m "feat(sidebar): remote status rings for sessions open or busy on o
 **Requirements served:** R1, R2, R5
 
 **Behavior:**
-- End-to-end against the real Rust server: a second raw-WS device pushes a `tabs.sync.push` snapshot whose terminal pane payload references a seeded session (`sessionRef`) with `activity: 'busy'`; after the browser page (re)loads — which triggers the query-on-`ready` consumer path — the sidebar row for that session shows `data-remote-status="busy"`. A follow-up push without `activity` + reload flips the row to `data-remote-status="open"`. A push whose records don't reference the session + reload removes the attribute. This pins Rust payload passthrough (R5) and both ring colors (R1, R2) through the real WS/store/selector/render chain.
+- End-to-end against the real Rust server: a second raw-WS device pushes a `tabs.sync.push` snapshot whose terminal pane payload carries `sessionKeys: ['claude:<seeded-id>']` with `activity: 'busy'`; after the browser page (re)loads — which triggers the query-on-`ready` consumer path — the sidebar row for that session shows `data-remote-status="busy"`. A follow-up push without `activity` + reload flips the row to `data-remote-status="open"`. A push whose records don't reference the session + reload removes the attribute. This pins Rust payload passthrough (R5) and both ring colors (R1, R2) through the real WS/store/selector/render chain.
 - `AGENTS.md` "Agent Status Indicators" paragraph gains one sentence documenting the sidebar rings (green = open on another device, blue = busy on another device, only when not open locally).
 - Note recorded in the plan (decided during planning): `docs/index.html`'s sidebar mock renders monochrome provider icons with no per-entry status colors, so no mock change (repo rule requires updating it only for major UI shifts).
 
