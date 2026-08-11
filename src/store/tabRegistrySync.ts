@@ -10,6 +10,7 @@ import {
   setTabRegistrySyncError,
 } from './tabRegistrySlice'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
+import { collectPaneIdentityActivity } from '@/lib/pane-activity'
 import type { PaneNode } from './paneTypes'
 import {
   TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY,
@@ -183,6 +184,16 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
     return closedAt >= closedCutoff
   })
   const retainedClosedTabKeys = new Set(retainedClosedRecords.map((closed) => closed.tabKey))
+  const paneIdentityActivity = collectPaneIdentityActivity({
+    tabs: state.tabs.tabs,
+    paneLayouts: state.panes.layouts,
+    codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? {},
+    claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? {},
+    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? {},
+    opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? {},
+    paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? {},
+    freshAgentSessions: state.freshAgent?.sessions,
+  })
 
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
@@ -202,6 +213,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       deviceLabel,
       revision: 0,
       updatedAt,
+      paneIdentityActivity,
     })
     if (retainedClosedTabKeys.has(recordBase.tabKey)) continue
     const version = nextRecordVersion(recordBase, revisions, now)

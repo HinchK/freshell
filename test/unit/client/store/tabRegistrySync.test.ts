@@ -274,6 +274,77 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('stamps per-pane session identity and busy keys, and re-pushes when busy transitions flip', () => {
+    const resumeId = '11111111-1111-4111-8111-111111111111'
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-pane-1',
+              status: 'running',
+              mode: 'claude',
+              shell: 'system',
+              terminalId: 'term-1',
+              resumeSessionId: resumeId,
+            },
+          },
+        },
+      },
+      claudeActivity: { byTerminalId: {} },
+    } as RootState
+
+    const stop = startTabRegistrySync(createStore() as any, ws)
+
+    const firstPayload = ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0].payload
+    expect(firstPayload.sessionKeys).toEqual([`claude:${resumeId}`, 'claude:terminal:term-1'])
+    expect(firstPayload).not.toHaveProperty('busySessionKeys')
+
+    // An unchanged state ticks without pushing (fingerprint dedupe).
+    ws.sendTabsSyncPush.mockClear()
+    vi.advanceTimersByTime(SYNC_INTERVAL_MS)
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(0)
+
+    // idle -> busy flips the fingerprint, so the next 5s tick pushes with the
+    // pane's effective busy identity stamped.
+    state = {
+      ...state,
+      claudeActivity: {
+        byTerminalId: {
+          'term-1': { terminalId: 'term-1', phase: 'busy', updatedAt: 1_740_000_001_000 },
+        },
+      },
+    } as RootState
+    vi.advanceTimersByTime(SYNC_INTERVAL_MS)
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const busyPayload = ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0].payload
+    expect(busyPayload.sessionKeys).toEqual([`claude:${resumeId}`, 'claude:terminal:term-1'])
+    expect(busyPayload.busySessionKeys).toEqual([`claude:${resumeId}`])
+
+    // busy -> idle removes the key and pushes again on the next tick.
+    ws.sendTabsSyncPush.mockClear()
+    state = {
+      ...state,
+      claudeActivity: {
+        byTerminalId: {
+          'term-1': { terminalId: 'term-1', phase: 'idle', updatedAt: 1_740_000_002_000 },
+        },
+      },
+    } as RootState
+    vi.advanceTimersByTime(SYNC_INTERVAL_MS)
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const idlePayload = ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0].payload
+    expect(idlePayload.sessionKeys).toEqual([`claude:${resumeId}`, 'claude:terminal:term-1'])
+    expect(idlePayload).not.toHaveProperty('busySessionKeys')
+
+    stop()
+  })
+
   it('includes selected closed retention when querying snapshots', () => {
     state = {
       ...state,
