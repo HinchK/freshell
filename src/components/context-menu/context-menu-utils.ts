@@ -67,6 +67,10 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
       return data.tabId && data.paneId
         ? { kind: 'pane', tabId: data.tabId, paneId: data.paneId }
         : null
+    case ContextIds.PaneHeader:
+      return data.tabId && data.paneId
+        ? { kind: 'pane', tabId: data.tabId, paneId: data.paneId }
+        : null
     case ContextIds.PaneDivider:
       return data.tabId && data.splitId
         ? { kind: 'pane-divider', tabId: data.tabId, splitId: data.splitId }

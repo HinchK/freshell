@@ -137,6 +137,25 @@ describe('PaneHeader', () => {
       expect(screen.getByText('My Terminal')).toBeInTheDocument()
     })
 
+    it('renders its pane-header context marker and exact pane identity', () => {
+      render(
+        <PaneHeader
+          tabId="tab-header"
+          paneId="pane-header"
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+        />
+      )
+
+      const header = screen.getByRole('banner', { name: 'Pane: My Terminal' })
+      expect(header).toHaveAttribute('data-context', 'pane-header')
+      expect(header).toHaveAttribute('data-tab-id', 'tab-header')
+      expect(header).toHaveAttribute('data-pane-id', 'pane-header')
+    })
+
     it('renders status indicator', () => {
       render(
         <PaneHeader
