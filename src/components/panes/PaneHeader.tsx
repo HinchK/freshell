@@ -126,6 +126,8 @@ export default function PaneHeader({
           : isActive ? 'bg-muted' : 'bg-muted/50 text-muted-foreground'
       )}
       data-context={ContextIds.PaneHeader}
+      data-tab-id={tabId}
+      data-pane-id={paneId}
       onDoubleClick={isRenaming ? undefined : onDoubleClick}
       role="banner"
       aria-label={`Pane: ${title}`}

@@ -54,6 +54,35 @@ describe('parseContextTarget', () => {
     expect(result).toEqual({ kind: 'tab', tabId: 'tab-1' })
   })
 
+  it('parseContextTarget for PaneHeader returns the exact pane target', () => {
+    const result = parseContextTarget(ContextIds.PaneHeader, {
+      tabId: 'tab-header',
+      paneId: 'pane-header',
+    })
+
+    expect(result).toEqual({
+      kind: 'pane',
+      tabId: 'tab-header',
+      paneId: 'pane-header',
+    })
+  })
+
+  it('parseContextTarget for PaneHeader returns null when tabId is missing', () => {
+    const result = parseContextTarget(ContextIds.PaneHeader, {
+      paneId: 'pane-header',
+    })
+
+    expect(result).toBeNull()
+  })
+
+  it('parseContextTarget for PaneHeader returns null when paneId is missing', () => {
+    const result = parseContextTarget(ContextIds.PaneHeader, {
+      tabId: 'tab-header',
+    })
+
+    expect(result).toBeNull()
+  })
+
   it('parseContextTarget for FreshAgent preserves pane and session flavor identity', () => {
     const result = parseContextTarget(ContextIds.FreshAgent, {
       tabId: 'tab-1',
