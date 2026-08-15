@@ -1446,11 +1446,14 @@ async fn main() -> ExitCode {
     // The fresh-agent thread-snapshot REST endpoint (Batch D PR-5): `GET
     // /api/fresh-agent/threads/:sessionType/:provider/:threadId`, the SPA's
     // `commitSnapshot` read path (`src/lib/api.ts:312` `getFreshAgentThreadSnapshot`).
-    // Shares the already-constructed codex/opencode slices -- no new session state.
+    // Shares the already-constructed codex/opencode/claude slices -- no new session
+    // state. The claude slice feeds the Task 3 live-pending overlay (cards survive
+    // reload: `capabilities.approvals/questions` + `pendingApprovals/pendingQuestions`).
     let snapshot_state = freshell_freshagent::SnapshotState::new(
         Arc::clone(&auth_token),
         fresh_codex_state.clone(),
         fresh_agent_state.clone(),
+        fresh_claude_state.clone(),
     );
 
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +

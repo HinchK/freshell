@@ -30,7 +30,10 @@
 //! their live runtime slices, while **freshclaude/claude** and **kilroy/claude** are a
 //! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
 //! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
-//! required, so snapshots survive a server restart. A missing transcript is a positive
+//! required, so snapshots survive a server restart. When the session is LIVE, the route
+//! overlays its folded pending approvals/questions onto the disk-built JSON and flips the
+//! presence-of-pending `capabilities` gates (reload-while-pending — Task 3, matching
+//! `normalize.ts:186-204, 226-232`). A missing transcript is a positive
 //! denial: 404 with `code:'FRESH_AGENT_LOST_SESSION'` (the codex/opencode convention); a
 //! read failure is a 500. An outright invalid enum member (e.g. `sessionType=bogus`) is a
 //! 400, mirroring the reference's `ThreadParamsSchema.safeParse` failure (`router.ts:181-186`).
@@ -47,6 +50,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::claude::FreshClaudeState;
 use crate::codex::{CodexSnapshotError, FreshCodexState};
 use crate::{FreshAgentState, OpencodeSnapshotError};
 
@@ -55,21 +59,29 @@ const VALID_SESSION_TYPES: &[&str] = &["freshclaude", "freshcodex", "kilroy", "f
 /// `FreshAgentRuntimeProviderSchema` (`fresh-agent-contract.ts:4`).
 const VALID_PROVIDERS: &[&str] = &["claude", "codex", "opencode"];
 
-/// Shared, cheaply-cloneable state for the snapshot endpoint: the auth token plus the two
-/// provider slices this port can actually build a snapshot from.
+/// Shared, cheaply-cloneable state for the snapshot endpoint: the auth token plus the
+/// three provider slices this port builds snapshots from (claude included — its live
+/// pending approvals/questions overlay the disk-built snapshot, Task 3).
 #[derive(Clone)]
 pub struct SnapshotState {
     auth_token: Arc<String>,
     codex: FreshCodexState,
     opencode: FreshAgentState,
+    claude: FreshClaudeState,
 }
 
 impl SnapshotState {
-    pub fn new(auth_token: Arc<String>, codex: FreshCodexState, opencode: FreshAgentState) -> Self {
+    pub fn new(
+        auth_token: Arc<String>,
+        codex: FreshCodexState,
+        opencode: FreshAgentState,
+        claude: FreshClaudeState,
+    ) -> Self {
         Self {
             auth_token,
             codex,
             opencode,
+            claude,
         }
     }
 }
@@ -130,9 +142,27 @@ async fn get_snapshot(
                 }
             }
         }
+        // One arm serves both session types (the SAME overlay logic — kilroy rides the
+        // claude path): overlays populate + gates flip identically, only the stamped
+        // `sessionType` differs.
         ("freshclaude", "claude") | ("kilroy", "claude") => {
             match crate::claude_snapshot::get_claude_snapshot(&session_type, &thread_id).await {
-                Ok(snapshot) => Json(snapshot).into_response(),
+                Ok(mut snapshot) => {
+                    // Task 3 (reload-while-pending): overlay the session's LIVE pending
+                    // approvals/questions and flip the presence-of-pending gates
+                    // (`normalize.ts:186-204, 226-232`). The thread id resolves through
+                    // `cli_index` like every claude handler; an untracked id (e.g. a
+                    // disk-only read after restart) yields an empty overlay = strict
+                    // no-op, byte-identical to the pre-overlay output.
+                    let (approvals, questions) =
+                        state.claude.snapshot_pending_overlay(&thread_id).await;
+                    crate::claude_snapshot::apply_pending_overlay(
+                        &mut snapshot,
+                        approvals,
+                        questions,
+                    );
+                    Json(snapshot).into_response()
+                }
                 Err(crate::claude_snapshot::ClaudeSnapshotError::NotFound) => fail_with_code(
                     StatusCode::NOT_FOUND,
                     format!("claude session {thread_id} not found"),
@@ -223,8 +253,17 @@ mod tests {
         )
     }
 
+    fn claude_state() -> FreshClaudeState {
+        FreshClaudeState::new(Arc::new(tokio::sync::broadcast::channel::<String>(64).0))
+    }
+
     fn snapshot_state() -> SnapshotState {
-        SnapshotState::new(Arc::new("tok".to_string()), codex_state(), opencode_state())
+        SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude_state(),
+        )
     }
 
     fn headers_with_token(token: &str) -> HeaderMap {
@@ -347,6 +386,183 @@ mod tests {
         assert_eq!(body["code"], "FRESH_AGENT_LOST_SESSION");
     }
 
+    /// Write a one-user-turn transcript for `durable` under a temp claude store root and
+    /// point `CLAUDE_CONFIG_DIR` (the FIRST candidate root) at it. Returns the tempdir
+    /// guard + the exact content written (the empty-shape test rebuilds its expectation
+    /// from it).
+    fn stage_transcript(durable: &str) -> (tempfile::TempDir, &'static str) {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects").join("-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = r#"{"type":"user","timestamp":"2026-08-15T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#;
+        std::fs::write(dir.join(format!("{durable}.jsonl")), content).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        (home, content)
+    }
+
+    /// Authorized GET against an explicit [`SnapshotState`] (the overlay tests stage a
+    /// live claude session, so the no-live-claude `get_json` helper cannot serve them).
+    async fn get_json_with_state(
+        state: SnapshotState,
+        session_type: &str,
+        thread_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = get_snapshot(
+            State(state),
+            Path((
+                session_type.to_string(),
+                "claude".to_string(),
+                thread_id.to_string(),
+            )),
+            Query(HashMap::new()),
+            headers_with_token("tok"),
+        )
+        .await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Task 3 (reload-while-pending): a live claude session's folded pending
+    /// approvals/questions overlay the disk-built snapshot — `pendingApprovals`/
+    /// `pendingQuestions` populated with the exact `.strict()` contract entry keys
+    /// (object equality pins the KEY SET: no extras, no missing) and the
+    /// presence-of-pending gates flipped (`normalize.ts:186-204, 226-232`). Addressed by
+    /// the DURABLE UUID (the `cli_index` alias), the id a live pane's GET carries.
+    #[tokio::test]
+    async fn claude_locator_overlays_live_pending_and_flips_capability_gates() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let durable = "81818181-8181-4818-8818-818181818181";
+        let (_home, _content) = stage_transcript(durable);
+        let claude = claude_state();
+        crate::claude::tests::insert_fake_claude_session_with_pending(
+            &claude,
+            "client-nanoid-9",
+            Some(durable),
+            &[
+                json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-1",
+                        "subtype": "can_use_tool",
+                        "tool": { "name": "Bash", "input": { "command": "ls" } },
+                        "toolUseID": "toolu_1", "blockedPath": "/repo/.env",
+                        "decisionReason": "command requires approval" }),
+                json!({ "type": "sdk.question.request", "sessionId": "s", "requestId": "q-1",
+                        "questions": [{ "question": "Continue?", "header": "Confirm" }] }),
+            ],
+        )
+        .await;
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["sessionType"], json!("freshclaude"));
+        assert_eq!(
+            value["pendingApprovals"],
+            json!([{
+                "requestId": "req-1", "toolName": "Bash", "toolUseID": "toolu_1",
+                "blockedPath": "/repo/.env", "decisionReason": "command requires approval",
+                "input": { "command": "ls" },
+            }]),
+            "exact `.strict()` entry keys ({{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?}}) — no extras, omitted-when-absent"
+        );
+        assert_eq!(
+            value["pendingQuestions"],
+            json!([{
+                "requestId": "q-1",
+                "questions": [{ "question": "Continue?", "header": "Confirm" }],
+            }])
+        );
+        assert_eq!(value["capabilities"]["approvals"], json!(true));
+        assert_eq!(value["capabilities"]["questions"], json!(true));
+    }
+
+    /// Task 3: kilroy rides the SAME claude overlay path — live pending overlays, the
+    /// gate flips, and `sessionType` keeps the kilroy flavour (AGENT-24's ride-through).
+    #[tokio::test]
+    async fn kilroy_locator_overlays_live_pending_with_kilroy_session_type() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let durable = "82828282-8282-4828-8828-828282828282";
+        let (_home, _content) = stage_transcript(durable);
+        let claude = claude_state();
+        crate::claude::tests::insert_fake_claude_session_with_pending(
+            &claude,
+            "client-nanoid-10",
+            Some(durable),
+            &[
+                json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-7",
+                      "subtype": "can_use_tool",
+                      "tool": { "name": "Read", "input": { "file_path": "/a" } },
+                      "toolUseID": "toolu_7" }),
+            ],
+        )
+        .await;
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "kilroy", durable).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["sessionType"], json!("kilroy"));
+        assert_eq!(
+            value["pendingApprovals"],
+            json!([{
+                "requestId": "req-7", "toolName": "Read", "toolUseID": "toolu_7",
+                "input": { "file_path": "/a" },
+            }])
+        );
+        assert!(value["pendingQuestions"].as_array().unwrap().is_empty());
+        // Per-kind gate independence: approvals flip, questions stay false.
+        assert_eq!(value["capabilities"]["approvals"], json!(true));
+        assert_eq!(value["capabilities"]["questions"], json!(false));
+    }
+
+    /// Task 3: a live session with NOTHING pending must keep the exact pre-overlay
+    /// response shape (fields/values) — reload-while-idle is unchanged, and the golden
+    /// FIXTURE (`builder_output_matches_the_golden_snapshot_fixture`) stays untouched.
+    #[tokio::test]
+    async fn claude_locator_with_a_live_but_empty_pending_set_keeps_the_empty_shape() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let durable = "83838383-8383-4838-8838-838383838383";
+        let (_home, content) = stage_transcript(durable);
+        let claude = claude_state();
+        crate::claude::tests::insert_fake_claude_session_with_pending(
+            &claude,
+            "client-nanoid-11",
+            Some(durable),
+            &[],
+        )
+        .await;
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        let mut expected =
+            crate::claude_snapshot::build_claude_snapshot_json("freshclaude", durable, content, 0);
+        // `revision` is transcript-mtime-derived — not the shape under test.
+        expected["revision"] = value["revision"].clone();
+        assert_eq!(
+            value, expected,
+            "empty pending ⇒ byte-shape identical to the pre-overlay builder output"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_codex_thread_is_404_with_lost_session_code() {
         // `get_snapshot` now attempts ensure-runtime-on-demand for a thread outside the live
@@ -405,7 +621,12 @@ mod tests {
         codex
             .insert_session_for_test("thread-1", client, None)
             .await;
-        let state = SnapshotState::new(Arc::new("tok".to_string()), codex, opencode_state());
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex,
+            opencode_state(),
+            claude_state(),
+        );
 
         let driver = tokio::spawn(async move {
             get_snapshot(
@@ -531,7 +752,12 @@ mod tests {
             .expect("healthy fake serve starts");
         opencode.set_manager_for_test(manager).await;
 
-        let state = SnapshotState::new(Arc::new("tok".to_string()), codex_state(), opencode);
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode,
+            claude_state(),
+        );
         let resp = get_snapshot(
             State(state),
             Path((

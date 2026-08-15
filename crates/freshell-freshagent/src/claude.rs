@@ -940,7 +940,6 @@ impl FreshClaudeState {
     /// decisionReason?, input?}` / `{requestId, questions}`, no extra keys, absent keys
     /// omitted). `any_id` resolves like every handler here: the map key OR the durable
     /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
-    #[allow(dead_code)] // Task 2 folds + responds through this state; Task 3 reads it.
     pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
         let Some(map_key) = self.resolve_session_key(any_id).await else {
             return (Vec::new(), Vec::new());
@@ -2015,6 +2014,33 @@ pub(crate) mod tests {
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
             },
         );
+    }
+
+    /// Task 3: insert a fake session AND stage its pending set by folding raw `sdk.*`
+    /// lines through the PRODUCTION fold ([`fold_pending_frame`]) — the snapshot.rs
+    /// route tests address the overlay this way. `durable` (when `Some`) registers the
+    /// `cli_index` alias so the route's durable-id resolution (`resolve_session_key`)
+    /// finds the session, exactly as a live post-init session is reachable.
+    pub(crate) async fn insert_fake_claude_session_with_pending(
+        st: &FreshClaudeState,
+        map_key: &str,
+        durable: Option<&str>,
+        frames: &[Value],
+    ) {
+        insert_fake_claude_session(st, map_key).await;
+        if let Some(durable) = durable {
+            st.cli_index
+                .lock()
+                .await
+                .insert(durable.to_string(), map_key.to_string());
+        }
+        let pending = {
+            let sessions = st.sessions.lock().await;
+            Arc::clone(&sessions[map_key].pending)
+        };
+        for frame in frames {
+            fold_pending_frame(&pending, frame);
+        }
     }
 
     /// P0.2 slice 1 (restart-resilience §2.8): an attach for a session this process does
