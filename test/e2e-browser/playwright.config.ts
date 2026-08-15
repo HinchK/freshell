@@ -277,6 +277,10 @@ export const RUST_ONLY_SPECS = [
   // layout into), so they only ever run under the rust-chromium project.
   /automation-layout-rust\.spec\.ts$/,
   /git-badges-rust\.spec\.ts$/,
+  // SESSION-02/03 soft delete + unmatched-/api/* 404-JSON contract wall:
+  // owns its RustServer (isolated HOME, ephemeral port); the DELETE route
+  // exists only on the Rust server.
+  /session-delete-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -510,6 +514,9 @@ export default defineConfig({
         // persistence, Tasks 17-18). Covers git badge parity for
         // REST-created terminals via FreshAgentState post-create seeding.
         /git-badges-rust\.spec\.ts$/,
+        // SESSION-02/03 -- soft-delete route + unmatched-/api/* 404-JSON
+        // contract wall (see RUST_ONLY_SPECS entry + the spec's doc comment).
+        /session-delete-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
