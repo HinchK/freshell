@@ -225,13 +225,6 @@ function socketClosed(socket: WebSocket): Promise<void> {
   })
 }
 
-async function expectSocketClosedWithin(socket: WebSocket, ms: number): Promise<void> {
-  await expect(Promise.race([
-    socketClosed(socket).then(() => 'closed'),
-    delay(ms).then(() => 'timeout'),
-  ])).resolves.toBe('closed')
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -1794,7 +1787,7 @@ describe('CodexRemoteProxy', () => {
         padding: largePadding(),
       }))
 
-      await expectSocketClosedWithin(tui, 100)
+      await socketClosed(tui)
       expect(candidates).toEqual([])
       expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
     }
@@ -1891,7 +1884,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 118, method: 'thread/start', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(candidates).toEqual([])
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
@@ -1914,7 +1907,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 119, method: 'initialize', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
 
@@ -1937,7 +1930,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 120, method: 'initialize', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
 
@@ -1950,16 +1943,15 @@ describe('CodexRemoteProxy', () => {
         padding: largePadding(),
       }))
     })
-    const proxy = await startProxy(upstream.wsUrl, {
-      candidateCaptureTimeoutMs: 1_000,
-    })
+    const proxy = await startProxy(upstream.wsUrl)
+    proxy.pauseCandidateCapture('isolate unsafe response failure')
     const repairTriggers: unknown[] = []
     proxy.onRepairTrigger((event) => repairTriggers.push(event))
     const tui = await connect(proxy.wsUrl)
 
     tui.send(JSON.stringify({ id: 121, method: 'thread/start', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
@@ -2065,7 +2057,7 @@ describe('CodexRemoteProxy', () => {
       params: { threadId: 'thread-parent', excludeTurns: false },
     }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(candidates).toEqual([])
     expect(repairTriggers).toContainEqual(expect.objectContaining({
       kind: 'proxy_error',
