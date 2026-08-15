@@ -55,8 +55,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
+    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond,
     FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
@@ -124,6 +125,60 @@ struct ClaudeCreateRecord {
     session_id: String,
 }
 
+/// The per-session pending approval/question set folded from the sidecar's stdout
+/// stream (Task 2). Feeds the respond handlers' membership check and the Task 3
+/// snapshot overlay. Lives behind a shared handle (the `broadcast_id` precedent): the
+/// detached stdout consumer folds into it while the respond handlers read/mutate it.
+/// Session eviction on EOF/exit drops the Arc with the record — no extra handling.
+#[derive(Default)]
+struct ClaudePending {
+    permissions: Vec<PendingApprovalEntry>,
+    questions: Vec<PendingQuestionEntry>,
+}
+
+/// One pending claude approval (an `sdk.permission.request` not yet answered/cancelled),
+/// capturing the contract fields the Task 3 snapshot overlay serializes.
+struct PendingApprovalEntry {
+    request_id: String,
+    tool_name: Option<String>,
+    tool_use_id: Option<String>,
+    blocked_path: Option<String>,
+    decision_reason: Option<String>,
+    input: Option<Value>,
+}
+
+impl PendingApprovalEntry {
+    /// The `.strict()` contract shape the Task 3 snapshot overlay serializes
+    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?}` —
+    /// keys omitted when absent, never null).
+    fn to_json(&self) -> Value {
+        let mut obj = Map::new();
+        obj.insert("requestId".to_string(), json!(self.request_id));
+        if let Some(tool_name) = &self.tool_name {
+            obj.insert("toolName".to_string(), json!(tool_name));
+        }
+        if let Some(tool_use_id) = &self.tool_use_id {
+            obj.insert("toolUseID".to_string(), json!(tool_use_id));
+        }
+        if let Some(blocked_path) = &self.blocked_path {
+            obj.insert("blockedPath".to_string(), json!(blocked_path));
+        }
+        if let Some(decision_reason) = &self.decision_reason {
+            obj.insert("decisionReason".to_string(), json!(decision_reason));
+        }
+        if let Some(input) = &self.input {
+            obj.insert("input".to_string(), input.clone());
+        }
+        Value::Object(obj)
+    }
+}
+
+/// One pending provider question (`sdk.question.request`, the AskUserQuestion tool).
+struct PendingQuestionEntry {
+    request_id: String,
+    questions: Value,
+}
+
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
@@ -151,6 +206,8 @@ struct ClaudeSession {
     /// the pane keyed on the durable receives events. A shared mutable handle because
     /// the consumer task runs detached from this record.
     broadcast_id: Arc<std::sync::Mutex<String>>,
+    /// The folded pending approval/question set (Task 2) — see [`ClaudePending`].
+    pending: Arc<std::sync::Mutex<ClaudePending>>,
 }
 
 impl FreshClaudeState {
@@ -420,9 +477,11 @@ impl FreshClaudeState {
             }
         };
 
-        // Start the stdout consumer (the completion edge normalization lives here).
-        // `Some(settings)` => the consumer records a binding row at `sdk.session.init`.
+        // Start the stdout consumer (the completion edge normalization + the Task 2
+        // pending-set fold live here). `Some(settings)` => the consumer records a
+        // binding row at `sdk.session.init`.
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -430,6 +489,7 @@ impl FreshClaudeState {
             created.clone(),
             Some(settings),
             Arc::clone(&broadcast_id),
+            Arc::clone(&pending),
         );
 
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
@@ -453,6 +513,7 @@ impl FreshClaudeState {
                 sidecar_session_id: created.clone(),
                 cli_session_id: resume_sid.clone(),
                 broadcast_id,
+                pending,
             },
         );
 
@@ -698,6 +759,208 @@ impl FreshClaudeState {
                 submitted_turn_id: None,
             },
         ));
+    }
+
+    // ── freshAgent.approval.respond / question.respond / compact (WS, Task 2) ─────────
+
+    /// The shared Task 2 handler prologue: resolve the client-addressed id to the
+    /// sessions-map key (`resolve_session_key` discipline — map key OR durable UUID via
+    /// `cli_index`) and take a session-scoped guard for the sidecar write. A miss at
+    /// either step broadcasts the nested `INVALID_SESSION_ID` lost-session envelope
+    /// (engaging the client's recovery) and yields `None`.
+    async fn respond_session_guard(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+    ) -> Option<tokio::sync::MappedMutexGuard<'_, ClaudeSession>> {
+        let Some(map_key) = self.resolve_session_key(session_id).await else {
+            self.broadcast(&lost_session_frame(session_id, session_type));
+            return None;
+        };
+        let guard = self.sessions.lock().await;
+        if !guard.contains_key(&map_key) {
+            drop(guard);
+            self.broadcast(&lost_session_frame(session_id, session_type));
+            return None;
+        }
+        Some(tokio::sync::MutexGuard::map(guard, |map| {
+            map.get_mut(&map_key).expect("key checked above")
+        }))
+    }
+
+    /// Handle a `freshAgent.approval.respond` for claude/kilroy: forward a
+    /// `permission.respond` request to the owned sidecar with the decision payload
+    /// VERBATIM (a defined `updatedInput` wholesale replaces tool input — never
+    /// synthesize one), resolving the parked SDK promise (`permission-channel.mjs
+    /// respondPermission`). Every failure answers on the NESTED
+    /// `freshAgent.event{freshAgent.error}` envelope (the client only surfaces top-level
+    /// errors correlated with a pending send, which these control frames never
+    /// establish): unknown session → `INVALID_SESSION_ID` (engages the lost-session
+    /// recovery); a requestId outside the pending set → `INTERNAL_ERROR` with the parity
+    /// message (`adapter.ts:192`). WRITE-THEN-REMOVE (fresh-eyes F3): the pending entry
+    /// is removed only after the sidecar write's flush succeeds, so a failed write
+    /// leaves the card actionable (the user can retry) — never clear-then-fail.
+    pub async fn handle_approval_respond(&self, msg: FreshAgentApprovalRespond) {
+        let session_id = msg.session_id.clone();
+        let session_type = session_type_str(msg.session_type);
+        let request_id = request_id_string(&msg.request_id);
+
+        let Some(mut session) = self
+            .respond_session_guard(&session_id, msg.session_type)
+            .await
+        else {
+            return;
+        };
+        if !session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .permissions
+            .iter()
+            .any(|p| p.request_id == request_id)
+        {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INTERNAL_ERROR",
+                &format!("Claude approval {request_id} is not available"),
+            );
+            return;
+        }
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
+        let respond_req = json!({
+            "type": "permission.respond",
+            "sessionId": session.sidecar_session_id,
+            "requestId": request_id,
+            "decision": msg.decision,
+        });
+        if let Err(err) = write_line(&mut session.stdin, &respond_req).await {
+            drop(session);
+            self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
+            return;
+        }
+        session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .permissions
+            .retain(|p| p.request_id != request_id);
+    }
+
+    /// Handle a `freshAgent.question.respond` for claude/kilroy: identical ordering
+    /// discipline to [`Self::handle_approval_respond`]; the frame is
+    /// `question.respond` with the answers as a JSON object (the sidecar wraps them
+    /// into the SDK-shaped `updatedInput`, `permission-channel.mjs respondQuestion`).
+    pub async fn handle_question_respond(&self, msg: FreshAgentQuestionRespond) {
+        let session_id = msg.session_id.clone();
+        let session_type = session_type_str(msg.session_type);
+        let request_id = request_id_string(&msg.request_id);
+
+        let Some(mut session) = self
+            .respond_session_guard(&session_id, msg.session_type)
+            .await
+        else {
+            return;
+        };
+        if !session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .questions
+            .iter()
+            .any(|q| q.request_id == request_id)
+        {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INTERNAL_ERROR",
+                &format!("Claude question {request_id} is not available"),
+            );
+            return;
+        }
+        let answers: Map<String, Value> = msg
+            .answers
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+        let respond_req = json!({
+            "type": "question.respond",
+            "sessionId": session.sidecar_session_id,
+            "requestId": request_id,
+            "answers": Value::Object(answers),
+        });
+        if let Err(err) = write_line(&mut session.stdin, &respond_req).await {
+            drop(session);
+            self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
+            return;
+        }
+        session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .questions
+            .retain(|q| q.request_id != request_id);
+    }
+
+    /// Handle a `freshAgent.compact` for claude/kilroy: write the legacy adapter's plain
+    /// user-turn shape (`adapter.ts:168-174`) — `/compact`, or `/compact <instructions
+    /// trimmed>` when instructions are present. NO ack frame (compact does not reuse
+    /// `handle_send`'s send.accepted broadcast; the turn is observable through the
+    /// normal `sdk.*` stream).
+    pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        let session_id = msg.session_id.clone();
+        let session_type = session_type_str(msg.session_type);
+
+        let Some(mut session) = self
+            .respond_session_guard(&session_id, msg.session_type)
+            .await
+        else {
+            return;
+        };
+        let text = match msg.instructions.as_deref().map(str::trim) {
+            Some(instructions) if !instructions.is_empty() => {
+                format!("/compact {instructions}")
+            }
+            _ => "/compact".to_string(),
+        };
+        let send_req =
+            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
+        if let Err(err) = write_line(&mut session.stdin, &send_req).await {
+            drop(session);
+            self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
+        }
+    }
+
+    /// The session's live pending approvals + questions as overlay JSON (approvals,
+    /// questions) — Task 3's snapshot route consumes this. Entry keys are exactly the
+    /// `.strict()` contract shape (`{requestId, toolName?, toolUseID?, blockedPath?,
+    /// decisionReason?, input?}` / `{requestId, questions}`, no extra keys, absent keys
+    /// omitted). `any_id` resolves like every handler here: the map key OR the durable
+    /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
+    #[allow(dead_code)] // Task 2 folds + responds through this state; Task 3 reads it.
+    pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
+        let Some(map_key) = self.resolve_session_key(any_id).await else {
+            return (Vec::new(), Vec::new());
+        };
+        let guard = self.sessions.lock().await;
+        let Some(session) = guard.get(&map_key) else {
+            return (Vec::new(), Vec::new());
+        };
+        let pending = session.pending.lock().expect("pending lock");
+        let approvals = pending
+            .permissions
+            .iter()
+            .map(PendingApprovalEntry::to_json)
+            .collect();
+        let questions = pending
+            .questions
+            .iter()
+            .map(|q| json!({ "requestId": q.request_id, "questions": q.questions }))
+            .collect();
+        (approvals, questions)
     }
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
@@ -1020,6 +1283,7 @@ impl FreshClaudeState {
         // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
         // records nothing (no laundered blank row under the new id, V7/A10).
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -1027,6 +1291,7 @@ impl FreshClaudeState {
             sidecar_session_id.clone(),
             recovered,
             Arc::clone(&broadcast_id),
+            Arc::clone(&pending),
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
@@ -1038,6 +1303,7 @@ impl FreshClaudeState {
                 sidecar_session_id,
                 cli_session_id: Some(durable.to_string()),
                 broadcast_id,
+                pending,
             },
         );
         self.cli_index
@@ -1106,6 +1372,10 @@ impl FreshClaudeState {
     /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
     /// `broadcast_id` (Task 10b): the shared envelope-stamp handle read PER EVENT --
     /// starts as the map key; an attach-by-durable rebind flips it to the durable id.
+    /// `pending` (Task 2): the shared pending approval/question handle the consumer
+    /// folds `sdk.permission.*`/`sdk.question.*` lines into BEFORE the normalize/
+    /// broadcast step (so a respond racing the event never sees stale membership).
+    #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -1114,6 +1384,7 @@ impl FreshClaudeState {
         sidecar_session_id: String,
         settings: Option<crate::identity_sink::FreshAgentSettings>,
         broadcast_id: Arc<std::sync::Mutex<String>>,
+        pending: Arc<std::sync::Mutex<ClaudePending>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
@@ -1129,6 +1400,10 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                // Task 2: fold the pending approval/question state BEFORE the
+                // normalize/broadcast step, so a respond racing the event never
+                // observes a stale membership check.
+                fold_pending_frame(&pending, &value);
                 // Restart-parity (plan §2.8 item 2): record the durable Claude UUID.
                 // The index insert is load-bearing; the session-field copy is
                 // best-effort (the map entry may not exist yet during create).
@@ -1245,6 +1520,90 @@ impl FreshClaudeState {
     }
 }
 
+// ── pending-set fold (Task 2) ────────────────────────────────────────────────────────────
+
+/// Fold one sidecar line into the session's pending approval/question state:
+/// `sdk.permission.request`/`sdk.question.request` PUSH (resend of the same requestId
+/// REPLACES — de-dupe), `sdk.permission.cancelled`/`sdk.question.cancelled` REMOVE.
+/// Every other line is a no-op here. The cancelled frames are additionally forwarded
+/// to the client (see `normalize_sdk_type`) — the fold never suppresses a broadcast.
+fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
+    let Some(sdk_type) = value.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    match sdk_type {
+        "sdk.permission.request" => {
+            let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
+                return;
+            };
+            let entry = PendingApprovalEntry {
+                request_id,
+                tool_name: value
+                    .get("tool")
+                    .and_then(|t| t.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                tool_use_id: value
+                    .get("toolUseID")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                blocked_path: value
+                    .get("blockedPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                decision_reason: value
+                    .get("decisionReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                input: value.get("tool").and_then(|t| t.get("input")).cloned(),
+            };
+            let mut p = pending.lock().expect("pending lock");
+            p.permissions.retain(|e| e.request_id != entry.request_id);
+            p.permissions.push(entry);
+        }
+        "sdk.permission.cancelled" => {
+            if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
+                pending
+                    .lock()
+                    .expect("pending lock")
+                    .permissions
+                    .retain(|e| e.request_id != request_id);
+            }
+        }
+        "sdk.question.request" => {
+            let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
+                return;
+            };
+            let entry = PendingQuestionEntry {
+                request_id,
+                questions: value.get("questions").cloned().unwrap_or(Value::Null),
+            };
+            let mut p = pending.lock().expect("pending lock");
+            p.questions.retain(|e| e.request_id != entry.request_id);
+            p.questions.push(entry);
+        }
+        "sdk.question.cancelled" => {
+            if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
+                pending
+                    .lock()
+                    .expect("pending lock")
+                    .questions
+                    .retain(|e| e.request_id != request_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A sidecar frame's `requestId` as a string (the sidecar mints nanoid strings; tolerate
+/// numeric ids so a non-string id can't wedge the fold).
+fn frame_request_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+}
+
 // ── sdk.* → freshAgent.event frame (port of sdk-events.ts normalizeFreshAgentProviderEvent) ─
 
 /// Map an `sdk.*` event line from the sidecar to a `freshAgent.event` wire frame. Renames
@@ -1284,6 +1643,10 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.permission.request" => "freshAgent.permission.request",
         "sdk.permission.cancelled" => "freshAgent.permission.cancelled",
         "sdk.question.request" => "freshAgent.question.request",
+        // Task 2 (fresh-eyes round-3 F3): forwarded, not dropped — the client folds
+        // freshAgent.question.cancelled into removeQuestion (card clear on
+        // provider-originated cancellation).
+        "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
         "sdk.turn.complete" => "freshAgent.turn.complete",
         "sdk.turn.waiting" => "freshAgent.turn.waiting",
@@ -1301,6 +1664,16 @@ fn session_type_str(session_type: SessionType) -> &'static str {
     match session_type {
         SessionType::Kilroy => "kilroy",
         _ => "freshclaude",
+    }
+}
+
+/// The approval/question respond `requestId` as a string (the wire type is
+/// `string | number`; the pending fold keys on the sidecar-minted nanoid string, so a
+/// numeric respond id can still match its entry).
+fn request_id_string(request_id: &freshell_protocol::StringOrNumber) -> String {
+    match request_id {
+        freshell_protocol::StringOrNumber::Str(s) => s.clone(),
+        freshell_protocol::StringOrNumber::Num(n) => n.to_string(),
     }
 }
 
@@ -1639,6 +2012,7 @@ pub(crate) mod tests {
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+                pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
             },
         );
     }
@@ -1934,6 +2308,26 @@ pub(crate) mod tests {
             normalize_sdk_type("sdk.turn.waiting"),
             Some("freshAgent.turn.waiting")
         );
+        // Task 2 (g): the pending-state family is forwarded too — including
+        // sdk.question.cancelled (fresh-eyes round-3 F3 REPLACED the earlier "keep it
+        // dropped" plan: the client folds freshAgent.question.cancelled into
+        // removeQuestion, so a provider-cancelled question must reach it to clear the card).
+        assert_eq!(
+            normalize_sdk_type("sdk.permission.request"),
+            Some("freshAgent.permission.request")
+        );
+        assert_eq!(
+            normalize_sdk_type("sdk.permission.cancelled"),
+            Some("freshAgent.permission.cancelled")
+        );
+        assert_eq!(
+            normalize_sdk_type("sdk.question.request"),
+            Some("freshAgent.question.request")
+        );
+        assert_eq!(
+            normalize_sdk_type("sdk.question.cancelled"),
+            Some("freshAgent.question.cancelled")
+        );
         // Control + unknown types are NOT surfaced as fresh-agent events.
         assert_eq!(normalize_sdk_type("created"), None);
         assert_eq!(normalize_sdk_type("create.failed"), None);
@@ -2082,13 +2476,18 @@ pub(crate) mod tests {
     /// on `{"type":"interrupt",sessionId}` it appends `sessionId` to
     /// `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` (the observable proxy for "the sidecar's
     /// `query.interrupt()` was actually invoked", mirroring the real sidecar's
-    /// `handleInterrupt`); on `{"type":"shutdown"}` it exits. `send` is intentionally
-    /// unhandled -- the dedup tests never exercise it.
+    /// `handleInterrupt`); on `{"type":"shutdown"}` it exits. Task 2 arms: a magic send
+    /// of `__raise_permission__` emits a canned `sdk.permission.request` (the canUseTool
+    /// stand-in — the fake parks nothing), and `permission.respond`/`question.respond`/
+    /// non-magic `send` frames append the full received line to
+    /// `FRESHELL_TEST_CLAUDE_RESPOND_LOG` (the assertion surface for the respond/compact
+    /// handlers' exact stdin frame shapes).
     const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import readline from 'node:readline'
 
 const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
+const respondLog = process.env.FRESHELL_TEST_CLAUDE_RESPOND_LOG
 
 let counter = 0
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
@@ -2119,6 +2518,26 @@ rl.on('line', (line) => {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
     if (msg.text === '__exit__') process.exit(0)
+    // Task 2 test hook: raise a canned pending permission the approve/deny flow can
+    // respond to. The fake parks nothing — Rust's pending fold is the state under test.
+    if (msg.text === '__raise_permission__') {
+      process.stdout.write(JSON.stringify({
+        type: 'sdk.permission.request',
+        sessionId: msg.sessionId,
+        requestId: 'req-1',
+        subtype: 'can_use_tool',
+        tool: { name: 'Bash', input: { command: 'ls' } },
+        toolUseID: 'toolu_fake_1',
+        blockedPath: null,
+        decisionReason: null,
+      }) + '\n')
+    } else if (respondLog) {
+      // Non-magic sends (e.g. `/compact …`) land in the respond log verbatim so
+      // tests can assert the exact stdin frame shape the compact handler writes.
+      fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
+    }
+  } else if (msg.type === 'permission.respond' || msg.type === 'question.respond') {
+    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
   } else if (msg.type === 'interrupt') {
     const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
@@ -2136,6 +2555,7 @@ rl.on('line', (line) => {
         dir: PathBuf,
         spawn_log: PathBuf,
         interrupt_log: PathBuf,
+        respond_log: PathBuf,
     }
     impl FakeClaudeSidecarEnv {
         fn install() -> Self {
@@ -2150,14 +2570,18 @@ rl.on('line', (line) => {
             std::fs::write(&spawn_log, "").expect("init spawn log");
             let interrupt_log = dir.join("interrupt.log");
             std::fs::write(&interrupt_log, "").expect("init interrupt log");
+            let respond_log = dir.join("respond.log");
+            std::fs::write(&respond_log, "").expect("init respond log");
             std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
             std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
             std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
             std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
+            std::env::set_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG", &respond_log);
             Self {
                 dir,
                 spawn_log,
                 interrupt_log,
+                respond_log,
             }
         }
 
@@ -2180,12 +2604,38 @@ rl.on('line', (line) => {
         fn interrupt_log_contents(&self) -> String {
             std::fs::read_to_string(&self.interrupt_log).unwrap_or_default()
         }
+
+        /// The parsed respond-log lines (one full JSON frame per line the fake sidecar
+        /// received a `permission.respond` / `question.respond` / non-magic `send`
+        /// request for). Bounded-waits for at least `min` lines so the assertion reads
+        /// AFTER the sidecar's append, never racing it.
+        async fn respond_log_frames(&self, min: usize) -> Vec<Value> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let frames: Vec<Value> = std::fs::read_to_string(&self.respond_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| serde_json::from_str(l).expect("respond log line is JSON"))
+                    .collect();
+                if frames.len() >= min {
+                    return frames;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "respond log never reached {min} frame(s)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
     }
     impl Drop for FakeClaudeSidecarEnv {
         fn drop(&mut self) {
             std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
             std::env::remove_var("FRESHELL_CLAUDE_NODE");
             std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
+            std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG");
+            std::env::remove_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG");
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -2400,6 +2850,488 @@ rl.on('line', (line) => {
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
         assert_eq!(frame["sessionId"], "unknown-session");
+    }
+
+    // ── freshAgent.approval.respond / question.respond / compact (Task 2) ─────────
+
+    fn approval_respond_msg(
+        session_id: &str,
+        session_type: SessionType,
+        request_id: &str,
+        decision: Value,
+    ) -> FreshAgentApprovalRespond {
+        FreshAgentApprovalRespond {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type,
+            decision,
+            request_id: freshell_protocol::StringOrNumber::Str(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    fn question_respond_msg(
+        session_id: &str,
+        request_id: &str,
+        answers: &[(&str, &str)],
+    ) -> FreshAgentQuestionRespond {
+        FreshAgentQuestionRespond {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            answers: answers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            request_id: freshell_protocol::StringOrNumber::Str(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    fn compact_msg(session_id: &str, instructions: Option<&str>) -> FreshAgentCompact {
+        FreshAgentCompact {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+            instructions: instructions.map(str::to_string),
+        }
+    }
+
+    /// Read the session's folded pending request ids (permissions, questions).
+    async fn pending_request_ids(
+        st: &FreshClaudeState,
+        session_id: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let guard = st.sessions.lock().await;
+        let session = guard.get(session_id).expect("session tracked");
+        let pending = session.pending.lock().expect("pending lock");
+        (
+            pending
+                .permissions
+                .iter()
+                .map(|p| p.request_id.clone())
+                .collect(),
+            pending
+                .questions
+                .iter()
+                .map(|q| q.request_id.clone())
+                .collect(),
+        )
+    }
+
+    /// Bounded-wait until the consumer has folded a pending `requestId` permission for
+    /// the session (the respond handlers refuse ids outside the pending set, so the
+    /// fold MUST be observed before responding).
+    async fn await_pending_permission(st: &FreshClaudeState, session_id: &str, request_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let (permissions, _) = pending_request_ids(st, session_id).await;
+            if permissions.iter().any(|id| id == request_id) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pending permission {request_id} never folded into the session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Insert a fake session whose sidecar stdin belongs to an already-exited child:
+    /// writes fail DETERMINISTICALLY (EPIPE) without racing the stdout consumer's
+    /// eviction path (a real dead sidecar's consumer would evict the record out from
+    /// under the assertion; this record carries a no-op consumer, so nothing evicts it).
+    async fn insert_dead_stdin_session(
+        st: &FreshClaudeState,
+        session_id: &str,
+        pending: ClaudePending,
+    ) {
+        let mut child = tokio::process::Command::new("true")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn true");
+        let stdin = child.stdin.take().expect("piped stdin");
+        child.wait().await.expect("true exits");
+        let consumer = tokio::spawn(async {});
+        st.sessions.lock().await.insert(
+            session_id.to_string(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id: format!("test-{session_id}"),
+                consumer,
+                sidecar_session_id: session_id.to_string(),
+                cli_session_id: None,
+                broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+                pending: Arc::new(std::sync::Mutex::new(pending)),
+            },
+        );
+    }
+
+    /// Task 2 (a): approve/deny resolves the parked permission — the handler writes the
+    /// exact `permission.respond` stdin frame (sidecar-keyed sessionId, VERBATIM
+    /// decision — a defined updatedInput is forwarded untouched, never synthesized) and
+    /// removes the entry from the pending set.
+    #[tokio::test]
+    async fn approval_respond_writes_the_frame_and_removes_the_pending_entry() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-respond"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-respond").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // consumer folds it into the session's pending set.
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        let decision = json!({ "behavior": "allow", "updatedInput": { "command": "ls -la" } });
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            decision.clone(),
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "permission.respond")
+            .expect("permission.respond frame written to the sidecar");
+        assert_eq!(
+            respond["sessionId"],
+            json!(session_id),
+            "sidecar-keyed sessionId"
+        );
+        assert_eq!(respond["requestId"], "req-1");
+        assert_eq!(
+            respond["decision"], decision,
+            "the decision payload is a VERBATIM passthrough"
+        );
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert!(
+            !permissions.iter().any(|id| id == "req-1"),
+            "the resolved entry leaves the pending set"
+        );
+        drop(env);
+    }
+
+    /// Task 2 (a2, fresh-eyes F3 regression pin): write-then-remove ordering — when the
+    /// sidecar stdin write FAILS, the pending entry MUST stay (the card stays; the user
+    /// can retry) and the failure surfaces via the nested freshAgent.error envelope.
+    /// Never clear-then-fail.
+    #[tokio::test]
+    async fn approval_respond_write_failure_keeps_the_pending_entry_and_emits_the_error() {
+        let (st, mut rx) = state_with_bus();
+        let pending = ClaudePending {
+            permissions: vec![PendingApprovalEntry {
+                request_id: "req-9".to_string(),
+                tool_name: Some("Bash".to_string()),
+                tool_use_id: None,
+                blocked_path: None,
+                decision_reason: None,
+                input: None,
+            }],
+            questions: Vec::new(),
+        };
+        insert_dead_stdin_session(&st, "dead-stdin-approval", pending).await;
+
+        st.handle_approval_respond(approval_respond_msg(
+            "dead-stdin-approval",
+            SessionType::Freshclaude,
+            "req-9",
+            json!({ "behavior": "deny", "message": "no", "interrupt": false }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(frame["sessionId"], "dead-stdin-approval");
+        let (permissions, _) = pending_request_ids(&st, "dead-stdin-approval").await;
+        assert_eq!(
+            permissions,
+            vec!["req-9".to_string()],
+            "a failed write leaves the entry pending (never clear-then-fail)"
+        );
+    }
+
+    /// Task 2 (b): a requestId outside the pending set is refused LOUDLY with the parity
+    /// message on the nested hub-frame — and NOTHING is written to the sidecar (Rust
+    /// validates against its pending set first; the sidecar's unknown-id path is
+    /// stderr-log-only and must never be reached).
+    #[tokio::test]
+    async fn approval_respond_unknown_request_id_emits_parity_error_and_writes_nothing() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-unknown"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-unknown").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-nope",
+            json!({ "behavior": "allow" }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(
+            frame["event"]["message"],
+            "Claude approval req-nope is not available"
+        );
+        assert_eq!(frame["sessionType"], "freshclaude");
+        assert_eq!(frame["sessionId"], json!(session_id));
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a refused respond must never reach the sidecar"
+        );
+        drop(env);
+    }
+
+    /// Task 2 (c): question.respond writes the `question.respond` stdin frame with the
+    /// answers object (Map → JSON object) and removes the pending question.
+    #[tokio::test]
+    async fn question_respond_writes_the_frame_with_the_answers_object() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-question-respond"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-question-respond").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Seed the pending question directly (the consumer fold itself is pinned by
+        // consumer_folds_permission_and_question_frames_into_the_pending_set below).
+        {
+            let guard = st.sessions.lock().await;
+            guard
+                .get(&session_id)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .questions
+                .push(PendingQuestionEntry {
+                    request_id: "q-1".to_string(),
+                    questions: json!([{ "question": "Continue?" }]),
+                });
+        }
+
+        st.handle_question_respond(question_respond_msg(
+            &session_id,
+            "q-1",
+            &[("choice", "yes"), ("note", "ship it")],
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "question.respond")
+            .expect("question.respond frame written to the sidecar");
+        assert_eq!(respond["sessionId"], json!(session_id));
+        assert_eq!(respond["requestId"], "q-1");
+        assert_eq!(
+            respond["answers"],
+            json!({ "choice": "yes", "note": "ship it" }),
+            "answers arrive as a JSON object (Map → object)"
+        );
+        let (_, questions) = pending_request_ids(&st, &session_id).await;
+        assert!(
+            questions.is_empty(),
+            "the answered question leaves the pending set"
+        );
+        drop(env);
+    }
+
+    /// Task 2 (d): compact forwards to the sidecar as a plain `send` of `/compact`
+    /// (empty/absent instructions) or `/compact <instructions trimmed>` — the legacy
+    /// adapter's shape (`adapter.ts:168-174`) — with NO send.accepted ack frame.
+    #[tokio::test]
+    async fn compact_writes_send_frames_with_the_compact_command() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-compact")).await;
+        let created = await_claude_created(&mut rx, "req-compact").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_compact(compact_msg(&session_id, None)).await;
+        st.handle_compact(compact_msg(&session_id, Some("  focus the diff  ")))
+            .await;
+
+        let frames = env.respond_log_frames(2).await;
+        let sends: Vec<&Value> = frames.iter().filter(|f| f["type"] == "send").collect();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0]["sessionId"], json!(session_id));
+        assert_eq!(sends[0]["text"], "/compact");
+        assert_eq!(
+            sends[1]["text"], "/compact focus the diff",
+            "instructions are trimmed and appended"
+        );
+
+        // No ack: compact must not reuse handle_send's send.accepted broadcast.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            assert_ne!(
+                frame["type"], "freshAgent.send.accepted",
+                "compact emits no ack frame: {frame}"
+            );
+        }
+        drop(env);
+    }
+
+    /// Task 2 (e, AGENT-24): kilroy rides the claude provider path — every error
+    /// envelope from these handlers keeps the `kilroy` sessionType flavour (never the
+    /// freshclaude default), so the client routes the lost/error frame to the kilroy pane.
+    #[tokio::test]
+    async fn respond_error_envelopes_keep_the_kilroy_session_type() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let mut create = dedup_create_msg("req-kilroy-respond");
+        create.session_type = SessionType::Kilroy;
+        st.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "req-kilroy-respond").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Unknown pending id on a LIVE kilroy session → INTERNAL_ERROR, kilroy flavour.
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Kilroy,
+            "req-nope",
+            json!({ "behavior": "allow" }),
+        ))
+        .await;
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["sessionType"], "kilroy");
+        assert_eq!(frame["provider"], "claude");
+        assert_eq!(frame["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(
+            frame["event"]["message"],
+            "Claude approval req-nope is not available"
+        );
+
+        // Unknown kilroy SESSION → the nested INVALID_SESSION_ID lost-session shape,
+        // still kilroy-flavoured (engages markSessionLost on the right pane).
+        st.handle_approval_respond(approval_respond_msg(
+            "kilroy-gone",
+            SessionType::Kilroy,
+            "req-1",
+            json!({ "behavior": "allow" }),
+        ))
+        .await;
+        let lost = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(lost["sessionType"], "kilroy");
+        assert_eq!(lost["event"]["code"], "INVALID_SESSION_ID");
+        assert_eq!(lost["sessionId"], "kilroy-gone");
+        assert!(env.respond_log_frames(0).await.is_empty());
+        drop(env);
+    }
+
+    /// Task 2 (f): the stdout consumer folds the sidecar's pending-state frames into the
+    /// per-session pending set BEFORE normalize/broadcast: request frames push (resend of
+    /// the same requestId REPLACES), cancelled frames remove.
+    #[tokio::test]
+    async fn consumer_folds_permission_and_question_frames_into_the_pending_set() {
+        let lines = [
+            json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-1",
+                    "subtype": "can_use_tool", "tool": { "name": "Bash", "input": { "command": "ls" } },
+                    "toolUseID": "toolu_1" }),
+            json!({ "type": "sdk.question.request", "sessionId": "s", "requestId": "q-1",
+                    "questions": [{ "question": "Continue?" }] }),
+            json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-2",
+                    "subtype": "can_use_tool", "tool": { "name": "Read", "input": { "file_path": "/a" } },
+                    "toolUseID": "toolu_2" }),
+            json!({ "type": "sdk.permission.cancelled", "sessionId": "s", "requestId": "req-1" }),
+            json!({ "type": "sdk.question.cancelled", "sessionId": "s", "requestId": "q-1" }),
+            // Resend of req-2 REPLACES the entry (de-dupe by requestId).
+            json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-2",
+                    "subtype": "can_use_tool", "tool": { "name": "Read", "input": { "file_path": "/b" } },
+                    "toolUseID": "toolu_2" }),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let lines_path = dir.path().join("fold-lines.jsonl");
+        // Terminated final line: `Lines::next_line` holds an unterminated tail in its
+        // buffer until EOF (which never comes — the child sleeps with the pipe open).
+        let mut script = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        script.push('\n');
+        std::fs::write(&lines_path, script).unwrap();
+        // Keep the pipe OPEN after the lines (sleep) so the consumer can't hit EOF and
+        // evict mid-test; kill_on_drop reaps the child at test end.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("cat {}; sleep 30", lines_path.display()))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn scripted stdout child");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let reader = BufReader::new(stdout).lines();
+
+        let st = state();
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let consumer = st.spawn_consumer(
+            reader,
+            "fold-session".to_string(),
+            "freshclaude".to_string(),
+            "fold-session".to_string(),
+            None,
+            Arc::new(std::sync::Mutex::new("fold-session".to_string())),
+            Arc::clone(&pending),
+        );
+
+        // The replace-resend is the LAST scripted line: observing its input proves the
+        // whole stream has been folded (consumer lines are processed in order).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            {
+                let p = pending.lock().expect("pending lock");
+                if p.permissions.len() == 1
+                    && p.questions.is_empty()
+                    && p.permissions[0].input == Some(json!({ "file_path": "/b" }))
+                {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pending fold never converged on the scripted final state"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let p = pending.lock().expect("pending lock");
+        assert_eq!(
+            p.permissions.len(),
+            1,
+            "cancelled + replaced ids leave ONE permission entry"
+        );
+        assert_eq!(p.permissions[0].request_id, "req-2");
+        assert_eq!(p.permissions[0].tool_name.as_deref(), Some("Read"));
+        assert_eq!(p.permissions[0].tool_use_id.as_deref(), Some("toolu_2"));
+        assert_eq!(
+            p.permissions[0].input,
+            Some(json!({ "file_path": "/b" })),
+            "resend REPLACES the prior entry (de-dupe by requestId)"
+        );
+        assert!(p.questions.is_empty(), "the cancelled question is removed");
+        drop(p);
+        consumer.abort();
     }
 
     // ── cliSessionId recording (restart-parity plan §2.8 item 2) ──────────────────

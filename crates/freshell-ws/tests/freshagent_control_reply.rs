@@ -1,15 +1,16 @@
-//! Silent-drop fix (bug-hunt pbh-20260807): the fresh-agent control frames the
-//! frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
-//! click), `freshAgent.question.respond` (question answer), `freshAgent.fork`
-//! and `freshAgent.compact` -- used to fall into the typed dispatch's silent
-//! `_ => true` catch-all (`terminal.rs`) and vanish: no reply, no log, and the
-//! pane hung waiting forever. They must now answer on the wire with the
-//! `freshAgent.error` event shape the client renders as a visible pane error
-//! (`fresh-agent-ws.ts:333-342`) instead of being dropped.
+//! Fresh-agent control-frame dispatch (Task 2 of the approval-respond run): the four
+//! frames the frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
+//! click), `freshAgent.question.respond` (question answer), `freshAgent.fork` and
+//! `freshAgent.compact` -- no longer vanish into the typed dispatch's silent
+//! `_ => true` catch-all. A provider x op refusal table
+//! (`terminal.rs::fresh_agent_control_refusal`) answers the genuinely UNSUPPORTED
+//! cells with the legacy parity text (`runtime-manager.ts`:
+//! `"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
+//! `"Fork is …"`, `"Compact is …"`) under code `UNSUPPORTED_CAPABILITY`; every handled
+//! cell routes to a real dispatch arm.
 //!
-//! These tests drive a REAL axum server + REAL tokio-tungstenite client (same
-//! harness as `unknown_terminal_reply.rs`, the kata-dtfn precedent). On the
-//! pre-fix dispatch every test here times out waiting for ANY reply frame.
+//! These tests drive a REAL axum server + REAL tokio-tungstenite client (same harness
+//! as `unknown_terminal_reply.rs`, the kata-dtfn precedent).
 
 mod common;
 use common::*;
@@ -23,45 +24,48 @@ async fn send_json(ws: &mut TestWs, value: serde_json::Value) {
         .expect("send control frame");
 }
 
-/// Assert the `freshAgent.event` reply wraps a visible (non-lost-session)
-/// `freshAgent.error` for `session_id`.
-fn assert_visible_error(frame: &serde_json::Value, session_id: &str, provider: &str) {
+/// Assert `frame` is the refusal-table's `freshAgent.event{freshAgent.error}` envelope
+/// with the legacy parity capability text and the `UNSUPPORTED_CAPABILITY` code (any
+/// code other than INVALID_SESSION_ID renders as a visible pane error client-side;
+/// INVALID_SESSION_ID would instead mark the session lost and trigger recovery, which
+/// a capability refusal is not).
+fn assert_capability_refusal(
+    frame: &serde_json::Value,
+    session_id: &str,
+    provider: &str,
+    session_type: &str,
+    message: &str,
+) {
     assert_eq!(frame["provider"], serde_json::json!(provider));
     assert_eq!(frame["sessionId"], serde_json::json!(session_id));
+    assert_eq!(frame["sessionType"], serde_json::json!(session_type));
     assert_eq!(
         frame["event"]["type"],
         serde_json::json!("freshAgent.error")
     );
     assert_eq!(frame["event"]["sessionId"], serde_json::json!(session_id));
-    // Any code OTHER than INVALID_SESSION_ID renders as a visible pane error
-    // client-side (`sessionError`); INVALID_SESSION_ID would instead mark the
-    // session lost and trigger recovery, which this is not.
     assert_eq!(
         frame["event"]["code"],
-        serde_json::json!("UNSUPPORTED_MESSAGE")
+        serde_json::json!("UNSUPPORTED_CAPABILITY")
     );
-    assert!(
-        frame["event"]["message"]
-            .as_str()
-            .expect("error message is a string")
-            .contains("not supported"),
-        "the error must name the unsupported control frame: {frame}"
-    );
+    assert_eq!(frame["event"]["message"], serde_json::json!(message));
 }
 
+/// Refusal-matrix cell: approvals belong to the claude provider only — a
+/// codex-provider approval.respond is refused with the parity capability text.
 #[tokio::test]
-async fn approval_respond_answers_with_a_visible_fresh_agent_error() {
+async fn codex_approval_respond_is_refused_with_the_parity_capability_message() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
-    // The exact frame shape FreshAgentView.tsx:2339 sends on an Approve click.
+    // The exact frame shape FreshAgentView.tsx sends on an Approve click.
     send_json(
         &mut ws,
         serde_json::json!({
             "type": "freshAgent.approval.respond",
-            "provider": "claude",
+            "provider": "codex",
             "sessionId": "ses-approve-1",
-            "sessionType": "freshclaude",
+            "sessionType": "freshcodex",
             "decision": { "approved": true, "scope": "once" },
             "requestId": "perm-1",
         }),
@@ -69,60 +73,87 @@ async fn approval_respond_answers_with_a_visible_fresh_agent_error() {
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_visible_error(&frame, "ses-approve-1", "claude");
+    assert_capability_refusal(
+        &frame,
+        "ses-approve-1",
+        "codex",
+        "freshcodex",
+        "Approvals are not supported for freshcodex",
+    );
 }
 
+/// Refusal-matrix cell: claude has no fork — refused with the parity capability text.
 #[tokio::test]
-async fn question_respond_answers_with_a_visible_fresh_agent_error() {
+async fn claude_fork_is_refused_with_the_parity_capability_message() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
-    // FreshAgentView.tsx:2462's answer frame (requestId may be a number).
-    send_json(
-        &mut ws,
-        serde_json::json!({
-            "type": "freshAgent.question.respond",
-            "provider": "claude",
-            "sessionId": "ses-question-1",
-            "sessionType": "freshclaude",
-            "answers": { "q1": "yes" },
-            "requestId": 42,
-        }),
-    )
-    .await;
-
-    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_visible_error(&frame, "ses-question-1", "claude");
-}
-
-#[tokio::test]
-async fn fork_answers_with_a_visible_fresh_agent_error() {
-    let (url, _registry) = spawn_server().await;
-    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
-
-    // FreshAgentView.tsx:1080's fork frame.
+    // FreshAgentView.tsx's fork frame.
     send_json(
         &mut ws,
         serde_json::json!({
             "type": "freshAgent.fork",
-            "provider": "codex",
+            "provider": "claude",
             "sessionId": "ses-fork-1",
-            "sessionType": "freshcodex",
+            "sessionType": "freshclaude",
             "requestId": "fork-req-1",
         }),
     )
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_visible_error(&frame, "ses-fork-1", "codex");
+    assert_capability_refusal(
+        &frame,
+        "ses-fork-1",
+        "claude",
+        "freshclaude",
+        "Fork is not supported for freshclaude",
+    );
 }
 
+/// Dispatch-matrix cell: kilroy rides the claude provider path (AGENT-24) — a kilroy
+/// approval.respond is NOT refused; it reaches the claude handler, which answers an
+/// unknown session with the nested INVALID_SESSION_ID lost-session shape (proving the
+/// frame reached dispatch instead of hitting the refusal table).
 #[tokio::test]
-async fn compact_answers_with_a_visible_fresh_agent_error() {
+async fn kilroy_approval_respond_reaches_the_claude_dispatch_arm() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
-    // FreshAgentView.tsx:1100's compact frame.
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.approval.respond",
+            "provider": "claude",
+            "sessionId": "ses-kilroy-approve-1",
+            "sessionType": "kilroy",
+            "decision": { "approved": true, "scope": "once" },
+            "requestId": "perm-9",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("claude"));
+    assert_eq!(frame["sessionType"], serde_json::json!("kilroy"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the claude handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Dispatch-matrix cell: claude compact reaches `FreshClaudeState::handle_compact`
+/// (unknown session → nested INVALID_SESSION_ID lost-session shape, freshclaude flavour).
+#[tokio::test]
+async fn claude_compact_reaches_the_claude_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
     send_json(
         &mut ws,
         serde_json::json!({
@@ -135,12 +166,18 @@ async fn compact_answers_with_a_visible_fresh_agent_error() {
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_visible_error(&frame, "ses-compact-1", "claude");
+    assert_eq!(frame["provider"], serde_json::json!("claude"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshclaude"));
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the claude handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
+    );
 }
 
 #[tokio::test]
 async fn handled_control_frames_still_reach_their_dispatch_arms() {
-    // Guard: the interception must not swallow a HANDLED sibling -- `ping`
+    // Guard: the refusal table must not swallow a HANDLED sibling -- `ping`
     // (the simplest round-trip control frame) still answers `pong`.
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;

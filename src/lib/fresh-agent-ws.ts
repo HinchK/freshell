@@ -16,6 +16,7 @@ import {
   markSessionLost,
   materializeSession as materializeFreshAgentSessionState,
   removePermission,
+  removeQuestion,
   removeSession,
   registerPendingCreate,
   sessionError,
@@ -325,6 +326,14 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         requestId: event.requestId as string,
         questions: event.questions as never,
         providerRequest: event,
+      }))
+      return true
+    case 'freshAgent.question.cancelled':
+      // Provider-originated cancellation (the Rust claude/kilroy slice forwards
+      // sdk.question.cancelled): clear the card without inventing a user decision.
+      dispatch(removeQuestion({
+        ...locator,
+        requestId: event.requestId as string,
       }))
       return true
     case 'freshAgent.exit':

@@ -424,6 +424,37 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
+  it('folds freshAgent.question.cancelled into removeQuestion and sits in the snapshot-invalidating set', async () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-question-cancel'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'running' })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-7',
+      questions: [{ question: 'Continue?', options: [{ label: 'Yes', description: 'Proceed' }] }],
+    })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].pendingQuestions['question-7']).toBeDefined()
+
+    // A provider-cancelled question must clear its card (the removeQuestion reducer
+    // otherwise has zero dispatch sites and the card stays actionable forever).
+    expect(sendEvent({ type: 'freshAgent.question.cancelled', requestId: 'question-7' })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].pendingQuestions['question-7']).toBeUndefined()
+
+    // The snapshot-driven self-heal path must treat the cancel as invalidating too, so
+    // the card clears even if the fold races (FreshAgentView.tsx's subscription re-query).
+    const { SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS } = await import('@/components/fresh-agent/FreshAgentView')
+    expect(SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS?.has('freshAgent.question.cancelled') ?? false).toBe(true)
+  })
+
   it('handles freshAgent.session.changed without mutating idle status', () => {
     const store = createFreshAgentStore()
     const sessionId = 'ses_opencode_idle'

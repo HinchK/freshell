@@ -650,12 +650,14 @@ async fn handle_client_text(
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
-    // Silent-drop fix (bug-hunt pbh-20260807): the fresh-agent control frames
-    // this port has no runtime handler for (approval.respond / question.respond /
-    // fork / compact) used to fall into the dispatch's `_ => true` catch-all and
-    // vanish -- the pane hung waiting forever. Answer them BEFORE the typed
-    // dispatch; see `unhandled_fresh_agent_control_reply`.
-    if let Some(reply) = unhandled_fresh_agent_control_reply(&message) {
+    // Capability refusal table (Task 2 of the approval-respond run; the silent-drop
+    // fix of bug-hunt pbh-20260807): the fresh-agent control frames (approval.respond
+    // / question.respond / fork / compact) that hit a genuinely unsupported provider x
+    // op cell are answered with the parity-text UNSUPPORTED_CAPABILITY envelope BEFORE
+    // the typed dispatch; every handled cell (claude approval/question/compact now,
+    // codex/opencode compact/fork in Tasks 4-6) falls through to a real arm. See
+    // `fresh_agent_control_refusal`.
+    if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
     match message {
@@ -1010,6 +1012,43 @@ async fn handle_client_text(
             }
             true
         }
+        // freshAgent.approval.respond / question.respond / compact (approval-respond
+        // Task 2): the refusal table already answered every unsupported provider x op
+        // cell before this match; the remaining cells route to real handlers.
+        // Claude/kilroy route to the FreshClaudeState sidecar handlers as DETACHED
+        // tasks (same shape as FreshAgentSend above — a sidecar stdin write never
+        // blocks this connection's select loop). Non-claude cells here are
+        // unreachable post-refusal; the `if` keeps the arm total defensively.
+        ClientMessage::FreshAgentApprovalRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(
+                    async move { fresh_claude.handle_approval_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+            }
+            true
+        }
+        ClientMessage::FreshAgentQuestionRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(
+                    async move { fresh_claude.handle_question_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+            }
+            true
+        }
+        ClientMessage::FreshAgentCompact(compact) => {
+            if compact.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(
+                    async move { fresh_claude.handle_compact(compact).await }
+                        .instrument(tracing::Span::current()),
+                );
+            }
+            true
+        }
         // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
         // `screenshot.capture` command. Route it to the broker, waking the awaiting
         // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
@@ -1159,9 +1198,9 @@ async fn handle_client_text(
         // pre-loop handshake (`evaluate_hello`); `codingcli.*` has
         // no runtime here and the frozen client never sends it (zero senders in
         // `src/`). The user-reachable fresh-agent control frames
-        // (approval.respond / question.respond / fork / compact) are answered
-        // BEFORE this match by `unhandled_fresh_agent_control_reply` -- they must
-        // never fall through to this silent arm again.
+        // (approval.respond / question.respond / fork / compact) are refused or
+        // dispatched BEFORE/INSIDE this match by `fresh_agent_control_refusal` + the
+        // claude arms above -- they must never fall through to this silent arm again.
         _ => true,
     }
 }
@@ -4611,67 +4650,77 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
     }
 }
 
-/// Silent-drop fix (bug-hunt pbh-20260807): the four fresh-agent control frames
-/// the frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
-/// click, `FreshAgentView.tsx:2208/2339`), `freshAgent.question.respond`
-/// (`:2462`), `freshAgent.fork` (`:1080`) and `freshAgent.compact` (`:1100`) --
-/// previously fell into the typed dispatch's silent `_ => true` catch-all and
-/// vanished: no reply, no log, and the pane hung waiting forever. No runtime
-/// handler exists in this port yet (the claude sidecar's interactive
-/// permission/question response channel is explicitly out of scope --
-/// `crates/freshell-claude-sidecar/index.mjs:42-45` -- and the codex/opencode
-/// slices expose no approval/fork/compact RPC), so follow the kata-dtfn
-/// discipline (see [`unknown_terminal_input_blocked`]): never TOTAL SILENCE for
-/// a user action. Answer with the `freshAgent.error` event shape the client
-/// folds into a visible pane error (`fresh-agent-ws.ts:333-342` -- any code
-/// other than `INVALID_SESSION_ID` dispatches `sessionError`), so the click
-/// fails loudly instead of wedging the pane. Returns `None` for every message
-/// that has a real dispatch arm.
-pub(crate) fn unhandled_fresh_agent_control_reply(
-    message: &ClientMessage,
-) -> Option<ServerMessage> {
-    let (msg_type, provider, session_id, session_type) = match message {
+/// Approval-respond run (Task 2): the refusal table for the four fresh-agent control
+/// frames the frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
+/// click, `FreshAgentView.tsx`), `freshAgent.question.respond`, `freshAgent.fork` and
+/// `freshAgent.compact` — replacing the silent-drop-era blanket
+/// `unhandled_fresh_agent_control_reply`. Returns `Some(freshAgent.event{
+/// freshAgent.error{code:'UNSUPPORTED_CAPABILITY', message:<parity text>}})` ONLY for
+/// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
+/// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
+/// `"Fork is …"`, `"Compact is …"`): approvals/questions are claude-only, fork is
+/// refused for claude (permanently — the claude path has no fork) and for every other
+/// provider until their Tasks 4-6 arms land. Every other combo returns `None` and
+/// routes to a real dispatch arm (claude approval/question/compact handlers in
+/// `FreshClaudeState`). The kata-dtfn discipline still holds: never TOTAL SILENCE for
+/// a user action -- a refusal is a visible pane error (`fresh-agent-ws.ts` -- any code
+/// other than `INVALID_SESSION_ID` dispatches `sessionError`).
+pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
+    let (refused, wording, provider, session_id, session_type) = match message {
         ClientMessage::FreshAgentApprovalRespond(m) => (
-            "freshAgent.approval.respond",
+            m.provider != AgentProvider::Claude,
+            "Approvals are",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
         ClientMessage::FreshAgentQuestionRespond(m) => (
-            "freshAgent.question.respond",
+            m.provider != AgentProvider::Claude,
+            "Questions are",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
+        // Fork has NO claude arm; codex/opencode arms land in Tasks 5/6 — until then
+        // every provider is refused here.
         ClientMessage::FreshAgentFork(m) => (
-            "freshAgent.fork",
+            true,
+            "Fork is",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
+        // Codex/opencode compact arms land in Task 4 — until then only the claude
+        // provider routes to a real compact handler.
         ClientMessage::FreshAgentCompact(m) => (
-            "freshAgent.compact",
+            m.provider != AgentProvider::Claude,
+            "Compact is",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
         _ => return None,
     };
+    if !refused {
+        return None;
+    }
+    let session_type = session_type_wire(session_type);
     tracing::warn!(
-        message_type = msg_type,
+        provider = agent_provider_wire(provider),
         session_id = %session_id,
-        "fresh-agent control frame has no handler in this port; answering freshAgent.error instead of dropping it"
+        session_type,
+        "fresh-agent control frame hits an unsupported provider x op cell; answering freshAgent.error UNSUPPORTED_CAPABILITY"
     );
     Some(ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: serde_json::json!({
             "type": "freshAgent.error",
             "sessionId": session_id,
-            "code": "UNSUPPORTED_MESSAGE",
-            "message": format!("{msg_type} is not supported by this server"),
+            "code": "UNSUPPORTED_CAPABILITY",
+            "message": format!("{wording} not supported for {session_type}"),
         }),
         provider: agent_provider_wire(provider).to_string(),
         session_id: session_id.to_string(),
-        session_type: session_type_wire(session_type).to_string(),
+        session_type: session_type.to_string(),
     }))
 }
 
