@@ -1232,9 +1232,12 @@ impl FreshCodexState {
     /// (`thread/status/changed{active}` → `turn/started` → items/token-usage →
     /// `thread/status/changed{idle}` → `turn/completed{turn.status:'completed'}`; NO
     /// `thread/compacted` notification exists in the success flow, so no new
-    /// `CodexStatus` is needed). Concurrency gate: refuse while a turn is already
-    /// running (`active_turn` set) with the codex slice's existing error shape rather
-    /// than letting the app-server EINVAL.
+    /// `CodexStatus` is needed). Concurrency gate: a BEST-EFFORT refusal while a turn
+    /// is tracked active (`active_turn` set) — a concurrent send or a rapid second
+    /// Compact click can slip past it, in which case the app-server's rejection is
+    /// the backstop (surfaced as `CODEX_COMPACT_FAILED`). Every failure path is LOUD
+    /// via the nested `freshAgent.error` banner envelope (a request-less top-level
+    /// `error` frame never reaches the frozen client's pane surface).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
 
@@ -1245,13 +1248,17 @@ impl FreshCodexState {
                 .map(|s| (s.client.clone(), s.active_turn.clone()))
         };
         let Some((client, active_turn)) = looked_up else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+            self.emit_fresh_agent_error(
+                &session_id,
+                "SESSION_NOT_FOUND",
+                "codex session not found",
+            );
             return;
         };
 
         if active_turn.lock().expect("active_turn mutex").is_some() {
-            self.send_error(
-                &None,
+            self.emit_fresh_agent_error(
+                &session_id,
                 "CODEX_COMPACT_FAILED",
                 &format!(
                     "Codex session {session_id} has an active turn; compact it after the turn completes."
@@ -1261,7 +1268,7 @@ impl FreshCodexState {
         }
 
         if let Err(err) = client.compact_thread(&session_id).await {
-            self.send_error(&None, "CODEX_COMPACT_FAILED", &err.to_string());
+            self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
     }
 
@@ -4718,13 +4725,20 @@ pub(crate) mod tests {
 
         st.handle_compact(compact_msg("thread-busy")).await;
 
+        // The refusal is LOUD and pane-visible: the nested freshAgent.error
+        // banner envelope, never a request-less top-level `error` frame.
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "thread-busy");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
         assert!(
-            frame["message"]
+            frame["event"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("CODEX_COMPACT_FAILED"),
+                .contains("active turn"),
             "{frame}"
         );
 
@@ -4755,21 +4769,20 @@ pub(crate) mod tests {
         peer.respond_error(&id, -32600, "compact rejected");
         driver.await.expect("compact task");
 
+        // The app-server's rejection surfaces LOUD via the nested banner envelope.
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "thread-ce");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
         assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("CODEX_COMPACT_FAILED:"),
-            "{frame}"
-        );
-        assert!(
-            frame["message"]
+            frame["event"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("compact rejected"),
-            "{frame}"
+            "the app-server's rejection text crosses the wire: {frame}"
         );
 
         // No compact flow was accepted server-side, so NOTHING else may be broadcast
@@ -4781,22 +4794,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_compact_unknown_session_errors_like_the_other_codex_handlers() {
+    async fn handle_compact_unknown_session_surfaces_a_loud_nested_error() {
         let (st, mut rx) = state_with_bus();
 
         st.handle_compact(compact_msg("does-not-exist")).await;
 
+        // Session-keyed so the client's banner path routes it to the pane that
+        // clicked Compact; a request-less top-level `error` frame is invisible.
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "does-not-exist");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "SESSION_NOT_FOUND");
         assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .contains("SESSION_NOT_FOUND"),
-            "{frame}"
-        );
-        assert!(
-            frame["message"]
+            frame["event"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("codex session not found"),

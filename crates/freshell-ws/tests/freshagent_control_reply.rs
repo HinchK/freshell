@@ -178,8 +178,9 @@ async fn claude_compact_reaches_the_claude_dispatch_arm() {
 }
 
 /// Dispatch-matrix cell (Task 4): codex compact is NO LONGER refused — it reaches
-/// `FreshCodexState::handle_compact`, which answers an unknown session with the codex
-/// slice's top-level `SESSION_NOT_FOUND` error shape (never UNSUPPORTED_CAPABILITY).
+/// `FreshCodexState::handle_compact`, which answers an unknown session with the nested
+/// `freshAgent.error{SESSION_NOT_FOUND}` envelope (never UNSUPPORTED_CAPABILITY; the
+/// nested shape keeps every compact failure pane-visible, matching the other arms).
 #[tokio::test]
 async fn codex_compact_reaches_the_codex_dispatch_arm() {
     let (url, _registry) = spawn_server().await;
@@ -196,13 +197,17 @@ async fn codex_compact_reaches_the_codex_dispatch_arm() {
     )
     .await;
 
-    let frame = next_frame_of_type(&mut ws, "error").await;
-    assert!(
-        frame["message"]
-            .as_str()
-            .unwrap()
-            .contains("SESSION_NOT_FOUND"),
-        "the frame reached the codex handler (a refusal-table answer would be a freshAgent.event UNSUPPORTED_CAPABILITY): {frame}"
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("codex"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshcodex"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("SESSION_NOT_FOUND"),
+        "the frame reached the codex handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
     );
 }
 
