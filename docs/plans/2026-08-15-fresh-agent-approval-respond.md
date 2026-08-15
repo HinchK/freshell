@@ -85,22 +85,43 @@ The sidecar's `canUseTool` (`crates/freshell-claude-sidecar/index.mjs:219-228`) 
 //    (unhandled rejection → sidecar crash under Node 22 throw-mode). Therefore
 //    cancelAll splits by live state: post-interrupt (transport still open) →
 //    resolve-with-deny; post-close/shutdown → emit cancel frames ONLY, never
-//    resolve. index.mjs ALSO installs a process-level unhandledRejection
-//    handler (stderr log, never crash) at startup before any query() is created
-//    (belt-and-braces). REVIEWED CONSTRAINT: do NOT install an
-//    uncaughtException swallow — a synchronous fault MUST still crash the
-//    sidecar so Rust's exit-eviction/SIDECAR_EXITED path engages (ADR 2.1);
-//    only the known rejection vector is suppressed.
+//    resolve. REVIEWED GUARD DESIGN (fresh-eyes round 2): NO process-level
+//    swallow handlers. The resolveDeny split prevents the KNOWN rejection
+//    vector at its origin (the SDK's internal floating promise is not
+//    reachable from sidecar code, so no per-promise catch exists for it — the
+//    prevention is simply never producing the late resolution). Any UNFORESEEN
+//    unhandledRejection/uncaughtException keeps Node's default fatal behavior
+//    so Rust's exit-eviction/SIDECAR_EXITED path engages (ADR 2.1) — deliberately
+//    crash loudly rather than wedge alive. Reviewer's preference (handle at the
+//    originating promise) was assessed: impossible for the SDK-internal floating
+//    promise; source-prevention + crash-on-unforeseen is the correct shape.
 // 6. bypassPermissions mode: no request emitted, immediate allow (preserve existing
 //    behavior, exercised via a canUseTool-shaped adapter helper exported from the module)
 // 7. AskUserQuestion routes to the question path even under bypassPermissions
 //    (legacy ordering: question check precedes bypass check — sdk-bridge.ts:203-214).
-// 8. Process guard: spawn a probe (child node process) that imports index.mjs with a
-//    held-open stdin pipe, rejects a synthetic promise, then closes stdin — assert the
-//    stderr lines recorded the rejection and the process exited 0 on EOF (never crashed
-//    on the rejection). Keep the probe tiny; its only job is pinning the unhandledRejection
-//    guard. There is deliberately NO uncaughtException swallow (review finding F1):
-//    synchronous faults still terminate the process so exit-eviction engages.
+// 8. No-guard invariant probe: spawn a probe (child node process) that imports index.mjs
+//    with a held-open stdin pipe, rejects a synthetic promise, then closes stdin —
+//    assert the process exited NONZERO on the rejection (default fatal handling kept;
+//    crash preserves the Rust exit-eviction path; a wedged-alive sidecar is the
+//    unacceptable state).
+// 9. Provider-originated cancellation (options.signal; fresh-eyes round-2 F1; AGENT-05's
+//    "provider cancellation removes the card without inventing a user decision"):
+//    raisePermissionRequest subscribes options.signal — on abort: delete the pending
+//    entry, emit sdk.permission.cancelled, resolve the parked promise with
+//    {behavior:'deny', message:'Aborted by provider'} (query still open in this state).
+//    Node leaks these (its signal is never subscribed); this is a deliberate parity-plus
+//    completing the checklist cell, recorded in the commit message.
+// 10. PRODUCTION-WIRING contract test (fresh-eyes round-2 F4): index.mjs gets an
+//    env-injected SDK seam — `FRESHELL_CLAUDE_SDK_QUERY_MODULE=<abs path to an ESM
+//    module exporting query>` overriding the `@anthropic-ai/claude-agent-sdk` import
+//    (dynamic import at startup; default = the real package). The vitest integration
+//    case spawns the REAL index.mjs with a scripted fake query module whose query()
+//    invokes options.canUseTool on cue (scripted via a control file/env), then drives
+//    the FULL dispatch: create → magic send → canUseTool fires → sdk.permission.request
+//    on stdout → permission.respond stdin → fake's parked promise settled with the exact
+//    decision → interrupt while a second request parks → cancel frames. This exercises
+//    canUseTool registration, stdin dispatch, question routing, and cancellation through
+//    the production entry point — not just the extracted module.
 ```
 
 Module shape (implementation target):
@@ -140,13 +161,13 @@ canUseTool: async (toolName, input, options) => {
   const s = sessions.get(sessionId)
   if (!s) return { behavior: 'allow', updatedInput: input }
   if (toolName === 'AskUserQuestion') {
-    return raiseQuestionRequest({ session: s, emit, nanoid, nextMonotonic, sessionId, input })
+    return raiseQuestionRequest({ session: s, emit, nanoid, nextMonotonic, sessionId, input, signal: options?.signal })
   }
   if (s.permissionMode === 'bypassPermissions') return { behavior: 'allow', updatedInput: input }
   return raisePermissionRequest({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
 }
 ```
-(`options` carries `toolUseID/suggestions/blockedPath/decisionReason/signal` — passed through into the emitted frame; `signal` is **not** subscribed, legacy parity.)
+`options` carries `toolUseID/suggestions/blockedPath/decisionReason/signal`; the payloads pass through into the emitted frame; `signal` IS subscribed (review round-2 F1) — on abort the pending entry is deleted, `sdk.permission.cancelled`/`sdk.question.cancelled` is emitted, and the parked promise resolves `{behavior:'deny', message:'Aborted by provider'}` (query open in this state).
 3. stdin dispatch adds:
 ```js
 case 'permission.respond': {
@@ -162,11 +183,11 @@ case 'question.respond': {
 ```
 (An unknown requestId is a lose-safely no-op — Rust validates against its pending set first, Task 2. Log to stderr only.)
 4. On `interrupt`: per affected session `cancelPending(session, emit, sessionId, { resolveDeny: true })` (transport still open — safe). On `shutdown`/process teardown: `cancelPending(..., { resolveDeny: false })` — emit cancel frames for card cleanup, never resolve parked promises (LB-04). Track query-open state per session (a flag set false when the query generator closes/cleanup completes).
-5. Install at the very top of index.mjs, before any query() exists (NO uncaughtException
-   handler — see the reviewed constraint above):
+5. Install NO process-level handlers (reviewed guard design above). Add the env seam:
 ```js
-process.on('unhandledRejection', (reason) => { logerr(`unhandledRejection: ${String(reason)}`) })
+const sdkModule = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '@anthropic-ai/claude-agent-sdk')
 ```
+   and use `sdkModule.query` everywhere (default resolution unchanged without the env).
 6. Update the header protocol comment and the out-of-scope note at index.mjs:42-45 (response channel is now in scope; the T2 auto-allow remains only for `bypassPermissions` sessions).
 
 - [ ] **Step 4: Run the focused test**
@@ -206,8 +227,8 @@ git commit -m "feat(claude-sidecar): interactive permission/question response ch
 **Interfaces:**
 - Consumes: protocol types `FreshAgentApprovalRespond`/`FreshAgentQuestionRespond`/`FreshAgentCompact` (`crates/freshell-protocol/src/client_messages.rs:584-645`); sidecar frames from Task 1.
 - Produces:
-  - `FreshClaudeState::handle_approval_respond(&self, FreshAgentApprovalRespond)` — resolve session (same `resolve_session_key` discipline as `handle_send`); unknown session → same emission `handle_send` already uses for a missing session; requestId not in pending → `emit_fresh_agent_error`/`send`-parity error `Claude approval <id> is not available`; hit → remove from pending set + `write_line({type:'permission.respond', sessionId: session.sidecar_session_id, requestId, decision})` (decision verbatim `serde_json::Value`). No ack frame.
-  - `FreshClaudeState::handle_question_respond(...)` — same; frame `{type:'question.respond', sessionId, requestId, answers}` (answers as a JSON object, Map→object).
+- `FreshClaudeState::handle_approval_respond(&self, FreshAgentApprovalRespond)` — resolve session (same `resolve_session_key` discipline as `handle_send`); unknown session → same emission `handle_send` already uses for a missing session; requestId not in pending → `emit_fresh_agent_error`/`send`-parity error `Claude approval <id> is not available`. REVIEWED ORDERING (fresh-eyes round-2 F3): on hit, `write_line({type:'permission.respond', sessionId: session.sidecar_session_id, requestId, decision})` FIRST (decision verbatim `serde_json::Value`) and remove the pending entry ONLY after the write's flush succeeds; a failed write leaves the entry pending (card stays; the user can retry) and surfaces the write error via the error path — never clear-then-fail. No ack frame. Regression test pinned: write failure → entry still pending + error emitted.
+- `FreshClaudeState::handle_question_respond(...)` — identical ordering discipline; frame `{type:'question.respond', sessionId, requestId, answers}` (answers as a JSON object, Map→object).
   - `FreshClaudeState::handle_compact(...)` — writes `{type:'send', sessionId: sidecar_session_id, text}` where `text = "/compact"` or `format!("/compact {}", instructions.trim())` (empty → bare `/compact`). No ack frame (do not reuse `handle_send`'s send.accepted broadcast).
   - `FreshClaudeState::snapshot_pending_overlay(&self, any_id: &str) -> (Vec<serde_json::Value>, Vec<serde_json::Value>)` (approvals, questions) — consumed by Task 3.
 
@@ -231,7 +252,7 @@ ClientMessage::FreshAgentApprovalRespond(m) => {
 ```
 
 - [ ] **Step 1: Write the failing behavioral tests**
-  - claude.rs (fake-sidecar route): extend `FakeClaudeSidecarEnv`'s scripted fake (`claude.rs:2087-2129`) with: magic send `__raise_permission__` → emit `sdk.permission.request{requestId:"req-1", tool:{name:"Bash",input:{command:"ls"}}}` + park nothing (fake needs no promise); stdin arms for `permission.respond`/`question.respond` appending full lines to a new `FRESHELL_TEST_CLAUDE_RESPOND_LOG`. Tests: (a) approval.respond writes exact stdin frame w/ `sidecar_session_id` + verbatim decision and removes the pending entry; (b) unknown requestId → freshAgent.error hub-frame with parity message, no stdin write; (c) question.respond writes frame incl. answers object; (d) compact writes `{type:'send', text:"/compact"}` and `"/compact focus the diff"`; (e) same for SessionType::Kilroy (flavour preserved on error envelopes); (f) fold tests: feed `sdk.permission.request`/`sdk.question.request`/`sdk.permission.cancelled` through the consumer path → pending set content matches; (g) normalize keeps `sdk.question.cancelled` OFF the broadcast.
+  - claude.rs (fake-sidecar route): extend `FakeClaudeSidecarEnv`'s scripted fake (`claude.rs:2087-2129`) with: magic send `__raise_permission__` → emit `sdk.permission.request{requestId:"req-1", tool:{name:"Bash",input:{command:"ls"}}}` + park nothing (fake needs no promise); stdin arms for `permission.respond`/`question.respond` appending full lines to a new `FRESHELL_TEST_CLAUDE_RESPOND_LOG`. Tests: (a) approval.respond writes exact stdin frame w/ `sidecar_session_id` + verbatim decision and removes the pending entry; (a2) write failure (fake sidecar's stdin closed / flush error — use the fake's `__exit__` mechanic to kill the child first) keeps the pending entry and emits the error (fresh-eyes F3 regression pin); (b) unknown requestId → freshAgent.error hub-frame with parity message, no stdin write; (c) question.respond writes frame incl. answers object; (d) compact writes `{type:'send', text:"/compact"}` and `"/compact focus the diff"`; (e) same for SessionType::Kilroy (flavour preserved on error envelopes); (f) fold tests: feed `sdk.permission.request`/`sdk.question.request`/`sdk.permission.cancelled` through the consumer path → pending set content matches; (g) normalize keeps `sdk.question.cancelled` OFF the broadcast.
   - terminal.rs/WS (`freshagent_control_reply.rs`): rewrite the four UNSUPPORTED_MESSAGE pins into the refusal matrix: codex approval.respond → "Approvals are not supported for freshcodex"; claude fork → "Fork is not supported for freshclaude"; kilroy approval.respond reaches dispatch (no refusal frame emitted); claude compact reaches dispatch.
 - [ ] **Step 2: Run and verify intended failures**
   - Run: `cargo test -p freshell-freshagent approval` (+ `question`/`compact`/`pending`) — Expected: FAIL (no handlers/fields)
@@ -281,7 +302,7 @@ git commit -m "feat(fresh-agent): claude/kilroy snapshot carries live pending ap
 ### Task 4: Compact for codex and opencode
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/codex.rs` — new `FreshCodexState::handle_compact` (mirror `handle_send` at `:1047-1158`; text `"/compact"` / `format!("/compact {trimmed}")` via the existing `client.start_turn` with the session's stored settings; track `active_turn`; NO ack broadcast)
+- Modify: `crates/freshell-freshagent/src/codex.rs` — new `FreshCodexState::handle_compact`. REVIEWED (fresh-eyes round-2 F5): do NOT send `/compact` as turn text — codex 0.147.0 has a real RPC `thread/compact/start` (params `{threadId}` per the generated `ThreadCompactStartParams`; no instructions field — the client's `instructions` are DROPPED for codex, upstream limitation; precedent: schema inventory `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:13,140` also records the `thread/compacted` notification). Implementation: new `CodexAppServerClient::compact_thread(threadId)` calling `thread/compact/start` (await its `Record<string,never>` response; error → the codex slice's existing error path); the busy/compacting → completion flow rides the existing consumer's turn-status notifications — VERIFY during implementation which frames the app-server emits for a compact turn (probe the fake arm written in Task 8; pin the observed flow in a test; if `thread/compacted` doesn't map through `adapter_event_to_frame` today, add it so the status gating stays honest). Concurrency gate: refuse the RPC when the session has a running turn (`active_turn` set) with the existing error shape rather than letting the app-server EINVAL.
 - Modify: `crates/freshell-opencode/src/serve.rs` — new `OpencodeServeManager::compact(session_id, provider_id, model_id, route)`: `POST /session/:id/summarize` via the private `json_request` helper (clone of `abort` at `:686`) with body `{providerID, modelID}` — VALIDATED contract (LB-03, falsified → redesigned; `/doc` schema: required `["providerID","modelID"]`, `additionalProperties:false`, 200 `boolean`; live probes: missing keys → 400). REVIEWED CONSTRAINT (fresh-eyes F2): the serve manager stores no session metadata — the model pair is an EXPLICIT PARAMETER supplied by the caller, never resolved crate-side.
   Resolution happens at the freshagent layer (`handle_compact`), in order: (1) `crate::model::split_opencode_model(session.model)` (the existing helper, `build_prompt_body` precedent opencode_ws.rs:937-948); (2) if unset/unsplittable: `GET /config` → its `model` key (probed: present, string-or-null) → `split_opencode_model` on it; (3) if still nothing: emit the error loudly (broadcast `freshAgent.error`, message naming the failed compact; no false success, no POST). The client's `instructions` are DROPPED for opencode (no-op upstream; legacy Node has the same degradation — its `serve-manager.ts:465-471` body shape 400s on 1.18.18 — note this divergence in the commit message).
 - Modify: `crates/freshell-freshagent/src/opencode_ws.rs` — new `FreshOpencodeState::handle_compact`: silent no-op when `real_session_id` is none (legacy `adapter.ts:992-994`); otherwise REVIEWED lifecycle (fresh-eyes F3, legacy adapter.ts:356-410 verbatim): FIRST reset the session's `turn_aborted` and `turn_errored` flags to false (a prior interrupted/errored turn must not suppress this compact's completion edge), broadcast the running-status snapshot (the busy indicator must be visible before the upstream request settles), THEN `subscribe()` BEFORE POST → resolve the model pair per the `serve.rs` bullet → `manager.compact(real, provider_id, model_id, route)` → `await_idle(real, rx, DEFAULT_TURN_TIMEOUT, route)` → idle snapshot broadcast + `turn_complete_event` ONLY on success (`!turn_aborted && !turn_errored`, monotonic `at` via `next_monotonic_turn_complete_at`) — same shape as `handle_send`'s turn task at `:714-751`; a serve error flows to the existing error handling (no false turn-complete)
@@ -291,7 +312,7 @@ git commit -m "feat(fresh-agent): claude/kilroy snapshot carries live pending ap
 **Interfaces:** codex fake app-server records `turn/start` payloads (existing test transport); opencode tests inject a mock `ServeHttpRequest` transport (existing pattern — `serve.rs:48-99`) capturing method/path/body.
 
 - [ ] **Step 1: Failing tests**
-  - codex: compact on live session → recorded `turn/start` input text `"/compact"` (and `"/compact focus"` with instructions); `active_turn` set; no ack frame.
+  - codex: compact on live idle session → fake app-server recorded `thread/compact/start` with `{threadId}` exactly (NO turn/start, NO instructions key); active turn busy → refusal error frame + no RPC; RPC error → error path, no fake completion.
   - opencode: compact on materialized session → POST `/session/:id/summarize` body `{providerID:"<p>", modelID:"<m>"}` derived per the two-step resolution; success → idle snapshot + gated turn-complete; serve error → error broadcast + no turn-complete; unmaterialized → no POST at all; compact after an aborted/errored prior turn (flags stale-true) → flags reset, turn-complete emitted on success; running snapshot precedes the POST.
   - WS matrix: codex/opencode compact no longer refused.
 - [ ] **Step 2:** `cargo test -p freshell-freshagent -p freshell-opencode compact` — Expected: FAIL
@@ -342,7 +363,7 @@ git commit -m "feat(fresh-agent): fork freshopencode sessions (AGENT-07)"
 - Test: app_server.rs + codex.rs tests; WS matrix test
 
 **Interfaces:**
-- `fork_thread(&self, params: ThreadForkParams) -> Result<Value, AppServerError>` (+ the two archive/unarchive RPCs, same plumbing); types alongside `StartThreadParams` etc.
+- `fork_thread(&self, params: ThreadForkParams) -> Result<Value, CodexAppServerError>` — the crate's error type is `CodexAppServerError` (`crates/freshell-codex/src/app_server.rs:75`; fresh-eyes round-2 F6 name correction) — (+ `compact_thread`, `archive_thread`/`unarchive_thread`, same plumbing); types alongside `StartThreadParams` etc.
 - VALIDATED lifecycle (LB-01, real 0.147.0 probe): a cross-process `thread/resume(child)` while the parent app-server holds the child is REJECTED (`-32600 "thread … already has an active writer"` — thread-writer locks under CODEX_HOME). The proven while-alive handoff is **archive on parent → unarchive on child sidecar → resume on child sidecar**. Post-owner-exit resume also works (clean SIGTERM drops locks; SIGKILL leaves stale locks that 0.147.0 self-reclaims) — that's the restart-recovery shape, not the fork shape.
 - Handler order: parent lookup (unknown → freshAgent.error on sink, lost-session shape) → build fork params: parent's stored settings (`model/effort/cwd/sandbox/permission_mode`), `input` overrides only cwd/model per legacy adapter spread, `input.atTurnId` → `lastTurnId` when present → `fork_thread` on the parent client (app-server error — e.g. empty parent `-32600 no rollout found for thread id` — → reply `freshAgent.error` on sink with the server error text; no state change) → `archive_thread(child)` on the parent client (releases the writer lock; failure → error reply, child still usable on parent) → spawn the child sidecar + client via the existing owned-sidecar machinery (`ensure_session_resumable`-adjacent, `:2261+`) → `unarchive_thread(child)` → `resume_thread(child)` on the child client → register the child `CodexSession` → binding row via `record_codex_binding` → sink reply `FreshAgentForked{ request_id: msg.request_id, parent_session_id, session_id: child, session_type:'freshcodex', provider:'codex', runtime_provider:'codex', session_ref }`.
 - REVIEWED failure containment (fresh-eyes F6): after a successful `archive_thread(child)`, ANY later failure (child-sidecar spawn, `unarchive_thread`, `resume_thread`) must (a) reply `freshAgent.error` on the sink with the failing step's text, and (b) BEST-EFFORT `unarchive_thread(child)` on the PARENT client to restore the child's original visibility (ignore its own error — parent may be mid-kill), leaving the child recoverable via post-owner-exit resume. Zero silent exits on any post-fork path.
@@ -393,7 +414,9 @@ git commit -m "feat(fresh-agent): KILROY_ENABLED gates kilroy feature flag, lega
 - Modify: `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs` — VALIDATED extension (LB-05: reuse this HARNESS-03 fixture, do NOT author a parallel stub): add stdin arms in `handleInput()` (`:147-192`; today `create`/`send`/`interrupt`/`shutdown` only, no default arm — unknown types silently dropped) routing `permission.respond`/`question.respond` to `engine.handleMessage(msg)`; respond arms must DECREMENT the per-session pending counter (`st.pending`, `:159` — incremented by `waitingEdgeIfFirstPending`, today reset only by interrupt) so a second raise re-fires `sdk.turn.waiting`; add an env-gated raw-stdin JSONL appender using a `FRESHELL_FAKE_`-namespaced env var (e.g. `FRESHELL_FAKE_STDIN`, auto-records into the launch ledger; mirror `appendJsonl` at `:107-111`, which needs exporting). `on:'msg:permission.respond'`/`'msg:question.respond'` decision points + a `kind:'completion'` emission give the scripted continuation (`sdk.assistant` + `sdk.turn.complete` + `sdk.status:idle`, `fixture-core.mjs:101-118`); add a `sdk.result` render kind only if the spec pins it. Program DSL then drives: `RAISE_PERMISSION` → `sdk.permission.request{requestId:"req-perm-1", subtype:'can_use_tool', tool:{name:'Bash',input:{command:'ls'}}}` + park; `RAISE_QUESTION` (+ multi-select and `Other` variants) → `sdk.question.request{…}` + park; any `/compact…` text → `sdk.status{compacting}` → completion. VALIDATED SUB-DEPENDENCY — SETTLED (fresh-eyes F7): the fixture writes NO disk transcripts today while `get_claude_snapshot` returns NotFound without one and the cards render EXCLUSIVELY from the REST snapshot — so the fixture MUST gain transcript-write support on `create`/`sdk.session.init`: append a minimal JSONL transcript (one user entry; each completion appends the assistant/result entries) into `$HOME/.claude/projects/<cwd-mangled>/<cliSessionId>.jsonl` using the harness's isolated HOME (the server env supplies it; `applyIsolatedHomeEnvironment` precedent). This is in-pattern: the real CLI writes exactly there. Record the transcript-shape source (mirror `parse_transcript_turns`' accepted shape, claude_snapshot.rs) in the fixture header.
 - Create: `test/e2e-browser/specs/fresh-agent-control-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` — register spec in `RUST_ONLY_SPECS` AND the `rust-chromium` project's `testMatch` (both lists; convention verified)
-- Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` — tick/re-annotate AGENT-04/05/06/07/24 **only** as far as the evidence of this run justifies: annotate each row with its evidence class (browser PW-RUST for the claude/kilroy lanes; cargo suite for codex/opencode compact+fork, with the hermeticity reason from case 9; credentialed browser validation of provider compact/fork = named residual). Append a dated status note citing this plan.
+- Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` (or its e2e mirror `test/e2e-browser/fixtures/providers/fake-codex-app-server.mjs` — pick the file the spec's CODEX_CMD actually points at; both must stay consistent) — new `thread/fork`/`thread/archive`/`thread/unarchive`/`thread/compact/start` arms per case 9
+- Modify: `test/e2e-browser/fixtures/providers/fake-opencode-server.mjs` (+ `test/e2e-browser/fixtures/fake-opencode.cjs` shim if that's the spawned surface) — fork/summarize arms with audit logging
+- Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` — tick/re-annotate AGENT-04/05/06/07/24 **only** as far as the evidence of this run justifies: annotate each row with its evidence class (PW-RUST browser via hermetic fakes for all four lanes + cargo suites; fake-vs-real semantic-fidelity caveat from case 9). Append a dated status note citing this plan.
 
 **Test approach:** `RustServer` boot with `env: { FRESHELL_CLAUDE_SIDECAR: <fixture abs path>, FRESHELL_CLAUDE_NODE: process.execPath, FRESHELL_FAKE_STDIN: <tmp log> }` (`RustServerOptions.env` exists; precedent `freshclaude-identity-persistence-rust.spec.ts:231`). Drive the real browser: create a freshclaude pane (follow the bootstrap of an existing freshclaude rust spec). Cases:
 1. **Approval allow:** send `RAISE_PERMISSION` via composer → approval card renders (snapshot poll) with tool name → click `Allow` (accessible name per `FreshAgentApprovalCard`) → stdin log contains `permission.respond` with `{behavior:'allow'}` **and zero respond lines before the click** → card clears → completion flows.
@@ -405,7 +428,8 @@ git commit -m "feat(fresh-agent): KILROY_ENABLED gates kilroy feature flag, lega
 6b. **Always Allow (AGENT-05 session-scoped cell):** raise for tool `Bash` → click `Always Allow` on `FreshAgentApprovalCard` → raise the SAME tool again → the second respond is client-generated without a click (stdin log shows two `permission.respond{behavior:'allow'}` lines, only one click).
 7. **Fork hidden for claude:** `/fork` absent from slash menu / fork affordance disabled (capabilities gate).
 8. **Kilroy variant (AGENT-24):** repeat case 1's core with a kilroy session-type pane (fixture defaults to kilroy unless configured — check fixture's provider/sessionType config at implementation) asserting envelopes carry `sessionType:"kilroy"`.
-9. **Provider fork/compact lanes (codex + opencode) — evidence-class note, not browser cases:** browser e2e for freshcodex/freshopencode compact is not hermetic: summarize invokes a real model (credentials), and opencode fork needs an actual session turn to pre-populate messages (real provider). Their coverage in this run is the cargo suites (Tasks 4-6: request shape, call order, child registration, failure replies, `lastTurnId`/`messageID` mapping), and this task's checklist annotation must say exactly that — no browser claim. (Reviewer F8 resolved by honest evidence classification; a credentialed real-provider browser spec is the named residual.)
+9. **Provider lanes in-browser — hermetic, no residual (fresh-eyes round-2 F7):** the repo ALREADY has boot-time fakes for every provider (fresh-eyes verified): codex via `CODEX_CMD="<node> <test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs>"` + `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON (pattern: freshagent-settings-resume-rust.spec.ts:248-255), opencode via `OPENCODE_CMD=<fake-opencode.cjs>` + `FAKE_OPENCODE_AUDIT_LOG` (:349-353). Extend those fakes with the new surface: fake codex app-server gains `thread/fork` (+ its lastTurnId echo into the operation log), `thread/archive`, `thread/unarchive`, `thread/compact/start` arms; fake opencode serve gains `POST /session/:id/fork` and `POST /session/:id/summarize` arms (audit-logging bodies). Browser cases: freshcodex Compact click → operation log has `thread/compact/start{threadId}` and NO `turn/start`; freshcodex Fork (from idle) → child session repoints the pane (freshAgent.forked flow) and the log shows fork→archive→(child client) unarchive→resume; freshcodex per-turn Fork → the log's fork params carry `lastTurnId`; freshopencode Compact → audit log `summarize` body `{providerID,modelID}`; freshopencode Fork → child insert + pane repoint; freshopencode per-turn Fork → body carries `messageID`. Where a fake's existing arm lacks a detail, extend it in the same style (these fixtures are the harness's own, not frozen).
+   Residual honesty note (record in checklist annotation): fakes pin contract shape + server/client wiring; real-provider semantic fidelity of compact content is out of scope for shape tests by design (and the real-provider contract suites are opt-in per repo policy).
 
 - [ ] **Step 1: Failing tests** — spec runs against the unfixed server only insofar as TDD demands: at THIS point in the task order the underlying features are already implemented (Tasks 1-7), so the red step is: author spec + stub, run it, and confirm each assertion genuinely exercises the wiring (kill any vacuous assertion by mutation check: temporarily expect the pre-fix failure shape and see the test fail — e.g. assert no `permission.respond` line pre-click while also asserting card visible; comment in the spec how to run the pre-fix negative).
 - [ ] **Step 2:** Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium fresh-agent-control-rust` — Expected: PASS against fixed code; record one deliberate pre-fix-style negative run (e.g. `RUST` server started with `FRESHELL_CLAUDE_SIDECAR` pointed at a no-op stub) proving the spec fails loudly without the wiring.
@@ -415,10 +439,10 @@ git commit -m "feat(fresh-agent): KILROY_ENABLED gates kilroy feature flag, lega
 - [ ] **Step 6: Impacted runs** — checklist file edit + config edit: run `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list` to prove registration without selection errors; run the config's own unit tests: `npm run test:e2e:helpers`.
 - [ ] **Step 7: Commit**
 ```bash
-git add test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs test/e2e-browser/fixtures/providers/fixture-core.mjs test/e2e-browser/specs/fresh-agent-control-rust.spec.ts test/e2e-browser/playwright.config.ts docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
-git commit -m "test(fresh-agent): PW-RUST approval/question/compact validation; checklist AGENT-04/05/06/07/24 status"
+git add test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs test/e2e-browser/fixtures/providers/fixture-core.mjs test/e2e-browser/fixtures/providers/fake-codex-app-server.mjs test/e2e-browser/fixtures/providers/fake-opencode-server.mjs test/e2e-browser/specs/fresh-agent-control-rust.spec.ts test/e2e-browser/playwright.config.ts docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
+git commit -m "test(fresh-agent): PW-RUST approval/question/compact/fork validation across providers; checklist AGENT-04/05/06/07/24 status"
 ```
-(The `fixture-core.mjs` add is conditional — only if its export surface changed for the stdin-log appender.)
+(Conditional adds: `fixture-core.mjs` only if its export surface changed; `test/e2e-browser/fixtures/fake-opencode.cjs` and/or `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` if the spec's spawn path uses them instead of the providers/ mirrors — stage exactly the files the spec references.)
 
 ---
 
