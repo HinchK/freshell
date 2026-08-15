@@ -600,6 +600,298 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── DELETE /api/sessions/:sessionId (soft delete, sessions-router.ts:243-251) ──
+
+/// Node parity: `router.delete('/sessions/:sessionId')` requires the same
+/// token gate as PATCH — an unauthenticated DELETE never reaches the store.
+#[tokio::test]
+async fn delete_requires_auth() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let app = super::router(state(&dir));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/abc123?provider=claude")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The core soft-delete write: a single-key `{deleted:true}` override patch
+/// (`configStore.deleteSession`) lands on disk under the composite key, the
+/// response is exactly `{"ok":true}`, and no provider `.jsonl` is touched.
+#[tokio::test]
+async fn delete_persists_soft_delete_override_and_returns_ok() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let app = super::router(state(&dir));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/del-me?provider=claude")
+                .header("x-auth-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v, serde_json::json!({ "ok": true }));
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg["sessionOverrides"]["claude:del-me"]["deleted"],
+        serde_json::json!(true)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Node parity: the route NEVER 404s — an unknown id just writes a harmless
+/// tombstone override and still answers `{"ok":true}`.
+#[tokio::test]
+async fn delete_unknown_session_returns_ok_tombstone() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let app = super::router(state(&dir));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/no-such-session?provider=claude")
+                .header("x-auth-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v, serde_json::json!({ "ok": true }));
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg["sessionOverrides"]["claude:no-such-session"]["deleted"],
+        serde_json::json!(true)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Key shaping: axum percent-decodes the path param BEFORE we see it, so an
+/// already-composite `codex%3Axyz` passes through verbatim, while a BARE id
+/// gets the `?provider=` prefix — same ladder as `composite_key` for PATCH.
+#[tokio::test]
+async fn delete_decodes_composite_key_and_prefixes_bare_ids() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let app = super::router(state(&dir));
+    for uri in [
+        "/api/sessions/codex%3Axyz",
+        "/api/sessions/plain-id?provider=codex",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "DELETE {uri}");
+    }
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg["sessionOverrides"]["codex:xyz"]["deleted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        cfg["sessionOverrides"]["codex:plain-id"]["deleted"],
+        serde_json::json!(true)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// GAP-1 twin of the archive test: a delete is an override-only,
+/// sidebar-visible change the directory sweep is blind to, so the route must
+/// broadcast `sessions.changed` directly — and successive deletes must bump
+/// the SHARED counter (monotonic, not reset per request).
+#[tokio::test]
+async fn delete_broadcasts_sessions_changed_and_revision_is_monotonic() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let st = state(&dir);
+    let mut broadcast_rx = st.broadcast_tx.subscribe();
+    let app = super::router(st.clone());
+
+    for uri in [
+        "/api/sessions/abc123?provider=claude",
+        "/api/sessions/def456?provider=claude",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "DELETE {uri}");
+    }
+
+    let first_frame = broadcast_rx
+        .try_recv()
+        .expect("sessions.changed broadcast fired for the first delete");
+    let first_frame: serde_json::Value = serde_json::from_str(&first_frame).unwrap();
+    assert_eq!(first_frame["type"], serde_json::json!("sessions.changed"));
+    let first_revision = first_frame["revision"].as_i64().unwrap();
+    let second_frame = broadcast_rx
+        .try_recv()
+        .expect("sessions.changed broadcast fired for the second delete");
+    let second_frame: serde_json::Value = serde_json::from_str(&second_frame).unwrap();
+    let second_revision = second_frame["revision"].as_i64().unwrap();
+    assert!(
+        second_revision > first_revision,
+        "revision must strictly increase across successive deletes"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Round-trip through the READ model: a session visible in the directory
+/// disappears after a DELETE through THIS router because the overlay
+/// (`apply_session_overrides`, session_directory.rs) filters `deleted:true`
+/// rows — and the underlying index/jsonl are untouched.
+#[tokio::test]
+async fn deleted_session_disappears_from_session_directory_overlay() {
+    let home = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    let project = home.join(".claude").join("projects").join("-tmp-proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(home.join(".freshell")).unwrap();
+    // Same discovery-safe shape as the overlay donor above: `cwd`-bearing,
+    // two user messages (survives the default `isNonInteractive` filter).
+    let content = [
+        r#"{"cwd":"/tmp/proj","sessionId":"healthy-session-id","type":"user","message":{"role":"user","content":"first prompt"},"timestamp":"2025-01-30T10:00:00.000Z"}"#,
+        r#"{"cwd":"/tmp/proj","sessionId":"healthy-session-id","type":"assistant","message":{"role":"assistant","content":"ack"},"timestamp":"2025-01-30T10:00:01.000Z"}"#,
+        r#"{"cwd":"/tmp/proj","sessionId":"healthy-session-id","type":"user","message":{"role":"user","content":"second prompt"},"timestamp":"2025-01-30T10:00:02.000Z"}"#,
+    ]
+    .join("\n");
+    std::fs::write(project.join("healthy-session-id.jsonl"), content).unwrap();
+
+    let settings = crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+    let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let sessions_app = super::router(super::SessionsState {
+        auth_token: std::sync::Arc::clone(&auth_token),
+        settings: settings.clone(),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        broadcast_tx: std::sync::Arc::new(tx),
+        terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        ai_key: crate::ai_title::AiKeyCell::init(None, None),
+        gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+        index: None,
+    });
+    let session_index =
+        std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
+            std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                crate::session_directory::claude_home(&home),
+            )) as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        ]));
+    let dir_app =
+        crate::session_directory::router(crate::session_directory::SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+        });
+
+    // Present BEFORE the delete.
+    let before_resp = dir_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session-directory?priority=visible")
+                .header("x-auth-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_resp.status(), StatusCode::OK);
+    let before = body_json(before_resp).await;
+    let items = before["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i["sessionId"] == serde_json::json!("healthy-session-id")),
+        "seeded session must be visible before DELETE"
+    );
+
+    // Soft-delete through the sessions router.
+    let del_resp = sessions_app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/healthy-session-id?provider=claude")
+                .header("x-auth-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status(), StatusCode::OK);
+
+    // Gone AFTER the delete — and the source .jsonl is still on disk, since
+    // a soft delete only writes the override.
+    let after_resp = dir_app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session-directory?priority=visible")
+                .header("x-auth-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_resp.status(), StatusCode::OK);
+    let after = body_json(after_resp).await;
+    let items = after["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .all(|i| i["sessionId"] != serde_json::json!("healthy-session-id")),
+        "deleted session must be filtered from the directory, got {items:?}"
+    );
+    assert!(project.join("healthy-session-id.jsonl").exists());
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Same 4-line fake as `auto_title_sweep`'s test transport: the wired-in
 /// result IS the Gemini reply. NO live Gemini calls in tests, ever.
 struct FakeGemini(Result<String, String>);

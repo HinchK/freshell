@@ -1,6 +1,7 @@
 //! `/api/sessions/:sessionId` — session rename/archive/delete overrides and
 //! AI/first-message title generation. Faithful port of the write half of
-//! `server/sessions-router.ts` (`PATCH` :122-165, `POST generate-title` :167-210),
+//! `server/sessions-router.ts` (`PATCH` :122-165, `DELETE` :243-251,
+//! `POST generate-title` :167-210),
 //! backed by `SettingsStore::patch_session_override`. The REVERSE terminal-cascade
 //! rename (`cascadeSessionRenameToTerminal`, `rename-cascade.ts:39-50`) IS
 //! implemented in `patch_session` below: a rename of a session currently running
@@ -77,10 +78,13 @@ pub struct SessionsState {
     pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
 }
 
-/// The sessions sub-router (`PATCH /api/sessions/:id` + `POST .../generate-title`).
+/// The sessions sub-router (`PATCH`/`DELETE /api/sessions/:id` + `POST .../generate-title`).
 pub fn router(state: SessionsState) -> Router {
     Router::new()
-        .route("/api/sessions/{session_id}", patch(patch_session))
+        .route(
+            "/api/sessions/{session_id}",
+            patch(patch_session).delete(delete_session),
+        )
         .route(
             "/api/sessions/{session_id}/generate-title",
             post(generate_title),
@@ -219,6 +223,32 @@ async fn patch_session(
     }
 
     Json(Value::Object(out)).into_response()
+}
+
+/// `DELETE /api/sessions/:sessionId` — the Node soft delete
+/// (`sessions-router.ts:243-251`): a single-key `{deleted:true}` override
+/// patch (`configStore.deleteSession` → `patch_session_override`; existing
+/// title/summary overrides survive), then a direct `sessions.changed`
+/// broadcast (the route's counterpart to the Node route's
+/// `codingCliIndexer.refresh()` — the directory sweep is blind to
+/// override-only changes, GAP-1). Always `{ok:true}` — no 404 for unknown
+/// ids, matching the Node route exactly.
+async fn delete_session(
+    State(state): State<SessionsState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let key = composite_key(&raw_id, &provider_of(&q));
+    state
+        .settings
+        .patch_session_override(&key, &[("deleted", Some(Value::Bool(true)))])
+        .await;
+    broadcast_sessions_changed_from(&state);
+    Json(json!({ "ok": true })).into_response()
 }
 
 /// The one `sessions.changed` emit site (revision bump + frame send), factored
