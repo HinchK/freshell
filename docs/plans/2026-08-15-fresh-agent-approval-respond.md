@@ -74,13 +74,29 @@ The sidecar's `canUseTool` (`crates/freshell-claude-sidecar/index.mjs:219-228`) 
 //    short-circuits to {behavior:'allow', updatedInput: input} and parks nothing.
 // 4. respondQuestion resolves with {behavior:'allow', updatedInput:{...originalInput,
 //    questions, answers}}.
-// 5. cancelAll(session) emits sdk.permission.cancelled / sdk.question.cancelled per
-//    entry and resolves each parked promise {behavior:'deny', message:'Interrupted'}
-//    (questions: same deny) — never a fabricated user approval.
+// 5. cancelAll(session, {resolveDeny:true}) (post-interrupt) emits sdk.permission.
+//    cancelled / sdk.question.cancelled per entry and resolves each parked promise
+//    {behavior:'deny', message:'Interrupted'} (questions: same deny) — never a
+//    fabricated user approval. cancelAll(..., {resolveDeny:false}) (post-close/
+//    shutdown) emits the cancel frames and NEVER resolves.
+//    VALIDATED CONSTRAINT (LB-04, falsified-then-designed): with @anthropic-ai/
+//    claude-agent-sdk@0.2.71, resolving a parked canUseTool promise AFTER the
+//    query's transport close() throws inside the SDK's floating promise
+//    (unhandled rejection → sidecar crash under Node 22 throw-mode). Therefore
+//    cancelAll splits by live state: post-interrupt (transport still open) →
+//    resolve-with-deny; post-close/shutdown → emit cancel frames ONLY, never
+//    resolve. index.mjs ALSO installs process-level unhandledRejection/
+//    uncaughtException handlers (stderr log, never crash) at startup before any
+//    query() is created (belt-and-braces; the ADR 2.1 no-false-completion
+//    backstop depends on the sidecar not dying mid-interrupt).
 // 6. bypassPermissions mode: no request emitted, immediate allow (preserve existing
 //    behavior, exercised via a canUseTool-shaped adapter helper exported from the module)
 // 7. AskUserQuestion routes to the question path even under bypassPermissions
 //    (legacy ordering: question check precedes bypass check — sdk-bridge.ts:203-214).
+// 8. Process guard: spawn a probe (child node process) that imports index.mjs with a
+//    held-open stdin pipe, rejects a synthetic promise, then closes stdin — assert the
+//    stderr lines recorded the rejection and the process exited 0 on EOF (never crashed
+//    on the rejection). Keep the probe tiny; its only job is pinning the startup guard.
 ```
 
 Module shape (implementation target):
@@ -97,12 +113,16 @@ export function raiseQuestionRequest({ … }) // AskUserQuestion sanitize (legac
   // sdk-bridge.ts:571-626); invalid array → {behavior:'allow',updatedInput:input}
 export function respondPermission(session, requestId, decision) // delete+resolve verbatim, bool
 export function respondQuestion(session, requestId, answers)    // wrap per spec above, bool
-export function cancelPending(session, emit, sessionId) // cancel frames + deny resolves, clears maps
+export function cancelPending(session, emit, sessionId, { resolveDeny }) // cancel frames,
+  // clears maps; resolves deny ONLY when resolveDeny is true (query open — post-interrupt);
+  // post-close callers pass false (LB-04: late resolve → unhandled rejection → crash)
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/server/claude-sidecar/permission-channel.test.ts`
+Run: `npm run test:vitest -- run test/unit/server/claude-sidecar/permission-channel.test.ts --config config/vitest/vitest.server.config.ts`
+
+(VALIDATED fix — LB-06: omitting `--config` makes the coordinator prepend its own `run --config`, leaving the literal `run` as a substring filter that mis-fires across ~11 unrelated files; the explicit-config form targets exactly one file. Verified by execution.)
 
 Expected: FAIL because `permission-channel.mjs` does not exist (import error).
 
@@ -137,12 +157,17 @@ case 'question.respond': {
 }
 ```
 (An unknown requestId is a lose-safely no-op — Rust validates against its pending set first, Task 2. Log to stderr only.)
-4. On `interrupt` and on `shutdown` (and process teardown), per affected session: `cancelPending(session, emit, sessionId)`.
-5. Update the header protocol comment and the out-of-scope note at index.mjs:42-45 (response channel is now in scope; the T2 auto-allow remains only for `bypassPermissions` sessions).
+4. On `interrupt`: per affected session `cancelPending(session, emit, sessionId, { resolveDeny: true })` (transport still open — safe). On `shutdown`/process teardown: `cancelPending(..., { resolveDeny: false })` — emit cancel frames for card cleanup, never resolve parked promises (LB-04). Track query-open state per session (a flag set false when the query generator closes/cleanup completes).
+5. Install at the very top of index.mjs, before any query() exists:
+```js
+process.on('unhandledRejection', (reason) => { logerr(`unhandledRejection: ${String(reason)}`) })
+process.on('uncaughtException', (err) => { logerr(`uncaughtException: ${String(err)}`) })
+```
+6. Update the header protocol comment and the out-of-scope note at index.mjs:42-45 (response channel is now in scope; the T2 auto-allow remains only for `bypassPermissions` sessions).
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npm run test:vitest -- run test/unit/server/claude-sidecar/permission-channel.test.ts`
+Run: `npm run test:vitest -- run test/unit/server/claude-sidecar/permission-channel.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: PASS
 
@@ -152,11 +177,11 @@ Keep the module dependency-injected (no imports of sessions-map/module state); e
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Sidecar is consumed by Rust only via newline-JSON (Task 2 lands that this run). Impacted set: anything importing the sidecar — grep `freshell-claude-sidecar` under test/ and run that set:
+Sidecar is consumed by Rust only via newline-JSON (Task 2 lands that this run). VALIDATED impacted set (LB-06 — a vitest sweep over `git grep -l freshell-claude-sidecar -- test` hits only fixtures no vitest config owns, so it verifies nothing): prove no vitest-owned test code references the sidecar import path, then run the third-config helper suite that DOES own the adjacent fixtures:
 
-Run: `npm run test:vitest -- run $(git grep -l "freshell-claude-sidecar" -- test | tr '\n' ' ')`
+Run: `git grep -n "freshell-claude-sidecar" -- test/unit test/server test/integration ':(exclude)test/unit/server/claude-sidecar/**'` (Expected: no matches past this task's own new file) && `npm run test:e2e:helpers`
 
-Expected: PASS (or no matches → state that)
+Expected: grep silent (excluding the new test) + helpers suite PASS
 
 - [ ] **Step 7: Commit the task**
 
@@ -253,8 +278,8 @@ git commit -m "feat(fresh-agent): claude/kilroy snapshot carries live pending ap
 
 **Files:**
 - Modify: `crates/freshell-freshagent/src/codex.rs` — new `FreshCodexState::handle_compact` (mirror `handle_send` at `:1047-1158`; text `"/compact"` / `format!("/compact {trimmed}")` via the existing `client.start_turn` with the session's stored settings; track `active_turn`; NO ack broadcast)
-- Modify: `crates/freshell-opencode/src/serve.rs` — new `OpencodeServeManager::compact(session_id, instructions, route)`: `POST /session/:id/summarize` JSON body `{instructions?}` via the private `json_request` helper (clone of `abort` at `:686`)
-- Modify: `crates/freshell-freshagent/src/opencode_ws.rs` — new `FreshOpencodeState::handle_compact`: silent no-op when `real_session_id` is none (legacy `adapter.ts:992-994`); otherwise per legacy (`adapter.ts:356-410`): `subscribe()` BEFORE POST → `manager.compact` → `await_idle(real, rx, DEFAULT_TURN_TIMEOUT, route)` → idle snapshot broadcast + `turn_complete_event` ONLY on success (`!turn_aborted && !turn_errored`, monotonic `at` via `next_monotonic_turn_complete_at`) — same shape as `handle_send`'s turn task at `:714-751`
+- Modify: `crates/freshell-opencode/src/serve.rs` — new `OpencodeServeManager::compact(session_id, route)`: `POST /session/:id/summarize` via the private `json_request` helper (clone of `abort` at `:686`) with body `{providerID, modelID, auto: some?}` — VALIDATED contract (LB-03, falsified → redesigned): opencode 1.18.18's summarize REQUIRES `providerID`/`modelID` (400 `Missing key` otherwise) and NEVER reads an `instructions` key (verified via `/doc` OpenAPI schema, live probes, and the packaged handler). Derive the pair from the session's stored model via the EXISTING `crate::model::split_opencode_model` helper (the one `build_prompt_body` uses, opencode_ws.rs:937-948). If the stored model is unset/unsplittable (bare `prompt_async` model omission is fine there but NOT here — summarize requires both): fetch the session's effective model from the serve (verify at implementation which GET — `/session/:id` or `/config` — exposes it; the validator's `/doc` dump in reports/load-bearing-validator-lb03.md has the endpoint inventory); if no source yields provider+model, emit the error loudly (no false success). The client's `instructions` are DROPPED for opencode (no-op upstream; legacy Node has the same degradation — its `serve-manager.ts:465-471` body shape 400s on 1.18.18 — note this divergence in the commit message).
+- Modify: `crates/freshell-freshagent/src/opencode_ws.rs` — new `FreshOpencodeState::handle_compact`: silent no-op when `real_session_id` is none (legacy `adapter.ts:992-994`); otherwise: `subscribe()` BEFORE POST → `manager.compact(real, route)` → `await_idle(real, rx, DEFAULT_TURN_TIMEOUT, route)` → idle snapshot broadcast + `turn_complete_event` ONLY on success (`!turn_aborted && !turn_errored`, monotonic `at` via `next_monotonic_turn_complete_at`) — same shape as `handle_send`'s turn task at `:714-751`; a serve error (incl. the 400 shape guard) flows to the existing error handling (no false turn-complete)
 - Modify: `crates/freshell-ws/src/terminal.rs` — `FreshAgentCompact` arms for Codex/Opencode (same spawn-detached shape); shrink refusal table (Tasks 2) dropping the two compact cells
 - Test: codex.rs/opencode_ws.rs/serve.rs in-crate tests + `freshagent_control_reply.rs` matrix update
 
@@ -262,7 +287,7 @@ git commit -m "feat(fresh-agent): claude/kilroy snapshot carries live pending ap
 
 - [ ] **Step 1: Failing tests**
   - codex: compact on live session → recorded `turn/start` input text `"/compact"` (and `"/compact focus"` with instructions); `active_turn` set; no ack frame.
-  - opencode: compact on materialized session → POST `/session/:id/summarize` body `{instructions:"focus"}`; success → idle snapshot + gated turn-complete; serve 500 → no turn-complete; unmaterialized → no POST at all.
+  - opencode: compact on materialized session → POST `/session/:id/summarize` body `{providerID:"<p>", modelID:"<m>"}` derived from the session's model; success → idle snapshot + gated turn-complete; serve error → no turn-complete; unmaterialized → no POST at all.
   - WS matrix: codex/opencode compact no longer refused.
 - [ ] **Step 2:** `cargo test -p freshell-freshagent -p freshell-opencode compact` — Expected: FAIL
 - [ ] **Step 3: Implement** per Files/Interfaces.
@@ -305,24 +330,26 @@ git commit -m "feat(fresh-agent): fork freshopencode sessions (AGENT-07)"
 ### Task 6: Fork for codex (thread/fork + child registration)
 
 **Files:**
-- Modify: `crates/freshell-codex/src/app_server.rs` — `CodexAppServerClient::fork_thread` (clone of `resume_thread` shape at `:308`; method `thread/fork`; params `{threadId, cwd?, model?, sandbox?, approvalPolicy?, excludeTurns: true}`; result parse `.thread.id` (+ `.thread.path` retained))
+- Modify: `crates/freshell-codex/src/app_server.rs` — three new RPCs (clones of the `resume_thread` shape at `:308`): `fork_thread` (`thread/fork`, params `{threadId, cwd?, model?, sandbox?, approvalPolicy?}` — **NO `excludeTurns`**: 0.147.0 removed it from the schema; it is silently ignored if sent, and without it `result.thread.turns` is populated, child rollout keeps full history), plus `archive_thread` (`thread/archive`) and `unarchive_thread` (`thread/unarchive`) — result shapes parsed loosely (generic success Value is enough for archive/unarchive; fork parses `.thread.id`)
 - Modify: `crates/freshell-freshagent/src/codex.rs` — `FreshCodexState::handle_fork(msg, reply_sink: FrameSink)`
 - Modify: `crates/freshell-ws/src/terminal.rs` — FreshAgentFork codex arm w/ conn_sink
 - Test: app_server.rs + codex.rs tests; WS matrix test
 
 **Interfaces:**
-- `fork_thread(&self, params: ThreadForkParams) -> Result<ThreadForkResult, AppServerError>` — types alongside `StartThreadParams` etc.
-- Handler: parent lookup (thread-id keyed sessions map; unknown → freshAgent.error on sink, lost-session shape) → settings = parent `CodexSession` fields (`model/effort/cwd/sandbox/permission_mode`), `input` overrides only cwd/model per legacy adapter spread → `fork_thread` → app-server RPC failure (e.g. empty parent "no rollout found") → reply `freshAgent.error` on sink (message = server error text) → on success register child through the EXISTING owned-sidecar resume machinery (`ensure_session_resumable`, `:2261+`: new sidecar + `thread/resume(child.id)`; fork rollout exists on disk at response time despite `excludeTurns:true`, `result.thread.path` — design choice (B) from exploration: preserves the port's one-thread-per-sidecar invariant, needs no consumer multiplexer / kill refcount) → binding row via `record_codex_binding` → sink reply `FreshAgentForked{ request_id: msg.request_id, parent_session_id, session_id: child, session_type:'freshcodex', provider:'codex', runtime_provider:'codex', session_ref }`.
-- Rationale recorded in the commit message: Node pins the child to the parent's app-server connection (`adapter.ts:1070`); option (B) diverges deliberately to keep the port's lifecycle invariant; the client's immediate parent-kill lands on the parent sidecar only.
+- `fork_thread(&self, params: ThreadForkParams) -> Result<Value, AppServerError>` (+ the two archive/unarchive RPCs, same plumbing); types alongside `StartThreadParams` etc.
+- VALIDATED lifecycle (LB-01, real 0.147.0 probe): a cross-process `thread/resume(child)` while the parent app-server holds the child is REJECTED (`-32600 "thread … already has an active writer"` — thread-writer locks under CODEX_HOME). The proven while-alive handoff is **archive on parent → unarchive on child sidecar → resume on child sidecar**. Post-owner-exit resume also works (clean SIGTERM drops locks; SIGKILL leaves stale locks that 0.147.0 self-reclaims) — that's the restart-recovery shape, not the fork shape.
+- Handler order: parent lookup (unknown → freshAgent.error on sink, lost-session shape) → `fork_thread` on the parent client (app-server error — e.g. empty parent `-32600 no rollout found for thread id` — → reply `freshAgent.error` on sink with the server error text; no state change) → `archive_thread(child)` on the parent client (releases the writer lock; failure → error reply, child still usable on parent) → spawn the child sidecar + client via the existing owned-sidecar machinery (`ensure_session_resumable`-adjacent, `:2261+`) → `unarchive_thread(child)` → `resume_thread(child)` on the child client → register the child `CodexSession` (settings = parent's `model/effort/cwd/sandbox/permission_mode`, `input` overrides only cwd/model per legacy adapter spread) → binding row via `record_codex_binding` → sink reply `FreshAgentForked{ request_id: msg.request_id, parent_session_id, session_id: child, session_type:'freshcodex', provider:'codex', runtime_provider:'codex', session_ref }`.
+- Notes for the implementer (probed facts): empty parents cannot fork; fork is capability-gated client-side to idle parents (`fork: !is_running` in the snapshot, already true); the client kills the parent immediately after `forked` — that kill tears down only the parent sidecar and does not disturb the resumed child (post-owner-exit resume proven, incl. SIGKILL staleness).
+- Rationale in the commit message: Node pins the child to the parent's app-server connection (`adapter.ts:1070`); the port deliberately registers the child on its own sidecar (one-thread-per-sidecar invariant), using the probed archive→unarchive→resume handoff.
 
 - [ ] **Step 1: Failing tests**
-  - app_server: `fork_thread` serializes `{threadId,…,excludeTurns:true}` and parses `.thread.id` (fake transport).
-  - codex.rs (fake app-server WS): fork on parent → child session exists after resume path (assert spawn count + resume params) + sink `freshAgent.forked` fields; parent unknown → error shape; app-server error → sink error, no child, parent intact.
+  - app_server: `fork_thread` serializes `{threadId,…}` **without** `excludeTurns` (pin that absence) and parses `.thread.id`; archive/unarchive serialize their method names (fake transport).
+  - codex.rs (fake app-server WS): fork on parent → RPC call ORDER `thread/fork` → `thread/archive` (parent) → spawn#2: `thread/unarchive` → `thread/resume` (child client; assert spawn count and per-connection params) → child session exists + sink `freshAgent.forked` fields exact; parent unknown → error shape; `thread/fork` error → sink error, no archive call, no spawn; `thread/archive` failure → sink error, no spawn.
   - WS matrix: codex fork not refused.
 - [ ] **Step 2:** `cargo test -p freshell-codex -p freshell-freshagent fork` — FAIL
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4:** PASS
-- [ ] **Step 5: Refactor** — the resume-path registration should reuse `ensure_session_resumable` verbatim; flag any forced duplication.
+- [ ] **Step 5: Refactor** — the child-sidecar spawn+register should reuse the existing resume machinery verbatim; flag any forced duplication. Do NOT refactor the consumer into a multiplexer (option A) — invalidated as unnecessary by the probe.
 - [ ] **Step 6:** `cargo test -p freshell-codex -p freshell-freshagent -p freshell-ws` + clippy incl. `-p freshell-codex --features real-transport` — PASS
 - [ ] **Step 7: Commit**
 ```bash
@@ -335,7 +362,7 @@ git commit -m "feat(fresh-agent): fork freshcodex threads via thread/fork (AGENT
 ### Task 7: Kilroy availability + ride-through coverage (AGENT-24)
 
 **Files:**
-- Modify: `crates/freshell-server/src/main.rs:2332-2355` (`build_platform_payload`) — `featureFlags.kilroy` = env `KILROY_ENABLED` truthy read with legacy parity (`server/platform-router.ts:22`; legacy treats `'1','true','yes','on'` case-insensitive as true — verify the legacy `isTruthy` helper's exact set and mirror it) — including those comments' "no KILROY_ENABLED wiring yet" note
+- Modify: `crates/freshell-server/src/main.rs:2332-2355` (`build_platform_payload`) — `featureFlags.kilroy` = env `KILROY_ENABLED` truthy read with legacy parity — VALIDATED set (LB-finder B8): legacy is exactly `value === '1' || value.toLowerCase() === 'true'` (`server/platform-router.ts:15-18`; the `'yes'`-accepting helper elsewhere in `server/cli/index.ts:106` is a DIFFERENT function, do not mirror it) — including those comments' "no KILROY_ENABLED wiring yet" note
 - Test: main.rs tests (`:3195-3213` currently pin `kilroy:false` — rewrite to env-matrix); kilroy coverage added to Task 2/3 test surfaces
 
 - [ ] **Step 1: Failing tests** — with `KILROY_ENABLED=1` payload kilroy=true; unset/empty/"0" → false (each env case a separate test, under the existing env-mutation lock convention in that module).
@@ -356,19 +383,20 @@ git commit -m "feat(fresh-agent): KILROY_ENABLED gates kilroy feature flag, lega
 ### Task 8: PW-RUST e2e validation + checklist reconciliation
 
 **Files:**
-- Create: `test/e2e-browser/fixtures/providers/freshclaude-sidecar-stub.mjs` — scripted claude-sidecar-protocol stub: understands `create` (→ `created` + `sdk.session.init` with fixed durable UUID + `sdk.status:idle`), `send` with magic texts — `RAISE_PERMISSION` → emit `sdk.permission.request{requestId:"req-perm-1", subtype:'can_use_tool', tool:{name:'Bash',input:{command:'ls'}}}` + `sdk.turn.waiting`, park (no result); `RAISE_QUESTION` → emit `sdk.question.request{requestId:"req-q-1", questions:[{question:'Pick one', header:'Choice', options:[{label:'A',description:'…'},{label:'B',description:'…'}], multiSelect:false}]}`, park; any `/compact…` text → `sdk.status{compacting}` → `sdk.assistant{summary}` → `sdk.result{subtype:'success'}` → `sdk.turn.complete` → `sdk.status{idle}`, recording that the compaction happened; on permission.respond/question.respond → emit `sdk.assistant('done')` + `sdk.result{subtype:'success'}` + `sdk.turn.complete` + `sdk.status:idle`; EVERY stdin line appended to `FRESHELL_E2E_CLAUDE_STUB_LOG` path (from env) so assertions run off the fixture log; `interrupt` → cancel frames per pending + `sdk.status:idle`; `shutdown` → exit 0
+- Modify: `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs` — VALIDATED extension (LB-05: reuse this HARNESS-03 fixture, do NOT author a parallel stub): add stdin arms in `handleInput()` (`:147-192`; today `create`/`send`/`interrupt`/`shutdown` only, no default arm — unknown types silently dropped) routing `permission.respond`/`question.respond` to `engine.handleMessage(msg)`; respond arms must DECREMENT the per-session pending counter (`st.pending`, `:159` — incremented by `waitingEdgeIfFirstPending`, today reset only by interrupt) so a second raise re-fires `sdk.turn.waiting`; add an env-gated raw-stdin JSONL appender using a `FRESHELL_FAKE_`-namespaced env var (e.g. `FRESHELL_FAKE_STDIN`, auto-records into the launch ledger; mirror `appendJsonl` at `:107-111`, which needs exporting). `on:'msg:permission.respond'`/`'msg:question.respond'` decision points + a `kind:'completion'` emission give the scripted continuation (`sdk.assistant` + `sdk.turn.complete` + `sdk.status:idle`, `fixture-core.mjs:101-118`); add a `sdk.result` render kind only if the spec pins it. Program DSL then drives: `RAISE_PERMISSION` → `sdk.permission.request{requestId:"req-perm-1", subtype:'can_use_tool', tool:{name:'Bash',input:{command:'ls'}}}` + park; `RAISE_QUESTION` → `sdk.question.request{requestId:"req-q-1", questions:[{question:'Pick one', header:'Choice', options:[{label:'A',description:'…'},{label:'B',description:'…'}], multiSelect:false}]}` + park; any `/compact…` text → `sdk.status{compacting}` → completion. VALIDATED SUB-DEPENDENCY (validator flag): this fixture writes NO disk transcripts; the snapshot route (`get_claude_snapshot`) is transcript-driven, so the spec's pending-card assertions need either fixture transcript-write support or a verified behavior of the route on missing transcript — resolve at implementation and record the choice in the spec doc comment.
 - Create: `test/e2e-browser/specs/fresh-agent-control-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` — register spec in `RUST_ONLY_SPECS` AND the `rust-chromium` project's `testMatch` (both lists; convention verified)
 - Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` — tick/re-annotate AGENT-04/05/06/07/24 **only** as far as the evidence of this run justifies; append a dated status note citing this plan
 
-**Test approach:** `RustServer` boot with `env: { FRESHELL_CLAUDE_SIDECAR: <stub abs path>, FRESHELL_CLAUDE_NODE: process.execPath, FRESHELL_E2E_CLAUDE_STUB_LOG: <tmp> }` (`RustServerOptions.env` exists). Drive the real browser: create a freshclaude pane (REST `POST /api/tabs` agent=claude path — follow an existing fresh-agent spec's bootstrap if one exists; else create tab via REST then visit). Cases:
-1. **Approval allow:** send `RAISE_PERMISSION` via composer → approval card renders (snapshot poll) with tool name → click `Allow` (accessible name per `FreshAgentApprovalCard`) → stub log contains `permission.respond` with `{behavior:'allow'}` **and zero respond lines before the click** → card clears → transcript shows `done` → turn-complete.
-2. **Deny:** same then `Deny` → stub log decision `{behavior:'deny', message:'Denied by user', interrupt:false}`; no `sdk.turn.complete` from that request (stub asserts deny path → emits nothing more; pane back to prompt-usable).
+**Test approach:** `RustServer` boot with `env: { FRESHELL_CLAUDE_SIDECAR: <fixture abs path>, FRESHELL_CLAUDE_NODE: process.execPath, FRESHELL_FAKE_STDIN: <tmp log> }` (`RustServerOptions.env` exists; precedent `freshclaude-identity-persistence-rust.spec.ts:231`). Drive the real browser: create a freshclaude pane (follow the bootstrap of an existing freshclaude rust spec). Cases:
+1. **Approval allow:** send `RAISE_PERMISSION` via composer → approval card renders (snapshot poll) with tool name → click `Allow` (accessible name per `FreshAgentApprovalCard`) → stdin log contains `permission.respond` with `{behavior:'allow'}` **and zero respond lines before the click** → card clears → completion flows.
+2. **Deny:** same then `Deny` → stdin log decision `{behavior:'deny', message:'Denied by user', interrupt:false}`; no success completion from that request (fixture's respond arm keyable on behavior); pane back to prompt-usable.
 3. **Reload-while-pending:** raise → `page.reload()` → card re-renders from snapshot (exactly one entry) → Allow → works.
-4. **Cancel (AGENT-05 cancellation cell):** raise → click composer's `Stop` (`aria-label="Stop"`) → card disappears without any `permission.respond` line in the stub log (`freshAgent.permission.cancelled` → card removal + snapshot backstop).
-5. **Question:** `RAISE_QUESTION` → choose option A in `FreshAgentQuestionBanner` → stub log `question.respond` answers `{"0":"A"}`-shaped per banner contract (verify exact key shape from the banner component at implementation and pin it here in the test) → completion flows.
-6. **Compact:** type `/compact focus the diff` in composer → stub log `send` with text `/compact focus the diff` → compacting indicator visible → turn completes → session identity (durable id) unchanged in the pane state.
+4. **Cancel (AGENT-05 cancellation cell):** raise → click composer's `Stop` (`aria-label="Stop"`) → card disappears without any `permission.respond` line in the stdin log (`freshAgent.permission.cancelled` → card removal + snapshot backstop).
+5. **Question:** `RAISE_QUESTION` → choose option A in `FreshAgentQuestionBanner` → stdin log `question.respond` with answers keyed by QUESTION TEXT (`{[questionText]: answer}` — verified `FreshAgentQuestionBanner.tsx:182`, e.g. `{"Pick one":"A"}`; NOT index-keyed) → completion flows.
+6. **Compact:** type `/compact focus the diff` in composer → stdin log `send` with text `/compact focus the diff` → compacting indicator visible → turn completes → session identity (durable id) unchanged in the pane state.
 7. **Fork hidden for claude:** `/fork` absent from slash menu / fork affordance disabled (capabilities gate).
+8. **Kilroy variant (AGENT-24):** repeat case 1's core with a kilroy session-type pane (fixture defaults to kilroy unless configured — check fixture's provider/sessionType config at implementation) asserting envelopes carry `sessionType:"kilroy"`.
 
 - [ ] **Step 1: Failing tests** — spec runs against the unfixed server only insofar as TDD demands: at THIS point in the task order the underlying features are already implemented (Tasks 1-7), so the red step is: author spec + stub, run it, and confirm each assertion genuinely exercises the wiring (kill any vacuous assertion by mutation check: temporarily expect the pre-fix failure shape and see the test fail — e.g. assert no `permission.respond` line pre-click while also asserting card visible; comment in the spec how to run the pre-fix negative).
 - [ ] **Step 2:** Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium fresh-agent-control-rust` — Expected: PASS against fixed code; record one deliberate pre-fix-style negative run (e.g. `RUST` server started with `FRESHELL_CLAUDE_SIDECAR` pointed at a no-op stub) proving the spec fails loudly without the wiring.
@@ -396,4 +424,4 @@ git commit -m "test(fresh-agent): PW-RUST approval/question/compact validation; 
 | 7 | AGENT-24 (availability) | cargo main.rs suite |
 | 8 | all (PW-RUST) | rust-chromium spec |
 
-Final whole-run gates (owned by the executing stage): `cargo test -p freshell-ws -p freshell-freshagent -p freshell-codex -p freshell-opencode -p freshell-server -p freshell-protocol`, fmt/clippy set (incl. real-transport variants), `npm run test:port` + contract regen diff-clean, `npm run test:vitest -- run test/unit/server/claude-sidecar/`, focused PW spec green, then the coordinated full npm suite.
+Final whole-run gates (owned by the executing stage): `cargo test -p freshell-ws -p freshell-freshagent -p freshell-codex -p freshell-opencode -p freshell-server -p freshell-protocol`, fmt/clippy set (incl. real-transport variants), `npm run test:port` + contract regen diff-clean, `npm run test:vitest -- run test/unit/server/claude-sidecar/ --config config/vitest/vitest.server.config.ts` (explicit-config form per LB-06), focused PW spec green, then the coordinated full npm suite.
