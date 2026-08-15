@@ -128,7 +128,7 @@ function nextMonotonic(last, now) {
   return last != null && now <= last ? last + 1 : now
 }
 
-/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, queryOpen?:boolean, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
+/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
@@ -207,7 +207,6 @@ async function consumeStream(sessionId, sdkQuery) {
     // resolve lands inside the SDK's floating promise chain → unhandled
     // rejection → crash under Node 22 throw-mode).
     if (st) {
-      st.queryOpen = false
       cancelPending(st, emit, sessionId, { resolveDeny: false })
     }
     // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
@@ -227,10 +226,11 @@ function handleCreate(req) {
     sessionId = nanoid()
     const abort = new AbortController()
     const { iterable, handle } = createInputStream()
-    // queryOpen tracks whether the SDK query's transport is live: set false the
-    // moment the generator's cleanup completes (LB-04 — a parked canUseTool
-    // promise must never be resolved after transport close).
-    const state = { inputStream: handle, abort, permissionMode: req.permissionMode, queryOpen: true }
+    // Liveness IS session-map membership: consumeStream's finally removes the
+    // session synchronously after cancelPending (LB-04 — a parked canUseTool
+    // promise must never be resolved after transport close), and stdin line
+    // events (macrotasks) cannot interleave inside that finally.
+    const state = { inputStream: handle, abort, permissionMode: req.permissionMode }
     sessions.set(sessionId, state)
 
     const sdkQuery = query({
@@ -319,6 +319,14 @@ rl.on('line', (line) => {
     case 'permission.respond': {
       const st = sessions.get(req.sessionId)
       if (!st) break
+      // Missing decision: NEVER resolve — `undefined` is not a PermissionResult,
+      // and a synthesized default would fabricate the user's choice. Log-only
+      // no-op; the entry stays parked for a later valid respond (mirrors the
+      // coerced-answers asymmetry one arm below).
+      if (req.decision == null) {
+        logerr(`permission.respond: missing decision for request ${req.requestId} (session ${req.sessionId})`)
+        break
+      }
       // Unknown requestId: lose-safely (Rust validates its pending set first) —
       // stderr log only, no frame.
       if (!respondPermission(st, String(req.requestId), req.decision)) {

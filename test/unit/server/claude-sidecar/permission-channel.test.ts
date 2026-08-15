@@ -485,6 +485,45 @@ describe('case 9: options.signal subscription (provider cancellation removes the
   })
 })
 
+// ── review follow-up (Minor 1): pre-aborted signal short-circuit pins ────────
+// Characterization pins for the preemptive-deny branches at
+// permission-channel.mjs:39/:107 (report-disclosed untested branches): an
+// already-aborted provider parks nothing, emits nothing, and resolves the deny
+// payload at once — never a card for a dead request.
+describe('pre-aborted signal short-circuits: never park, never emit, resolve deny at once', () => {
+  it('raisePermissionRequest with an already-aborted options.signal: no frames, nothing parked, resolves deny/Aborted by provider', async () => {
+    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const ctrl = new AbortController()
+    ctrl.abort()
+    const result = await raisePermissionRequest({
+      session, emit, nanoid, nextMonotonic,
+      sessionId: 's1', toolName: 'Bash', input: { command: 'ls' },
+      options: { toolUseID: 't1', signal: ctrl.signal },
+    })
+    expect(result).toEqual({ behavior: 'deny', message: 'Aborted by provider' })
+    expect(frames).toEqual([])
+    expect(session.pendingPermissions?.size ?? 0).toBe(0)
+    expect(session.pendingQuestions?.size ?? 0).toBe(0)
+  })
+
+  it('raiseQuestionRequest with an already-aborted signal: no frames, nothing parked, resolves deny/Aborted by provider', async () => {
+    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const ctrl = new AbortController()
+    ctrl.abort()
+    // Usable questions, so the raise reaches the pre-aborted branch (:107) rather
+    // than the empty/invalid allow short-circuits that precede it (:81-105).
+    const result = await raiseQuestionRequest({
+      session, emit, nanoid, nextMonotonic, sessionId: 's1',
+      input: { questions: [{ question: 'Q?', header: '', options: [], multiSelect: false }] },
+      signal: ctrl.signal,
+    })
+    expect(result).toEqual({ behavior: 'deny', message: 'Aborted by provider' })
+    expect(frames).toEqual([])
+    expect(session.pendingQuestions?.size ?? 0).toBe(0)
+    expect(session.pendingPermissions?.size ?? 0).toBe(0)
+  })
+})
+
 // ── case 10: production-wiring contract test (round-2 F4) ────────────────────
 describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE_SDK_QUERY_MODULE seam)', () => {
   it('create -> magic send -> canUseTool -> respond; interrupt cancels a second park; question routing; shutdown', async () => {
@@ -570,6 +609,51 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     expect(resolved2.decision).toEqual({ behavior: 'deny', message: 'Interrupted' })
 
     // clean teardown
+    const exitP = harness.waitExit()
+    harness.send({ type: 'shutdown' })
+    const { code, signal } = await exitP
+    expect(signal).toBeNull()
+    expect(code).toBe(0)
+  })
+})
+
+// ── review follow-up (Nit 2): permission.respond missing-decision guard ──────
+// A hand-crafted permission.respond with no decision must NOT resolve the parked
+// promise (undefined is not a PermissionResult, and a synthesized default would
+// fabricate the user's choice): the arm logs to stderr and leaves the entry
+// parked for a later valid respond — the mirror of the coerced-answers asymmetry
+// one arm below (index.mjs question.respond).
+describe('production wiring: permission.respond with a null/absent decision is a log-only no-op', () => {
+  it('the parked entry survives a decisionless respond; a later valid respond resolves verbatim', async () => {
+    const harness = spawnSidecar()
+
+    harness.send({ type: 'create', requestId: 'r-create-guard', permissionMode: 'default' })
+    const created = await harness.waitFor((f) => f.type === 'created', 'created')
+    const sessionId = created.sessionId as string
+
+    harness.send({ type: 'send', sessionId, text: '__raise_permission__' })
+    const permReq = await harness.waitFor((f) => f.type === 'sdk.permission.request', 'sdk.permission.request')
+
+    // Hand-crafted malformed frame: NO decision key at all.
+    harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId })
+
+    // Log-only no-op: stderr carries the guard line, and the parked promise must
+    // NOT settle (no probe.resolved frame) within a generous window.
+    await new Promise((r) => setTimeout(r, 300))
+    expect(harness.stderr()).toContain('permission.respond: missing decision')
+    expect(harness.frames.filter((f) => f.type === 'probe.resolved')).toEqual([])
+
+    // The entry is still parked: a later well-formed respond resolves verbatim.
+    const decision = { behavior: 'deny', message: 'Denied by user' }
+    harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId, decision })
+    const resolved = await harness.waitFor(
+      (f) => f.type === 'probe.resolved' && f.kind === 'permission',
+      'probe.resolved after the valid respond',
+    )
+    expect(resolved.decision).toEqual(decision)
+    expect(harness.frames.filter((f) => f.type === 'probe.resolved')).toHaveLength(1)
+
+    // Clean teardown.
     const exitP = harness.waitExit()
     harness.send({ type: 'shutdown' })
     const { code, signal } = await exitP
