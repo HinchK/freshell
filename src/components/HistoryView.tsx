@@ -48,6 +48,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
 
   useEffect(() => {
     if (historyWindow || topLevelSessionCount > 0) return
@@ -117,7 +118,16 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   async function deleteSession(provider: CodingCliProviderName | undefined, sessionId: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
-    await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+    try {
+      await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+    } catch (err) {
+      // SESSION-03: a failed delete must not LOOK like a success — surface it
+      // inline instead of an unhandled rejection while the row stays put.
+      const message = err instanceof Error ? err.message : 'Delete failed'
+      setDeleteError(`Failed to delete session: ${message}`)
+      return
+    }
+    setDeleteError(null)
     // The depth-preserving silent refresh no longer removes vanished sessions —
     // propagate the delete explicitly and immediately.
     dispatch(removeSessionFromProjects({ provider, sessionId }))
@@ -185,6 +195,15 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
           />
         </div>
       </div>
+
+      {deleteError ? (
+        <div
+          role="alert"
+          className="border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive md:px-6"
+        >
+          {deleteError}
+        </div>
+      ) : null}
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">

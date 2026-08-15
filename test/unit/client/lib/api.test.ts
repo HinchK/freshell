@@ -910,4 +910,13 @@ describe('api error mapping', () => {
     expect(err.retryAfterMs).toBeGreaterThan(20_000)
     expect(err.retryAfterMs).toBeLessThanOrEqual(31_000)
   })
+
+  it('locks the delete contract the failure-surfacing UI relies on: a 404 JSON body rejects as an ApiError', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(404, { error: 'Not found' }))
+
+    await expect(api.delete('/api/sessions/claude%3Amissing')).rejects.toMatchObject({
+      status: 404,
+      message: 'Not found',
+    })
+  })
 })

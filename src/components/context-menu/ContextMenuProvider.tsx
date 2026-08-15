@@ -119,6 +119,10 @@ type ConfirmState = {
   body: React.ReactNode
   confirmLabel: string
   onConfirm: () => void
+  /** Set when a confirm attempt fails (e.g. the delete request rejected):
+   * ConfirmModal announces it via role="alert" and the dialog stays open
+   * instead of silently closing with the row intact. */
+  error?: string
 }
 
 type ContextMenuProviderProps = {
@@ -566,19 +570,24 @@ export function ContextMenuProvider({
         </div>
       ),
       onConfirm: async () => {
+        const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
         try {
-          const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
           await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
-          // The depth-preserving silent refresh (see refreshVisibleSessionWindowSilently)
-          // no longer removes vanished sessions — propagate the delete
-          // explicitly and immediately.
-          dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
-          await dispatch(refreshActiveSessionWindow() as any)
-        } catch {
-          // ignore
-        } finally {
-          setConfirmState(null)
+        } catch (err) {
+          // SESSION-03: a failed delete must not LOOK like a success — keep
+          // the dialog open and announce the failure instead of swallowing it.
+          const message = err instanceof Error ? err.message : 'Delete failed'
+          setConfirmState((prev) =>
+            prev ? { ...prev, error: `Failed to delete session: ${message}` } : prev,
+          )
+          return
         }
+        setConfirmState(null)
+        // The depth-preserving silent refresh (see refreshVisibleSessionWindowSilently)
+        // no longer removes vanished sessions — propagate the delete
+        // explicitly and immediately.
+        dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
+        await dispatch(refreshActiveSessionWindow() as any)
       },
     })
   }, [dispatch, getSessionInfo, menuState?.target])
@@ -1459,6 +1468,7 @@ export function ContextMenuProvider({
         title={confirmState?.title || ''}
         body={confirmState?.body || null}
         confirmLabel={confirmState?.confirmLabel || 'Confirm'}
+        error={confirmState?.error}
         onConfirm={() => confirmState?.onConfirm()}
         onCancel={() => setConfirmState(null)}
       />
