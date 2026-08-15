@@ -394,6 +394,19 @@ impl CodexAppServerClient {
         Ok(())
     }
 
+    /// `thread/compact/start` (the 0.147.0 `ThreadCompactStartParams` RPC). Params are
+    /// `{threadId}` ONLY — the schema has NO instructions field, so any client
+    /// `instructions` are dropped by the CALLER (never synthesized or turn-texted here;
+    /// fresh-eyes round-2 F5). Awaiting the `Record<string, never>` response is merely
+    /// the acceptance edge: the compact TURN itself arrives afterwards as the probed
+    /// notification sequence (`thread/status/changed{active}` → `turn/started` → … →
+    /// `turn/completed`) on the session's existing notification consumer.
+    pub async fn compact_thread(&self, thread_id: &str) -> Result<(), CodexAppServerError> {
+        self.request("thread/compact/start", json!({ "threadId": thread_id }))
+            .await?;
+        Ok(())
+    }
+
     /// `thread/read` (`client.ts readThread`; adapter usage `adapter.ts:1089,1094`) \u2014 fetch the
     /// full thread record (`{ thread: {\u2026} }`), optionally with its turns embedded
     /// (`includeTurns`). Returns the raw JSON result verbatim; the fresh-agent REST snapshot
@@ -1016,6 +1029,66 @@ mod tests {
                 assert_eq!(timeout_ms, 50);
             }
             other => panic!("expected a Timeout at the short request_timeout, got {other:?}"),
+        }
+    }
+
+    // ── thread/compact/start (AGENT-04, approval-respond Task 4) ─────────────
+
+    #[tokio::test]
+    async fn compact_thread_sends_thread_compact_start_with_only_the_thread_id() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.compact_thread("thread-1").await });
+
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // 0.147.0 ThreadCompactStartParams: `{threadId}` ONLY -- pin the EXACT key set so
+        // an `instructions` key (or anything else) can never sneak onto this schema.
+        let obj = params.as_object().expect("params object");
+        assert_eq!(obj.len(), 1, "params must carry ONLY threadId: {params}");
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert!(
+            params.get("instructions").is_none(),
+            "codex compact has NO instructions field (0.147.0), never one: {params}"
+        );
+        // The success response is `Record<string, never>` (an empty object).
+        peer.respond(&id, json!({}));
+
+        task.await.unwrap().expect("compact_thread succeeds");
+    }
+
+    #[tokio::test]
+    async fn compact_thread_surfaces_an_rpc_error_with_the_method_name() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.compact_thread("thread-1").await });
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond_error(&id, -32600, "thread is mid-turn");
+
+        match task.await.unwrap() {
+            Err(CodexAppServerError::Rpc { method, error }) => {
+                assert_eq!(method, "thread/compact/start");
+                assert_eq!(error.code, -32600);
+                assert_eq!(error.message, "thread is mid-turn");
+            }
+            other => panic!("expected an Rpc error, got {other:?}"),
         }
     }
 

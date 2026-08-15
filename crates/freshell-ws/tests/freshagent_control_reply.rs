@@ -7,7 +7,9 @@
 //! cells with the legacy parity text (`runtime-manager.ts`:
 //! `"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
 //! `"Fork is …"`, `"Compact is …"`) under code `UNSUPPORTED_CAPABILITY`; every handled
-//! cell routes to a real dispatch arm.
+//! cell routes to a real dispatch arm. Task 4 landed the codex/opencode compact arms
+//! (their cells dropped from the table) and pins the unconditional amplifier x op
+//! refusal cells.
 //!
 //! These tests drive a REAL axum server + REAL tokio-tungstenite client (same harness
 //! as `unknown_terminal_reply.rs`, the kata-dtfn precedent).
@@ -172,6 +174,177 @@ async fn claude_compact_reaches_the_claude_dispatch_arm() {
         frame["event"]["code"],
         serde_json::json!("INVALID_SESSION_ID"),
         "the frame reached the claude handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Dispatch-matrix cell (Task 4): codex compact is NO LONGER refused — it reaches
+/// `FreshCodexState::handle_compact`, which answers an unknown session with the codex
+/// slice's top-level `SESSION_NOT_FOUND` error shape (never UNSUPPORTED_CAPABILITY).
+#[tokio::test]
+async fn codex_compact_reaches_the_codex_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.compact",
+            "provider": "codex",
+            "sessionId": "ses-cx-compact-1",
+            "sessionType": "freshcodex",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "error").await;
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("SESSION_NOT_FOUND"),
+        "the frame reached the codex handler (a refusal-table answer would be a freshAgent.event UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Dispatch-matrix cell (Task 4): opencode compact reaches
+/// `FreshOpencodeState::handle_compact` (unknown session → SESSION_NOT_FOUND).
+#[tokio::test]
+async fn opencode_compact_reaches_the_opencode_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.compact",
+            "provider": "opencode",
+            "sessionId": "ses-oc-compact-1",
+            "sessionType": "freshopencode",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "error").await;
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("SESSION_NOT_FOUND"),
+        "the frame reached the opencode handler (a refusal-table answer would be a freshAgent.event UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Refusal-matrix pin (carried Task-2 nit, cleared in Task 4): there is no amplifier
+/// FRESH-AGENT runtime, so EVERY control frame naming the amplifier provider is refused
+/// with the parity capability text. (There is no amplifier `sessionType`; the sessionType
+/// field here is filler the pin never consults.)
+#[tokio::test]
+async fn amplifier_approval_respond_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.approval.respond",
+            "provider": "amplifier",
+            "sessionId": "ses-amp-approve",
+            "sessionType": "freshclaude",
+            "decision": { "approved": true, "scope": "once" },
+            "requestId": "perm-amp-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-amp-approve",
+        "amplifier",
+        "freshclaude",
+        "Approvals are not supported for freshclaude",
+    );
+}
+
+#[tokio::test]
+async fn amplifier_question_respond_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.question.respond",
+            "provider": "amplifier",
+            "sessionId": "ses-amp-question",
+            "sessionType": "freshclaude",
+            "answers": { "Pick one": "A" },
+            "requestId": "q-amp-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-amp-question",
+        "amplifier",
+        "freshclaude",
+        "Questions are not supported for freshclaude",
+    );
+}
+
+#[tokio::test]
+async fn amplifier_fork_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.fork",
+            "provider": "amplifier",
+            "sessionId": "ses-amp-fork",
+            "sessionType": "freshcodex",
+            "requestId": "fork-amp-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-amp-fork",
+        "amplifier",
+        "freshcodex",
+        "Fork is not supported for freshcodex",
+    );
+}
+
+/// The Task-4 table shrink keeps exactly ONE compact refusal cell: amplifier.
+#[tokio::test]
+async fn amplifier_compact_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.compact",
+            "provider": "amplifier",
+            "sessionId": "ses-amp-compact",
+            "sessionType": "freshopencode",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-amp-compact",
+        "amplifier",
+        "freshopencode",
+        "Compact is not supported for freshopencode",
     );
 }
 

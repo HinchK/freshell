@@ -67,9 +67,10 @@ use freshell_codex::{
     StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
+    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage,
+    SessionLocator,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
@@ -1215,6 +1216,52 @@ impl FreshCodexState {
             Err(err) => {
                 self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
             }
+        }
+    }
+
+    // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
+
+    /// Handle a `freshAgent.compact` for codex: issue the app-server's REAL compact RPC
+    /// (`thread/compact/start`, 0.147.0) — NEVER a `/compact` user-turn fallback
+    /// (fresh-eyes round-2 F5). The schema's params are `{threadId}` ONLY, so the
+    /// client's `instructions` are DELIBERATELY DROPPED (upstream limitation).
+    /// Awaiting the `Record<string, never>` response is merely the acceptance edge: the
+    /// compact turn's busy→idle lifecycle and its status-gated `freshAgent.turn.complete`
+    /// chime ride THIS session's existing notification consumer
+    /// ([`reduce_notification`]), matching the PROBED 0.147.0 flow
+    /// (`thread/status/changed{active}` → `turn/started` → items/token-usage →
+    /// `thread/status/changed{idle}` → `turn/completed{turn.status:'completed'}`; NO
+    /// `thread/compacted` notification exists in the success flow, so no new
+    /// `CodexStatus` is needed). Concurrency gate: refuse while a turn is already
+    /// running (`active_turn` set) with the codex slice's existing error shape rather
+    /// than letting the app-server EINVAL.
+    pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        let session_id = msg.session_id.clone();
+
+        let looked_up = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(&session_id)
+                .map(|s| (s.client.clone(), s.active_turn.clone()))
+        };
+        let Some((client, active_turn)) = looked_up else {
+            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+            return;
+        };
+
+        if active_turn.lock().expect("active_turn mutex").is_some() {
+            self.send_error(
+                &None,
+                "CODEX_COMPACT_FAILED",
+                &format!(
+                    "Codex session {session_id} has an active turn; compact it after the turn completes."
+                ),
+            );
+            return;
+        }
+
+        if let Err(err) = client.compact_thread(&session_id).await {
+            self.send_error(&None, "CODEX_COMPACT_FAILED", &err.to_string());
         }
     }
 
@@ -4423,6 +4470,338 @@ pub(crate) mod tests {
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
+    }
+
+    // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
+
+    fn compact_msg(session_id: &str) -> FreshAgentCompact {
+        FreshAgentCompact {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            instructions: None,
+        }
+    }
+
+    /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
+    /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
+    /// the channel plus a fresh bus receiver.
+    async fn insert_idle_compact_session(
+        st: &FreshCodexState,
+        thread_id: &str,
+    ) -> (
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let rx = insert_fake_session_with_real_consumer(
+            st,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            &format!("codex-sidecar-test-compact-{thread_id}"),
+        )
+        .await;
+        (peer, rx)
+    }
+
+    /// Complete the initialize handshake a first RPC triggers (client.ts:777-778).
+    async fn answer_initialize(peer: &freshell_codex::ChannelPeer) {
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await; // initialized
+    }
+
+    /// Drive the PROBED real-0.147.0 post-compact notification sequence (plan Task 4,
+    /// fresh-eyes round-3 F4 closure): `thread/status/changed{active}` → `turn/started`
+    /// → `item/started` → `thread/tokenUsage/updated` → `item/completed` →
+    /// `thread/status/changed{idle}` → `turn/completed{turn.status}`. NO
+    /// `thread/compacted` notification exists in the success flow.
+    fn emit_compact_notification_sequence(
+        peer: &freshell_codex::ChannelPeer,
+        thread_id: &str,
+        turn_status: &str,
+    ) {
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": thread_id, "status": { "type": "active" } }),
+        );
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1" } }),
+        );
+        peer.emit_notification(
+            "item/started",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/tokenUsage/updated",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "tokenUsage": {} }),
+        );
+        peer.emit_notification(
+            "item/completed",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": thread_id, "status": { "type": "idle" } }),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_issues_thread_compact_start_and_the_probed_notification_flow_completes()
+    {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-c1").await;
+
+        // The pane's Compact click: instructions ARE on the wire frame, but codex
+        // 0.147.0's `thread/compact/start` schema has NO instructions field -- they are
+        // deliberately DROPPED (never sent as `/compact` turn text either).
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut msg = compact_msg("thread-c1");
+                msg.instructions = Some("focus the diff".to_string());
+                st.handle_compact(msg).await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        let obj = params.as_object().expect("params object");
+        assert_eq!(
+            obj.len(),
+            1,
+            "thread/compact/start params are `{{threadId}}` ONLY: {params}"
+        );
+        assert_eq!(params["threadId"], json!("thread-c1"));
+        assert!(
+            params.get("instructions").is_none(),
+            "instructions NEVER cross the wire for codex compact: {params}"
+        );
+        peer.respond(&id, json!({}));
+        driver.await.expect("compact task");
+
+        // NO turn/start anywhere in this drive: compact never degenerates to turn text.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.expect_request())
+                .await
+                .is_err(),
+            "compact must issue NO further RPC (in particular, no `turn/start`)"
+        );
+
+        // The fake app-server then drives the probed notification sequence, and the
+        // session must go BUSY then IDLE with ONE server-authoritative chime (existing
+        // consumer machinery absorbs the compact flow; no thread/compacted is needed).
+        emit_compact_notification_sequence(&peer, "thread-c1", "completed");
+
+        let mut snapshots: Vec<String> = Vec::new();
+        let mut completes = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no turn.complete within the budget (snapshots seen: {snapshots:?})"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" || frame["sessionId"] != "thread-c1" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    snapshots.push(frame["event"]["status"].as_str().unwrap_or("?").to_string());
+                }
+                Some("freshAgent.turn.complete") => {
+                    completes += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            completes, 1,
+            "exactly one completion chime, got {completes}"
+        );
+        assert!(
+            snapshots.iter().any(|s| s == "running"),
+            "compact must mark the session BUSY first, got {snapshots:?}"
+        );
+        assert!(
+            snapshots.iter().any(|s| s == "idle"),
+            "compact must return the session to idle, got {snapshots:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_failed_or_interrupted_turn_produces_no_completion_chime() {
+        for status in ["failed", "interrupted"] {
+            let (st, _rx_boot) = state_with_bus();
+            let (peer, mut rx) = insert_idle_compact_session(&st, "thread-cx").await;
+
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.handle_compact(compact_msg("thread-cx")).await;
+                })
+            };
+            answer_initialize(&peer).await;
+            let (id, method, _params) = peer.expect_request().await;
+            assert_eq!(method, "thread/compact/start");
+            peer.respond(&id, json!({}));
+            driver.await.expect("compact task");
+
+            // Same probed sequence, but the compact turn ends WITHOUT status:completed.
+            emit_compact_notification_sequence(&peer, "thread-cx", status);
+
+            let mut saw_idle = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                    break;
+                };
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                if frame["sessionId"] != "thread-cx" {
+                    continue;
+                }
+                match frame["event"]["type"].as_str() {
+                    Some("freshAgent.session.snapshot") if frame["event"]["status"] == "idle" => {
+                        saw_idle = true;
+                    }
+                    Some("freshAgent.turn.complete") => {
+                        panic!("a `{status}` compact turn must never chime")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                saw_idle,
+                "the idle snapshot still flows for a `{status}` compact turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_compact_refuses_while_a_turn_is_active_without_issuing_any_rpc() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thread-busy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-9".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-compact-busy",
+        )
+        .await;
+
+        st.handle_compact(compact_msg("thread-busy")).await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("CODEX_COMPACT_FAILED"),
+            "{frame}"
+        );
+
+        // The gate fires BEFORE any RPC -- nothing (not even the initialize gating)
+        // ever reaches the app-server: no app-server EINVAL is let through.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a busy session must produce NO compact RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_rpc_error_surfaces_the_error_path_and_no_fake_completion() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-ce").await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-ce")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond_error(&id, -32600, "compact rejected");
+        driver.await.expect("compact task");
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("CODEX_COMPACT_FAILED:"),
+            "{frame}"
+        );
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("compact rejected"),
+            "{frame}"
+        );
+
+        // No compact flow was accepted server-side, so NOTHING else may be broadcast
+        // (in particular no fabricated idle snapshot or turn.complete).
+        assert!(
+            rx.try_recv().is_err(),
+            "an RPC failure must not fabricate a completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_unknown_session_errors_like_the_other_codex_handlers() {
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_compact(compact_msg("does-not-exist")).await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("SESSION_NOT_FOUND"),
+            "{frame}"
+        );
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("codex session not found"),
+            "{frame}"
+        );
     }
 
     #[tokio::test]

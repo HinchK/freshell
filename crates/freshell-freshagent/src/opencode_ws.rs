@@ -16,20 +16,21 @@
 //! | `freshAgent.send {sessionId,text,…}` | **materialize-or-send** (`adapter.ts:324-361`): create the durable `ses_*` session ONLY the first time (THE continuity fix — see below), broadcast `freshAgent.session.materialized` exactly once, then broadcast `freshAgent.send.accepted` and run the turn |
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
 //! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
+//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
 //! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
 //! the client folds into `markSessionLost` instead of hanging. **Out of scope entirely
-//! for this slice:** `freshAgent.fork` / `freshAgent.compact`.
+//! for this slice:** `freshAgent.fork` (approval-respond Task 5).
 //!
 //! The turn this module runs on `freshAgent.send` DOES land in the real opencode session
 //! (via [`freshell_opencode::OpencodeServeManager::run_turn`]) — the pane's live-updating
 //! transcript just isn't wired to the WS bus yet, so nothing streams to the browser
 //! until that turn resolves and a later `freshAgent.attach`/REST read observes it.
 //! **Deferred to PR-4:** `freshAgent.attach`. **Out of scope entirely for this slice:**
-//! `freshAgent.fork` / `freshAgent.compact`.
+//! `freshAgent.fork` (approval-respond Task 5).
 //!
 //! ## THE continuity fix (AGENT-08)
 //!
@@ -69,10 +70,10 @@ use freshell_opencode::{
     SdkProviderEvent, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
-    SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
+    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
 use crate::{
@@ -725,28 +726,14 @@ impl FreshOpencodeState {
                 )
                 .await;
 
-            // `emitStatus(state, 'idle')` (adapter.ts:371/384) -- unconditional, whether
-            // the turn succeeded or the promptAsync/idle-wait itself errored.
-            fresh_agent.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
-
-            // adapter.ts:377 -- a positive completion requires the idle-wait to have
-            // actually succeeded AND the turn to have been neither interrupted
-            // (`turn_aborted`, set by `handle_interrupt`) nor errored (`turn_errored`,
-            // set by the serve-stream bridge on an observed `session.error`).
-            if result.is_ok()
-                && !turn_aborted.load(Ordering::SeqCst)
-                && !turn_errored.load(Ordering::SeqCst)
-            {
-                let at = {
-                    let mut guard = last_turn_complete_at
-                        .lock()
-                        .expect("last_turn_complete_at mutex");
-                    let at = next_monotonic_turn_complete_at(*guard, now_ms());
-                    *guard = Some(at);
-                    at
-                };
-                fresh_agent.broadcast(&event_frame(&real_id, turn_complete_event(&real_id, at)));
-            }
+            settle_turn_outcome(
+                &fresh_agent,
+                &real_id,
+                result.is_ok(),
+                &turn_aborted,
+                &turn_errored,
+                &last_turn_complete_at,
+            );
         });
         session.turn_task = Some(turn_task);
     }
@@ -872,6 +859,125 @@ impl FreshOpencodeState {
                 // silently swallowed.
                 turn_aborted.store(false, Ordering::SeqCst);
             }
+        }
+    }
+
+    // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
+
+    /// Handle a `freshAgent.compact` for opencode (legacy `compact()` →
+    /// `compactForState`, `adapter.ts:992-1011,356-399`) against the VALIDATED
+    /// opencode 1.18.18 summarize contract (`POST /session/:id/summarize` with a body
+    /// of EXACTLY `{providerID, modelID}` — required, `additionalProperties:false`).
+    /// The client's `instructions` are DELIBERATELY DROPPED (no-op upstream; note the
+    /// deliberate divergence: legacy Node's own `serve-manager.ts:465-471` body shape
+    /// `{instructions?}` 400s on 1.18.18, so this port does NOT mirror it). A
+    /// not-yet-materialized session is a SILENT NO-OP (`adapter.ts:992-994`).
+    ///
+    /// REVIEWED lifecycle (fresh-eyes F3, `adapter.ts:356-399`): FIRST reset the
+    /// session's `turn_aborted`/`turn_errored` flags (a prior interrupted/errored turn
+    /// must not suppress this compact's completion edge), broadcast the running-status
+    /// snapshot (the busy indicator must be visible before the upstream request
+    /// settles), subscribe BEFORE the POST (the idle edge cannot be missed), resolve
+    /// the model pair (the serve crate stores no session metadata, so resolution lives
+    /// here: the session's model split via `split_opencode_model`, else `GET /config`'s
+    /// `model`, else a LOUD error), POST, await idle, and settle with the SAME
+    /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
+    /// error still returns the pane to idle and surfaces the error loudly — never a
+    /// false completion.
+    pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        let session_id = msg.session_id.clone();
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
+            return;
+        };
+
+        let (real_id, model, route, turn_aborted, turn_errored, last_turn_complete_at) = {
+            let session = session_arc.lock().await;
+            let Some(real_id) = session.real_session_id.clone() else {
+                // adapter.ts:992-994 — no server-side session to compact; silent no-op.
+                return;
+            };
+            // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
+            session.turn_aborted.store(false, Ordering::SeqCst);
+            session.turn_errored.store(false, Ordering::SeqCst);
+            (
+                real_id,
+                session.model.clone(),
+                session.cwd.clone(),
+                session.turn_aborted.clone(),
+                session.turn_errored.clone(),
+                session.last_turn_complete_at.clone(),
+            )
+        };
+
+        // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
+        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
+
+        let manager = self.fresh_agent.ensure_manager().await;
+        // Subscribe BEFORE the POST so the compact's idle edge cannot be missed (the
+        // same mechanic as `run_turn`; legacy arms its `onceIdle` first too).
+        let rx = manager.subscribe(&real_id);
+
+        // Model-pair resolution: (1) the session's stored model via the existing
+        // `build_prompt_body` helper; (2) `GET /config`'s `model` key (probed: present,
+        // string-or-null); (3) a LOUD failure (no false success, NO POST).
+        let model_pair = match freshell_opencode::split_opencode_model(model.as_deref()) {
+            Some(pair) => Some(pair),
+            None => match manager.get_config(&route).await {
+                Ok(config) => freshell_opencode::split_opencode_model(
+                    config.get("model").and_then(Value::as_str),
+                ),
+                Err(_) => None,
+            },
+        };
+        let Some(model_pair) = model_pair else {
+            // Never leave the pane stuck busy on the failure path.
+            self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            self.emit_fresh_agent_error(
+                &real_id,
+                "OPENCODE_COMPACT_FAILED",
+                &format!(
+                    "Compact failed for opencode session {real_id}: no model/provider pair is resolvable (both the session model and the serve /config model are unset or unusable)"
+                ),
+            );
+            return;
+        };
+
+        let result = match manager
+            .compact(
+                &real_id,
+                &model_pair.provider_id,
+                &model_pair.model_id,
+                &route,
+            )
+            .await
+        {
+            Ok(()) => {
+                manager
+                    .await_idle(&real_id, rx, DEFAULT_TURN_TIMEOUT, route)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+
+        // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
+        // unconditionally + the gated chime); a serve error additionally surfaces
+        // loudly and never produces a false turn-complete.
+        let succeeded = result.is_ok();
+        settle_turn_outcome(
+            &self.fresh_agent,
+            &real_id,
+            succeeded,
+            &turn_aborted,
+            &turn_errored,
+            &last_turn_complete_at,
+        );
+        if let Err(err) = result {
+            self.emit_fresh_agent_error(&real_id, "OPENCODE_COMPACT_FAILED", &err.to_string());
         }
     }
 
@@ -1289,6 +1395,34 @@ fn error_event(session_id: &str, message: &str) -> Value {
 /// positive-completion chime, adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+}
+
+/// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
+/// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
+/// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
+/// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
+/// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
+/// session's monotonic turn-complete clock.
+fn settle_turn_outcome(
+    fresh_agent: &FreshAgentState,
+    real_id: &str,
+    succeeded: bool,
+    turn_aborted: &AtomicBool,
+    turn_errored: &AtomicBool,
+    last_turn_complete_at: &StdMutex<Option<i64>>,
+) {
+    fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
+    if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
+        let at = {
+            let mut guard = last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            let at = next_monotonic_turn_complete_at(*guard, now_ms());
+            *guard = Some(at);
+            at
+        };
+        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    }
 }
 
 /// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
@@ -2865,6 +2999,484 @@ mod tests {
         assert!(
             !saw_complete,
             "an errored turn must never emit turn.complete"
+        );
+    }
+
+    // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
+
+    fn compact_msg(session_id: &str) -> FreshAgentCompact {
+        FreshAgentCompact {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            instructions: None,
+        }
+    }
+
+    /// One recorded fake-serve request.
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        url: String,
+        body: Option<Value>,
+    }
+
+    /// The compact-suite serve fake: records EVERY request, scripts `/config`, fails
+    /// summarize on demand, and re-arms a per-session busy budget (two polls) on every
+    /// `prompt_async`/`summarize` POST so `await_idle`'s status-poll fallback resolves
+    /// deterministically. `summarize` additionally pins the reviewed lifecycle ORDER:
+    /// drained synchronously from its own bus probe, the LAST session snapshot before
+    /// the POST must be the busy `running` one (the busy indicator is visible before
+    /// the upstream request settles).
+    struct CompactFakeHttp {
+        next_session: AtomicUsize,
+        requests: StdMutex<Vec<RecordedRequest>>,
+        busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
+        summarize_fails: bool,
+        config_body: Vec<u8>,
+        bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
+    }
+
+    impl CompactFakeHttp {
+        fn new(
+            config_body: Vec<u8>,
+            summarize_fails: bool,
+            bus_probe: tokio::sync::broadcast::Receiver<String>,
+        ) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                requests: StdMutex::new(Vec::new()),
+                busy_budget: StdMutex::new(std::collections::HashMap::new()),
+                summarize_fails,
+                config_body,
+                bus_probe: StdMutex::new(bus_probe),
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn summarize_requests(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.contains("/summarize"))
+                .collect()
+        }
+
+        fn get_config_count(&self) -> usize {
+            self.recorded()
+                .iter()
+                .filter(|r| r.method == "GET" && r.url.contains("/config"))
+                .count()
+        }
+
+        /// Synchronously drain the bus probe and return the LAST `running`/`idle`
+        /// snapshot status seen for `session_id`, if any.
+        fn last_snapshot_status_for(&self, session_id: &str) -> Option<String> {
+            let mut last = None;
+            let mut probe = self.bus_probe.lock().expect("bus probe mutex");
+            while let Ok(text) = probe.try_recv() {
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if v["type"] == "freshAgent.event"
+                    && v["sessionId"] == session_id
+                    && v["event"]["type"] == "freshAgent.session.snapshot"
+                {
+                    last = v["event"]["status"].as_str().map(str::to_string);
+                }
+            }
+            last
+        }
+    }
+
+    impl ServeHttp for CompactFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body_value = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.requests
+                .lock()
+                .expect("requests mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body: body_value,
+                });
+
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
+            if method == "POST" && (req.url.ends_with("/session") || req.url.contains("/session?"))
+            {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body =
+                    serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
+                        .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "POST" && req.url.contains("/summarize") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                // ORDER PIN: the busy snapshot must already be on the bus when the
+                // summarize POST lands (reviewed lifecycle: running FIRST, then POST).
+                assert_eq!(
+                    self.last_snapshot_status_for(&id).as_deref(),
+                    Some("running"),
+                    "the busy `running` snapshot must precede the summarize POST"
+                );
+                if self.summarize_fails {
+                    return Box::pin(async {
+                        Ok(ServeHttpResponse::new(500, b"summarize exploded".to_vec()))
+                    });
+                }
+                self.busy_budget
+                    .lock()
+                    .expect("busy budget mutex")
+                    .insert(id, 2);
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"true".to_vec())) });
+            }
+            if method == "POST" && req.url.contains("/prompt_async") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                self.busy_budget
+                    .lock()
+                    .expect("busy budget mutex")
+                    .insert(id, 2);
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if method == "GET" && req.url.contains("/session/status") {
+                let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
+                let mut map = serde_json::Map::new();
+                for (id, budget) in budgets.iter_mut() {
+                    if *budget > 0 {
+                        *budget -= 1;
+                        map.insert(id.clone(), json!({ "type": "busy" }));
+                    }
+                }
+                let body = serde_json::to_vec(&Value::Object(map)).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "GET" && req.url.contains("/config") {
+                let body = self.config_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`CompactFakeHttp`]-backed serve manager,
+    /// returning the state, the fake, and a bus receiver subscribed BEFORE any handler
+    /// runs.
+    async fn compact_state(
+        config_body: &str,
+        summarize_fails: bool,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let http = Arc::new(CompactFakeHttp::new(
+            config_body.as_bytes().to_vec(),
+            summarize_fails,
+            tx.subscribe(),
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), http, rx)
+    }
+
+    /// Insert a directly-materialized session (no send drove it) with the given model.
+    async fn insert_compact_session(st: &FreshOpencodeState, id: &str, model: Option<&str>) {
+        let mut session =
+            OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
+        session.real_session_id = Some(id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+    }
+
+    /// Drain every buffered bus frame in arrival order (full parsed payloads).
+    fn drain_frames(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            out.push(v);
+        }
+        out
+    }
+
+    /// `true` when `frame` is a `freshAgent.event` whose inner `event.type == wanted`
+    /// (and, when given, whose inner `status == status`).
+    fn is_event(frame: &Value, wanted: &str, status: Option<&str>) -> bool {
+        frame["type"] == "freshAgent.event"
+            && frame["event"]["type"] == wanted
+            && status
+                .map(|s| frame["event"]["status"] == s)
+                .unwrap_or(true)
+    }
+
+    #[tokio::test]
+    async fn compact_posts_summarize_with_the_session_model_then_busy_idle_and_one_chime() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+
+        // The pane's Compact click carries instructions, but opencode's summarize
+        // schema has NO instructions field -- they are deliberately DROPPED.
+        let mut msg = compact_msg("ses_1");
+        msg.instructions = Some("focus the diff".to_string());
+        st.handle_compact(msg).await;
+
+        let summarize = http.summarize_requests();
+        assert_eq!(summarize.len(), 1, "exactly one summarize POST");
+        assert!(summarize[0].url.contains("/session/ses_1/summarize"));
+        let body = summarize[0].body.clone().expect("a JSON body");
+        let obj = body.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "additionalProperties:false — EXACTLY providerID+modelID: {body}"
+        );
+        assert_eq!(body["providerID"], "prov-a");
+        assert_eq!(body["modelID"], "mdl-x");
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "a splittable session model wins -- /config is NOT consulted"
+        );
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "busy snapshot present: {frames:?}"
+        );
+        let idle_idx = frames
+            .iter()
+            .position(|f| is_event(f, "freshAgent.session.snapshot", Some("idle")))
+            .expect("an idle snapshot was broadcast");
+        let complete_idx = frames
+            .iter()
+            .position(|f| is_event(f, "freshAgent.turn.complete", None))
+            .expect("the gated turn.complete was broadcast");
+        assert!(
+            idle_idx < complete_idx,
+            "idle precedes the chime: {frames:?}"
+        );
+        assert!(
+            frames[complete_idx]["event"]["at"].as_i64().unwrap_or(0) > 0,
+            "the chime carries a positive monotonic at: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_falls_back_to_the_serve_config_model_when_the_session_has_none() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":"conf-prov/conf-mdl","theme":"dark"}"#, false).await;
+        // A resumed session never touched by a send can carry NO model.
+        insert_compact_session(&st, "ses_1", None).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert_eq!(http.get_config_count(), 1, "GET /config ran exactly once");
+        let summarize = http.summarize_requests();
+        assert_eq!(summarize.len(), 1);
+        let body = summarize[0].body.clone().unwrap();
+        assert_eq!(body["providerID"], "conf-prov");
+        assert_eq!(body["modelID"], "conf-mdl");
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "resolution via /config still completes: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_with_no_resolvable_model_errors_loudly_and_never_posts() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        // An unsplittable session model forces the /config fallback, which is null.
+        insert_compact_session(&st, "ses_1", Some("noslash")).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert_eq!(
+            http.get_config_count(),
+            1,
+            "the unsplittable session model did consult /config"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "NO POST when no model pair is resolvable"
+        );
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "the busy snapshot precedes the resolution attempt: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane is NOT left stuck busy: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "no false success chime: {frames:?}"
+        );
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD (a freshAgent.error frame)");
+        assert_eq!(
+            error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED",
+            "{error_frame}"
+        );
+        let message = error_frame["event"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.to_ascii_lowercase().contains("compact"),
+            "the message names the failed compact: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_on_a_not_yet_materialized_session_is_a_silent_noop() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+
+        st.handle_create(create_msg("req-noop")).await;
+        let placeholder = "freshopencode-req-noop";
+        // Drain the freshAgent.created frame.
+        assert!(rx.try_recv().is_ok());
+
+        st.handle_compact(compact_msg(placeholder)).await;
+
+        assert!(
+            http.summarize_requests().is_empty(),
+            "unmaterialized -> NO POST at all (legacy adapter.ts:992-994)"
+        );
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "unmaterialized -> no model resolution either"
+        );
+        assert!(rx.try_recv().is_err(), "a silent no-op broadcasts NOTHING");
+    }
+
+    #[tokio::test]
+    async fn compact_after_an_interrupted_or_errored_turn_resets_the_stale_flags_and_chimes() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+            let session = session_arc.lock().await;
+            // Stale flags from a prior interrupted AND errored turn: a compact that
+            // completes successfully MUST still chime (they get reset FIRST).
+            session.turn_aborted.store(true, Ordering::SeqCst);
+            session.turn_errored.store(true, Ordering::SeqCst);
+        }
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert_eq!(http.summarize_requests().len(), 1);
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "stale aborted/errored flags must not suppress this compact's completion: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, true).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "busy shown first: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane returns to idle even on failure (legacy emitStatus idle): {frames:?}"
+        );
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("a loud freshAgent.error");
+        assert_eq!(
+            error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED",
+            "{error_frame}"
+        );
+        assert!(
+            error_frame["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("summarize exploded"),
+            "the serve error text crosses the wire: {error_frame}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "a serve error never fabricates a completion: {frames:?}"
         );
     }
 

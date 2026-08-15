@@ -655,8 +655,8 @@ async fn handle_client_text(
     // / question.respond / fork / compact) that hit a genuinely unsupported provider x
     // op cell are answered with the parity-text UNSUPPORTED_CAPABILITY envelope BEFORE
     // the typed dispatch; every handled cell (claude approval/question/compact now,
-    // codex/opencode compact/fork in Tasks 4-6) falls through to a real arm. See
-    // `fresh_agent_control_refusal`.
+    // codex/opencode compact since Task 4, their fork arms in Tasks 5-6) falls through
+    // to a real arm. See `fresh_agent_control_refusal`.
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
@@ -1039,11 +1039,26 @@ async fn handle_client_text(
             }
             true
         }
+        // Task 4 (approval-respond run) added the codex/opencode compact arms (detached
+        // tasks, same shape as FreshAgentSend); the refusal table already answered the
+        // one remaining unsupported cell (amplifier), so it never reaches this arm.
         ClientMessage::FreshAgentCompact(compact) => {
             if compact.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
                 tokio::spawn(
                     async move { fresh_claude.handle_compact(compact).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else if is_codex_provider(compact.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_compact(compact).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else if compact.provider == freshell_protocol::AgentProvider::Opencode {
+                let fresh_opencode = state.fresh_opencode.clone();
+                tokio::spawn(
+                    async move { fresh_opencode.handle_compact(compact).await }
                         .instrument(tracing::Span::current()),
                 );
             }
@@ -4660,11 +4675,13 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
 /// `"Fork is …"`, `"Compact is …"`): approvals/questions are claude-only, fork is
 /// refused for claude (permanently — the claude path has no fork) and for every other
-/// provider until their Tasks 4-6 arms land. Every other combo returns `None` and
-/// routes to a real dispatch arm (claude approval/question/compact handlers in
-/// `FreshClaudeState`). The kata-dtfn discipline still holds: never TOTAL SILENCE for
-/// a user action -- a refusal is a visible pane error (`fresh-agent-ws.ts` -- any code
-/// other than `INVALID_SESSION_ID` dispatches `sessionError`).
+/// provider until their Tasks 5-6 arms land, and compact is refused ONLY for amplifier
+/// (every other provider has a real arm since Task 4). There is no amplifier
+/// FRESH-AGENT runtime at all, so the amplifier x op cells are unconditional
+/// refusals. Every other combo returns `None` and routes to a real dispatch arm. The
+/// kata-dtfn discipline still holds: never TOTAL SILENCE for a user action -- a
+/// refusal is a visible pane error (`fresh-agent-ws.ts` -- any code other than
+/// `INVALID_SESSION_ID` dispatches `sessionError`).
 pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
     let (refused, wording, provider, session_id, session_type) = match message {
         ClientMessage::FreshAgentApprovalRespond(m) => (
@@ -4690,10 +4707,10 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
             m.session_id.as_str(),
             m.session_type,
         ),
-        // Codex/opencode compact arms land in Task 4 — until then only the claude
-        // provider routes to a real compact handler.
+        // Task 4 landed the codex/opencode compact arms — the one remaining refusal
+        // cell is amplifier (no amplifier fresh-agent runtime exists).
         ClientMessage::FreshAgentCompact(m) => (
-            m.provider != AgentProvider::Claude,
+            m.provider == AgentProvider::Amplifier,
             "Compact is",
             m.provider,
             m.session_id.as_str(),
