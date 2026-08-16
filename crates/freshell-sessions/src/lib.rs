@@ -21,6 +21,7 @@ pub mod codex_locator;
 pub mod directory_index;
 pub mod indexer;
 pub mod provider_layout;
+pub mod session_watcher;
 pub mod meta;
 pub mod opencode_locator;
 pub mod parse;
