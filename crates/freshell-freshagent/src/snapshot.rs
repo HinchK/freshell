@@ -483,6 +483,98 @@ mod tests {
         assert_eq!(value["capabilities"]["questions"], json!(true));
     }
 
+    /// Delta-review round 5 (AGENT-06): an SDK-valid question whose options carry the
+    /// documented `preview` field (plus other extras the sidecar preserves verbatim via
+    /// `permission-channel.mjs`'s `...o`) must still produce a snapshot whose
+    /// `pendingQuestions` entries satisfy the STRICT
+    /// `FreshAgentQuestionDefinitionSchema` — the pending overlay normalizes the
+    /// snapshot-bound copy at fold time. With no zod in Rust, strictness is pinned by
+    /// exact key-set assertions at BOTH nesting levels. The WS broadcast of the same
+    /// frame stays verbatim (forwards-compat), pinned on the claude.rs side.
+    #[tokio::test]
+    async fn claude_locator_pending_question_entry_is_contract_exact_after_normalize() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let durable = "84848484-8484-4848-8848-848484848484";
+        let (_home, _content) = stage_transcript(durable);
+        let claude = claude_state();
+        crate::claude::tests::insert_fake_claude_session_with_pending(
+            &claude,
+            "client-nanoid-12",
+            Some(durable),
+            &[
+                json!({ "type": "sdk.question.request", "sessionId": "s", "requestId": "q-prev",
+                    "questions": [{
+                        "question": "Pick one",
+                        "header": "Choice",
+                        "multiSelect": false,
+                        "options": [
+                            { "label": "Yes", "description": "go ahead", "preview": "diff…" },
+                            { "label": "No", "description": "stop", "preview": 42 }
+                        ],
+                        "extraTop": { "nested": "dropped" }
+                    }] }),
+            ],
+        )
+        .await;
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        // The snapshot route succeeds with the preview-carrying pending question (the
+        // reload-while-pending card now renders under the client's strict parse).
+        assert_eq!(value["capabilities"]["questions"], json!(true));
+        assert_eq!(
+            value["pendingQuestions"],
+            json!([{
+                "requestId": "q-prev",
+                "questions": [{
+                    "question": "Pick one",
+                    "header": "Choice",
+                    "multiSelect": false,
+                    "options": [
+                        { "label": "Yes", "description": "go ahead" },
+                        { "label": "No", "description": "stop" }
+                    ]
+                }],
+            }]),
+            "snapshot-bound pending question entries carry EXACTLY the strict-contract keys at both levels — `preview` and other extras dropped"
+        );
+        // Explicit structural key-set assertion at BOTH nesting levels (strictness, no
+        // zod required): question ⊆ {question, header, options, multiSelect}, option == {label, description}.
+        let question = &value["pendingQuestions"][0]["questions"][0];
+        let question_keys: std::collections::BTreeSet<&str> = question
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            question_keys
+                .iter()
+                .all(|k| ["question", "header", "options", "multiSelect"].contains(k)),
+            "question-level keys stay within the contract: {question_keys:?}"
+        );
+        for option in question["options"].as_array().unwrap() {
+            let option_keys: std::collections::BTreeSet<&str> = option
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                option_keys.iter().copied().collect::<Vec<_>>(),
+                ["description", "label"],
+                "option keys are EXACTLY {{label, description}} (sorted)"
+            );
+        }
+    }
+
     /// Task 3: kilroy rides the SAME claude overlay path — live pending overlays, the
     /// gate flips, and `sessionType` keeps the kilroy flavour (AGENT-24's ride-through).
     #[tokio::test]

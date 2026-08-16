@@ -174,6 +174,9 @@ impl PendingApprovalEntry {
 }
 
 /// One pending provider question (`sdk.question.request`, the AskUserQuestion tool).
+/// `questions` is the CONTRACT-NORMALIZED copy ([`normalize_question_definitions`]) —
+/// the pending set feeds the `.strict()` snapshot overlay, while the WS broadcast of
+/// the same frame stays verbatim.
 struct PendingQuestionEntry {
     request_id: String,
     questions: Value,
@@ -1590,9 +1593,17 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
             let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
                 return;
             };
+            // Delta-review round 5 (AGENT-06): the pending set feeds ONLY the
+            // respond-membership check and the snapshot overlay, so its question copy
+            // is normalized to the strict wire contract on entry (see
+            // [`normalize_question_definitions`]). The sibling WS broadcast
+            // (`sdk_line_to_frame`) keeps the VERBATIM frame — an intentional
+            // divergence: the event stream is schema-opaque and keeps
+            // forwards-compat extras (e.g. `preview`), while the client parses the
+            // REST snapshot against a `.strict()` schema that would reject them.
             let entry = PendingQuestionEntry {
                 request_id,
-                questions: value.get("questions").cloned().unwrap_or(Value::Null),
+                questions: normalize_question_definitions(value.get("questions")),
             };
             let mut p = pending.lock().expect("pending lock");
             p.questions.retain(|e| e.request_id != entry.request_id);
@@ -1609,6 +1620,86 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
         }
         _ => {}
     }
+}
+
+/// Normalize an `sdk.question.request`'s `questions` to the strict wire contract
+/// (`shared/fresh-agent-contract.ts` `FreshAgentQuestionDefinitionSchema`): per
+/// question exactly `{question, header?, options?, multiSelect?}` (keys omitted when
+/// absent), per option exactly `{label, description}` — every other key is dropped at
+/// those two levels. The Claude SDK's AskUserQuestion options may carry extras (e.g.
+/// the documented `preview` field) and the sidecar preserves them verbatim
+/// (`permission-channel.mjs`'s `...o`); relayed raw into the snapshot, the client's
+/// `.strict()` parse rejects the whole snapshot response and the question card never
+/// renders (delta review round 5, AGENT-06). Values are rewritten only by string
+/// coercion of the known text fields (`frame_request_id`'s string|number tolerance)
+/// and bool pass-through for `multiSelect`. Members that can never satisfy the
+/// contract — a question without coercible `question` text, an option without
+/// coercible `label`/`description` — are dropped so a malformed member cannot poison
+/// the whole array. A missing/non-array `questions` yields an EMPTY array: the pending
+/// entry itself stays (respond-membership semantics) with a contract-valid shape.
+///
+/// Intentional divergence: normalization applies ONLY to this snapshot-bound pending
+/// copy. The WS broadcast of the same frame (`sdk_line_to_frame`) relays the sidecar
+/// payload VERBATIM so the schema-opaque event stream keeps forwards-compat extras
+/// for consumers that understand them.
+fn normalize_question_definitions(questions: Option<&Value>) -> Value {
+    let mut out = Vec::new();
+    let Some(items) = questions.and_then(Value::as_array) else {
+        return Value::Array(out);
+    };
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        // `question` is contract-REQUIRED (z.string()) — drop a member without
+        // coercible text; it could only ever break the snapshot parse.
+        let Some(question) = obj.get("question").and_then(coerce_contract_string) else {
+            continue;
+        };
+        let mut normalized = Map::new();
+        normalized.insert("question".to_string(), Value::String(question));
+        if let Some(header) = obj.get("header").and_then(coerce_contract_string) {
+            normalized.insert("header".to_string(), Value::String(header));
+        }
+        if let Some(options) = obj.get("options").and_then(Value::as_array) {
+            normalized.insert(
+                "options".to_string(),
+                Value::Array(
+                    options
+                        .iter()
+                        .filter_map(normalize_question_option)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(multi_select) = obj.get("multiSelect").and_then(Value::as_bool) {
+            normalized.insert("multiSelect".to_string(), Value::Bool(multi_select));
+        }
+        out.push(Value::Object(normalized));
+    }
+    Value::Array(out)
+}
+
+/// One contract option: `label` + `description` are both REQUIRED strings — keep the
+/// member only when both coerce, and then carry EXACTLY those two keys.
+fn normalize_question_option(option: &Value) -> Option<Value> {
+    let obj = option.as_object()?;
+    let label = obj.get("label").and_then(coerce_contract_string)?;
+    let description = obj.get("description").and_then(coerce_contract_string)?;
+    let mut normalized = Map::new();
+    normalized.insert("label".to_string(), Value::String(label));
+    normalized.insert("description".to_string(), Value::String(description));
+    Some(Value::Object(normalized))
+}
+
+/// String-coerce a contract text field (`frame_request_id`'s string|number tolerance):
+/// a JSON string passes through, a number stringifies, anything else is absent.
+fn coerce_contract_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+        .or_else(|| value.as_f64().map(|n| n.to_string()))
 }
 
 /// A sidecar frame's `requestId` as a string (the sidecar mints nanoid strings; tolerate
@@ -2411,6 +2502,38 @@ pub(crate) mod tests {
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+    }
+
+    /// Delta-review round 5 (AGENT-06): the `sdk.question.request` →
+    /// `freshAgent.question.request` WS broadcast stays VERBATIM even though the
+    /// snapshot-bound copy is normalized (see
+    /// `fold_normalizes_question_definitions_to_the_strict_contract_shape`). The
+    /// event-stream path is schema-opaque, so forwards-compat extras (e.g. the
+    /// SDK-documented `preview` option field, preserved by
+    /// `permission-channel.mjs`'s `...o`) must reach consumers that understand them.
+    #[test]
+    fn question_request_broadcast_keeps_the_verbatim_payload() {
+        let line = json!({
+            "type": "sdk.question.request",
+            "sessionId": "s",
+            "requestId": "q-prev",
+            "questions": [{
+                "question": "Pick one",
+                "options": [{ "label": "Yes", "description": "go", "preview": "diff…" }],
+                "extraTop": { "nested": "kept" }
+            }]
+        });
+        let frame = sdk_line_to_frame(&line, "s", "freshclaude").unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.question.request");
+        assert_eq!(
+            wire["event"]["questions"][0]["options"][0]["preview"], "diff…",
+            "the WS event stream keeps the verbatim payload (forwards-compat)"
+        );
+        assert_eq!(
+            wire["event"]["questions"][0]["extraTop"],
+            json!({ "nested": "kept" })
+        );
     }
 
     #[test]
@@ -3482,6 +3605,107 @@ rl.on('line', (line) => {
         assert!(p.questions.is_empty(), "the cancelled question is removed");
         drop(p);
         consumer.abort();
+    }
+
+    /// Delta-review round 5 (AGENT-06): the snapshot-bound copy of an
+    /// `sdk.question.request` is NORMALIZED at fold time to the strict wire contract
+    /// (`shared/fresh-agent-contract.ts` `FreshAgentQuestionDefinitionSchema`): per
+    /// question exactly `{question, header?, options?, multiSelect?}`, per option
+    /// exactly `{label, description}`. SDK-valid extras (e.g. the documented `preview`
+    /// option field, preserved by `permission-channel.mjs`'s `...o`) are dropped — a
+    /// preview-carrying question relayed raw would fail the client's strict snapshot
+    /// parse and the question card would never render. Malformed members (no coercible
+    /// `question`/`label`/`description` text) are dropped rather than poisoning the
+    /// whole parse. The WS broadcast of the same frame stays verbatim — see
+    /// `question_request_broadcast_keeps_the_verbatim_payload`.
+    #[test]
+    fn fold_normalizes_question_definitions_to_the_strict_contract_shape() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        let frame = json!({
+            "type": "sdk.question.request",
+            "sessionId": "s",
+            "requestId": "q-prev",
+            "questions": [
+                {
+                    "question": "Pick one",
+                    "header": "Choice",
+                    "multiSelect": true,
+                    "options": [
+                        { "label": "Yes", "description": "go ahead", "preview": "diff…" },
+                        { "label": "No", "description": "stop", "preview": 42, "markdown": true }
+                    ],
+                    "extraTop": "drop-me",
+                    "nested": { "also": "dropped" }
+                },
+                // Malformed members DROP (they can never satisfy the strict parse):
+                { "header": "no question text" },
+                {
+                    "question": "Only well-formed options survive",
+                    "options": [
+                        { "label": "Fine", "description": "kept" },
+                        { "label": "missing description" },
+                        "not-an-object"
+                    ]
+                }
+            ]
+        });
+        fold_pending_frame(&pending, &frame);
+
+        let p = pending.lock().expect("pending lock");
+        assert_eq!(p.questions.len(), 1);
+        assert_eq!(
+            p.questions[0].questions,
+            json!([
+                {
+                    "question": "Pick one",
+                    "header": "Choice",
+                    "multiSelect": true,
+                    "options": [
+                        { "label": "Yes", "description": "go ahead" },
+                        { "label": "No", "description": "stop" }
+                    ]
+                },
+                {
+                    "question": "Only well-formed options survive",
+                    "options": [{ "label": "Fine", "description": "kept" }]
+                }
+            ]),
+            "extras dropped at BOTH nesting levels — the pending copy parses against the strict contract"
+        );
+        drop(p);
+
+        // A non-array `questions` never reaches the snapshot as a parse-breaking
+        // scalar/null — the entry stays (respond-membership) with an empty array.
+        fold_pending_frame(
+            &pending,
+            &json!({
+                "type": "sdk.question.request",
+                "sessionId": "s",
+                "requestId": "q-scalar",
+                "questions": "not-an-array"
+            }),
+        );
+        fold_pending_frame(
+            &pending,
+            &json!({
+                "type": "sdk.question.request",
+                "sessionId": "s",
+                "requestId": "q-missing"
+            }),
+        );
+        let p = pending.lock().expect("pending lock");
+        let scalar = p
+            .questions
+            .iter()
+            .find(|q| q.request_id == "q-scalar")
+            .unwrap();
+        assert_eq!(scalar.questions, json!([]));
+        let missing = p
+            .questions
+            .iter()
+            .find(|q| q.request_id == "q-missing")
+            .unwrap();
+        assert_eq!(missing.questions, json!([]));
     }
 
     // ── cliSessionId recording (restart-parity plan §2.8 item 2) ──────────────────
