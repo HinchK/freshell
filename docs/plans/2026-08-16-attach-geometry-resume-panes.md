@@ -169,7 +169,8 @@ Expected: PASS with zero failures; record the file list and counts in the task r
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx && git rm crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs
+rm crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs  # untracked probe — plain rm, evidence retained in run logs
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
 git commit -m "fix(client): hidden panes never claim viewport geometry on attach
 
 A hidden pane's fitted dims are stale; viewport_hydrate hydration attaches
