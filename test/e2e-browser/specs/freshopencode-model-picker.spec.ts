@@ -5,6 +5,59 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+/**
+ * The shared two-column model + thinking selector (freshopencode leg).
+ * Covers: gear-popover entry, /model entry, search filtering, keyboard
+ * navigation, commit persistence, the Default row, and the
+ * catalog-unavailable state. freshclaude/kilroy keep the old popover list.
+ */
+
+const CATALOG = {
+  ok: true,
+  sessionType: 'freshopencode',
+  runtimeProvider: 'opencode',
+  status: 'fresh' as const,
+  fetchedAt: Date.now(),
+  models: [
+    {
+      id: 'opencode-go/glm-5.2',
+      displayName: 'GLM 5.2',
+      provider: 'opencode',
+      source: { id: 'opencode-go', displayName: 'OpenCode Go' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high', 'max'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'deepseek/deepseek-v4-pro',
+      displayName: 'DeepSeek V4 Pro',
+      provider: 'opencode',
+      source: { id: 'deepseek', displayName: 'DeepSeek' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'kimi-for-coding/kimi-k2.7',
+      displayName: 'Kimi K2.7 Code',
+      provider: 'opencode',
+      source: { id: 'kimi-for-coding', displayName: 'Kimi For Coding' },
+      supportsEffort: false,
+      supportedEffortLevels: [],
+      supportsAdaptiveThinking: false,
+    },
+  ],
+}
+
+const UNAVAILABLE_CATALOG = {
+  ok: false,
+  sessionType: 'freshopencode',
+  runtimeProvider: 'opencode',
+  status: 'unavailable',
+  models: [],
+  error: { code: 'CAPABILITY_PROBE_FAILED', message: 'probe failed' },
+}
+
 async function enableFreshClientsAndOpencode(page: Page): Promise<void> {
   await page.evaluate(() => {
     const harness = window.__FRESHELL_TEST_HARNESS__
@@ -22,9 +75,119 @@ async function enableFreshClientsAndOpencode(page: Page): Promise<void> {
   })
 }
 
-async function openFreshAgentSettings(page: Page, providerName: string) {
+function freshAgentSnapshot(sessionType: string, provider: string, threadId: string) {
+  return {
+    sessionType,
+    provider,
+    threadId,
+    sessionId: threadId,
+    revision: 1,
+    latestTurnId: null,
+    status: 'idle',
+    capabilities: {
+      send: true,
+      interrupt: true,
+      approvals: true,
+      questions: true,
+      fork: true,
+    },
+    settings: {
+      model: 'opencode-go/glm-5.2',
+      permissionMode: undefined,
+      plugins: [],
+    },
+    tokenUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      costUsd: 0,
+    },
+    pendingApprovals: [],
+    pendingQuestions: [],
+    turns: [],
+  }
+}
+
+async function routeCatalog(page: Page, catalog: unknown): Promise<void> {
+  await page.route('**/api/fresh-agent/model-capabilities/freshopencode?**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(catalog),
+    })
+  })
+}
+
+async function routeThreads(page: Page): Promise<void> {
+  await page.route('**/api/fresh-agent/threads/**', async (route) => {
+    const url = new URL(route.request().url())
+    const [, sessionType = 'freshopencode', provider = 'opencode', threadId = 'ses_e2e'] =
+      url.pathname.match(/\/api\/fresh-agent\/threads\/([^/]+)\/([^/]+)\/([^/?]+)/) ?? []
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId))),
+    })
+  })
+}
+
+async function routeFileApis(page: Page, cwd: string): Promise<void> {
+  await page.route('**/api/files/candidate-dirs', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ directories: ['/tmp'] }),
+    })
+  })
+  await page.route('**/api/files/validate-dir', async (route) => {
+    const body = route.request().postDataJSON() as { path?: string }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ valid: true, resolvedPath: body?.path ?? cwd }),
+    })
+  })
+}
+
+/** Create a freshopencode pane through the picker (network effects suppressed)
+ * and hand it an idle session id so the composer becomes usable. */
+async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
+  const picker = await openPanePicker(page)
+  await expect(picker.getByRole('button', { name: /^Freshopencode$/i })).toBeVisible({ timeout: 10_000 })
+  const targetPaneId = await picker.getAttribute('data-pane-id')
+  expect(targetPaneId).toBeTruthy()
+  await page.evaluate((paneId) => {
+    window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+  }, targetPaneId!)
+  await picker.getByRole('button', { name: /^Freshopencode$/i }).click({ force: true })
+  const directoryInput = page.getByLabel(/^Starting directory for Freshopencode$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
+  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
+
+  await page.evaluate((paneId) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness || !paneId) return
+    const panes = harness.getState().panes
+    const tabId = Object.keys(panes.layouts).find((key) => JSON.stringify(panes.layouts[key]).includes(paneId))
+    if (!tabId) return
+    const layout = panes.layouts[tabId]
+    if (layout?.type !== 'leaf' || layout.content?.kind !== 'fresh-agent') return
+    harness.dispatch({
+      type: 'panes/updatePaneContent',
+      payload: {
+        tabId,
+        paneId,
+        content: { ...layout.content, sessionId: 'ses_e2e', status: 'idle' },
+      },
+    })
+  }, targetPaneId)
+}
+
+async function openFreshAgentSettings(page: Page) {
   const pane = page.getByRole('group').filter({
-    has: page.getByText(providerName, { exact: true }),
+    has: page.getByText('Freshopencode', { exact: true }),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -37,223 +200,189 @@ async function openFreshAgentSettings(page: Page, providerName: string) {
   return dialog
 }
 
-test.describe('Freshopencode model picker', () => {
-  test('shows MRU tiles, sorted modal sources, and client-side filtering', async ({
+test.describe('Freshopencode model + thinking selector', () => {
+  test('gear popover shows a compact Model row that opens the dialog; commit persists the provider default', async ({
     freshellPage,
     page,
     harness,
     terminal,
   }) => {
     await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-selector-'))
 
-    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-picker-'))
-
-    const fixture = {
-      ok: true,
-      sessionType: 'freshopencode',
-      runtimeProvider: 'opencode',
-      status: 'fresh' as const,
-      fetchedAt: Date.now(),
-      models: [
-        {
-          id: 'opencode-go/deepseek-v4-flash',
-          displayName: 'DeepSeek V4 Flash',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'opencode-go/glm-4.5',
-          displayName: 'GLM 4.5',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'opencode-go/glm-5.2',
-          displayName: 'GLM 5.2',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'opencode-go/kimi-k2.7',
-          displayName: 'Kimi K2.7',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'deepseek/deepseek-v4-pro',
-          displayName: 'DeepSeek V4 Pro',
-          provider: 'opencode',
-          source: { id: 'deepseek', displayName: 'deepseek' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'glm-vast/glm-vast-alpha',
-          displayName: 'GLM Vast Alpha',
-          provider: 'opencode',
-          source: { id: 'glm-vast', displayName: 'glm-vast' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'glm-vast/glm-vast-beta',
-          displayName: 'GLM Vast Beta',
-          provider: 'opencode',
-          source: { id: 'glm-vast', displayName: 'glm-vast' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-      ],
-    }
-
-    let capabilityRequests = 0
     let capturedUrl: string | undefined
     await page.route('**/api/fresh-agent/model-capabilities/freshopencode?**', async (route) => {
-      capabilityRequests += 1
       capturedUrl = route.request().url()
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify(fixture),
+        body: JSON.stringify(CATALOG),
       })
     })
-    await page.route('**/api/files/candidate-dirs', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ directories: ['/tmp'] }),
-      })
-    })
-    await page.route('**/api/files/validate-dir', async (route) => {
-      const body = route.request().postDataJSON() as { path?: string }
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ valid: true, resolvedPath: body?.path ?? cwd }),
-      })
-    })
-
+    await routeThreads(page)
+    await routeFileApis(page, cwd)
     await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
 
-    const mruEntries = [
-      {
-        id: 'opencode-go/deepseek-v4-flash',
-        displayName: 'DeepSeek V4 Flash',
-        source: { id: 'opencode-go', displayName: 'opencode-go' },
-        cwdKey: cwd,
-        lastVerifiedAt: Date.now(),
-      },
-      {
-        id: 'deepseek/deepseek-v4-pro',
-        displayName: 'DeepSeek V4 Pro',
-        source: { id: 'deepseek', displayName: 'deepseek' },
-        cwdKey: cwd,
-        lastVerifiedAt: Date.now(),
-      },
-      {
-        id: 'glm-vast/glm-vast-alpha',
-        displayName: 'GLM Vast Alpha',
-        source: { id: 'glm-vast', displayName: 'glm-vast' },
-        cwdKey: cwd,
-        lastVerifiedAt: Date.now(),
-      },
-      {
-        id: 'opencode-go/glm-5.2',
-        displayName: 'GLM 5.2',
-        source: { id: 'opencode-go', displayName: 'opencode-go' },
-        cwdKey: cwd,
-        lastVerifiedAt: Date.now(),
-      },
-    ]
-    await page.evaluate((mru) => {
-      window.localStorage.setItem('freshopencode.modelMru.v2', JSON.stringify(mru))
-    }, mruEntries)
+    const settings = await openFreshAgentSettings(page)
 
-    const picker = await openPanePicker(page)
-    await expect(picker.getByRole('button', { name: /^Freshopencode$/i })).toBeVisible({ timeout: 10_000 })
-    const targetPaneId = await picker.getAttribute('data-pane-id')
-    expect(targetPaneId).toBeTruthy()
-    await page.evaluate((paneId) => {
-      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
-    }, targetPaneId!)
-    await picker.getByRole('button', { name: /^Freshopencode$/i }).click({ force: true })
-    const directoryInput = page.getByLabel(/^Starting directory for Freshopencode$/i)
-    await expect(directoryInput).toBeVisible({ timeout: 15_000 })
-    await directoryInput.fill(cwd)
-    await directoryInput.press('Enter')
-    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
-
-    let dialog = await openFreshAgentSettings(page, 'Freshopencode')
-
-    await expect.poll(async () => capabilityRequests).toBeGreaterThanOrEqual(1)
+    // Compact row: current model · level + Change…; retired tiles/search entry.
+    const modelRow = settings.getByRole('button', { name: /GLM 5\.2 · max.*Change/ })
+    await expect(modelRow).toBeVisible({ timeout: 10_000 })
+    await expect(settings.getByRole('searchbox', { name: /Search enabled models/i })).toHaveCount(0)
+    await expect(settings.getByRole('searchbox', { name: 'Thinking level' })).toHaveCount(0)
     expect(capturedUrl).toContain('cwd=')
 
-    const labels = (await dialog.locator('.font-medium').allTextContents()).map((s) => s.trim())
-    const styleIndex = labels.indexOf('Style')
-    const thinkingIndex = labels.indexOf('Thinking')
-    const modelIndex = labels.indexOf('Model')
-    expect(styleIndex).toBeGreaterThanOrEqual(0)
-    expect(thinkingIndex).toBeGreaterThan(styleIndex)
-    expect(modelIndex).toBeGreaterThan(thinkingIndex)
+    await modelRow.click()
+    const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
 
-    await expect(page.getByRole('dialog', { name: 'Choose Freshopencode model' })).toHaveCount(0)
-    const mruTiles = dialog.getByRole('button', { name: /(Use model|Current model):/i })
-    await expect(mruTiles).toHaveCount(4)
-    await expect(dialog.getByRole('heading', { name: 'deepseek' })).toHaveCount(0)
-    await expect(dialog.getByRole('heading', { name: 'glm-vast' })).toHaveCount(0)
-    await expect(dialog.getByRole('heading', { name: 'opencode-go' })).toHaveCount(0)
+    const search = dialog.getByRole('searchbox', { name: 'Filter models' })
+    await expect(search).toBeFocused()
 
-    await dialog.getByRole('button', { name: /Use model: DeepSeek V4 Pro/i }).click()
+    // Provider groups + the current model marker
+    const modelsList = dialog.getByRole('listbox', { name: 'Models' })
+    await expect(modelsList).toContainText('DeepSeek')
+    await expect(modelsList).toContainText('OpenCode Go')
+    await expect(dialog.getByRole('option', { name: /GLM 5\.2 current/ }).first()).toBeVisible()
+
+    // Real per-model levels for the current model, canonically ordered
+    const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GLM 5.2' })
+    await expect(levelsList).toBeVisible()
+    const levelTexts = (await levelsList.getByRole('option').allTextContents())
+      .map((text) => text.replace(/last used|highest|current|●/g, '').trim())
+    expect(levelTexts).toEqual(['low', 'high', 'max'])
+    await expect(dialog.getByRole('button', { name: 'Use GLM 5.2 · max' })).toBeVisible()
+
+    // Search filters the left column
+    await search.fill('deepseek')
+    await expect(dialog.getByRole('option', { name: /GLM 5\.2/ })).toHaveCount(0)
+    const deepseekOption = dialog.getByRole('option', { name: /DeepSeek V4 Pro/ })
+    await expect(deepseekOption).toBeVisible()
+    await expect(dialog.getByRole('listbox', { name: 'Thinking levels for DeepSeek V4 Pro' })).toBeVisible()
+
+    // Keyboard: switch to levels, move to low, Enter commits
+    await page.keyboard.press('ArrowRight')
+    await page.keyboard.press('ArrowUp')
+    await expect(dialog.getByRole('button', { name: 'Use DeepSeek V4 Pro · low' })).toBeVisible()
+    await page.keyboard.press('Enter')
+    await expect(dialog).toHaveCount(0)
+
     await expect.poll(async () => {
       const settings = await harness.getSettings()
       return settings?.freshAgent?.providers?.freshopencode?.modelSelection?.modelId
     }).toBe('deepseek/deepseek-v4-pro')
+    await expect.poll(async () => {
+      const settings = await harness.getSettings()
+      return settings?.freshAgent?.providers?.freshopencode?.effort
+    }).toBe('low')
 
-    const searchEntry = dialog.getByRole('searchbox', { name: /Search enabled models/i })
-    await searchEntry.click()
-    const modal = page.getByRole('dialog', { name: 'Choose Freshopencode model' })
-    await expect(modal).toBeVisible({ timeout: 10_000 })
+    // MRU stores recorded
+    const levelMru = await page.evaluate(() => window.localStorage.getItem('freshopencode.modelLevelMru.v1'))
+    expect(levelMru).toContain('deepseek/deepseek-v4-pro')
+    expect(levelMru).toContain('"low"')
+  })
 
-    const headingTexts = await modal.getByRole('heading').allTextContents()
-    expect(headingTexts).toEqual(['deepseek', 'glm-vast', 'opencode-go'])
+  test('/model in the composer opens the same dialog', async ({
+    freshellPage,
+    page,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-selector-slash-'))
 
-    const opencodeGoHeading = modal.getByRole('heading', { name: 'opencode-go' })
-    const opencodeGoGroup = opencodeGoHeading.locator('xpath=..')
-    const opencodeGoButtons = opencodeGoGroup.getByRole('button', { name: /Use model:/i })
-    const opencodeGoModelNames = (await opencodeGoButtons.allTextContents()).map((s) => s.trim())
-    expect(opencodeGoModelNames).toEqual(['DeepSeek V4 Flash', 'GLM 4.5', 'GLM 5.2', 'Kimi K2.7'])
+    await routeCatalog(page, CATALOG)
+    await routeThreads(page)
+    await routeFileApis(page, cwd)
+    await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
 
-    await modal.getByRole('searchbox', { name: /Filter enabled models/i }).fill('glm')
-    await modal.getByRole('searchbox', { name: /Filter enabled models/i }).fill('glm 5.2')
-    expect(capabilityRequests).toBe(1)
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 15_000 })
+    await composer.fill('/model')
+    await composer.press('Enter')
 
-    await expect(modal.getByRole('button', { name: /Use model: GLM 5\.2/i })).toBeVisible()
-    await expect(modal.getByRole('button', { name: /Use model: DeepSeek V4 Pro/i })).toHaveCount(0)
+    const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    await expect(dialog.getByRole('searchbox', { name: 'Filter models' })).toBeFocused()
+    // the typed command is consumed, not sent to the agent
+    await expect(page.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('')
 
     await page.keyboard.press('Escape')
+    await expect(dialog).toHaveCount(0)
+  })
+
+  test('a model with no declared levels shows exactly one Default row and commits no effort', async ({
+    freshellPage,
+    page,
+    harness,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-selector-default-'))
+
+    await routeCatalog(page, CATALOG)
+    await routeThreads(page)
+    await routeFileApis(page, cwd)
+    await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
+
+    const settings = await openFreshAgentSettings(page)
+    await settings.getByRole('button', { name: /Change/ }).click()
+
+    const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    await dialog.getByRole('searchbox', { name: 'Filter models' }).fill('kimi')
+
+    const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for Kimi K2.7 Code' })
+    await expect(levelsList).toBeVisible()
+    await expect(levelsList.getByRole('option')).toHaveCount(1)
+    await expect(levelsList.getByRole('option').first()).toHaveText(/Default/)
+
+    await dialog.getByRole('button', { name: 'Use Kimi K2.7 Code · Default' }).click()
+    await expect(dialog).toHaveCount(0)
+
+    await expect.poll(async () => {
+      const settings = await harness.getSettings()
+      return settings?.freshAgent?.providers?.freshopencode?.modelSelection?.modelId
+    }).toBe('kimi-for-coding/kimi-k2.7')
+    // the Default commit clears the provider effort default (no variant)
+    await expect.poll(async () => {
+      const settings = await harness.getSettings()
+      return settings?.freshAgent?.providers?.freshopencode?.effort ?? null
+    }).toBeNull()
+
+    // the level store records nothing for Default
+    const levelMru = await page.evaluate(() => window.localStorage.getItem('freshopencode.modelLevelMru.v1'))
+    expect(levelMru === null || !levelMru.includes('kimi-for-coding/kimi-k2.7')).toBe(true)
+  })
+
+  test('catalog unavailability shows the shared notice in the popover and on /model, never an empty dialog', async ({
+    freshellPage,
+    page,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-selector-unavail-'))
+
+    await routeCatalog(page, UNAVAILABLE_CATALOG)
+    await routeThreads(page)
+    await routeFileApis(page, cwd)
+    await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
+
+    const settings = await openFreshAgentSettings(page)
+    await expect(settings.getByText('Model catalog unavailable — try again')).toBeVisible({ timeout: 10_000 })
+    await expect(settings.getByRole('button', { name: /Change/ })).toHaveCount(0)
+    await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toHaveCount(0)
+
     await page.keyboard.press('Escape')
 
-    await page.setViewportSize({ width: 400, height: 800 })
-    dialog = await openFreshAgentSettings(page, 'Freshopencode')
-    const narrowMruTiles = dialog.getByRole('button', { name: /(Use model|Current model):/i })
-    await expect(narrowMruTiles.nth(0)).toBeVisible({ timeout: 10_000 })
-    await expect(narrowMruTiles.nth(1)).toBeVisible()
-    await expect(narrowMruTiles.nth(2)).toBeVisible()
-    await expect(narrowMruTiles.nth(3)).toBeHidden()
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 15_000 })
+    await composer.fill('/model')
+    await composer.press('Enter')
+    await expect(page.getByRole('alert').filter({ hasText: 'Model catalog unavailable — try again' })).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toHaveCount(0)
   })
 })
