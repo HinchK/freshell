@@ -243,7 +243,7 @@ recreate predicate and reveal planning are unchanged."
 **Interfaces:**
 - Consumes: existing helpers in `specs/multi-client.spec.ts` (`waitForTabWithTerminalId`, `waitForMarkedPtySize` (:154-165 — marker shape `__LABEL__:<rows> <cols>`), the file's `test` import/fixtures), the reload/persist-restore flow precedent from `test/e2e-browser/specs/rest-tab-persistence.spec.ts` (reuse its restore helpers/patterns verbatim where applicable), plus page-side `window.__FRESHELL_TEST_HARNESS__` (`getSentWsMessages`, `getTerminalBuffer`) and store dispatch as used by other specs.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Deterministic mount-hidden shape via reload restore (round-3 findings 4-5: the REST-create flow auto-selects and then never re-hydrates, so it could never demonstrate the hidden attach; the boot-time path is the production shape behind the 80x24 stale-dims fleet). Test flow:
 
@@ -254,33 +254,33 @@ Deterministic mount-hidden shape via reload restore (round-3 findings 4-5: the R
 
 If the reload-restore helper flow in `rest-tab-persistence.spec.ts` cannot supply T-B's terminalId at boot, get it from the harness/store dispatch state in-page; never resurrect a REST-create-empty-window shape.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
 Expected: FAIL at step 2's intent assertion (pre-fix hidden hydration attaches viewport_hydrate). Setup errors → fix setup only. If Task 1 landed first, the test is green-by-construction; record that and cite the unit RED witnesses.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 None (Task 1 covers production). Additionally, update the pre-existing reconnect test in THIS spec file (round-2 finding 5): its hidden/background branch's accepted wire intent becomes `keepalive_delta` with an updated comment ("hidden/background attaches are keepalive_delta BY POLICY — they never claim geometry; visible foreground attaches remain viewport_hydrate/transport_reconnect"). Record the edit in the task report.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
 Expected: PASS on both projects, including the updated pre-existing reconnect test.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Reuse the file's helper patterns; no new infrastructure.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
 Expected: PASS (whole file, both projects).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/multi-client.spec.ts
