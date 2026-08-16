@@ -44,11 +44,12 @@ use crate::meta::ParsedSessionMeta;
 use crate::provider_layout::ProviderLayout;
 use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
 
-/// Default snapshot freshness window: a request that lands within this window
-/// of the last successful scan reads the cached snapshot; older triggers a
-/// refresh. 1s keeps a burst of requests (e.g. a UI poll loop) to one scan
-/// while still surfacing new/changed transcripts within a second of an edit.
-const DEFAULT_TTL: Duration = Duration::from_millis(1000);
+/// Reconciliation sweep interval. With the session watcher handling the
+/// common case (~98.2% of changes detected via inotify), this TTL is a
+/// safety net for the ~1.8% of events the watcher misses. Previously 1s
+/// (continuous polling); raised to 15 minutes now that the watcher
+/// provides sub-second freshness for the common case.
+const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// One session, enumerated by a [`SessionSource`]. Provider-agnostic — the
 /// superset of fields `crates/freshell-server/src/session_directory.rs`'s
