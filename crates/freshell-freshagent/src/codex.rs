@@ -1350,9 +1350,21 @@ impl FreshCodexState {
     /// against a dead connection. Loud legs remain for genuinely unrespawnable
     /// (`RespawnFailed`) or leased (`Reserved`) parents. Adaptation for the
     /// `Respawned` outcome: the old rollout was genuinely gone, so the fork proceeds
-    /// against the newly-minted thread id (the old id no longer names anything), while
-    /// every reply below stays keyed to the CLICKED id (`msg.session_id`) — the pane's
-    /// addressing.
+    /// against the newly-minted thread id (the old id no longer names anything) — and every
+    /// post-resolution reply/error below keys to the RESOLVED id (`parent_id`, == the
+    /// clicked id on AlreadyRunning/Recovered): the mint-new respawn broadcasts
+    /// `freshAgent.session.materialized{OLD→NEW}` DURING ensure-alive, so the frozen client
+    /// has ALREADY re-keyed the pane's `sessionId` to the new id and deleted the old
+    /// session record before any fork frame can arrive (whole-branch fix review F-1). A
+    /// reply keyed to the clicked old id would be DROPPED by the pane's ANDed
+    /// requestId+parentSessionId fork correlation (`FreshAgentView.tsx`), and a nested
+    /// error keyed old would ENSURE-create a phantom deleted-id record whose `lastError`
+    /// no pane reads. Only the pre-resolution legs below (`NotFound`/`RespawnFailed`/
+    /// `Reserved`) address `msg.session_id` — no materialized broadcast has occurred there.
+    /// The lease-`BoundLive` Respawned corner (a contender bound the durable id to a
+    /// DIFFERENT live key before this call claimed it) follows the same resolved-id keying —
+    /// uniform with [`Self::handle_send`]/[`Self::handle_compact`]: replies address the live
+    /// session the fork actually ran against.
     ///
     /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
     /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
@@ -1414,8 +1426,10 @@ impl FreshCodexState {
         )) = looked_up
         else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
-            // lost-session leg, never silence.
-            reply_sink(lost_session_frame(&msg.session_id));
+            // lost-session leg, never silence. Keyed to the RESOLVED parent id (F-1):
+            // post-resolve, the client no longer tracks the clicked id on the mint-new
+            // route.
+            reply_sink(lost_session_frame(&parent_id));
             return;
         };
 
@@ -1453,8 +1467,9 @@ impl FreshCodexState {
             Ok(result) => result,
             Err(err) => {
                 // e.g. the PROBED empty-parent rejection (`-32600 "no rollout found
-                // for thread id"`). No state changes on this path.
-                reply_sink(fork_error_frame(&msg.session_id, &err.to_string()));
+                // for thread id"`). No state changes on this path. Keyed to the
+                // RESOLVED parent id (F-1).
+                reply_sink(fork_error_frame(&parent_id, &err.to_string()));
                 return;
             }
         };
@@ -1469,10 +1484,10 @@ impl FreshCodexState {
             // repoint the pane at a garbage child (the opencode malformed-id guard's
             // sibling).
             reply_sink(fork_error_frame(
-                &msg.session_id,
+                &parent_id,
                 &format!(
                     "codex thread/fork of session {} returned a malformed response: missing thread \"id\".",
-                    msg.session_id
+                    parent_id
                 ),
             ));
             return;
@@ -1482,7 +1497,7 @@ impl FreshCodexState {
         // it. An archive failure leaves the child attached to the PARENT connection
         // (still usable there; no handoff was attempted), so nothing more happens.
         if let Err(err) = parent_client.archive_thread(&child_id).await {
-            reply_sink(fork_error_frame(&msg.session_id, &err.to_string()));
+            reply_sink(fork_error_frame(&parent_id, &err.to_string()));
             return;
         }
 
@@ -1493,7 +1508,7 @@ impl FreshCodexState {
                 self.fail_fork_after_archive(
                     &parent_client,
                     &child_id,
-                    &msg.session_id,
+                    &parent_id,
                     &reply_sink,
                     &err,
                 )
@@ -1508,7 +1523,7 @@ impl FreshCodexState {
             self.fail_fork_after_archive(
                 &parent_client,
                 &child_id,
-                &msg.session_id,
+                &parent_id,
                 &reply_sink,
                 &err.to_string(),
             )
@@ -1534,7 +1549,7 @@ impl FreshCodexState {
                 self.fail_fork_after_archive(
                     &parent_client,
                     &child_id,
-                    &msg.session_id,
+                    &parent_id,
                     &reply_sink,
                     &err.to_string(),
                 )
@@ -1553,7 +1568,7 @@ impl FreshCodexState {
             self.fail_fork_after_archive(
                 &parent_client,
                 &child_id,
-                &msg.session_id,
+                &parent_id,
                 &reply_sink,
                 &message,
             )
@@ -1595,13 +1610,16 @@ impl FreshCodexState {
         tracing::info!(
             provider = PROVIDER,
             session_id = %child_id,
-            parent_session_id = %msg.session_id,
+            parent_session_id = %parent_id,
             "freshagent.session.forked"
         );
 
+        // Keyed to the RESOLVED parent id (F-1): the pane re-keyed to it on the
+        // mint-new materialized broadcast, so its ANDed requestId+parentSessionId
+        // correlation only matches THIS id.
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
-            parent_session_id: msg.session_id.clone(),
+            parent_session_id: parent_id.clone(),
             session_id: child_id.clone(),
             session_type: SESSION_TYPE.to_string(),
             provider: PROVIDER.to_string(),
@@ -3901,7 +3919,9 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
 /// The nested `freshAgent.event{freshAgent.error{code:'INTERNAL_ERROR'}}` envelope every
 /// codex fork failure rides on (approval-respond run, Task 6): delivered on the REQUESTING
 /// connection's sink (never silence for a user action — the Fork click's pane banner gets
-/// the message text), keyed to the PARENT session id the fork was clicked on.
+/// the message text), keyed to the PARENT session id the fork ran against — the RESOLVED
+/// post-ensure-alive id (whole-branch fix review F-1: on the mint-new respawn route the
+/// client has already re-keyed the pane off the clicked id).
 fn fork_error_frame(session_id: &str, message: &str) -> ServerMessage {
     fork_error_frame_with_code(session_id, "INTERNAL_ERROR", message)
 }
@@ -8346,6 +8366,308 @@ pub(crate) mod tests {
         }
 
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch fix review F-1 — the MINT-NEW (`Respawned { new_session_id }`) fork
+    /// route, the sub-path the M-2 pair above does NOT drive (they drive Recovered, where
+    /// `parent_id == msg.session_id`). The respawn machinery broadcasts
+    /// `freshAgent.session.materialized{previousSessionId: OLD, sessionId: NEW}` DURING
+    /// `ensure_session_alive` — strictly before the fork RPC chain starts, hence before any
+    /// reply can exist — and the frozen client re-keys the pane's `sessionId` to NEW on that
+    /// broadcast (`panesSlice.ts` materialized fold) and DELETES the old session record
+    /// (`freshAgentSlice.ts`). Every post-resolution fork frame is therefore addressed by the
+    /// RESOLVED parent id: the pane's ANDed fork correlation
+    /// (`requestId === createRequestId && parentSessionId === paneContent.sessionId`,
+    /// `FreshAgentView.tsx:1671-1676`) only matches when `parentSessionId` is the pane's
+    /// CURRENT (NEW) id — a reply keyed to the clicked OLD id is DROPPED (orphan child,
+    /// user-silent no-op). This test drives the genuine route end-to-end: crashed parent →
+    /// negative-cache-confirmed dead thread → mint-new respawn → fork.
+    ///
+    /// The mint-new route is forced via the dead-thread negative cache
+    /// ([`FreshCodexState::mark_thread_dead`] — a prior crash recovery already confirmed the
+    /// durable rollout gone: disk cleanup / corruption / the RUN's probed `-32600 "no
+    /// rollout found"`) rather than a `thread/resume` error override, because the override
+    /// lands in the shared `FAKE_CODEX_APP_SERVER_BEHAVIOR` env var that EVERY subsequently
+    /// spawned fake process reads at startup — it would break the fork CHILD sidecar's own
+    /// `thread/resume` handoff step too. The negative-cache shortcut takes the same
+    /// `respawn_as_new_thread_after_crash` machinery either way.
+    #[tokio::test]
+    async fn fork_on_a_mint_new_respawn_keys_the_forked_reply_to_the_resolved_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-mint-new-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-new-marker-unused");
+
+        // Spawn 1: the parent, which crashes right after `thread/start` (a real
+        // unrequested exit, observed by the exit-watcher self-heal).
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Fork click"
+        );
+
+        // The durable rollout is confirmed genuinely gone (negative-cache hit) — ensure-alive
+        // skips the doomed resume attempt and mints a fresh thread for this pane.
+        st.mark_thread_dead(&old_id).await;
+
+        // Spawn 2 (the respawned parent: `thread/start` mints "parent-new-mint", then
+        // `thread/fork` of it mints the child) and spawn 3 (the child's own sidecar:
+        // unarchive + resume handoff) share this config.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-mint" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint", None), sink)
+            .await;
+
+        // THE F-1 pin: the forked reply's EXACT envelope is keyed to the RESOLVED parent id
+        // (the pane's current session id post-materialized), never the clicked old id.
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(
+            frames[0],
+            json!({
+                "type": "freshAgent.forked",
+                "requestId": "fork-req-mint",
+                "parentSessionId": "parent-new-mint",
+                "sessionId": "child-after-mint",
+                "sessionType": "freshcodex",
+                "provider": "codex",
+                "runtimeProvider": "codex",
+                "sessionRef": { "provider": "codex", "sessionId": "child-after-mint" },
+            }),
+            "the forked reply must address the RESOLVED (respawned) parent the pane now tracks"
+        );
+
+        assert_eq!(
+            spawn_count(&capture),
+            3,
+            "parent respawn (spawn 2) + the fork child's own sidecar (spawn 3): {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
+        // respawned parent = thread/start (the mint) → thread/fork → thread/archive,
+        // with the fork RPC TARGETING the minted parent id; child = unarchive → resume.
+        let log_text = read_op_log_when_complete(&log_path, 6).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        let mut fork_target: Option<String> = None;
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+            if entry["method"].as_str() == Some("thread/fork") {
+                fork_target = Some(
+                    entry["params"]["threadId"]
+                        .as_str()
+                        .expect("fork threadId")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            fork_target.as_deref(),
+            Some("parent-new-mint"),
+            "thread/fork runs against the RESPAWNED parent thread: {log_text}"
+        );
+        assert_eq!(
+            by_url.len(),
+            3,
+            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/start"] < ["thread/start", "thread/fork", ...] < ["thread/unarchive", ...].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/start"],
+            "the crashed spawn served only the original create: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start", "thread/fork", "thread/archive"],
+            "the respawned parent minted its new thread, then ran fork + archive: {log_text}"
+        );
+        assert_eq!(
+            sequences[2],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
+        );
+
+        // Registrations: the old id is GONE (the respawn re-keyed the session map), the
+        // minted parent and the child are live.
+        {
+            let guard = st.sessions.lock().await;
+            assert!(
+                !guard.contains_key(&old_id),
+                "the mint-new respawn removed the old parent id"
+            );
+            assert!(guard.contains_key("parent-new-mint"));
+            assert!(guard.contains_key("child-after-mint"));
+        }
+
+        // Broadcast leg audit: the materialized OLD→NEW pair DID go out (the client re-key
+        // this whole finding hinges on), and NO broadcast error frame is keyed to the old id
+        // (the expected THREAD_MEMORY_LOST degradation frame is keyed to the NEW id).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut saw_materialized = false;
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                assert_eq!(
+                    frame["previousSessionId"],
+                    json!(old_id),
+                    "materialized names the clicked id as previous: {frame}"
+                );
+                assert_eq!(
+                    frame["sessionId"],
+                    json!("parent-new-mint"),
+                    "materialized re-keys the pane to the minted id: {frame}"
+                );
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.error" {
+                assert_ne!(
+                    frame["sessionId"],
+                    json!(old_id),
+                    "no broadcast error may target the discarded old id: {frame}"
+                );
+                assert_eq!(
+                    frame["sessionId"], json!("parent-new-mint"),
+                    "the degradation frame rides the new id, like the crate's own keying invariant: {frame}"
+                );
+            }
+        }
+        assert!(
+            saw_materialized,
+            "the mint-new respawn must broadcast the OLD→NEW materialized pair"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch fix review F-1, failure leg: the DOMINANT real-world outcome on the
+    /// mint-new route is a mid-flight fork failure (a freshly-minted thread is EMPTY, so
+    /// `thread/fork` answers the PROBED `-32600 "no rollout found for thread id"`
+    /// rejection). The nested `freshAgent.error` must key to the RESOLVED parent id: keyed
+    /// to the clicked OLD id it would ENSURE-create a phantom deleted-id record in the
+    /// client (`sessionError` → `resolveOrEnsureSession`) whose `lastError` no pane reads —
+    /// an invisible banner, the precise silent-death class I-1 was chartered to kill.
+    #[tokio::test]
+    async fn fork_on_a_mint_new_respawn_keys_mid_flight_failures_to_the_resolved_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-fail-marker-unused");
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        st.mark_thread_dead(&old_id).await;
+
+        // The respawned parent mints "parent-new-mint"; its `thread/fork` then fails with
+        // the probed empty-parent rejection. No child sidecar is spawned on this leg.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "overrides": {
+                    "thread/fork": {
+                        "error": { "code": -32600, "message": "no rollout found for thread id" }
+                    }
+                },
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint-fail", None), sink)
+            .await;
+
+        // THE F-1 failure-leg pin: the FULL nested envelope, keyed to the RESOLVED parent.
+        let frames = captured_frames(&captured);
+        assert_single_fork_error_frame(
+            &frames,
+            "parent-new-mint",
+            "INTERNAL_ERROR",
+            "no rollout found for thread id",
+        );
+        assert_eq!(
+            frames[0]["event"]["sessionId"],
+            json!("parent-new-mint"),
+            "the nested event's sessionId must be the RESOLVED parent id too: {}",
+            frames[0]
+        );
+
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "a failed fork spawns ONLY the respawned parent — never a child sidecar"
+        );
+        {
+            let guard = st.sessions.lock().await;
+            assert!(!guard.contains_key(&old_id));
+            assert!(guard.contains_key("parent-new-mint"));
+            assert!(
+                !guard.contains_key("child-after-mint"),
+                "a failed fork registers no child"
+            );
+        }
+
+        // Broadcast leg audit: mint-new materialization went out; the sink's failure frame is
+        // a REQUESTING-connection answer, so no broadcast error besides the NEW-keyed
+        // THREAD_MEMORY_LOST may name this pane's ids.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut saw_materialized = false;
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                assert_eq!(frame["previousSessionId"], json!(old_id), "{frame}");
+                assert_eq!(frame["sessionId"], json!("parent-new-mint"), "{frame}");
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.error" {
+                assert_ne!(
+                    frame["sessionId"],
+                    json!(old_id),
+                    "no broadcast error may target the discarded old id: {frame}"
+                );
+            }
+        }
+        assert!(saw_materialized, "mint-new must broadcast the OLD→NEW pair");
     }
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
