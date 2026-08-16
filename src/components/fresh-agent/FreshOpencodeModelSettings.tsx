@@ -13,10 +13,10 @@ import {
   resolveFreshOpencodeCapabilityById,
 } from '@/lib/fresh-agent-model-capabilities'
 import {
-  buildFreshOpencodeVisibleMru,
-  loadFreshOpencodeModelMru,
-  pruneFreshOpencodeModelMru,
-  recordFreshOpencodeModelUse,
+  buildFreshAgentVisibleMru,
+  loadFreshAgentModelMru,
+  pruneFreshAgentModelMru,
+  recordFreshAgentModelUse,
 } from '@/lib/freshopencode-model-mru'
 import { normalizeFreshAgentModel } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
@@ -91,10 +91,10 @@ export function FreshOpencodeModelSettings({
             ?? providerDefaults?.modelSelection?.modelId
           const currentModel = resolveFreshOpencodeCapabilityById(result, currentModelId)
           if (currentModel && cwdKey) {
-            recordFreshOpencodeModelUse(currentModel, cwdKey)
+            recordFreshAgentModelUse('freshopencode', currentModel, cwdKey)
           }
           if (cwdKey) {
-            pruneFreshOpencodeModelMru(result, cwdKey)
+            pruneFreshAgentModelMru('freshopencode', result, cwdKey)
           }
         }
       })
@@ -136,10 +136,10 @@ export function FreshOpencodeModelSettings({
   }, [modalOpen])
 
   const visibleMru = useMemo(() => {
-    return buildFreshOpencodeVisibleMru({
+    return buildFreshAgentVisibleMru('freshopencode', {
       currentModelId: activeModel,
       cwdKey,
-      entries: loadFreshOpencodeModelMru(),
+      entries: loadFreshAgentModelMru('freshopencode'),
       capabilities: unavailable ? undefined : capabilities,
       now: Date.now(),
       maxVisible: 4,
@@ -181,7 +181,7 @@ export function FreshOpencodeModelSettings({
       },
     }))
     if (cwdKey) {
-      recordFreshOpencodeModelUse(model, cwdKey)
+      recordFreshAgentModelUse('freshopencode', model, cwdKey)
     }
     setModalOpen(false)
   }
