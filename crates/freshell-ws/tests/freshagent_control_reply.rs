@@ -11,6 +11,10 @@
 //! (their cells dropped from the table) and pins the unconditional amplifier x op
 //! refusal cells; Task 5 landed the opencode fork arm, Task 6 the codex fork arm (both
 //! cells dropped — the remaining fork refusals are claude [permanent] and amplifier).
+//! The whole-branch-review follow-up completed the matrix (question.respond refusals
+//! for codex/opencode, approval.respond refusal for opencode, claude question.respond
+//! dispatch reachability) and flipped BOTH compact unknown-session legs to the nested
+//! `INVALID_SESSION_ID` lost-session envelope (review findings I-1 opencode / M-1 codex).
 //!
 //! These tests drive a REAL axum server + REAL tokio-tungstenite client (same harness
 //! as `unknown_terminal_reply.rs`, the kata-dtfn precedent).
@@ -85,6 +89,99 @@ async fn codex_approval_respond_is_refused_with_the_parity_capability_message() 
     );
 }
 
+/// Refusal-matrix cell (whole-branch review M-3): approvals belong to the claude
+/// provider only — an opencode-provider approval.respond is refused with the parity
+/// capability text.
+#[tokio::test]
+async fn opencode_approval_respond_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.approval.respond",
+            "provider": "opencode",
+            "sessionId": "ses-oc-approve-1",
+            "sessionType": "freshopencode",
+            "decision": { "approved": true, "scope": "once" },
+            "requestId": "perm-oc-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-oc-approve-1",
+        "opencode",
+        "freshopencode",
+        "Approvals are not supported for freshopencode",
+    );
+}
+
+/// Refusal-matrix cell (whole-branch review M-3): questions belong to the claude
+/// provider only — a codex-provider question.respond is refused with the parity
+/// capability text.
+#[tokio::test]
+async fn codex_question_respond_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.question.respond",
+            "provider": "codex",
+            "sessionId": "ses-cx-question-1",
+            "sessionType": "freshcodex",
+            "answers": { "Pick one": "A" },
+            "requestId": "q-cx-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-cx-question-1",
+        "codex",
+        "freshcodex",
+        "Questions are not supported for freshcodex",
+    );
+}
+
+/// Refusal-matrix cell (whole-branch review M-3): questions belong to the claude
+/// provider only — an opencode-provider question.respond is refused with the parity
+/// capability text.
+#[tokio::test]
+async fn opencode_question_respond_is_refused_with_the_parity_capability_message() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.question.respond",
+            "provider": "opencode",
+            "sessionId": "ses-oc-question-1",
+            "sessionType": "freshopencode",
+            "answers": { "Pick one": "A" },
+            "requestId": "q-oc-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_capability_refusal(
+        &frame,
+        "ses-oc-question-1",
+        "opencode",
+        "freshopencode",
+        "Questions are not supported for freshopencode",
+    );
+}
+
 /// Refusal-matrix cell: claude has no fork — refused with the parity capability text.
 #[tokio::test]
 async fn claude_fork_is_refused_with_the_parity_capability_message() {
@@ -150,6 +247,43 @@ async fn kilroy_approval_respond_reaches_the_claude_dispatch_arm() {
     );
 }
 
+/// Dispatch-matrix cell (whole-branch review M-3): claude question.respond is NOT
+/// refused — it reaches `FreshClaudeState::handle_question_respond`, which answers an
+/// unknown session with the nested INVALID_SESSION_ID lost-session shape (the shared
+/// `respond_session_guard` prologue), proving the frame reached dispatch instead of
+/// hitting the refusal table.
+#[tokio::test]
+async fn claude_question_respond_reaches_the_claude_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.question.respond",
+            "provider": "claude",
+            "sessionId": "ses-cl-question-1",
+            "sessionType": "freshclaude",
+            "answers": { "Pick one": "A" },
+            "requestId": "q-cl-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("claude"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshclaude"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the claude handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
 /// Dispatch-matrix cell: claude compact reaches `FreshClaudeState::handle_compact`
 /// (unknown session → nested INVALID_SESSION_ID lost-session shape, freshclaude flavour).
 #[tokio::test]
@@ -180,8 +314,11 @@ async fn claude_compact_reaches_the_claude_dispatch_arm() {
 
 /// Dispatch-matrix cell (Task 4): codex compact is NO LONGER refused — it reaches
 /// `FreshCodexState::handle_compact`, which answers an unknown session with the nested
-/// `freshAgent.error{SESSION_NOT_FOUND}` envelope (never UNSUPPORTED_CAPABILITY; the
-/// nested shape keeps every compact failure pane-visible, matching the other arms).
+/// `freshAgent.error{INVALID_SESSION_ID}` lost-session envelope (never
+/// UNSUPPORTED_CAPABILITY; whole-branch-review M-1 switched SESSION_NOT_FOUND to the
+/// lost-session code so the client engages `markSessionLost` recovery, matching codex
+/// fork's own unknown-parent leg — the nested shape keeps every compact failure
+/// pane-visible, matching the other arms).
 #[tokio::test]
 async fn codex_compact_reaches_the_codex_dispatch_arm() {
     let (url, _registry) = spawn_server().await;
@@ -207,13 +344,17 @@ async fn codex_compact_reaches_the_codex_dispatch_arm() {
     );
     assert_eq!(
         frame["event"]["code"],
-        serde_json::json!("SESSION_NOT_FOUND"),
+        serde_json::json!("INVALID_SESSION_ID"),
         "the frame reached the codex handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
     );
 }
 
-/// Dispatch-matrix cell (Task 4): opencode compact reaches
-/// `FreshOpencodeState::handle_compact` (unknown session → SESSION_NOT_FOUND).
+/// Dispatch-matrix cell (Task 4; whole-branch-review I-1): opencode compact reaches
+/// `FreshOpencodeState::handle_compact`, which answers an unknown session with the
+/// nested `freshAgent.error{INVALID_SESSION_ID}` lost-session envelope — mirroring
+/// opencode fork's own unknown-session leg (broadcast is fine: the client routes
+/// nested frames by sessionId). A request-less top-level `error` frame never reaches
+/// any pane, so the leg MUST be nested.
 #[tokio::test]
 async fn opencode_compact_reaches_the_opencode_dispatch_arm() {
     let (url, _registry) = spawn_server().await;
@@ -230,13 +371,20 @@ async fn opencode_compact_reaches_the_opencode_dispatch_arm() {
     )
     .await;
 
-    let frame = next_frame_of_type(&mut ws, "error").await;
-    assert!(
-        frame["message"]
-            .as_str()
-            .unwrap()
-            .contains("SESSION_NOT_FOUND"),
-        "the frame reached the opencode handler (a refusal-table answer would be a freshAgent.event UNSUPPORTED_CAPABILITY): {frame}"
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("opencode"));
+    assert_eq!(frame["sessionId"], serde_json::json!("ses-oc-compact-1"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshopencode"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the opencode handler with the lost-session shape (a refusal-table \
+         answer would be UNSUPPORTED_CAPABILITY; the pre-I-1 top-level `error` frame was \
+         invisible to every pane): {frame}"
     );
 }
 

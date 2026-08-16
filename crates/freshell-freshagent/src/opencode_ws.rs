@@ -869,7 +869,10 @@ impl FreshOpencodeState {
     /// The client's `instructions` are DELIBERATELY DROPPED (no-op upstream; note the
     /// deliberate divergence: legacy Node's own `serve-manager.ts:465-471` body shape
     /// `{instructions?}` 400s on 1.18.18, so this port does NOT mirror it). A
-    /// not-yet-materialized session is a SILENT NO-OP (`adapter.ts:992-994`).
+    /// not-yet-materialized session is a SILENT NO-OP (`adapter.ts:992-994`), while a
+    /// session id this server never tracked is the LOUD lost-session leg: nested
+    /// `freshAgent.error{INVALID_SESSION_ID}` mirroring [`Self::handle_fork`] (review I-1),
+    /// so the pane engages its recovery instead of dying invisibly.
     ///
     /// REVIEWED lifecycle (fresh-eyes F3, `adapter.ts:356-399`): FIRST reset the
     /// session's `turn_aborted`/`turn_errored` flags (a prior interrupted/errored turn
@@ -889,7 +892,21 @@ impl FreshOpencodeState {
             guard.get(&session_id).cloned()
         };
         let Some(session_arc) = session_arc else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
+            // Whole-branch review I-1: mirror handle_fork's untracked leg — the nested
+            // `INVALID_SESSION_ID` lost-session envelope engages the client's
+            // `markSessionLost` recovery (legacy `requireOrRecoverSession` →
+            // `FreshAgentLostSessionError` parity, `runtime-manager.ts:309-313`). The
+            // pre-I-1 shape — a request-less top-level `error` frame — never reached
+            // any pane: `ws-client.ts` only correlates top-level errors with a pending
+            // send's requestId, which a compact frame never establishes. Broadcast
+            // (not a reply sink) is right here: the client routes nested frames by
+            // sessionId, so post-restart stale panes and cross-device duplicates both
+            // surface the recovery.
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INVALID_SESSION_ID",
+                &format!("OpenCode fresh-agent session {session_id} is not available."),
+            );
             return;
         };
 

@@ -4696,8 +4696,8 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// Approval-respond run (Task 2): the refusal table for the four fresh-agent control
 /// frames the frozen client really sends -- `freshAgent.approval.respond` (Approve/Deny
 /// click, `FreshAgentView.tsx`), `freshAgent.question.respond`, `freshAgent.fork` and
-/// `freshAgent.compact` — replacing the silent-drop-era blanket
-/// `unhandled_fresh_agent_control_reply`. Returns `Some(freshAgent.event{
+/// `freshAgent.compact` — replacing the silent-drop-era blanket (the former
+/// `unhandled_fresh_agent_control_reply`). Returns `Some(freshAgent.event{
 /// freshAgent.error{code:'UNSUPPORTED_CAPABILITY', message:<parity text>}})` ONLY for
 /// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,

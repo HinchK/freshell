@@ -1239,8 +1239,55 @@ impl FreshCodexState {
     /// the backstop (surfaced as `CODEX_COMPACT_FAILED`). Every failure path is LOUD
     /// via the nested `freshAgent.error` banner envelope (a request-less top-level
     /// `error` frame never reaches the frozen client's pane surface).
+    ///
+    /// Whole-branch-review M-2: [`Self::ensure_session_alive`] runs FIRST — the
+    /// [`Self::handle_send`] precedent, and legacy's `ensureRuntime(sessionId, settings)`
+    /// before compact (`adapter.ts:1030`) — so a crash-stale sidecar (kept mapped by the
+    /// self-heal design BY DESIGN) transparently respawns instead of the click dying
+    /// loudly against a dead connection; genuinely unrespawnable sessions keep their LOUD
+    /// `CODEX_RESPAWN_FAILED`/`SESSION_RESERVED` legs. Review M-1: an untracked session
+    /// answers the nested lost-session `INVALID_SESSION_ID` envelope (codex fork's own
+    /// unknown-parent shape, legacy `requireOrRecoverSession` →
+    /// `FreshAgentLostSessionError` parity) so the pane engages `markSessionLost`
+    /// recovery rather than showing a dead-end banner.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
-        let session_id = msg.session_id.clone();
+        let mut session_id = msg.session_id.clone();
+
+        match self.ensure_session_alive(&session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) => {}
+            // A resume-recovered session keeps its ORIGINAL id — nothing to re-key,
+            // same as the already-running case.
+            Ok(EnsureAliveOutcome::Recovered) => {}
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => {
+                // Recovery minted a NEW thread (the old rollout was genuinely gone; the
+                // client was told via the materialized broadcast) — compact the
+                // respawned session.
+                session_id = new_session_id;
+            }
+            Err(EnsureAliveError::NotFound) => {
+                // Review M-1: the lost-session shape (codex fork's own unknown-parent
+                // leg, legacy `requireOrRecoverSession` → `FreshAgentLostSessionError`
+                // parity) — `INVALID_SESSION_ID` engages the client's `markSessionLost`
+                // recovery. Broadcast: compact frames carry no requestId, so a top-level
+                // `error` frame would never reach any pane.
+                self.broadcast(&lost_session_frame(&session_id));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                self.emit_fresh_agent_error(&session_id, "CODEX_RESPAWN_FAILED", &err);
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                // Task 13 (D8) discipline, mirrored from handle_send: another
+                // create/attach holds this sessionRef — retryable, never lost.
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
+                return;
+            }
+        }
 
         let looked_up = {
             let guard = self.sessions.lock().await;
@@ -1249,11 +1296,9 @@ impl FreshCodexState {
                 .map(|s| (s.client.clone(), s.active_turn.clone()))
         };
         let Some((client, active_turn)) = looked_up else {
-            self.emit_fresh_agent_error(
-                &session_id,
-                "SESSION_NOT_FOUND",
-                "codex session not found",
-            );
+            // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
+            // lost-session leg, never silence.
+            self.broadcast(&lost_session_frame(&session_id));
             return;
         };
 
@@ -1297,6 +1342,18 @@ impl FreshCodexState {
     /// (`adapter.ts:1062-1067`); those are NOT honored here (the client's fork frame
     /// never sends them — it carries only `input.atTurnId`).
     ///
+    /// Whole-branch-review M-2: [`Self::ensure_session_alive`] runs FIRST — legacy's
+    /// `ensureRuntime(sessionId, settings)` before fork (`adapter.ts:1056`), the
+    /// [`Self::handle_send`]/[`Self::handle_compact`] precedent — so a crash-stale parent
+    /// (kept mapped by the self-heal design BY DESIGN) transparently respawns and the
+    /// fork proceeds against the RESUMED thread, rather than failing the click loudly
+    /// against a dead connection. Loud legs remain for genuinely unrespawnable
+    /// (`RespawnFailed`) or leased (`Reserved`) parents. Adaptation for the
+    /// `Respawned` outcome: the old rollout was genuinely gone, so the fork proceeds
+    /// against the newly-minted thread id (the old id no longer names anything), while
+    /// every reply below stays keyed to the CLICKED id (`msg.session_id`) — the pane's
+    /// addressing.
+    ///
     /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
     /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
     /// the REVIEWED post-archive containment (fresh-eyes F6) — replies a nested
@@ -1305,9 +1362,38 @@ impl FreshCodexState {
     /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
     /// the parent may be mid-kill), restoring the child's original visibility.
     pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        let parent_id = match self.ensure_session_alive(&msg.session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
+                // A resume-recovered parent keeps its ORIGINAL id.
+                msg.session_id.clone()
+            }
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => new_session_id,
+            Err(EnsureAliveError::NotFound) => {
+                // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
+                // answers the same lost-session shape on the requesting connection so the
+                // client's recovery path engages.
+                reply_sink(lost_session_frame(&msg.session_id));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                reply_sink(fork_error_frame(&msg.session_id, &err));
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                // Task 13 (D8) discipline: retryable, never lost — answered on the
+                // requesting sink like every other fork failure.
+                reply_sink(fork_error_frame_with_code(
+                    &msg.session_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
+
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard.get(&msg.session_id).map(|s| {
+            guard.get(&parent_id).map(|s| {
                 (
                     s.client.clone(),
                     s.model.clone(),
@@ -1327,9 +1413,8 @@ impl FreshCodexState {
             parent_permission_mode,
         )) = looked_up
         else {
-            // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
-            // answers the same lost-session shape on the requesting connection so the
-            // client's recovery path engages.
+            // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
+            // lost-session leg, never silence.
             reply_sink(lost_session_frame(&msg.session_id));
             return;
         };
@@ -1353,7 +1438,10 @@ impl FreshCodexState {
 
         let fork_result = match parent_client
             .fork_thread(ThreadForkParams {
-                thread_id: msg.session_id.clone(),
+                // The RESOLVED parent id (post ensure-alive): identical to the clicked
+                // id for already-running/resume-recovered parents, the newly-minted
+                // thread id for the memory-lost respawn fallback.
+                thread_id: parent_id.clone(),
                 last_turn_id,
                 model: Some(eff_model.clone()),
                 cwd: eff_cwd.clone(),
@@ -3815,11 +3903,18 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
 /// connection's sink (never silence for a user action — the Fork click's pane banner gets
 /// the message text), keyed to the PARENT session id the fork was clicked on.
 fn fork_error_frame(session_id: &str, message: &str) -> ServerMessage {
+    fork_error_frame_with_code(session_id, "INTERNAL_ERROR", message)
+}
+
+/// [`fork_error_frame`] carrying a non-default code (whole-branch review M-2: the
+/// ensure-alive `Reserved` leg is retryable and never lost — `SESSION_RESERVED` mirrors
+/// [`FreshCodexState::handle_send`]'s answer).
+fn fork_error_frame_with_code(session_id: &str, code: &str, message: &str) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: json!({
             "type": "freshAgent.error",
             "sessionId": session_id,
-            "code": "INTERNAL_ERROR",
+            "code": code,
             "message": message,
         }),
         provider: PROVIDER.to_string(),
@@ -5156,20 +5251,25 @@ pub(crate) mod tests {
 
         st.handle_compact(compact_msg("does-not-exist")).await;
 
-        // Session-keyed so the client's banner path routes it to the pane that
-        // clicked Compact; a request-less top-level `error` frame is invisible.
+        // Whole-branch-review M-1: the unknown-session leg is the lost-session shape —
+        // the SAME `INVALID_SESSION_ID` envelope codex fork answers for an unknown
+        // parent (`lost_session_frame`) — so the pane engages its `markSessionLost`
+        // recovery instead of showing a dead-end banner (legacy
+        // `requireOrRecoverSession` → `FreshAgentLostSessionError` parity). Session-keyed
+        // so the client's banner path routes it to the pane that clicked Compact; a
+        // request-less top-level `error` frame is invisible.
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.event");
         assert_eq!(frame["provider"], "codex");
         assert_eq!(frame["sessionType"], "freshcodex");
         assert_eq!(frame["sessionId"], "does-not-exist");
         assert_eq!(frame["event"]["type"], "freshAgent.error");
-        assert_eq!(frame["event"]["code"], "SESSION_NOT_FOUND");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
         assert!(
             frame["event"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("codex session not found"),
+                .contains("codex session does-not-exist not found"),
             "{frame}"
         );
     }
@@ -7994,6 +8094,258 @@ pub(crate) mod tests {
                 || outcome["event"]["type"] == "freshAgent.session.snapshot",
             "unexpected first frame: {outcome}"
         );
+    }
+
+    /// Read the fake app-server's cross-process op log once `want_rows` newline rows have
+    /// landed (bounded poll). WHY THE POLL: the fixture SENDS each RPC result BEFORE
+    /// appending the op row (same event-loop tick, `fake-app-server.mjs:697-701`), so a
+    /// handler that resolves on the result can return with the last row not yet on disk
+    /// (`handle_compact`'s final await IS the `thread/compact/start` result — zero
+    /// slack); a read-once is a measured flake here (reproduced 4/13 runs pre-poll).
+    async fn read_op_log_when_complete(log_path: &std::path::Path, want_rows: usize) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(log_path) {
+                Ok(text) if text.lines().count() >= want_rows => return text,
+                other => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "op log never reached {want_rows} rows within the budget: {other:?}"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar died
+    /// unrequested; the self-heal design keeps the session MAPPED) must transparently
+    /// respawn the sidecar FIRST — the `handle_send` ensure-alive precedent, and legacy's
+    /// `ensureRuntime(sessionId, settings)` before compact (`adapter.ts:1030`) — then issue
+    /// the compact RPC on the RESPAWNED sidecar. Dying loudly against the dead connection
+    /// is reserved for genuinely unrespawnable sessions, not garden-variety crash-stale
+    /// panes. Spawn-counting + the cross-process op log pin the recovery leg.
+    #[tokio::test]
+    async fn compact_after_unrequested_crash_respawns_the_sidecar_then_compacts() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-compact-respawn-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("compact-respawn-marker-unused");
+
+        // Spawn 1 crashes right after `thread/start` — a real unrequested-exit crash.
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Compact click"
+        );
+
+        // The respawned sidecar serves thread/resume (echo) + thread/compact/start.
+        configure_fake_codex_cmd(
+            &json!({ "appendThreadOperationLogPath": log_path.to_string_lossy() }).to_string(),
+        );
+
+        st.handle_compact(compact_msg(&thread_id)).await;
+
+        // The recovery was transparent: no user-facing error frame names this session.
+        // (Checked FIRST — if a compact leg ever fails, the panic names the failing
+        // branch instead of leaving a bare op-log diff.)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a self-healed compact must never surface an error frame: {frame}"
+            );
+        }
+
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "Compact on a crash-stale session must respawn the sidecar exactly once \
+             (ensure-alive first), never fail loudly against the dead connection: {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over the TWO sidecars: the crashed spawn served only
+        // thread/start; the respawned connection served thread/resume (the recovery)
+        // THEN thread/compact/start (the actual Compact click).
+        let log_text = read_op_log_when_complete(&log_path, 3).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+        }
+        assert_eq!(
+            by_url.len(),
+            2,
+            "exactly two sidecar connections (crashed spawn + respawn): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/resume", "thread/compact/start"] < ["thread/start"].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/resume", "thread/compact/start"],
+            "the respawned sidecar resumed the SAME thread, then ran the compact RPC: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start"],
+            "the crashed spawn served only the create: {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch review M-2: a Fork click on a crash-stale parent must respawn the
+    /// parent's sidecar FIRST (legacy `ensureRuntime` before fork, `adapter.ts:1056`) and
+    /// fork the RESUMED parent — the child handoff (archive → child spawn → unarchive →
+    /// resume) then proceeds exactly as it does for a healthy parent. Loudly failing the
+    /// fork against a dead connection is the leg for genuinely unrespawnable parents only.
+    #[tokio::test]
+    async fn fork_after_unrequested_crash_respawns_the_parent_sidecar_then_forks() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-respawn-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-respawn-marker-unused");
+
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let parent_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Fork click"
+        );
+
+        // The respawned parent AND the child's own sidecar share this config: resume
+        // echoes the requested id; thread/fork mints a deterministic child id.
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-crash" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-crash", None), sink)
+            .await;
+
+        // The fork SUCCEEDED on the requesting connection — never a loud failure
+        // against the dead parent connection.
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let forked = &frames[0];
+        assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+        assert_eq!(forked["requestId"], json!("fork-req-crash"), "{forked}");
+        assert_eq!(
+            forked["parentSessionId"],
+            json!(parent_id),
+            "the reply stays keyed to the CLICKED parent id: {forked}"
+        );
+        assert_eq!(forked["sessionId"], json!("child-after-crash"), "{forked}");
+
+        assert_eq!(
+            spawn_count(&capture),
+            3,
+            "parent respawn (spawn 2) + the fork child's own sidecar (spawn 3): {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
+        // respawned parent = thread/resume → thread/fork → thread/archive; child =
+        // thread/unarchive → thread/resume.
+        let log_text = read_op_log_when_complete(&log_path, 6).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+        }
+        assert_eq!(
+            by_url.len(),
+            3,
+            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/resume", ...] < ["thread/start"] < ["thread/unarchive", ...].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/resume", "thread/fork", "thread/archive"],
+            "the respawned parent was forked, never the dead connection: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start"],
+            "the crashed spawn served only the create: {log_text}"
+        );
+        assert_eq!(
+            sequences[2],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
+        );
+
+        // Both the respawned parent and the child are registered and live.
+        let guard = st.sessions.lock().await;
+        assert!(
+            guard.contains_key(&parent_id),
+            "the respawned parent stays registered under the SAME id"
+        );
+        assert!(
+            guard.contains_key("child-after-crash"),
+            "the forked child is registered on its own sidecar"
+        );
+        drop(guard);
+
+        // The recovery was transparent: no user-facing error frame names the parent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a self-healed fork must never surface an error frame: {frame}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&log_path);
     }
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
