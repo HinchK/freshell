@@ -256,6 +256,14 @@ export interface RustServerOptions {
   token?: string
   /** Extra env vars merged into (and able to override) the spawned server's environment. */
   env?: Record<string, string>
+  /**
+   * Env var name PREFIXES deleted from the spawned server's environment after
+   * the merge (same `delete env.X` pattern as VITE_PORT in boot()). `env` can
+   * only add/override keys — never delete inherited `process.env` keys — so
+   * proving a lane's STRUCTURAL independence from a developer machine's
+   * credentials (e.g. `['GEMINI_']` for the AGENT-24 kilroy lane) lives here.
+   */
+  stripEnvPrefixes?: string[]
   /** Hook to populate the isolated HOME before the server boots. */
   setupHome?: (homeDir: string) => Promise<void>
   /** Timeout in ms to wait for the server to become healthy (default: 60000). */
@@ -492,6 +500,14 @@ export class RustServer implements E2eServerHandle {
     )
     // Remove any inherited PORT-adjacent var that might interfere.
     delete (env as Record<string, string | undefined>).VITE_PORT
+    // Caller-requested credential scrubs (see RustServerOptions.stripEnvPrefixes).
+    for (const prefix of this.options.stripEnvPrefixes ?? []) {
+      for (const key of Object.keys(env)) {
+        if (key.startsWith(prefix)) {
+          delete (env as Record<string, string | undefined>)[key]
+        }
+      }
+    }
 
     this.stdoutBuffer = ''
     this.stderrBuffer = ''

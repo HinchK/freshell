@@ -137,7 +137,10 @@ function trackPending(sessionId, kind, requestId) {
 /**
  * Resolve ONE parked request (permission.respond/question.respond): drop the
  * tracked entry and decrement the counter so a later raise re-fires the
- * 0→≥1 waiting edge. Unknown requestIds are a lose-safely no-op.
+ * 0→≥1 waiting edge. Unknown requestIds are a lose-safely no-op — the
+ * decrement is gated on having actually resolved a tracked entry, or a
+ * foreign respond would desync pending vs pendingEntries and let the next
+ * raise spuriously re-fire the waiting edge (task-008-review N-2).
  */
 function resolvePending(sessionId, kind, requestId) {
   const st = sessions.get(sessionId)
@@ -145,7 +148,8 @@ function resolvePending(sessionId, kind, requestId) {
   const idx = st.pendingEntries.findIndex(
     (entry) => entry.kind === kind && entry.requestId === String(requestId),
   )
-  if (idx !== -1) st.pendingEntries.splice(idx, 1)
+  if (idx === -1) return
+  st.pendingEntries.splice(idx, 1)
   if (st.pending > 0) st.pending -= 1
 }
 

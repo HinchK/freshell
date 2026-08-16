@@ -217,6 +217,40 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     },
   )
 
+  it('a respond for a NEVER-raised requestId does not poison the pending ledger (task-008-review N-2)', async () => {
+    const fx = launch(RAISE_PROGRAM)
+    try {
+      fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
+      const created = await fx.waitLine((o) => o.type === 'created', 'created')
+      const sessionId = created.sessionId as string
+
+      fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION' })
+      await fx.waitLine((o) => o.type === 'sdk.permission.request', 'permission.request')
+      expect(fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting')).toHaveLength(1)
+
+      // Resolve a requestId that was NEVER raised. (deny matches no
+      // RAISE_PROGRAM rule, so this respond emits nothing else; only the
+      // resolvePending ledger bookkeeping runs.)
+      fx.send({ type: 'permission.respond', sessionId, requestId: 'req-never-raised', decision: { behavior: 'deny' } })
+
+      // The ledger must still hold the real parked request: the next raise
+      // crosses NO 0->>=1 boundary, so no second waiting edge may fire.
+      // Pre-fix resolvePending decremented `pending` on ANY respond, so the
+      // re-raise below re-fired sdk.turn.waiting (pending desync).
+      fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION_2' })
+      await fx.waitLine(
+        (o) => o.type === 'sdk.permission.request' && o.requestId === 'req-perm-2',
+        'second permission.request',
+      )
+      expect(
+        fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting'),
+        'the foreign respond must not have decremented pending (no spurious waiting-edge re-fire)',
+      ).toHaveLength(1)
+    } finally {
+      await fx.stop()
+    }
+  })
+
   it('interrupt cancels every parked entry with cancel frames and never emits sdk.exit', async () => {
     const stdinLog = path.join(tmp, 'stdin.jsonl')
     const fx = launch(RAISE_PROGRAM, { FRESHELL_FAKE_STDIN: stdinLog })

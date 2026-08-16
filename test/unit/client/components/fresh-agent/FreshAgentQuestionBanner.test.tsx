@@ -76,6 +76,65 @@ describe('FreshAgentQuestionBanner', () => {
     })
   })
 
+  it('gates the multi-select Submit on at least one selection (empty answer cannot submit)', () => {
+    const onAnswer = vi.fn()
+    render(
+      <FreshAgentQuestionBanner
+        providerLabel="Claude"
+        onAnswer={onAnswer}
+        question={{
+          requestId: 'q-multi',
+          questions: [{
+            header: 'Pick',
+            question: 'Which apply?',
+            options: [
+              { label: 'X', description: 'x' },
+              { label: 'Y', description: 'y' },
+            ],
+            multiSelect: true,
+          }],
+        }}
+      />,
+    )
+
+    const submit = screen.getByRole('button', { name: 'Submit' })
+    // Zero selection: the gate at FreshAgentQuestionBanner.tsx (selected.size === 0) disables.
+    expect(submit).toBeDisabled()
+    fireEvent.click(submit)
+    expect(onAnswer).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'X' }))
+    expect(submit).toBeEnabled()
+    // Toggling the only selection back off returns to the disabled gate.
+    fireEvent.click(screen.getByRole('button', { name: 'X' }))
+    expect(submit).toBeDisabled()
+  })
+
+  it('gates the Other submit on non-empty trimmed text (whitespace cannot submit)', () => {
+    const onAnswer = vi.fn()
+    render(
+      <FreshAgentQuestionBanner
+        question={singleQuestion}
+        providerLabel="Claude"
+        onAnswer={onAnswer}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    const input = screen.getByRole('textbox')
+    const submit = screen.getByRole('button', { name: 'Submit' })
+    // Empty text: the gate at FreshAgentQuestionBanner.tsx (!otherText.trim()) disables.
+    expect(submit).toBeDisabled()
+
+    fireEvent.change(input, { target: { value: '   ' } })
+    expect(submit).toBeDisabled()
+    fireEvent.click(submit)
+    expect(onAnswer).not.toHaveBeenCalled()
+
+    fireEvent.change(input, { target: { value: 'custom path' } })
+    expect(submit).toBeEnabled()
+  })
+
   it('keeps mobile and desktop touch targets identifiable while disabled', () => {
     render(
       <FreshAgentQuestionBanner

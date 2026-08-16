@@ -263,10 +263,15 @@ async function bootWall(
   page: Page,
   options: {
     env?: Record<string, string>
+    stripEnvPrefixes?: string[]
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
 ): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
-  const server = new RustServer({ env: options.env, setupHome: options.setupHome })
+  const server = new RustServer({
+    env: options.env,
+    stripEnvPrefixes: options.stripEnvPrefixes,
+    setupHome: options.setupHome,
+  })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
@@ -483,6 +488,12 @@ async function bootClaudeLane(
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
       env: claudeLaneEnv(sharedRoot, flavour, extraEnv),
+      // AGENT-24 (task-008-review M-3): kilroy parity includes independence
+      // from Gemini-summary availability — made STRUCTURAL: any developer
+      // machine's GEMINI_* keys are scrubbed from the spawned server's env
+      // (option unit-pinned in helpers/rust-server.test.ts), so the lifecycle
+      // provably passes with no Gemini credentials available at all.
+      stripEnvPrefixes: flavour === 'kilroy' ? ['GEMINI_'] : undefined,
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     await selectShellIfPickerShowing(page)
@@ -1149,6 +1160,22 @@ function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
 }
 
+/**
+ * The fork handoff's lifecycle methods (task-008-review C-1). The fake's op
+ * log records EVERY `thread/*` RPC — including `thread/read` snapshot
+ * refetches (post-`turn/completed` or attach-time) that may legally
+ * INTERLEAVE the archive→unarchive→resume chain — so absolute-adjacency
+ * indexing over the raw log (`ops[forkIdx + N]`) is a false-precision flake
+ * source. Assertions over the chain must filter to these methods first and
+ * then check RELATIVE order + id placements.
+ */
+const CODEX_FORK_LIFECYCLE_METHODS = new Set([
+  'thread/fork',
+  'thread/archive',
+  'thread/unarchive',
+  'thread/resume',
+])
+
 /** Send one freshcodex turn and wait until its snapshot rows render. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
@@ -1262,19 +1289,30 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // The exact handoff chain — fork, archive, then the CHILD sidecar's own
       // unarchive → resume (second spawn's log rows share the same file).
+      // RELATIVE order over lifecycle-filtered rows (see
+      // CODEX_FORK_LIFECYCLE_METHODS): `thread/read` refetches may interleave
+      // the chain, so raw-log adjacency is not assertable.
       await waitForLogEntry(lane.opLogPath, (o) => o.method === 'thread/resume' && o.params?.threadId === childId, 'child thread/resume')
       const ops = readCodexOps(lane.opLogPath)
-      const methods = ops.map((o) => o.method)
-      const forkIdx = methods.indexOf('thread/fork')
-      expect(ops[forkIdx + 1].method).toBe('thread/archive')
-      expect(ops[forkIdx + 1].threadId).toBe(childId)
-      expect(ops[forkIdx + 2].method).toBe('thread/unarchive')
-      expect(ops[forkIdx + 2].threadId).toBe(childId)
-      expect(ops[forkIdx + 3].method).toBe('thread/resume')
-      expect(ops[forkIdx + 3].params.threadId).toBe(childId)
+      const forkIdx = ops.findIndex((o) => o.method === 'thread/fork')
+      const chain = ops.filter(
+        (o) =>
+          CODEX_FORK_LIFECYCLE_METHODS.has(o.method)
+          && (o.threadId === childId
+            || o.threadId === 'thread-new-1'
+            || o.params?.threadId === childId
+            || o.params?.threadId === 'thread-new-1'),
+      )
+      expect(
+        chain.map((o) => o.method),
+        'fork lifecycle handoff in relative order (thread/read rows may interleave)',
+      ).toEqual(['thread/fork', 'thread/archive', 'thread/unarchive', 'thread/resume'])
+      expect(chain[1].threadId).toBe(childId)
+      expect(chain[2].threadId).toBe(childId)
+      expect(chain[3].params.threadId).toBe(childId)
       // The handoff provably crossed a process: the resume/unarchive rows ride
       // a DIFFERENT app-server listener than the parent's.
-      expect(ops[forkIdx + 3].listenUrl).not.toBe(ops[forkIdx].listenUrl)
+      expect(chain[3].listenUrl).not.toBe(chain[0].listenUrl)
 
       // AGENT-07 (a) source unchanged: after the fork call, NO mutation/turn
       // operation touches the source thread, and the source rollout is

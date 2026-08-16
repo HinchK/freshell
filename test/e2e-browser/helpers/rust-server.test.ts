@@ -2,6 +2,7 @@
 // if the picked port is stolen before the spawned freshell-server binds it,
 // start() must retry with a fresh port instead of failing the whole fixture.
 import { describe, it, expect } from 'vitest'
+import fs from 'node:fs'
 import net from 'node:net'
 import http from 'node:http'
 import { RustServer } from './rust-server.js'
@@ -112,6 +113,35 @@ describe('RustServer.start bind-race retry', () => {
       await server.stop()
       for (const socket of blockerSockets) socket.destroy()
       await new Promise<void>((resolve) => blocker.close(() => resolve()))
+    }
+  }, 600_000)
+})
+
+describe('RustServer stripEnvPrefixes', () => {
+  // task-008-review M-3: the AGENT-24 kilroy lane must prove independence
+  // from Gemini-summary availability STRUCTURALLY — a developer machine's
+  // GEMINI_API_KEY must not leak through boot()'s `...process.env` spread
+  // (an options.env entry can only add/override keys, never delete inherited
+  // ones). Observed via the child's exec-time /proc/<pid>/environ (Linux).
+  // Genuinely RED without the option: the probe key lands in the child env.
+  it('deletes inherited env keys with the given prefixes from the spawned server', async () => {
+    expect(process.platform, 'relies on /proc/<pid>/environ').toBe('linux')
+    process.env.GEMINI_STRIP_PROBE = 'present'
+    const server = new RustServer({ stripEnvPrefixes: ['GEMINI_'] })
+    try {
+      const info = await server.start()
+      const keys = fs
+        .readFileSync(`/proc/${info.pid}/environ`, 'utf8')
+        .split('\0')
+        .map((kv) => kv.split('=', 1)[0])
+        .filter(Boolean)
+      expect(
+        keys.filter((k) => k.startsWith('GEMINI_')),
+        'no GEMINI_* key may survive into the spawned server env',
+      ).toEqual([])
+    } finally {
+      delete process.env.GEMINI_STRIP_PROBE
+      await server.stop()
     }
   }, 600_000)
 })
