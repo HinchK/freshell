@@ -1,11 +1,15 @@
 // @vitest-environment node
 import { EventEmitter } from 'node:events'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import {
   createOpencodeModelCatalogProvider,
   normalizeOpencodeEnabledModelCatalog,
 } from '../../../../server/fresh-agent/adapters/opencode/model-catalog.js'
+
+const SHARED_FIXTURE_DIR = path.join(__dirname, '../../../fixtures/fresh-agent-model-capabilities')
 
 function fakeChild() {
   const child = new EventEmitter() as any
@@ -81,6 +85,10 @@ describe('OpenCode model catalog provider', () => {
               description: 'must-not-leak-description',
               options: { apiKey: 'must-not-leak' },
               headers: { authorization: 'must-not-leak' },
+              variants: {
+                high: { reasoningEffort: 'high' },
+                max: { reasoningEffort: 'max' },
+              },
             },
           },
         },
@@ -98,7 +106,7 @@ describe('OpenCode model catalog provider', () => {
         provider: 'opencode',
         source: { id: 'deepseek', displayName: 'deepseek' },
         supportsEffort: true,
-        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportedEffortLevels: ['high', 'max'],
         supportsAdaptiveThinking: true,
       },
     ])
@@ -156,15 +164,27 @@ describe('OpenCode model catalog provider', () => {
           id: 'deepseek',
           name: 'deepseek',
           models: {
-            'deepseek-v4-pro': { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-            'deepseek-v4-flash': { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+            'deepseek-v4-pro': {
+              id: 'deepseek-v4-pro',
+              name: 'DeepSeek V4 Pro',
+              variants: { high: {}, max: {} },
+            },
+            'deepseek-v4-flash': {
+              id: 'deepseek-v4-flash',
+              name: 'DeepSeek V4 Flash',
+              variants: { low: {}, high: {}, max: {} },
+            },
           },
         },
         {
           id: 'opencode-go',
           name: 'opencode-go',
           models: {
-            'glm-5.2': { id: 'glm-5.2', name: 'GLM 5.2' },
+            'glm-5.2': {
+              id: 'glm-5.2',
+              name: 'GLM 5.2',
+              variants: { high: {}, max: {} },
+            },
           },
         },
       ],
@@ -178,7 +198,7 @@ describe('OpenCode model catalog provider', () => {
         provider: 'opencode',
         source: { id: 'deepseek', displayName: 'deepseek' },
         supportsEffort: true,
-        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportedEffortLevels: ['low', 'high', 'max'],
         supportsAdaptiveThinking: true,
       },
       {
@@ -187,7 +207,7 @@ describe('OpenCode model catalog provider', () => {
         provider: 'opencode',
         source: { id: 'deepseek', displayName: 'deepseek' },
         supportsEffort: true,
-        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportedEffortLevels: ['high', 'max'],
         supportsAdaptiveThinking: true,
       },
       {
@@ -196,9 +216,131 @@ describe('OpenCode model catalog provider', () => {
         provider: 'opencode',
         source: { id: 'opencode-go', displayName: 'opencode-go' },
         supportsEffort: true,
-        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportedEffortLevels: ['high', 'max'],
         supportsAdaptiveThinking: true,
       },
     ])
+  })
+})
+
+describe('opencode model catalog thinking variants', () => {
+  function normalizeSingleModel(model: Record<string, unknown>) {
+    const models = normalizeOpencodeEnabledModelCatalog({
+      providers: {
+        'opencode-go': {
+          id: 'opencode-go',
+          name: 'OpenCode Go',
+          models: { m: model },
+        },
+      },
+    })
+    expect(models).toHaveLength(1)
+    return models[0]
+  }
+
+  it('derives supportedEffortLevels from the model variants map keys, ordered canonically', () => {
+    // Real served order from lunaroute/glm-5.2-vision (opencode 1.18.18).
+    const model = normalizeSingleModel({
+      id: 'glm-5.2-vision',
+      name: 'glm-5.2-vision',
+      variants: {
+        high: { reasoningEffort: 'high' },
+        max: { reasoningEffort: 'max' },
+        off: { reasoningEffort: 'none' },
+        minimal: { reasoningEffort: 'minimal' },
+        low: { reasoningEffort: 'low' },
+        medium: { reasoningEffort: 'medium' },
+        xhigh: { reasoningEffort: 'xhigh' },
+      },
+    })
+
+    expect(model).toMatchObject({
+      supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+      supportsEffort: true,
+      supportsAdaptiveThinking: true,
+    })
+  })
+
+  it('keeps a single-variant model effort-capable', () => {
+    // Real: opencode-go/kimi-k3 declares { max } only.
+    const model = normalizeSingleModel({
+      id: 'kimi-k3',
+      name: 'Kimi K3',
+      variants: { max: { reasoningEffort: 'max' } },
+    })
+
+    expect(model).toMatchObject({
+      supportedEffortLevels: ['max'],
+      supportsEffort: true,
+      supportsAdaptiveThinking: true,
+    })
+  })
+
+  it('ranks unknown variant ids after the known canonical levels', () => {
+    // Real: opencode-go/minimax-m3 declares { none, thinking }.
+    const model = normalizeSingleModel({
+      id: 'minimax-m3',
+      name: 'MiniMax-M3',
+      variants: {
+        none: { thinking: { type: 'disabled' } },
+        thinking: { thinking: { type: 'adaptive' } },
+      },
+    })
+
+    expect(model).toMatchObject({
+      supportedEffortLevels: ['none', 'thinking'],
+      supportsEffort: true,
+      supportsAdaptiveThinking: true,
+    })
+  })
+
+  it('drops blank variant ids', () => {
+    const model = normalizeSingleModel({
+      id: 'm',
+      name: 'M',
+      variants: { '': {}, '  ': {}, low: {}, high: {} },
+    })
+
+    expect(model.supportedEffortLevels).toEqual(['low', 'high'])
+  })
+
+  it('treats a model with no variants as having no selectable levels', () => {
+    // The server does NOT invent levels for these — the client renders a single
+    // "Default" row from an empty supportedEffortLevels list.
+    const missingKey = normalizeSingleModel({ id: 'm', name: 'M' })
+    const emptyObject = normalizeSingleModel({ id: 'm', name: 'M', variants: {} })
+
+    for (const model of [missingKey, emptyObject]) {
+      expect(model).toMatchObject({
+        supportedEffortLevels: [],
+        supportsEffort: false,
+        supportsAdaptiveThinking: false,
+      })
+    }
+  })
+
+  it('ignores non-object variants payloads', () => {
+    const asArray = normalizeSingleModel({ id: 'm', name: 'M', variants: ['low', 'high'] })
+    const asString = normalizeSingleModel({ id: 'm', name: 'M', variants: 'low,high' })
+    const asNumber = normalizeSingleModel({ id: 'm', name: 'M', variants: 3 })
+
+    for (const model of [asArray, asString, asNumber]) {
+      expect(model).toMatchObject({
+        supportedEffortLevels: [],
+        supportsEffort: false,
+        supportsAdaptiveThinking: false,
+      })
+    }
+  })
+
+  it('matches the shared fixture the Rust normalizer also asserts against', () => {
+    const fixture = JSON.parse(
+      readFileSync(path.join(SHARED_FIXTURE_DIR, 'opencode-config-providers.fixture.json'), 'utf8'),
+    )
+    const expected = JSON.parse(
+      readFileSync(path.join(SHARED_FIXTURE_DIR, 'opencode-config-providers.normalized.json'), 'utf8'),
+    )
+
+    expect(normalizeOpencodeEnabledModelCatalog(fixture)).toEqual(expected)
   })
 })
