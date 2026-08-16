@@ -16,6 +16,7 @@ import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -40,6 +41,7 @@ import {
   getFreshAgentDisplayTurnKey,
 } from '@shared/fresh-agent-turns'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
@@ -653,6 +655,10 @@ export function FreshAgentView({
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
+  const [modelDialogOpen, setModelDialogOpen] = useState(false)
+  const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
+  // /model with a dead catalog opens the shared notice, not an empty dialog.
+  const handleModelCatalogUnavailable = useCallback(() => setNotice(FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE), [])
   // Optimistic echo of the just-sent user message: the transcript renders
   // snapshot turns only, which left a 2-10s blank gap after send
   // (live-test finding). Cleared when a snapshot containing the turn lands.
@@ -1095,6 +1101,12 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (command.action === 'new') {
       startNewConversation()
+      return
+    }
+    if (command.action === 'model') {
+      // Opens the shared model + thinking selector. Commit stages the choice
+      // for the next message — nothing in-flight is interrupted or resent.
+      setModelDialogOpen(true)
       return
     }
     if (command.action === 'compact') {
@@ -2543,6 +2555,14 @@ export function FreshAgentView({
                 sendUserText(outgoing)
               }}
             />
+            <FreshAgentModelDialog
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={paneContent}
+              open={modelDialogOpen}
+              onClose={closeModelDialog}
+              onCatalogUnavailable={handleModelCatalogUnavailable}
+            />
           </div>
           <FreshAgentSidebar
             worktrees={worktrees}
@@ -2568,6 +2588,9 @@ export function FreshAgentView({
     isRestoring,
     loadError,
     localEcho,
+    modelDialogOpen,
+    closeModelDialog,
+    handleModelCatalogUnavailable,
     notice,
     paneContent,
     pendingCreateFailure,

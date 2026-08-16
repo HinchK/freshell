@@ -201,6 +201,9 @@ beforeEach(() => {
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
   saveServerSettingsPatchSpy.mockClear()
   window.localStorage.removeItem('freshopencode.modelMru.v2')
+  window.localStorage.removeItem('freshopencode.modelLevelMru.v1')
+  window.localStorage.removeItem('freshcodex.modelMru.v2')
+  window.localStorage.removeItem('freshcodex.modelLevelMru.v1')
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
     status: 'idle',
     summary: 'Codex summary',
@@ -6167,5 +6170,117 @@ describe('snapshot scheduler integration (zrrj)', () => {
     // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
     const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
     expect(options?.signal).toBeUndefined()
+  })
+})
+
+describe('FreshAgentView /model slash command', () => {
+  function modelCommandPaneContent(content: Record<string, unknown>) {
+    return {
+      kind: 'fresh-agent',
+      createRequestId: 'req-model-cmd',
+      sessionId: 'ses_model_cmd',
+      status: 'idle',
+      initialCwd: '/repo/project-a',
+      ...content,
+    }
+  }
+
+  it('opens the shared model dialog when /model is typed into a freshopencode composer', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 1))
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: modelCommandPaneContent({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'opencode-go/glm-5.2',
+        effort: 'max',
+      }),
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/model' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('dialog', { name: 'Model and thinking level' })).toBeInTheDocument()
+    expect(screen.getByRole('searchbox', { name: 'Filter models' })).toBeInTheDocument()
+    // the composer text is consumed as a command, not sent to the agent
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+  })
+
+  it('opens the shared model dialog for freshcodex without any catalog probe', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: modelCommandPaneContent({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        model: 'gpt-5.5',
+        effort: 'max',
+      }),
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/model' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('dialog', { name: 'Model and thinking level' })).toBeInTheDocument()
+    expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
+  })
+
+  it('shows the shared catalog-unavailable notice instead of an empty dialog when the freshopencode probe fails', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 1))
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: false,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'unavailable',
+      models: [],
+      error: { code: 'CAPABILITY_PROBE_FAILED', message: 'nope' },
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: modelCommandPaneContent({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'opencode-go/glm-5.2',
+        effort: 'max',
+      }),
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/model' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Model catalog unavailable — try again')
+    expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
   })
 })

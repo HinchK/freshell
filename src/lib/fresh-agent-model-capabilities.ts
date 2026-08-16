@@ -14,6 +14,10 @@ import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-m
 
 export const FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS = FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS_VALUE
 
+/** Shared notice text shown wherever a catalog-backed model UI cannot open
+ * (the settings popover's Model row, the /model slash command path). */
+export const FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE = 'Model catalog unavailable — try again'
+
 const FRESH_AGENT_MODEL_SELECTION_OPTION_VALUE_PREFIX = '__agent_chat_selection__:'
 
 type EncodedFreshAgentSettingsModelValue =
