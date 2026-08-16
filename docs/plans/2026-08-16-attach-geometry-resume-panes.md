@@ -24,7 +24,7 @@ Fix the freshell root cause behind broken mouse scrolling and garbage rendering 
 
 **Goal:** A terminal pane's PTY size is always governed by the visible client; hidden/background-hydration attaches replay scrollback without ever resizing the PTY.
 
-**Architecture:** One invariant in the client attach path: when the pane is not visible (`hiddenRef.current`), an attach intent of `viewport_hydrate` is downgraded to `keepalive_delta` at the single choke point (`attachTerminal` in `TerminalView.tsx`). The server never resizes for `keepalive_delta` (existing `registry.rs` contract: `KeepaliveDelta => false`), and wire replay behavior is intent-independent (registry `attach()` receives only `since_seq`). Reveal attaches of visible panes stay `viewport_hydrate` and keep healing geometry.
+**Architecture:** One invariant in the client attach path: a pane that is not visible (`hiddenRef.current === true`) must never claim viewport geometry. Enforced at the single choke point `attachTerminal` (`src/components/TerminalView.tsx` ~2698): when hidden, the attach runs as a **geometry-neutral full replay** — `effectiveIntent = 'keepalive_delta'`, `sinceSeq` forced to `0` — independent of the caller's requested intent. This avoids three verified collisions with the naive clamp: (1) the internal re-promotion of non-viewport intents to `viewport_hydrate` (~2743-2751) is bypassed for hidden attaches; (2) the warm-delta rejection ladders in the `terminal.attach.ready` handler (4108/4143) can only fire when `sinceSeq > 0`, so forcing `sinceSeq = 0` prevents a clamp→reject→reattach loop in multi-client scenarios where `attach.ready` stamps `geometryAuthority: 'multi_client_unknown'`; (3) the client-side viewport bookkeeping (`syncGeometryEpochForViewport` ~2728, `rememberSentViewport`/`lastSentViewportRef` ~2855-2856) is skipped for hidden attaches, so a later visible-pane `terminal.resize` is not suppressed by `matchesLastSentViewport` (~1643-1650). Servers never resize for `keepalive_delta` (`registry.rs` contract) and wire replay keys off `since_seq` only, so hidden panes still warm up with the full stream. Reveal attaches of visible panes stay `viewport_hydrate`; the reveal effect's `fit+resize` must then heal geometry — because hidden attaches no longer poison the "last sent viewport" record, the reveal resize actually reaches the server.
 
 **Tech Stack:** React 18 / TypeScript client (xterm.js), Vitest + Testing Library (`test/unit/client/components/`), Playwright e2e (`test/e2e-browser/`), Rust ws/terminal crates only for the evidence probe (no Rust change).
 
@@ -86,7 +86,7 @@ it('hidden background hydration attach does not claim viewport geometry', async 
   })
 })
 
-it('reveal after hidden hydration still attaches viewport_hydrate so geometry heals', async () => {
+it('reveal after hidden hydration heals geometry via a resize, not a new geometry-claiming attach', async () => {
   const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-hidden-then-visible',
@@ -112,18 +112,30 @@ it('reveal after hidden hydration still attaches viewport_hydrate so geometry he
     </Provider>,
   )
 
+  // Contract: reveal of a pane that attached while hidden does NOT send
+  // another geometry-claiming attach (deferred mode is 'live', not
+  // 'waiting_for_geometry'); the existing reveal layout effect sends a
+  // terminal.resize with the real fitted dims, and the hidden attach must
+  // not have poisoned the suppression record (so this resize is actually
+  // emitted).
   await waitFor(() => {
-    const attach = wsMocks.send.mock.calls
-      .map(([msg]) => msg)
-      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-    expect(attach?.intent).toBe('viewport_hydrate')
+    expect(
+      wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .some((msg) => msg?.type === 'terminal.attach'),
+    ).toBe(false)
+    expect(
+      wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .some((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId),
+    ).toBe(true)
   })
 })
 ```
 
 (Adjust identifiers at the call edges only — e.g. if `renderTerminalHarness` returns differently named keys or needs `sessionRef`/`mode`, mirror the neighboring tests. The assertions are the contract.)
 
-Also update the pre-existing hidden-hydration replay-gap test (~line 8685, "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output"): its attach predicate filters on `intent === 'viewport_hydrate' && priority === 'background'`. That encoded the old contract; change ONLY the predicate's intent to `'keepalive_delta'` so it keeps testing the recreate-on-replay-gap behavior under the new intent. The kill/recreate behavior contract of that test is unchanged. Do not weaken its assertions. Any other pre-existing test that fails for asserting hidden-pane `viewport_hydrate` must be reviewed individually: update it only if its purpose is the same (hidden-path contract), record each touched test in the task report, and never update the "hidden split create keeps viewport_hydrate intent when reconnect fires before reveal" test's assertion intent if the attach it waits for is sent after the pane became visible — verify by reading its rerender order before deciding.
+Also update the pre-existing hidden-hydration replay-gap test (~line 8685, "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output"): its attach predicate filters on `intent === 'viewport_hydrate' && priority === 'background'`. That encoded the old contract; change ONLY the predicate's intent to `'keepalive_delta'` so it keeps testing the recreate-on-replay-gap behavior under the new intent. The kill/recreate behavior contract of that test is unchanged. Do not weaken its assertions. Any other pre-existing test that fails for asserting hidden-pane `viewport_hydrate` must be reviewed individually: update it only if its purpose is the same (hidden-path contract), record each touched test in the task report. The "hidden split create keeps viewport_hydrate intent when reconnect fires before reveal" test (~line 4635) must be verified by reading its rerender order first: it rerenders with `hidden={false}` after the reconnect tick, so its awaited attach is sent while visible and must stay `viewport_hydrate` — if it fails, that failure is real information about stale `hiddenRef` handling; stop and escalate to the coordinator rather than loosening it.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -133,20 +145,19 @@ Expected: FAIL because the hidden background-hydration attach frame carries `int
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `src/components/TerminalView.tsx`, locate `const attachTerminal = useCallback((` (~line 2698). Inside it, before the WS frame is built, clamp the intent by visibility:
+In `src/components/TerminalView.tsx`, inside `attachTerminal` (~line 2698), apply four coordinated edits, all gated on one boolean captured at entry. Do not touch the visible-pane paths.
 
 ```ts
-  // Geometry authority invariant: only a pane visible on THIS client may
-  // claim viewport geometry. A hidden pane's dims are stale (never fitted
-  // past its last visibility), and every server treats viewport_hydrate as
-  // an unconditional PTY resize — so a hidden attach would stomp the
-  // visible pane's geometry on every background hydration. keepalive_delta
-  // is replay-identical on the wire (replay keys off sinceSeq, not intent)
-  // and never resizes server-side.
-  const effectiveIntent: AttachIntent =
-    intent === 'viewport_hydrate' && hiddenRef.current ? 'keepalive_delta' : intent
+// at the top of attachTerminal, right after existing early returns (~2717):
+const isHiddenAttach = hiddenRef.current
 ```
-Use `effectiveIntent` everywhere below in place of `intent` for the sent frame and for any bookkeeping keyed on the sent intent (e.g. the deferred-attach record's `pendingIntent`, attach tracking, epoch sync decisions). Do not change replay options, priorities, or clearViewportFirst — those are surface-management, not geometry claims.
+
+1. **Intent + replay clamp.** Replace the initial `let effectiveIntent = intent` assignment (~2740) so that when `isHiddenAttach`, `effectiveIntent` becomes `'keepalive_delta'` and both re-promotion branches (~2743-2751) are skipped (guard them with `!isHiddenAttach`). Force full replay for hidden attaches: when `isHiddenAttach`, treat `explicitSinceSeq` as `undefined` and the checkpoint decision as not-ok for the `deltaSeq`/`sinceSeq` derivation (~2752-2753), yielding `sinceSeq === 0`. This is what prevents the warm-delta rejection ladders (which require `sinceSeq > 0`) and any clamp→reject→reattach loop. Do NOT force `clearViewportFirst` either way for hidden attaches; keep the caller's value (cosmetic on a hidden surface).
+2. **Skip geometry bookkeeping for hidden attaches.** Guard with `!isHiddenAttach`: the `syncGeometryEpochForViewport(tid, cols, rows)` call (~2728) and the `rememberSentViewport(tid, cols, rows)` + `lastSentViewportRef.current = ...` pair (~2855-2856). A hidden attach never resizes server-side, so its dims must not become the "last sent viewport" that future visible resizes are suppressed against. Compute `cols`/`rows` as today (they stay in the frame — the schema is unchanged; the server ignores them for keepalive).
+3. Keep `deferredAttachStateRef.current` (~2794) and `currentAttachRef.current` (~2801) recording `pendingIntent`/`intent` = the SENT intent (`effectiveIntent`), so the reveal plan and ready-handler see the true wire semantics.
+4. Add a code comment on the clamp stating the invariant and why sinceSeq must be 0 and viewport bookkeeping skipped (this is the load-bearing summary of the run's evidence; reference that `resize_for_attach` resizes unconditionally for viewport_hydrate).
+
+- [ ] **Step 3b (same task, same commit): reveal-side resize must not be suppressible.** In `flushScheduledLayout` (~1613-1658), evaluate whether, after a hidden attach with clamped bookkeeping, the reveal-time `fit+resize` can be suppressed by `matchesLastSentViewport`. The expected answer post-fix is "no" (nothing recorded while hidden; the last visible record may still be stale-equal if the visible pane's fitted dims are unchanged while the server was resized by someone... — with the stomp gone, the only resizer is THIS pane's visible client; if its last-sent record still matches the fitted dims, the suppression is CORRECT except when another client resized the PTY underneath, which the server-side contract still permits — accepted residual per the User Request). If the focused tests prove suppression still bites in the intended-heal flow, amend the reveal call to bypass suppression explicitly (the smallest change that does that, e.g. a forced resize flag on the reveal layout request), and pin it with the second lifecycle test's assertion list (add: "a terminal.resize frame with the pane's fitted dims is sent on reveal even when a previous visible attach recorded the same dims after a foreign resize changed the server geometry"). Document the chosen answer in the task report.
 
 - [ ] **Step 4: Run the focused test**
 
