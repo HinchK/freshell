@@ -1,7 +1,7 @@
 [package]
 name = "freshell-sessions"
 version = "0.1.0"
-description = "Layer C of the freshell Rust port: read-only coding-CLI transcript indexer + parsers. Faithful ports of the claude .jsonl (parseSessionContent), codex rollout .jsonl (parseCodexSessionContent), and opencode SQLite listing parsers, plus the notify-based session-indexer whose late-root watcher carries the DEV-0002 process-liveness fix (log + degrade + rescan, never abort). Identical port of server/coding-cli/{providers/{claude,codex,opencode},session-indexer}.ts. Read-only: never mutates provider data."
+description = "Layer C of the freshell Rust port: read-only coding-CLI transcript index, parsers, and session watcher. Faithful ports of the claude .jsonl (parseSessionContent), codex rollout .jsonl (parseCodexSessionContent), and opencode SQLite listing parsers, plus the notify-based session watcher (inotify) with DEV-0002 late-root liveness handling. Read-only: never mutates provider data."
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -22,7 +22,7 @@ chrono = { workspace = true }
 # yaml-rust2's successor project). default-features off: we only need
 # untyped `Yaml` access to one nested string key, no serde.
 saphyr = { version = "0.0.11", default-features = false }
-# chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
+# notify: the session-directory file watcher (session_watcher.rs).
 notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
 # compiles the SQLite amalgamation so the parser is not coupled to the host's

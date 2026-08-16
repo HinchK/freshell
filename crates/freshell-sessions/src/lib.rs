@@ -1,25 +1,27 @@
 //! `freshell-sessions` — Layer C of the freshell Rust port.
 //!
-//! Read-only coding-CLI transcript **indexer** + **parsers**. This crate is a faithful,
-//! additive port of `server/coding-cli/{providers/{claude,codex,opencode},session-indexer}.ts`.
+//! Read-only coding-CLI transcript **index** + **parsers** + **watcher**. This crate is a
+//! faithful, additive port of
+//! `server/coding-cli/{providers/{claude,codex,opencode},session-indexer}.ts`.
 //! It never mutates provider data (transcripts, databases) — it only reads and indexes.
 //!
-//! Two responsibilities (ADR Decision 1.1, `port/machine/architecture-spec.md`):
+//! Three responsibilities:
 //!
 //! 1. [`parse`] — the three transcript parsers (claude `.jsonl`, codex rollout `.jsonl`,
 //!    opencode `opencode.db`). Corruption-tolerant: a malformed line/row can never panic
 //!    the parse. Graded by T2 `transcript.parseable` and pinned to the committed fixtures.
-//! 2. [`indexer`] — the `notify` file-watcher that discovers provider transcript roots and
-//!    emits change events, carrying the **DEV-0002** process-liveness fix (late-root
-//!    watcher must log + degrade + rescan, never abort). Pinned by the mandatory liveness
-//!    test in `tests/late_root_watcher_liveness.rs`.
+//! 2. [`directory_index`] — the refreshable session-directory cache with dirty-marking
+//!    and change-notification support.
+//! 3. [`session_watcher`] — the `notify` (inotify) file-watcher that feeds dirty-path
+//!    notifications to the directory index. Carries the **DEV-0002** process-liveness fix
+//!    (late-root watcher must degrade + watch ancestor, never abort). Pinned by the
+//!    `watcher_handles_late_root_appearance` test.
 
 pub mod amplifier;
 pub mod amplifier_stub;
 pub mod bundle_config;
 pub mod codex_locator;
 pub mod directory_index;
-pub mod indexer;
 pub mod provider_layout;
 pub mod session_watcher;
 pub mod meta;
@@ -46,9 +48,10 @@ pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSear
 
 #[cfg(test)]
 mod tests {
-    //! Fast in-crate unit tests for the string/time helpers. Fixture-parity and the
-    //! DEV-0002 liveness pin live in `tests/` (integration tests, so they can read the
-    //! committed fixture files).
+    //! Fast in-crate unit tests for the string/time helpers. Fixture-parity
+    //! tests live in `tests/` (integration tests, so they can read the
+    //! committed fixture files). The DEV-0002 late-root liveness pin is in
+    //! `session_watcher::tests::watcher_handles_late_root_appearance`.
     use super::text::*;
     use super::time::*;
     use serde_json::json;
