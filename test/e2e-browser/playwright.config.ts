@@ -277,6 +277,10 @@ export const RUST_ONLY_SPECS = [
   // layout into), so they only ever run under the rust-chromium project.
   /automation-layout-rust\.spec\.ts$/,
   /git-badges-rust\.spec\.ts$/,
+  // AGENT-04/05/06/07/24 — fresh-agent approval/question/compact/fork control
+  // surfaces validated in-browser against hermetic provider fakes (owns
+  // per-test RustServers; hard e2eServerKind==='rust' assertion per test).
+  /fresh-agent-control-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -510,6 +514,9 @@ export default defineConfig({
         // persistence, Tasks 17-18). Covers git badge parity for
         // REST-created terminals via FreshAgentState post-create seeding.
         /git-badges-rust\.spec\.ts$/,
+        // AGENT-04/05/06/07/24 (see the RUST_ONLY_SPECS entry): fresh-agent
+        // approval/question/compact/fork PW-RUST validation across providers.
+        /fresh-agent-control-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
