@@ -41,12 +41,28 @@ function buildSessionKey(item: { provider: string; sessionId: string }): string 
 }
 
 type PersistedIdentityCollision = {
-  /** Internal only: used to quarantine every conflicting row, never serialized. */
+  /** Internal only: used to quarantine every conflicting persisted row, never serialized. */
   keys: ReadonlySet<string>
   collisionCount: number
   duplicateItemCount: number
   collisionKeySamples: readonly string[]
   collisionKeySamplesTruncated: boolean
+}
+
+/**
+ * Remove only persisted rows whose identity is ambiguous. Live terminals are
+ * deliberately joined afterwards: their terminal-owned identity can still be
+ * rendered as a generic running row without choosing between conflicting
+ * transcript metadata.
+ */
+function quarantinePersistedProjects(
+  projects: ProjectGroup[],
+  collisionKeys: ReadonlySet<string>,
+): ProjectGroup[] {
+  return projects.map((project) => {
+    const sessions = project.sessions.filter((session) => !collisionKeys.has(buildSessionKey(session)))
+    return sessions.length === project.sessions.length ? project : { ...project, sessions }
+  })
 }
 
 export class SessionDirectoryCursorError extends Error {
@@ -306,9 +322,15 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     ...input.terminalMeta.map((meta) => meta.updatedAt),
   )
 
-  let items = toItems(input.projects, input.terminalMeta)
-    .filter((item) => !identityCollision?.keys.has(buildSessionKey(item)))
-    .sort(compareItems)
+  // Filter persisted rows BEFORE joining live terminals. This prevents a
+  // duplicate file from contributing arbitrary title/path metadata while
+  // still allowing a currently running terminal to appear as its safe,
+  // terminal-owned placeholder.
+  const persistedProjects = identityCollision
+    ? quarantinePersistedProjects(input.projects, identityCollision.keys)
+    : input.projects
+
+  let items = toItems(persistedProjects, input.terminalMeta).sort(compareItems)
 
   // Server-side visibility pre-filtering to avoid wasting search budget on
   // sessions the client will hide. Matches the client's default sidebar settings.
@@ -342,7 +364,10 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
         .filter((item): item is SessionDirectoryItem => item !== null)
     } else {
       // File-based search for userMessages / fullText
-      const fileResult = await applyFileSearch(items, input.query.query!.trim(), tier, input, limit)
+      const fileResult = await applyFileSearch(items, input.query.query!.trim(), tier, {
+        ...input,
+        projects: persistedProjects,
+      }, limit)
       items = fileResult.items
       partial = fileResult.partial
       partialReason = fileResult.partialReason
@@ -389,12 +414,11 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     page.partialReason = partialReason
   }
   if (identityCollision) {
-    // Do not silently choose one duplicate.  Every ambiguous row is removed
-    // from this response, the structured error is logged above, and the UI
-    // gets enough information to explain how to recover without leaking
-    // session ids or source paths over the wire.
+    // Do not silently choose one duplicate. Every ambiguous PERSISTED row is
+    // removed; a matching live terminal may remain as a generic, terminal-
+    // owned row. The structured error is logged above and the UI gets enough
+    // information to explain recovery without leaking ids or source paths.
     page.partial = true
-    page.partialReason ??= 'identity_collision'
     page.integrityError = {
       kind: 'identity_collision',
       collisionCount: identityCollision.collisionCount,

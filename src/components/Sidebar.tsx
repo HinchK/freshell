@@ -895,8 +895,8 @@ export default function Sidebar({
               >
                 <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
                 <span>
-                  {integrityError.collisionCount} session {integrityError.collisionCount === 1 ? 'identity conflict' : 'identities conflict'}.
-                  {' '}Conflicted sessions are hidden. Check the server log, then remove or rename the duplicate session file.
+                  {integrityError.collisionCount} conflicting saved session {integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+                  {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
                 </span>
               </div>
             ) : null}

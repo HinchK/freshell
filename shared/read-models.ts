@@ -76,7 +76,11 @@ export const SessionDirectoryPageSchema = z.object({
   nextCursor: z.string().nullable(),
   revision: z.number().int().nonnegative(),
   partial: z.boolean().optional(),
-  partialReason: z.enum(['budget', 'io_error', 'identity_collision']).optional(),
+  // Keep this closed to the pre-existing transport reasons. Integrity errors
+  // travel in `integrityError`, so an older cached SPA can strip that unknown
+  // field and still parse a collision response instead of crashing on a new
+  // enum value.
+  partialReason: z.enum(['budget', 'io_error']).optional(),
   /**
    * Present when conflicted persisted rows were quarantined from this page.
    * `partial` is also true in that case so existing partial-result consumers

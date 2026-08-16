@@ -162,7 +162,6 @@ describe('GET /api/session-directory', () => {
     expect(res.body).toMatchObject({
       items: [expect.objectContaining({ sessionId: 'healthy-session' })],
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount,

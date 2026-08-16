@@ -777,6 +777,13 @@ fn now_ms() -> i64 {
 /// stat'd every sweep but never re-parsed unless it actually changes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct FileEntry {
+    /// The file-backed source that discovered this path. Persisted so a root
+    /// outage for one provider can retain only that provider's cache while
+    /// healthy providers still prune deleted rows. Older cache entries omit
+    /// this and are conservatively retained during any failed sweep until a
+    /// healthy discovery assigns them a source.
+    #[serde(default)]
+    source_name: Option<String>,
     mtime_ms: i64,
     size: u64,
     item: Option<IndexedSession>,
@@ -937,11 +944,10 @@ impl SessionIndex {
     /// use [`Self::snapshot_with_failures`] instead of pairing `snapshot()`
     /// with a later `scan_failures()` call.
     ///
-    /// NODE PARITY NOTE: Node behaves exactly like `refresh_snapshot` here —
-    /// a throwing `listSessionFiles()` also yields an empty file list and
-    /// lets the full-scan prune drop that provider's cached entries
-    /// (`session-indexer.ts:1467-1475`, `:1499-1504`); what makes the outage
-    /// VISIBLE is the recorded scan failure, which the route merges into
+    /// NODE PARITY NOTE: a throwing `listSessionFiles()` records a provider
+    /// failure and preserves that provider's last-known-good file cache;
+    /// healthy providers still prune their own deleted files
+    /// (`session-indexer.ts:1512-1545`). The route merges the failure into
     /// `providerErrors` and marks the response `degraded` — never a silent
     /// healthy `ready + matches: []`. Both direct-listed (opencode) and
     /// file-backed (claude/codex/amplifier) outages are therefore recorded.
@@ -1323,11 +1329,12 @@ fn refresh_snapshot(
 ) -> (Vec<IndexedSession>, usize) {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     // A failed root listing cannot distinguish "everything disappeared" from
-    // "the provider is temporarily unreadable." Skip this sweep's file-cache
-    // prune entirely when any file-backed source fails so an outage cannot
-    // delete and persist an otherwise healthy cache. A later fully healthy
-    // sweep reconciles actual removals normally.
+    // "this provider is temporarily unreadable." Remember failures by source
+    // so their rows stay cached while healthy providers still reconcile real
+    // deletions. Legacy cache entries without a source marker are retained
+    // conservatively during any failed sweep until a healthy scan marks them.
     let mut file_backed_discovery_failed = false;
+    let mut failed_file_source_names = HashSet::<String>::new();
     // Count of file-cache mutations + direct-listed sources re-queried this
     // sweep -- the persistent-parse-cache save gate's "how much changed"
     // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
@@ -1397,6 +1404,7 @@ fn refresh_snapshot(
         // existing cache. Treating it as an empty listing makes a transient
         // permission/I/O outage look like mass deletion and can persist a
         // gutted cache for the next boot.
+        let source_name = source.provider_name().map(str::to_owned);
         let stats = match source.discover_checked() {
             Ok(stats) => {
                 if let Some(name) = source.provider_name() {
@@ -1408,6 +1416,7 @@ fn refresh_snapshot(
                 file_backed_discovery_failed = true;
                 if let Some(name) = source.provider_name() {
                     scan_failures.insert(name.to_string());
+                    failed_file_source_names.insert(name.to_string());
                 }
                 eprintln!(
                     "session-directory: source #{idx} root listing failed \
@@ -1420,11 +1429,24 @@ fn refresh_snapshot(
             let unchanged = cache
                 .get(&stat.path)
                 .is_some_and(|entry| entry.mtime_ms == stat.mtime_ms && entry.size == stat.size);
-            if !unchanged {
+            if unchanged {
+                // Migrate older persisted entries (and correct any stale
+                // ownership) without reparsing an otherwise unchanged file.
+                if cache
+                    .get(&stat.path)
+                    .is_some_and(|entry| entry.source_name != source_name)
+                {
+                    if let Some(entry) = cache.get_mut(&stat.path) {
+                        entry.source_name = source_name.clone();
+                        changed += 1;
+                    }
+                }
+            } else {
                 let item = source.parse(&stat.path);
                 cache.insert(
                     stat.path.clone(),
                     FileEntry {
+                        source_name: source_name.clone(),
                         mtime_ms: stat.mtime_ms,
                         size: stat.size,
                         item,
@@ -1436,14 +1458,23 @@ fn refresh_snapshot(
         }
     }
 
-    // Prune entries only after every file-backed source completed discovery.
     // A prune is a real cache mutation and must contribute to persistence
-    // accounting; otherwise a cleaned cache can remain stale on disk.
-    if !file_backed_discovery_failed {
-        let cache_len_before_prune = cache.len();
-        cache.retain(|path, _| discovered.contains(path));
-        changed = changed.saturating_add(cache_len_before_prune - cache.len());
-    }
+    // accounting; otherwise a cleaned cache can remain stale on disk. A
+    // failed provider retains only its own known cache entries; a healthy
+    // provider's deleted files still disappear this sweep. Unattributed
+    // legacy entries stay only while any source failed, because their owner is
+    // unknowable until a healthy discovery above migrates them.
+    let cache_len_before_prune = cache.len();
+    cache.retain(|path, entry| {
+        if discovered.contains(path) {
+            return true;
+        }
+        match entry.source_name.as_deref() {
+            Some(source_name) => failed_file_source_names.contains(source_name),
+            None => file_backed_discovery_failed,
+        }
+    });
+    changed = changed.saturating_add(cache_len_before_prune - cache.len());
 
     let mut items: Vec<IndexedSession> = cache
         .values()
@@ -1624,7 +1655,7 @@ fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3327,6 +3358,7 @@ mod tests {
             (
                 matching_path.clone(),
                 FileEntry {
+                    source_name: None,
                     mtime_ms: matching_stat.mtime_ms,
                     size: matching_stat.size,
                     item: source.parse(&matching_path),
@@ -3335,6 +3367,7 @@ mod tests {
             (
                 child_path.clone(),
                 FileEntry {
+                    source_name: None,
                     mtime_ms: child_stat.mtime_ms,
                     size: child_stat.size,
                     item: Some(legacy_child),
@@ -3550,6 +3583,7 @@ mod tests {
             (
                 canonical_path.clone(),
                 FileEntry {
+                    source_name: None,
                     mtime_ms: canonical_stat.mtime_ms,
                     size: canonical_stat.size,
                     item: source.parse(&canonical_path),
@@ -3558,6 +3592,7 @@ mod tests {
             (
                 nested_path.clone(),
                 FileEntry {
+                    source_name: None,
                     mtime_ms: nested_stat.mtime_ms,
                     size: nested_stat.size,
                     item: source.parse(&nested_path),
@@ -3647,6 +3682,7 @@ mod tests {
         cache.insert(
             PathBuf::from("/fake/path.jsonl"),
             FileEntry {
+                source_name: None,
                 mtime_ms: 1,
                 size: 2,
                 item: None,
@@ -4111,6 +4147,92 @@ mod tests {
                 .is_empty())
             .await,
             "file-backed scan failure must clear once the root is listable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_failed_file_source_does_not_block_pruning_a_healthy_source() {
+        struct ToggleFileSource {
+            name: &'static str,
+            path: PathBuf,
+            item: IndexedSession,
+            present: Arc<AtomicBool>,
+            broken: Arc<AtomicBool>,
+        }
+        impl SessionSource for ToggleFileSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                if self.broken.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "denied",
+                    ));
+                }
+                Ok(self
+                    .present
+                    .load(Ordering::SeqCst)
+                    .then(|| FileStat {
+                        path: self.path.clone(),
+                        mtime_ms: 1,
+                        size: 1,
+                    })
+                    .into_iter()
+                    .collect())
+            }
+            fn parse(&self, path: &Path) -> Option<IndexedSession> {
+                (path == self.path).then(|| self.item.clone())
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some(self.name)
+            }
+        }
+
+        let claude_present = Arc::new(AtomicBool::new(true));
+        let codex_broken = Arc::new(AtomicBool::new(false));
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![
+                Arc::new(ToggleFileSource {
+                    name: "claude",
+                    path: PathBuf::from("mem://claude-session"),
+                    item: mk("claude-session", "claude", 200),
+                    present: Arc::clone(&claude_present),
+                    broken: Arc::new(AtomicBool::new(false)),
+                }) as _,
+                Arc::new(ToggleFileSource {
+                    name: "codex",
+                    path: PathBuf::from("mem://codex-session"),
+                    item: mk("codex-session", "codex", 100),
+                    present: Arc::new(AtomicBool::new(true)),
+                    broken: Arc::clone(&codex_broken),
+                }) as _,
+            ],
+            Duration::ZERO,
+            None,
+        );
+        assert_eq!(
+            index.snapshot().await.len(),
+            2,
+            "sanity: both sources seed cache"
+        );
+
+        claude_present.store(false, Ordering::SeqCst);
+        codex_broken.store(true, Ordering::SeqCst);
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(Duration::from_secs(2), || index.scan_failures()
+                == vec!["codex".to_string()])
+            .await,
+            "the failed source must publish its scan failure"
+        );
+        let items = index
+            .peek()
+            .expect("failed sweep published a retained snapshot");
+        assert_eq!(
+            items.iter().map(|item| item.key()).collect::<Vec<_>>(),
+            vec!["codex:codex-session"],
+            "the failed provider retains its cache while the healthy provider's deletion prunes"
         );
     }
 

@@ -325,7 +325,7 @@ function buildSearchPayload(
   deepSearchPending: boolean,
   opts?: {
     partial?: boolean
-    partialReason?: 'budget' | 'io_error' | 'identity_collision'
+    partialReason?: 'budget' | 'io_error'
     integrityError?: SessionDirectoryIntegrityError
     hasMore?: boolean
     searchCursor?: string | null
@@ -405,7 +405,7 @@ async function refreshVisibleSessionWindowSilently(args: {
     query?: string
     searchTier?: SearchOptions['tier']
     partial?: boolean
-    partialReason?: 'budget' | 'io_error' | 'identity_collision'
+    partialReason?: 'budget' | 'io_error'
     integrityError?: SessionDirectoryIntegrityError
   }) => {
     if (!canCommit()) {

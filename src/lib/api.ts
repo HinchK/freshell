@@ -577,7 +577,7 @@ export type SearchResponse = {
   /** True when the server has additional matches beyond this page (nextCursor is non-null). */
   hasMore: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  partialReason?: 'budget' | 'io_error'
   /** Server-detected persisted-session integrity issue; conflicted rows were omitted. */
   integrityError?: ReadModelSessionDirectoryIntegrityError
   /** SESSION-05: the page's per-project color map (only present when the server emitted one). */

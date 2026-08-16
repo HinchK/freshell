@@ -101,7 +101,6 @@ describe('sessionsThunks', () => {
       oldestIncludedSessionId: 'claude:session-alpha',
       hasMore: false,
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 1,

@@ -204,8 +204,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
         >
           <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
           <span>
-            {historyWindow.integrityError.collisionCount} session {historyWindow.integrityError.collisionCount === 1 ? 'identity conflict' : 'identities conflict'}.
-            {' '}Conflicted sessions are hidden. Check the server log, then remove or rename the duplicate session file.
+            {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+            {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
           </span>
         </div>
       ) : null}

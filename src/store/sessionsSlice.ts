@@ -24,7 +24,7 @@ export interface SessionWindowState {
   appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  partialReason?: 'budget' | 'io_error'
   /** Conflicted persisted identities were quarantined by the server. */
   integrityError?: SessionDirectoryIntegrityError
 }
@@ -199,7 +199,7 @@ type SessionWindowCommitPayload = {
   searchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  partialReason?: 'budget' | 'io_error'
   integrityError?: SessionDirectoryIntegrityError
 }
 

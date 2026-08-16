@@ -981,6 +981,55 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
+  it('does not apply a former Claude identity to a copied transcript while its canonical original remains', async () => {
+    const oldEmbeddedId = 'embedded-before-canonicalization'
+    const originalFile = path.join(tempDir, `${oldEmbeddedId}.jsonl`)
+    const copiedFile = path.join(tempDir, 'copied-transcript.jsonl')
+    await Promise.all([
+      fsp.writeFile(originalFile, JSON.stringify({ cwd: '/project/a' }) + '\n'),
+      fsp.writeFile(copiedFile, JSON.stringify({ cwd: '/project/b' }) + '\n'),
+    ])
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', oldEmbeddedId)]: {
+          titleOverride: 'Original user rename',
+          titleSource: 'user',
+        },
+      },
+      settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+    })
+    const provider = makeProvider([originalFile, copiedFile], {
+      parseSessionFile: async (_content, filePath) => ({
+        cwd: filePath === originalFile ? '/project/a' : '/project/b',
+        title: filePath === originalFile ? 'Original parsed title' : 'Copied parsed title',
+        sessionId: oldEmbeddedId,
+      }),
+    })
+    const metadataStore = {
+      getAll: vi.fn().mockResolvedValue({
+        [makeSessionKey('claude', oldEmbeddedId)]: { sessionType: 'freshclaude' },
+      }),
+      get: vi.fn(),
+      set: vi.fn(),
+    } as unknown as SessionMetadataStore
+    const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects().flatMap((project) => project.sessions)
+    expect(sessions.find((session) => session.sessionId === oldEmbeddedId)).toMatchObject({
+      sessionId: oldEmbeddedId,
+      title: 'Original user rename',
+      sessionType: 'freshclaude',
+    })
+    const copied = sessions.find((session) => session.sessionId === 'copied-transcript')
+    expect(copied).toMatchObject({
+      sessionId: 'copied-transcript',
+      title: 'Copied parsed title',
+    })
+    expect(copied?.sessionType).toBeUndefined()
+  })
+
   it('uses a real Claude child filename as identity during a full scan even when lines embed the parent id', async () => {
     const claudeHome = path.join(tempDir, '.claude')
     const cwd = path.join(tempDir, 'project')
@@ -3094,6 +3143,29 @@ describe('readiness + scan-failure channel (resume resolve)', () => {
     fail = false
     await indexer.refresh()
     expect(indexer.getScanFailures()).toEqual([])
+  })
+
+  it('preserves a file-backed provider cache when its full listing fails', async () => {
+    const file = path.join(tempDir, 'session-a.jsonl')
+    await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Cached session' }) + '\n')
+    let fail = false
+    const provider = makeProvider([], {
+      listSessionFiles: async () => {
+        if (fail) throw new Error('EIO: i/o error')
+        return [file]
+      },
+    })
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+    fail = true
+    ;(indexer as any).needsFullScan = true
+    await indexer.refresh()
+
+    expect(indexer.getProjects().flatMap((project) => project.sessions)).toEqual([
+      expect.objectContaining({ sessionId: 'session-a', title: 'Cached session' }),
+    ])
+    expect(indexer.getScanFailures()).toEqual(['claude'])
   })
 
   it('prunes a failed provider that is later DISABLED (unsearched, not failed — no retry trap)', async () => {

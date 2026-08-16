@@ -468,7 +468,6 @@ describe('visible-first read-model helpers', () => {
       nextCursor: null,
       revision: 1,
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 1,
@@ -480,7 +479,6 @@ describe('visible-first read-model helpers', () => {
 
     expect(response).toMatchObject({
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 1,
@@ -744,7 +742,6 @@ describe('searchSessions tier forwarding', () => {
       nextCursor: null,
       revision: 1,
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 2,
@@ -756,7 +753,6 @@ describe('searchSessions tier forwarding', () => {
 
     expect(response).toMatchObject({
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 2,

@@ -361,9 +361,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       vi.advanceTimersByTime(100)
     })
 
-    expect(screen.getByTestId('session-directory-integrity-error')).toHaveTextContent(
-      '2 session identities conflict. Conflicted sessions are hidden. Check the server log, then remove or rename the duplicate session file.',
-    )
+    const alert = screen.getByTestId('session-directory-integrity-error')
+    expect(alert).toHaveAttribute('role', 'alert')
+    expect(alert).toHaveTextContent('2 conflicting saved session identities are hidden')
+    expect(alert).toHaveTextContent('Running terminals remain available')
     expect(screen.getByRole('button', { name: /Healthy session/ })).toBeInTheDocument()
   })
 

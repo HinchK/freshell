@@ -477,6 +477,7 @@ fn bounded_fallback<T: Send + 'static>(
 fn lookup_session_override<'a>(
     overrides: &'a Map<String, Value>,
     session: &IndexedSession,
+    canonical_keys: &std::collections::HashSet<String>,
 ) -> Option<&'a Map<String, Value>> {
     let direct = overrides
         .get(&session.key())
@@ -489,8 +490,15 @@ fn lookup_session_override<'a>(
     if legacy_id.is_empty() || legacy_id == session.session_id {
         return None;
     }
+    let legacy_key = format!("{}:{legacy_id}", session.provider);
+    // A copied transcript can retain an old embedded id while the original
+    // canonical identity still exists. In that case the old user state belongs
+    // only to the original; do not project it onto the copy.
+    if canonical_keys.contains(&legacy_key) {
+        return None;
+    }
     overrides
-        .get(&format!("{}:{legacy_id}", session.provider))
+        .get(&legacy_key)
         .or_else(|| overrides.get(legacy_id))
         .filter(|v| !v.is_null())
         .and_then(Value::as_object)
@@ -512,8 +520,9 @@ fn lookup_session_override<'a>(
 fn project_session_through_overrides(
     session: &IndexedSession,
     overrides: &Map<String, Value>,
+    canonical_keys: &std::collections::HashSet<String>,
 ) -> Option<IndexedSession> {
-    let Some(ov) = lookup_session_override(overrides, session) else {
+    let Some(ov) = lookup_session_override(overrides, session, canonical_keys) else {
         return Some(session.clone());
     };
     if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
@@ -648,14 +657,31 @@ async fn resolve_session(
         .into_iter()
         .collect();
 
-    let snapshot: Option<Vec<IndexedSession>> = snapshot.map(|sessions| {
-        let overrides = state.settings.session_overrides();
-        sessions
-            .iter()
-            .filter(|session| enabled.contains(&session.provider))
-            .filter_map(|session| project_session_through_overrides(session, &overrides))
-            .collect()
-    });
+    let (snapshot, canonical_keys): (
+        Option<Vec<IndexedSession>>,
+        std::collections::HashSet<String>,
+    ) = match snapshot {
+        Some(sessions) => {
+            let enabled_sessions: Vec<IndexedSession> = sessions
+                .iter()
+                .filter(|session| enabled.contains(&session.provider))
+                .cloned()
+                .collect();
+            // Keep the set from BEFORE applying `deleted` overrides. A copy
+            // must not inherit an original's legacy state merely because that
+            // original becomes hidden by the same override.
+            let canonical_keys = enabled_sessions.iter().map(IndexedSession::key).collect();
+            let overrides = state.settings.session_overrides();
+            let projected = enabled_sessions
+                .iter()
+                .filter_map(|session| {
+                    project_session_through_overrides(session, &overrides, &canonical_keys)
+                })
+                .collect();
+            (Some(projected), canonical_keys)
+        }
+        None => (None, std::collections::HashSet::new()),
+    };
 
     // sessionType overlay (Node: `session-indexer.ts:1159-1161`), keyed
     // `"{provider}:{session_id}"`. Only needed when we can match at all.
@@ -682,7 +708,8 @@ async fn resolve_session(
                 continue;
             };
             let legacy_key = format!("{}:{legacy_id}", session.provider);
-            if !session_types.contains_key(&canonical_key) {
+            if !canonical_keys.contains(&legacy_key) && !session_types.contains_key(&canonical_key)
+            {
                 if let Some(session_type) = session_types.get(&legacy_key).cloned() {
                     session_types.insert(canonical_key, session_type);
                 }
@@ -1609,6 +1636,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_override_does_not_hide_a_copy_while_its_canonical_original_exists() {
+        let dir = temp_dir("legacy-copy-isolation");
+        let index =
+            fixture_index(vec![claude_fixture(), claude_fixture_with_legacy_source()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{CLAUDE_ID}"),
+                &[("deleted", Some(serde_json::json!(true)))],
+            )
+            .await;
+
+        let (status, body) = post(st, serde_json::json!({ "input": LEGACY_BASENAME }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"][0]["sessionId"], LEGACY_BASENAME);
     }
 
     #[tokio::test]

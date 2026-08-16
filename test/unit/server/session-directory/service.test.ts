@@ -150,13 +150,13 @@ describe('querySessionDirectory', () => {
     expect(page.items).toEqual([])
     expect(page).toMatchObject({
       partial: true,
-      partialReason: 'identity_collision',
       integrityError: {
         kind: 'identity_collision',
         collisionCount: 1,
         duplicateItemCount: 2,
       },
     })
+    expect(page.partialReason).toBeUndefined()
   })
 
   it('quarantines every row for a collided identity without hiding healthy sessions', async () => {
@@ -212,6 +212,56 @@ describe('querySessionDirectory', () => {
       kind: 'identity_collision',
       collisionCount: 2,
       duplicateItemCount: 4,
+    })
+  })
+
+  it('keeps a live-only terminal row when its persisted identity is quarantined', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/first-copy', [
+          makeSession({
+            sessionId: 'duplicate-running-session',
+            projectPath: '/repo/first-copy',
+            lastActivityAt: 200,
+            title: 'First conflicting copy',
+          }),
+        ]),
+        makeProject('/repo/second-copy', [
+          makeSession({
+            sessionId: 'duplicate-running-session',
+            projectPath: '/repo/second-copy',
+            lastActivityAt: 100,
+            title: 'Second conflicting copy',
+          }),
+        ]),
+      ],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-conflicted',
+          provider: 'claude',
+          sessionId: 'duplicate-running-session',
+          updatedAt: 300,
+          cwd: '/repo/live-terminal',
+        }),
+      ],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        provider: 'claude',
+        sessionId: 'duplicate-running-session',
+        title: 'Claude CLI',
+        projectPath: '/repo/live-terminal',
+        isRunning: true,
+        runningTerminalId: 'term-conflicted',
+      }),
+    ])
+    expect(page.items[0]?.liveTerminalOnly).not.toBe(true)
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount: 1,
+      duplicateItemCount: 2,
     })
   })
 
