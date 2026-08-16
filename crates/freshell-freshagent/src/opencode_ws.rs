@@ -1072,6 +1072,26 @@ impl FreshOpencodeState {
             }
         };
 
+        // A pathological 200 body without a usable `id` parses to an EMPTY child id
+        // (serve.rs `ForkedSession.id` defaults to ""); treat it as a serve failure —
+        // reply and NEVER register/bind a "" child (a wrong "success" that would
+        // repoint the pane at a garbage session).
+        if child.id.trim().is_empty() {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": format!(
+                        "OpenCode serve fork of session {} returned a malformed response: missing session \"id\".",
+                        real_id
+                    ),
+                }),
+            ));
+            return;
+        }
+
         // adapter.ts fork:1005-1020 — the child lands in the SAME session map (its
         // placeholder IS its durable id), inherits model/effort from the parent, takes
         // cwd from `child.directory ?? state.cwd`, and gets its own serve-SSE bridge
@@ -3828,6 +3848,11 @@ mod tests {
         let forks = http.fork_requests();
         assert_eq!(forks.len(), 1, "exactly one fork POST");
         assert!(forks[0].url.contains("/session/ses_parent/fork"));
+        assert!(
+            forks[0].url.contains("directory=%2Fparent%2Fcwd"),
+            "the parent's cwd crosses as the `directory=` route query (with_route propagation): {}",
+            forks[0].url
+        );
         assert!(forks[0].body.is_none(), "no atTurnId -> no body: {forks:?}");
     }
 
@@ -3939,6 +3964,55 @@ mod tests {
             !st.has_live_session("ses_child").await,
             "no child insert on failure"
         );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_malformed_child_response_replies_internal_error_and_registers_no_child() {
+        // A pathological 200 fork body without a usable `id` yields an EMPTY child id
+        // from the serve parse (serve.rs `ForkedSession.id` defaults to "") — treat it
+        // as a serve failure (nested INTERNAL_ERROR naming the malformed response) and
+        // NEVER register/bind a "" child (a wrong "success" that would repoint the
+        // pane at a garbage session). Both the missing-id and blank-id shapes:
+        for body in [b"{}".to_vec(), br#"{"id":"   "}"#.to_vec()] {
+            let mut fake = ForkFakeHttp::child_ok();
+            fake.fork_body = body;
+            let http = Arc::new(fake);
+            let st = fork_state(http.clone()).await;
+            let identity = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            st.set_identity_sink(identity.clone());
+            insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+            let (sink, captured) = capturing_sink();
+            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), sink)
+                .await;
+
+            let frames = captured.lock().expect("captured mutex").clone();
+            assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+            let v = serde_json::to_value(&frames[0]).unwrap();
+            assert_eq!(v["type"], "freshAgent.event");
+            assert_eq!(v["event"]["type"], "freshAgent.error");
+            assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+            assert!(
+                v["event"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("missing session \"id\""),
+                "the message names the malformed fork response: {v}"
+            );
+            assert_eq!(http.fork_requests().len(), 1, "the fork POST did land");
+            let sessions = st.sessions.lock().await;
+            let keys: Vec<&String> = sessions.keys().collect();
+            assert_eq!(sessions.len(), 1, "no child insert at all: {keys:?}");
+            assert!(
+                !sessions.contains_key(""),
+                "no child registration under the empty id"
+            );
+            drop(sessions);
+            assert!(
+                identity.bindings.lock().unwrap().is_empty(),
+                "no binding row for a malformed child"
+            );
+        }
     }
 
     #[tokio::test]
