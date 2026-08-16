@@ -297,19 +297,19 @@ git commit -m "test(e2e): pin geometry-neutral boot-time background hydration an
 **Interfaces:**
 - Consumes: Tasks 1-2. Scratch dev instance from the worktree per repo process-safety rules: `NODE_ENV=development PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid` from the worktree, teasing out the token, driving via a browser (the agent's browser automation).
 
-- [ ] **Step 1: Boot + witness setup**
+- [x] **Step 1: Boot + witness setup**
 
 Verify the pid file PID belongs to the worktree (`ps -fp $(cat /tmp/freshell-3344.pid)` and confirm the cwd/command path includes the worktree). Open the dev client URL with token in the browser at a fixed window size. Create TWO panes: (a) a shell pane T-A (leave active); (b) an opencode-mode pane (T-OC) via the pane picker/REST; (c) a second shell tab T-B. Then RELOAD the page (same context): persisted tabs restore, T-A active/visible, T-B hidden — the boot-time mount-hidden hydration shape.
 
-- [ ] **Step 2: Machine-checkable assertions**
+- [x] **Step 2: Machine-checkable assertions**
 
 (a) Shell pane: type `echo __AXIS__:$(stty size)` — marker must equal the pane's current fitted xterm dims. (b) Opencode pane: assert via buffer rows (harness) that the footer renders on ONE row and contains both `ctrl+p` and `commands` (no wrap cascade); scroll back a few pages with PgUp and assert rows stay coherent (no right-edge fragment cascade — compare before/after dumps for absence of the known garbage pattern `^ ▀+$` mid-row splits and lone `\d+%)` fragments). (c) Witness tab T-B: assert from `getSentWsMessages` that its boot hydration attach was `keepalive_delta` with `priority: 'background'` and no `viewport_hydrate` frames named T-B's terminalId while hidden. (d) Reveal T-B, assert a `terminal.resize` frame followed the reveal (a new attach is NOT expected once hydration completed), then type the stty marker and confirm its dims equal the emitted resize frame dims (not the 80x24 never-fitted defaults). (e) The opencode pane T-OC (visible): footer renders on ONE row containing both `ctrl+p` and `commands`; PgUp-scroll a few pages and confirm no right-edge wrap-cascade fragments (compare row dumps; absence of lone `\d+%)` cells and row-split footer). Record all dims + one screenshot per assertion into the run logs dir `/home/dan/code/freshell/.worktrees/.the-usual-logs/attach-geometry-resume-panes/reports/live-verify-*.png|json` (outside the tracked worktree — never commit these).
 
-- [ ] **Step 3: Teardown + record**
+- [x] **Step 3: Teardown + record**
 
 Verify ownership before stopping: `ps -fp "$(cat /tmp/freshell-3344.pid)"` and confirm the process's cwd/binary is inside the worktree; only then `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`. Write `/home/dan/code/freshell/.worktrees/.the-usual-logs/attach-geometry-resume-panes/reports/live-verify.md` with the evidence list and the assertion outcomes.
 
-- [ ] **Step 4: No commit**
+- [x] **Step 4: No commit**
 
 This task produces no tracked artifacts (the evidence lives in the run logs).
 
