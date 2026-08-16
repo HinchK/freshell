@@ -153,7 +153,7 @@ Also update the pre-existing hidden replay-gap test "recreates a hidden restored
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
-Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix), FAIL for T2 (reveal resize suppressed pre-fix because the hidden viewport_hydrate attach recorded identical dims), and FAIL for T4 (hide-then-reconnect race: stale hiddenRef leaks a `viewport_hydrate`). T3 and the reconnect-before-reveal test (~4635) must pass pre-fix — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; all failure modes must be assertion-level, not setup errors.
+Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix) and FAIL for T2 (reveal resize suppressed pre-fix: the hidden viewport_hydrate attach records dims the reveal-fit matches exactly in this fixture). T3 and the reconnect-before-reveal test (~4635) must pass pre-fix — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; all failure modes must be assertion-level, not setup errors.
 
 - [x] **Step 3: Add the minimal production implementation**
 
