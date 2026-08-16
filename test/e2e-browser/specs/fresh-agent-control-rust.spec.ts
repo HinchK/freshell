@@ -72,7 +72,11 @@ import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import {
+  RustServer,
+  GEMINI_STRIP_ENV_PREFIXES,
+  type TestServerInfo,
+} from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -551,12 +555,16 @@ async function bootClaudeLane(
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
       env: claudeLaneEnv(sharedRoot, flavour, extraEnv),
-      // AGENT-24 (task-008-review M-3): kilroy parity includes independence
-      // from Gemini-summary availability — made STRUCTURAL: any developer
-      // machine's GEMINI_* keys are scrubbed from the spawned server's env
-      // (option unit-pinned in helpers/rust-server.test.ts), so the lifecycle
-      // provably passes with no Gemini credentials available at all.
-      stripEnvPrefixes: flavour === 'kilroy' ? ['GEMINI_'] : undefined,
+      // AGENT-24 (task-008-review M-3, hardened in delta review round 4):
+      // kilroy parity includes independence from Gemini-summary availability
+      // — made STRUCTURAL: every env name that could give the spawned server
+      // Gemini access (GOOGLE_GENERATIVE_AI_API_KEY — what main.rs actually
+      // consumes, env winning over settings.ai.geminiApiKey — plus
+      // GEMINI_API_KEY, the FRESHELL_GEMINI_BASE_URL test seam, and any other
+      // GEMINI_* var a developer shell carries) is scrubbed from its env via
+      // the one shared list (unit-pinned in helpers/rust-server.test.ts), so
+      // the lifecycle provably passes with no Gemini credentials available.
+      stripEnvPrefixes: flavour === 'kilroy' ? [...GEMINI_STRIP_ENV_PREFIXES] : undefined,
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     await selectShellIfPickerShowing(page)

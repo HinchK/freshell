@@ -247,6 +247,25 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * AGENT-24 kilroy-lane Gemini-independence scrub list — the single source of
+ * truth shared by `fresh-agent-control-rust.spec.ts` and its unit pin in
+ * `rust-server.test.ts`. Every env name that could hand the spawned Rust
+ * server Gemini-summary availability must be here: `main.rs` consumes
+ * `GOOGLE_GENERATIVE_AI_API_KEY` (env wins over `settings.ai.geminiApiKey`)
+ * and the Rust-only `FRESHELL_GEMINI_BASE_URL` endpoint seam, while a
+ * developer shell commonly exports `GEMINI_API_KEY` or other `GEMINI_*` vars.
+ * Used as `stripEnvPrefixes` entries — exact names strip exact keys, the
+ * `GEMINI_` entry strips any prefixed key — so no dev-machine credential can
+ * leak through boot()'s `...process.env` spread NOR an `options.env` set.
+ */
+export const GEMINI_STRIP_ENV_PREFIXES: string[] = [
+  'GEMINI_',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'GEMINI_API_KEY',
+  'FRESHELL_GEMINI_BASE_URL',
+]
+
 export interface RustServerOptions {
   /** Reuse this isolated HOME instead of creating a fresh mkdtemp one. */
   homeDir?: string

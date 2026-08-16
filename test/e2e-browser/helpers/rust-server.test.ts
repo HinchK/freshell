@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import net from 'node:net'
 import http from 'node:http'
-import { RustServer } from './rust-server.js'
+import { RustServer, GEMINI_STRIP_ENV_PREFIXES } from './rust-server.js'
 import { findFreePort } from './test-server.js'
 
 describe('RustServer.start bind-race retry', () => {
@@ -118,16 +118,40 @@ describe('RustServer.start bind-race retry', () => {
 })
 
 describe('RustServer stripEnvPrefixes', () => {
-  // task-008-review M-3: the AGENT-24 kilroy lane must prove independence
-  // from Gemini-summary availability STRUCTURALLY — a developer machine's
-  // GEMINI_API_KEY must not leak through boot()'s `...process.env` spread
-  // (an options.env entry can only add/override keys, never delete inherited
-  // ones). Observed via the child's exec-time /proc/<pid>/environ (Linux).
-  // Genuinely RED without the option: the probe key lands in the child env.
-  it('deletes inherited env keys with the given prefixes from the spawned server', async () => {
+  // task-008-review M-3 + delta review round 4: the AGENT-24 kilroy lane must
+  // prove independence from Gemini-summary availability STRUCTURALLY. The
+  // Rust server consumes `GOOGLE_GENERATIVE_AI_API_KEY` (env wins over
+  // settings.ai.geminiApiKey, crates/freshell-server/src/main.rs) and the
+  // Rust-only `FRESHELL_GEMINI_BASE_URL` endpoint seam; a developer shell can
+  // additionally carry `GEMINI_API_KEY` or any other `GEMINI_*` var. NONE may
+  // leak into the spawned server — neither through boot()'s `...process.env`
+  // spread (inherited keys; an options.env entry can only add/override, never
+  // delete) nor through options.env (the scrub runs AFTER the merge).
+  // Observed via the child's exec-time /proc/<pid>/environ (Linux). Genuinely
+  // RED if GEMINI_STRIP_ENV_PREFIXES lacks any of these names: the probe keys
+  // land in the child env.
+  it('strips every Gemini credential name from the spawned server, inherited or option-set', async () => {
     expect(process.platform, 'relies on /proc/<pid>/environ').toBe('linux')
-    process.env.GEMINI_STRIP_PROBE = 'present'
-    const server = new RustServer({ stripEnvPrefixes: ['GEMINI_'] })
+    // Exact names + one prefix probe, set as INHERITED keys on this process.
+    const inheritedProbes = [
+      'GOOGLE_GENERATIVE_AI_API_KEY',
+      'GEMINI_API_KEY',
+      'GEMINI_FOO', // prefix-strip probe
+    ]
+    const savedEnv = new Map<string, string | undefined>()
+    for (const key of inheritedProbes) {
+      savedEnv.set(key, process.env[key])
+      process.env[key] = `strip-probe-inherited-${key}`
+    }
+    // The option-set path: the scrub runs AFTER options.env merges, so an
+    // options.env credential must be stripped too. Deliberately NOT inherited
+    // (any ambient value is saved and removed) so survival is attributable.
+    savedEnv.set('FRESHELL_GEMINI_BASE_URL', process.env.FRESHELL_GEMINI_BASE_URL)
+    delete process.env.FRESHELL_GEMINI_BASE_URL
+    const server = new RustServer({
+      stripEnvPrefixes: [...GEMINI_STRIP_ENV_PREFIXES],
+      env: { FRESHELL_GEMINI_BASE_URL: 'strip-probe-option-set' },
+    })
     try {
       const info = await server.start()
       const keys = fs
@@ -135,12 +159,22 @@ describe('RustServer stripEnvPrefixes', () => {
         .split('\0')
         .map((kv) => kv.split('=', 1)[0])
         .filter(Boolean)
+      for (const key of [
+        'GOOGLE_GENERATIVE_AI_API_KEY',
+        'GEMINI_API_KEY',
+        'FRESHELL_GEMINI_BASE_URL',
+      ]) {
+        expect(keys, `${key} must not survive into the spawned server env`).not.toContain(key)
+      }
       expect(
         keys.filter((k) => k.startsWith('GEMINI_')),
         'no GEMINI_* key may survive into the spawned server env',
       ).toEqual([])
     } finally {
-      delete process.env.GEMINI_STRIP_PROBE
+      for (const [key, prior] of savedEnv) {
+        if (prior === undefined) delete process.env[key]
+        else process.env[key] = prior
+      }
       await server.stop()
     }
   }, 600_000)
