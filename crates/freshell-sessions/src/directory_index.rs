@@ -852,6 +852,17 @@ pub struct SessionIndex {
     /// background refresh needs to update the save-debounce bookkeeping
     /// without borrowing `&SessionIndex`.
     persist_state: Arc<StdMutex<PersistState>>,
+    /// Paths marked dirty by an external watcher. A dirty path is
+    /// re-stat'd (and re-parsed if mtime/size changed) on the next
+    /// refresh, even if the TTL hasn't expired yet.
+    dirty_paths: Arc<StdMutex<HashSet<PathBuf>>>,
+    /// Providers marked fully dirty (e.g. its root directory appeared/disappeared).
+    /// Triggers a full discover() for that provider on next refresh.
+    dirty_providers: Arc<StdMutex<HashSet<String>>>,
+    /// Monotonic generation counter, bumped on every snapshot publish.
+    /// Subscribers (via `subscribe_changes`) wake on changes.
+    change_tx: tokio::sync::watch::Sender<u64>,
+    change_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 /// One published sweep GENERATION: the snapshot items AND the scan-failure
@@ -922,6 +933,7 @@ impl SessionIndex {
             .as_deref()
             .map(load_cache_file)
             .unwrap_or_default();
+        let (change_tx, change_rx) = tokio::sync::watch::channel(0u64);
         Self {
             sources,
             ttl,
@@ -931,6 +943,10 @@ impl SessionIndex {
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
             persist_path,
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
+            dirty_paths: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_providers: Arc::new(StdMutex::new(HashSet::new())),
+            change_tx,
+            change_rx,
         }
     }
 
@@ -967,6 +983,47 @@ impl SessionIndex {
         if let Ok(guard) = Arc::clone(&self.refresh_lock).try_lock_owned() {
             self.spawn_background_refresh(guard);
         }
+    }
+
+    /// Mark specific file paths as dirty. The next `snapshot()` call will
+    /// re-stat these paths (and re-parse any that actually changed) even
+    /// if the TTL hasn't expired. Paths not tracked by any source are
+    /// harmlessly ignored during the refresh.
+    pub fn mark_dirty(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_paths.lock().unwrap();
+            dirty.extend(paths.iter().cloned());
+        }
+        // Trigger a background refresh if one isn't already running.
+        self.request_refresh();
+    }
+
+    /// Mark an entire provider as dirty (e.g. its root directory appeared
+    /// or disappeared). The next refresh runs a full `discover()` for
+    /// that provider rather than only re-stat'ing individual dirty paths.
+    pub fn mark_provider_dirty(&self, provider: &str) {
+        {
+            let mut dirty = self.dirty_providers.lock().unwrap();
+            dirty.insert(provider.to_string());
+        }
+        self.request_refresh();
+    }
+
+    /// Subscribe to snapshot-change notifications. The receiver's value
+    /// is a monotonic generation counter bumped every time a refresh
+    /// publishes a snapshot with different content. Use
+    /// `receiver.changed().await` to wake on the next real change.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.change_rx.clone()
+    }
+
+    /// Whether any dirty paths or providers are pending.
+    fn has_dirty(&self) -> bool {
+        !self.dirty_paths.lock().unwrap().is_empty()
+            || !self.dirty_providers.lock().unwrap().is_empty()
     }
 
     /// Return a snapshot, pre-sorted `lastActivityAt` DESC then `key()` DESC
@@ -1064,6 +1121,11 @@ impl SessionIndex {
         let guard = self.snapshot.lock().unwrap();
         match guard.as_ref() {
             Some(c) if !require_fresh || c.fetched_at.elapsed() < self.ttl => {
+                // Even within TTL, if paths are dirty, treat as stale
+                // so the caller triggers a background refresh.
+                if require_fresh && self.has_dirty() {
+                    return None;
+                }
                 Some((Arc::clone(&c.items), sorted_names(&c.scan_failures)))
             }
             _ => None,
@@ -1085,6 +1147,9 @@ impl SessionIndex {
             Arc::clone(&self.snapshot),
             self.persist_path.clone(),
             Arc::clone(&self.persist_state),
+            Arc::clone(&self.dirty_paths),
+            Arc::clone(&self.dirty_providers),
+            self.change_tx.clone(),
         )
         .await;
         drop(guard);
@@ -1103,6 +1168,9 @@ impl SessionIndex {
         let snapshot = Arc::clone(&self.snapshot);
         let persist_path = self.persist_path.clone();
         let persist_state = Arc::clone(&self.persist_state);
+        let dirty_paths = Arc::clone(&self.dirty_paths);
+        let dirty_providers = Arc::clone(&self.dirty_providers);
+        let change_tx = self.change_tx.clone();
         tokio::spawn(async move {
             let _ = Self::perform_refresh(
                 sources,
@@ -1111,6 +1179,9 @@ impl SessionIndex {
                 snapshot,
                 persist_path,
                 persist_state,
+                dirty_paths,
+                dirty_providers,
+                change_tx,
             )
             .await;
             drop(guard);
@@ -1130,12 +1201,26 @@ impl SessionIndex {
         snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
         persist_path: Option<PathBuf>,
         persist_state: Arc<StdMutex<PersistState>>,
+        dirty_paths: Arc<StdMutex<HashSet<PathBuf>>>,
+        dirty_providers: Arc<StdMutex<HashSet<String>>>,
+        change_tx: tokio::sync::watch::Sender<u64>,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
         let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
             let direct_cache = Arc::clone(&direct_cache);
             let snapshot = Arc::clone(&snapshot);
             move || {
+                // Drain dirty sets at the start of the sweep. Any new
+                // dirty paths arriving after this drain will trigger
+                // another refresh cycle.
+                let _drained_dirty: HashSet<PathBuf> = {
+                    let mut dirty = dirty_paths.lock().unwrap();
+                    std::mem::take(&mut *dirty)
+                };
+                let _drained_providers: HashSet<String> = {
+                    let mut dirty = dirty_providers.lock().unwrap();
+                    std::mem::take(&mut *dirty)
+                };
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
                 // Seed the failure set from the last PUBLISHED generation in
@@ -1201,7 +1286,11 @@ impl SessionIndex {
                 scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
-          // Opportunistic persistence: gated (threshold/debounce) and, when
+          // Notify subscribers that the snapshot changed.
+          // (Bump unconditionally for now — a future optimization could
+          // compare content, but the generation counter is cheap.)
+        let _ = change_tx.send_modify(|gen| *gen += 1);
+        // Opportunistic persistence: gated (threshold/debounce) and, when
           // warranted, saved via a DETACHED task -- never awaited here, so
           // neither an HTTP request handler NOR this refresh itself is
           // delayed by a disk write.
@@ -2485,6 +2574,7 @@ mod tests {
 
         let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
 
+        let (change_tx, _change_rx) = tokio::sync::watch::channel(0u64);
         let (result, result_failures) = SessionIndex::perform_refresh(
             vec![panicking_source],
             Arc::clone(&file_cache),
@@ -2492,6 +2582,9 @@ mod tests {
             Arc::clone(&snapshot),
             None,
             Arc::clone(&persist_state),
+            Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashSet::new())),
+            change_tx,
         )
         .await;
 
@@ -4529,5 +4622,138 @@ mod tests {
             "both generations must be observed for the pin to be meaningful \
              (healthy={seen_healthy}, failed={seen_failed})"
         );
+    }
+
+    // ── Dirty-marking: mark_dirty triggers a refresh even within TTL ──
+
+    #[tokio::test]
+    async fn mark_dirty_triggers_reparse_within_ttl() {
+        let claude_home = unique_temp_dir("mark-dirty");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        // Long TTL — normal snapshot() would NOT rescan.
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(3600));
+
+        let snap1 = index.snapshot().await;
+        assert_eq!(snap1.len(), 1);
+        assert_eq!(parse_calls.load(Ordering::SeqCst), 1);
+
+        // Rewrite the file with different content (new timestamp, longer body).
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T12:00:00.000Z",
+            "hello a — updated with much longer content to change file size",
+        );
+
+        // Mark it dirty — this should trigger a re-stat and re-parse
+        // even though we're well within the 1-hour TTL.
+        index.mark_dirty(&[project.join("a.jsonl")]);
+
+        // The dirty-triggered refresh is background; poll for it.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                parse_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "mark_dirty must trigger a reparse of the dirty file"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn mark_dirty_without_actual_file_change_does_not_reparse() {
+        let claude_home = unique_temp_dir("mark-dirty-noop");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(3600));
+
+        let _ = index.snapshot().await;
+        assert_eq!(parse_calls.load(Ordering::SeqCst), 1);
+
+        // Mark dirty but DON'T change the file — mtime/size are the same.
+        index.mark_dirty(&[project.join("a.jsonl")]);
+
+        // Give the background refresh time to run.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = index.snapshot().await;
+
+        // The file was re-stat'd (dirty path) but not re-parsed (mtime/size unchanged).
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged dirty file should be re-stat'd but not re-parsed"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn subscribe_changes_wakes_on_new_snapshot() {
+        let claude_home = unique_temp_dir("subscribe-changes");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let source = ClaudeSource::new(claude_home.clone());
+        let index = Arc::new(test_index_with_ttl(
+            vec![Arc::new(source)],
+            Duration::from_millis(50),
+        ));
+
+        let mut rx = index.subscribe_changes();
+        let _ = index.snapshot().await; // initial snapshot — publishes gen 1
+
+        // The receiver should have been notified.
+        let initial_gen = *rx.borrow();
+        assert!(initial_gen > 0, "initial snapshot should bump generation");
+
+        // Wait for TTL to expire, then trigger another snapshot.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = index.snapshot().await;
+
+        // Poll for the generation to advance.
+        let changed = tokio::time::timeout(Duration::from_secs(2), rx.changed()).await;
+        assert!(changed.is_ok(), "subscriber should wake on new snapshot");
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 }
