@@ -35,6 +35,9 @@ real-transport = ["dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` event/property
 # model (JSON.parse parity, corruption-tolerant). preserve_order matches the object model.
 serde_json = { workspace = true }
+# `#[derive(Serialize)]` for the model-catalog capability wire shape
+# (`catalog.rs` — the exact `FreshAgentModelCapabilitySchema` camelCase keys).
+serde = { workspace = true }
 # Async runtime for the bounded health wait, the once-idle select loop, and the
 # broadcast fan-out. `time` = the per-probe timeout + retry sleep (DEV-0001);
 # `sync` = the per-session broadcast emitter + single-flight start mutex.
@@ -50,3 +53,10 @@ reqwest = { version = "0.13", default-features = false, features = ["stream"], o
 # FRESHELL_OPENCODE_SIDECAR_ID tag (killOwnedProcesses, serve-manager.ts:599-623). Only
 # needed by the real transport; libc is already in the workspace lock (transitive).
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# `test-util` unlocks `#[tokio::test(start_paused = true)]` so the catalog probe's
+# bounded-health/deadline tests (catalog.rs) run deterministically on a paused clock —
+# the same discipline tests/serve_health_bounded.rs relies on with real sleeps; unlike
+# that integration test these in-file tests advance the mock clock instantly.
+tokio = { version = "1", features = ["test-util"] }

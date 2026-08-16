@@ -160,6 +160,13 @@ pub struct SpawnRequest {
     pub ownership_id: String,
     /// The full child environment (base env + `FRESHELL_OPENCODE_SIDECAR_ID`).
     pub env: Vec<(String, String)>,
+    /// The catalog probe spawns `serve --pure` (`model-catalog.ts:173`); the
+    /// long-lived session sidecar must NOT (it defaults config off).
+    pub pure: bool,
+    /// The catalog probe's working directory (`model-catalog.ts:178`) so
+    /// project-level `opencode.json` provider config resolves; `None` for the
+    /// session sidecar (its cwd scoping rides the `?directory=` route param).
+    pub cwd: Option<String>,
 }
 
 /// A spawned serve sidecar handle. Readiness consults [`ServeProcess::exited`] and
@@ -431,6 +438,8 @@ impl OpencodeServeManager {
                 port: endpoint.port,
                 ownership_id,
                 env,
+                pure: false,
+                cwd: None,
             })
             .map_err(ServeError::Spawn)?;
 
