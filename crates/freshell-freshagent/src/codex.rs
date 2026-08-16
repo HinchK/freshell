@@ -64,13 +64,15 @@ use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
     normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
     CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
+use freshell_terminal::FrameSink;
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
@@ -158,6 +160,18 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// Per-parent-session fork single-flight (delta-review rounds 2+3, D2-F2): the
+    /// client leaves the Fork action enabled while a fork is in flight, so a rapid
+    /// duplicate click would otherwise mint TWO children for one parent — once the
+    /// first reply re-keys the pane and kills the parent, the second reply can no
+    /// longer correlate, leaving its child (a registered sidecar + durable thread
+    /// here) UNOWNED. [`Self::handle_fork`] acquires AFTER `ensure_session_alive`,
+    /// under the RESOLVED parent id — on the mint-new respawn route the materialized
+    /// broadcast re-keys the pane mid-flight, so the duplicate click arrives
+    /// addressed to the NEW id (that route holds the clicked id too, atomically —
+    /// round-3). The RAII guard releases on every terminal leg (success, refusal,
+    /// and the post-archive containment alike).
+    fork_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -293,6 +307,7 @@ impl FreshCodexState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            fork_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -1216,6 +1231,484 @@ impl FreshCodexState {
                 self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
             }
         }
+    }
+
+    // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
+
+    /// Handle a `freshAgent.compact` for codex: issue the app-server's REAL compact RPC
+    /// (`thread/compact/start`, 0.147.0) — NEVER a `/compact` user-turn fallback
+    /// (fresh-eyes round-2 F5). The schema's params are `{threadId}` ONLY, so the
+    /// client's `instructions` are DELIBERATELY DROPPED (upstream limitation).
+    /// Awaiting the `Record<string, never>` response is merely the acceptance edge: the
+    /// compact turn's busy→idle lifecycle and its status-gated `freshAgent.turn.complete`
+    /// chime ride THIS session's existing notification consumer
+    /// ([`reduce_notification`]), matching the PROBED 0.147.0 flow
+    /// (`thread/status/changed{active}` → `turn/started` → items/token-usage →
+    /// `thread/status/changed{idle}` → `turn/completed{turn.status:'completed'}`; NO
+    /// `thread/compacted` notification exists in the success flow, so no new
+    /// `CodexStatus` is needed). Concurrency gate: a BEST-EFFORT refusal while a turn
+    /// is tracked active (`active_turn` set) — a concurrent send or a rapid second
+    /// Compact click can slip past it, in which case the app-server's rejection is
+    /// the backstop (surfaced as `CODEX_COMPACT_FAILED`). Every failure path is LOUD
+    /// via the nested `freshAgent.error` banner envelope (a request-less top-level
+    /// `error` frame never reaches the frozen client's pane surface).
+    ///
+    /// Whole-branch-review M-2: [`Self::ensure_session_alive`] runs FIRST — the
+    /// [`Self::handle_send`] precedent, and legacy's `ensureRuntime(sessionId, settings)`
+    /// before compact (`adapter.ts:1030`) — so a crash-stale sidecar (kept mapped by the
+    /// self-heal design BY DESIGN) transparently respawns instead of the click dying
+    /// loudly against a dead connection; genuinely unrespawnable sessions keep their LOUD
+    /// `CODEX_RESPAWN_FAILED`/`SESSION_RESERVED` legs. Review M-1: an untracked session
+    /// answers the nested lost-session `INVALID_SESSION_ID` envelope (codex fork's own
+    /// unknown-parent shape, legacy `requireOrRecoverSession` →
+    /// `FreshAgentLostSessionError` parity) so the pane engages `markSessionLost`
+    /// recovery rather than showing a dead-end banner.
+    pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        let mut session_id = msg.session_id.clone();
+
+        match self.ensure_session_alive(&session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) => {}
+            // A resume-recovered session keeps its ORIGINAL id — nothing to re-key,
+            // same as the already-running case.
+            Ok(EnsureAliveOutcome::Recovered) => {}
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => {
+                // Recovery minted a NEW thread (the old rollout was genuinely gone; the
+                // client was told via the materialized broadcast) — compact the
+                // respawned session.
+                session_id = new_session_id;
+            }
+            Err(EnsureAliveError::NotFound) => {
+                // Review M-1: the lost-session shape (codex fork's own unknown-parent
+                // leg, legacy `requireOrRecoverSession` → `FreshAgentLostSessionError`
+                // parity) — `INVALID_SESSION_ID` engages the client's `markSessionLost`
+                // recovery. Broadcast: compact frames carry no requestId, so a top-level
+                // `error` frame would never reach any pane.
+                self.broadcast(&lost_session_frame(&session_id));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                self.emit_fresh_agent_error(&session_id, "CODEX_RESPAWN_FAILED", &err);
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                // Task 13 (D8) discipline, mirrored from handle_send: another
+                // create/attach holds this sessionRef — retryable, never lost.
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
+                return;
+            }
+        }
+
+        let looked_up = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(&session_id)
+                .map(|s| (s.client.clone(), s.active_turn.clone()))
+        };
+        let Some((client, active_turn)) = looked_up else {
+            // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
+            // lost-session leg, never silence.
+            self.broadcast(&lost_session_frame(&session_id));
+            return;
+        };
+
+        if active_turn.lock().expect("active_turn mutex").is_some() {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "CODEX_COMPACT_FAILED",
+                &format!(
+                    "Codex session {session_id} has an active turn; compact it after the turn completes."
+                ),
+            );
+            return;
+        }
+
+        if let Err(err) = client.compact_thread(&session_id).await {
+            self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
+        }
+    }
+
+    // ── freshAgent.fork (WS, AGENT-07) ───────────────────────────────────────
+
+    /// Handle a `freshAgent.fork` for codex: `thread/fork` on the PARENT's app-server,
+    /// then move the child onto its OWN sidecar via the VALIDATED (LB-01, real 0.147.0
+    /// probe) while-alive handoff — **archive on parent → spawn the child sidecar →
+    /// unarchive on child → resume on child**. A direct cross-process `thread/resume`
+    /// while the parent owns the child is rejected outright (`-32600 "thread … already
+    /// has an active writer"`; thread-writer locks under CODEX_HOME), and a post-`fork`
+    /// `result.thread.turns` keeps full history because 0.147.0 removed `excludeTurns`
+    /// from the schema (it is NEVER sent here).
+    ///
+    /// Deliberate divergence from legacy: Node pins the child to the PARENT's
+    /// app-server connection (`adapter.ts:1070` `rememberRuntimeThread`); this port
+    /// registers the child on its own sidecar, preserving the one-thread-per-sidecar
+    /// invariant (the pane kills the parent immediately after `forked`; a resumed child
+    /// on a killed parent's connection would die with it — here the child owns its
+    /// sidecar, and post-owner-exit resume was probed to work, SIGKILL stale locks
+    /// included).
+    ///
+    /// Deliberate override narrowing vs. legacy: `input` overrides ONLY `cwd`/`model`
+    /// — the legacy adapter also honored `input.sandbox`/`input.permissionMode`
+    /// (`adapter.ts:1062-1067`); those are NOT honored here (the client's fork frame
+    /// never sends them — it carries only `input.atTurnId`).
+    ///
+    /// Whole-branch-review M-2: [`Self::ensure_session_alive`] runs FIRST — legacy's
+    /// `ensureRuntime(sessionId, settings)` before fork (`adapter.ts:1056`), the
+    /// [`Self::handle_send`]/[`Self::handle_compact`] precedent — so a crash-stale parent
+    /// (kept mapped by the self-heal design BY DESIGN) transparently respawns and the
+    /// fork proceeds against the RESUMED thread, rather than failing the click loudly
+    /// against a dead connection. Loud legs remain for genuinely unrespawnable
+    /// (`RespawnFailed`) or leased (`Reserved`) parents. Adaptation for the
+    /// `Respawned` outcome: the old rollout was genuinely gone, so the fork proceeds
+    /// against the newly-minted thread id (the old id no longer names anything) — and every
+    /// post-resolution reply/error below keys to the RESOLVED id (`parent_id`, == the
+    /// clicked id on AlreadyRunning/Recovered): the mint-new respawn broadcasts
+    /// `freshAgent.session.materialized{OLD→NEW}` DURING ensure-alive, so the frozen client
+    /// has ALREADY re-keyed the pane's `sessionId` to the new id and deleted the old
+    /// session record before any fork frame can arrive (whole-branch fix review F-1). A
+    /// reply keyed to the clicked old id would be DROPPED by the pane's ANDed
+    /// requestId+parentSessionId fork correlation (`FreshAgentView.tsx`), and a nested
+    /// error keyed old would ENSURE-create a phantom deleted-id record whose `lastError`
+    /// no pane reads. Only the pre-resolution legs below (`NotFound`/`RespawnFailed`/
+    /// `Reserved`) address `msg.session_id` — no materialized broadcast has occurred there.
+    /// The lease-`BoundLive` Respawned corner (a contender bound the durable id to a
+    /// DIFFERENT live key before this call claimed it) follows the same resolved-id keying —
+    /// uniform with [`Self::handle_send`]/[`Self::handle_compact`]: replies address the live
+    /// session the fork actually ran against.
+    ///
+    /// Delta-review round 3: the resolved-id keying principle extends to the D2-F2
+    /// fork in-flight guard itself. The guard acquires AFTER ensure-alive, under the
+    /// RESOLVED parent id (plus the clicked id alongside it on the mint-new route) —
+    /// keyed only to the clicked id it never collides with the duplicate click the
+    /// re-keyed pane emits under the NEW id while this fork is parked mid-RPC, and
+    /// both forks would mint children whose replies race the pane's createRequestId
+    /// re-key + parent-kill (the loser leaves its child sidecar + durable thread
+    /// unowned).
+    ///
+    /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
+    /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
+    /// the REVIEWED post-archive containment (fresh-eyes F6) — replies a nested
+    /// `freshAgent.error`, so a Fork click never dies silently. After the child is
+    /// archived on the parent, ANY later failure additionally BEST-EFFORT
+    /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
+    /// the parent may be mid-kill), restoring the child's original visibility.
+    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        let parent_id = match self.ensure_session_alive(&msg.session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
+                // A resume-recovered parent keeps its ORIGINAL id.
+                msg.session_id.clone()
+            }
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => new_session_id,
+            Err(EnsureAliveError::NotFound) => {
+                // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
+                // answers the same lost-session shape on the requesting connection so the
+                // client's recovery path engages.
+                reply_sink(lost_session_frame(&msg.session_id));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                reply_sink(fork_error_frame(&msg.session_id, &err));
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                // Task 13 (D8) discipline: retryable, never lost — answered on the
+                // requesting sink like every other fork failure.
+                reply_sink(fork_error_frame_with_code(
+                    &msg.session_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
+
+        // D2-F2 single-flight, keyed to the RESOLVED parent id (delta-review round
+        // 3): a rapid duplicate Fork click for the same parent must never mint a
+        // second child — the first reply's re-key + parent-kill leaves the second
+        // reply uncorrelatable and its child/sidecar/thread unowned. Acquisition
+        // happens AFTER ensure-alive because the respawn the fork may trigger
+        // MINT-NEWS the parent's id: the materialized broadcast re-keys the pane
+        // mid-flight, so the duplicate click arrives addressed to the NEW id — a
+        // guard holding only the clicked id (the round-2 shape) never collides with
+        // it. The mint-new route additionally holds the CLICKED id for the fork's
+        // duration: `try_acquire_pair` is atomic under the registry lock, so neither
+        // key-space admits a racing Fork while this one is parked. The refusal
+        // answers on the requesting sink keyed to the RESOLVED id (the F-1
+        // post-resolution keying principle, identical to every failure leg below);
+        // the RAII guard releases on EVERY terminal path (success, refusal legs,
+        // and the post-archive containment alike), so a refreshed click can retry
+        // once this fork settles.
+        let _fork_guard = if parent_id == msg.session_id {
+            let Some(guard) = self.fork_in_flight.try_acquire(&parent_id) else {
+                reply_sink(fork_error_frame(
+                    &parent_id,
+                    &format!("fork already in progress for {parent_id}"),
+                ));
+                return;
+            };
+            guard
+        } else {
+            let Some(guard) = self
+                .fork_in_flight
+                .try_acquire_pair(&parent_id, &msg.session_id)
+            else {
+                reply_sink(fork_error_frame(
+                    &parent_id,
+                    &format!("fork already in progress for {parent_id}"),
+                ));
+                return;
+            };
+            guard
+        };
+
+        let looked_up = {
+            let guard = self.sessions.lock().await;
+            guard.get(&parent_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.cwd.clone(),
+                    s.sandbox.clone(),
+                    s.permission_mode.clone(),
+                )
+            })
+        };
+        let Some((
+            parent_client,
+            parent_model,
+            parent_effort,
+            parent_cwd,
+            parent_sandbox,
+            parent_permission_mode,
+        )) = looked_up
+        else {
+            // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
+            // lost-session leg, never silence. Keyed to the RESOLVED parent id (F-1):
+            // post-resolve, the client no longer tracks the clicked id on the mint-new
+            // route.
+            reply_sink(lost_session_frame(&parent_id));
+            return;
+        };
+
+        // Effective fork params: the parent's stored settings (model/effort/cwd/
+        // sandbox/permission_mode), with `input` overriding ONLY cwd/model (the legacy
+        // adapter spread, narrowed per the Task-6 plan). `lastTurnId` comes from
+        // `input.atTurnId` with the synthetic `:row-<digits>` split suffix stripped
+        // (the snapshot's split turn ids vs. codex's raw provider turn ids — round-3
+        // F6, `build_codex_turn_json`).
+        let input = msg.input.as_ref();
+        let input_str = |key: &str| {
+            input
+                .and_then(|v| v.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let eff_cwd = input_str("cwd").or(parent_cwd);
+        let eff_model = input_str("model").unwrap_or(parent_model);
+        let last_turn_id = input_str("atTurnId").map(|id| strip_codex_row_suffix(&id).to_string());
+
+        let fork_result = match parent_client
+            .fork_thread(ThreadForkParams {
+                // The RESOLVED parent id (post ensure-alive): identical to the clicked
+                // id for already-running/resume-recovered parents, the newly-minted
+                // thread id for the memory-lost respawn fallback.
+                thread_id: parent_id.clone(),
+                last_turn_id,
+                model: Some(eff_model.clone()),
+                cwd: eff_cwd.clone(),
+                approval_policy: parent_permission_mode.clone(),
+                sandbox: parent_sandbox.clone(),
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                // e.g. the PROBED empty-parent rejection (`-32600 "no rollout found
+                // for thread id"`). No state changes on this path. Keyed to the
+                // RESOLVED parent id (F-1).
+                reply_sink(fork_error_frame(&parent_id, &err.to_string()));
+                return;
+            }
+        };
+        let child_id = fork_result
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string);
+        let Some(child_id) = child_id else {
+            // A pathological 200 without a usable thread.id — never register or
+            // repoint the pane at a garbage child (the opencode malformed-id guard's
+            // sibling).
+            reply_sink(fork_error_frame(
+                &parent_id,
+                &format!(
+                    "codex thread/fork of session {} returned a malformed response: missing thread \"id\".",
+                    parent_id
+                ),
+            ));
+            return;
+        };
+
+        // Release the child's writer lock on the parent so the child sidecar can own
+        // it. An archive failure leaves the child attached to the PARENT connection
+        // (still usable there; no handoff was attempted), so nothing more happens.
+        if let Err(err) = parent_client.archive_thread(&child_id).await {
+            reply_sink(fork_error_frame(&parent_id, &err.to_string()));
+            return;
+        }
+
+        // ── post-archive (failure containment applies to every step below) ──
+        let child_parts = match self.spawn_sidecar(eff_cwd.as_deref()).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.fail_fork_after_archive(
+                    &parent_client,
+                    &child_id,
+                    &parent_id,
+                    &reply_sink,
+                    &err,
+                )
+                .await;
+                return;
+            }
+        };
+        let (child_client, child_notifs, child_ownership_id, mut child_proc) = child_parts;
+
+        if let Err(err) = child_client.unarchive_thread(&child_id).await {
+            shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &parent_id,
+                &reply_sink,
+                &err.to_string(),
+            )
+            .await;
+            return;
+        }
+
+        let resumed = child_client
+            .resume_thread(
+                &child_id,
+                StartThreadParams {
+                    cwd: eff_cwd.clone(),
+                    model: Some(eff_model.clone()),
+                    sandbox: parent_sandbox.clone(),
+                    approval_policy: parent_permission_mode.clone(),
+                },
+            )
+            .await;
+        let resumed = match resumed {
+            Ok(resumed) => resumed,
+            Err(err) => {
+                shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+                self.fail_fork_after_archive(
+                    &parent_client,
+                    &child_id,
+                    &parent_id,
+                    &reply_sink,
+                    &err.to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+        // TERM-25's wrong-thread guard, on the child's own connection.
+        if resumed.thread_id != child_id {
+            let message = format!(
+                "codex thread/resume returned wrong thread id {} (expected {child_id}); \
+                 refusing to adopt the wrong thread",
+                resumed.thread_id
+            );
+            shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &parent_id,
+                &reply_sink,
+                &message,
+            )
+            .await;
+            return;
+        }
+
+        // Register the child on its OWN sidecar (the shared registration tail, the
+        // ensure_session_resumable shape), inheriting the parent's settings.
+        self.register_live_session(
+            &child_id,
+            child_client,
+            child_notifs,
+            child_ownership_id,
+            child_proc,
+            eff_model.clone(),
+            parent_effort.clone(),
+            eff_cwd.clone(),
+            parent_sandbox.clone(),
+            parent_permission_mode.clone(),
+        )
+        .await;
+
+        // P1.13: the child's binding row, AWAITED before the forked reply
+        // (durable-before-answer). Fork is not a create: no create_request_id.
+        self.record_codex_binding(
+            &child_id,
+            None,
+            &eff_model,
+            parent_sandbox.as_deref(),
+            parent_permission_mode.as_deref(),
+            parent_effort.as_deref(),
+            eff_cwd.as_deref(),
+            None,
+        )
+        .await;
+
+        // DIAG-01: lifecycle metadata only.
+        tracing::info!(
+            provider = PROVIDER,
+            session_id = %child_id,
+            parent_session_id = %parent_id,
+            "freshagent.session.forked"
+        );
+
+        // Keyed to the RESOLVED parent id (F-1): the pane re-keyed to it on the
+        // mint-new materialized broadcast, so its ANDed requestId+parentSessionId
+        // correlation only matches THIS id.
+        reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
+            request_id: msg.request_id.clone(),
+            parent_session_id: parent_id.clone(),
+            session_id: child_id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            provider: PROVIDER.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: child_id,
+            }),
+        }));
+    }
+
+    /// REVIEWED post-archive failure containment (fresh-eyes F6): after the child was
+    /// archived on the parent, ANY later failure (child-sidecar spawn, child
+    /// unarchive/resume) (a) replies the nested `freshAgent.error` on the requesting
+    /// sink with the failing step's text AND (b) BEST-EFFORT `thread/unarchive`s the
+    /// child on the PARENT client, restoring the child's original visibility. The
+    /// unarchive's own error is IGNORED — the parent may be mid-kill — and the child
+    /// stays recoverable via post-owner-exit resume.
+    async fn fail_fork_after_archive(
+        &self,
+        parent_client: &CodexAppServerClient,
+        child_id: &str,
+        session_id: &str,
+        reply_sink: &FrameSink,
+        message: &str,
+    ) {
+        reply_sink(fork_error_frame(session_id, message));
+        let _ = parent_client.unarchive_thread(child_id).await;
     }
 
     // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
@@ -2459,42 +2952,24 @@ impl FreshCodexState {
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
 
-        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
-        let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
-        let (kill_tx, kill_rx) = oneshot::channel();
-        let watcher = spawn_exit_watcher(
-            child,
-            ownership_id,
-            thread_id.to_string(),
-            self.broadcast_tx.clone(),
-            kill_rx,
-            exited.clone(),
-            Arc::clone(&self.leases),
-        );
-        {
-            let mut guard = self.sessions.lock().await;
-            guard.insert(
-                thread_id.to_string(),
-                CodexSession {
-                    client: client.clone(),
-                    // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
-                    // only when no record was recoverable (never-recorded historical
-                    // sessions resume on defaults, exactly as before this fix).
-                    model: rec.model.clone().unwrap_or_default(),
-                    // (lease completion happens right after this insert -- see below)
-                    effort: rec.effort.clone(),
-                    cwd: cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
-                    sandbox: rec.sandbox.clone(),
-                    permission_mode: rec.permission_mode.clone(),
-                    active_turn: active_turn.clone(),
-                    consumer,
-                    kill_tx: Some(kill_tx),
-                    watcher,
-                    exited,
-                },
-            );
-        }
+        // Registration tail (shared with `handle_fork`). P1.13 (Task 5, R3): the ledger
+        // record's settings snapshot -- blank only when no record was recoverable
+        // (never-recorded historical sessions resume on defaults, exactly as before
+        // this fix). (Lease completion happens right after the insert -- see below.)
+        let active_turn = self
+            .register_live_session(
+                thread_id,
+                client.clone(),
+                notifs,
+                ownership_id,
+                child,
+                rec.model.clone().unwrap_or_default(),
+                rec.effort.clone(),
+                cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                rec.sandbox.clone(),
+                rec.permission_mode.clone(),
+            )
+            .await;
 
         // Task 13: bind the durable thread id to this live session + release the lease.
         if let Some(mut g) = lease_guard.take() {
@@ -2539,6 +3014,58 @@ impl FreshCodexState {
             client,
             active_turn,
         })
+    }
+
+    /// The shared "register a freshly-resumed/forked session on its new sidecar" tail of
+    /// [`Self::ensure_session_resumable`] and [`Self::handle_fork`]: notification
+    /// consumer + exit-watcher + insert, built from the caller-resolved settings
+    /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
+    /// AROUND this insert (watcher ownership of the child, lease completion in
+    /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn register_live_session(
+        &self,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        ownership_id: String,
+        child: tokio::process::Child,
+        model: String,
+        effort: Option<String>,
+        cwd: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+    ) -> Arc<StdMutex<Option<String>>> {
+        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let exited = Arc::new(AtomicBool::new(false));
+        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id,
+            thread_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+            Arc::clone(&self.leases),
+        );
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                client,
+                model,
+                effort,
+                cwd,
+                sandbox,
+                permission_mode,
+                active_turn: active_turn.clone(),
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+                exited,
+            },
+        );
+        active_turn
     }
 
     /// Fast-path lookup: is `thread_id` already tracked (created, or previously resumed by
@@ -3448,6 +3975,66 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
     })
+}
+
+/// The nested `freshAgent.event{freshAgent.error{code:'INTERNAL_ERROR'}}` envelope every
+/// codex fork failure rides on (approval-respond run, Task 6): delivered on the REQUESTING
+/// connection's sink (never silence for a user action — the Fork click's pane banner gets
+/// the message text), keyed to the PARENT session id the fork ran against — the RESOLVED
+/// post-ensure-alive id (whole-branch fix review F-1: on the mint-new respawn route the
+/// client has already re-keyed the pane off the clicked id).
+fn fork_error_frame(session_id: &str, message: &str) -> ServerMessage {
+    fork_error_frame_with_code(session_id, "INTERNAL_ERROR", message)
+}
+
+/// [`fork_error_frame`] carrying a non-default code (whole-branch review M-2: the
+/// ensure-alive `Reserved` leg is retryable and never lost — `SESSION_RESERVED` mirrors
+/// [`FreshCodexState::handle_send`]'s answer).
+fn fork_error_frame_with_code(session_id: &str, code: &str, message: &str) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": code,
+            "message": message,
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: SESSION_TYPE.to_string(),
+    })
+}
+
+/// Tear down a fork-child sidecar whose registration never completed (close the client,
+/// kill the child, sweep by ownership id) — the same teardown `ensure_session_resumable`
+/// runs on its resume failure paths.
+async fn shut_down_fork_child(
+    client: &CodexAppServerClient,
+    child: &mut tokio::process::Child,
+    ownership_id: &str,
+) {
+    client.close().await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    reap_owned_codex_sidecars(ownership_id);
+}
+
+/// Codex fork's `lastTurnId` normalization (fresh-eyes round-3 F6): the REST snapshot
+/// renders synthetic SPLIT turn ids of the form `{raw_turn_id}:row-{index}`
+/// (`build_codex_turn_json`), but `thread/fork` expects the RAW provider turn id —
+/// strip exactly ONE trailing `:row-<digits>` suffix; a non-split id passes VERBATIM.
+fn strip_codex_row_suffix(turn_id: &str) -> &str {
+    let Some(idx) = turn_id.rfind(':') else {
+        return turn_id;
+    };
+    let (head, tail) = turn_id.split_at(idx);
+    let Some(digits) = tail[1..].strip_prefix("row-") else {
+        return turn_id;
+    };
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        head
+    } else {
+        turn_id
+    }
 }
 
 // ── PATCH /api/settings (fresh-clients enable toggle) ────────────────────────
@@ -4423,6 +5010,1175 @@ pub(crate) mod tests {
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
+    }
+
+    // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
+
+    fn compact_msg(session_id: &str) -> FreshAgentCompact {
+        FreshAgentCompact {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            instructions: None,
+        }
+    }
+
+    /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
+    /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
+    /// the channel plus a fresh bus receiver.
+    async fn insert_idle_compact_session(
+        st: &FreshCodexState,
+        thread_id: &str,
+    ) -> (
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let rx = insert_fake_session_with_real_consumer(
+            st,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            &format!("codex-sidecar-test-compact-{thread_id}"),
+        )
+        .await;
+        (peer, rx)
+    }
+
+    /// Complete the initialize handshake a first RPC triggers (client.ts:777-778).
+    async fn answer_initialize(peer: &freshell_codex::ChannelPeer) {
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await; // initialized
+    }
+
+    /// Drive the PROBED real-0.147.0 post-compact notification sequence (plan Task 4,
+    /// fresh-eyes round-3 F4 closure): `thread/status/changed{active}` → `turn/started`
+    /// → `item/started` → `thread/tokenUsage/updated` → `item/completed` →
+    /// `thread/status/changed{idle}` → `turn/completed{turn.status}`. NO
+    /// `thread/compacted` notification exists in the success flow.
+    fn emit_compact_notification_sequence(
+        peer: &freshell_codex::ChannelPeer,
+        thread_id: &str,
+        turn_status: &str,
+    ) {
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": thread_id, "status": { "type": "active" } }),
+        );
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1" } }),
+        );
+        peer.emit_notification(
+            "item/started",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/tokenUsage/updated",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "tokenUsage": {} }),
+        );
+        peer.emit_notification(
+            "item/completed",
+            json!({ "threadId": thread_id, "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": thread_id, "status": { "type": "idle" } }),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_issues_thread_compact_start_and_the_probed_notification_flow_completes()
+    {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-c1").await;
+
+        // The pane's Compact click: instructions ARE on the wire frame, but codex
+        // 0.147.0's `thread/compact/start` schema has NO instructions field -- they are
+        // deliberately DROPPED (never sent as `/compact` turn text either).
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut msg = compact_msg("thread-c1");
+                msg.instructions = Some("focus the diff".to_string());
+                st.handle_compact(msg).await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        let obj = params.as_object().expect("params object");
+        assert_eq!(
+            obj.len(),
+            1,
+            "thread/compact/start params are `{{threadId}}` ONLY: {params}"
+        );
+        assert_eq!(params["threadId"], json!("thread-c1"));
+        assert!(
+            params.get("instructions").is_none(),
+            "instructions NEVER cross the wire for codex compact: {params}"
+        );
+        peer.respond(&id, json!({}));
+        driver.await.expect("compact task");
+
+        // NO turn/start anywhere in this drive: compact never degenerates to turn text.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.expect_request())
+                .await
+                .is_err(),
+            "compact must issue NO further RPC (in particular, no `turn/start`)"
+        );
+
+        // The fake app-server then drives the probed notification sequence, and the
+        // session must go BUSY then IDLE with ONE server-authoritative chime (existing
+        // consumer machinery absorbs the compact flow; no thread/compacted is needed).
+        emit_compact_notification_sequence(&peer, "thread-c1", "completed");
+
+        let mut snapshots: Vec<String> = Vec::new();
+        let mut completes = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no turn.complete within the budget (snapshots seen: {snapshots:?})"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" || frame["sessionId"] != "thread-c1" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    snapshots.push(frame["event"]["status"].as_str().unwrap_or("?").to_string());
+                }
+                Some("freshAgent.turn.complete") => {
+                    completes += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            completes, 1,
+            "exactly one completion chime, got {completes}"
+        );
+        assert!(
+            snapshots.iter().any(|s| s == "running"),
+            "compact must mark the session BUSY first, got {snapshots:?}"
+        );
+        assert!(
+            snapshots.iter().any(|s| s == "idle"),
+            "compact must return the session to idle, got {snapshots:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_failed_or_interrupted_turn_produces_no_completion_chime() {
+        for status in ["failed", "interrupted"] {
+            let (st, _rx_boot) = state_with_bus();
+            let (peer, mut rx) = insert_idle_compact_session(&st, "thread-cx").await;
+
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.handle_compact(compact_msg("thread-cx")).await;
+                })
+            };
+            answer_initialize(&peer).await;
+            let (id, method, _params) = peer.expect_request().await;
+            assert_eq!(method, "thread/compact/start");
+            peer.respond(&id, json!({}));
+            driver.await.expect("compact task");
+
+            // Same probed sequence, but the compact turn ends WITHOUT status:completed.
+            emit_compact_notification_sequence(&peer, "thread-cx", status);
+
+            let mut saw_idle = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                    break;
+                };
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                if frame["sessionId"] != "thread-cx" {
+                    continue;
+                }
+                match frame["event"]["type"].as_str() {
+                    Some("freshAgent.session.snapshot") if frame["event"]["status"] == "idle" => {
+                        saw_idle = true;
+                    }
+                    Some("freshAgent.turn.complete") => {
+                        panic!("a `{status}` compact turn must never chime")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                saw_idle,
+                "the idle snapshot still flows for a `{status}` compact turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_compact_refuses_while_a_turn_is_active_without_issuing_any_rpc() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thread-busy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-9".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-compact-busy",
+        )
+        .await;
+
+        st.handle_compact(compact_msg("thread-busy")).await;
+
+        // The refusal is LOUD and pane-visible: the nested freshAgent.error
+        // banner envelope, never a request-less top-level `error` frame.
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "thread-busy");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+        assert!(
+            frame["event"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("active turn"),
+            "{frame}"
+        );
+
+        // The gate fires BEFORE any RPC -- nothing (not even the initialize gating)
+        // ever reaches the app-server: no app-server EINVAL is let through.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a busy session must produce NO compact RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_rpc_error_surfaces_the_error_path_and_no_fake_completion() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-ce").await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-ce")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond_error(&id, -32600, "compact rejected");
+        driver.await.expect("compact task");
+
+        // The app-server's rejection surfaces LOUD via the nested banner envelope.
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "thread-ce");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+        assert!(
+            frame["event"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("compact rejected"),
+            "the app-server's rejection text crosses the wire: {frame}"
+        );
+
+        // No compact flow was accepted server-side, so NOTHING else may be broadcast
+        // (in particular no fabricated idle snapshot or turn.complete).
+        assert!(
+            rx.try_recv().is_err(),
+            "an RPC failure must not fabricate a completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_unknown_session_surfaces_a_loud_nested_error() {
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_compact(compact_msg("does-not-exist")).await;
+
+        // Whole-branch-review M-1: the unknown-session leg is the lost-session shape —
+        // the SAME `INVALID_SESSION_ID` envelope codex fork answers for an unknown
+        // parent (`lost_session_frame`) — so the pane engages its `markSessionLost`
+        // recovery instead of showing a dead-end banner (legacy
+        // `requireOrRecoverSession` → `FreshAgentLostSessionError` parity). Session-keyed
+        // so the client's banner path routes it to the pane that clicked Compact; a
+        // request-less top-level `error` frame is invisible.
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionType"], "freshcodex");
+        assert_eq!(frame["sessionId"], "does-not-exist");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+        assert!(
+            frame["event"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("codex session does-not-exist not found"),
+            "{frame}"
+        );
+    }
+
+    // ── freshAgent.fork (AGENT-07, approval-respond Task 6) ────────────────
+
+    fn fork_msg(session_id: &str, request_id: &str, input: Option<Value>) -> FreshAgentFork {
+        FreshAgentFork {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            input,
+            request_id: Some(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    /// A `FrameSink` that records every delivered frame — the requesting connection's
+    /// sink the fork handler answers on (`conn_sink` in terminal.rs).
+    fn capturing_sink() -> (
+        freshell_terminal::FrameSink,
+        Arc<StdMutex<Vec<ServerMessage>>>,
+    ) {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let sink: freshell_terminal::FrameSink = {
+            let captured = captured.clone();
+            Arc::new(move |msg| captured.lock().expect("captured mutex").push(msg))
+        };
+        (sink, captured)
+    }
+
+    fn captured_frames(captured: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<Value> {
+        captured
+            .lock()
+            .expect("captured mutex")
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("frame serializes"))
+            .collect()
+    }
+
+    fn assert_single_fork_error_frame(
+        frames: &[Value],
+        session_id: &str,
+        code: &str,
+        message_fragment: &str,
+    ) {
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let frame = &frames[0];
+        assert_eq!(frame["type"], "freshAgent.event", "{frame}");
+        assert_eq!(frame["provider"], "codex", "{frame}");
+        assert_eq!(frame["sessionType"], "freshcodex", "{frame}");
+        assert_eq!(frame["sessionId"], session_id, "{frame}");
+        assert_eq!(frame["event"]["type"], "freshAgent.error", "{frame}");
+        assert_eq!(frame["event"]["code"], code, "{frame}");
+        assert!(
+            frame["event"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message_fragment),
+            "sink error must carry the failing step's text ({message_fragment}): {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_unknown_parent_replies_the_lost_session_shape_on_the_sink() {
+        let (st, _rx_boot) = state_with_bus();
+        let (sink, captured) = capturing_sink();
+
+        st.handle_fork(fork_msg("does-not-exist", "fork-req-x", None), sink)
+            .await;
+
+        // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
+        // answers the same lost-session code ON THE REQUESTING CONNECTION so the
+        // client's recovery path engages (never silence, never the refusal table).
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "does-not-exist",
+            "INVALID_SESSION_ID",
+            "codex session does-not-exist not found",
+        );
+        assert!(
+            st.sessions.lock().await.is_empty(),
+            "no fork machinery ran for an unknown parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_rpc_error_replies_on_the_sink_without_archiving_or_spawning() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-fork-err",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-err",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-err", "fork-req-e", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["threadId"], json!("parent-fork-err"));
+        // The PROBED empty-parent rejection (0.147.0 real binary).
+        peer.respond_error(&id, -32600, "no rollout found for thread id");
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-fork-err",
+            "INTERNAL_ERROR",
+            "no rollout found for thread id",
+        );
+
+        // A failed fork changes NO state: no archive RPC follows, no child registers.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a failed thread/fork must produce NO archive call"
+        );
+        assert!(
+            st.sessions.lock().await.len() == 1,
+            "only the parent remains registered"
+        );
+    }
+
+    /// D2-F2 (delta-review round 2): the client leaves the Fork action enabled while a
+    /// fork is in flight (and reuses the pane's `createRequestId`), so rapid duplicate
+    /// clicks would otherwise mint TWO children for one parent — once the first reply
+    /// re-keys the pane and kills the parent, the second reply can no longer correlate,
+    /// leaving its child (and, for codex, a registered sidecar + durable thread)
+    /// UNOWNED. The duplicate must be refused ON THE REQUESTING SINK with the nested
+    /// `freshAgent.error{INTERNAL_ERROR}` shape and take NO other action (no
+    /// thread/fork RPC, no state change); the guard releases on EVERY terminal leg
+    /// (failure included), so a refreshed click can retry.
+    #[tokio::test]
+    async fn handle_fork_duplicate_in_flight_is_refused_and_releases_on_failure() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-fork-dup",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-dup",
+        )
+        .await;
+
+        // Fork #1 parks mid-RPC — the duplicate click's deterministic in-flight window.
+        let (sink1, captured1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d1", None), sink1)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id1, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+
+        // Fork #2 — the duplicate — is refused INLINE (never waits upstream) and
+        // takes NO other action.
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d2", None), sink2),
+        )
+        .await
+        .expect("the duplicate fork is refused inline, never upstream-blocking");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured2),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "already in progress",
+        );
+
+        // Fail fork #1: its reply rides the fork-RPC failure leg and the guard must
+        // release even on a failure terminal path.
+        peer.respond_error(&id1, -32000, "fork kaput");
+        driver1.await.expect("fork #1 task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured1),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "fork kaput",
+        );
+
+        // A refreshed click reaches the wire again (no stranded guard) — fail it too
+        // so the test leaves no parked task.
+        let (sink3, captured3) = capturing_sink();
+        let driver3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d3", None), sink3)
+                    .await;
+            })
+        };
+        let (id3, method, _params) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/fork",
+            "the retried fork reached the wire — the guard released on failure"
+        );
+        peer.respond_error(&id3, -32000, "kaput too");
+        driver3.await.expect("fork #3 task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured3),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "kaput too",
+        );
+
+        // Exactly two thread/fork RPCs total crossed the wire (#1 and #3 — the
+        // refused duplicate produced none) and no child ever registered.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no further RPCs (the duplicate never touched the wire)"
+        );
+        assert!(
+            st.sessions.lock().await.len() == 1,
+            "no child registered across the refused/failed forks"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_archive_failure_replies_on_the_sink_and_never_spawns() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-arch-err",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-arch-err",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-arch-err", "fork-req-a", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-arch-err" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-arch-err"));
+        peer.respond_error(&id, -32000, "archive denied");
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-arch-err",
+            "INTERNAL_ERROR",
+            "archive denied",
+        );
+
+        // The child stays attached to the PARENT connection (an archive failure is
+        // pre-handoff, so there is nothing to restore): nothing further crosses the
+        // wire and no child registers.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a failed thread/archive must produce NO unarchive/spawn"
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_malformed_fork_result_replies_and_never_archives() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-malformed",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-malformed",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-malformed", "fork-req-m", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        // A pathological 200 without a usable thread.id must NEVER be registered or
+        // repointed at (same guard class as the opencode malformed-child-id pin).
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-malformed",
+            "INTERNAL_ERROR",
+            "malformed",
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a malformed fork result must produce NO archive call"
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_builds_params_from_parent_settings_input_overrides_and_strips_row_suffix()
+    {
+        // Case A+B share a parent with EVERY setting stored; case C is bare defaults.
+        for (case, overrides, expected) in [
+            (
+                "A",
+                Some(
+                    json!({ "cwd": "/override/cwd", "model": "override-model", "atTurnId": "turn-42:row-2" }),
+                ),
+                ("/override/cwd", "override-model", Some("turn-42")),
+            ),
+            (
+                "B",
+                Some(json!({ "atTurnId": "turn-9:row-0" })),
+                ("/stored/cwd", "stored-model", Some("turn-9")),
+            ),
+        ] {
+            let (st, _rx_boot) = state_with_bus();
+            let (transport, peer) = freshell_codex::new_channel_transport();
+            let (client, _notifs) = CodexAppServerClient::connect(transport);
+            insert_fake_session(
+                &st,
+                "parent-params",
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                spawn_sleeper(),
+                "codex-sidecar-test-fork-params",
+            )
+            .await;
+            {
+                let mut guard = st.sessions.lock().await;
+                let s = guard.get_mut("parent-params").expect("parent session");
+                s.model = "stored-model".to_string();
+                s.cwd = Some("/stored/cwd".to_string());
+                s.sandbox = Some("workspace-write".to_string());
+                s.permission_mode = Some("on-request".to_string());
+                s.effort = Some("high".to_string());
+            }
+
+            let (sink, captured) = capturing_sink();
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.handle_fork(fork_msg("parent-params", "fork-req-p", overrides), sink)
+                        .await;
+                })
+            };
+
+            answer_initialize(&peer).await;
+            let (id, method, params) = peer.expect_request().await;
+            assert_eq!(method, "thread/fork", "case {case}");
+            let (exp_cwd, exp_model, exp_last_turn) = expected;
+            assert_eq!(params["threadId"], json!("parent-params"), "case {case}");
+            assert_eq!(params["cwd"], json!(exp_cwd), "case {case} cwd");
+            assert_eq!(params["model"], json!(exp_model), "case {case} model");
+            assert_eq!(
+                params["sandbox"],
+                json!("workspace-write"),
+                "case {case}: parent sandbox flows verbatim"
+            );
+            assert_eq!(
+                params["approvalPolicy"],
+                json!("on-request"),
+                "case {case}: parent permissionMode flows verbatim"
+            );
+            match exp_last_turn {
+                Some(raw) => assert_eq!(
+                    params["lastTurnId"],
+                    json!(raw),
+                    "case {case}: atTurnId normalizes to the raw provider turn id"
+                ),
+                None => assert!(
+                    params.get("lastTurnId").is_none(),
+                    "case {case}: no atTurnId → no lastTurnId"
+                ),
+            }
+            assert!(
+                params.get("excludeTurns").is_none(),
+                "case {case}: excludeTurns is removed from 0.147.0, never sent"
+            );
+            let obj = params.as_object().expect("params object");
+            assert_eq!(obj.len(), 6, "case {case} exact key set: {params}");
+            // Stop the flow AFTER the params probe: a fork RPC error ends it cleanly.
+            peer.respond_error(&id, -32000, "stop after param probe");
+            driver.await.expect("fork task");
+            assert_single_fork_error_frame(
+                &captured_frames(&captured),
+                "parent-params",
+                "INTERNAL_ERROR",
+                "stop after param probe",
+            );
+        }
+
+        // Case C: bare stored defaults + no input → only {threadId, model} cross the wire.
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-bare",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-bare",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-bare", "fork-req-c", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        let obj = params.as_object().expect("params object");
+        assert_eq!(
+            obj.len(),
+            2,
+            "defaults + no input → {{threadId, model}} ONLY: {params}"
+        );
+        assert_eq!(params["threadId"], json!("parent-bare"));
+        assert_eq!(params["model"], json!("gpt-5.3-codex-spark"));
+        peer.respond_error(&id, -32000, "stop after param probe");
+        driver.await.expect("fork task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-bare",
+            "INTERNAL_ERROR",
+            "stop after param probe",
+        );
+    }
+
+    #[test]
+    fn codex_fork_last_turn_id_strips_exactly_one_trailing_row_suffix() {
+        // The snapshot surface renders synthetic split turn ids `{raw}:row-{index}`
+        // (`build_codex_turn_json`, round-3 F6); codex expects the RAW provider turn id.
+        assert_eq!(strip_codex_row_suffix("turn-1:row-2"), "turn-1");
+        assert_eq!(strip_codex_row_suffix("turn-9:row-0"), "turn-9");
+        // A non-split id passes VERBATIM — including lookalikes.
+        assert_eq!(strip_codex_row_suffix("turn-9"), "turn-9");
+        assert_eq!(strip_codex_row_suffix("turn-1:row-"), "turn-1:row-");
+        assert_eq!(strip_codex_row_suffix("turn-1:row-x"), "turn-1:row-x");
+        assert_eq!(strip_codex_row_suffix("raw:row-12"), "raw");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_child_spawn_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(
+            "CODEX_CMD",
+            "definitely-missing-codex-binary-freshell-fork-test",
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-spawn-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-spawn-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-spawn-fail", "fork-req-s", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-spawn-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-spawn-fail"));
+        peer.respond(&id, json!({}));
+
+        // Post-archive containment (fresh-eyes F6): the spawn failure replies on the
+        // sink AND best-effort unarchives the child on the PARENT client, restoring the
+        // child's original visibility (post-owner-exit resume stays possible).
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-spawn-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-spawn-fail",
+            "INTERNAL_ERROR",
+            "spawn failed",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_unarchive_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/unarchive": { "error": { "code": -32000, "message": "unarchive kaput" } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-ua-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-ua-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-ua-fail", "fork-req-u", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-ua-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-ua-fail"));
+        peer.respond(&id, json!({}));
+
+        // The child sidecar (a REAL scripted fake) spawns and its thread/unarchive
+        // fails — containment: sink error with the step text + the parent's
+        // best-effort unarchive of the child.
+        let (id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), peer.expect_request())
+                .await
+                .expect("the best-effort parent unarchive arrives");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-ua-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-ua-fail",
+            "INTERNAL_ERROR",
+            "unarchive kaput",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_resume_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": { "error": { "code": -32600, "message": "resume kaput" } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-resume-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-resume-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-resume-fail", "fork-req-r", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-resume-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-resume-fail"));
+        peer.respond(&id, json!({}));
+
+        // Child sidecar spawns, unarchive succeeds, thread/resume fails → containment.
+        let (id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), peer.expect_request())
+                .await
+                .expect("the best-effort parent unarchive arrives");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-resume-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-resume-fail",
+            "INTERNAL_ERROR",
+            "resume kaput",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_threads_fork_archive_then_child_unarchive_resume_across_two_sidecars_and_replies_forked(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-thread-1" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session(&st, &mut rx).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-1", None), sink)
+            .await;
+
+        // The exact `freshAgent.forked` reply — every field, request_id echoed (the
+        // client matches on requestId + parentSessionId to repoint the pane).
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let forked = &frames[0];
+        assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+        assert_eq!(forked["requestId"], json!("fork-req-1"), "{forked}");
+        assert_eq!(forked["parentSessionId"], json!(parent_id), "{forked}");
+        assert_eq!(forked["sessionId"], json!("child-thread-1"), "{forked}");
+        assert_eq!(forked["sessionType"], json!("freshcodex"), "{forked}");
+        assert_eq!(forked["provider"], json!("codex"), "{forked}");
+        assert_eq!(forked["runtimeProvider"], json!("codex"), "{forked}");
+        assert_eq!(
+            forked["sessionRef"],
+            json!({ "provider": "codex", "sessionId": "child-thread-1" }),
+            "{forked}"
+        );
+
+        // The child is registered on its OWN sidecar (one-thread-per-sidecar
+        // invariant), inheriting the parent's stored settings verbatim.
+        let (child_settings, parent_settings) = {
+            let guard = st.sessions.lock().await;
+            let child = guard
+                .get("child-thread-1")
+                .expect("the child session is registered");
+            let parent = guard.get(&parent_id).expect("the parent session stays");
+            (
+                (
+                    child.model.clone(),
+                    child.effort.clone(),
+                    child.cwd.clone(),
+                    child.sandbox.clone(),
+                    child.permission_mode.clone(),
+                ),
+                (
+                    parent.model.clone(),
+                    parent.effort.clone(),
+                    parent.cwd.clone(),
+                    parent.sandbox.clone(),
+                    parent.permission_mode.clone(),
+                ),
+            )
+        };
+        assert_eq!(
+            child_settings, parent_settings,
+            "the child inherits the parent's stored settings verbatim"
+        );
+
+        // P1.13: a binding row durable-before-answer for the child.
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let row = bindings
+                .iter()
+                .find(|b| b.session_id == "child-thread-1")
+                .expect("a binding row for the child");
+            assert_eq!(row.provider, "codex");
+            assert_eq!(row.mode, "freshcodex");
+            assert_eq!(row.create_request_id, None, "fork is not a create");
+        }
+
+        // RPC call order, per connection (the op log tags every thread/* call with
+        // its process's listenUrl): parent = thread/start → thread/fork →
+        // thread/archive; child (spawn #2) = thread/unarchive → thread/resume.
+        //
+        // Read with a bounded poll: the fake appends each op line AFTER sending the
+        // RPC result (adjacent statements in the same event-loop tick), so under
+        // parallel-suite load the fake child process can be descheduled between the
+        // two while the resumed `handle_fork` races ahead to this read (observed once
+        // as a missing trailing `thread/resume` line in a 480-test parallel run — a
+        // test-read race, never a handler-ordering defect). Poll until both
+        // connection sequences settle to the exact expected value, then run the
+        // original assertions for their diagnostic output.
+        let read_sequences = || -> Option<(String, Vec<Vec<String>>)> {
+            let log_text = std::fs::read_to_string(&log_path).expect("the op log exists");
+            let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+            for line in log_text.lines() {
+                let entry: Value = serde_json::from_str(line).expect("op log line parses");
+                by_url
+                    .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                    .or_default()
+                    .push(entry["method"].as_str().expect("method").to_string());
+            }
+            if by_url.len() != 2 {
+                return None;
+            }
+            let mut sequences: Vec<Vec<String>> = by_url.into_values().collect();
+            sequences.sort();
+            Some((log_text, sequences))
+        };
+        let settled = |s: &[Vec<String>]| {
+            s.len() == 2
+                && s[0] == ["thread/start", "thread/fork", "thread/archive"]
+                && s[1] == ["thread/unarchive", "thread/resume"]
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (log_text, sequences) = loop {
+            if let Some((text, sequences)) = read_sequences() {
+                if settled(&sequences) {
+                    break (text, sequences);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the op log never settled to exactly two sidecar connections (parent \
+                 + one child spawn) with the expected RPC order: {}",
+                read_sequences()
+                    .map(|(text, _)| text)
+                    .unwrap_or_else(|| "<unreadable>".to_string())
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            sequences[0],
+            vec!["thread/start", "thread/fork", "thread/archive"],
+            "the parent connection's RPC order: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar's RPC order (the archive→unarchive→resume handoff): {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
     }
 
     #[tokio::test]
@@ -6683,6 +8439,798 @@ pub(crate) mod tests {
                 || outcome["event"]["type"] == "freshAgent.session.snapshot",
             "unexpected first frame: {outcome}"
         );
+    }
+
+    /// Read the fake app-server's cross-process op log once `want_rows` newline rows have
+    /// landed (bounded poll). WHY THE POLL: the fixture SENDS each RPC result BEFORE
+    /// appending the op row (same event-loop tick, `fake-app-server.mjs:697-701`), so a
+    /// handler that resolves on the result can return with the last row not yet on disk
+    /// (`handle_compact`'s final await IS the `thread/compact/start` result — zero
+    /// slack); a read-once is a measured flake here (reproduced 4/13 runs pre-poll).
+    async fn read_op_log_when_complete(log_path: &std::path::Path, want_rows: usize) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(log_path) {
+                Ok(text) if text.lines().count() >= want_rows => return text,
+                other => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "op log never reached {want_rows} rows within the budget: {other:?}"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar died
+    /// unrequested; the self-heal design keeps the session MAPPED) must transparently
+    /// respawn the sidecar FIRST — the `handle_send` ensure-alive precedent, and legacy's
+    /// `ensureRuntime(sessionId, settings)` before compact (`adapter.ts:1030`) — then issue
+    /// the compact RPC on the RESPAWNED sidecar. Dying loudly against the dead connection
+    /// is reserved for genuinely unrespawnable sessions, not garden-variety crash-stale
+    /// panes. Spawn-counting + the cross-process op log pin the recovery leg.
+    #[tokio::test]
+    async fn compact_after_unrequested_crash_respawns_the_sidecar_then_compacts() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-compact-respawn-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("compact-respawn-marker-unused");
+
+        // Spawn 1 crashes right after `thread/start` — a real unrequested-exit crash.
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Compact click"
+        );
+
+        // The respawned sidecar serves thread/resume (echo) + thread/compact/start.
+        configure_fake_codex_cmd(
+            &json!({ "appendThreadOperationLogPath": log_path.to_string_lossy() }).to_string(),
+        );
+
+        st.handle_compact(compact_msg(&thread_id)).await;
+
+        // The recovery was transparent: no user-facing error frame names this session.
+        // (Checked FIRST — if a compact leg ever fails, the panic names the failing
+        // branch instead of leaving a bare op-log diff.)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a self-healed compact must never surface an error frame: {frame}"
+            );
+        }
+
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "Compact on a crash-stale session must respawn the sidecar exactly once \
+             (ensure-alive first), never fail loudly against the dead connection: {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over the TWO sidecars: the crashed spawn served only
+        // thread/start; the respawned connection served thread/resume (the recovery)
+        // THEN thread/compact/start (the actual Compact click).
+        let log_text = read_op_log_when_complete(&log_path, 3).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+        }
+        assert_eq!(
+            by_url.len(),
+            2,
+            "exactly two sidecar connections (crashed spawn + respawn): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/resume", "thread/compact/start"] < ["thread/start"].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/resume", "thread/compact/start"],
+            "the respawned sidecar resumed the SAME thread, then ran the compact RPC: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start"],
+            "the crashed spawn served only the create: {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch review M-2: a Fork click on a crash-stale parent must respawn the
+    /// parent's sidecar FIRST (legacy `ensureRuntime` before fork, `adapter.ts:1056`) and
+    /// fork the RESUMED parent — the child handoff (archive → child spawn → unarchive →
+    /// resume) then proceeds exactly as it does for a healthy parent. Loudly failing the
+    /// fork against a dead connection is the leg for genuinely unrespawnable parents only.
+    #[tokio::test]
+    async fn fork_after_unrequested_crash_respawns_the_parent_sidecar_then_forks() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-respawn-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-respawn-marker-unused");
+
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let parent_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Fork click"
+        );
+
+        // The respawned parent AND the child's own sidecar share this config: resume
+        // echoes the requested id; thread/fork mints a deterministic child id.
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-crash" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-crash", None), sink)
+            .await;
+
+        // The fork SUCCEEDED on the requesting connection — never a loud failure
+        // against the dead parent connection.
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let forked = &frames[0];
+        assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+        assert_eq!(forked["requestId"], json!("fork-req-crash"), "{forked}");
+        assert_eq!(
+            forked["parentSessionId"],
+            json!(parent_id),
+            "the reply stays keyed to the CLICKED parent id: {forked}"
+        );
+        assert_eq!(forked["sessionId"], json!("child-after-crash"), "{forked}");
+
+        assert_eq!(
+            spawn_count(&capture),
+            3,
+            "parent respawn (spawn 2) + the fork child's own sidecar (spawn 3): {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
+        // respawned parent = thread/resume → thread/fork → thread/archive; child =
+        // thread/unarchive → thread/resume.
+        let log_text = read_op_log_when_complete(&log_path, 6).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+        }
+        assert_eq!(
+            by_url.len(),
+            3,
+            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/resume", ...] < ["thread/start"] < ["thread/unarchive", ...].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/resume", "thread/fork", "thread/archive"],
+            "the respawned parent was forked, never the dead connection: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start"],
+            "the crashed spawn served only the create: {log_text}"
+        );
+        assert_eq!(
+            sequences[2],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
+        );
+
+        // Both the respawned parent and the child are registered and live.
+        let guard = st.sessions.lock().await;
+        assert!(
+            guard.contains_key(&parent_id),
+            "the respawned parent stays registered under the SAME id"
+        );
+        assert!(
+            guard.contains_key("child-after-crash"),
+            "the forked child is registered on its own sidecar"
+        );
+        drop(guard);
+
+        // The recovery was transparent: no user-facing error frame names the parent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a self-healed fork must never surface an error frame: {frame}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch fix review F-1 — the MINT-NEW (`Respawned { new_session_id }`) fork
+    /// route, the sub-path the M-2 pair above does NOT drive (they drive Recovered, where
+    /// `parent_id == msg.session_id`). The respawn machinery broadcasts
+    /// `freshAgent.session.materialized{previousSessionId: OLD, sessionId: NEW}` DURING
+    /// `ensure_session_alive` — strictly before the fork RPC chain starts, hence before any
+    /// reply can exist — and the frozen client re-keys the pane's `sessionId` to NEW on that
+    /// broadcast (`panesSlice.ts` materialized fold) and DELETES the old session record
+    /// (`freshAgentSlice.ts`). Every post-resolution fork frame is therefore addressed by the
+    /// RESOLVED parent id: the pane's ANDed fork correlation
+    /// (`requestId === createRequestId && parentSessionId === paneContent.sessionId`,
+    /// `FreshAgentView.tsx:1671-1676`) only matches when `parentSessionId` is the pane's
+    /// CURRENT (NEW) id — a reply keyed to the clicked OLD id is DROPPED (orphan child,
+    /// user-silent no-op). This test drives the genuine route end-to-end: crashed parent →
+    /// negative-cache-confirmed dead thread → mint-new respawn → fork.
+    ///
+    /// The mint-new route is forced via the dead-thread negative cache
+    /// ([`FreshCodexState::mark_thread_dead`] — a prior crash recovery already confirmed the
+    /// durable rollout gone: disk cleanup / corruption / the RUN's probed `-32600 "no
+    /// rollout found"`) rather than a `thread/resume` error override, because the override
+    /// lands in the shared `FAKE_CODEX_APP_SERVER_BEHAVIOR` env var that EVERY subsequently
+    /// spawned fake process reads at startup — it would break the fork CHILD sidecar's own
+    /// `thread/resume` handoff step too. The negative-cache shortcut takes the same
+    /// `respawn_as_new_thread_after_crash` machinery either way.
+    #[tokio::test]
+    async fn fork_on_a_mint_new_respawn_keys_the_forked_reply_to_the_resolved_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-mint-new-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-new-marker-unused");
+
+        // Spawn 1: the parent, which crashes right after `thread/start` (a real
+        // unrequested exit, observed by the exit-watcher self-heal).
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the Fork click"
+        );
+
+        // The durable rollout is confirmed genuinely gone (negative-cache hit) — ensure-alive
+        // skips the doomed resume attempt and mints a fresh thread for this pane.
+        st.mark_thread_dead(&old_id).await;
+
+        // Spawn 2 (the respawned parent: `thread/start` mints "parent-new-mint", then
+        // `thread/fork` of it mints the child) and spawn 3 (the child's own sidecar:
+        // unarchive + resume handoff) share this config.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-mint" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint", None), sink)
+            .await;
+
+        // THE F-1 pin: the forked reply's EXACT envelope is keyed to the RESOLVED parent id
+        // (the pane's current session id post-materialized), never the clicked old id.
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(
+            frames[0],
+            json!({
+                "type": "freshAgent.forked",
+                "requestId": "fork-req-mint",
+                "parentSessionId": "parent-new-mint",
+                "sessionId": "child-after-mint",
+                "sessionType": "freshcodex",
+                "provider": "codex",
+                "runtimeProvider": "codex",
+                "sessionRef": { "provider": "codex", "sessionId": "child-after-mint" },
+            }),
+            "the forked reply must address the RESOLVED (respawned) parent the pane now tracks"
+        );
+
+        assert_eq!(
+            spawn_count(&capture),
+            3,
+            "parent respawn (spawn 2) + the fork child's own sidecar (spawn 3): {}",
+            spawn_count(&capture)
+        );
+
+        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
+        // respawned parent = thread/start (the mint) → thread/fork → thread/archive,
+        // with the fork RPC TARGETING the minted parent id; child = unarchive → resume.
+        let log_text = read_op_log_when_complete(&log_path, 6).await;
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        let mut fork_target: Option<String> = None;
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+            if entry["method"].as_str() == Some("thread/fork") {
+                fork_target = Some(
+                    entry["params"]["threadId"]
+                        .as_str()
+                        .expect("fork threadId")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            fork_target.as_deref(),
+            Some("parent-new-mint"),
+            "thread/fork runs against the RESPAWNED parent thread: {log_text}"
+        );
+        assert_eq!(
+            by_url.len(),
+            3,
+            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        // Sorted order: ["thread/start"] < ["thread/start", "thread/fork", ...] < ["thread/unarchive", ...].
+        assert_eq!(
+            sequences[0],
+            vec!["thread/start"],
+            "the crashed spawn served only the original create: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/start", "thread/fork", "thread/archive"],
+            "the respawned parent minted its new thread, then ran fork + archive: {log_text}"
+        );
+        assert_eq!(
+            sequences[2],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
+        );
+
+        // Registrations: the old id is GONE (the respawn re-keyed the session map), the
+        // minted parent and the child are live.
+        {
+            let guard = st.sessions.lock().await;
+            assert!(
+                !guard.contains_key(&old_id),
+                "the mint-new respawn removed the old parent id"
+            );
+            assert!(guard.contains_key("parent-new-mint"));
+            assert!(guard.contains_key("child-after-mint"));
+        }
+
+        // Broadcast leg audit: the materialized OLD→NEW pair DID go out (the client re-key
+        // this whole finding hinges on), and NO broadcast error frame is keyed to the old id
+        // (the expected THREAD_MEMORY_LOST degradation frame is keyed to the NEW id).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut saw_materialized = false;
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                assert_eq!(
+                    frame["previousSessionId"],
+                    json!(old_id),
+                    "materialized names the clicked id as previous: {frame}"
+                );
+                assert_eq!(
+                    frame["sessionId"],
+                    json!("parent-new-mint"),
+                    "materialized re-keys the pane to the minted id: {frame}"
+                );
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.error" {
+                assert_ne!(
+                    frame["sessionId"],
+                    json!(old_id),
+                    "no broadcast error may target the discarded old id: {frame}"
+                );
+                assert_eq!(
+                    frame["sessionId"], json!("parent-new-mint"),
+                    "the degradation frame rides the new id, like the crate's own keying invariant: {frame}"
+                );
+            }
+        }
+        assert!(
+            saw_materialized,
+            "the mint-new respawn must broadcast the OLD→NEW materialized pair"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Whole-branch fix review F-1, failure leg: the DOMINANT real-world outcome on the
+    /// mint-new route is a mid-flight fork failure (a freshly-minted thread is EMPTY, so
+    /// `thread/fork` answers the PROBED `-32600 "no rollout found for thread id"`
+    /// rejection). The nested `freshAgent.error` must key to the RESOLVED parent id: keyed
+    /// to the clicked OLD id it would ENSURE-create a phantom deleted-id record in the
+    /// client (`sessionError` → `resolveOrEnsureSession`) whose `lastError` no pane reads —
+    /// an invisible banner, the precise silent-death class I-1 was chartered to kill.
+    #[tokio::test]
+    async fn fork_on_a_mint_new_respawn_keys_mid_flight_failures_to_the_resolved_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-fail-marker-unused");
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        st.mark_thread_dead(&old_id).await;
+
+        // The respawned parent mints "parent-new-mint"; its `thread/fork` then fails with
+        // the probed empty-parent rejection. No child sidecar is spawned on this leg.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "overrides": {
+                    "thread/fork": {
+                        "error": { "code": -32600, "message": "no rollout found for thread id" }
+                    }
+                },
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint-fail", None), sink)
+            .await;
+
+        // THE F-1 failure-leg pin: the FULL nested envelope, keyed to the RESOLVED parent.
+        let frames = captured_frames(&captured);
+        assert_single_fork_error_frame(
+            &frames,
+            "parent-new-mint",
+            "INTERNAL_ERROR",
+            "no rollout found for thread id",
+        );
+        assert_eq!(
+            frames[0]["event"]["sessionId"],
+            json!("parent-new-mint"),
+            "the nested event's sessionId must be the RESOLVED parent id too: {}",
+            frames[0]
+        );
+
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "a failed fork spawns ONLY the respawned parent — never a child sidecar"
+        );
+        {
+            let guard = st.sessions.lock().await;
+            assert!(!guard.contains_key(&old_id));
+            assert!(guard.contains_key("parent-new-mint"));
+            assert!(
+                !guard.contains_key("child-after-mint"),
+                "a failed fork registers no child"
+            );
+        }
+
+        // Broadcast leg audit: mint-new materialization went out; the sink's failure frame is
+        // a REQUESTING-connection answer, so no broadcast error besides the NEW-keyed
+        // THREAD_MEMORY_LOST may name this pane's ids.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut saw_materialized = false;
+        while let Ok(Ok(raw)) =
+            tokio::time::timeout(deadline - std::time::Instant::now(), rx.recv()).await
+        {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                assert_eq!(frame["previousSessionId"], json!(old_id), "{frame}");
+                assert_eq!(frame["sessionId"], json!("parent-new-mint"), "{frame}");
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.error" {
+                assert_ne!(
+                    frame["sessionId"],
+                    json!(old_id),
+                    "no broadcast error may target the discarded old id: {frame}"
+                );
+            }
+        }
+        assert!(saw_materialized, "mint-new must broadcast the OLD→NEW pair");
+    }
+
+    /// Delta-review round-3 Major: the fork single-flight guard keyed ONLY to the
+    /// CLICKED, pre-recovery id (the round-2 shape) misses the duplicate click that
+    /// matters most on the mint-new route. `ensure_session_alive`'s respawn broadcasts
+    /// `freshAgent.session.materialized{OLD→NEW}` and the frozen client re-keys the
+    /// pane MID-FLIGHT while leaving the Fork action enabled, so the second click
+    /// arrives addressed to the NEW id — a guard that holds only OLD never collides
+    /// with it, and both forks mint children whose replies race the pane's
+    /// createRequestId re-key + parent-kill: whichever reply lands second can no
+    /// longer correlate, leaving its child sidecar + durable thread UNOWNED. The guard
+    /// must hold the RESOLVED parent id (plus the clicked id alongside it) for the
+    /// fork's whole duration.
+    ///
+    /// Drives the genuine mint-new route (crash-stale parent + the dead-thread
+    /// negative cache — the F-1 pins' machinery) with the respawned parent's
+    /// `thread/fork` delayed, parking fork #1 mid-RPC (the second click's
+    /// deterministic in-flight window). The duplicate, addressed to the re-keyed id,
+    /// must be refused INLINE with the nested `freshAgent.error{INTERNAL_ERROR,
+    /// "already in progress"}` shape on its own sink and must NEVER reach the wire;
+    /// fork #1 then completes; BOTH guard keys release (a later fork addressed to the
+    /// respawned id succeeds and mints a distinct child).
+    #[tokio::test]
+    async fn fork_in_flight_guard_covers_the_respawn_rekeyed_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-mint-rekey-guard-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-rekey-guard-marker-unused");
+
+        // Spawn 1: the parent, crashing right after `thread/start` (a real unrequested
+        // exit observed by the exit-watcher self-heal).
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        // Dead-thread negative cache: ensure-alive goes straight to the mint-new
+        // respawn fallback (the F-1 route).
+        st.mark_thread_dead(&old_id).await;
+
+        // Spawns 2+ (the respawned parent and every fork child's own sidecar) share
+        // this config: `thread/start` mints the new parent id; `thread/fork` is
+        // DELAYED long enough to hold fork #1's mid-RPC window deterministically,
+        // minting a distinct `thread-fork-<pid>-<n>` child per call.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "delayMethodsMs": { "thread/fork": 2000 },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        // Fork #1 — addressed to the CLICKED old id, exactly the pane's pre-respawn id.
+        let (sink1, captured1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            let old_id = old_id.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg(&old_id, "fork-req-g1", None), sink1)
+                    .await;
+            })
+        };
+
+        // The mint-new respawn re-keyed the pane mid-flight: the materialized OLD→NEW
+        // pair went out on the broadcast bus (the re-key this whole finding hinges on).
+        let (previous, minted) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.session.materialized" {
+                    return (
+                        frame["previousSessionId"].clone(),
+                        frame["sessionId"].clone(),
+                    );
+                }
+            }
+        })
+        .await
+        .expect("the mint-new respawn broadcasts the OLD→NEW materialized pair");
+        assert_eq!(previous, json!(old_id), "materialized names the clicked id");
+        assert_eq!(
+            minted,
+            json!("parent-new-mint"),
+            "materialized re-keys the pane"
+        );
+
+        // Deterministic witness that fork #1 cleared ensure-alive and is parked INSIDE
+        // its guarded critical section (its `thread/fork` RPC blocked upstream): the
+        // guard must hold the RESPAWNED id AND the clicked id — a successful probe of
+        // either would prove the guard does not cover that key at all. (A probe that
+        // acquires is dropped immediately, releasing nothing fork #1 holds.)
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if st.fork_in_flight.try_acquire("parent-new-mint").is_none()
+                    && st.fork_in_flight.try_acquire(&old_id).is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "fork #1's in-flight guard must hold BOTH the respawned parent id and the \
+             clicked id — otherwise a click addressed to the re-keyed id forks \
+             concurrently and leaks an unowned child",
+        );
+
+        // Fork #2 — the second click, addressed to the NEW id the pane re-keyed to —
+        // is refused INLINE on its own sink and never reaches the wire.
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_fork(fork_msg("parent-new-mint", "fork-req-g2", None), sink2),
+        )
+        .await
+        .expect("the re-keyed duplicate fork is refused inline, never upstream-blocking");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured2),
+            "parent-new-mint",
+            "INTERNAL_ERROR",
+            "already in progress",
+        );
+
+        // Fork #1 rides out its delayed RPC and completes: its reply keys to the
+        // RESOLVED parent id (the F-1 pin) with the fixture-minted child.
+        driver1.await.expect("fork #1 task");
+        let frames1 = captured_frames(&captured1);
+        assert_eq!(
+            frames1.len(),
+            1,
+            "exactly one sink frame for fork #1: {frames1:?}"
+        );
+        assert_eq!(frames1[0]["type"], "freshAgent.forked", "{:?}", frames1[0]);
+        assert_eq!(
+            frames1[0]["parentSessionId"],
+            json!("parent-new-mint"),
+            "fork #1's reply keys to the resolved parent id: {:?}",
+            frames1[0]
+        );
+        let child1 = frames1[0]["sessionId"]
+            .as_str()
+            .expect("child id")
+            .to_string();
+        assert!(
+            child1.starts_with("thread-fork-"),
+            "the fixture minted the child: {child1}"
+        );
+
+        // BOTH guard keys released at the terminal leg: the resolved id and the
+        // clicked id are acquirable again...
+        assert!(
+            st.fork_in_flight.try_acquire("parent-new-mint").is_some(),
+            "the resolved-id guard key released when fork #1 completed"
+        );
+        assert!(
+            st.fork_in_flight.try_acquire(&old_id).is_some(),
+            "the clicked-id guard key released when fork #1 completed"
+        );
+
+        // ...behaviorally: a later fork addressed to the respawned id succeeds and
+        // mints a DISTINCT child (its RPC rides the same 2s fixture delay).
+        let (sink3, captured3) = capturing_sink();
+        let driver3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-new-mint", "fork-req-g3", None), sink3)
+                    .await;
+            })
+        };
+        driver3.await.expect("fork #3 task");
+        let frames3 = captured_frames(&captured3);
+        assert_eq!(
+            frames3.len(),
+            1,
+            "exactly one sink frame for fork #3: {frames3:?}"
+        );
+        assert_eq!(frames3[0]["type"], "freshAgent.forked", "{:?}", frames3[0]);
+        let child2 = frames3[0]["sessionId"]
+            .as_str()
+            .expect("child id")
+            .to_string();
+        assert_ne!(child1, child2, "each successful fork mints its own child");
+
+        // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
+        // post-completion fork #3 — the refused duplicate produced NONE), both
+        // targeting the respawned parent, over exactly four sidecar connections
+        // (crashed spawn + respawned parent + one sidecar per child).
+        assert_eq!(
+            spawn_count(&capture),
+            4,
+            "crashed parent + respawn + two child sidecars: {}",
+            spawn_count(&capture)
+        );
+        let log_text = read_op_log_when_complete(&log_path, 10).await;
+        let fork_targets: Vec<String> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("op log row parses"))
+            .filter(|entry| entry["method"] == "thread/fork")
+            .map(|entry| {
+                entry["params"]["threadId"]
+                    .as_str()
+                    .expect("fork target")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            fork_targets,
+            vec!["parent-new-mint".to_string(), "parent-new-mint".to_string()],
+            "exactly the two legitimate forks hit the wire — the refused duplicate none: {log_text}"
+        );
+        let urls: std::collections::HashSet<String> = log_text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["listenUrl"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            urls.len(),
+            4,
+            "crashed + respawned parent + two child sidecars: {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
     }
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --

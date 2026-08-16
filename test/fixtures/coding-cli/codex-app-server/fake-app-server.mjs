@@ -66,6 +66,59 @@ function getRolloutSessionDir() {
   return path.join(getCodexHome(), 'sessions', year, month, day)
 }
 
+// ── AGENT-04/07 e2e (fresh-agent-control-rust): per-thread turn recording ────
+// OPT-IN via behavior.recordTurns: when on, every turn/start RECORDS a turn
+// (id `turn-<k>`, user+assistant items so the snapshot splits each turn into
+// `turn-<k>:row-0`/`:row-1` display rows — the synthetic-id form Task 6's
+// lastTurnId normalization strips), thread/read(includeTurns:true) returns the
+// recorded list, and forks persist the checkpointed prefix. Records persist to
+// <codexHome>/fake-turns/<threadId>.json so the CHILD sidecar process (a
+// separate fake process) reads the same history the parent process recorded —
+// fork durability is cross-process, like the rollout files themselves.
+// Default OFF: every legacy consumer (static makeTurn world) is untouched.
+const recordedTurnsByThread = new Map()
+
+function recordedTurnsPath(threadId) {
+  return path.join(getCodexHome(), 'fake-turns', `${threadId}.json`)
+}
+
+function loadRecordedTurns(threadId) {
+  if (!threadId) return []
+  if (recordedTurnsByThread.has(threadId)) return recordedTurnsByThread.get(threadId)
+  let turns = []
+  try {
+    const parsed = JSON.parse(fs.readFileSync(recordedTurnsPath(threadId), 'utf8'))
+    if (Array.isArray(parsed)) turns = parsed
+  } catch {
+    // no persisted record yet — empty history
+  }
+  recordedTurnsByThread.set(threadId, turns)
+  return turns
+}
+
+function persistRecordedTurns(threadId, turns) {
+  const file = recordedTurnsPath(threadId)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(turns))
+}
+
+function makeRecordedTurn(turnId, promptText) {
+  const nowSec = Math.floor(Date.now() / 1000)
+  return {
+    id: turnId,
+    status: 'completed',
+    itemsView: 'full',
+    items: [
+      { type: 'userMessage', id: `${turnId}:user`, content: [{ type: 'text', text: promptText ?? '' }] },
+      { type: 'agentMessage', id: `${turnId}:item-0`, text: 'Fixture turn' },
+    ],
+    error: null,
+    startedAt: nowSec,
+    completedAt: nowSec + 1,
+    durationMs: 1000,
+  }
+}
+
 function getThreadHandle(threadId) {
   return {
     id: threadId,
@@ -252,9 +305,61 @@ function successResult(method, params) {
     }
   }
   if (method === 'turn/start') {
+    if (behavior.recordTurns) {
+      const threadId = params?.threadId || 'thread-new-1'
+      const turns = loadRecordedTurns(threadId)
+      const promptText = Array.isArray(params?.input)
+        ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
+        : ''
+      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText)
+      turns.push(turn)
+      recordedTurnsByThread.set(threadId, turns)
+      persistRecordedTurns(threadId, turns)
+      return { turn }
+    }
     return {
       turn: makeTurn('turn-1'),
     }
+  }
+  if (method === 'thread/fork') {
+    // AGENT-07 arm: rollouts are copy-on-write — the child is minted with the
+    // recorded prefix through `lastTurnId` (when recordTurns is on; otherwise
+    // an empty history, matching the old static-fixture world's silence), the
+    // parent's records are never touched, and the child gets a durable rollout
+    // + persisted turns so the CHILD sidecar process can resume it.
+    const parentThreadId = params?.threadId
+    forkCounter += 1
+    const childThreadId = `thread-fork-${process.pid}-${forkCounter}`
+    const child = makeThread(childThreadId, params)
+    ensureDurableArtifact(childThreadId)
+    let childTurns = []
+    if (behavior.recordTurns) {
+      const parentTurns = loadRecordedTurns(parentThreadId)
+      const pin = typeof params?.lastTurnId === 'string' ? params.lastTurnId : null
+      const pinIndex = pin ? parentTurns.findIndex((turn) => turn.id === pin) : -1
+      childTurns = pin ? parentTurns.slice(0, pinIndex + 1) : parentTurns.slice()
+      persistRecordedTurns(childThreadId, childTurns)
+      child.turns = childTurns
+    }
+    return {
+      thread: child,
+      cwd: params?.cwd ?? process.cwd(),
+      model: params?.model ?? 'fixture-model',
+      modelProvider: 'openai',
+      instructionSources: [],
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: params?.sandbox ?? 'danger-full-access',
+    }
+  }
+  if (method === 'thread/compact/start') {
+    // AGENT-04 arm: the probed 0.147.0 response is an empty object; the whole
+    // compact lifecycle then arrives as NOTIFICATIONS (emitCompactSequence,
+    // called after this result is sent — mirrors the real server's ordering).
+    return {}
+  }
+  if (method === 'thread/archive' || method === 'thread/unarchive') {
+    return {}
   }
   if (method === 'fs/watch') {
     return {
@@ -269,6 +374,11 @@ function successResult(method, params) {
       ...params,
       includeTurns: params?.includeTurns === true,
     })
+    // recordTurns opt-in: the snapshot reads REAL recorded turns, so a forked
+    // child's history provably stops at the fork point (checkpoint divergence).
+    if (behavior.recordTurns && params?.includeTurns === true) {
+      thread.turns = loadRecordedTurns(thread.id)
+    }
     // Task 9 knob: per-thread scriptable status, consulted by thread/read only.
     // threadStatuses: {"<threadId>": "active"|"idle"} — an absent knob or an
     // unlisted thread id keeps makeThread's hardcoded { type: 'idle' }, so all
@@ -350,6 +460,7 @@ if (behavior.spawnNativeChild) {
 const wss = new WebSocketServer({ host, port })
 const watches = new Map()
 const activeThreadIds = new Set()
+let forkCounter = 0
 
 function broadcastNotification(method, params) {
   const payload = JSON.stringify({
@@ -422,6 +533,39 @@ function claimCrossProcessOnce(markerPath, key) {
     }
     throw error
   }
+}
+
+/**
+ * AGENT-04 e2e: the PROBED codex 0.147.0 compact notification sequence (plan
+ * Task 4/8; fresh-eyes round-3 F4): after the `thread/compact/start` RPC
+ * result, the real app-server broadcasts, in order:
+ *   thread/status/changed active → turn/started → item/started →
+ *   thread/tokenUsage/updated → item/completed → thread/status/changed idle →
+ *   turn/completed {turn:{status:'completed'}}
+ * The fake mirrors EXACTLY that sequence (the Rust consumer's busy/idle and
+ * chime gating ride it). `threadStatuses` is kept consistent so a subsequent
+ * thread/read reports the same phase.
+ */
+async function emitCompactNotificationSequence(threadId) {
+  const pauseMs = Number(behavior.compactSequenceDelayMs ?? 25)
+  const pause = () => new Promise((resolve) => setTimeout(resolve, pauseMs))
+  const turnId = `compact-turn-${Date.now()}`
+  const item = { id: `${turnId}:item-0`, type: 'contextCompaction', summary: 'Compacted context' }
+  behavior.threadStatuses = { ...(behavior.threadStatuses ?? {}), [threadId]: 'active' }
+  broadcastNotification('thread/status/changed', { threadId, status: { type: 'active' } })
+  await pause()
+  broadcastNotification('turn/started', { threadId, turn: { id: turnId, status: 'inProgress' } })
+  await pause()
+  broadcastNotification('item/started', { threadId, item })
+  await pause()
+  broadcastNotification('thread/tokenUsage/updated', { threadId, tokenUsage: { totalTokens: 0 } })
+  await pause()
+  broadcastNotification('item/completed', { threadId, item })
+  await pause()
+  behavior.threadStatuses[threadId] = 'idle'
+  broadcastNotification('thread/status/changed', { threadId, status: { type: 'idle' } })
+  await pause()
+  broadcastNotification('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } })
 }
 
 function emitConfiguredThreadStatusChanges(method) {
@@ -544,6 +688,27 @@ wss.on('connection', (socket) => {
       process.exit(1)
     }
 
+    // recordTurns-on strict pin (AGENT-07): a lastTurnId that is not a recorded
+    // turn of the parent fails loudly instead of silently forking the tip.
+    if (
+      method === 'thread/fork'
+      && behavior.recordTurns
+      && typeof message.params?.lastTurnId === 'string'
+    ) {
+      const pinIndex = loadRecordedTurns(message.params?.threadId)
+        .findIndex((turn) => turn.id === message.params.lastTurnId)
+      if (pinIndex === -1) {
+        socket.send(JSON.stringify({
+          id: message.id,
+          error: {
+            code: -32602,
+            message: `lastTurnId ${message.params.lastTurnId} not found in thread ${message.params?.threadId}`,
+          },
+        }))
+        return
+      }
+    }
+
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
@@ -568,6 +733,29 @@ wss.on('connection', (socket) => {
       }))
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
+      if (method === 'thread/compact/start') {
+        // The compact RPC result is empty; the lifecycle rides notifications.
+        await emitCompactNotificationSequence(message.params?.threadId)
+      }
+      if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
+        // recordTurns opt-in: a recorded turn closes with the real turn
+        // lifecycle notifications (turn/started → turn/completed{completed})
+        // so the consumer's active-turn tracking clears and the idle snapshot
+        // edge (which re-fetches the recorded transcript) actually fires. The
+        // gap MATTERS (never drop it): the server's send task records
+        // active_turn when the RPC result lands; a same-tick turn/completed
+        // could clear it BEFORE that record, leaving the session wedged busy —
+        // a real provider never completes a turn within the result's tick.
+        broadcastNotification('turn/started', {
+          threadId: message.params?.threadId,
+          turn: { id: result.turn.id, status: 'inProgress' },
+        })
+        await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
+        broadcastNotification('turn/completed', {
+          threadId: message.params?.threadId,
+          turn: { id: result.turn.id, status: 'completed' },
+        })
+      }
       if (method === 'initialize') {
         initialized = true
       }

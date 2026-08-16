@@ -247,6 +247,25 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * AGENT-24 kilroy-lane Gemini-independence scrub list — the single source of
+ * truth shared by `fresh-agent-control-rust.spec.ts` and its unit pin in
+ * `rust-server.test.ts`. Every env name that could hand the spawned Rust
+ * server Gemini-summary availability must be here: `main.rs` consumes
+ * `GOOGLE_GENERATIVE_AI_API_KEY` (env wins over `settings.ai.geminiApiKey`)
+ * and the Rust-only `FRESHELL_GEMINI_BASE_URL` endpoint seam, while a
+ * developer shell commonly exports `GEMINI_API_KEY` or other `GEMINI_*` vars.
+ * Used as `stripEnvPrefixes` entries — exact names strip exact keys, the
+ * `GEMINI_` entry strips any prefixed key — so no dev-machine credential can
+ * leak through boot()'s `...process.env` spread NOR an `options.env` set.
+ */
+export const GEMINI_STRIP_ENV_PREFIXES: string[] = [
+  'GEMINI_',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'GEMINI_API_KEY',
+  'FRESHELL_GEMINI_BASE_URL',
+]
+
 export interface RustServerOptions {
   /** Reuse this isolated HOME instead of creating a fresh mkdtemp one. */
   homeDir?: string
@@ -256,6 +275,14 @@ export interface RustServerOptions {
   token?: string
   /** Extra env vars merged into (and able to override) the spawned server's environment. */
   env?: Record<string, string>
+  /**
+   * Env var name PREFIXES deleted from the spawned server's environment after
+   * the merge (same `delete env.X` pattern as VITE_PORT in boot()). `env` can
+   * only add/override keys — never delete inherited `process.env` keys — so
+   * proving a lane's STRUCTURAL independence from a developer machine's
+   * credentials (e.g. `['GEMINI_']` for the AGENT-24 kilroy lane) lives here.
+   */
+  stripEnvPrefixes?: string[]
   /** Hook to populate the isolated HOME before the server boots. */
   setupHome?: (homeDir: string) => Promise<void>
   /** Timeout in ms to wait for the server to become healthy (default: 60000). */
@@ -492,6 +519,14 @@ export class RustServer implements E2eServerHandle {
     )
     // Remove any inherited PORT-adjacent var that might interfere.
     delete (env as Record<string, string | undefined>).VITE_PORT
+    // Caller-requested credential scrubs (see RustServerOptions.stripEnvPrefixes).
+    for (const prefix of this.options.stripEnvPrefixes ?? []) {
+      for (const key of Object.keys(env)) {
+        if (key.startsWith(prefix)) {
+          delete (env as Record<string, string | undefined>)[key]
+        }
+      }
+    }
 
     this.stdoutBuffer = ''
     this.stderrBuffer = ''

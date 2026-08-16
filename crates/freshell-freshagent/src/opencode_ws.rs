@@ -16,20 +16,20 @@
 //! | `freshAgent.send {sessionId,text,…}` | **materialize-or-send** (`adapter.ts:324-361`): create the durable `ses_*` session ONLY the first time (THE continuity fix — see below), broadcast `freshAgent.session.materialized` exactly once, then broadcast `freshAgent.send.accepted` and run the turn |
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
 //! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
+//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
+//! | `freshAgent.fork` | AGENT-07 (approval-respond Task 5): `POST /session/:id/fork` (optional `messageID` when the client pins a `^msg` turn), then register the child (bridge + binding row) and answer `freshAgent.forked` ON THE REQUESTING CONNECTION — every failure path also answers on that sink, never silence |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
 //! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
-//! the client folds into `markSessionLost` instead of hanging. **Out of scope entirely
-//! for this slice:** `freshAgent.fork` / `freshAgent.compact`.
+//! the client folds into `markSessionLost` instead of hanging.
 //!
 //! The turn this module runs on `freshAgent.send` DOES land in the real opencode session
 //! (via [`freshell_opencode::OpencodeServeManager::run_turn`]) — the pane's live-updating
 //! transcript just isn't wired to the WS bus yet, so nothing streams to the browser
 //! until that turn resolves and a later `freshAgent.attach`/REST read observes it.
-//! **Deferred to PR-4:** `freshAgent.attach`. **Out of scope entirely for this slice:**
-//! `freshAgent.fork` / `freshAgent.compact`.
+//! **Deferred to PR-4:** `freshAgent.attach`.
 //!
 //! ## THE continuity fix (AGENT-08)
 //!
@@ -69,11 +69,12 @@ use freshell_opencode::{
     SdkProviderEvent, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
-    SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
+use freshell_terminal::FrameSink;
 
 use crate::{
     FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
@@ -120,6 +121,12 @@ pub struct FreshOpencodeState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// Per-parent-session fork single-flight (delta-review round 2, D2-F2; the
+    /// opencode arm of [`crate::FreshCodexState::fork_in_flight`]'s rationale): the
+    /// client leaves the Fork action enabled during the op, so a duplicate click
+    /// would otherwise mint a second child whose reply can no longer correlate after
+    /// the first fork re-keys the pane — an orphaned `ses_*` row + serve session.
+    fork_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -132,6 +139,39 @@ struct OpencodeCreateRecord {
     placeholder_id: String,
 }
 
+/// What the session's registered driving task is running (delta-review round 2,
+/// D2-F1): every [`OpencodeSession::turn_task`] entry is tagged so
+/// [`FreshOpencodeState::handle_send`] can REFUSE to overwrite an in-flight
+/// COMPACT's handle (the overwrite would disconnect kill/interrupt from the
+/// still-running compact drive and let ONE idle edge settle both operations into a
+/// false/duplicate completion) while preserving the pre-existing
+/// send-overwrites-send behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnTaskKind {
+    /// A `freshAgent.send` turn drive (`handle_send`'s `run_turn` task).
+    Send,
+    /// A `freshAgent.compact` drive (`handle_compact`'s POST + await-idle + settle).
+    Compact,
+}
+
+/// The session's registered driving task + its [`TurnTaskKind`]. Kill/interrupt abort
+/// the handle regardless of kind (an aborted compact drops mid-await and never reaches
+/// its settle tail — no false `freshAgent.turn.complete`).
+struct TurnTask {
+    kind: TurnTaskKind,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TurnTask {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
 /// One live (or not-yet-materialized) freshopencode WS session.
 struct OpencodeSession {
     placeholder_id: String,
@@ -140,11 +180,16 @@ struct OpencodeSession {
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    /// The detached task running the current/most-recent turn (`manager.run_turn`), so
-    /// `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not serialized against a
-    /// concurrent `freshAgent.send` — mirrors `adapter.ts`'s `sendQueue` only loosely
-    /// (this crate does not yet serialize overlapping sends).
-    turn_task: Option<tokio::task::JoinHandle<()>>,
+    /// The detached, kind-tagged task driving the current/most-recent operation
+    /// (`manager.run_turn` for a send, the POST/await-idle/settle drive for a
+    /// compact), so `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not
+    /// serialized against a concurrent `freshAgent.send` while a SEND is in flight —
+    /// mirrors `adapter.ts`'s `sendQueue` only loosely (this crate does not yet
+    /// serialize overlapping sends); the new drive's task simply overwrites the
+    /// finished/hijacked handle. A send arriving while a COMPACT is in flight is
+    /// REFUSED instead ([`FreshOpencodeState::handle_send`], D2-F1): overwriting the
+    /// compact's handle would orphan its still-running drive.
+    turn_task: Option<TurnTask>,
     /// PR-3: set by `handle_interrupt` (BEFORE aborting) so a racing in-flight turn's
     /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
     /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
@@ -212,6 +257,7 @@ impl FreshOpencodeState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            fork_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -270,6 +316,26 @@ impl FreshOpencodeState {
 
     fn broadcast(&self, msg: &ServerMessage) {
         self.fresh_agent.broadcast(msg);
+    }
+
+    /// The shared P1.13 binding-row write (materialization row, settings refresh,
+    /// resume refresh, forked child): AWAITED (durable-before-answer), and a write
+    /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
+    /// broadcast but NEVER blocks the caller's reply — the same failure policy at
+    /// every call site.
+    async fn record_binding_row(&self, upsert: crate::identity_sink::FreshAgentBindingUpsert) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        let session_id = upsert.session_id.clone();
+        if let Err(e) = sink.record_binding(upsert).await {
+            tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
+            self.emit_fresh_agent_error(
+                &session_id,
+                "LEDGER_WRITE_FAILED",
+                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            );
+        }
     }
 
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
@@ -502,6 +568,14 @@ impl FreshOpencodeState {
     /// (the continuity fix), broadcasts `freshAgent.session.materialized` exactly once,
     /// then `freshAgent.send.accepted`, then runs the turn against the real opencode
     /// serve session in a detached task (PR-3 bridges its completion signal onto the bus).
+    ///
+    /// BUSY REFUSAL (delta-review round 2, D2-F1): a send arriving while a COMPACT is
+    /// in flight (the session's `turn_task` kind — the composer stays interactive, so
+    /// this race is reachable) is refused with the nested
+    /// `freshAgent.error{INTERNAL_ERROR}` BEFORE any side effect; overwriting the
+    /// compact's registered handle would orphan its drive. A send arriving while a
+    /// SEND is in flight keeps the pre-existing loose-overwrite behavior (the
+    /// divergence documented on [`OpencodeSession::turn_task`]).
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
@@ -520,6 +594,31 @@ impl FreshOpencodeState {
         };
 
         let mut session = session_arc.lock().await;
+
+        // D2-F1 (delta-review round 2): a send arriving while a COMPACT is in flight
+        // is REFUSED — the nested `freshAgent.error{INTERNAL_ERROR}` — BEFORE any side
+        // effect (flag reset, busy snapshot, materialization, prompt POST). Registering
+        // this send's drive would overwrite the compact's `turn_task` handle while the
+        // compact keeps running: kill/interrupt would silently stop reaching it, and
+        // the shared idle edge would settle both operations (a false/duplicate
+        // completion). A send arriving while a SEND is in flight keeps the PRE-EXISTING
+        // behavior: the new task overwrites the old registration (the documented
+        // divergence — this crate does not serialize overlapping sends).
+        if session
+            .turn_task
+            .as_ref()
+            .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished())
+        {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INTERNAL_ERROR",
+                &format!(
+                    "send while a compact is in progress is not supported (opencode session {session_id})"
+                ),
+            );
+            return;
+        }
 
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and the
@@ -597,33 +696,22 @@ impl FreshOpencodeState {
             // P1.13: binding row at materialization (AWAITED BEFORE the materialized
             // broadcast -- durable-before-answer), resolving the create's pending
             // marker. Opencode has no sandbox/permission concepts -- always `None`.
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: durable_id.clone(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: request_id.clone(),
-                        resolves_pending: Some(session.placeholder_id.clone()),
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: session.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: session.effort.clone(),
-                            cwd: session.cwd.clone(),
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        &durable_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: request_id.clone(),
+                resolves_pending: Some(session.placeholder_id.clone()),
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            })
+            .await;
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
@@ -658,33 +746,22 @@ impl FreshOpencodeState {
         // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: acked_session_id.clone(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: None,
-                        resolves_pending: None,
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: session.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: session.effort.clone(),
-                            cwd: session.cwd.clone(),
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %acked_session_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        &acked_session_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: acked_session_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            })
+            .await;
         }
 
         let real_id = acked_session_id.clone();
@@ -725,30 +802,19 @@ impl FreshOpencodeState {
                 )
                 .await;
 
-            // `emitStatus(state, 'idle')` (adapter.ts:371/384) -- unconditional, whether
-            // the turn succeeded or the promptAsync/idle-wait itself errored.
-            fresh_agent.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
-
-            // adapter.ts:377 -- a positive completion requires the idle-wait to have
-            // actually succeeded AND the turn to have been neither interrupted
-            // (`turn_aborted`, set by `handle_interrupt`) nor errored (`turn_errored`,
-            // set by the serve-stream bridge on an observed `session.error`).
-            if result.is_ok()
-                && !turn_aborted.load(Ordering::SeqCst)
-                && !turn_errored.load(Ordering::SeqCst)
-            {
-                let at = {
-                    let mut guard = last_turn_complete_at
-                        .lock()
-                        .expect("last_turn_complete_at mutex");
-                    let at = next_monotonic_turn_complete_at(*guard, now_ms());
-                    *guard = Some(at);
-                    at
-                };
-                fresh_agent.broadcast(&event_frame(&real_id, turn_complete_event(&real_id, at)));
-            }
+            settle_turn_outcome(
+                &fresh_agent,
+                &real_id,
+                result.is_ok(),
+                &turn_aborted,
+                &turn_errored,
+                &last_turn_complete_at,
+            );
         });
-        session.turn_task = Some(turn_task);
+        session.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Send,
+            handle: turn_task,
+        });
     }
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): is this id tracked
@@ -873,6 +939,386 @@ impl FreshOpencodeState {
                 turn_aborted.store(false, Ordering::SeqCst);
             }
         }
+    }
+
+    // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
+
+    /// Handle a `freshAgent.compact` for opencode (legacy `compact()` →
+    /// `compactForState`, `adapter.ts:992-1011,356-399`) against the VALIDATED
+    /// opencode 1.18.18 summarize contract (`POST /session/:id/summarize` with a body
+    /// of EXACTLY `{providerID, modelID}` — required, `additionalProperties:false`).
+    /// The client's `instructions` are DELIBERATELY DROPPED (no-op upstream; note the
+    /// deliberate divergence: legacy Node's own `serve-manager.ts:465-471` body shape
+    /// `{instructions?}` 400s on 1.18.18, so this port does NOT mirror it). A
+    /// not-yet-materialized session is a SILENT NO-OP (`adapter.ts:992-994`), while a
+    /// session id this server never tracked is the LOUD lost-session leg: nested
+    /// `freshAgent.error{INVALID_SESSION_ID}` mirroring [`Self::handle_fork`] (review I-1),
+    /// so the pane engages its recovery instead of dying invisibly.
+    ///
+    /// REVIEWED lifecycle (fresh-eyes F3, `adapter.ts:356-399`): FIRST reset the
+    /// session's `turn_aborted`/`turn_errored` flags (a prior interrupted/errored turn
+    /// must not suppress this compact's completion edge), broadcast the running-status
+    /// snapshot (the busy indicator must be visible before the upstream request
+    /// settles), subscribe BEFORE the POST (the idle edge cannot be missed), resolve
+    /// the model pair (the serve crate stores no session metadata, so resolution lives
+    /// here: the session's model split via `split_opencode_model`, else `GET /config`'s
+    /// `model`, else a LOUD error), POST, await idle, and settle with the SAME
+    /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
+    /// error still returns the pane to idle and surfaces the error loudly — never a
+    /// false completion.
+    ///
+    /// TURN-SCOPED LIFECYCLE (delta-review round 1, D1-F1): the composer stays
+    /// interactive while a session is busy (queued sends) and the `/compact` slash
+    /// action sends `freshAgent.compact` without a busy gate, so a compact CAN arrive
+    /// mid-turn. Two defenses make a compact a first-class turn:
+    ///
+    /// (a) A compact arriving while the session's `turn_task` (a send OR an earlier
+    ///     compact) is still in flight is REFUSED with a nested
+    ///     `freshAgent.error{INTERNAL_ERROR}` naming the in-flight turn — before
+    ///     touching the shared abort/error flags or opening an idle waiter (one
+    ///     idle/error edge can never settle two operations into a false/duplicate
+    ///     completion). This refusal EXCEEDS legacy: the Node adapter CHAINS compact
+    ///     onto `state.sendQueue` (adapter.ts:992) rather than refusing.
+    /// (b) An accepted compact's driving task (POST + await-idle + settle) is
+    ///     REGISTERED as the session's `turn_task` (mirroring [`Self::handle_send`]'s
+    ///     registration unit), so `freshAgent.kill`/`freshAgent.interrupt` abort a
+    ///     mid-flight compact: dropped mid-await it never reaches the settle tail,
+    ///     and the interrupt's `turn_aborted` flag would gate even a raced settle —
+    ///     killing mid-compact yields NO false `freshAgent.turn.complete`.
+    pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        let session_id = msg.session_id.clone();
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            // Whole-branch review I-1: mirror handle_fork's untracked leg — the nested
+            // `INVALID_SESSION_ID` lost-session envelope engages the client's
+            // `markSessionLost` recovery (legacy `requireOrRecoverSession` →
+            // `FreshAgentLostSessionError` parity, `runtime-manager.ts:309-313`). The
+            // pre-I-1 shape — a request-less top-level `error` frame — never reached
+            // any pane: `ws-client.ts` only correlates top-level errors with a pending
+            // send's requestId, which a compact frame never establishes. Broadcast
+            // (not a reply sink) is right here: the client routes nested frames by
+            // sessionId, so post-restart stale panes and cross-device duplicates both
+            // surface the recovery.
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INVALID_SESSION_ID",
+                &format!("OpenCode fresh-agent session {session_id} is not available."),
+            );
+            return;
+        };
+
+        // Held across the whole preflight (busy-check → flag reset → model pair
+        // resolution) so a compact's refusal check and its own `turn_task`
+        // registration are one atomic unit against handle_send/handle_interrupt (the
+        // same lock discipline handle_send uses across materialization).
+        let mut session = session_arc.lock().await;
+        let Some(real_id) = session.real_session_id.clone() else {
+            // adapter.ts:992-994 — no server-side session to compact; silent no-op.
+            return;
+        };
+
+        // D1-F1(a): REFUSE a compact while the session's turn is in flight.
+        if session.turn_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INTERNAL_ERROR",
+                &format!(
+                    "compact while a turn is in progress is not supported (opencode session {session_id})"
+                ),
+            );
+            return;
+        }
+
+        // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
+        session.turn_aborted.store(false, Ordering::SeqCst);
+        session.turn_errored.store(false, Ordering::SeqCst);
+        let model = session.model.clone();
+        let route = session.cwd.clone();
+        let turn_aborted = session.turn_aborted.clone();
+        let turn_errored = session.turn_errored.clone();
+        let last_turn_complete_at = session.last_turn_complete_at.clone();
+
+        // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
+        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
+
+        let manager = self.fresh_agent.ensure_manager().await;
+        // Subscribe BEFORE the POST so the compact's idle edge cannot be missed (the
+        // same mechanic as `run_turn`; legacy arms its `onceIdle` first too).
+        let rx = manager.subscribe(&real_id);
+
+        // Model-pair resolution: (1) the session's stored model via the existing
+        // `build_prompt_body` helper; (2) `GET /config`'s `model` key (probed: present,
+        // string-or-null); (3) a LOUD failure (no false success, NO POST).
+        let model_pair = match freshell_opencode::split_opencode_model(model.as_deref()) {
+            Some(pair) => Some(pair),
+            None => match manager.get_config(&route).await {
+                Ok(config) => freshell_opencode::split_opencode_model(
+                    config.get("model").and_then(Value::as_str),
+                ),
+                Err(_) => None,
+            },
+        };
+        let Some(model_pair) = model_pair else {
+            // Never leave the pane stuck busy on the failure path (and nothing was
+            // ever registered on turn_task — the failure is inline, pre-spawn).
+            self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            self.emit_fresh_agent_error(
+                &real_id,
+                "OPENCODE_COMPACT_FAILED",
+                &format!(
+                    "Compact failed for opencode session {real_id}: no model/provider pair is resolvable (both the session model and the serve /config model are unset or unusable)"
+                ),
+            );
+            return;
+        };
+
+        // D1-F1(b): run the compact's drive (POST + await-idle + settle) in the
+        // session's DETACHED, REGISTERED turn task — mirroring handle_send so
+        // kill/interrupt abort it (aborted mid-await ⇒ no settle ⇒ no chime).
+        let fresh_agent = self.fresh_agent.clone();
+        let compact_id = real_id.clone();
+        let compact_task = tokio::spawn(async move {
+            let result = match manager
+                .compact(
+                    &compact_id,
+                    &model_pair.provider_id,
+                    &model_pair.model_id,
+                    &route,
+                )
+                .await
+            {
+                Ok(()) => {
+                    manager
+                        .await_idle(&compact_id, rx, DEFAULT_TURN_TIMEOUT, route)
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+
+            // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
+            // unconditionally + the gated chime); a serve error additionally surfaces
+            // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
+            // never produces a false turn-complete.
+            let succeeded = result.is_ok();
+            settle_turn_outcome(
+                &fresh_agent,
+                &compact_id,
+                succeeded,
+                &turn_aborted,
+                &turn_errored,
+                &last_turn_complete_at,
+            );
+            if let Err(err) = result {
+                fresh_agent.broadcast(&event_frame(
+                    &compact_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": compact_id,
+                        "code": "OPENCODE_COMPACT_FAILED",
+                        "message": err.to_string(),
+                    }),
+                ));
+            }
+        });
+        session.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Compact,
+            handle: compact_task,
+        });
+    }
+
+    // ── freshAgent.fork (WS, AGENT-07, approval-respond Task 5) ─────────────
+
+    /// Handle a `freshAgent.fork` for opencode (legacy `fork()` → `forkForState`,
+    /// `adapter.ts:1005-1020,401-409`): `POST /session/:id/fork`, register the child
+    /// session locally (bridge + identity binding row), and answer ON THE REQUESTING
+    /// CONNECTION's sink (`conn_sink`) — unlike the broadcast-only handlers, fork is a
+    /// request/response op (`freshAgent.forked` echoes the request's `requestId`), and
+    /// EVERY failure path also answers on that sink (the silent-hang defect class this
+    /// run exists to kill):
+    ///
+    /// | failure | reply |
+    /// |---|---|
+    /// | session id not tracked at all | nested `freshAgent.error{INVALID_SESSION_ID}` (`requireState` parity, adapter.ts:223) — the lost-session shape the client folds into `markSessionLost`/recovery (`fresh-agent-ws.ts:343`) |
+    /// | placeholder never materialized | nested `freshAgent.error{INVALID_SESSION_ID}` with the legacy parity text (adapter.ts:403) |
+    /// | a fork for this parent is already in flight (duplicate click, D2-F2) | nested `freshAgent.error{INTERNAL_ERROR}`, NO other action — no second fork POST, no child minted (a second child could never correlate after the first fork re-keys the pane) |
+    /// | serve failure (400/500/…) | nested `freshAgent.error{INTERNAL_ERROR}` carrying the serve error text, BEFORE any state change |
+    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        // D2-F2 single-flight: acquire BEFORE any lookup/POST; the RAII guard
+        // releases on every terminal leg (success AND every failure), so a refreshed
+        // Fork click once this op settles is never stranded.
+        let Some(_fork_guard) = self.fork_in_flight.try_acquire(&msg.session_id) else {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": format!("fork already in progress for {}", msg.session_id),
+                }),
+            ));
+            return;
+        };
+
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&msg.session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INVALID_SESSION_ID",
+                    "message": format!(
+                        "OpenCode fresh-agent session {} is not available.",
+                        msg.session_id
+                    ),
+                }),
+            ));
+            return;
+        };
+
+        let (real_id, route, model, effort) = {
+            let session = session_arc.lock().await;
+            let Some(real_id) = session.real_session_id.clone() else {
+                // Legacy throws FreshAgentLostSessionError BEFORE calling the serve
+                // manager; the port answers the same lost-session code so the client's
+                // recovery path engages.
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "INVALID_SESSION_ID",
+                        "message": format!(
+                            "OpenCode session {} has not materialized; cannot fork.",
+                            session.placeholder_id
+                        ),
+                    }),
+                ));
+                return;
+            };
+            (
+                real_id,
+                session.cwd.clone(),
+                session.model.clone(),
+                session.effort.clone(),
+            )
+        };
+
+        // The selected-turn knob (REVIEWED, fresh-eyes F4/F5): the probed opencode
+        // 1.18.18 `POST /session/:id/fork` body schema is `{messageID?: ^msg…}` with
+        // `additionalProperties:false`, so the client's `input.atTurnId` passes as
+        // `messageID` ONLY when it is opencode-message-shaped (`^msg`); anything else
+        // is dropped and the fork proceeds from the tip.
+        let message_id = msg
+            .input
+            .as_ref()
+            .and_then(|input| input.get("atTurnId"))
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("msg"));
+
+        let manager = self.fresh_agent.ensure_manager().await;
+        let child = match manager.fork(&real_id, &route, message_id).await {
+            Ok(child) => child,
+            Err(err) => {
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "INTERNAL_ERROR",
+                        "message": err.to_string(),
+                    }),
+                ));
+                return;
+            }
+        };
+
+        // A pathological 200 body without a usable `id` parses to an EMPTY child id
+        // (serve.rs `ForkedSession.id` defaults to ""); treat it as a serve failure —
+        // reply and NEVER register/bind a "" child (a wrong "success" that would
+        // repoint the pane at a garbage session).
+        if child.id.trim().is_empty() {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": format!(
+                        "OpenCode serve fork of session {} returned a malformed response: missing session \"id\".",
+                        real_id
+                    ),
+                }),
+            ));
+            return;
+        }
+
+        // adapter.ts fork:1005-1020 — the child lands in the SAME session map (its
+        // placeholder IS its durable id), inherits model/effort from the parent, takes
+        // cwd from `child.directory ?? state.cwd`, and gets its own serve-SSE bridge
+        // (`bindServeStream(childState)`).
+        let child_cwd = child
+            .directory
+            .clone()
+            .filter(|d| !d.is_empty())
+            .or(route.clone());
+        let mut child_session = OpencodeSession::new(
+            child.id.clone(),
+            child_cwd.clone(),
+            model.clone(),
+            effort.clone(),
+        );
+        child_session.real_session_id = Some(child.id.clone());
+        child_session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager,
+            child.id.clone(),
+            child_session.turn_errored.clone(),
+        ));
+        self.sessions
+            .lock()
+            .await
+            .insert(child.id.clone(), Arc::new(TokioMutex::new(child_session)));
+
+        // P1.13: binding row for the child (the materialization record pattern,
+        // `_pattern :600-626`) — AWAITED BEFORE the forked reply
+        // (durable-before-answer). Opencode has no sandbox/permission concepts —
+        // always `None`.
+        self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: PROVIDER.into(),
+            session_id: child.id.clone(),
+            mode: SESSION_TYPE.into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model,
+                sandbox: None,
+                permission_mode: None,
+                effort,
+                cwd: child_cwd.clone(),
+            },
+        })
+        .await;
+
+        reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
+            request_id: msg.request_id.clone(),
+            parent_session_id: msg.session_id.clone(),
+            session_id: child.id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            provider: PROVIDER.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: child.id.clone(),
+            }),
+        }));
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -1124,33 +1570,22 @@ impl FreshOpencodeState {
         // (durable-before-answer), and ONLY when a record was actually recovered: never
         // launder a defaults row for a never-recorded session (V7).
         if recovered.is_some() {
-            if let Some(sink) = sink {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: session_id.to_string(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: None,
-                        resolves_pending: None,
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: rec.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: rec.effort.clone(),
-                            cwd,
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        session_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: session_id.to_string(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: rec.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: rec.effort.clone(),
+                    cwd,
+                },
+            })
+            .await;
         }
 
         Ok(session_arc)
@@ -1289,6 +1724,34 @@ fn error_event(session_id: &str, message: &str) -> Value {
 /// positive-completion chime, adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+}
+
+/// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
+/// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
+/// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
+/// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
+/// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
+/// session's monotonic turn-complete clock.
+fn settle_turn_outcome(
+    fresh_agent: &FreshAgentState,
+    real_id: &str,
+    succeeded: bool,
+    turn_aborted: &AtomicBool,
+    turn_errored: &AtomicBool,
+    last_turn_complete_at: &StdMutex<Option<i64>>,
+) {
+    fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
+    if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
+        let at = {
+            let mut guard = last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            let at = next_monotonic_turn_complete_at(*guard, now_ms());
+            *guard = Some(at);
+            at
+        };
+        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    }
 }
 
 /// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
@@ -2865,6 +3328,1441 @@ mod tests {
         assert!(
             !saw_complete,
             "an errored turn must never emit turn.complete"
+        );
+    }
+
+    // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
+
+    fn compact_msg(session_id: &str) -> FreshAgentCompact {
+        FreshAgentCompact {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            instructions: None,
+        }
+    }
+
+    /// One recorded fake-serve request.
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        url: String,
+        body: Option<Value>,
+    }
+
+    /// The compact-suite serve fake: records EVERY request, scripts `/config`, fails
+    /// summarize on demand, and re-arms a per-session busy budget (two polls) on every
+    /// `prompt_async`/`summarize` POST so `await_idle`'s status-poll fallback resolves
+    /// deterministically. `summarize` additionally pins the reviewed lifecycle ORDER:
+    /// drained synchronously from its own bus probe, the LAST session snapshot before
+    /// the POST must be the busy `running` one (the busy indicator is visible before
+    /// the upstream request settles).
+    struct CompactFakeHttp {
+        next_session: AtomicUsize,
+        requests: StdMutex<Vec<RecordedRequest>>,
+        busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
+        summarize_fails: bool,
+        config_body: Vec<u8>,
+        bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
+        /// D1-F1: when set, the summarize POST parks on `notified()` AFTER
+        /// recording itself + the order pin — a deterministic "compact in
+        /// flight" window for the kill/interrupt lifecycle tests.
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl CompactFakeHttp {
+        fn new(
+            config_body: Vec<u8>,
+            summarize_fails: bool,
+            bus_probe: tokio::sync::broadcast::Receiver<String>,
+            summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        ) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                requests: StdMutex::new(Vec::new()),
+                busy_budget: StdMutex::new(std::collections::HashMap::new()),
+                summarize_fails,
+                config_body,
+                bus_probe: StdMutex::new(bus_probe),
+                summarize_gate,
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn summarize_requests(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.contains("/summarize"))
+                .collect()
+        }
+
+        fn get_config_count(&self) -> usize {
+            self.recorded()
+                .iter()
+                .filter(|r| r.method == "GET" && r.url.contains("/config"))
+                .count()
+        }
+
+        /// Synchronously drain the bus probe and return the LAST `running`/`idle`
+        /// snapshot status seen for `session_id`, if any.
+        fn last_snapshot_status_for(&self, session_id: &str) -> Option<String> {
+            let mut last = None;
+            let mut probe = self.bus_probe.lock().expect("bus probe mutex");
+            while let Ok(text) = probe.try_recv() {
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if v["type"] == "freshAgent.event"
+                    && v["sessionId"] == session_id
+                    && v["event"]["type"] == "freshAgent.session.snapshot"
+                {
+                    last = v["event"]["status"].as_str().map(str::to_string);
+                }
+            }
+            last
+        }
+    }
+
+    impl ServeHttp for CompactFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body_value = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.requests
+                .lock()
+                .expect("requests mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body: body_value,
+                });
+
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
+            if method == "POST" && (req.url.ends_with("/session") || req.url.contains("/session?"))
+            {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body =
+                    serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
+                        .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "POST" && req.url.contains("/summarize") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                // ORDER PIN: the busy snapshot must already be on the bus when the
+                // summarize POST lands (reviewed lifecycle: running FIRST, then POST).
+                assert_eq!(
+                    self.last_snapshot_status_for(&id).as_deref(),
+                    Some("running"),
+                    "the busy `running` snapshot must precede the summarize POST"
+                );
+                if self.summarize_fails {
+                    return Box::pin(async {
+                        Ok(ServeHttpResponse::new(500, b"summarize exploded".to_vec()))
+                    });
+                }
+                self.busy_budget
+                    .lock()
+                    .expect("busy budget mutex")
+                    .insert(id, 2);
+                let gate = self.summarize_gate.clone();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(200, b"true".to_vec()))
+                });
+            }
+            if method == "POST" && req.url.contains("/prompt_async") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                self.busy_budget
+                    .lock()
+                    .expect("busy budget mutex")
+                    .insert(id, 2);
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if method == "GET" && req.url.contains("/session/status") {
+                let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
+                let mut map = serde_json::Map::new();
+                for (id, budget) in budgets.iter_mut() {
+                    if *budget > 0 {
+                        *budget -= 1;
+                        map.insert(id.clone(), json!({ "type": "busy" }));
+                    }
+                }
+                let body = serde_json::to_vec(&Value::Object(map)).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "GET" && req.url.contains("/config") {
+                let body = self.config_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`CompactFakeHttp`]-backed serve manager,
+    /// returning the state, the fake, and a bus receiver subscribed BEFORE any handler
+    /// runs.
+    async fn compact_state(
+        config_body: &str,
+        summarize_fails: bool,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        compact_state_gated(config_body, summarize_fails, None).await
+    }
+
+    /// [`compact_state`] with an optional summarize gate (D1-F1: a deterministic
+    /// in-flight-compact window for the kill/interrupt lifecycle tests).
+    async fn compact_state_gated(
+        config_body: &str,
+        summarize_fails: bool,
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let http = Arc::new(CompactFakeHttp::new(
+            config_body.as_bytes().to_vec(),
+            summarize_fails,
+            tx.subscribe(),
+            summarize_gate,
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), http, rx)
+    }
+
+    /// Insert a directly-materialized session (no send drove it) with the given model.
+    async fn insert_compact_session(st: &FreshOpencodeState, id: &str, model: Option<&str>) {
+        let mut session =
+            OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
+        session.real_session_id = Some(id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+    }
+
+    /// Drain every buffered bus frame in arrival order (full parsed payloads).
+    fn drain_frames(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            out.push(v);
+        }
+        out
+    }
+
+    /// Collect bus frames (in arrival order) until `pred` matches one of them,
+    /// returning everything seen INCLUDING the matching frame. Bounded: panics
+    /// after 5s with no match, so a missing terminal frame fails loudly instead
+    /// of hanging the suite. Needed wherever a handler's settle tail runs in a
+    /// DETACHED driving task (D1-F1: a compact's settle lives on the session's
+    /// `turn_task`, exactly like a send turn's).
+    async fn frames_until(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let raw = rx.recv().await.expect("the bus stays open");
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let hit = pred(&v);
+                out.push(v);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a matching frame arrives within the budget");
+        out
+    }
+
+    /// `true` when `frame` is a `freshAgent.event` whose inner `event.type == wanted`
+    /// (and, when given, whose inner `status == status`).
+    fn is_event(frame: &Value, wanted: &str, status: Option<&str>) -> bool {
+        frame["type"] == "freshAgent.event"
+            && frame["event"]["type"] == wanted
+            && status
+                .map(|s| frame["event"]["status"] == s)
+                .unwrap_or(true)
+    }
+
+    #[tokio::test]
+    async fn compact_posts_summarize_with_the_session_model_then_busy_idle_and_one_chime() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+
+        // The pane's Compact click carries instructions, but opencode's summarize
+        // schema has NO instructions field -- they are deliberately DROPPED.
+        let mut msg = compact_msg("ses_1");
+        msg.instructions = Some("focus the diff".to_string());
+        st.handle_compact(msg).await;
+
+        // The drive is detached+registered (D1-F1): await its terminal chime so
+        // the POST/idle assertions below never race the spawned task.
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+
+        let summarize = http.summarize_requests();
+        assert_eq!(summarize.len(), 1, "exactly one summarize POST");
+        assert!(summarize[0].url.contains("/session/ses_1/summarize"));
+        let body = summarize[0].body.clone().expect("a JSON body");
+        let obj = body.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "additionalProperties:false — EXACTLY providerID+modelID: {body}"
+        );
+        assert_eq!(body["providerID"], "prov-a");
+        assert_eq!(body["modelID"], "mdl-x");
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "a splittable session model wins -- /config is NOT consulted"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "busy snapshot present: {frames:?}"
+        );
+        let idle_idx = frames
+            .iter()
+            .position(|f| is_event(f, "freshAgent.session.snapshot", Some("idle")))
+            .expect("an idle snapshot was broadcast");
+        let complete_idx = frames
+            .iter()
+            .position(|f| is_event(f, "freshAgent.turn.complete", None))
+            .expect("the gated turn.complete was broadcast");
+        assert!(
+            idle_idx < complete_idx,
+            "idle precedes the chime: {frames:?}"
+        );
+        assert!(
+            frames[complete_idx]["event"]["at"].as_i64().unwrap_or(0) > 0,
+            "the chime carries a positive monotonic at: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_falls_back_to_the_serve_config_model_when_the_session_has_none() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":"conf-prov/conf-mdl","theme":"dark"}"#, false).await;
+        // A resumed session never touched by a send can carry NO model.
+        insert_compact_session(&st, "ses_1", None).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        // GET /config ran inline (pre-spawn); the POST runs on the detached
+        // drive — await its terminal chime before asserting over it.
+        assert_eq!(http.get_config_count(), 1, "GET /config ran exactly once");
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+        let summarize = http.summarize_requests();
+        assert_eq!(summarize.len(), 1);
+        let body = summarize[0].body.clone().unwrap();
+        assert_eq!(body["providerID"], "conf-prov");
+        assert_eq!(body["modelID"], "conf-mdl");
+
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "resolution via /config still completes: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_with_no_resolvable_model_errors_loudly_and_never_posts() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        // An unsplittable session model forces the /config fallback, which is null.
+        insert_compact_session(&st, "ses_1", Some("noslash")).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert_eq!(
+            http.get_config_count(),
+            1,
+            "the unsplittable session model did consult /config"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "NO POST when no model pair is resolvable"
+        );
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "the busy snapshot precedes the resolution attempt: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane is NOT left stuck busy: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "no false success chime: {frames:?}"
+        );
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD (a freshAgent.error frame)");
+        assert_eq!(
+            error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED",
+            "{error_frame}"
+        );
+        let message = error_frame["event"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.to_ascii_lowercase().contains("compact"),
+            "the message names the failed compact: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_on_a_not_yet_materialized_session_is_a_silent_noop() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+
+        st.handle_create(create_msg("req-noop")).await;
+        let placeholder = "freshopencode-req-noop";
+        // Drain the freshAgent.created frame.
+        assert!(rx.try_recv().is_ok());
+
+        st.handle_compact(compact_msg(placeholder)).await;
+
+        assert!(
+            http.summarize_requests().is_empty(),
+            "unmaterialized -> NO POST at all (legacy adapter.ts:992-994)"
+        );
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "unmaterialized -> no model resolution either"
+        );
+        assert!(rx.try_recv().is_err(), "a silent no-op broadcasts NOTHING");
+    }
+
+    #[tokio::test]
+    async fn compact_after_an_interrupted_or_errored_turn_resets_the_stale_flags_and_chimes() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+            let session = session_arc.lock().await;
+            // Stale flags from a prior interrupted AND errored turn: a compact that
+            // completes successfully MUST still chime (they get reset FIRST).
+            session.turn_aborted.store(true, Ordering::SeqCst);
+            session.turn_errored.store(true, Ordering::SeqCst);
+        }
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+        assert_eq!(http.summarize_requests().len(), 1);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "stale aborted/errored flags must not suppress this compact's completion: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, true).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        // The failure settles on the detached drive (D1-F1): the terminal frame
+        // is the loud error (idle precedes it inside the settle tail).
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "busy shown first: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane returns to idle even on failure (legacy emitStatus idle): {frames:?}"
+        );
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("a loud freshAgent.error");
+        assert_eq!(
+            error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED",
+            "{error_frame}"
+        );
+        assert!(
+            error_frame["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("summarize exploded"),
+            "the serve error text crosses the wire: {error_frame}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "a serve error never fabricates a completion: {frames:?}"
+        );
+    }
+
+    // ── D1-F1: compact is turn-scoped — busy refusal + kill/interrupt ──────
+
+    /// Wait (bounded) until the fake has recorded its first summarize POST —
+    /// with the gated fake this is the deterministic "compact parked mid-drive"
+    /// state for the kill/interrupt tests below.
+    async fn await_summarize_posted(http: &Arc<CompactFakeHttp>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !http.summarize_requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the summarize POST lands within the budget");
+    }
+
+    /// D1-F1(a): the composer stays interactive while a session is busy, so a
+    /// `/compact` gesture CAN arrive while a turn is in flight. The compact
+    /// must be REFUSED with a nested `freshAgent.error{INTERNAL_ERROR}` naming
+    /// the in-flight turn — and must never reach the summarize POST (a second
+    /// idle-waiter on one edge would settle both operations and produce a
+    /// false/duplicate completion). This refusal EXCEEDS legacy: the Node
+    /// adapter CHAINS compact onto `state.sendQueue` (adapter.ts:992); we
+    /// refuse loudly instead of queueing.
+    #[tokio::test]
+    async fn compact_while_a_turn_is_in_flight_is_refused_and_never_posts() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+        // A genuinely in-flight turn (never resolves) parked as the session's
+        // driving task — the exact state a queued-send busy pane leaves behind.
+        session_arc.lock().await.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Send,
+            handle: tokio::spawn(std::future::pending::<()>()),
+        });
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert!(
+            http.summarize_requests().is_empty(),
+            "a busy session must NEVER reach the summarize POST"
+        );
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "a refused compact resolves no model pair"
+        );
+        let frames = drain_frames(&mut rx);
+        let refusal = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the refusal is a LOUD nested freshAgent.error");
+        assert_eq!(refusal["event"]["code"], "INTERNAL_ERROR", "{refusal}");
+        assert!(
+            refusal["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("turn is in progress"),
+            "the message names the in-flight turn: {refusal}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "a refusal never chimes: {frames:?}"
+        );
+        // The in-flight turn's task is untouched — still registered, still running.
+        let task = session_arc
+            .lock()
+            .await
+            .turn_task
+            .take()
+            .expect("the refusal must not steal the turn's task");
+        assert!(
+            !task.is_finished(),
+            "the refused compact left the turn alone"
+        );
+        task.abort();
+    }
+
+    /// D1-F1(b): the compact's driving task is the session's `turn_task`, so a
+    /// `freshAgent.kill` mid-compact aborts it — dropped mid-await, it never
+    /// reaches the settle tail: NO false `freshAgent.turn.complete` (and the
+    /// released gate resurrects nothing).
+    #[tokio::test]
+    async fn kill_during_an_in_flight_compact_aborts_it_without_a_false_completion() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        // The handler spawns + registers the driving task, then returns — the
+        // drive runs DETACHED (a pre-fix regression would block inline on the
+        // gate here, which the timeout turns into a clean failure).
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+
+        {
+            let session = session_arc.lock().await;
+            let task = session
+                .turn_task
+                .as_ref()
+                .expect("the compact's driving task is registered as turn_task");
+            assert!(
+                !task.is_finished(),
+                "the registered compact is parked on the summarize gate"
+            );
+        }
+        // Wait until the summarize POST is parked on the gate — deterministically
+        // in-flight — before the kill lands.
+        await_summarize_posted(&http).await;
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_1").await,
+            "kill removes the session's bookkeeping"
+        );
+        gate.notify_waiters(); // released AFTER the abort: nothing may resume
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "the compact's busy snapshot was broadcast: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
+            "the kill frame was broadcast: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "an aborted compact must NEVER fabricate a turn-complete: {frames:?}"
+        );
+    }
+
+    /// D1-F1(b), symmetric interrupt case: `freshAgent.interrupt` mid-compact
+    /// sets `turn_aborted` BEFORE aborting the registered task and issues the
+    /// best-effort serve abort — the pane hears the interrupt's idle and NEVER
+    /// a chime (even a settle that outran the abort would be gated by the flag).
+    #[tokio::test]
+    async fn interrupt_during_an_in_flight_compact_aborts_it_and_emits_idle_without_a_chime() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+        await_summarize_posted(&http).await;
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        gate.notify_waiters(); // the aborted task can never consume this
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the interrupt's own idle snapshot lands: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "an interrupted compact must NEVER fabricate a turn-complete: {frames:?}"
+        );
+        assert!(
+            http.recorded().iter().any(|r| r.url.contains("/abort")),
+            "the best-effort serve abort reached the fake"
+        );
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true),
+            "the interrupt took + aborted the compact's registered task"
+        );
+    }
+
+    /// D2-F1 (delta-review round 2): the composer stays interactive while a session
+    /// is busy, so a send CAN arrive mid-compact. The send must be REFUSED — a nested
+    /// `freshAgent.event{freshAgent.error{INTERNAL_ERROR}}` naming the compact — rather
+    /// than overwriting the compact's registered `turn_task`: such an overwrite would
+    /// disconnect kill/interrupt from the still-running compact drive and let ONE idle
+    /// edge settle both operations (a false/duplicate completion). The refused send
+    /// takes NO other action (no prompt POST, no send.accepted, no busy snapshot), the
+    /// compact's task stays registered, and a later kill still aborts it.
+    #[tokio::test]
+    async fn send_during_an_in_flight_compact_is_refused_and_leaves_the_compact_owned() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        // The handler spawns + registers the compact drive, then returns.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+        await_summarize_posted(&http).await; // the compact is deterministically in flight
+
+        // The mid-compact send is refused inline (never waits on upstream, never
+        // spawns a drive): a clean inline-return assertion pins that ordering.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_send(send_msg("ses_1", "mid-compact")),
+        )
+        .await
+        .expect("the mid-compact send is refused inline, never upstream-blocking");
+
+        let frames = drain_frames(&mut rx);
+        let refusal = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the refused send answers a LOUD nested freshAgent.error");
+        assert_eq!(refusal["event"]["code"], "INTERNAL_ERROR", "{refusal}");
+        assert!(
+            refusal["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("compact"),
+            "the message names the in-flight compact: {refusal}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f["type"] == "freshAgent.send.accepted"),
+            "a refused send never broadcasts send.accepted: {frames:?}"
+        );
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("/prompt_async")),
+            "a refused send never reaches the prompt POST"
+        );
+
+        // The compact's driving task is STILL the registered turn task (never stolen).
+        let still_live = {
+            let session = session_arc.lock().await;
+            session
+                .turn_task
+                .as_ref()
+                .map(|t| !t.is_finished())
+                .unwrap_or(false)
+        };
+        assert!(
+            still_live,
+            "the refused send must not overwrite the compact's registered task"
+        );
+
+        // The ownership invariant holds end-to-end: a kill mid-compact aborts the
+        // registered drive — no false completion after the gate releases.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
+            "the kill frame lands: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "the aborted compact never fabricates a turn-complete: {frames:?}"
+        );
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true),
+            "the kill took + aborted the compact's registered task"
+        );
+    }
+
+    // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
+
+    fn fork_msg(session_id: &str, request_id: &str, at_turn_id: Option<&str>) -> FreshAgentFork {
+        FreshAgentFork {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            input: at_turn_id.map(|id| json!({ "atTurnId": id })),
+            request_id: Some(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    /// A `FrameSink` that records every delivered frame — the requesting
+    /// connection's sink the fork handler answers on (`conn_sink` in terminal.rs).
+    fn capturing_sink() -> (FrameSink, Arc<StdMutex<Vec<ServerMessage>>>) {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let sink: FrameSink = {
+            let captured = captured.clone();
+            Arc::new(move |msg| captured.lock().expect("captured mutex").push(msg))
+        };
+        (sink, captured)
+    }
+
+    /// The fork-suite serve fake: records EVERY request and scripts the
+    /// `POST /session/:id/fork` response (`fork_status` + `fork_body`).
+    struct ForkFakeHttp {
+        requests: StdMutex<Vec<RecordedRequest>>,
+        fork_status: u16,
+        fork_body: Vec<u8>,
+        /// D2-F2 test seam: when set, the FIRST fork POST records itself then parks on
+        /// `notified()` — a deterministic "fork in flight" window. `take()` one-shots
+        /// it, so a later fork proceeds without needing a second release.
+        fork_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+    }
+
+    impl ForkFakeHttp {
+        fn child_ok() -> Self {
+            Self {
+                requests: StdMutex::new(Vec::new()),
+                fork_status: 200,
+                fork_body: br#"{"id":"ses_child","directory":"/forked/dir"}"#.to_vec(),
+                fork_gate: StdMutex::new(None),
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn fork_requests(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.contains("/fork"))
+                .collect()
+        }
+    }
+
+    impl ServeHttp for ForkFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body_value = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.requests
+                .lock()
+                .expect("requests mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body: body_value,
+                });
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if method == "POST" && req.url.contains("/fork") {
+                let status = self.fork_status;
+                let body = self.fork_body.clone();
+                let gate = self.fork_gate.lock().expect("fork gate mutex").take();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(status, body))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`ForkFakeHttp`]-backed serve manager.
+    async fn fork_state(http: Arc<ForkFakeHttp>) -> FreshOpencodeState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        FreshOpencodeState::new(fresh_agent)
+    }
+
+    /// Insert a directly-materialized parent session (no send drove it) with the
+    /// given settings.
+    async fn insert_fork_parent(
+        st: &FreshOpencodeState,
+        id: &str,
+        cwd: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        let mut session = OpencodeSession::new(
+            id.to_string(),
+            cwd.map(str::to_string),
+            model.map(str::to_string),
+            effort.map(str::to_string),
+        );
+        session.real_session_id = Some(id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+    }
+
+    #[tokio::test]
+    async fn fork_registers_the_child_and_replies_forked_on_the_requesting_sink() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(
+            &st,
+            "ses_parent",
+            Some("/parent/cwd"),
+            Some("prov-a/mdl-x"),
+            Some("low"),
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), sink)
+            .await;
+
+        // The exact `freshAgent.forked` reply — every field, request_id echoed
+        // (the client matches on requestId + parentSessionId to repoint the pane).
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            frames,
+            vec![ServerMessage::FreshAgentForked(FreshAgentForked {
+                request_id: Some("fork-req-1".to_string()),
+                parent_session_id: "ses_parent".to_string(),
+                session_id: "ses_child".to_string(),
+                session_type: "freshopencode".to_string(),
+                provider: "opencode".to_string(),
+                runtime_provider: "opencode".to_string(),
+                session_ref: Some(SessionLocator {
+                    provider: "opencode".to_string(),
+                    session_id: "ses_child".to_string(),
+                }),
+            })],
+            "exactly one forked reply on the requesting sink"
+        );
+
+        // The child session is registered: bridge started, settings inherited from
+        // the parent, cwd from the fork response's directory (legacy
+        // `child.directory ?? state.cwd`, adapter.ts fork).
+        assert!(st.has_live_session("ses_child").await);
+        let child = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_child")
+            .cloned()
+            .expect("the child is in the session map");
+        {
+            let child = child.lock().await;
+            assert_eq!(child.placeholder_id, "ses_child");
+            assert_eq!(child.real_session_id.as_deref(), Some("ses_child"));
+            assert_eq!(child.cwd.as_deref(), Some("/forked/dir"));
+            assert_eq!(child.model.as_deref(), Some("prov-a/mdl-x"));
+            assert_eq!(child.effort.as_deref(), Some("low"));
+            assert!(
+                child.serve_bridge.is_some(),
+                "the child's serve-SSE bridge started (bindServeStream)"
+            );
+        }
+
+        // The identity row for the child was recorded (materialization pattern).
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == "ses_child")
+            .expect("a binding row for the forked child");
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.mode, "freshopencode");
+        assert_eq!(b.settings.model.as_deref(), Some("prov-a/mdl-x"));
+        assert_eq!(b.settings.effort.as_deref(), Some("low"));
+        assert_eq!(b.settings.cwd.as_deref(), Some("/forked/dir"));
+
+        // No atTurnId → the legacy no-body fork POST.
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1, "exactly one fork POST");
+        assert!(forks[0].url.contains("/session/ses_parent/fork"));
+        assert!(
+            forks[0].url.contains("directory=%2Fparent%2Fcwd"),
+            "the parent's cwd crosses as the `directory=` route query (with_route propagation): {}",
+            forks[0].url
+        );
+        assert!(forks[0].body.is_none(), "no atTurnId -> no body: {forks:?}");
+    }
+
+    #[tokio::test]
+    async fn fork_child_inherits_the_parent_cwd_when_the_response_carries_no_directory() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_body = br#"{"id":"ses_child"}"#.to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), sink)
+            .await;
+
+        assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
+        let child = st.sessions.lock().await.get("ses_child").cloned().unwrap();
+        let child = child.lock().await;
+        assert_eq!(
+            child.cwd.as_deref(),
+            Some("/parent/cwd"),
+            "child.directory ?? state.cwd (adapter.ts fork)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_on_an_unmaterialized_placeholder_replies_invalid_session_id_and_posts_nothing() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        st.handle_create(create_msg("req-fork")).await;
+        let placeholder = "freshopencode-req-fork";
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["provider"], "opencode");
+        assert_eq!(v["sessionId"], placeholder);
+        assert_eq!(v["sessionType"], "freshopencode");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INVALID_SESSION_ID");
+        let message = v["event"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("has not materialized; cannot fork"),
+            "the legacy parity text (adapter.ts:403): {message}"
+        );
+        assert!(
+            http.fork_requests().is_empty(),
+            "unmaterialized -> NO POST at all (legacy throws before serveManager.fork)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_on_an_unknown_session_replies_the_lost_session_shape() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(
+            v["event"]["code"], "INVALID_SESSION_ID",
+            "the lost-session shape the client folds into recovery (never silence): {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_serve_error_replies_internal_error_and_registers_no_child() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_status = 500;
+        fake.fork_body = b"fork exploded".to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            frames.len(),
+            1,
+            "failure-without-reply is the exact defect class this kills"
+        );
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert!(
+            v["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the serve error text crosses the reply: {v}"
+        );
+        assert_eq!(http.fork_requests().len(), 1, "the POST did land");
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "no child insert on failure"
+        );
+    }
+
+    /// D2-F2 (delta-review round 2): the client leaves the Fork action enabled while a
+    /// fork is in flight, so a rapid duplicate click would otherwise mint TWO children
+    /// for one parent — once the first reply re-keys the pane and kills the parent, the
+    /// second reply can no longer correlate, leaving its child (a live serve session +
+    /// local registration) UNOWNED. The duplicate must be refused ON THE REQUESTING
+    /// SINK (nested `freshAgent.error{INTERNAL_ERROR}`) with NO second fork POST and no
+    /// other action; when the first fork completes, the guard releases and a fresh
+    /// fork for the same parent proceeds.
+    #[tokio::test]
+    async fn fork_duplicate_in_flight_is_refused_and_releases_on_success() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = ForkFakeHttp::child_ok();
+        *fake.fork_gate.lock().expect("fork gate mutex") = Some(gate.clone());
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+        // Fork #1 parks mid-POST — the duplicate click's deterministic in-flight window.
+        let (sink1, captured1) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), sink1)
+                    .await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !http.fork_requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first fork POST lands within the budget");
+
+        // Fork #2 — the duplicate — is refused INLINE (never waits upstream).
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), sink2),
+        )
+        .await
+        .expect("the duplicate fork is refused inline, never upstream-blocking");
+
+        let frames = captured2.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the refusal ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["sessionId"], "ses_parent");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert!(
+            v["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already in progress"),
+            "the refusal names the in-flight fork: {v}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            1,
+            "the duplicate takes NO action — no second fork POST"
+        );
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "the duplicate registers no child"
+        );
+
+        // Release fork #1: it completes with the forked reply, and the guard's
+        // release lets a fresh fork for the same parent reach the wire.
+        gate.notify_waiters();
+        driver.await.expect("fork #1 task");
+        let frames1 = captured1.lock().expect("captured mutex").clone();
+        assert!(
+            matches!(frames1.as_slice(), [ServerMessage::FreshAgentForked(_)]),
+            "fork #1 completes with the forked reply: {frames1:?}"
+        );
+
+        let (sink3, captured3) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), sink3)
+            .await;
+        let frames3 = captured3.lock().expect("captured mutex").clone();
+        assert!(
+            matches!(frames3.as_slice(), [ServerMessage::FreshAgentForked(_)]),
+            "a post-completion fork for the same parent proceeds: {frames3:?}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            2,
+            "the guard released on success — the retry reached the wire"
+        );
+    }
+
+    /// D2-F2: the in-flight guard releases on EVERY terminal path — after a serve
+    /// failure a refreshed Fork click for the same parent must reach the wire again
+    /// (a stranded guard would refuse the session's forks forever).
+    #[tokio::test]
+    async fn fork_in_flight_guard_releases_on_the_failure_path() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_status = 500;
+        fake.fork_body = b"fork exploded".to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink1, captured1) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), sink1)
+            .await;
+        let frames1 = captured1.lock().expect("captured mutex").clone();
+        let v1 = serde_json::to_value(&frames1[0]).unwrap();
+        assert!(
+            v1["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the first fork fails on the serve error leg (NOT an in-flight refusal): {v1}"
+        );
+
+        // The retry reaches the wire — the failure path released the guard.
+        let (sink2, captured2) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), sink2)
+            .await;
+        let frames2 = captured2.lock().expect("captured mutex").clone();
+        let v2 = serde_json::to_value(&frames2[0]).unwrap();
+        assert!(
+            v2["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the retry fails on the serve error too (not stranded on the guard): {v2}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            2,
+            "the retry reached the fake — the guard released on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_malformed_child_response_replies_internal_error_and_registers_no_child() {
+        // A pathological 200 fork body without a usable `id` yields an EMPTY child id
+        // from the serve parse (serve.rs `ForkedSession.id` defaults to "") — treat it
+        // as a serve failure (nested INTERNAL_ERROR naming the malformed response) and
+        // NEVER register/bind a "" child (a wrong "success" that would repoint the
+        // pane at a garbage session). Both the missing-id and blank-id shapes:
+        for body in [b"{}".to_vec(), br#"{"id":"   "}"#.to_vec()] {
+            let mut fake = ForkFakeHttp::child_ok();
+            fake.fork_body = body;
+            let http = Arc::new(fake);
+            let st = fork_state(http.clone()).await;
+            let identity = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            st.set_identity_sink(identity.clone());
+            insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+            let (sink, captured) = capturing_sink();
+            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), sink)
+                .await;
+
+            let frames = captured.lock().expect("captured mutex").clone();
+            assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+            let v = serde_json::to_value(&frames[0]).unwrap();
+            assert_eq!(v["type"], "freshAgent.event");
+            assert_eq!(v["event"]["type"], "freshAgent.error");
+            assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+            assert!(
+                v["event"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("missing session \"id\""),
+                "the message names the malformed fork response: {v}"
+            );
+            assert_eq!(http.fork_requests().len(), 1, "the fork POST did land");
+            let sessions = st.sessions.lock().await;
+            let keys: Vec<&String> = sessions.keys().collect();
+            assert_eq!(sessions.len(), 1, "no child insert at all: {keys:?}");
+            assert!(
+                !sessions.contains_key(""),
+                "no child registration under the empty id"
+            );
+            drop(sessions);
+            assert!(
+                identity.bindings.lock().unwrap().is_empty(),
+                "no binding row for a malformed child"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_msg_shaped_at_turn_id_passes_it_as_message_id() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), sink)
+            .await;
+
+        assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(
+            forks[0].body.clone().expect("a messageID body"),
+            json!({ "messageID": "msg_abc" }),
+            "the selected-turn knob: the strict-schema body carries EXACTLY messageID"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_non_msg_at_turn_id_omits_message_id_entirely() {
+        // A non-`msg` atTurnId is DROPPED and the fork proceeds from the tip — the
+        // strict `additionalProperties:false` 1.18.18 schema must never receive an
+        // unknown/malformed keying (probed: GET /doc `{messageID?: ^msg…}`).
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg("ses_parent", "fork-req-7", Some("not-a-msg")),
+            sink,
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "the fork still proceeded from the tip"
+        );
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1, "the fork POST landed");
+        assert!(
+            forks[0].body.is_none(),
+            "the strict schema never receives a non-msg id: {forks:?}"
         );
     }
 

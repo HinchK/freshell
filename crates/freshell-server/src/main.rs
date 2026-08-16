@@ -1446,11 +1446,14 @@ async fn main() -> ExitCode {
     // The fresh-agent thread-snapshot REST endpoint (Batch D PR-5): `GET
     // /api/fresh-agent/threads/:sessionType/:provider/:threadId`, the SPA's
     // `commitSnapshot` read path (`src/lib/api.ts:312` `getFreshAgentThreadSnapshot`).
-    // Shares the already-constructed codex/opencode slices -- no new session state.
+    // Shares the already-constructed codex/opencode/claude slices -- no new session
+    // state. The claude slice feeds the Task 3 live-pending overlay (cards survive
+    // reload: `capabilities.approvals/questions` + `pendingApprovals/pendingQuestions`).
     let snapshot_state = freshell_freshagent::SnapshotState::new(
         Arc::clone(&auth_token),
         fresh_codex_state.clone(),
         fresh_agent_state.clone(),
+        fresh_claude_state.clone(),
     );
 
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
@@ -2329,12 +2332,27 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
     false
 }
 
+/// Legacy `platform-router.ts:15-18` parity for the kilroy feature flag:
+/// `isTruthy(process.env.KILROY_ENABLED)` is EXACTLY
+/// `value === '1' || value.toLowerCase() === 'true'` — the validated truthy set is
+/// {'1', any case variant of 'true'}; unset/empty/'0'/'yes'/'on' are all FALSE (the
+/// 'yes'-accepting helper in `server/cli/index.ts:106` is a DIFFERENT function —
+/// do NOT mirror it). A non-Unicode value reads as Err → FALSE (Node would see
+/// replacement characters, never '1'/'true').
+fn kilroy_enabled_flag() -> bool {
+    match std::env::var("KILROY_ENABLED") {
+        Ok(value) => value == "1" || value.to_lowercase() == "true",
+        Err(_) => false,
+    }
+}
+
 /// Build the `{ platform, availableClis, hostName, featureFlags }` payload the
 /// SPA reads on boot (mirrors `server/platform-router.ts`). `platform` is the
 /// real `/proc/version`-derived string (`detect_platform_proc`); `availableClis`
 /// is the extension-driven `which`/`where.exe` detection result (Follow-up 3.19,
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
-/// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
+/// is the legacy `isTruthy(process.env.KILROY_ENABLED)` read
+/// (`platform-router.ts:20-29` → [`kilroy_enabled_flag`]); `featureFlags.aiEnabled`
 /// mirrors `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`) — since Task 2
 /// backed by [`ai_title::AiKeyCell::enabled`] (env boot precedence + settings
 /// key fallback), not the raw env var alone.
@@ -2352,7 +2370,7 @@ fn build_platform_payload(
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled, "sessionResolve": true },
+        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true },
     })
 }
 
@@ -3192,6 +3210,80 @@ mod tests {
         assert!(!cell.enabled());
     }
 
+    /// `featureFlags.kilroy` under a given `KILROY_ENABLED` value (`None` = unset).
+    /// Serializes on the crate-wide `HOME_ENV_TEST_LOCK`; [`EnvVarGuard`] restores
+    /// the prior value on drop (panic included), so a real-world `KILROY_ENABLED`
+    /// never leaks across tests in either direction.
+    fn kilroy_flag_for_env(value: Option<&str>) -> bool {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _kilroy = match value {
+            Some(v) => EnvVarGuard::set("KILROY_ENABLED", v),
+            None => EnvVarGuard::unset("KILROY_ENABLED"),
+        };
+        build_platform_payload(serde_json::json!({}), false)["featureFlags"]["kilroy"]
+            .as_bool()
+            .expect("featureFlags.kilroy is always a bool")
+    }
+
+    // `featureFlags.kilroy` mirrors legacy `detectFeatureFlags`'s
+    // `isTruthy(process.env.KILROY_ENABLED)` (server/platform-router.ts:15-18, 20-29):
+    // EXACTLY `value === '1' || value.toLowerCase() === 'true'` — the validated set is
+    // {'1', any case variant of 'true'}; '0'/'yes'/'on'/empty/unset are all FALSE (the
+    // 'yes'-accepting helper in server/cli/index.ts:106 is a DIFFERENT function — do
+    // NOT mirror it). Each env case is its own test under the shared env-mutation lock.
+
+    #[test]
+    fn platform_payload_kilroy_true_when_kilroy_enabled_is_1() {
+        assert!(kilroy_flag_for_env(Some("1")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_true_when_kilroy_enabled_is_true() {
+        assert!(kilroy_flag_for_env(Some("true")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_true_when_kilroy_enabled_is_uppercase_true() {
+        // JS `value.toLowerCase() === 'true'`: 'TRUE' lowercases to 'true' → TRUE.
+        assert!(kilroy_flag_for_env(Some("TRUE")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_true_when_kilroy_enabled_is_mixed_case_true() {
+        assert!(kilroy_flag_for_env(Some("True")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_false_when_kilroy_enabled_unset() {
+        // JS `!value` → false for undefined.
+        assert!(!kilroy_flag_for_env(None));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_false_when_kilroy_enabled_empty() {
+        // JS `!value` → false for ''.
+        assert!(!kilroy_flag_for_env(Some("")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_false_when_kilroy_enabled_is_0() {
+        assert!(!kilroy_flag_for_env(Some("0")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_false_when_kilroy_enabled_is_yes() {
+        // 'yes' is accepted by server/cli/index.ts:106's DIFFERENT helper, not by
+        // the platform feature-flag `isTruthy` — FALSE here.
+        assert!(!kilroy_flag_for_env(Some("yes")));
+    }
+
+    #[test]
+    fn platform_payload_kilroy_false_when_kilroy_enabled_is_on() {
+        assert!(!kilroy_flag_for_env(Some("on")));
+    }
+
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
@@ -3199,7 +3291,12 @@ mod tests {
         // Rust payload. `sessionResolve` is TRUE: the hardened resolve
         // response surface (degraded/providerErrors/unsearchedProviders/
         // homeDir, warming default) landed via the hardened plan Tasks 2-6
-        // (SYNC-06), so the flag is genuinely earned.
+        // (SYNC-06), so the flag is genuinely earned. `KILROY_ENABLED` is pinned
+        // off under the shared lock so the assertion is environment-independent.
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _kilroy = EnvVarGuard::unset("KILROY_ENABLED");
         let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
@@ -3210,6 +3307,10 @@ mod tests {
 
     #[test]
     fn platform_payload_ai_enabled_false_without_key() {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _kilroy = EnvVarGuard::unset("KILROY_ENABLED");
         let cell = ai_title::AiKeyCell::init(None, None);
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(

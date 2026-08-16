@@ -2227,6 +2227,85 @@ pub struct FreshAgentCreateGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// A clone-shared per-key single-flight registry for one-shot runtime operations
+/// (delta-review round 2, D2-F2: `freshAgent.fork` duplicate-click suppression on
+/// BOTH the codex and opencode arms). [`Self::try_acquire`] inserts the key and
+/// hands back an RAII guard; a second acquisition for the SAME key while the guard
+/// is held answers `None` so the caller can refuse loudly. The guard's `Drop`
+/// removes the key, so EVERY handler exit path — success, refusal, and the codex
+/// post-archive containment alike — releases it: no leg can strand the key.
+///
+/// [`Self::try_acquire_pair`] (delta-review round 3) inserts up to TWO keys
+/// atomically under the same map lock: the codex fork guard must cover the
+/// RESOLVED parent id across the mint-new respawn re-key (the materialized
+/// broadcast re-keys the pane mid-flight, so the duplicate click arrives addressed
+/// to a DIFFERENT id than the one clicked) while still holding the clicked id.
+/// Neither key is inserted unless both are free, and the guard releases both in a
+/// single lock acquisition — there is no partial state a racing click could slip
+/// through.
+///
+/// The critical sections are tiny `HashSet` ops, never held across `.await`, so a
+/// plain std mutex suffices (the crate's existing `Arc<Mutex<…>>`-in-std pattern,
+/// e.g. `ClaudeSession.pending`).
+#[derive(Clone, Default)]
+pub(crate) struct InFlightRegistry {
+    keys: Arc<Mutex<HashSet<String>>>,
+}
+
+impl InFlightRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `key`; `None` when an operation for this key is already in flight.
+    /// The returned guard removes the key on drop.
+    pub(crate) fn try_acquire(&self, key: &str) -> Option<InFlightGuard> {
+        self.try_acquire_all(&[key])
+    }
+
+    /// Insert BOTH keys atomically under one map lock; `None` when an operation for
+    /// EITHER key is already in flight (a partial acquisition would leak the
+    /// unguarded key space entirely). The returned guard removes both on drop, also
+    /// under one lock. `first`-equals-`second` degrades to the single-key shape.
+    pub(crate) fn try_acquire_pair(&self, first: &str, second: &str) -> Option<InFlightGuard> {
+        self.try_acquire_all(&[first, second])
+    }
+
+    fn try_acquire_all(&self, keys: &[&str]) -> Option<InFlightGuard> {
+        let mut held: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !held.iter().any(|h| h == key) {
+                held.push((*key).to_string());
+            }
+        }
+        let mut guard = self.keys.lock().expect("in-flight registry lock");
+        if held.iter().any(|key| guard.contains(key)) {
+            return None;
+        }
+        guard.extend(held.iter().cloned());
+        Some(InFlightGuard {
+            keys: Arc::clone(&self.keys),
+            held,
+        })
+    }
+}
+
+/// RAII release for an [`InFlightRegistry`] acquisition: removes its held key(s)
+/// when the driving handler returns, on every terminal path.
+pub(crate) struct InFlightGuard {
+    keys: Arc<Mutex<HashSet<String>>>,
+    held: Vec<String>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut keys = self.keys.lock().expect("in-flight registry lock");
+        for key in &self.held {
+            keys.remove(key);
+        }
+    }
+}
+
 /// RAII holder for a claimed fresh-agent session lease (Task 12, mirror of
 /// `SessionRefLeaseGuard` in `freshell-ws/src/terminal.rs`). `Drop` calls `fail()` ONLY
 /// while armed AND no kill handle was recorded: once a live child exists (kill handle

@@ -258,11 +258,18 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
       expect(question.requestId).toBe('q-1')
       expect(question.questions[0]).toMatchObject({ question: 'which file should I edit?', multiSelect: false })
       const complete = await readSidecarLine(fixture, (o) => o.type === 'sdk.turn.complete', 'sdk.turn.complete')
-      expect(complete.subtype).toBe('success')
+      // D1-F2: sdk.turn.complete now mirrors the REAL protocol shape
+      // {sessionId, at} exactly (the fixture `subtype` extension is gone) —
+      // per-turn success/error truth lives on the always-emitted sdk.result.
+      expect(complete.subtype).toBeUndefined()
       expect(typeof complete.at).toBe('number')
+      const result = await readSidecarLine(fixture, (o) => o.type === 'sdk.result', 'sdk.result')
+      expect(result.result).toBe('success')
       expect((await readSidecarLine(fixture, (o) => o.type === 'sdk.status' && o.status === 'idle', 'idle')).sessionId).toBe(sessionId)
 
-      const kinds = fixture.readEvents().map((event) => event.kind)
+      // The ledger also carries `kind:'wire'` outbound-frame audit rows
+      // (D1-F2); the program-emission assertions filter to program kinds.
+      const kinds = fixture.readEvents().map((event) => event.kind).filter((kind) => kind !== 'wire')
       expect(kinds).toEqual(['session', 'activity', 'approval', 'question', 'completion'])
 
       fixture.proc.stdin?.write(`${JSON.stringify({ type: 'send', sessionId, text: 'explode' })}\n`)

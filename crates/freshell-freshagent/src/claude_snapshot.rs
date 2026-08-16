@@ -626,6 +626,27 @@ pub(crate) async fn get_claude_snapshot(
     Ok(snapshot)
 }
 
+/// Task 3 (reload-while-pending): overlay a session's LIVE pending approvals/questions
+/// onto the disk-built snapshot — the legacy `normalizeClaudeThreadSnapshot` behavior
+/// (`normalize.ts:186-204`: `pendingApprovals`/`pendingQuestions` come from the live
+/// session, not the transcript). The `capabilities.approvals`/`capabilities.questions`
+/// gates are driven by PRESENCE OF PENDING (`normalize.ts:226-232`), never by provider
+/// capability constants. Entry values arrive already in the `.strict()` contract shape
+/// ([`crate::claude::FreshClaudeState::snapshot_pending_overlay`] builds them); this fn
+/// stamps them verbatim. An EMPTY overlay re-stamps the same empty arrays + false gates
+/// the builder produces, so the no-pending output stays byte-identical to the golden
+/// fixture (`builder_output_matches_the_golden_snapshot_fixture`).
+pub(crate) fn apply_pending_overlay(
+    snapshot: &mut Value,
+    approvals: Vec<Value>,
+    questions: Vec<Value>,
+) {
+    snapshot["capabilities"]["approvals"] = json!(!approvals.is_empty());
+    snapshot["capabilities"]["questions"] = json!(!questions.is_empty());
+    snapshot["pendingApprovals"] = Value::Array(approvals);
+    snapshot["pendingQuestions"] = Value::Array(questions);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +936,59 @@ mod tests {
         let golden: serde_json::Value =
             serde_json::from_str(GOLDEN_SNAPSHOT).expect("golden parses");
         assert_eq!(built, golden);
+    }
+
+    /// Task 3 (presence-of-pending gate, `normalize.ts:226-232`): an EMPTY overlay must
+    /// leave the disk-built snapshot untouched — the reload-while-idle read keeps the
+    /// exact golden shape (the route's byte-identical guarantee, pinned at unit level).
+    #[test]
+    fn pending_overlay_with_empty_sets_leaves_the_snapshot_unchanged() {
+        let built = build_claude_snapshot_json(
+            "freshclaude",
+            "44444444-4444-4444-8444-444444444444",
+            SAMPLE_TRANSCRIPT,
+            1753437600000,
+        );
+        let mut overlaid = built.clone();
+        apply_pending_overlay(&mut overlaid, Vec::new(), Vec::new());
+        assert_eq!(overlaid, built, "an empty overlay is a strict no-op");
+    }
+
+    /// Task 3: a non-empty overlay populates `pendingApprovals`/`pendingQuestions` and
+    /// flips the presence-of-pending gates; untouched capabilities/fields stay put.
+    #[test]
+    fn pending_overlay_populates_entries_and_flips_the_presence_gates() {
+        let mut built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 7);
+        let approvals = vec![json!({
+            "requestId": "req-1", "toolName": "Bash", "toolUseID": "toolu_1",
+            "input": { "command": "ls" },
+        })];
+        let questions = vec![json!({
+            "requestId": "q-1", "questions": [{ "question": "Continue?" }],
+        })];
+        apply_pending_overlay(&mut built, approvals.clone(), questions.clone());
+        assert_eq!(built["pendingApprovals"], json!(approvals));
+        assert_eq!(built["pendingQuestions"], json!(questions));
+        assert_eq!(built["capabilities"]["approvals"], json!(true));
+        assert_eq!(built["capabilities"]["questions"], json!(true));
+        // Untouched gates and fields.
+        assert_eq!(built["capabilities"]["send"], json!(true));
+        assert_eq!(built["capabilities"]["interrupt"], json!(true));
+        assert_eq!(built["capabilities"]["fork"], json!(false));
+        assert_eq!(built["sessionType"], json!("freshclaude"));
+        assert_eq!(built["revision"], json!(7));
+    }
+
+    /// Task 3: the two gates track their own pending kind independently — approvals
+    /// pending with NO questions leaves `capabilities.questions` false.
+    #[test]
+    fn pending_overlay_gates_track_each_pending_kind_independently() {
+        let mut built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0);
+        apply_pending_overlay(&mut built, vec![json!({ "requestId": "r-2" })], Vec::new());
+        assert_eq!(built["pendingApprovals"], json!([{ "requestId": "r-2" }]));
+        assert!(built["pendingQuestions"].as_array().unwrap().is_empty());
+        assert_eq!(built["capabilities"]["approvals"], json!(true));
+        assert_eq!(built["capabilities"]["questions"], json!(false));
     }
 
     #[test]

@@ -7,23 +7,29 @@
 // JSON to this process:
 //
 //   Rust → sidecar (stdin, one JSON per line):
-//     { type:'create',    requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
-//     { type:'send',      sessionId, text }
-//     { type:'interrupt', sessionId }
+//     { type:'create',             requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
+//     { type:'send',               sessionId, text }
+//     { type:'interrupt',          sessionId }
+//     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
+//     { type:'question.respond',   sessionId, requestId, answers }
 //     { type:'shutdown' }
 //
 //   sidecar → Rust (stdout, one JSON per line):
-//     { type:'created',           requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
-//     { type:'create.failed',     requestId, message }
-//     { type:'sdk.session.init',  sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
-//     { type:'sdk.assistant',     sessionId, content, model }
-//     { type:'sdk.stream',        sessionId, event, parentToolUseId }
-//     { type:'sdk.result',        sessionId, result, durationMs, costUsd, usage }
-//     { type:'sdk.turn.complete', sessionId, at }                   // ONLY on result subtype==='success'
-//     { type:'sdk.turn.waiting',  sessionId, at }                   // 0->>=1 pending edge (claude only)
-//     { type:'sdk.status',        sessionId, status }               // compacting / idle (stream end)
-//     { type:'sdk.error',         sessionId, message }
-//     { type:'sdk.exit',          sessionId }
+//     { type:'created',                 requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
+//     { type:'create.failed',           requestId, message }
+//     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
+//     { type:'sdk.assistant',           sessionId, content, model }
+//     { type:'sdk.stream',              sessionId, event, parentToolUseId }
+//     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
+//     { type:'sdk.turn.complete',       sessionId, at }                   // ONLY on result subtype==='success'
+//     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (claude only)
+//     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
+//     { type:'sdk.error',               sessionId, message }
+//     { type:'sdk.exit',                sessionId }
+//     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
+//     { type:'sdk.question.request',    sessionId, requestId, questions }
+//     { type:'sdk.permission.cancelled', sessionId, requestId }
+//     { type:'sdk.question.cancelled',  sessionId, requestId }
 //
 // The Rust side normalizes `sdk.* -> freshAgent.*` (a port of
 // server/fresh-agent/sdk-events.ts) and wraps each in a `freshAgent.event`
@@ -39,14 +45,28 @@
 // needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
 // DELIBERATELY OMITTED — a pinned pure-text T2 turn never calls a tool, MCP tools
 // are not in the T2 baseline, and injecting the MCP server would spawn an extra
-// node grandchild bound to the REST API. The full interactive permission/question
-// RESPONSE channel is likewise out of scope (the T2 turn runs bypassPermissions);
-// the 0->>=1 waiting edge IS surfaced (sdk.turn.waiting), then allowed, so an
-// unattended turn can never hang.
+// node grandchild bound to the REST API. The interactive permission/question
+// RESPONSE channel IS in scope (permission-channel.mjs, a faithful port of
+// server/sdk-bridge.ts): canUseTool parks a pending request, surfaces
+// sdk.permission.request / sdk.question.request, and waits for the Rust side's
+// permission.respond / question.respond (unknown respond ids are stderr-log-only
+// no-ops). The auto-allow shortcut remains ONLY for bypassPermissions sessions
+// (AskUserQuestion still routes to the question path first, per legacy ordering).
 
-import { query } from '@anthropic-ai/claude-agent-sdk'
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
+import {
+  canUseTool as routeCanUseTool,
+  cancelPending,
+  respondPermission,
+  respondQuestion,
+} from './permission-channel.mjs'
+
+// Env-injected SDK seam: FRESHELL_CLAUDE_SDK_QUERY_MODULE overrides the vendored
+// SDK import (tests inject a scripted fake query module; default resolution is
+// unchanged without the env).
+const sdkModule = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '@anthropic-ai/claude-agent-sdk')
+const { query } = sdkModule
 
 // ── stdout writer (newline-JSON; stderr is the only log sink) ────────────────
 function emit(msg) {
@@ -108,7 +128,7 @@ function nextMonotonic(last, now) {
   return last != null && now <= last ? last + 1 : now
 }
 
-/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number}>} */
+/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
@@ -182,9 +202,16 @@ async function consumeStream(sessionId, sdkQuery) {
   } catch (err) {
     emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
-    // Stream ended (natural end, error, or abort). Mirror SdkBridge: an aborted
-    // session surfaces sdk.exit; a natural end surfaces an idle status. NEITHER is
-    // a completion chime, so a mid-turn death cannot fake a turn.complete.
+    // Stream ended (natural end, error, or abort). The transport is closing:
+    // clear any parked cards WITHOUT resolving their promises (LB-04: a late
+    // resolve lands inside the SDK's floating promise chain → unhandled
+    // rejection → crash under Node 22 throw-mode).
+    if (st) {
+      cancelPending(st, emit, sessionId, { resolveDeny: false })
+    }
+    // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
+    // surfaces an idle status. NEITHER is a completion chime, so a mid-turn
+    // death cannot fake a turn.complete.
     if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
     else emit({ type: 'sdk.status', sessionId, status: 'idle' })
     sessions.delete(sessionId)
@@ -199,6 +226,10 @@ function handleCreate(req) {
     sessionId = nanoid()
     const abort = new AbortController()
     const { iterable, handle } = createInputStream()
+    // Liveness IS session-map membership: consumeStream's finally removes the
+    // session synchronously after cancelPending (LB-04 — a parked canUseTool
+    // promise must never be resolved after transport close), and stdin line
+    // events (macrotasks) cannot interleave inside that finally.
     const state = { inputStream: handle, abort, permissionMode: req.permissionMode }
     sessions.set(sessionId, state)
 
@@ -216,15 +247,13 @@ function handleCreate(req) {
         env: createClaudeSdkCleanEnv(process.env),
         settingSources: ['user', 'project', 'local'],
         stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
-        canUseTool: async (_toolName, input) => {
+        canUseTool: async (toolName, input, options) => {
           const s = sessions.get(sessionId)
-          if (s?.permissionMode === 'bypassPermissions') return { behavior: 'allow', updatedInput: input }
-          // Surface the 0->>=1 pending waiting edge, then allow (unattended: never
-          // hang). The interactive response channel is out of scope for the T2 slice.
-          const at = nextMonotonic(s?.lastWaitingAt, Date.now())
-          if (s) s.lastWaitingAt = at
-          emit({ type: 'sdk.turn.waiting', sessionId, at })
-          return { behavior: 'allow', updatedInput: input }
+          if (!s) return { behavior: 'allow', updatedInput: input }
+          // AskUserQuestion routes first (even under bypassPermissions), then the
+          // bypass fast-path, else park-and-surface a pending request — legacy
+          // ordering, sdk-bridge.ts:203-214.
+          return routeCanUseTool({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
         },
       },
     })
@@ -257,13 +286,20 @@ function handleSend(req) {
 function handleInterrupt(req) {
   const st = sessions.get(req.sessionId)
   if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
+  // The transport is still open here (interrupt only signals), so resolving the
+  // parked requests with deny is safe — and required so the SDK's canUseTool
+  // await settles instead of hanging the interrupted turn.
+  cancelPending(st, emit, req.sessionId, { resolveDeny: true })
   st.query?.interrupt?.().catch((err) => {
     logerr(`interrupt failed: ${err?.message || err}`)
   })
 }
 
 function shutdown() {
-  for (const [, st] of sessions) {
+  for (const [sessionId, st] of sessions) {
+    // Teardown: emit the card-clearing frames but NEVER resolve parked promises
+    // (LB-04 — transport closing; a late resolve is an unhandled rejection).
+    cancelPending(st, emit, sessionId, { resolveDeny: false })
     try { st.abort.abort(); st.query?.close?.() } catch { /* ignore */ }
   }
   sessions.clear()
@@ -280,6 +316,33 @@ rl.on('line', (line) => {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
     case 'interrupt': handleInterrupt(req); break
+    case 'permission.respond': {
+      const st = sessions.get(req.sessionId)
+      if (!st) break
+      // Missing decision: NEVER resolve — `undefined` is not a PermissionResult,
+      // and a synthesized default would fabricate the user's choice. Log-only
+      // no-op; the entry stays parked for a later valid respond (mirrors the
+      // coerced-answers asymmetry one arm below).
+      if (req.decision == null) {
+        logerr(`permission.respond: missing decision for request ${req.requestId} (session ${req.sessionId})`)
+        break
+      }
+      // Unknown requestId: lose-safely (Rust validates its pending set first) —
+      // stderr log only, no frame.
+      if (!respondPermission(st, String(req.requestId), req.decision)) {
+        logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+      }
+      break
+    }
+    case 'question.respond': {
+      const st = sessions.get(req.sessionId)
+      if (!st) break
+      const answers = req.answers && typeof req.answers === 'object' ? req.answers : {}
+      if (!respondQuestion(st, String(req.requestId), answers)) {
+        logerr(`question.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+      }
+      break
+    }
     case 'shutdown': shutdown(); process.exit(0); break
     default: logerr(`unknown request type: ${req?.type}`)
   }

@@ -69,7 +69,7 @@ pub mod transport;
 pub use app_server::{
     new_channel_transport, BoxFuture, ChannelPeer, ChannelTransport, CodexAppServerClient,
     CodexAppServerError, StartThreadParams, StartTurnParams, StartedThread, StartedTurn,
-    WsTransport, DEFAULT_REQUEST_TIMEOUT_MS,
+    ThreadForkParams, WsTransport, DEFAULT_REQUEST_TIMEOUT_MS,
 };
 pub use durability::{
     default_server_instance_id, extract_session_id_from_filename, is_codex_thread_id,

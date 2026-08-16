@@ -104,7 +104,8 @@ export function recordedEnv(env) {
   return out
 }
 
-function appendJsonl(filePath, row) {
+/** Append one JSONL row to `filePath` (creating parent dirs); no-op on a falsy path. */
+export function appendJsonl(filePath, row) {
   if (!filePath) return
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
   fs.appendFileSync(filePath, `${JSON.stringify(row)}\n`)

@@ -72,7 +72,8 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 // up). Exported so tests assert the cap against the real constant.
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
-const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
+// Exported so tests assert membership against the real constant.
+export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
   'freshAgent.result',
@@ -80,6 +81,9 @@ const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.permission.request',
   'freshAgent.permission.cancelled',
   'freshAgent.question.request',
+  // A provider-cancelled question must also re-drive the snapshot, so the card clears
+  // even if the freshAgent.question.cancelled fold races (fresh-eyes round-3 F3).
+  'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
 

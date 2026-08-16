@@ -227,8 +227,8 @@ function seedRunDatabase(input) {
       createdAt: Number(existing?.time_created ?? userTime),
       updatedAt: assistantTime,
     })
-    const userMessageId = `${input.sessionId}_msg_${sequence}_user`
-    const assistantMessageId = `${input.sessionId}_msg_${sequence + 1}_assistant`
+    const userMessageId = `msg_${input.sessionId}_${sequence}_user`
+    const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
     insertTextMessage(db, {
       sessionId: input.sessionId,
       messageId: userMessageId,
@@ -583,8 +583,8 @@ function appendPromptMessages(input) {
       .filter(Boolean)
       .join('\n')
     const responseText = process.env.FAKE_OPENCODE_RESPONSE_TEXT || `Fake OpenCode response: ${promptText}`
-    const userMessageId = `${input.sessionId}_msg_${sequence}_user`
-    const assistantMessageId = `${input.sessionId}_msg_${sequence + 1}_assistant`
+    const userMessageId = `msg_${input.sessionId}_${sequence}_user`
+    const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
     insertTextMessage(db, {
       sessionId: input.sessionId,
       messageId: userMessageId,
@@ -863,7 +863,108 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    if (action === 'fork' && req.method === 'POST') {
+      // AGENT-07 e2e: opencode's `POST /session/:id/fork` — {messageID?: ^msg…}
+      // pins the fork point; the child shares the parent's directory and carries
+      // ONLY the messages up to the pin (rollout is copy-on-write: the parent's
+      // rows are never touched).
+      const body = parseJsonText(await readRequestBody(req)) || {}
+      const messageId = typeof body.messageID === 'string' ? body.messageID : undefined
+      appendAudit({
+        event: 'fork',
+        sessionId,
+        routeDirectory: directory,
+        directory: session.directory,
+        parentId: sessionId,
+        body,
+        bodyKeys: Object.keys(body).sort(),
+      })
+      const now = Date.now()
+      const childSessionId = `ses_fork_${now}_${process.pid}`
+      const forkDb = openDatabase()
+      try {
+        ensureSchema(forkDb)
+        insertSession(forkDb, {
+          sessionId: childSessionId,
+          projectId: 'proj-fork',
+          parentId: sessionId,
+          slug: childSessionId,
+          directory: session.directory,
+          title: `Fork of ${session.title ?? sessionId}`,
+          createdAt: now,
+          updatedAt: now,
+        })
+        const source = messagesForSession(forkDb, sessionId).messages
+        let kept = source
+        if (messageId) {
+          const pinIndex = source.findIndex((m) => m.info.id === messageId)
+          if (pinIndex !== -1) kept = source.slice(0, pinIndex + 1)
+        }
+        let forkSeq = 0
+        for (const copied of kept) {
+          forkSeq += 1
+          const role = copied.info?.role === 'assistant' ? 'assistant' : 'user'
+          const text = (copied.parts ?? [])
+            .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+            .map((part) => part.text)
+            .join('\n')
+          const childMessageId = `msg_${childSessionId}_${forkSeq}_${role}`
+          insertTextMessage(forkDb, {
+            sessionId: childSessionId,
+            messageId: childMessageId,
+            partId: `${childMessageId}_part_text`,
+            role,
+            text,
+            now: now + forkSeq,
+          })
+        }
+        forkDb.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(now + forkSeq + 1, childSessionId)
+      } finally {
+        forkDb.close()
+      }
+      sessionStatuses.set(childSessionId, 'idle')
+      appendAudit({ event: 'forked', sessionId: childSessionId, parentId: sessionId, pinnedMessageId: messageId ?? null })
+      sendJson(res, 200, { id: childSessionId, directory: session.directory })
+      return
+    }
+
+    if (action === 'summarize' && req.method === 'POST') {
+      // AGENT-04 e2e: opencode's `POST /session/:id/summarize` {providerID,
+      // modelID} — the compact RPC. Busy → response → idle, the same SSE
+      // lifecycle the prompt arm has (the Rust handle_compact awaits the idle
+      // edge, so the idle edge is mandatory realism, not decoration).
+      const body = parseJsonText(await readRequestBody(req)) || {}
+      appendAudit({
+        event: 'summarize',
+        sessionId,
+        routeDirectory: directory,
+        directory: session.directory,
+        body: { providerID: body.providerID, modelID: body.modelID },
+        bodyKeys: Object.keys(body).sort(),
+      })
+      emitSessionStatus(sessionId, 'busy', {
+        routeDirectory: directory,
+        directory: session.directory,
+      })
+      sendJson(res, 200, true)
+      setTimeout(() => {
+        emitSessionIdle(sessionId, {
+          routeDirectory: directory,
+          directory: session.directory,
+        })
+      }, 25).unref?.()
+      return
+    }
+
     sendJson(res, 404, { error: 'not found' })
+    return
+  }
+
+  if (url.pathname === '/config' && req.method === 'GET') {
+    // The compact model-pair resolution falls back to GET /config when the
+    // session has no splittable model recorded (serve.rs handle_compact).
+    appendAudit({ event: 'config_get' })
+    sendJson(res, 200, { model: 'opencode/fake-opencode' })
     return
   }
 

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::broadcast;
 
 use crate::events::{
@@ -693,11 +693,59 @@ impl OpencodeServeManager {
         Ok(())
     }
 
-    /// `fork(id, route)` (`serve-manager.ts:411-416`).
-    pub async fn fork(&self, id: &str, route: &Route) -> Result<ForkedSession, ServeError> {
+    /// `GET /config` — the serve's global config, returned verbatim. The fresh-agent
+    /// compact path consumes only its `model` key (probed on 1.18.18: present,
+    /// string-or-null) as the model-pair fallback when a session carries no splittable
+    /// model of its own.
+    pub async fn get_config(&self, route: &Route) -> Result<Value, ServeError> {
+        let path = with_route("/config", route);
+        self.json_request(HttpMethod::Get, &path, None, None).await
+    }
+
+    /// `POST /session/:id/summarize` — the compact RPC. VALIDATED opencode 1.18.18
+    /// contract (`/doc` schema + live probes): the body REQUIRES `{providerID,
+    /// modelID}` (400 when missing) and is `additionalProperties:false`, so the body is
+    /// EXACTLY those two keys — the manager stores no session metadata, hence the model
+    /// pair is an EXPLICIT parameter the caller resolved upstream. The 200 `boolean`
+    /// result is not consumed by the fresh-agent path.
+    pub async fn compact(
+        &self,
+        id: &str,
+        provider_id: &str,
+        model_id: &str,
+        route: &Route,
+    ) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/summarize", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(
+            HttpMethod::Post,
+            &path,
+            Some(json!({ "providerID": provider_id, "modelID": model_id })),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `fork(id, route)` (`serve-manager.ts:411-416`) + the Task 5 selected-turn knob:
+    /// the probed opencode 1.18.18 `POST /session/:id/fork` body schema is
+    /// `{messageID?: ^msg…}` with `additionalProperties:false` (GET /doc), so the body
+    /// carries EXACTLY `messageID` when `message_id` is `Some` and is omitted entirely
+    /// when `None` (the legacy no-body shape). Callers gate the client-supplied value
+    /// to the `^msg` shape before passing it here — the strict schema must never
+    /// receive an unknown/malformed key.
+    pub async fn fork(
+        &self,
+        id: &str,
+        route: &Route,
+        message_id: Option<&str>,
+    ) -> Result<ForkedSession, ServeError> {
         let path = with_route(&format!("/session/{}/fork", encode_path_segment(id)), route);
+        let body = message_id.map(|mid| json!({ "messageID": mid }));
         let value = self
-            .json_request(HttpMethod::Post, &path, None, None)
+            .json_request(HttpMethod::Post, &path, body, None)
             .await?;
         Ok(ForkedSession {
             id: value
@@ -1104,5 +1152,281 @@ mod tests {
         let body = build_prompt_body("hi", Some("noslash"), Some(""));
         assert!(body.get("model").is_none(), "unsplittable model omitted");
         assert!(body.get("variant").is_none(), "empty effort omitted");
+    }
+
+    // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
+
+    /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
+    /// responses: healthy probes, summarize per `summarize_status`, fork per
+    /// `fork_status`/`fork_body`, `/config` per `config_body`, everything else a
+    /// benign 200 `{}`.
+    struct RecordingHttp {
+        requests: Mutex<Vec<(String, String, Option<String>)>>,
+        summarize_status: u16,
+        fork_status: u16,
+        fork_body: Vec<u8>,
+        config_body: Vec<u8>,
+    }
+
+    impl RecordingHttp {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                summarize_status: 200,
+                fork_status: 200,
+                fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
+                config_body: br#"{"model":null}"#.to_vec(),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(String, String, Option<String>)> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+    }
+
+    impl ServeHttp for RecordingHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>> {
+            let method = format!("{:?}", req.method).to_uppercase();
+            self.requests.lock().expect("requests mutex").push((
+                method,
+                req.url.clone(),
+                req.body
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+            ));
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if req.url.contains("/summarize") {
+                let status = self.summarize_status;
+                let body = if status == 200 {
+                    // VALIDATED 1.18.18 contract: the summarize success body is a boolean.
+                    b"true".to_vec()
+                } else {
+                    br#"{"error":"providerID is required"}"#.to_vec()
+                };
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            if req.url.contains("/fork") {
+                let status = self.fork_status;
+                let body = self.fork_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            if req.url.contains("/config") {
+                let body = self.config_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    struct FakeAllocator;
+    impl PortAllocator for FakeAllocator {
+        fn allocate(&self) -> Result<Endpoint, String> {
+            Ok(Endpoint {
+                hostname: "127.0.0.1".into(),
+                port: 1,
+            })
+        }
+    }
+
+    struct NeverExitsProcess;
+    impl ServeProcess for NeverExitsProcess {
+        fn exited(&self) -> Option<i32> {
+            None
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {}
+    }
+
+    struct FakeSpawner;
+    impl ProcessSpawner for FakeSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Ok(Box::new(NeverExitsProcess))
+        }
+    }
+
+    struct NoopHandle;
+    impl EventStreamHandle for NoopHandle {}
+    struct NoopEventSource;
+    impl EventSource for NoopEventSource {
+        fn connect(&self, _url: String, _sink: EventSink) -> Box<dyn EventStreamHandle> {
+            Box::new(NoopHandle)
+        }
+    }
+
+    async fn started_recording_manager(http: Arc<RecordingHttp>) -> OpencodeServeManager {
+        let deps = ServeDeps {
+            spawner: Arc::new(FakeSpawner),
+            http,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        mgr
+    }
+
+    #[tokio::test]
+    async fn compact_posts_the_exact_validated_summarize_body() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.compact("ses_9", "prov-a", "mdl-x", &Some("/work dir".to_string()))
+            .await
+            .expect("200 summarize succeeds");
+
+        let requests = http.recorded();
+        let (_, url, body) = requests
+            .iter()
+            .find(|(method, url, _)| method == "POST" && url.contains("/summarize"))
+            .expect("a summarize POST was recorded");
+        assert!(
+            url.contains("/session/ses_9/summarize"),
+            "the summarize path carries the session id: {url}"
+        );
+        assert!(
+            url.contains("directory=%2Fwork%20dir"),
+            "the route is preserved: {url}"
+        );
+        let body: Value =
+            serde_json::from_str(body.as_deref().expect("summarize carries a JSON body")).unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "additionalProperties:false — EXACTLY the two required keys: {body}"
+        );
+        assert_eq!(body["providerID"], serde_json::json!("prov-a"));
+        assert_eq!(body["modelID"], serde_json::json!("mdl-x"));
+    }
+
+    #[tokio::test]
+    async fn compact_surfaces_a_validation_400_as_an_http_error() {
+        let http = Arc::new(RecordingHttp {
+            summarize_status: 400,
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http).await;
+
+        match mgr.compact("ses_9", "prov-a", "mdl-x", &None).await {
+            Err(ServeError::Http { method, status, .. }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(status, 400);
+            }
+            other => panic!("expected a 400 Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_config_returns_the_raw_config_body() {
+        let http = Arc::new(RecordingHttp {
+            config_body: br#"{"model":"prov-a/mdl-x","theme":"dark"}"#.to_vec(),
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http.clone()).await;
+
+        let config = mgr.get_config(&None).await.expect("config fetches");
+        assert_eq!(config["model"], serde_json::json!("prov-a/mdl-x"));
+        assert_eq!(config["theme"], serde_json::json!("dark"));
+
+        let requests = http.recorded();
+        let (_, _, body) = requests
+            .iter()
+            .find(|(method, url, _)| method == "GET" && url.contains("/config"))
+            .expect("a /config GET was recorded");
+        assert!(body.is_none(), "GET /config carries no body");
+    }
+
+    // ── fork (POST /session/:id/fork) ────────────────────────────────────────
+
+    /// The recorded `POST /session/:id/fork` request, if any.
+    fn fork_request(http: &RecordingHttp) -> Option<(String, String, Option<String>)> {
+        http.recorded()
+            .into_iter()
+            .find(|(method, url, _)| method == "POST" && url.contains("/fork"))
+    }
+
+    #[tokio::test]
+    async fn fork_without_a_message_id_posts_no_body_and_parses_the_child() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        let child = mgr
+            .fork("ses_9", &Some("/work dir".to_string()), None)
+            .await
+            .expect("200 fork succeeds");
+
+        assert_eq!(child.id, "ses_child");
+        assert_eq!(child.directory.as_deref(), Some("/tmp/x"));
+        let (_, url, body) = fork_request(&http).expect("a fork POST was recorded");
+        assert!(
+            url.contains("/session/ses_9/fork"),
+            "the fork path carries the session id: {url}"
+        );
+        assert!(
+            url.contains("directory=%2Fwork%20dir"),
+            "the route is preserved: {url}"
+        );
+        assert!(
+            body.is_none(),
+            "no message_id -> the legacy no-POST-body shape (strict additionalProperties:false schema): {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_message_id_posts_exactly_the_message_id_key() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.fork("ses_9", &None, Some("msg_abc"))
+            .await
+            .expect("200 fork succeeds");
+
+        let (_, _, body) = fork_request(&http).expect("a fork POST was recorded");
+        let body: Value =
+            serde_json::from_str(body.as_deref().expect("a message id carries a JSON body"))
+                .unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            1,
+            "additionalProperties:false — EXACTLY the single optional key: {body}"
+        );
+        assert_eq!(body["messageID"], serde_json::json!("msg_abc"));
+    }
+
+    #[tokio::test]
+    async fn fork_surfaces_a_validation_400_as_an_http_error() {
+        let http = Arc::new(RecordingHttp {
+            fork_status: 400,
+            fork_body: br#"{"error":"expected string to match '^msg'"}"#.to_vec(),
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http).await;
+
+        match mgr.fork("ses_9", &None, None).await {
+            Err(ServeError::Http {
+                method,
+                status,
+                body,
+                ..
+            }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(status, 400);
+                assert!(
+                    body.contains("expected string to match '^msg'"),
+                    "the serve error text crosses the surface: {body}"
+                );
+            }
+            other => panic!("expected a 400 Http error, got {other:?}"),
+        }
     }
 }

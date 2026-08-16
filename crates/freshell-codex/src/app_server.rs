@@ -142,6 +142,22 @@ pub struct StartedThread {
     pub reasoning_effort: Option<String>,
 }
 
+/// `thread/fork` params (the 0.147.0 `ThreadForkParams` generated type): `{threadId,
+/// lastTurnId?, model?, cwd?, approvalPolicy?, sandbox?}` — there is **NO `excludeTurns`**:
+/// 0.147.0 removed it from the schema (it is silently ignored if sent), and without it
+/// `result.thread.turns` is populated so the child rollout keeps full history. `lastTurnId`
+/// EXISTS on 0.147.0 ("turns after `last_turn_id` are omitted"; the referenced turn cannot
+/// be in progress) — it is the per-turn fork knob (fork through the selected turn).
+#[derive(Clone, Debug, Default)]
+pub struct ThreadForkParams {
+    pub thread_id: String,
+    pub last_turn_id: Option<String>,
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox: Option<String>,
+}
+
 /// `turn/start` params (`CodexTurnStartParams`, `protocol.ts:303-316`; adapter send,
 /// `adapter.ts:971-979`).
 ///
@@ -346,6 +362,47 @@ impl CodexAppServerClient {
         })
     }
 
+    /// `thread/fork` (0.147.0) — fork `thread_id` into a NEW child thread that this
+    /// app-server connection then owns (the child shares the parent's rollout lineage).
+    /// The wire shape carries NO `excludeTurns` (see [`ThreadForkParams`]). Returns the
+    /// raw result `Value`; the CALLER parses `.thread.id` (parsed loosely — a
+    /// malformed success payload is the caller's guard, not a decode here).
+    pub async fn fork_thread(
+        &self,
+        params: ThreadForkParams,
+    ) -> Result<Value, CodexAppServerError> {
+        let mut wire = Map::new();
+        wire.insert("threadId".to_string(), json!(params.thread_id));
+        insert_opt_str(&mut wire, "lastTurnId", params.last_turn_id);
+        insert_opt_str(&mut wire, "model", params.model);
+        insert_opt_str(&mut wire, "cwd", params.cwd);
+        insert_opt_str(&mut wire, "approvalPolicy", params.approval_policy);
+        insert_opt_str(&mut wire, "sandbox", params.sandbox);
+        self.request("thread/fork", Value::Object(wire)).await
+    }
+
+    /// `thread/archive` (0.147.0) — archive a thread, RELEASING its writer lock so the
+    /// thread is no longer owned by this connection. The result is a generic success
+    /// payload; awaiting it is enough (no fields are consumed). In the fork handoff
+    /// (VALIDATED, LB-01 real 0.147.0 probe) this is what lets a SECOND app-server
+    /// connection then unarchive+resume the child (a direct cross-process
+    /// `thread/resume` while the parent owns it is rejected with `-32600 "thread …
+    /// already has an active writer"`).
+    pub async fn archive_thread(&self, thread_id: &str) -> Result<(), CodexAppServerError> {
+        self.request("thread/archive", json!({ "threadId": thread_id }))
+            .await?;
+        Ok(())
+    }
+
+    /// `thread/unarchive` (0.147.0) — unarchive a thread (restores visibility; does
+    /// NOT claim a writer). The result is a generic success payload; awaiting it is
+    /// enough. See [`Self::archive_thread`] for the fork handoff this pairs with.
+    pub async fn unarchive_thread(&self, thread_id: &str) -> Result<(), CodexAppServerError> {
+        self.request("thread/unarchive", json!({ "threadId": thread_id }))
+            .await?;
+        Ok(())
+    }
+
     /// `turn/start` (`client.ts:424-431`; adapter send `adapter.ts:971-979`). **Forwards
     /// `effort` VERBATIM (DEV-0003)** — the value the caller supplies is inserted unchanged.
     pub async fn start_turn(
@@ -391,6 +448,19 @@ impl CodexAppServerClient {
             json!({ "threadId": thread_id, "turnId": turn_id }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// `thread/compact/start` (the 0.147.0 `ThreadCompactStartParams` RPC). Params are
+    /// `{threadId}` ONLY — the schema has NO instructions field, so any client
+    /// `instructions` are dropped by the CALLER (never synthesized or turn-texted here;
+    /// fresh-eyes round-2 F5). Awaiting the `Record<string, never>` response is merely
+    /// the acceptance edge: the compact TURN itself arrives afterwards as the probed
+    /// notification sequence (`thread/status/changed{active}` → `turn/started` → … →
+    /// `turn/completed`) on the session's existing notification consumer.
+    pub async fn compact_thread(&self, thread_id: &str) -> Result<(), CodexAppServerError> {
+        self.request("thread/compact/start", json!({ "threadId": thread_id }))
+            .await?;
         Ok(())
     }
 
@@ -1016,6 +1086,227 @@ mod tests {
                 assert_eq!(timeout_ms, 50);
             }
             other => panic!("expected a Timeout at the short request_timeout, got {other:?}"),
+        }
+    }
+
+    // ── thread/compact/start (AGENT-04, approval-respond Task 4) ─────────────
+
+    #[tokio::test]
+    async fn compact_thread_sends_thread_compact_start_with_only_the_thread_id() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.compact_thread("thread-1").await });
+
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // 0.147.0 ThreadCompactStartParams: `{threadId}` ONLY -- pin the EXACT key set so
+        // an `instructions` key (or anything else) can never sneak onto this schema.
+        let obj = params.as_object().expect("params object");
+        assert_eq!(obj.len(), 1, "params must carry ONLY threadId: {params}");
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert!(
+            params.get("instructions").is_none(),
+            "codex compact has NO instructions field (0.147.0), never one: {params}"
+        );
+        // The success response is `Record<string, never>` (an empty object).
+        peer.respond(&id, json!({}));
+
+        task.await.unwrap().expect("compact_thread succeeds");
+    }
+
+    #[tokio::test]
+    async fn compact_thread_surfaces_an_rpc_error_with_the_method_name() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.compact_thread("thread-1").await });
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond_error(&id, -32600, "thread is mid-turn");
+
+        match task.await.unwrap() {
+            Err(CodexAppServerError::Rpc { method, error }) => {
+                assert_eq!(method, "thread/compact/start");
+                assert_eq!(error.code, -32600);
+                assert_eq!(error.message, "thread is mid-turn");
+            }
+            other => panic!("expected an Rpc error, got {other:?}"),
+        }
+    }
+
+    // ── thread/fork + thread/archive + thread/unarchive (AGENT-07, approval-respond Task 6) ──
+
+    #[tokio::test]
+    async fn fork_thread_serializes_without_exclude_turns_with_last_turn_id_and_returns_the_raw_result(
+    ) {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.fork_thread(ThreadForkParams {
+                thread_id: "parent-1".to_string(),
+                last_turn_id: Some("turn-3".to_string()),
+                model: Some("gpt-5.3-codex-spark".to_string()),
+                cwd: Some("/fork/cwd".to_string()),
+                approval_policy: Some("on-request".to_string()),
+                sandbox: Some("workspace-write".to_string()),
+            })
+            .await
+        });
+
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        // 0.147.0 `ThreadForkParams`: `{threadId, lastTurnId?, model?, cwd?,
+        // approvalPolicy?, sandbox?}` — `excludeTurns` was REMOVED from that schema, so
+        // it must NEVER be sent (the child keeps full history), and `lastTurnId` (the
+        // per-turn fork knob) must pass through when the caller carried one.
+        let obj = params.as_object().expect("params object");
+        assert_eq!(
+            obj.len(),
+            6,
+            "thread/fork params are exactly the 0.147.0 key set: {params}"
+        );
+        assert_eq!(params["threadId"], json!("parent-1"));
+        assert_eq!(params["lastTurnId"], json!("turn-3"));
+        assert_eq!(params["model"], json!("gpt-5.3-codex-spark"));
+        assert_eq!(params["cwd"], json!("/fork/cwd"));
+        assert_eq!(params["approvalPolicy"], json!("on-request"));
+        assert_eq!(params["sandbox"], json!("workspace-write"));
+        assert!(
+            params.get("excludeTurns").is_none(),
+            "0.147.0 removed excludeTurns from thread/fork — never send it: {params}"
+        );
+        peer.respond(&id, json!({ "thread": { "id": "child-1" } }));
+
+        let result = task.await.unwrap().expect("fork_thread succeeds");
+        assert_eq!(result["thread"]["id"], json!("child-1"));
+    }
+
+    #[tokio::test]
+    async fn fork_thread_omits_absent_optional_keys() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.fork_thread(ThreadForkParams {
+                thread_id: "parent-2".to_string(),
+                ..ThreadForkParams::default()
+            })
+            .await
+        });
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await;
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        let obj = params.as_object().expect("params object");
+        assert_eq!(obj.len(), 1, "absent optionals omit their keys: {params}");
+        assert_eq!(params["threadId"], json!("parent-2"));
+        assert!(
+            params.get("lastTurnId").is_none(),
+            "no atTurnId → no lastTurnId (fork from the tip): {params}"
+        );
+        peer.respond(&id, json!({ "thread": { "id": "child-2" } }));
+
+        let result = task.await.unwrap().expect("fork_thread succeeds");
+        assert_eq!(result["thread"]["id"], json!("child-2"));
+    }
+
+    #[tokio::test]
+    async fn archive_thread_and_unarchive_thread_send_their_method_names_with_only_thread_id() {
+        for (call, expected_method) in [
+            ("archive", "thread/archive"),
+            ("unarchive", "thread/unarchive"),
+        ] {
+            let (transport, peer) = new_channel_transport();
+            let (client, _notifs) = CodexAppServerClient::connect(transport);
+            let client = Arc::new(client);
+
+            let c = client.clone();
+            let task = tokio::spawn(async move {
+                match call {
+                    "archive" => c.archive_thread("thread-9").await,
+                    _ => c.unarchive_thread("thread-9").await,
+                }
+            });
+
+            let (init_id, _m, _p) = peer.expect_request().await;
+            peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+            let (_note, _) = peer.expect_notification().await;
+
+            let (id, method, params) = peer.expect_request().await;
+            assert_eq!(method, expected_method);
+            let obj = params.as_object().expect("params object");
+            assert_eq!(
+                obj.len(),
+                1,
+                "{expected_method} params are `{{threadId}}` ONLY: {params}"
+            );
+            assert_eq!(params["threadId"], json!("thread-9"));
+            // Archive/unarchive results are generic success payloads (parsed loosely).
+            peer.respond(&id, json!({}));
+
+            task.await.unwrap().expect("archive/unarchive succeeds");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_thread_surfaces_an_rpc_error_with_the_method_name() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.fork_thread(ThreadForkParams {
+                thread_id: "empty-parent".to_string(),
+                ..ThreadForkParams::default()
+            })
+            .await
+        });
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let (_note, _) = peer.expect_notification().await;
+
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        // The PROBED empty-parent rejection (0.147.0 real binary).
+        peer.respond_error(&id, -32600, "no rollout found for thread id");
+
+        match task.await.unwrap() {
+            Err(CodexAppServerError::Rpc { method, error }) => {
+                assert_eq!(method, "thread/fork");
+                assert_eq!(error.code, -32600);
+                assert_eq!(error.message, "no rollout found for thread id");
+            }
+            other => panic!("expected an Rpc error, got {other:?}"),
         }
     }
 
