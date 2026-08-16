@@ -272,13 +272,13 @@ describe('session-corpus claude writer', () => {
     })
     expect(ctx.files[0].path).toContain(
       '/10000000-0000-4000-8000-000000000101/subagents/agent-a0076913f8bb3baa.jsonl')
-    // indexed id is the filename stem (no sessionId field in sidechain lines)
+    // indexed id is the filename stem even though real sidechain lines embed the parent id
     expect(exp.sessionId).toBe('agent-a0076913f8bb3baa')
     const lines = (await fsp.readFile(path.join(home, ctx.files[0].path), 'utf-8'))
       .trim().split('\n').map((l) => JSON.parse(l))
     expect(lines[0].type).toBe('user') // no init line in sidechain transcripts
     expect(lines[0].isSidechain).toBe(true)
-    expect(lines[0]).not.toHaveProperty('sessionId')
+    expect(lines[0].sessionId).toBe('10000000-0000-4000-8000-000000000101')
     expect(lines[0].timestamp).toBe('2026-07-08T10:00:00.000Z')
     expect(lines[3].timestamp).toBe('2026-07-08T10:00:00.003Z')
     expect(exp.visibility).toBe('hidden-default')

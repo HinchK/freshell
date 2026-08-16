@@ -562,12 +562,18 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
     // Query the session-directory read model with the SAME settings store.
     // Batch B: the read model is backed by a `SessionIndex` now, not a
     // per-request `home: Option<PathBuf>` scan.
-    let session_index =
-        std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
-            std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                crate::session_directory::claude_home(&home),
-            )) as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
-        ]));
+    let session_index = std::sync::Arc::new(
+        freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
+            vec![
+                std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                    crate::session_directory::claude_home(&home),
+                ))
+                    as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            ],
+            std::time::Duration::from_millis(1_000),
+            None,
+        ),
+    );
     let dir_app =
         crate::session_directory::router(crate::session_directory::SessionDirectoryState {
             auth_token: std::sync::Arc::clone(&auth_token),
@@ -1019,14 +1025,20 @@ async fn generate_title_provider_generated_short_circuits_without_write() {
     st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("AI Title".into())));
     st.index = Some(std::sync::Arc::new(
-        freshell_sessions::directory_index::SessionIndex::new(vec![std::sync::Arc::new(
-            freshell_sessions::directory_index::ClaudeSource::new(
-                crate::session_directory::claude_home(&home),
-            ),
-        )
-            as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>]),
+        freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
+            vec![
+                std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                    crate::session_directory::claude_home(&home),
+                ))
+                    as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            ],
+            std::time::Duration::from_millis(1_000),
+            None,
+        ),
     ));
-    let sid = "b7936c10-4935-441c-837c-c1f33cafec2d"; // the fixture's sessionId
+    // Claude's canonical identity is the transcript filename, even when an
+    // embedded record carries a different (for example parent-agent) id.
+    let sid = "real-corrupted";
     let body = body_json(post_generate_title(&st, sid, "hello").await).await;
     assert_eq!(body["title"], "Test Session 1"); // the fixture's parsed summary title
     assert_eq!(body["source"], "provider-generated");

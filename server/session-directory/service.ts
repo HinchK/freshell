@@ -1,5 +1,6 @@
 import type { CodingCliProvider } from '../coding-cli/provider.js'
 import type { ProjectGroup } from '../coding-cli/types.js'
+import { logger } from '../logger.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet, searchSessionFile } from './file-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
@@ -33,8 +34,78 @@ type CursorPayload = {
   key: string
 }
 
+const IDENTITY_COLLISION_KEY_SAMPLE_LIMIT = 20
+
 function buildSessionKey(item: { provider: string; sessionId: string }): string {
   return `${item.provider}:${item.sessionId}`
+}
+
+type PersistedIdentityCollision = {
+  /** Internal only: used to quarantine every conflicting persisted row, never serialized. */
+  keys: ReadonlySet<string>
+  collisionCount: number
+  duplicateItemCount: number
+  collisionKeySamples: readonly string[]
+  collisionKeySamplesTruncated: boolean
+}
+
+/**
+ * Remove only persisted rows whose identity is ambiguous. Live terminals are
+ * deliberately joined afterwards: their terminal-owned identity can still be
+ * rendered as a generic running row without choosing between conflicting
+ * transcript metadata.
+ */
+function quarantinePersistedProjects(
+  projects: ProjectGroup[],
+  collisionKeys: ReadonlySet<string>,
+): ProjectGroup[] {
+  return projects.map((project) => {
+    const sessions = project.sessions.filter((session) => !collisionKeys.has(buildSessionKey(session)))
+    return sessions.length === project.sessions.length ? project : { ...project, sessions }
+  })
+}
+
+export class SessionDirectoryCursorError extends Error {
+  constructor() {
+    super('Invalid session-directory cursor')
+    this.name = 'SessionDirectoryCursorError'
+  }
+}
+
+/**
+ * Detect identity corruption before any visibility/filter/pagination work.
+ *
+ * A collision is still an ERROR-level data-integrity event.  It must not,
+ * however, make every healthy session inaccessible because a user copied one
+ * transcript into a session directory.  Callers quarantine all rows for the
+ * conflicted identities, return the remaining unambiguous rows, and expose a
+ * small actionable integrity state to the client.
+ */
+function findPersistedIdentityCollisions(
+  projects: ProjectGroup[],
+): PersistedIdentityCollision | undefined {
+  const counts = new Map<string, number>()
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const key = buildSessionKey(session)
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+  }
+
+  const collisions = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .sort(([a], [b]) => a.localeCompare(b))
+  if (collisions.length === 0) return undefined
+
+  return {
+    keys: new Set(collisions.map(([key]) => key)),
+    collisionCount: collisions.length,
+    duplicateItemCount: collisions.reduce((total, [, count]) => total + count, 0),
+    collisionKeySamples: collisions
+      .slice(0, IDENTITY_COLLISION_KEY_SAMPLE_LIMIT)
+      .map(([key]) => key),
+    collisionKeySamplesTruncated: collisions.length > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT,
+  }
 }
 
 function encodeCursor(payload: CursorPayload): string {
@@ -49,7 +120,7 @@ function decodeCursor(cursor: string): CursorPayload {
     }
     return { lastActivityAt: payload.lastActivityAt, key: payload.key }
   } catch {
-    throw new Error('Invalid session-directory cursor')
+    throw new SessionDirectoryCursorError()
   }
 }
 
@@ -231,6 +302,17 @@ async function applyFileSearch(
 }
 
 export async function querySessionDirectory(input: QuerySessionDirectoryInput): Promise<SessionDirectoryPage> {
+  throwIfAborted(input.signal)
+  const identityCollision = findPersistedIdentityCollisions(input.projects)
+  if (identityCollision) {
+    logger.error({
+      collisionCount: identityCollision.collisionCount,
+      duplicateItemCount: identityCollision.duplicateItemCount,
+      collisionKeySamples: identityCollision.collisionKeySamples,
+      collisionKeySamplesTruncated: identityCollision.collisionKeySamplesTruncated,
+    }, 'Session directory identity collision; omitting conflicted sessions')
+  }
+
   const limit = Math.min(input.query.limit ?? MAX_DIRECTORY_PAGE_ITEMS, MAX_DIRECTORY_PAGE_ITEMS)
   const tier = input.query.tier ?? 'title'
   const cursor = input.query.cursor ? decodeCursor(input.query.cursor) : null
@@ -240,9 +322,15 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     ...input.terminalMeta.map((meta) => meta.updatedAt),
   )
 
-  throwIfAborted(input.signal)
+  // Filter persisted rows BEFORE joining live terminals. This prevents a
+  // duplicate file from contributing arbitrary title/path metadata while
+  // still allowing a currently running terminal to appear as its safe,
+  // terminal-owned placeholder.
+  const persistedProjects = identityCollision
+    ? quarantinePersistedProjects(input.projects, identityCollision.keys)
+    : input.projects
 
-  let items = toItems(input.projects, input.terminalMeta).sort(compareItems)
+  let items = toItems(persistedProjects, input.terminalMeta).sort(compareItems)
 
   // Server-side visibility pre-filtering to avoid wasting search budget on
   // sessions the client will hide. Matches the client's default sidebar settings.
@@ -276,7 +364,10 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
         .filter((item): item is SessionDirectoryItem => item !== null)
     } else {
       // File-based search for userMessages / fullText
-      const fileResult = await applyFileSearch(items, input.query.query!.trim(), tier, input, limit)
+      const fileResult = await applyFileSearch(items, input.query.query!.trim(), tier, {
+        ...input,
+        projects: persistedProjects,
+      }, limit)
       items = fileResult.items
       partial = fileResult.partial
       partialReason = fileResult.partialReason
@@ -321,6 +412,18 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   if (partial) {
     page.partial = partial
     page.partialReason = partialReason
+  }
+  if (identityCollision) {
+    // Do not silently choose one duplicate. Every ambiguous PERSISTED row is
+    // removed; a matching live terminal may remain as a generic, terminal-
+    // owned row. The structured error is logged above and the UI gets enough
+    // information to explain recovery without leaking ids or source paths.
+    page.partial = true
+    page.integrityError = {
+      kind: 'identity_collision',
+      collisionCount: identityCollision.collisionCount,
+      duplicateItemCount: identityCollision.duplicateItemCount,
+    }
   }
 
   return page

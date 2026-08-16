@@ -44,8 +44,8 @@ export interface ClaudeSessionSpec {
   /**
    * Subagent transcript: written at the REAL claude layout
    * `projects/<slug>/<parentSessionId>/subagents/agent-<id>.jsonl` with
-   * sidechain lines (`isSidechain: true`, promptId, agentId, no sessionId —
-   * the indexed session id is the filename stem, matching
+   * sidechain lines (`isSidechain: true`, promptId, agentId, and the parent sessionId —
+   * the indexed child session id is nevertheless the filename stem, matching
    * `claude.extractSessionId`).
    */
   subagent?: { parentSessionId: string }
@@ -96,9 +96,8 @@ export async function writeClaudeSession(
     ? path.join(projectDir, spec.subagent.parentSessionId, 'subagents')
     : projectDir
   await fsp.mkdir(dir, { recursive: true })
-  // Indexed id = filename stem (`extractSessionId` falls back to basename).
-  // Subagent transcripts carry NO sessionId field (real layout: isSidechain
-  // lines with agentId/promptId), so their stem IS the id — `agent-<id>`.
+  // Indexed id = filename stem. Real sidechain lines carry their parent sessionId,
+  // while `claude.extractSessionId` deliberately makes the child stem authoritative.
   const indexedId = spec.subagent ? `agent-${spec.sessionId}` : spec.sessionId
   const file = path.join(dir, `${indexedId}.jsonl`)
 
@@ -108,7 +107,12 @@ export async function writeClaudeSession(
     gitBranch: 'main',
     timestamp: iso(schedTs),
     ...(spec.subagent
-      ? { isSidechain: true, promptId: `${spec.sessionId}-prompt`, agentId: spec.sessionId }
+      ? {
+          sessionId: spec.subagent.parentSessionId,
+          isSidechain: true,
+          promptId: `${spec.sessionId}-prompt`,
+          agentId: spec.sessionId,
+        }
       : { sessionId: spec.sessionId }),
   })
 

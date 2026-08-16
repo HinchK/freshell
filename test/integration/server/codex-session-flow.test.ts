@@ -331,6 +331,8 @@ describeLinux('Codex Session Flow Integration', () => {
   let fakeCodexPath: string
   let argLogPath: string
   let previousCodexCmd: string | undefined
+  let previousCodexHome: string | undefined
+  let previousDurableWriteOptIn: string | undefined
   let previousFakeCodexArgLog: string | undefined
   let server: http.Server
   let port: number
@@ -355,8 +357,12 @@ describeLinux('Codex Session Flow Integration', () => {
     await writeFakeCodexExecutable(fakeCodexPath)
 
     previousCodexCmd = process.env.CODEX_CMD
+    previousCodexHome = process.env.CODEX_HOME
+    previousDurableWriteOptIn = process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES
     previousFakeCodexArgLog = process.env.FAKE_CODEX_ARG_LOG
     process.env.CODEX_CMD = fakeCodexPath
+    process.env.CODEX_HOME = path.join(tempDir, 'codex-home')
+    process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES = '1'
     process.env.FAKE_CODEX_ARG_LOG = argLogPath
 
     const app = express()
@@ -412,6 +418,16 @@ describeLinux('Codex Session Flow Integration', () => {
       delete process.env.CODEX_CMD
     } else {
       process.env.CODEX_CMD = previousCodexCmd
+    }
+    if (previousCodexHome === undefined) {
+      delete process.env.CODEX_HOME
+    } else {
+      process.env.CODEX_HOME = previousCodexHome
+    }
+    if (previousDurableWriteOptIn === undefined) {
+      delete process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES
+    } else {
+      process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES = previousDurableWriteOptIn
     }
     if (previousFakeCodexArgLog === undefined) {
       delete process.env.FAKE_CODEX_ARG_LOG

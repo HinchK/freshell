@@ -177,14 +177,43 @@ function nextMessageWithin(socket: WebSocket, ms: number): Promise<any> {
   ])
 }
 
-async function nextResponseWithIdWithin(socket: WebSocket, id: number, ms: number): Promise<any> {
-  const deadline = Date.now() + ms
-  while (Date.now() < deadline) {
-    const remainingMs = Math.max(1, deadline - Date.now())
-    const message = await nextMessageWithin(socket, remainingMs)
-    if (message?.id === id) return message
-  }
-  throw new Error(`Timed out waiting ${ms}ms for websocket response ${id}.`)
+function nextResponseWithId(socket: WebSocket, id: number, timeoutMs = 5_000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout)
+      socket.off('message', onMessage)
+      socket.off('close', onClose)
+      socket.off('error', onError)
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error(`Socket closed before response ${id}.`))
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
+      if (isBinary) return
+      let message: any
+      try {
+        message = JSON.parse(rawDataToBuffer(raw).toString('utf8'))
+      } catch {
+        return
+      }
+      if (message?.id !== id) return
+      cleanup()
+      resolve(message)
+    }
+    timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error(`Timed out waiting ${timeoutMs}ms for response ${id}.`))
+    }, timeoutMs)
+    socket.on('message', onMessage)
+    socket.once('close', onClose)
+    socket.once('error', onError)
+  })
 }
 
 function nextMessageFrame(socket: WebSocket): Promise<{ message: any; isBinary: boolean }> {
@@ -221,13 +250,6 @@ function socketClosed(socket: WebSocket): Promise<void> {
     }
     socket.once('close', () => resolve())
   })
-}
-
-async function expectSocketClosedWithin(socket: WebSocket, ms: number): Promise<void> {
-  await expect(Promise.race([
-    socketClosed(socket).then(() => 'closed'),
-    delay(ms).then(() => 'timeout'),
-  ])).resolves.toBe('closed')
 }
 
 function delay(ms: number): Promise<void> {
@@ -1109,6 +1131,10 @@ describe('CodexRemoteProxy', () => {
   it('acks duplicate turn/interrupt after the turn already completed', async () => {
     const interruptRequests: unknown[] = []
     const upstream = await startUpstream((socket, message) => {
+      if (message.method === 'thread/list') {
+        socket.send(JSON.stringify({ id: message.id, result: { data: [] } }))
+        return
+      }
       if (message.method !== 'turn/interrupt') return
       interruptRequests.push(message)
       if (interruptRequests.length !== 1) return
@@ -1131,22 +1157,26 @@ describe('CodexRemoteProxy', () => {
     })
     const tui = await connect(proxy.wsUrl)
 
+    const firstInterruptResponse = nextResponseWithId(tui, 1)
     tui.send(JSON.stringify({
       id: 1,
       method: 'turn/interrupt',
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     }))
-    await expect(nextMessageWithin(tui, 100)).resolves.toEqual({ id: 1, result: {} })
+    await expect(firstInterruptResponse).resolves.toEqual({ id: 1, result: {} })
     await expect(completed).resolves.toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' })
 
+    const duplicateInterruptResponse = nextResponseWithId(tui, 2)
     tui.send(JSON.stringify({
       id: 2,
       method: 'turn/interrupt',
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     }))
+    await expect(duplicateInterruptResponse).resolves.toEqual({ id: 2, result: {} })
 
-    await expect(nextResponseWithIdWithin(tui, 2, 50)).resolves.toEqual({ id: 2, result: {} })
-    await delay(25)
+    const upstreamBarrierResponse = nextResponseWithId(tui, 3)
+    tui.send(JSON.stringify({ id: 3, method: 'thread/list', params: {} }))
+    await expect(upstreamBarrierResponse).resolves.toEqual({ id: 3, result: { data: [] } })
     expect(interruptRequests).toHaveLength(1)
   })
 
@@ -1784,7 +1814,7 @@ describe('CodexRemoteProxy', () => {
         padding: largePadding(),
       }))
 
-      await expectSocketClosedWithin(tui, 100)
+      await socketClosed(tui)
       expect(candidates).toEqual([])
       expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
     }
@@ -1881,7 +1911,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 118, method: 'thread/start', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(candidates).toEqual([])
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
@@ -1904,7 +1934,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 119, method: 'initialize', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
 
@@ -1927,7 +1957,7 @@ describe('CodexRemoteProxy', () => {
 
     tui.send(JSON.stringify({ id: 120, method: 'initialize', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
   })
 
@@ -1940,16 +1970,15 @@ describe('CodexRemoteProxy', () => {
         padding: largePadding(),
       }))
     })
-    const proxy = await startProxy(upstream.wsUrl, {
-      candidateCaptureTimeoutMs: 1_000,
-    })
+    const proxy = await startProxy(upstream.wsUrl)
+    proxy.pauseCandidateCapture('isolate unsafe response failure')
     const repairTriggers: unknown[] = []
     proxy.onRepairTrigger((event) => repairTriggers.push(event))
     const tui = await connect(proxy.wsUrl)
 
     tui.send(JSON.stringify({ id: 121, method: 'thread/start', params: {} }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
@@ -2055,7 +2084,7 @@ describe('CodexRemoteProxy', () => {
       params: { threadId: 'thread-parent', excludeTurns: false },
     }))
 
-    await expectSocketClosedWithin(tui, 100)
+    await socketClosed(tui)
     expect(candidates).toEqual([])
     expect(repairTriggers).toContainEqual(expect.objectContaining({
       kind: 'proxy_error',

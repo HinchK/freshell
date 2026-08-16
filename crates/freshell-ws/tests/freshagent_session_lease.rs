@@ -32,6 +32,88 @@ const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 /// mirroring `freshagent_claude_attach.rs`'s convention for the same hazard.
 static LEASE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+const ISOLATED_CODEX_ENV_KEYS: [&str; 5] = [
+    "CODEX_HOME",
+    "CODEX_CMD",
+    "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+    "FAKE_CODEX_APP_SERVER_ARG_LOG",
+    "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+];
+
+struct IsolatedCodexEnv {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    dir: tempfile::TempDir,
+}
+
+impl IsolatedCodexEnv {
+    fn install() -> Self {
+        let dir = tempfile::tempdir().expect("create isolated Codex home");
+        let previous = ISOLATED_CODEX_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("CODEX_HOME", dir.path());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+        Self { previous, dir }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for IsolatedCodexEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[test]
+fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
+    let original: Vec<_> = ISOLATED_CODEX_ENV_KEYS
+        .iter()
+        .map(std::env::var_os)
+        .collect();
+    let mut installed_opt_in = None;
+    let mut installed_home = None;
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _lock = LEASE_ENV_LOCK.blocking_lock();
+        let _env = IsolatedCodexEnv::install();
+        installed_opt_in = std::env::var_os("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
+        installed_home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
+        for (index, key) in ISOLATED_CODEX_ENV_KEYS.iter().enumerate() {
+            std::env::set_var(key, format!("mutated-by-unwind-test-{index}"));
+        }
+        panic!("exercise panic-safe environment restoration");
+    }));
+
+    let after_unwind: Vec<_> = ISOLATED_CODEX_ENV_KEYS
+        .iter()
+        .map(std::env::var_os)
+        .collect();
+    // Restore eagerly before asserting so a RED run cannot contaminate another test process.
+    for (key, value) in ISOLATED_CODEX_ENV_KEYS.iter().zip(original.iter()) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    assert!(unwind.is_err(), "the test closure must unwind");
+    assert_eq!(installed_opt_in.as_deref(), Some(std::ffi::OsStr::new("1")));
+    assert!(
+        !installed_home.expect("guard installs CODEX_HOME").exists(),
+        "the temporary Codex home must be removed during unwinding"
+    );
+    assert_eq!(after_unwind, original);
+}
+
 // ── fake claude sidecar with the Step 1a knobs ──────────────────────────────────────
 
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
@@ -496,13 +578,12 @@ async fn lease_applies_to_legacy_clients_and_retry_converges() {
 #[tokio::test]
 async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let dir = std::env::temp_dir().join(format!("freshell-codex-lease-ws-{}", uuid_like_suffix()));
-    std::fs::create_dir_all(&dir).expect("create codex temp dir");
+    let codex_home = IsolatedCodexEnv::install();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
         .canonicalize()
         .expect("fake-app-server fixture exists");
-    let arg_log = dir.join("app-server-args.json");
+    let arg_log = codex_home.path().join("app-server-args.json");
     std::env::set_var("CODEX_CMD", format!("node {}", fixture.display()));
     std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &arg_log);
 
@@ -574,7 +655,6 @@ async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
 
     std::env::remove_var("CODEX_CMD");
     std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An EXPIRED lease must be TREE-killed before release: the decoy grandchild (which a

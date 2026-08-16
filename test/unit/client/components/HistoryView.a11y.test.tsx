@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 
@@ -96,5 +96,46 @@ describe('HistoryView a11y', () => {
 
     consoleErrorSpy.mockRestore()
   })
-})
 
+  it('announces a quarantined session-identity conflict on the history surface', () => {
+    const store = configureStore({
+      reducer: {
+        sessions: sessionsReducer,
+        tabs: tabsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        sessions: {
+          projects: [],
+          expandedProjects: new Set(),
+          windows: {
+            history: {
+              projects: [],
+              integrityError: {
+                kind: 'identity_collision',
+                collisionCount: 2,
+                duplicateItemCount: 4,
+              },
+            },
+          },
+        },
+        tabs: { tabs: [], activeTabId: null },
+      } as any,
+    })
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    const alert = screen.getByTestId('history-session-directory-integrity-error')
+    expect(alert).toHaveAttribute('role', 'alert')
+    expect(alert).toHaveTextContent('Running terminals remain available')
+  })
+})

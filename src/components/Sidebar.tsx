@@ -556,6 +556,7 @@ export default function Sidebar({
     && loadingKind === 'search'
     && hasRequestedQuery
   const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
+  const integrityError = sidebarWindow?.integrityError
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
@@ -886,6 +887,19 @@ export default function Sidebar({
             className="h-full overflow-y-auto"
             onScroll={handleListScroll}
           >
+            {integrityError?.kind === 'identity_collision' ? (
+              <div
+                role="alert"
+                data-testid="session-directory-integrity-error"
+                className="mx-1 mt-2 flex gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-2 text-xs text-amber-950 dark:text-amber-100"
+              >
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+                <span>
+                  {integrityError.collisionCount} conflicting saved session {integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+                  {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+                </span>
+              </div>
+            ) : null}
             {showBlockingLoad ? (
               <div
                 className="flex items-center justify-center py-8"

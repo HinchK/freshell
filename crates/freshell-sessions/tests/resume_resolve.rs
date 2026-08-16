@@ -29,6 +29,7 @@ const AMPLIFIER_FULL: &str = "417e8345-90ab-4cde-8f01-234567890abc";
 fn session(provider: &str, id: &str, last: i64) -> IndexedSession {
     IndexedSession {
         session_id: id.to_string(),
+        legacy_session_id: None,
         provider: provider.to_string(),
         project_path: format!("/repo/{provider}"),
         title: Some(format!("{provider} title")),
@@ -515,6 +516,7 @@ const AMP_ID_OLD: &str = "417e8345-bbbb-4ccc-8ddd-000000000002";
 fn session_in(provider: &str, id: &str, project: &str, last_activity_at: i64) -> IndexedSession {
     IndexedSession {
         session_id: id.to_string(),
+        legacy_session_id: None,
         provider: provider.to_string(),
         project_path: project.to_string(),
         title: None,

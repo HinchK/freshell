@@ -2630,6 +2630,7 @@ mod sessions_sweep_tests {
     fn mk_indexed(last_activity_at: i64) -> IndexedSession {
         IndexedSession {
             session_id: "s".to_string(),
+            legacy_session_id: None,
             provider: "claude".to_string(),
             project_path: "/tmp".to_string(),
             title: None,
@@ -2710,10 +2711,10 @@ mod sessions_sweep_tests {
 
     /// The scenario the sweep task depends on: writing a NEW session file
     /// (with a later `lastActivityAt`) into the watched home changes the
-    /// signature on the next `SessionIndex::snapshot()` call. `with_ttl(0)`
-    /// forces every `snapshot()` call to re-validate against disk (no TTL
-    /// window to wait out), matching the task pattern
-    /// `SessionIndex::with_ttl(0ms) + tempdir claude fixtures`.
+    /// signature on the next `SessionIndex::snapshot()` call. An explicit
+    /// zero TTL forces every `snapshot()` call to re-validate against disk
+    /// (no TTL window to wait out); the explicit `None` cache path keeps the
+    /// tempdir fixture isolated from the developer's persistent cache.
     #[tokio::test]
     async fn new_session_file_changes_the_signature() {
         let claude_home = unique_temp_dir("advance").join(".claude");
@@ -2723,9 +2724,10 @@ mod sessions_sweep_tests {
             "/tmp/sweep-test/alpha",
             "2025-01-01T00:00:00.000Z",
         );
-        let index = SessionIndex::with_ttl(
+        let index = SessionIndex::with_ttl_and_cache_path(
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
+            None,
         );
         let before = sessions_sweep_signature(&index.snapshot().await, &[]);
         assert_ne!(
@@ -2782,9 +2784,10 @@ mod sessions_sweep_tests {
             "/tmp/sweep-test/already-latest",
             "2030-01-01T00:00:00.000Z",
         );
-        let index = SessionIndex::with_ttl(
+        let index = SessionIndex::with_ttl_and_cache_path(
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
+            None,
         );
         let before = sessions_sweep_signature(&index.snapshot().await, &[]);
 
@@ -2828,9 +2831,10 @@ mod sessions_sweep_tests {
             "/tmp/sweep-test/gamma",
             "2025-01-01T00:00:00.000Z",
         );
-        let index = SessionIndex::with_ttl(
+        let index = SessionIndex::with_ttl_and_cache_path(
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
+            None,
         );
         let first = sessions_sweep_signature(&index.snapshot().await, &[]);
         let second = sessions_sweep_signature(&index.snapshot().await, &[]);

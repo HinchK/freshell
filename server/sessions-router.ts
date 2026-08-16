@@ -20,7 +20,10 @@ import {
   KnownSessionMetadataTypeSchema,
   SessionTypeMetadataSourceSchema,
 } from '../shared/session-flavor.js'
-import { querySessionDirectory } from './session-directory/service.js'
+import {
+  querySessionDirectory,
+  SessionDirectoryCursorError,
+} from './session-directory/service.js'
 import {
   ResumeResolveRequestSchema,
   type ResumeResolveProviderError,
@@ -132,7 +135,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
         return
       }
       const message = error instanceof Error ? error.message : 'Session directory query failed'
-      const status = /cursor/i.test(message) ? 400 : 500
+      const status = error instanceof SessionDirectoryCursorError ? 400 : 500
       if (status === 500) {
         log.error({ err: error }, 'Session directory query failed')
       }

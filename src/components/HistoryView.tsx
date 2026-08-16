@@ -9,7 +9,7 @@ import { applySessionRenameCascade } from '@/store/titleSync'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { useMobile } from '@/hooks/useMobile'
-import { Search, ChevronRight, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
+import { AlertCircle, Search, ChevronRight, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 function formatTime(ts: number) {
@@ -195,6 +195,20 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
           />
         </div>
       </div>
+
+      {historyWindow?.integrityError?.kind === 'identity_collision' ? (
+        <div
+          role="alert"
+          data-testid="history-session-directory-integrity-error"
+          className="flex gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-950 dark:text-amber-100 md:px-6"
+        >
+          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
+          <span>
+            {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+            {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+          </span>
+        </div>
+      ) : null}
 
       {deleteError ? (
         <div

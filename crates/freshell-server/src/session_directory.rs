@@ -98,6 +98,10 @@ pub struct SessionDirectoryState {
 #[derive(Debug, Clone)]
 struct DirItem {
     session_id: String,
+    /// Compatibility alias for user-authored state recorded before a provider
+    /// identity migration. Internal only: never serialized and never used for
+    /// joining/routing session identity.
+    legacy_session_id: Option<String>,
     provider: String,
     project_path: String,
     title: Option<String>,
@@ -152,6 +156,15 @@ impl DirItem {
     /// `buildSessionKey` (`session-directory/service.ts:36-38`): `provider:sessionId`.
     fn key(&self) -> String {
         format!("{}:{}", self.provider, self.session_id)
+    }
+
+    /// The compatibility key is only for reading prior user-owned metadata.
+    /// It never participates in sorting, filtering, live-terminal joins, or
+    /// the session identity invariant.
+    fn legacy_key(&self) -> Option<String> {
+        self.legacy_session_id
+            .as_ref()
+            .map(|session_id| format!("{}:{session_id}", self.provider))
     }
 
     /// Serialize to the `SessionDirectoryItem` shape — required fields always
@@ -422,15 +435,77 @@ async fn session_directory(
     // live-terminal join (the original's indexer output already carries
     // `sessionType` when `toItems` runs).
     let items = apply_session_metadata(items, &state.metadata.get_all().await);
+    // Capture the revision before quarantining corrupt persisted rows. A
+    // change to a conflicting source must still invalidate a client's cached
+    // read model even though that source is not safe to render.
+    let identities = state.identity.list();
+    let revision = items
+        .iter()
+        .map(|item| item.last_activity_at)
+        .chain(identities.iter().map(|identity| identity.updated_at))
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    let collisions = persisted_identity_collisions(&items);
+    let identity_collision = if !collisions.is_empty() {
+        let log_summary = persisted_identity_collision_log_summary(&collisions);
+        let collision_samples_json =
+            serde_json::to_string(&log_summary.samples).unwrap_or_else(|_| "[]".to_string());
+        tracing::error!(
+            target: "freshell_server::session_directory",
+            collision_count = log_summary.collision_count,
+            duplicate_item_count = log_summary.duplicate_item_count,
+            collision_sample_count = log_summary.samples.len(),
+            collision_samples_truncated = log_summary.collision_samples_truncated,
+            collision_samples_json = %collision_samples_json,
+            "session_directory_identity_collision"
+        );
+        Some((
+            collisions
+                .iter()
+                .map(|collision| collision.key.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            log_summary.collision_count,
+            log_summary.duplicate_item_count,
+        ))
+    } else {
+        None
+    };
+    // A collision remains an ERROR-level integrity event, but a single copied
+    // transcript must not make every healthy session inaccessible. Exclude
+    // every ambiguous PERSISTED row (never choose an arbitrary file winner),
+    // preserve all unambiguous rows, and allow the subsequent live-terminal
+    // join to create a safe generic placeholder when applicable.
+    let items = match &identity_collision {
+        Some((keys, ..)) => items
+            .into_iter()
+            .filter(|item| !keys.contains(&item.key()))
+            .collect(),
+        None => items,
+    };
     // Fix Spec: Session Naming Cluster (SYMPTOM 1) -- join the LIVE terminal
     // identity set against the parsed session items (`toItems`, `service.ts:132-151`).
     // `.list()` (live-only, excludes retired terminals): an exited terminal is not
     // part of the sidebar's "running" set, matching the original's
     // `TerminalMetadataService.list()` input to `toItems`.
-    let identities = state.identity.list();
     let items = join_live_terminals(items, &identities);
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
+            page["revision"] = json!(revision);
+            if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
+                // Keep an I/O/budget partial reason if the same request also
+                // encountered one. Collision identity travels only in the
+                // additive integrity object: an old cached SPA rejects an
+                // unknown enum value but strips an unknown object field.
+                if page.get("partial").is_none() {
+                    page["partial"] = json!(true);
+                }
+                page["integrityError"] = json!({
+                    "kind": "identity_collision",
+                    "collisionCount": collision_count,
+                    "duplicateItemCount": duplicate_item_count,
+                });
+            }
             // SESSION-05 (project colors, read half): embed the config's
             // `projectColors` map on the page when non-empty — the channel
             // the shared client's refetch-after-`sessions.changed` reads to
@@ -451,6 +526,127 @@ async fn session_directory(
             Json(json!({ "error": msg })),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PersistedIdentityCollision {
+    key: String,
+    source_files: Vec<String>,
+}
+
+const IDENTITY_COLLISION_KEY_SAMPLE_LIMIT: usize = 20;
+const IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT: usize = 4;
+
+#[derive(Debug, serde::Serialize)]
+struct PersistedIdentityCollisionLogSample {
+    key: String,
+    source_file_count: usize,
+    source_files: Vec<String>,
+    source_files_truncated: bool,
+}
+
+struct PersistedIdentityCollisionLogSummary {
+    collision_count: usize,
+    duplicate_item_count: usize,
+    samples: Vec<PersistedIdentityCollisionLogSample>,
+    collision_samples_truncated: bool,
+}
+
+/// Detect the server-owned session-directory identity invariant before any
+/// visibility filter, search tier, cursor, pagination, or live-terminal join.
+/// Provider is part of the identity, so the same raw session id from two
+/// different providers is legal. Multiple persisted rows with the same
+/// composite key are an ERROR-level integrity event; callers quarantine every
+/// ambiguous persisted row instead of hiding the error or choosing an
+/// arbitrary file winner.
+fn persisted_identity_collisions(items: &[DirItem]) -> Vec<PersistedIdentityCollision> {
+    // The sidebar hot path normally has no collision. Keep borrowed identity
+    // references and source indices until a duplicate is proven so a healthy
+    // request does not allocate a key and lossy path string for every row.
+    enum Occurrences {
+        First(usize),
+        Duplicate(Vec<usize>),
+    }
+
+    let mut occurrences: std::collections::BTreeMap<(&str, &str), Occurrences> =
+        std::collections::BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        use std::collections::btree_map::Entry;
+
+        match occurrences.entry((&item.provider, &item.session_id)) {
+            Entry::Vacant(entry) => {
+                entry.insert(Occurrences::First(index));
+            }
+            Entry::Occupied(mut entry) => {
+                let first_index = match entry.get() {
+                    Occurrences::First(first_index) => Some(*first_index),
+                    Occurrences::Duplicate(_) => None,
+                };
+                if let Some(first_index) = first_index {
+                    entry.insert(Occurrences::Duplicate(vec![first_index, index]));
+                } else if let Occurrences::Duplicate(indices) = entry.get_mut() {
+                    indices.push(index);
+                }
+            }
+        }
+    }
+
+    occurrences
+        .into_iter()
+        .filter_map(|((provider, session_id), occurrences)| {
+            let Occurrences::Duplicate(indices) = occurrences else {
+                return None;
+            };
+            let mut source_files: Vec<String> = indices
+                .into_iter()
+                .map(|index| {
+                    items[index]
+                        .source_file
+                        .as_deref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                })
+                .collect();
+            source_files.sort();
+            Some(PersistedIdentityCollision {
+                key: format!("{provider}:{session_id}"),
+                source_files,
+            })
+        })
+        .collect()
+}
+
+/// Build a deterministic, bounded diagnostic sample for the collision log.
+/// Counts cover the complete collision set; only local-path context is
+/// sampled so a corrupt corpus cannot create an unbounded single JSONL event.
+fn persisted_identity_collision_log_summary(
+    collisions: &[PersistedIdentityCollision],
+) -> PersistedIdentityCollisionLogSummary {
+    let samples = collisions
+        .iter()
+        .take(IDENTITY_COLLISION_KEY_SAMPLE_LIMIT)
+        .map(|collision| PersistedIdentityCollisionLogSample {
+            key: collision.key.clone(),
+            source_file_count: collision.source_files.len(),
+            source_files: collision
+                .source_files
+                .iter()
+                .take(IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT)
+                .cloned()
+                .collect(),
+            source_files_truncated: collision.source_files.len()
+                > IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT,
+        })
+        .collect();
+    PersistedIdentityCollisionLogSummary {
+        collision_count: collisions.len(),
+        duplicate_item_count: collisions
+            .iter()
+            .map(|collision| collision.source_files.len())
+            .sum(),
+        samples,
+        collision_samples_truncated: collisions.len() > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT,
     }
 }
 
@@ -560,6 +756,7 @@ pub(crate) fn codex_home(home: &Path) -> PathBuf {
 fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
     DirItem {
         session_id: idx.session_id.clone(),
+        legacy_session_id: idx.legacy_session_id.clone(),
         provider: idx.provider.clone(),
         project_path: idx.project_path.clone(),
         title: idx.title.clone(),
@@ -682,12 +879,22 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
     // `includeSubagents&includeNonInteractive&includeEmpty=true` still returns
     // `{items:[],nextCursor:null,revision:0}` \u2014 the file was never indexed at all.
     meta.cwd.as_ref()?;
+    let is_subagent = force_subagent || meta.is_subagent.unwrap_or(false);
+    // Keep the test-only differential oracle aligned with production: choose
+    // Claude's filename identity during construction. Child transcripts embed
+    // their parent id, which is not a child compatibility alias.
+    let legacy_session_id = (!is_subagent)
+        .then_some(meta.session_id.as_deref())
+        .flatten()
+        .filter(|session_id| *session_id != fallback)
+        .map(str::to_owned);
     Some(item_from_meta(
         &meta,
         "claude",
-        &fallback,
+        fallback,
         force_subagent,
         Some(path.to_path_buf()),
+        legacy_session_id,
     ))
 }
 
@@ -699,15 +906,14 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
 fn item_from_meta(
     meta: &ParsedSessionMeta,
     provider: &str,
-    fallback_session_id: &str,
+    session_id: String,
     force_subagent: bool,
     source_file: Option<PathBuf>,
+    legacy_session_id: Option<String>,
 ) -> DirItem {
     DirItem {
-        session_id: meta
-            .session_id
-            .clone()
-            .unwrap_or_else(|| fallback_session_id.to_string()),
+        session_id,
+        legacy_session_id,
         provider: provider.to_string(),
         // resolveProjectPath: `meta.cwd` (git-root resolution deferred), else 'unknown'.
         project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -741,10 +947,22 @@ fn apply_session_overrides(
     items: Vec<DirItem>,
     overrides: &serde_json::Map<String, Value>,
 ) -> Vec<DirItem> {
+    let canonical_keys: std::collections::HashSet<String> =
+        items.iter().map(DirItem::key).collect();
     items
         .into_iter()
         .filter_map(|mut item| {
-            let ov = overrides.get(&item.key()).and_then(Value::as_object);
+            let canonical_key = item.key();
+            // A compatibility identity is usable only after its canonical
+            // row disappeared. Otherwise a copied transcript would inherit
+            // the original's rename, archive, or deleted state.
+            let legacy_key = item
+                .legacy_key()
+                .filter(|key| !canonical_keys.contains(key));
+            let ov = overrides
+                .get(&canonical_key)
+                .or_else(|| legacy_key.as_ref().and_then(|key| overrides.get(key)))
+                .and_then(Value::as_object);
             if let Some(ov) = ov {
                 if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
                     return None;
@@ -787,11 +1005,20 @@ fn apply_session_metadata(
     items: Vec<DirItem>,
     metadata: &std::collections::HashMap<String, Value>,
 ) -> Vec<DirItem> {
+    let canonical_keys: std::collections::HashSet<String> =
+        items.iter().map(DirItem::key).collect();
     items
         .into_iter()
         .map(|mut item| {
+            let canonical_key = item.key();
+            // Match the override path: never let a still-present canonical
+            // original's metadata spill into a copied transcript.
+            let legacy_key = item
+                .legacy_key()
+                .filter(|key| !canonical_keys.contains(key));
             if let Some(session_type) = metadata
-                .get(&item.key())
+                .get(&canonical_key)
+                .or_else(|| legacy_key.as_ref().and_then(|key| metadata.get(key)))
                 .and_then(|entry| entry.get("sessionType"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -880,6 +1107,7 @@ fn build_live_terminal_session_item(
         .unwrap_or_else(|| format!("terminal:{}", identity.terminal_id));
     Some(DirItem {
         session_id,
+        legacy_session_id: None,
         provider: provider.clone(),
         project_path,
         title: Some(provider_display_name(&provider)),
@@ -945,6 +1173,7 @@ mod join_tests {
     fn file_item(provider: &str, session_id: &str, last_activity_at: i64) -> DirItem {
         DirItem {
             session_id: session_id.to_string(),
+            legacy_session_id: None,
             provider: provider.to_string(),
             project_path: "/repo".to_string(),
             title: Some("A real session".to_string()),
@@ -1633,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn item_from_meta_maps_fields_and_fallback_session_id() {
+    fn item_from_meta_maps_fields_with_an_explicit_canonical_session_id() {
         // real-corrupted: canonical UUID + cwd + title.
         let content = std::fs::read_to_string(fixtures_dir().join("real-corrupted.jsonl")).unwrap();
         let meta = parse_session_content(
@@ -1643,8 +1872,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        let item = item_from_meta(&meta, "claude", "real-corrupted", false, None);
-        assert_eq!(item.session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
+        let item = item_from_meta(
+            &meta,
+            "claude",
+            "real-corrupted".to_string(),
+            false,
+            None,
+            Some("b7936c10-4935-441c-837c-c1f33cafec2d".to_string()),
+        );
+        assert_eq!(item.session_id, "real-corrupted");
+        assert_eq!(
+            item.legacy_session_id.as_deref(),
+            Some("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
         assert_eq!(item.provider, "claude");
         assert_eq!(
             item.project_path,
@@ -1656,10 +1896,7 @@ mod tests {
 
         // Item value shape has the required keys.
         let v = item.to_value();
-        assert_eq!(
-            v["sessionId"],
-            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
-        );
+        assert_eq!(v["sessionId"], json!("real-corrupted"));
         assert_eq!(v["provider"], json!("claude"));
         assert_eq!(v["isRunning"], json!(false));
         assert_eq!(v["lastActivityAt"], json!(1_769_753_759_234i64));
@@ -1675,7 +1912,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let item = item_from_meta(&meta, "claude", "healthy", false, None);
+        let item = item_from_meta(&meta, "claude", "healthy".to_string(), false, None, None);
         assert_eq!(item.session_id, "healthy"); // not a canonical UUID
     }
 
@@ -1773,10 +2010,7 @@ mod tests {
         let page = apply_query(items, &q, &[]).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(
-            arr[0]["sessionId"],
-            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
-        );
+        assert_eq!(arr[0]["sessionId"], json!("real-corrupted"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1849,6 +2083,7 @@ mod tests {
         // Two synthetic titled interactive items; limit 1 → page + nextCursor.
         let mk = |sid: &str, at: i64| DirItem {
             session_id: sid.into(),
+            legacy_session_id: None,
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some(format!("t-{sid}")),
@@ -2063,6 +2298,7 @@ mod tests {
         // Two synthetic titled items.
         let mk = |sid: &str| DirItem {
             session_id: sid.into(),
+            legacy_session_id: None,
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("parsed".into()),
@@ -2104,9 +2340,132 @@ mod tests {
     }
 
     #[test]
+    fn canonical_identity_prefers_its_own_user_state_and_falls_back_to_a_safe_legacy_identity() {
+        let item = DirItem {
+            session_id: "canonical-filename".into(),
+            legacy_session_id: Some("embedded-before-canonicalization".into()),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("parsed".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:embedded-before-canonicalization".into(),
+            json!({ "titleOverride": "Legacy rename" }),
+        );
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "claude:embedded-before-canonicalization".into(),
+            json!({ "sessionType": "freshclaude" }),
+        );
+
+        let overlaid = apply_session_metadata(
+            apply_session_overrides(vec![item.clone()], &overrides),
+            &metadata,
+        );
+        assert_eq!(overlaid[0].title.as_deref(), Some("Legacy rename"));
+        assert_eq!(overlaid[0].session_type.as_deref(), Some("freshclaude"));
+
+        overrides.insert(
+            "claude:canonical-filename".into(),
+            json!({ "titleOverride": "Canonical rename" }),
+        );
+        metadata.insert(
+            "claude:canonical-filename".into(),
+            json!({ "sessionType": "freshclaude-canonical" }),
+        );
+        let canonical =
+            apply_session_metadata(apply_session_overrides(vec![item], &overrides), &metadata);
+        assert_eq!(canonical[0].title.as_deref(), Some("Canonical rename"));
+        assert_eq!(
+            canonical[0].session_type.as_deref(),
+            Some("freshclaude-canonical")
+        );
+    }
+
+    #[test]
+    fn legacy_user_state_does_not_spill_from_a_present_canonical_original_to_its_copy() {
+        let original = DirItem {
+            session_id: "embedded-before-canonicalization".into(),
+            legacy_session_id: None,
+            provider: "claude".into(),
+            project_path: "/original".into(),
+            title: Some("Original parsed title".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/original".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+        };
+        let copied = DirItem {
+            session_id: "copied-transcript".into(),
+            legacy_session_id: Some("embedded-before-canonicalization".into()),
+            project_path: "/copy".into(),
+            title: Some("Copied parsed title".into()),
+            cwd: Some("/copy".into()),
+            ..original.clone()
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:embedded-before-canonicalization".into(),
+            json!({ "titleOverride": "Original user rename" }),
+        );
+        let metadata = std::collections::HashMap::from([(
+            "claude:embedded-before-canonicalization".into(),
+            json!({ "sessionType": "freshclaude" }),
+        )]);
+
+        let overlaid = apply_session_metadata(
+            apply_session_overrides(vec![original, copied], &overrides),
+            &metadata,
+        );
+        let original = overlaid
+            .iter()
+            .find(|item| item.session_id == "embedded-before-canonicalization")
+            .unwrap();
+        let copied = overlaid
+            .iter()
+            .find(|item| item.session_id == "copied-transcript")
+            .unwrap();
+
+        assert_eq!(original.title.as_deref(), Some("Original user rename"));
+        assert_eq!(original.session_type.as_deref(), Some("freshclaude"));
+        assert_eq!(copied.title.as_deref(), Some("Copied parsed title"));
+        assert_eq!(copied.session_type, None);
+    }
+
+    #[test]
     fn overlay_shape_unchanged_when_no_overrides_archived_always_present() {
         let item = DirItem {
             session_id: "x".into(),
+            legacy_session_id: None,
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("t".into()),
@@ -2149,6 +2508,7 @@ mod tests {
     fn guard_item(sid: &str, title_source: Option<&str>) -> DirItem {
         DirItem {
             session_id: sid.into(),
+            legacy_session_id: None,
             provider: "amplifier".into(),
             project_path: "/p".into(),
             title: Some("Provider Title".into()),
@@ -2278,6 +2638,98 @@ mod tests {
 
     use freshell_sessions::directory_index::{ClaudeSource, SessionIndex, SessionSource};
 
+    fn test_session_index(sources: Vec<Arc<dyn SessionSource>>) -> SessionIndex {
+        SessionIndex::with_ttl_and_cache_path(sources, Duration::from_millis(1_000), None)
+    }
+
+    fn test_session_index_with_ttl(
+        sources: Vec<Arc<dyn SessionSource>>,
+        ttl: Duration,
+    ) -> SessionIndex {
+        SessionIndex::with_ttl_and_cache_path(sources, ttl, None)
+    }
+
+    struct StaticSessionSource {
+        items: Vec<IndexedSession>,
+    }
+
+    impl SessionSource for StaticSessionSource {
+        fn discover(&self) -> Vec<freshell_sessions::directory_index::FileStat> {
+            self.items
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, item)| freshell_sessions::directory_index::FileStat {
+                        path: item.source_file.clone().unwrap_or_else(|| {
+                            PathBuf::from(format!("/static-session-source/{index}.jsonl"))
+                        }),
+                        mtime_ms: index as i64,
+                        size: 1,
+                    },
+                )
+                .collect()
+        }
+
+        fn parse(&self, path: &Path) -> Option<IndexedSession> {
+            self.items
+                .iter()
+                .find(|item| item.source_file.as_deref() == Some(path))
+                .cloned()
+        }
+    }
+
+    fn static_indexed_session(
+        provider: &str,
+        session_id: &str,
+        source_file: &str,
+        last_activity_at: i64,
+    ) -> IndexedSession {
+        IndexedSession {
+            session_id: session_id.to_string(),
+            legacy_session_id: None,
+            provider: provider.to_string(),
+            project_path: "/p".to_string(),
+            title: Some(format!("{provider} {session_id}")),
+            title_provider_generated: false,
+            summary: None,
+            first_user_message: None,
+            title_source: None,
+            last_activity_at,
+            created_at: None,
+            cwd: Some("/p".to_string()),
+            git_branch: None,
+            is_subagent: false,
+            is_non_interactive: false,
+            source_file: Some(PathBuf::from(source_file)),
+        }
+    }
+
+    fn static_directory_app(items: Vec<IndexedSession>, home: &Path) -> Router {
+        static_directory_app_with_identity(
+            items,
+            home,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        )
+    }
+
+    fn static_directory_app_with_identity(
+        items: Vec<IndexedSession>,
+        home: &Path,
+        identity: freshell_ws::identity::TerminalIdentityRegistry,
+    ) -> Router {
+        let source = StaticSessionSource { items };
+        router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(
+                Some(home),
+                vec!["claude".into(), "codex".into()],
+            ),
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(source)]))),
+            identity,
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+        })
+    }
+
     /// Comparable projection of either `DirItem` or `IndexedSession`, keyed
     /// the same way, for the B-T1 differential assertion (the two types are
     /// deliberately distinct -- one server-local, one in `freshell_sessions`
@@ -2373,7 +2825,7 @@ mod tests {
             crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
-            std::sync::Arc::new(SessionIndex::new(vec![
+            std::sync::Arc::new(test_session_index(vec![
                 std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
@@ -2411,6 +2863,340 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[tokio::test]
+    async fn persisted_identity_collision_is_quarantined_before_filtering_or_pagination() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let app = static_directory_app(
+            vec![
+                static_indexed_session("claude", "unique", "/p/unique.jsonl", 300),
+                static_indexed_session("claude", "duplicate", "/p/one.jsonl", 200),
+                static_indexed_session("claude", "duplicate", "/p/two.jsonl", 100),
+            ],
+            &home,
+        );
+
+        for uri in [
+            "/api/session-directory?priority=visible&query=no-such-title",
+            "/api/session-directory?priority=visible&limit=1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header("x-auth-token", "tok")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::OK,
+                "collisions are an integrity error, but healthy rows stay available"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let page: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(page["partial"], json!(true));
+            assert!(page.get("partialReason").is_none());
+            assert_eq!(
+                page["integrityError"],
+                json!({
+                    "kind": "identity_collision",
+                    "collisionCount": 1,
+                    "duplicateItemCount": 2,
+                }),
+                "the response is actionable without exposing local source paths"
+            );
+            let served_keys: Vec<String> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}:{}",
+                        item["provider"].as_str().unwrap(),
+                        item["sessionId"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            if uri.contains("query=") {
+                assert!(served_keys.is_empty());
+            } else {
+                assert_eq!(served_keys, vec!["claude:unique"]);
+            }
+            assert!(!serde_json::to_string(&page)
+                .unwrap()
+                .contains("/p/one.jsonl"));
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn persisted_identity_collision_keeps_a_matching_live_terminal_as_a_safe_placeholder() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.upsert(
+            "term-conflicted",
+            Some("claude"),
+            Some("duplicate"),
+            Some("/live-terminal"),
+            400,
+        );
+        let app = static_directory_app_with_identity(
+            vec![
+                static_indexed_session("claude", "unique", "/p/unique.jsonl", 300),
+                static_indexed_session("claude", "duplicate", "/p/one.jsonl", 200),
+                static_indexed_session("claude", "duplicate", "/p/two.jsonl", 100),
+            ],
+            &home,
+            identity,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&body).unwrap();
+        let items = page["items"].as_array().unwrap();
+
+        assert!(
+            items.iter().any(|item| {
+                item["provider"] == "claude"
+                    && item["sessionId"] == "duplicate"
+                    && item["title"] == "Claude CLI"
+                    && item["projectPath"] == "/live-terminal"
+                    && item["isRunning"] == true
+                    && item["runningTerminalId"] == "term-conflicted"
+            }),
+            "page={page}"
+        );
+        let placeholder = items
+            .iter()
+            .find(|item| item["provider"] == "claude" && item["sessionId"] == "duplicate")
+            .unwrap();
+        assert_ne!(placeholder["liveTerminalOnly"], json!(true));
+        assert!(items
+            .iter()
+            .any(|item| { item["provider"] == "claude" && item["sessionId"] == "unique" }));
+        assert!(!serde_json::to_string(&page)
+            .unwrap()
+            .contains("/p/one.jsonl"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn persisted_identity_collision_context_is_deterministically_sorted() {
+        let items: Vec<DirItem> = [
+            static_indexed_session("claude", "z", "/p/z-two.jsonl", 1),
+            static_indexed_session("claude", "a", "/p/a-two.jsonl", 1),
+            static_indexed_session("claude", "z", "/p/z-one.jsonl", 1),
+            static_indexed_session("claude", "a", "/p/a-one.jsonl", 1),
+        ]
+        .iter()
+        .map(dir_item_from_indexed)
+        .collect();
+
+        let collisions = persisted_identity_collisions(&items);
+        assert_eq!(
+            collisions
+                .iter()
+                .map(|collision| collision.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude:a", "claude:z"]
+        );
+        assert_eq!(
+            collisions[0].source_files,
+            vec!["/p/a-one.jsonl", "/p/a-two.jsonl"]
+        );
+        assert_eq!(
+            collisions[1].source_files,
+            vec!["/p/z-one.jsonl", "/p/z-two.jsonl"]
+        );
+    }
+
+    #[test]
+    fn persisted_identity_collision_log_summary_is_deterministic_and_bounded() {
+        let mut items = Vec::new();
+        for collision_index in 0..(IDENTITY_COLLISION_KEY_SAMPLE_LIMIT + 3) {
+            for source_index in 0..(IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT + 2) {
+                items.push(static_indexed_session(
+                    "claude",
+                    &format!("collision-{collision_index:03}"),
+                    &format!("/p/{collision_index:03}-{source_index:03}.jsonl"),
+                    1,
+                ));
+            }
+        }
+        let dir_items: Vec<DirItem> = items.iter().map(dir_item_from_indexed).collect();
+        let collisions = persisted_identity_collisions(&dir_items);
+        let summary = persisted_identity_collision_log_summary(&collisions);
+
+        assert_eq!(
+            summary.collision_count,
+            IDENTITY_COLLISION_KEY_SAMPLE_LIMIT + 3
+        );
+        assert_eq!(
+            summary.duplicate_item_count,
+            (IDENTITY_COLLISION_KEY_SAMPLE_LIMIT + 3)
+                * (IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT + 2)
+        );
+        assert_eq!(summary.samples.len(), IDENTITY_COLLISION_KEY_SAMPLE_LIMIT);
+        assert_eq!(summary.samples[0].key, "claude:collision-000");
+        assert_eq!(summary.samples.last().unwrap().key, "claude:collision-019");
+        assert!(summary.collision_samples_truncated);
+        for sample in &summary.samples {
+            assert_eq!(
+                sample.source_file_count,
+                IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT + 2
+            );
+            assert_eq!(
+                sample.source_files.len(),
+                IDENTITY_COLLISION_SOURCE_SAMPLE_LIMIT
+            );
+            assert!(sample.source_files_truncated);
+        }
+    }
+
+    #[tokio::test]
+    async fn same_raw_session_id_from_different_providers_is_legal() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let app = static_directory_app(
+            vec![
+                static_indexed_session("claude", "shared", "/p/claude.jsonl", 200),
+                static_indexed_session("codex", "shared", "/p/codex.jsonl", 100),
+            ],
+            &home,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&body).unwrap();
+        let keys: std::collections::BTreeSet<String> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}:{}",
+                    item["provider"].as_str().unwrap(),
+                    item["sessionId"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "claude:shared".to_string(),
+                "codex:shared".to_string(),
+            ])
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn matching_live_terminal_duplicates_are_one_served_row_not_a_persisted_collision() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.upsert(
+            "term-one",
+            Some("claude"),
+            Some("shared-live-session"),
+            Some("/p"),
+            200,
+        );
+        identity.upsert(
+            "term-two",
+            Some("claude"),
+            Some("shared-live-session"),
+            Some("/p"),
+            300,
+        );
+        let app = static_directory_app_with_identity(
+            vec![static_indexed_session(
+                "claude",
+                "shared-live-session",
+                "/p/shared-live-session.jsonl",
+                100,
+            )],
+            &home,
+            identity,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&body).unwrap();
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "live records are join inputs, not persisted rows"
+        );
+        assert_eq!(rows[0]["provider"], json!("claude"));
+        assert_eq!(rows[0]["sessionId"], json!("shared-live-session"));
+        assert_eq!(rows[0]["isRunning"], json!(true));
+        assert!(matches!(
+            rows[0]["runningTerminalId"].as_str(),
+            Some("term-one" | "term-two")
+        ));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Task 20 (read-join): a `sessionType` tag persisted through the
     /// SESSION-06 `SessionMetadataStore` (`session-metadata.json`) is
     /// overlaid onto the matching served `/api/session-directory` item,
@@ -2432,12 +3218,7 @@ mod tests {
         // to -- the read side must discover the SAME file.
         let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
         metadata
-            .set(
-                "claude",
-                "b7936c10-4935-441c-837c-c1f33cafec2d",
-                "kilroy",
-                Some("explicit"),
-            )
+            .set("claude", "real-corrupted", "kilroy", Some("explicit"))
             .await
             .unwrap();
 
@@ -2445,7 +3226,7 @@ mod tests {
             crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
-            std::sync::Arc::new(SessionIndex::new(vec![
+            std::sync::Arc::new(test_session_index(vec![
                 std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
@@ -2478,7 +3259,7 @@ mod tests {
         let items = page["items"].as_array().unwrap();
         let item = items
             .iter()
-            .find(|i| i["sessionId"] == json!("b7936c10-4935-441c-837c-c1f33cafec2d"))
+            .find(|i| i["sessionId"] == json!("real-corrupted"))
             .expect("tagged session present in directory");
         assert_eq!(
             item["sessionType"],
@@ -2523,7 +3304,7 @@ mod tests {
             crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
-            std::sync::Arc::new(SessionIndex::new(vec![
+            std::sync::Arc::new(test_session_index(vec![
                 std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
@@ -2581,7 +3362,7 @@ mod tests {
             crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
-            std::sync::Arc::new(SessionIndex::new(vec![
+            std::sync::Arc::new(test_session_index(vec![
                 std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
@@ -2706,7 +3487,7 @@ mod tests {
         // Long TTL: both requests must land within the same cached window --
         // this test is about overrides never forcing a rebuild, not about TTL
         // expiry (that's B-T3/B-T4/the incremental-cache tests).
-        let session_index = std::sync::Arc::new(SessionIndex::with_ttl(
+        let session_index = std::sync::Arc::new(test_session_index_with_ttl(
             vec![std::sync::Arc::new(source) as std::sync::Arc<dyn SessionSource>],
             Duration::from_secs(60),
         ));
@@ -2751,10 +3532,7 @@ mod tests {
 
         // Apply an override BETWEEN the two requests.
         settings
-            .patch_session_override(
-                "claude:b7936c10-4935-441c-837c-c1f33cafec2d",
-                &[("archived", Some(json!(true)))],
-            )
+            .patch_session_override("claude:real-corrupted", &[("archived", Some(json!(true)))])
             .await;
 
         let resp2 = get_page(app).await;
@@ -2812,7 +3590,7 @@ mod tests {
         let settings =
             crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into()]);
         let auth_token: Arc<String> = Arc::new("tok".into());
-        let session_index = Arc::new(SessionIndex::new(vec![
+        let session_index = Arc::new(test_session_index(vec![
             Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>,
         ]));
         let state = SessionDirectoryState {
@@ -2908,7 +3686,7 @@ mod tests {
             vec!["codex".into(), "opencode".into()],
         );
         let auth_token: Arc<String> = Arc::new("tok".into());
-        let session_index = Arc::new(SessionIndex::new(vec![
+        let session_index = Arc::new(test_session_index(vec![
             Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>,
             Arc::new(OpencodeSource::new(opencode_home)) as Arc<dyn SessionSource>,
         ]));
@@ -3003,7 +3781,7 @@ mod tests {
             crate::settings_store::SettingsStore::load(Some(&home), vec!["opencode".into()]);
         let auth_token: Arc<String> = Arc::new("tok".into());
         let session_index =
-            Arc::new(SessionIndex::new(vec![
+            Arc::new(test_session_index(vec![
                 Arc::new(OpencodeSource::new(opencode_home)) as Arc<dyn SessionSource>,
             ]));
         let state = SessionDirectoryState {
@@ -3314,6 +4092,7 @@ mod tests {
         // OVERRIDE (renamed) title.
         let item = DirItem {
             session_id: "s1".into(),
+            legacy_session_id: None,
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("original parsed title".into()),

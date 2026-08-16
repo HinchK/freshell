@@ -201,6 +201,24 @@ export function isSubagentSession(filePath: string): boolean {
   return normalized.includes('/.claude/') || normalized.includes('\\.claude\\')
 }
 
+/**
+ * Claude subagent transcripts embed their parent's id, not an old identity
+ * for the child. Keep compatibility aliases only for non-subagent files so a
+ * parent rename, archive, or session type can never leak to every child.
+ */
+function legacyClaudeSessionId(
+  provider: CodingCliProvider,
+  filePath: string,
+  meta: { sessionId?: string; isSubagent?: boolean },
+  canonicalSessionId: string,
+): string | undefined {
+  if (provider.name !== 'claude' || isSubagentSession(filePath) || meta.isSubagent) return undefined
+  const embeddedSessionId = meta.sessionId?.trim()
+  return embeddedSessionId && embeddedSessionId !== canonicalSessionId
+    ? embeddedSessionId
+    : undefined
+}
+
 function applyOverride(
   session: CodingCliSession,
   ov: SessionOverride | undefined,
@@ -425,6 +443,12 @@ type CachedSessionEntry = {
    * (kata v4rw). Undefined for providers that don't expose sidecar activity.
    */
   activityMtimeMs?: number
+  /**
+   * Former identity retained only for safe provider migrations. It is used
+   * for read-only fallback lookups of user-owned overrides/metadata; the
+   * canonical `baseSession.sessionId` always remains the row identity.
+   */
+  legacySessionId?: string
 }
 
 export type SessionIndexerOptions = {
@@ -989,10 +1013,15 @@ export class CodingCliSessionIndexer {
     }
 
     const projectPath = await provider.resolveProjectPath(filePath, meta)
-    const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
+    const sessionId = provider.extractSessionId(filePath, meta)
+    const legacySessionId = legacyClaudeSessionId(provider, filePath, meta, sessionId)
     const previous = cached?.lightweight ? undefined : cached?.baseSession
     const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
     const metaKey = makeSessionKey(provider.name, sessionId)
+    // A compatibility identity cannot safely participate in cache-time title
+    // lookup: a copied transcript may still coexist with the original
+    // canonical identity. `buildProjectGroups` applies the legacy fallback
+    // only after it can see the entire current identity set.
     const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
     const parsedTitle = normalizeTitle(meta.title)
     const resolvedTitle = resolveSessionTitle(parsedTitle, sameSession ? previous?.title : undefined, storedTitle)
@@ -1051,6 +1080,7 @@ export class CodingCliSessionIndexer {
       baseSession,
       titleSource: resolvedTitleSource,
       activityMtimeMs,
+      legacySessionId,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
@@ -1166,27 +1196,47 @@ export class CodingCliSessionIndexer {
   ): { groups: ProjectGroup[]; sessionCount: number } {
     const groupsByPath = new Map<string, ProjectGroup>()
     let sessionCount = 0
+    // A former identity is safe only after its canonical row disappeared.
+    // Otherwise a copied transcript must not inherit the original's rename,
+    // archive/deleted state, session type, or derived title.
+    const canonicalSessionKeys = new Set<string>()
+    for (const [, cached] of this.fileCache) {
+      if (!enabledSet.has(cached.provider) || !cached.baseSession) continue
+      canonicalSessionKeys.add(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+    }
 
     for (const [, cached] of this.fileCache) {
       if (!enabledSet.has(cached.provider)) continue
       if (!cached.baseSession) continue
       const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
       let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[cached.baseSession.sessionId]
-      if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
-        const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
-        if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
-          const legacyKey = makeSessionKey(cached.baseSession.provider, legacySessionId)
-          const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[legacySessionId]
-          if (legacyOverride) {
-            logger.warn({ sessionId: cached.baseSession.sessionId, legacySessionId }, 'Using legacy Claude session override')
-            ov = legacyOverride
-          }
+      const legacyKey = cached.legacySessionId
+        ? makeSessionKey(cached.baseSession.provider, cached.legacySessionId)
+        : undefined
+      const canUseLegacyIdentity = !!legacyKey && !canonicalSessionKeys.has(legacyKey)
+      if (!ov && canUseLegacyIdentity && cached.legacySessionId && legacyKey) {
+        const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[cached.legacySessionId]
+        if (legacyOverride) {
+          logger.debug({
+            sessionId: cached.baseSession.sessionId,
+            legacySessionId: cached.legacySessionId,
+          }, 'Using compatibility session override')
+          ov = legacyOverride
         }
       }
       const merged = applyOverride(cached.baseSession, ov, cached.titleSource)
       if (!merged) continue
       const metaKey = makeSessionKey(merged.provider, merged.sessionId)
+      const legacyMetaKey = canUseLegacyIdentity ? legacyKey : undefined
       const meta = sessionMetadata[metaKey]
+        ?? (legacyMetaKey ? sessionMetadata[legacyMetaKey] : undefined)
+      // Parsed/previous/canonical derived titles already live on `merged`.
+      // Only an otherwise untitled session may use its safe former identity's
+      // derived title, after the full canonical identity set was checked.
+      if (!normalizeTitle(merged.title) && legacyMetaKey) {
+        const legacyDerivedTitle = normalizeTitle(sessionMetadata[legacyMetaKey]?.derivedTitle)
+        if (legacyDerivedTitle) merged.title = legacyDerivedTitle
+      }
       if (meta?.sessionType) {
         merged.sessionType = meta.sessionType
       }
@@ -1297,8 +1347,11 @@ export class CodingCliSessionIndexer {
       const existing = this.fileCache.get(cacheKey)
       if (existing && existing.baseSession) continue
 
-      const sessionId = meta.sessionId || provider.extractSessionId(meta.filePath)
+      const sessionId = provider.extractSessionId(meta.filePath, meta)
+      const legacySessionId = legacyClaudeSessionId(provider, meta.filePath, meta, sessionId)
       const metaKey = makeSessionKey(provider.name, sessionId)
+      // See `updateCacheEntry`: legacy titles are resolved only when the
+      // complete current identity set proves the original is gone.
       const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
       const resolvedTitle = resolveSessionTitle(meta.title, existing?.baseSession?.title, storedTitle)
       const projectPath = meta.cwd ? await resolveGitRepoRoot(meta.cwd) : meta.cwd
@@ -1321,6 +1374,7 @@ export class CodingCliSessionIndexer {
         baseSession,
         titleSource: meta.titleSource,
         lightweight: true,
+        legacySessionId,
       })
       this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), meta.filePath)
     }
@@ -1442,6 +1496,11 @@ export class CodingCliSessionIndexer {
 
       let filesByProvider: Map<CodingCliProvider, string[]> | undefined
       const seenCacheKeys = new Set<string>()
+      // A failed root listing is not evidence that this provider's cache
+      // vanished. Track failures per provider so the eventual prune still
+      // cleans healthy providers while retaining the failed one's last known
+      // good rows (matching the Rust SessionIndex behavior).
+      const failedFileProviderNames = new Set<string>()
 
       if (isColdStart) {
         // Cold start: lightweight parallel scan populates the sidebar immediately,
@@ -1464,16 +1523,20 @@ export class CodingCliSessionIndexer {
       // On warm rescan this processes all files normally.
       for (const provider of this.providers) {
         if (!enabledSet.has(provider.name) || provider.listSessionsDirect) continue
-        const files = filesByProvider?.get(provider) ?? await provider.listSessionFiles().then((listed) => {
-          this.scanFailures.delete(provider.name)
-          return listed
-        }).catch((err) => {
-          logger.warn({ err, provider: provider.name }, 'Could not list session files')
-          // Record per attempt (never bulk-cleared): the resolve endpoint must
-          // report this provider as unsearchable, not silently "no sessions".
-          this.scanFailures.add(provider.name)
-          return [] as string[]
-        })
+        let files = filesByProvider?.get(provider)
+        if (!files) {
+          try {
+            files = await provider.listSessionFiles()
+            this.scanFailures.delete(provider.name)
+          } catch (err) {
+            logger.warn({ err, provider: provider.name }, 'Could not list session files')
+            // Record per attempt (never bulk-cleared): the resolve endpoint must
+            // report this provider as unsearchable, not silently "no sessions".
+            this.scanFailures.add(provider.name)
+            failedFileProviderNames.add(provider.name)
+            files = []
+          }
+        }
         fileCount += files.length
 
       if (isColdStart) {
@@ -1499,7 +1562,14 @@ export class CodingCliSessionIndexer {
       // Prune cache entries for files that no longer exist.
       for (const cachedFile of this.fileCache.keys()) {
         const cached = this.fileCache.get(cachedFile)
-        if (!cached || !enabledSet.has(cached.provider) || !seenCacheKeys.has(cachedFile)) {
+        if (!cached || !enabledSet.has(cached.provider)) {
+          this.deleteCacheEntry(cachedFile)
+          continue
+        }
+        if (failedFileProviderNames.has(cached.provider)) {
+          continue
+        }
+        if (!seenCacheKeys.has(cachedFile)) {
           this.deleteCacheEntry(cachedFile)
         }
       }

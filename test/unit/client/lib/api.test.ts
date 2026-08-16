@@ -462,6 +462,31 @@ describe('visible-first read-model helpers', () => {
     ])
   })
 
+  it('preserves a quarantined identity-collision state in sidebar snapshots', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response).toMatchObject({
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
+  })
+
   it('preserves session-directory running state in sidebar snapshots', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [{
@@ -709,6 +734,31 @@ describe('searchSessions tier forwarding', () => {
 
     expect(response.partial).toBe(true)
     expect(response.partialReason).toBe('budget')
+  })
+
+  it('forwards a quarantined identity-collision state without exposing session ids', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 2,
+        duplicateItemCount: 4,
+      },
+    }))
+
+    const response = await searchSessions({ query: 'test', tier: 'title' })
+
+    expect(response).toMatchObject({
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 2,
+        duplicateItemCount: 4,
+      },
+    })
   })
 
   it('does not include partial fields when server omits them', async () => {

@@ -15,6 +15,7 @@ import sessionsReducer, {
   commitSessionWindowVisibleRefresh,
   setSessionWindowError,
   setSessionWindowLoading,
+  appendSessionsPage,
 } from '@/store/sessionsSlice'
 import type { ProjectGroup } from '@/store/types'
 
@@ -27,6 +28,7 @@ describe('sessionsSlice', () => {
       projectPath: '/project/one',
       sessions: [
         {
+          provider: 'claude',
           sessionId: 'session-1',
           projectPath: '/project/one',
           lastActivityAt: 1700000000000,
@@ -34,6 +36,7 @@ describe('sessionsSlice', () => {
           title: 'First Session',
         },
         {
+          provider: 'claude',
           sessionId: 'session-2',
           projectPath: '/project/one',
           lastActivityAt: 1700000001000,
@@ -47,6 +50,7 @@ describe('sessionsSlice', () => {
       projectPath: '/project/two',
       sessions: [
         {
+          provider: 'claude',
           sessionId: 'session-3',
           projectPath: '/project/two',
           lastActivityAt: 1700000002000,
@@ -155,6 +159,41 @@ describe('sessionsSlice', () => {
 
       const state = sessionsReducer(stateWithActiveWindow, setProjects(mockProjects))
       expect(state.windows.sidebar.projects).toEqual(mockProjects)
+    })
+
+    it('keeps the first global provider/session identity and preserves real empty groups', () => {
+      const state = sessionsReducer(initialState, setProjects([
+        {
+          projectPath: '/first',
+          sessions: [
+            { sessionId: 'shared', projectPath: '/first', lastActivityAt: 4, title: 'Authoritative' },
+            { provider: 'claude', sessionId: 'shared', projectPath: '/first', lastActivityAt: 3, title: 'Duplicate' },
+          ],
+        },
+        {
+          projectPath: '/collision-only',
+          sessions: [
+            { provider: 'claude', sessionId: 'shared', projectPath: '/collision-only', lastActivityAt: 2 },
+          ],
+        },
+        {
+          projectPath: '/other-provider',
+          sessions: [
+            { provider: 'codex', sessionId: 'shared', projectPath: '/other-provider', lastActivityAt: 1 },
+          ],
+        },
+        { projectPath: '/empty', color: '#123456', sessions: [] },
+      ] as any))
+
+      expect(state.projects.map((project) => project.projectPath))
+        .toEqual(['/first', '/other-provider', '/empty'])
+      expect(state.projects[0]?.sessions).toEqual([
+        expect.objectContaining({ provider: 'claude', sessionId: 'shared', title: 'Authoritative' }),
+      ])
+      expect(state.projects[1]?.sessions).toEqual([
+        expect.objectContaining({ provider: 'codex', sessionId: 'shared' }),
+      ])
+      expect(state.projects[2]).toEqual({ projectPath: '/empty', color: '#123456', sessions: [] })
     })
   })
 
@@ -425,6 +464,40 @@ describe('sessionsSlice', () => {
       expect(state.projects.some(p => p.projectPath === '/project/new')).toBe(true)
     })
 
+    it('moves an incoming identity out of a stale project and keeps pagination totals authoritative', () => {
+      const stateWithProjects: SessionsState = {
+        ...initialState,
+        totalSessions: 1,
+        projects: [{
+          projectPath: '/old',
+          sessions: [{
+            provider: 'claude',
+            sessionId: 'moved',
+            projectPath: '/old',
+            lastActivityAt: 1,
+            title: 'Old',
+          }],
+        }],
+      }
+
+      const state = sessionsReducer(stateWithProjects, mergeProjects([{
+        projectPath: '/new',
+        sessions: [{
+          provider: 'claude',
+          sessionId: 'moved',
+          projectPath: '/new',
+          lastActivityAt: 2,
+          title: 'New',
+        }],
+      }]))
+
+      expect(state.projects).toEqual([expect.objectContaining({
+        projectPath: '/new',
+        sessions: [expect.objectContaining({ projectPath: '/new', title: 'New' })],
+      })])
+      expect(state.totalSessions).toBe(1)
+    })
+
     it('sets lastLoadedAt timestamp', () => {
       const beforeTime = Date.now()
       const state = sessionsReducer(initialState, mergeProjects(mockProjects))
@@ -464,6 +537,22 @@ describe('sessionsSlice', () => {
   })
 
   describe('applySessionsPatch', () => {
+    it('keeps normalized session references on a no-op WebSocket patch', () => {
+      let state = sessionsReducer(initialState, setProjects(mockProjects))
+      state = sessionsReducer(state, markWsSnapshotReceived())
+      const originalSession = state.projects[0]?.sessions[0]
+
+      const next = sessionsReducer(state, applySessionsPatch({
+        upsertProjects: [],
+        removeProjectPaths: [],
+      }))
+
+      const nextSession = next.projects
+        .flatMap((project) => project.sessions)
+        .find((session) => session.sessionId === originalSession?.sessionId)
+      expect(nextSession).toBe(originalSession)
+    })
+
     it('ignores patches until a WS sessions.updated snapshot has been received', () => {
       const starting = sessionsReducer(undefined, setProjects([
         { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }] },
@@ -507,6 +596,36 @@ describe('sessionsSlice', () => {
 
       expect(next.projects[0]?.projectPath).toBe('/p1')
       expect(next.projects[1]?.projectPath).toBe('/p2')
+    })
+
+    it('removes a freshly moved identity from its stale project before applying the upsert', () => {
+      let starting = sessionsReducer(undefined, setProjects([
+        {
+          projectPath: '/old',
+          sessions: [{ provider: 'claude', sessionId: 'moved', projectPath: '/old', lastActivityAt: 1, title: 'Old' }],
+        },
+        {
+          projectPath: '/keep',
+          sessions: [{ provider: 'claude', sessionId: 'keep', projectPath: '/keep', lastActivityAt: 2 }],
+        },
+      ] as any))
+      starting = { ...starting, totalSessions: 2 }
+      starting = sessionsReducer(starting, markWsSnapshotReceived())
+
+      const next = sessionsReducer(starting, applySessionsPatch({
+        upsertProjects: [{
+          projectPath: '/new',
+          sessions: [{ provider: 'claude', sessionId: 'moved', projectPath: '/new', lastActivityAt: 3, title: 'New' }],
+        }],
+        removeProjectPaths: [],
+      }))
+
+      expect(next.projects.map((project) => project.projectPath)).toEqual(['/new', '/keep'])
+      expect(next.projects.flatMap((project) => project.sessions)).toEqual([
+        expect.objectContaining({ sessionId: 'moved', projectPath: '/new', title: 'New' }),
+        expect.objectContaining({ sessionId: 'keep' }),
+      ])
+      expect(next.totalSessions).toBe(2)
     })
   })
 
@@ -741,6 +860,51 @@ describe('sessionsSlice', () => {
       const state = sessionsReducer(initialState, setProjects(bad))
       expect(state.projects).toHaveLength(1)
       expect(state.projects[0].sessions).toHaveLength(1)
+    })
+
+    it('repairs pre-existing global identity collisions while appending a page', () => {
+      const malformedState: SessionsState = {
+        ...initialState,
+        projects: [
+          {
+            projectPath: '/first',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'shared',
+              projectPath: '/first',
+              lastActivityAt: 2,
+              title: 'First',
+            }],
+          },
+          {
+            projectPath: '/stale',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'shared',
+              projectPath: '/stale',
+              lastActivityAt: 3,
+              title: 'Stale duplicate',
+            }],
+          },
+        ],
+      }
+
+      const state = sessionsReducer(malformedState, appendSessionsPage([{
+        projectPath: '/later-page',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'new',
+          projectPath: '/later-page',
+          lastActivityAt: 1,
+          title: 'New page',
+        }],
+      }] as any))
+
+      expect(state.projects.map((project) => project.projectPath)).toEqual(['/first', '/later-page'])
+      expect(state.projects.flatMap((project) => project.sessions)).toEqual([
+        expect.objectContaining({ sessionId: 'shared', projectPath: '/first', title: 'First' }),
+        expect.objectContaining({ sessionId: 'new', projectPath: '/later-page' }),
+      ])
     })
   })
 
