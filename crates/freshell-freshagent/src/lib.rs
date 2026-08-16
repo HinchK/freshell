@@ -2227,6 +2227,58 @@ pub struct FreshAgentCreateGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// A clone-shared per-key single-flight registry for one-shot runtime operations
+/// (delta-review round 2, D2-F2: `freshAgent.fork` duplicate-click suppression on
+/// BOTH the codex and opencode arms). [`Self::try_acquire`] inserts the key and
+/// hands back an RAII guard; a second acquisition for the SAME key while the guard
+/// is held answers `None` so the caller can refuse loudly. The guard's `Drop`
+/// removes the key, so EVERY handler exit path — success, refusal, and the codex
+/// post-archive containment alike — releases it: no leg can strand the key.
+///
+/// The critical sections are tiny `HashSet` ops, never held across `.await`, so a
+/// plain std mutex suffices (the crate's existing `Arc<Mutex<…>>`-in-std pattern,
+/// e.g. `ClaudeSession.pending`).
+#[derive(Clone, Default)]
+pub(crate) struct InFlightRegistry {
+    keys: Arc<Mutex<HashSet<String>>>,
+}
+
+impl InFlightRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `key`; `None` when an operation for this key is already in flight.
+    /// The returned guard removes the key on drop.
+    pub(crate) fn try_acquire(&self, key: &str) -> Option<InFlightGuard> {
+        let mut keys = self.keys.lock().expect("in-flight registry lock");
+        if keys.insert(key.to_string()) {
+            Some(InFlightGuard {
+                keys: Arc::clone(&self.keys),
+                key: key.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// RAII release for an [`InFlightRegistry`] acquisition: removes its key when the
+/// driving handler returns, on every terminal path.
+pub(crate) struct InFlightGuard {
+    keys: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.keys
+            .lock()
+            .expect("in-flight registry lock")
+            .remove(&self.key);
+    }
+}
+
 /// RAII holder for a claimed fresh-agent session lease (Task 12, mirror of
 /// `SessionRefLeaseGuard` in `freshell-ws/src/terminal.rs`). `Drop` calls `fail()` ONLY
 /// while armed AND no kill handle was recorded: once a live child exists (kill handle

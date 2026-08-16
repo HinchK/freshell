@@ -121,6 +121,12 @@ pub struct FreshOpencodeState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// Per-parent-session fork single-flight (delta-review round 2, D2-F2; the
+    /// opencode arm of [`crate::FreshCodexState::fork_in_flight`]'s rationale): the
+    /// client leaves the Fork action enabled during the op, so a duplicate click
+    /// would otherwise mint a second child whose reply can no longer correlate after
+    /// the first fork re-keys the pane — an orphaned `ses_*` row + serve session.
+    fork_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -133,6 +139,39 @@ struct OpencodeCreateRecord {
     placeholder_id: String,
 }
 
+/// What the session's registered driving task is running (delta-review round 2,
+/// D2-F1): every [`OpencodeSession::turn_task`] entry is tagged so
+/// [`FreshOpencodeState::handle_send`] can REFUSE to overwrite an in-flight
+/// COMPACT's handle (the overwrite would disconnect kill/interrupt from the
+/// still-running compact drive and let ONE idle edge settle both operations into a
+/// false/duplicate completion) while preserving the pre-existing
+/// send-overwrites-send behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnTaskKind {
+    /// A `freshAgent.send` turn drive (`handle_send`'s `run_turn` task).
+    Send,
+    /// A `freshAgent.compact` drive (`handle_compact`'s POST + await-idle + settle).
+    Compact,
+}
+
+/// The session's registered driving task + its [`TurnTaskKind`]. Kill/interrupt abort
+/// the handle regardless of kind (an aborted compact drops mid-await and never reaches
+/// its settle tail — no false `freshAgent.turn.complete`).
+struct TurnTask {
+    kind: TurnTaskKind,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TurnTask {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
 /// One live (or not-yet-materialized) freshopencode WS session.
 struct OpencodeSession {
     placeholder_id: String,
@@ -141,11 +180,16 @@ struct OpencodeSession {
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    /// The detached task running the current/most-recent turn (`manager.run_turn`), so
-    /// `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not serialized against a
-    /// concurrent `freshAgent.send` — mirrors `adapter.ts`'s `sendQueue` only loosely
-    /// (this crate does not yet serialize overlapping sends).
-    turn_task: Option<tokio::task::JoinHandle<()>>,
+    /// The detached, kind-tagged task driving the current/most-recent operation
+    /// (`manager.run_turn` for a send, the POST/await-idle/settle drive for a
+    /// compact), so `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not
+    /// serialized against a concurrent `freshAgent.send` while a SEND is in flight —
+    /// mirrors `adapter.ts`'s `sendQueue` only loosely (this crate does not yet
+    /// serialize overlapping sends); the new drive's task simply overwrites the
+    /// finished/hijacked handle. A send arriving while a COMPACT is in flight is
+    /// REFUSED instead ([`FreshOpencodeState::handle_send`], D2-F1): overwriting the
+    /// compact's handle would orphan its still-running drive.
+    turn_task: Option<TurnTask>,
     /// PR-3: set by `handle_interrupt` (BEFORE aborting) so a racing in-flight turn's
     /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
     /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
@@ -213,6 +257,7 @@ impl FreshOpencodeState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            fork_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -523,6 +568,14 @@ impl FreshOpencodeState {
     /// (the continuity fix), broadcasts `freshAgent.session.materialized` exactly once,
     /// then `freshAgent.send.accepted`, then runs the turn against the real opencode
     /// serve session in a detached task (PR-3 bridges its completion signal onto the bus).
+    ///
+    /// BUSY REFUSAL (delta-review round 2, D2-F1): a send arriving while a COMPACT is
+    /// in flight (the session's `turn_task` kind — the composer stays interactive, so
+    /// this race is reachable) is refused with the nested
+    /// `freshAgent.error{INTERNAL_ERROR}` BEFORE any side effect; overwriting the
+    /// compact's registered handle would orphan its drive. A send arriving while a
+    /// SEND is in flight keeps the pre-existing loose-overwrite behavior (the
+    /// divergence documented on [`OpencodeSession::turn_task`]).
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
@@ -541,6 +594,31 @@ impl FreshOpencodeState {
         };
 
         let mut session = session_arc.lock().await;
+
+        // D2-F1 (delta-review round 2): a send arriving while a COMPACT is in flight
+        // is REFUSED — the nested `freshAgent.error{INTERNAL_ERROR}` — BEFORE any side
+        // effect (flag reset, busy snapshot, materialization, prompt POST). Registering
+        // this send's drive would overwrite the compact's `turn_task` handle while the
+        // compact keeps running: kill/interrupt would silently stop reaching it, and
+        // the shared idle edge would settle both operations (a false/duplicate
+        // completion). A send arriving while a SEND is in flight keeps the PRE-EXISTING
+        // behavior: the new task overwrites the old registration (the documented
+        // divergence — this crate does not serialize overlapping sends).
+        if session
+            .turn_task
+            .as_ref()
+            .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished())
+        {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INTERNAL_ERROR",
+                &format!(
+                    "send while a compact is in progress is not supported (opencode session {session_id})"
+                ),
+            );
+            return;
+        }
 
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and the
@@ -733,7 +811,10 @@ impl FreshOpencodeState {
                 &last_turn_complete_at,
             );
         });
-        session.turn_task = Some(turn_task);
+        session.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Send,
+            handle: turn_task,
+        });
     }
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): is this id tracked
@@ -1043,7 +1124,10 @@ impl FreshOpencodeState {
                 ));
             }
         });
-        session.turn_task = Some(compact_task);
+        session.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Compact,
+            handle: compact_task,
+        });
     }
 
     // ── freshAgent.fork (WS, AGENT-07, approval-respond Task 5) ─────────────
@@ -1060,8 +1144,25 @@ impl FreshOpencodeState {
     /// |---|---|
     /// | session id not tracked at all | nested `freshAgent.error{INVALID_SESSION_ID}` (`requireState` parity, adapter.ts:223) — the lost-session shape the client folds into `markSessionLost`/recovery (`fresh-agent-ws.ts:343`) |
     /// | placeholder never materialized | nested `freshAgent.error{INVALID_SESSION_ID}` with the legacy parity text (adapter.ts:403) |
+    /// | a fork for this parent is already in flight (duplicate click, D2-F2) | nested `freshAgent.error{INTERNAL_ERROR}`, NO other action — no second fork POST, no child minted (a second child could never correlate after the first fork re-keys the pane) |
     /// | serve failure (400/500/…) | nested `freshAgent.error{INTERNAL_ERROR}` carrying the serve error text, BEFORE any state change |
     pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        // D2-F2 single-flight: acquire BEFORE any lookup/POST; the RAII guard
+        // releases on every terminal leg (success AND every failure), so a refreshed
+        // Fork click once this op settles is never stranded.
+        let Some(_fork_guard) = self.fork_in_flight.try_acquire(&msg.session_id) else {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": format!("fork already in progress for {}", msg.session_id),
+                }),
+            ));
+            return;
+        };
+
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
@@ -3803,7 +3904,10 @@ mod tests {
         let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
         // A genuinely in-flight turn (never resolves) parked as the session's
         // driving task — the exact state a queued-send busy pane leaves behind.
-        session_arc.lock().await.turn_task = Some(tokio::spawn(std::future::pending::<()>()));
+        session_arc.lock().await.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Send,
+            handle: tokio::spawn(std::future::pending::<()>()),
+        });
 
         st.handle_compact(compact_msg("ses_1")).await;
 
@@ -3978,6 +4082,116 @@ mod tests {
         );
     }
 
+    /// D2-F1 (delta-review round 2): the composer stays interactive while a session
+    /// is busy, so a send CAN arrive mid-compact. The send must be REFUSED — a nested
+    /// `freshAgent.event{freshAgent.error{INTERNAL_ERROR}}` naming the compact — rather
+    /// than overwriting the compact's registered `turn_task`: such an overwrite would
+    /// disconnect kill/interrupt from the still-running compact drive and let ONE idle
+    /// edge settle both operations (a false/duplicate completion). The refused send
+    /// takes NO other action (no prompt POST, no send.accepted, no busy snapshot), the
+    /// compact's task stays registered, and a later kill still aborts it.
+    #[tokio::test]
+    async fn send_during_an_in_flight_compact_is_refused_and_leaves_the_compact_owned() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        // The handler spawns + registers the compact drive, then returns.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+        await_summarize_posted(&http).await; // the compact is deterministically in flight
+
+        // The mid-compact send is refused inline (never waits on upstream, never
+        // spawns a drive): a clean inline-return assertion pins that ordering.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_send(send_msg("ses_1", "mid-compact")),
+        )
+        .await
+        .expect("the mid-compact send is refused inline, never upstream-blocking");
+
+        let frames = drain_frames(&mut rx);
+        let refusal = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the refused send answers a LOUD nested freshAgent.error");
+        assert_eq!(refusal["event"]["code"], "INTERNAL_ERROR", "{refusal}");
+        assert!(
+            refusal["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("compact"),
+            "the message names the in-flight compact: {refusal}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f["type"] == "freshAgent.send.accepted"),
+            "a refused send never broadcasts send.accepted: {frames:?}"
+        );
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("/prompt_async")),
+            "a refused send never reaches the prompt POST"
+        );
+
+        // The compact's driving task is STILL the registered turn task (never stolen).
+        let still_live = {
+            let session = session_arc.lock().await;
+            session
+                .turn_task
+                .as_ref()
+                .map(|t| !t.is_finished())
+                .unwrap_or(false)
+        };
+        assert!(
+            still_live,
+            "the refused send must not overwrite the compact's registered task"
+        );
+
+        // The ownership invariant holds end-to-end: a kill mid-compact aborts the
+        // registered drive — no false completion after the gate releases.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
+            "the kill frame lands: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "the aborted compact never fabricates a turn-complete: {frames:?}"
+        );
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true),
+            "the kill took + aborted the compact's registered task"
+        );
+    }
+
     // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
 
     fn fork_msg(session_id: &str, request_id: &str, at_turn_id: Option<&str>) -> FreshAgentFork {
@@ -4008,6 +4222,10 @@ mod tests {
         requests: StdMutex<Vec<RecordedRequest>>,
         fork_status: u16,
         fork_body: Vec<u8>,
+        /// D2-F2 test seam: when set, the FIRST fork POST records itself then parks on
+        /// `notified()` — a deterministic "fork in flight" window. `take()` one-shots
+        /// it, so a later fork proceeds without needing a second release.
+        fork_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl ForkFakeHttp {
@@ -4016,6 +4234,7 @@ mod tests {
                 requests: StdMutex::new(Vec::new()),
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/forked/dir"}"#.to_vec(),
+                fork_gate: StdMutex::new(None),
             }
         }
 
@@ -4057,7 +4276,13 @@ mod tests {
             if method == "POST" && req.url.contains("/fork") {
                 let status = self.fork_status;
                 let body = self.fork_body.clone();
-                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+                let gate = self.fork_gate.lock().expect("fork gate mutex").take();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(status, body))
+                });
             }
             Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
         }
@@ -4300,6 +4525,146 @@ mod tests {
         assert!(
             !st.has_live_session("ses_child").await,
             "no child insert on failure"
+        );
+    }
+
+    /// D2-F2 (delta-review round 2): the client leaves the Fork action enabled while a
+    /// fork is in flight, so a rapid duplicate click would otherwise mint TWO children
+    /// for one parent — once the first reply re-keys the pane and kills the parent, the
+    /// second reply can no longer correlate, leaving its child (a live serve session +
+    /// local registration) UNOWNED. The duplicate must be refused ON THE REQUESTING
+    /// SINK (nested `freshAgent.error{INTERNAL_ERROR}`) with NO second fork POST and no
+    /// other action; when the first fork completes, the guard releases and a fresh
+    /// fork for the same parent proceeds.
+    #[tokio::test]
+    async fn fork_duplicate_in_flight_is_refused_and_releases_on_success() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = ForkFakeHttp::child_ok();
+        *fake.fork_gate.lock().expect("fork gate mutex") = Some(gate.clone());
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+        // Fork #1 parks mid-POST — the duplicate click's deterministic in-flight window.
+        let (sink1, captured1) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), sink1)
+                    .await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !http.fork_requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first fork POST lands within the budget");
+
+        // Fork #2 — the duplicate — is refused INLINE (never waits upstream).
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), sink2),
+        )
+        .await
+        .expect("the duplicate fork is refused inline, never upstream-blocking");
+
+        let frames = captured2.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the refusal ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["sessionId"], "ses_parent");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert!(
+            v["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already in progress"),
+            "the refusal names the in-flight fork: {v}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            1,
+            "the duplicate takes NO action — no second fork POST"
+        );
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "the duplicate registers no child"
+        );
+
+        // Release fork #1: it completes with the forked reply, and the guard's
+        // release lets a fresh fork for the same parent reach the wire.
+        gate.notify_waiters();
+        driver.await.expect("fork #1 task");
+        let frames1 = captured1.lock().expect("captured mutex").clone();
+        assert!(
+            matches!(frames1.as_slice(), [ServerMessage::FreshAgentForked(_)]),
+            "fork #1 completes with the forked reply: {frames1:?}"
+        );
+
+        let (sink3, captured3) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), sink3)
+            .await;
+        let frames3 = captured3.lock().expect("captured mutex").clone();
+        assert!(
+            matches!(frames3.as_slice(), [ServerMessage::FreshAgentForked(_)]),
+            "a post-completion fork for the same parent proceeds: {frames3:?}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            2,
+            "the guard released on success — the retry reached the wire"
+        );
+    }
+
+    /// D2-F2: the in-flight guard releases on EVERY terminal path — after a serve
+    /// failure a refreshed Fork click for the same parent must reach the wire again
+    /// (a stranded guard would refuse the session's forks forever).
+    #[tokio::test]
+    async fn fork_in_flight_guard_releases_on_the_failure_path() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_status = 500;
+        fake.fork_body = b"fork exploded".to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink1, captured1) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), sink1)
+            .await;
+        let frames1 = captured1.lock().expect("captured mutex").clone();
+        let v1 = serde_json::to_value(&frames1[0]).unwrap();
+        assert!(
+            v1["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the first fork fails on the serve error leg (NOT an in-flight refusal): {v1}"
+        );
+
+        // The retry reaches the wire — the failure path released the guard.
+        let (sink2, captured2) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), sink2)
+            .await;
+        let frames2 = captured2.lock().expect("captured mutex").clone();
+        let v2 = serde_json::to_value(&frames2[0]).unwrap();
+        assert!(
+            v2["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the retry fails on the serve error too (not stranded on the guard): {v2}"
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            2,
+            "the retry reached the fake — the guard released on failure"
         );
     }
 

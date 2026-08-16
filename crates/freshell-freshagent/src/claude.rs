@@ -828,6 +828,23 @@ impl FreshClaudeState {
             );
             return;
         }
+        // D2-M3 (delta-review round 2): the shared protocol requires the decision to
+        // be a RECORD (`Record<string, unknown>`) and the sidecar resolves it VERBATIM
+        // (`permission-channel.mjs` treats a null decision as a no-op), so forwarding
+        // a null/array/scalar and removing the entry would hide the card while the
+        // parked SDK promise stays unresolved forever (no retry, no resolve — the turn
+        // wedges). Refuse LOUDLY and leave the entry pending: DO NOT forward, DO NOT
+        // remove.
+        if !msg.decision.is_object() {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INTERNAL_ERROR",
+                &format!("Claude approval {request_id} requires a JSON object decision"),
+            );
+            return;
+        }
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let respond_req = json!({
@@ -3085,6 +3102,53 @@ rl.on('line', (line) => {
             vec!["req-9".to_string()],
             "a failed write leaves the entry pending (never clear-then-fail)"
         );
+    }
+
+    /// D2-M3 (delta-review round 2): the shared protocol requires the decision to be a
+    /// RECORD (`Record<string, unknown>`) and the sidecar resolves it VERBATIM — a
+    /// null/array/scalar decision forwarded and REMOVED would leave the SDK permission
+    /// promise permanently parked (the sidecar treats a null decision as a no-op) while
+    /// the card vanishes from the pane. A non-object decision must be refused LOUDLY
+    /// (nested `freshAgent.error{INTERNAL_ERROR}`), the pending entry MUST stay (the
+    /// card stays actionable), and NOTHING reaches the sidecar stdin.
+    #[tokio::test]
+    async fn approval_respond_with_a_non_object_decision_is_refused_and_keeps_the_pending_entry() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-null-decision"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-null-decision").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // consumer folds it into the session's pending set.
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!(null),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(frame["sessionId"], json!(session_id));
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert_eq!(
+            permissions,
+            vec!["req-1".to_string()],
+            "a refused non-object decision leaves the entry pending (never hide-then-wedge)"
+        );
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a refused non-object decision is never forwarded to the sidecar"
+        );
+        drop(env);
     }
 
     /// Task 2 (b): a requestId outside the pending set is refused LOUDLY with the parity

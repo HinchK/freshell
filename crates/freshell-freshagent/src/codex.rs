@@ -160,6 +160,15 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// Per-parent-session fork single-flight (delta-review round 2, D2-F2): the
+    /// client leaves the Fork action enabled while a fork is in flight, so a rapid
+    /// duplicate click would otherwise mint TWO children for one parent — once the
+    /// first reply re-keys the pane and kills the parent, the second reply can no
+    /// longer correlate, leaving its child (a registered sidecar + durable thread
+    /// here) UNOWNED. [`Self::handle_fork`] acquires the clicked id up front; the
+    /// RAII guard releases on every terminal leg (success, refusal, and the
+    /// post-archive containment alike).
+    fork_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -295,6 +304,7 @@ impl FreshCodexState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            fork_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -1374,6 +1384,20 @@ impl FreshCodexState {
     /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
     /// the parent may be mid-kill), restoring the child's original visibility.
     pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        // D2-F2 single-flight: a rapid duplicate Fork click for the SAME parent must
+        // never mint a second child — the first reply's re-key + parent-kill leaves
+        // the second reply uncorrelatable and its child/sidecar/thread unowned. The
+        // refusal answers on the requesting sink; the RAII guard releases on EVERY
+        // terminal path (success, refusal legs below, and the post-archive
+        // containment alike), so a refreshed click can retry once this fork settles.
+        let Some(_fork_guard) = self.fork_in_flight.try_acquire(&msg.session_id) else {
+            reply_sink(fork_error_frame(
+                &msg.session_id,
+                &format!("fork already in progress for {}", msg.session_id),
+            ));
+            return;
+        };
+
         let parent_id = match self.ensure_session_alive(&msg.session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
                 // A resume-recovered parent keeps its ORIGINAL id.
@@ -5428,6 +5452,108 @@ pub(crate) mod tests {
         );
     }
 
+    /// D2-F2 (delta-review round 2): the client leaves the Fork action enabled while a
+    /// fork is in flight (and reuses the pane's `createRequestId`), so rapid duplicate
+    /// clicks would otherwise mint TWO children for one parent — once the first reply
+    /// re-keys the pane and kills the parent, the second reply can no longer correlate,
+    /// leaving its child (and, for codex, a registered sidecar + durable thread)
+    /// UNOWNED. The duplicate must be refused ON THE REQUESTING SINK with the nested
+    /// `freshAgent.error{INTERNAL_ERROR}` shape and take NO other action (no
+    /// thread/fork RPC, no state change); the guard releases on EVERY terminal leg
+    /// (failure included), so a refreshed click can retry.
+    #[tokio::test]
+    async fn handle_fork_duplicate_in_flight_is_refused_and_releases_on_failure() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-fork-dup",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-dup",
+        )
+        .await;
+
+        // Fork #1 parks mid-RPC — the duplicate click's deterministic in-flight window.
+        let (sink1, captured1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d1", None), sink1)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id1, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+
+        // Fork #2 — the duplicate — is refused INLINE (never waits upstream) and
+        // takes NO other action.
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d2", None), sink2),
+        )
+        .await
+        .expect("the duplicate fork is refused inline, never upstream-blocking");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured2),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "already in progress",
+        );
+
+        // Fail fork #1: its reply rides the fork-RPC failure leg and the guard must
+        // release even on a failure terminal path.
+        peer.respond_error(&id1, -32000, "fork kaput");
+        driver1.await.expect("fork #1 task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured1),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "fork kaput",
+        );
+
+        // A refreshed click reaches the wire again (no stranded guard) — fail it too
+        // so the test leaves no parked task.
+        let (sink3, captured3) = capturing_sink();
+        let driver3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d3", None), sink3)
+                    .await;
+            })
+        };
+        let (id3, method, _params) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/fork",
+            "the retried fork reached the wire — the guard released on failure"
+        );
+        peer.respond_error(&id3, -32000, "kaput too");
+        driver3.await.expect("fork #3 task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured3),
+            "parent-fork-dup",
+            "INTERNAL_ERROR",
+            "kaput too",
+        );
+
+        // Exactly two thread/fork RPCs total crossed the wire (#1 and #3 — the
+        // refused duplicate produced none) and no child ever registered.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no further RPCs (the duplicate never touched the wire)"
+        );
+        assert!(
+            st.sessions.lock().await.len() == 1,
+            "no child registered across the refused/failed forks"
+        );
+    }
+
     #[tokio::test]
     async fn handle_fork_archive_failure_replies_on_the_sink_and_never_spawns() {
         let (st, _rx_boot) = state_with_bus();
@@ -5942,35 +6068,68 @@ pub(crate) mod tests {
         );
 
         // P1.13: a binding row durable-before-answer for the child.
-        let bindings = fake.bindings.lock().expect("bindings mutex");
-        let row = bindings
-            .iter()
-            .find(|b| b.session_id == "child-thread-1")
-            .expect("a binding row for the child");
-        assert_eq!(row.provider, "codex");
-        assert_eq!(row.mode, "freshcodex");
-        assert_eq!(row.create_request_id, None, "fork is not a create");
-        drop(bindings);
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let row = bindings
+                .iter()
+                .find(|b| b.session_id == "child-thread-1")
+                .expect("a binding row for the child");
+            assert_eq!(row.provider, "codex");
+            assert_eq!(row.mode, "freshcodex");
+            assert_eq!(row.create_request_id, None, "fork is not a create");
+        }
 
         // RPC call order, per connection (the op log tags every thread/* call with
         // its process's listenUrl): parent = thread/start → thread/fork →
         // thread/archive; child (spawn #2) = thread/unarchive → thread/resume.
-        let log_text = std::fs::read_to_string(&log_path).expect("the op log exists");
-        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
-        for line in log_text.lines() {
-            let entry: Value = serde_json::from_str(line).expect("op log line parses");
-            by_url
-                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
-                .or_default()
-                .push(entry["method"].as_str().expect("method").to_string());
-        }
-        assert_eq!(
-            by_url.len(),
-            2,
-            "exactly two sidecar connections (parent + one child spawn): {log_text}"
-        );
-        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
-        sequences.sort();
+        //
+        // Read with a bounded poll: the fake appends each op line AFTER sending the
+        // RPC result (adjacent statements in the same event-loop tick), so under
+        // parallel-suite load the fake child process can be descheduled between the
+        // two while the resumed `handle_fork` races ahead to this read (observed once
+        // as a missing trailing `thread/resume` line in a 480-test parallel run — a
+        // test-read race, never a handler-ordering defect). Poll until both
+        // connection sequences settle to the exact expected value, then run the
+        // original assertions for their diagnostic output.
+        let read_sequences = || -> Option<(String, Vec<Vec<String>>)> {
+            let log_text = std::fs::read_to_string(&log_path).expect("the op log exists");
+            let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+            for line in log_text.lines() {
+                let entry: Value = serde_json::from_str(line).expect("op log line parses");
+                by_url
+                    .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                    .or_default()
+                    .push(entry["method"].as_str().expect("method").to_string());
+            }
+            if by_url.len() != 2 {
+                return None;
+            }
+            let mut sequences: Vec<Vec<String>> = by_url.into_values().collect();
+            sequences.sort();
+            Some((log_text, sequences))
+        };
+        let settled = |s: &[Vec<String>]| {
+            s.len() == 2
+                && s[0] == ["thread/start", "thread/fork", "thread/archive"]
+                && s[1] == ["thread/unarchive", "thread/resume"]
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (log_text, sequences) = loop {
+            if let Some((text, sequences)) = read_sequences() {
+                if settled(&sequences) {
+                    break (text, sequences);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the op log never settled to exactly two sidecar connections (parent \
+                 + one child spawn) with the expected RPC order: {}",
+                read_sequences()
+                    .map(|(text, _)| text)
+                    .unwrap_or_else(|| "<unreadable>".to_string())
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
         assert_eq!(
             sequences[0],
             vec!["thread/start", "thread/fork", "thread/archive"],
