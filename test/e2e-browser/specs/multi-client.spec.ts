@@ -510,14 +510,17 @@ test.describe('Multi-Client', () => {
 
     // Kernel cross-check: the PTY's actual winsize must equal the dims the
     // reveal resize claimed (a hidden-clamp failure would leave the kernel
-    // at stale/never-fitted dims instead). Give the server a beat to apply
-    // the resize before asking stty.
-    await page.waitForTimeout(300)
-    await tabBTerminal.locator('.xterm').first().click()
-    await page.keyboard.type('echo __AXIS__:$(stty size)')
-    await page.keyboard.press('Enter')
-    const kernelSize = await waitForMarkedPtySize(page, '__AXIS__', terminalBId)
-    expect(kernelSize).toBe(`${healResize.rows} ${healResize.cols}`)
+    // at stale/never-fitted dims instead). Poll rather than assume the
+    // server has applied the resize within a fixed settle: each attempt
+    // re-asks stty, and readMarkedPtySize takes the LAST __AXIS__ marker,
+    // so a retry always compares the freshest kernel echo.
+    await expect(async () => {
+      await tabBTerminal.locator('.xterm').first().click()
+      await page.keyboard.type('echo __AXIS__:$(stty size)')
+      await page.keyboard.press('Enter')
+      const kernelSize = await waitForMarkedPtySize(page, '__AXIS__', terminalBId)
+      expect(kernelSize).toBe(`${healResize.rows} ${healResize.cols}`)
+    }).toPass({ timeout: 15_000, intervals: [250, 500, 1_000] })
 
     await context.close()
   })
