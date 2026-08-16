@@ -884,7 +884,7 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
     // Claude's filename identity during construction. Child transcripts embed
     // their parent id, which is not a child compatibility alias.
     let legacy_session_id = (!is_subagent)
-        .then(|| meta.session_id.as_deref())
+        .then_some(meta.session_id.as_deref())
         .flatten()
         .filter(|session_id| *session_id != fallback)
         .map(str::to_owned);
@@ -3009,7 +3009,7 @@ mod tests {
 
     #[test]
     fn persisted_identity_collision_context_is_deterministically_sorted() {
-        let items: Vec<DirItem> = vec![
+        let items: Vec<DirItem> = [
             static_indexed_session("claude", "z", "/p/z-two.jsonl", 1),
             static_indexed_session("claude", "a", "/p/a-two.jsonl", 1),
             static_indexed_session("claude", "z", "/p/z-one.jsonl", 1),

@@ -5949,7 +5949,7 @@ pub(crate) mod tests {
 
         let original: Vec<_> = ISOLATED_CODEX_ENV_KEYS
             .iter()
-            .map(|key| std::env::var_os(key))
+            .map(std::env::var_os)
             .collect();
         let mut installed_opt_in = None;
         let mut installed_home = None;
@@ -5966,7 +5966,7 @@ pub(crate) mod tests {
 
         let after_unwind: Vec<_> = ISOLATED_CODEX_ENV_KEYS
             .iter()
-            .map(|key| std::env::var_os(key))
+            .map(std::env::var_os)
             .collect();
         // Restore eagerly before asserting so a RED run cannot contaminate another test process.
         for (key, value) in ISOLATED_CODEX_ENV_KEYS.iter().zip(original.iter()) {

@@ -422,7 +422,7 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<IndexedSession
     // Children deliberately do not: their old embedded id is the parent and
     // applying it would incorrectly copy the parent's settings to each child.
     let legacy_session_id = (!is_subagent)
-        .then(|| meta.session_id.as_deref())
+        .then_some(meta.session_id.as_deref())
         .flatten()
         .filter(|session_id| *session_id != fallback)
         .map(str::to_owned);

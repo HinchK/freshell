@@ -77,7 +77,7 @@ impl Drop for IsolatedCodexEnv {
 fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
     let original: Vec<_> = ISOLATED_CODEX_ENV_KEYS
         .iter()
-        .map(|key| std::env::var_os(key))
+        .map(std::env::var_os)
         .collect();
     let mut installed_opt_in = None;
     let mut installed_home = None;
@@ -95,7 +95,7 @@ fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
 
     let after_unwind: Vec<_> = ISOLATED_CODEX_ENV_KEYS
         .iter()
-        .map(|key| std::env::var_os(key))
+        .map(std::env::var_os)
         .collect();
     // Restore eagerly before asserting so a RED run cannot contaminate another test process.
     for (key, value) in ISOLATED_CODEX_ENV_KEYS.iter().zip(original.iter()) {
