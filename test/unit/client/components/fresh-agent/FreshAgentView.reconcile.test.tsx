@@ -254,7 +254,10 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     expect(creates).toHaveLength(2) // the fold re-fired the create effect
     const last = creates[creates.length - 1]
     expect(last.requestId).toBe('req-1')
-    expect(last.resumeSessionId).toBe(DURABLE)
+    // Canonical carrier only: the server promotes sessionRef into its resume
+    // input on every door (claude.rs/codex.rs/opencode_ws.rs create paths,
+    // Node runtime-manager.ts:106-108) — the legacy duplicate is gone.
+    expect(last.resumeSessionId).toBeUndefined()
     expect(last.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
   })
 
@@ -268,9 +271,10 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     expect(sentOfType('freshAgent.create')).toHaveLength(0)
     const attach = sentOfType('freshAgent.attach').find((m) => m.sessionId === DURABLE)!
     expect(attach).toBeTruthy()
-    // claude's attach_durable_id reads ONLY resumeSessionId/sessionRef (claude.rs:866-872):
-    // the durable MUST ride those fields or a resumable session answers lost_session_frame.
-    expect(attach.resumeSessionId).toBe(DURABLE)
+    // claude's attach_durable_id reads resumeSessionId THEN sessionRef
+    // (claude.rs `attach_durable_id`): the durable rides the canonical
+    // sessionRef only — the legacy duplicate is no longer sent.
+    expect(attach.resumeSessionId).toBeUndefined()
     expect(attach.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
   })
 
@@ -395,7 +399,27 @@ describe('FreshAgentView .lost capability gate (Task 10)', () => {
     await flush()
     const creates = sentOfType('freshAgent.create')
     expect(creates.length).toBeGreaterThan(0)
-    expect(creates[creates.length - 1].resumeSessionId).toBe(DURABLE)
+    expect(creates[creates.length - 1].sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(creates[creates.length - 1].resumeSessionId).toBeUndefined()
+  })
+
+  it('legacy-only pane content promotes resumeSessionId into the create sessionRef client-side', async () => {
+    // A pane whose only persisted identity is the legacy content field (no
+    // sessionRef) must still reach the server with canonical identity: the
+    // builders promote {provider: content.provider, sessionId} instead of
+    // sending the legacy wire field.
+    renderFreshAgentPane({
+      sessionId: undefined,
+      status: 'creating',
+      createRequestId: 'req-1',
+      resumeSessionId: DURABLE,
+      sessionRef: undefined,
+    })
+    await flush()
+    const creates = sentOfType('freshAgent.create')
+    expect(creates).toHaveLength(1)
+    expect(creates[0].sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(creates[0].resumeSessionId).toBeUndefined()
   })
 
   it('an attach verdict for the SAME durable-as-sessionId clears the lost flag (no reconcile loop)', async () => {

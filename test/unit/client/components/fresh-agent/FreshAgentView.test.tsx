@@ -1308,7 +1308,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshopencode',
         provider: 'opencode',
         cwd: '/home/dan/code',
-        resumeSessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b' },
         legacyRestoreContext: {
           title: 'Identifying skills from GitHub repos',
           createdAt: 1_781_291_230_743,
@@ -1404,7 +1404,6 @@ describe('FreshAgentView', () => {
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        resumeSessionId: 'ses_attach_route',
         sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
         cwd: '/repo/route-aware',
       })
@@ -1422,7 +1421,6 @@ describe('FreshAgentView', () => {
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        resumeSessionId: 'ses_attach_route',
         sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
         cwd: '/repo/route-aware',
       })
@@ -4106,7 +4104,6 @@ describe('FreshAgentView', () => {
         sessionId: 'thread-refresh',
         sessionType: 'freshcodex',
         provider: 'codex',
-        resumeSessionId: 'thread-refresh',
         sessionRef: { provider: 'codex', sessionId: 'thread-refresh' },
       })
     })
@@ -5413,7 +5410,7 @@ describe('FreshAgentView', () => {
         type: 'freshAgent.create',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: durableSessionId,
+        sessionRef: { provider: 'claude', sessionId: durableSessionId },
         effort: 'high',
       }))
     })
@@ -5492,7 +5489,6 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',
       requestId: 'req-sessionref-only',
-      resumeSessionId: 'codex-thread-recover',
       sessionRef: { provider: 'codex', sessionId: 'codex-thread-recover' },
     }))
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
@@ -5562,7 +5558,7 @@ describe('FreshAgentView', () => {
         expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
           type: 'freshAgent.create',
           requestId: leaf.content.createRequestId,
-          resumeSessionId: 'codex-thread-disabled',
+          sessionRef: { provider: 'codex', sessionId: 'codex-thread-disabled' },
         }))
       }
     })

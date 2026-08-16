@@ -286,14 +286,14 @@ async fn amplifier_create_rejects_synthetic_terminal_placeholder_refs() {
 /// be rejected, never a second live PTY interleaving writes into one
 /// session dir.
 ///
-/// The second create rides the legacy `resumeSessionId` carrier: the
-/// wire-`sessionRef` carrier is already intercepted by the cross-mode D7
-/// liveness guard (PR #540, "Session ... is still running on the server"),
-/// which this amplifier-specific guard composes AFTER — sequentially, never
-/// instead of. The message is asserted EXACTLY because the pre-Task-9 path
-/// already rejected via the wrapped registry error ("Could not restore ...:
-/// duplicate live resume: ..."), which contains the same substring — only
-/// the friendly guard produces this exact frame.
+/// The second create rides the legacy `resumeSessionId` carrier. Since the
+/// legacy-rung D7 promotion (the 2026-08-16 duplicate-tab fix), the
+/// cross-mode D7 liveness guard intercepts this carrier too — BEFORE the
+/// amplifier-specific friendly guard — so the loud reject is now the uniform
+/// D7 frame (`RESTORE_UNAVAILABLE`, "Session ... is still running on the
+/// server"), identical to the wire-`sessionRef` carrier's answer. The
+/// amplifier friendly guard remains downstream as defense-in-depth (it also
+/// covers the registry-level duplicate race D7 cannot see).
 #[tokio::test]
 async fn amplifier_create_rejects_second_live_resume_of_same_session() {
     let _amp_home = isolate_amplifier_home();
@@ -346,14 +346,12 @@ async fn amplifier_create_rejects_second_live_resume_of_same_session() {
     .expect("send terminal.create");
 
     let err = next_frame_of_type(&mut ws, "error").await;
-    assert_eq!(err["code"], "PTY_SPAWN_FAILED", "loud reject: {err}");
+    assert_eq!(err["code"], "RESTORE_UNAVAILABLE", "loud reject: {err}");
     assert_eq!(err["requestId"], "req-amp-launcher-identity-6");
     assert_eq!(
         err["message"],
-        serde_json::json!(format!(
-            "Amplifier session {sid} is already open in a live terminal."
-        )),
-        "the friendly guard frame, not the wrapped registry error: {err}"
+        serde_json::json!(format!("Session {sid} is still running on the server.")),
+        "the uniform D7 frame — same answer as the sessionRef carrier: {err}"
     );
 
     // No duplicate spawn: exactly the original terminal owns sid.

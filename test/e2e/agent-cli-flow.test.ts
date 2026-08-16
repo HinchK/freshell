@@ -492,6 +492,68 @@ describe('cli e2e flow', () => {
     }
   })
 
+  it('promotes --resume into a canonical sessionRef for non-codex modes', async () => {
+    // The CLI is the last legacy-only carrier (the 2026-08-16 duplicate-tab
+    // incident): it must convert `--resume <sid>` into the canonical
+    // `sessionRef {provider: mode, sessionId}` before it hits the wire —
+    // exactly like the MCP freshell tool — instead of sending the legacy
+    // `resumeSessionId` field.
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '--mode',
+        'claude',
+        '--resume',
+        '11111111-1111-4111-8111-111111111111',
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(findPaneContent(snapshot.layouts[tabId], firstPaneId)).toEqual(expect.objectContaining({
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: '11111111-1111-4111-8111-111111111111' },
+        }))
+      })
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--mode',
+        'claude',
+        '--resume',
+        '22222222-2222-4222-8222-222222222222',
+      ])
+
+      await runCliJson<{ data: { terminalId: string } }>(server.url, [
+        'respawn-pane',
+        '-t',
+        firstPaneId,
+        '--mode',
+        'claude',
+        '--resume',
+        '33333333-3333-4333-8333-333333333333',
+      ])
+
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(findPaneContent(snapshot.layouts[tabId], firstPaneId)).toEqual(expect.objectContaining({
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: '33333333-3333-4333-8333-333333333333' },
+        }))
+        expect(findPaneContent(snapshot.layouts[tabId], split.data.paneId)).toEqual(expect.objectContaining({
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: '22222222-2222-4222-8222-222222222222' },
+        }))
+      })
+    } finally {
+      await server.close()
+    }
+  })
+
   it('rejects raw Codex resume ids in new-tab, split-pane, and respawn-pane', async () => {
     const server = await startTestServerWithRealLayoutStore()
     try {

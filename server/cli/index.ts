@@ -146,6 +146,28 @@ function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean
   return { rejected: false, sessionRef: { provider, sessionId } }
 }
 
+// `--resume <sid>` is promoted to the canonical `sessionRef {provider: mode,
+// sessionId}` before it hits the wire — exactly like the MCP freshell tool
+// (server/mcp/freshell-tool.ts new-tab) — so the CLI never sends the legacy
+// `resumeSessionId` field. An explicit `--session-ref` wins; codex is
+// rejected earlier by rejectRawCodexResume. Without a mode there is no
+// provider to promote with, so the flag combination is refused loudly rather
+// than silently dropping the resume identity.
+function promoteResumeFlag(
+  mode: unknown,
+  resumeSessionId: string | undefined,
+  explicit: CliSessionRef | undefined,
+): { rejected: boolean; sessionRef?: CliSessionRef } {
+  if (explicit) return { rejected: false, sessionRef: explicit }
+  if (!resumeSessionId) return { rejected: false }
+  if (typeof mode !== 'string' || mode.length === 0) {
+    writeError('--resume requires --mode (or use --session-ref provider:sessionId).')
+    process.exitCode = 1
+    return { rejected: true }
+  }
+  return { rejected: false, sessionRef: { provider: mode, sessionId: resumeSessionId } }
+}
+
 async function fetchTabs(client: ReturnType<typeof createHttpClient>): Promise<{ tabs: TabSummary[]; activeTabId?: string | null }> {
   const res = await client.get('/api/tabs')
   const data = unwrap(res)
@@ -355,6 +377,8 @@ async function main() {
       const prompt = getFlag(flags, 'prompt') as string | undefined
       if (rejectRawCodexResume(mode, resumeSessionId)) return
       if (sessionRefResult.rejected) return
+      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      if (promoted.rejected) return
 
       const res = await client.post('/api/tabs', {
         name,
@@ -363,8 +387,7 @@ async function main() {
         cwd,
         browser,
         editor,
-        resumeSessionId,
-        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+        ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       const data = unwrap(res)
       if (prompt && data?.paneId) {
@@ -464,6 +487,8 @@ async function main() {
       const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
       if (rejectRawCodexResume(mode, resumeSessionId)) return
       if (sessionRefResult.rejected) return
+      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      if (promoted.rejected) return
 
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
@@ -479,8 +504,7 @@ async function main() {
         mode,
         shell,
         cwd,
-        resumeSessionId,
-        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+        ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       writeJson(res)
       return
@@ -601,6 +625,8 @@ async function main() {
       const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
       if (rejectRawCodexResume(mode, resumeSessionId)) return
       if (sessionRefResult.rejected) return
+      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      if (promoted.rejected) return
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
         writeError(resolved.message || 'pane not found')
@@ -611,8 +637,7 @@ async function main() {
         mode,
         shell,
         cwd,
-        resumeSessionId,
-        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+        ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       writeJson(res)
       return
