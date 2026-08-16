@@ -497,10 +497,27 @@ impl FreshCodexState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
+        // The resume thread id: the legacy `resumeSessionId` first, else the
+        // provider-matched `sessionRef` (Node parity: `runtime-manager.ts:106-108`
+        // promotes the sessionRef into the adapter's resume input the same way) --
+        // the canonical carrier must work standalone so the client can drop the
+        // legacy duplicate.
+        let requested_resume_session_id = msg
+            .resume_session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                msg.session_ref
+                    .as_ref()
+                    .filter(|r| r.provider == PROVIDER)
+                    .map(|r| r.session_id.clone())
+                    .filter(|s| !s.is_empty())
+            });
+
         // P1.13 (Task 5, R1): for a resume-create the client's explicit params win and
         // the ledger record fills the gaps -- merged BEFORE normalization, so a missing
         // model recovers the recorded one instead of being rewritten to the default.
-        let rec = match msg.resume_session_id.as_deref() {
+        let rec = match requested_resume_session_id.as_deref() {
             Some(resume_id) => self
                 .identity_sink()
                 .and_then(|s| s.load_settings("codex", resume_id))
@@ -532,7 +549,7 @@ impl FreshCodexState {
         // `resumeSessionId` set, `FreshAgentView.tsx`'s `triggerRecovery`) silently produced
         // an EMPTY new conversation under a brand-new id -- connected, no error, just quiet
         // data loss.
-        if let Some(resume_session_id) = msg.resume_session_id.clone() {
+        if let Some(resume_session_id) = requested_resume_session_id.clone() {
             // Task 13b (cross-kind liveness): a live terminal PTY owning
             // `(codex, thread)` is the one writer on that rollout -- refuse the resume
             // with the retryable loser answer; NO lease claim, NO spawn.
@@ -7059,6 +7076,68 @@ pub(crate) mod tests {
             frame["sessionId"], "thread-existing-durable",
             "create-with-resume must preserve the CALLER's thread id, never mint a new one \
              (thread/start would have returned thread-should-never-be-minted): {frame}"
+        );
+        assert!(
+            st.sessions
+                .lock()
+                .await
+                .contains_key("thread-existing-durable"),
+            "the resumed thread must be registered under its ORIGINAL id"
+        );
+    }
+
+    /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
+    /// ONLY identity is a provider-matched `sessionRef` must resume the thread
+    /// exactly like the legacy `resumeSessionId` carrier. Same wrong-mint
+    /// canary as the legacy-carrier test above: `thread/start` is pinned to an
+    /// obviously wrong id, so a passing sessionId assertion proves
+    /// `thread/resume` was used.
+    #[tokio::test]
+    async fn handle_create_with_session_ref_only_resumes_the_same_thread() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(FreshAgentCreate {
+            request_id: "req-sref-resume-1".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "thread-existing-durable".to_string(),
+            }),
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+
+        assert_eq!(
+            frame["type"], "freshAgent.created",
+            "resuming via sessionRef must succeed: {frame}"
+        );
+        assert_eq!(
+            frame["sessionId"], "thread-existing-durable",
+            "sessionRef-only create must resume the CALLER's thread id, never mint a new one: {frame}"
         );
         assert!(
             st.sessions

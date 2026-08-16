@@ -344,7 +344,23 @@ impl FreshClaudeState {
         // Task 12 (D8 for fresh agents): a create-with-resume claims the per-sessionRef
         // lease BEFORE any spawn -- exactly one in-flight resume (and one live writer)
         // per durable transcript. ALWAYS ON (never capability-gated).
-        let resume_sid = msg.resume_session_id.clone().filter(|s| !s.is_empty());
+        //
+        // The resume id comes from the legacy `resumeSessionId` first, else the
+        // provider-matched `sessionRef` (Node parity: `runtime-manager.ts:106-108`
+        // promotes the sessionRef into the adapter's resume input the same way) --
+        // the canonical carrier must work standalone so the client can drop the
+        // legacy duplicate.
+        let resume_sid = msg
+            .resume_session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                msg.session_ref
+                    .as_ref()
+                    .filter(|r| r.provider == PROVIDER)
+                    .map(|r| r.session_id.clone())
+                    .filter(|s| !s.is_empty())
+            });
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         if let Some(sid) = resume_sid.as_deref() {
             // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, sid)`
@@ -450,7 +466,7 @@ impl FreshClaudeState {
             "model": msg.model,
             "permissionMode": msg.permission_mode,
             "effort": msg.effort,
-            "resumeSessionId": msg.resume_session_id,
+            "resumeSessionId": resume_sid,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
@@ -2856,6 +2872,40 @@ rl.on('line', (line) => {
         })
         .await
         .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
+    }
+
+    /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
+    /// ONLY identity is a provider-matched `sessionRef` must resume exactly
+    /// like the legacy `resumeSessionId` carrier — the canonical field cannot
+    /// be a second-class citizen while the client migrates off the legacy
+    /// duplicate. The fake sidecar echoes the create request's
+    /// `resumeSessionId` back as the durable id, so the created frame's
+    /// sessionId proves the promotion reached the sidecar.
+    #[tokio::test]
+    async fn handle_create_with_session_ref_only_resumes_like_legacy() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let durable = "66666666-6666-4666-8666-666666666666";
+        let mut msg = dedup_create_msg("req-sref-only-1");
+        msg.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: durable.to_string(),
+        });
+
+        st.handle_create(msg).await;
+        let frame = await_claude_created(&mut rx, "req-sref-only-1").await;
+
+        assert_eq!(
+            frame["type"], "freshAgent.created",
+            "sessionRef-only create must succeed: {frame}"
+        );
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        assert!(
+            log.contains(durable),
+            "sidecar create must carry the sessionRef-derived resumeSessionId: {log}"
+        );
+        drop(env);
     }
 
     /// THE regression this task fixes: a duplicate `freshAgent.create` sharing a

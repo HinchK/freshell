@@ -1513,6 +1513,24 @@ impl Drop for KeyedCreateGuard {
 /// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
 /// the P0.4 restore ladder) are freshly minted or single-source and carry no
 /// concurrent-duplicate shape, so they claim nothing.
+/// Node's legacy-restore refusal text (`server/ws-handler.ts:2181`; the SAME
+/// frozen string the REST door's codex rejection reuses,
+/// `freshell-freshagent/terminal_tabs.rs` `INVALID_RAW_CODEX_RESUME_MESSAGE`)
+/// -- byte-identical so clients see one contract across doors and servers.
+const LEGACY_RESTORE_IDENTITY_REFUSAL: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
+
+/// Node parity (`server/terminal-registry.ts:186-189` `modeSupportsResume`):
+/// a non-shell mode whose CLI spec declares `resumeArgs`. Mirrors Node's
+/// truthiness check on the array (`!!resumeArgs` -- present counts, even
+/// empty), so the two servers refuse the same set of modes.
+fn mode_supports_resume(state: &WsState, mode: &str) -> bool {
+    mode != "shell"
+        && state
+            .cli_commands
+            .iter()
+            .any(|s| s.name == mode && s.resume_args.is_some())
+}
+
 fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
     if create.mode == "shell" {
         return None;
@@ -2408,6 +2426,36 @@ pub(crate) async fn handle_create(
     // reject loudly when nothing can resolve. Claude-only: gemini/kimi
     // behavior is deliberately untouched, and fresh (non-restore)
     // claude keeps the preallocation branch above.
+    // Node parity (`server/ws-handler.ts:2170-2186`): a `restore:true` create
+    // for a resume-supporting non-codex mode whose ONLY identity is the
+    // legacy `resumeSessionId` is refused loudly -- restore identity must be
+    // a `sessionRef` (PR #318's durable-session contract). The Rust door
+    // previously fell through to `<cli> --resume <sid>` for this shape.
+    // Node's `!hasReusableRequestedLiveTerminal` arm has no Rust analog:
+    // `create.live_terminal` is a legacy repair hint the Rust server
+    // deliberately ignores (superseded by `pane.reconcile` verdicts -- see
+    // the field's doc in freshell-protocol/client_messages.rs), so no
+    // reuse path exists to exempt. Placed BEFORE the claude P0.4 restore
+    // ladder, matching Node's ordering (the refusal wins over ladder
+    // healing).
+    if create.restore == Some(true)
+        && mode != "codex"
+        && mode_supports_resume(state, &mode)
+        && create
+            .resume_session_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        && create.session_ref.is_none()
+    {
+        return send_create_error(
+            out,
+            ErrorCode::InvalidMessage,
+            LEGACY_RESTORE_IDENTITY_REFUSAL.to_string(),
+            &create.request_id,
+        )
+        .await;
+    }
+
     if mode == "claude" && create.restore == Some(true) {
         // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
         // a client-supplied claude id that is not canonical-UUID-shaped
@@ -2439,27 +2487,33 @@ pub(crate) async fn handle_create(
         }
     }
 
-    // D7 liveness guard on the DIRECT wire-sessionRef rung (recover-my-panes
-    // Task 2b, defense-in-depth). Every other live-guard lives inside the
+    // D7 liveness guard on the wire-identity rungs (recover-my-panes Task 2b,
+    // defense-in-depth). Every other live-guard lives inside the
     // createRequestId-keyed ladder (`resolve_claude_restore_session_id`), which
-    // the direct rung above bypasses entirely -- and the D5 recovery path
+    // the direct rungs above bypass entirely -- and the D5 recovery path
     // re-mints the createRequestId, so a session that goes live between the
     // inventory fetch and the user's accept would otherwise silently spawn a
     // SECOND `<cli> --resume S` while the original live PTY owns S (the
     // one-JSONL-writer doctrine: "silently wrong"). Mirrors the ladder's A13
     // row-matching -- the identity-registry owner check plus the REST-shaped
     // live-registry-row scan -- but MODE-GENERIC: codex/opencode/amplifier had
-    // no live-guard on ANY path, so this closes their gap too. Applies only
-    // when the resume id was derived from the wire `sessionRef` (the
-    // resumeSessionId fallback and ladder-resolved ids keep their existing
-    // guards).
-    if let Some(live_sid) = create
-        .session_ref
-        .as_ref()
-        .filter(|r| r.provider == mode)
-        .map(|r| r.session_id.as_str())
-        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
-    {
+    // no live-guard on ANY path, so this closes their gap too.
+    //
+    // The guard arms on [`create_session_locator`] -- the SAME wire-identity
+    // derivation the D8 lease claims on: the accepted `sessionRef` first,
+    // else the PROMOTED legacy `resumeSessionId` rung (`{provider: mode,
+    // sessionId}`, the reconcile door's §5.2 uniform promotion rule). The
+    // legacy rung was previously unguarded here -- the wire-resume gate's
+    // liveness precondition SKIPS live candidates rather than refusing them,
+    // so a legacy-only carrier double-spawned onto a live session (the
+    // 2026-08-16 duplicate-tab incident, REST twin in
+    // freshell-freshagent/terminal_tabs.rs). The `resume_session_id`
+    // equality filter keeps later-resolved identities (fresh-claude/amplifier
+    // mints, gate-healed ids, ladder-resolved ids) outside the guard -- they
+    // are freshly minted or single-source and keep their existing guards.
+    let d7_locator = create_session_locator(&create)
+        .filter(|loc| resume_session_id.as_deref() == Some(loc.session_id.as_str()));
+    if let Some(live_sid) = d7_locator.as_ref().map(|loc| loc.session_id.as_str()) {
         // #540 (ks38): the identity-owner + Running-row join is now the shared
         // `TerminalRegistry::live_session_owner` helper (the same join the REST
         // resume paths consult), replacing the former inline two-arm check.

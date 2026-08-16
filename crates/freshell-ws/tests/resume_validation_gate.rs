@@ -637,11 +637,15 @@ async fn restore_true_live_absent_sessionref_hits_d7_not_the_gate() {
     registry.kill_all();
 }
 
-/// Case 5 — the REGISTRY arm of the in-gate liveness precondition: a legacy
-/// `resumeSessionId`-only carrier bypasses D7 in every ordering, so the gate
-/// itself must refuse to fire on a LIVE session. Resume proceeds unchanged.
+/// Case 5 — the legacy `resumeSessionId`-only restore carrier is now REFUSED
+/// up front (Node parity, `server/ws-handler.ts:2170-2186`): restore identity
+/// must be a `sessionRef`. The refusal fires before D7 and before the gate,
+/// so the live session is never touched — its Bound row survives and no
+/// second writer spawns. (Pre-fix this carrier bypassed D7 entirely and the
+/// in-gate liveness precondition was its only protection; that precondition
+/// remains in `gate_wire_resume` as the D7→gate race-window backstop.)
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_true_live_absent_legacy_resume_id_fails_open() {
+async fn restore_true_live_legacy_resume_id_is_refused_invalid_message() {
     let probe = StubProbe::answering("amplifier", "live-amp-legacy", SessionExistence::Absent);
     let (url, registry, ledger, state) = spawn_server_with_probe(probe, false).await;
     seed_bound_row(&ledger, "amplifier", "live-amp-legacy");
@@ -664,12 +668,14 @@ async fn restore_true_live_absent_legacy_resume_id_fails_open() {
     let frame = next_created_or_error(&mut ws, "req-gate-5").await;
 
     assert_eq!(
-        frame["type"], "terminal.created",
-        "the legacy carrier must proceed (fail open on liveness): {frame}"
+        frame["type"], "error",
+        "a legacy-only restore must be refused loudly, never spawn: {frame}"
     );
-    assert!(
-        notice_of(&frame).is_none(),
-        "a LIVE session must never gate: {frame}"
+    assert_eq!(frame["code"], "INVALID_MESSAGE", "{frame}");
+    assert_eq!(
+        frame["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen Node refusal text: {frame}"
     );
     assert_eq!(
         ledger
@@ -683,13 +689,16 @@ async fn restore_true_live_absent_legacy_resume_id_fails_open() {
     registry.kill_all();
 }
 
-/// Case 6 — the ASYNC sidecar arm of the in-gate liveness join: liveness held
-/// ONLY by the fresh-agent sidecar (no registry/identity owner). This is the
-/// arm protecting live zero-turn sessions with no rollout on disk yet
-/// (`freshell-server/src/existence.rs:224-227`) — it must not be silently
-/// dropped while cases 4–5 still pass.
+/// Case 6 — the ASYNC sidecar arm of the cross-kind liveness join: liveness
+/// held ONLY by the fresh-agent sidecar (no registry/identity owner). Codex
+/// is exempt from the case-5 legacy-restore refusal (Node's refusal excludes
+/// codex too), so this carrier reaches D7 — whose legacy-rung promotion +
+/// Task 13b sidecar arm now refuse it loudly, protecting live zero-turn
+/// sessions with no rollout on disk yet
+/// (`freshell-server/src/existence.rs:224-227`) from a second writer. The
+/// live session is never gated stale — its Bound row survives.
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_true_sidecar_live_absent_legacy_resume_id_fails_open() {
+async fn restore_true_sidecar_live_legacy_resume_id_is_refused_by_d7() {
     // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
     // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
@@ -744,12 +753,15 @@ async fn restore_true_sidecar_live_absent_legacy_resume_id_fails_open() {
     let frame = next_created_or_error(&mut ws, "req-gate-6").await;
 
     assert_eq!(
-        frame["type"], "terminal.created",
-        "sidecar-live legacy carrier must proceed (fail open): {frame}"
+        frame["type"], "error",
+        "a sidecar-live legacy carrier must be refused (one writer per thread): {frame}"
     );
+    assert_eq!(frame["code"], "RESTORE_UNAVAILABLE", "{frame}");
     assert!(
-        notice_of(&frame).is_none(),
-        "a sidecar-LIVE session must never gate: {frame}"
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("still running")),
+        "D7's own rejection message must answer: {frame}"
     );
     assert_eq!(
         ledger

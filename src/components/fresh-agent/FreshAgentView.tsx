@@ -323,14 +323,29 @@ function persistDurableFreshAgentFlavor(message: {
   })
 }
 
+/// The ONE durable-identity claim an outgoing create/attach carries: the
+/// canonical sessionRef, with a legacy-only pane's `resumeSessionId` promoted
+/// into it ({provider, sessionId} — the same §5.2 promotion rule the server's
+/// reconcile door applies). The legacy wire field itself is no longer sent;
+/// every server door resolves its resume input from sessionRef
+/// (claude.rs/codex.rs/opencode_ws.rs create paths, claude.rs
+/// attach_durable_id, Node runtime-manager.ts:106-108).
+function effectiveSessionRef(content: FreshAgentPaneContent) {
+  if (content.sessionRef) return content.sessionRef
+  if (content.resumeSessionId) {
+    return { provider: content.provider, sessionId: content.resumeSessionId }
+  }
+  return undefined
+}
+
 function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: string) {
+  const sessionRef = effectiveSessionRef(content)
   return {
     type: 'freshAgent.attach',
     sessionId: content.sessionId,
     sessionType: content.sessionType,
     provider: content.provider,
-    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
-    ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
+    ...(sessionRef ? { sessionRef } : {}),
     ...(cwd ? { cwd } : {}),
   } as const
 }
@@ -1025,9 +1040,7 @@ export function FreshAgentView({
       provider: content.provider,
       cwd: content.initialCwd,
       ...(legacyRestoreContext ? { legacyRestoreContext } : {}),
-      resumeSessionId: content.resumeSessionId
-        ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
-      sessionRef: content.sessionRef,
+      sessionRef: effectiveSessionRef(content),
       modelSelection: content.modelSelection,
       model: resolveEffectiveFreshAgentModel(content, providerDefaults),
       ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),

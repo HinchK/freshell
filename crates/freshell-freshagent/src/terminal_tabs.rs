@@ -1198,18 +1198,47 @@ pub(crate) async fn spawn_terminal_pane(
     // Placement: before any side effect (no PTY, no MCP write, no port alloc,
     // no codex plan), so refusal needs zero rollback. This is the single choke
     // point for POST /api/tabs, /api/panes/:id/split, and /api/panes/:id/respawn
-    // (every spawn_terminal_pane caller). Scoped to the sessionRef rung exactly
-    // like WS (`accepted_session_ref` already implies provider == mode); the
-    // legacy bare-resumeSessionId rung keeps its existing behavior. No
-    // self-exemption for respawn: the old terminal is deliberately never
-    // killed ("detach, don't kill"), so resuming its live session in a second
-    // PTY would be exactly the two-writers corruption this guard forbids.
-    let mut session_ref_lease: Option<RestSessionRefLease> = None;
-    if let Some(live_sid) = accepted_session_ref
+    // (every spawn_terminal_pane caller). No self-exemption for respawn: the
+    // old terminal is deliberately never killed ("detach, don't kill"), so
+    // resuming its live session in a second PTY would be exactly the
+    // two-writers corruption this guard forbids.
+    //
+    // The guard arms on ONE effective session locator: the accepted wire
+    // `sessionRef` first, else the PROMOTED legacy `resumeSessionId` rung --
+    // `{provider: mode, sessionId}` per the reconcile door's §5.2 uniform
+    // promotion rule (reconcile.rs `promoted_legacy_claim`). The legacy rung
+    // was previously unguarded, which let a legacy-only carrier (the
+    // `freshell` CLI's `--resume`) spawn a second live writer onto an owned
+    // session (2026-08-16 duplicate-tab incident). Promotion is gated on the
+    // SAME predicate the EDEV-07 pane_content synthesis uses
+    // ([`is_session_provider_mode`] + [`plausible_resume_session_id`]), and
+    // on the resume id still being the CALLER's wire value -- a gate-healed
+    // or freshly-minted id (claude prealloc, amplifier launcher identity)
+    // never came from the wire and claims nothing, exactly like the WS door.
+    let wire_legacy_resume_id = body
+        .get("resumeSessionId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let guard_locator: Option<SessionLocator> = accepted_session_ref
         .as_ref()
-        .map(|r| r.session_id.as_str())
-        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
-    {
+        .filter(|r| {
+            !r.session_id.is_empty() && resume_session_id.as_deref() == Some(r.session_id.as_str())
+        })
+        .cloned()
+        .or_else(|| {
+            resume_session_id
+                .as_deref()
+                .filter(|sid| wire_legacy_resume_id == Some(*sid))
+                .filter(|sid| {
+                    is_session_provider_mode(&mode) && plausible_resume_session_id(&mode, sid)
+                })
+                .map(|sid| SessionLocator {
+                    provider: mode.clone(),
+                    session_id: sid.to_string(),
+                })
+        });
+    let mut session_ref_lease: Option<RestSessionRefLease> = None;
+    if let Some(live_sid) = guard_locator.as_ref().map(|r| r.session_id.as_str()) {
         if registry
             .live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
             .is_some()
@@ -1237,10 +1266,9 @@ pub(crate) async fn spawn_terminal_pane(
         // is the already-minted create_request_id; holder_conn is a fresh
         // registry connection id (collision-free with WS conn cleanup -- REST
         // leases rely on RAII drop + the lease TTL, not conn-death cleanup).
-        let locator = SessionLocator {
-            provider: mode.clone(),
-            session_id: live_sid.to_string(),
-        };
+        let locator = guard_locator
+            .clone()
+            .expect("guard_locator is Some inside this branch");
         match registry.claim_session_ref(
             &locator,
             &create_request_id,
@@ -5779,6 +5807,126 @@ mod tests {
             registry.bound_terminal_for_session_ref(&locator),
             Some(tid.clone()),
             "REST resume spawn must complete its lease into a sessionRef binding"
+        );
+
+        registry.kill(&tid);
+    }
+
+    // ── D7/D8 promotion of the legacy resumeSessionId rung ──────────────────
+    // The 2026-08-16 duplicate-tab incident: a legacy-only carrier (the
+    // `freshell` CLI's `new-tab --resume`) walked past both guards and spawned
+    // a second `opencode --session <sid>` writer onto a live session. A legacy
+    // `mode` + `resumeSessionId` pair IS a sessionRef claim (the reconcile
+    // door's §5.2 uniform promotion rule, reconcile.rs `promoted_legacy_claim`),
+    // so the guards must arm on it exactly as they do on the sessionRef rung.
+
+    #[tokio::test]
+    async fn rest_create_legacy_resume_onto_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-rest-legacy-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-legacy-live-owner");
+        let rows_before = registry.identity_probe_rows().len();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": LIVE_SESSION,
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert_eq!(
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no duplicate spawn on the legacy rung"
+        );
+
+        registry.kill("t-legacy-live-owner");
+    }
+
+    #[tokio::test]
+    async fn rest_create_legacy_resume_while_lease_held_is_refused_409() {
+        let argv_file = unique_argv_file("d8-legacy-lease-held-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        assert!(matches!(
+            registry.claim_session_ref(
+                &locator,
+                "foreign-holder",
+                registry.new_connection_id(),
+                test_now_ms()
+            ),
+            SessionRefClaim::Acquired
+        ));
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": LIVE_SESSION,
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.fail_session_ref_claim(&locator, "foreign-holder");
+    }
+
+    #[tokio::test]
+    async fn rest_create_legacy_resume_completes_claim_into_binding() {
+        let argv_file = unique_argv_file("d8-legacy-lease-completion");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        assert_eq!(registry.bound_terminal_for_session_ref(&locator), None);
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": LIVE_SESSION,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        assert_eq!(
+            registry.bound_terminal_for_session_ref(&locator),
+            Some(tid.clone()),
+            "a legacy-rung resume spawn must complete its lease into a sessionRef binding"
         );
 
         registry.kill(&tid);
