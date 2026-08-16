@@ -4,7 +4,7 @@ import type {
   FreshAgentModelCapability,
 } from '@shared/fresh-agent-model-capabilities'
 
-const MAX_MODEL_ENTRIES = 5
+export const FRESH_AGENT_MODEL_MRU_MAX_ENTRIES = 5
 const MAX_LEVEL_ENTRIES = 50
 
 /**
@@ -177,7 +177,7 @@ export function recordFreshAgentModelUse(
     cwdKey,
     lastVerifiedAt: now,
   }
-  const updated = [next, ...filtered].slice(0, MAX_MODEL_ENTRIES)
+  const updated = [next, ...filtered].slice(0, FRESH_AGENT_MODEL_MRU_MAX_ENTRIES)
   saveJson(resolved, modelMruStorageKey(provider), updated)
   return updated
 }

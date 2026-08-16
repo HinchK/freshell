@@ -30,6 +30,10 @@ export {
   normalizeFreshAgentModel,
   normalizeFreshcodexModel,
 } from '@/lib/fresh-agent-models'
+// `export ... from` above does not bind module-scope names; import the two
+// normalizers for the effective-value helpers below.
+import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '@/lib/fresh-agent-models'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
 export type FreshAgentRegistryEntry = {
   sessionType: FreshAgentSessionType
@@ -145,4 +149,43 @@ export function getFreshAgentLabel(sessionType: string | undefined): string {
   return resolveFreshAgentType(sessionType)?.label
     ?? getFreshAgentDescriptor(sessionType)?.label
     ?? 'Fresh Agent'
+}
+
+export type FreshAgentProviderDefaultsForModel = {
+  modelSelection?: { modelId: string }
+  effort?: string
+}
+
+/**
+ * The pane's effective model: the staged pane value first, then the explicit
+ * pane selection, then the persisted provider default, normalized for the
+ * runtime provider. Shared by the send/create paths, the settings popover,
+ * and the model+thinking dialog so a commit reads back exactly as staged.
+ */
+export function resolveEffectiveFreshAgentModel(
+  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection'>,
+  providerDefaults?: FreshAgentProviderDefaultsForModel,
+): string | undefined {
+  const configured = content.model
+    ?? content.modelSelection?.modelId
+    ?? providerDefaults?.modelSelection?.modelId
+  return normalizeFreshAgentModel(content.sessionType, content.provider, configured)
+}
+
+/**
+ * The pane's effective thinking level: the staged pane value first, then the
+ * persisted provider default, normalized against the model's known levels.
+ * For opencode live-catalog models an absent value stays absent (the model
+ * selector's explicit Default — no variant is sent).
+ */
+export function getEffectiveFreshAgentEffort(
+  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection' | 'effort'>,
+  providerDefaults?: FreshAgentProviderDefaultsForModel,
+): string | undefined {
+  return normalizeFreshAgentEffort(
+    content.sessionType,
+    content.provider,
+    resolveEffectiveFreshAgentModel(content, providerDefaults),
+    content.effort ?? providerDefaults?.effort,
+  )
 }
