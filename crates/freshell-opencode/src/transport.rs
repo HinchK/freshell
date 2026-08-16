@@ -213,11 +213,17 @@ impl ProcessSpawner for TokioProcessSpawner {
     fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
         use std::process::Stdio;
         let mut cmd = tokio::process::Command::new(&req.command);
-        cmd.arg("serve")
-            .arg("--hostname")
+        cmd.arg("serve");
+        if req.pure {
+            cmd.arg("--pure");
+        }
+        cmd.arg("--hostname")
             .arg(&req.hostname)
             .arg("--port")
             .arg(req.port.to_string());
+        if let Some(cwd) = &req.cwd {
+            cmd.current_dir(cwd);
+        }
         // Inherit the parent env, then layer the request env (incl. the ownership tag).
         for (key, value) in &req.env {
             cmd.env(key, value);

@@ -67,6 +67,10 @@ serde_json = { workspace = true }
 # guarantees). `fancy-regex` is already resolved in the workspace lockfile (a transitive dep of
 # `jsonschema`), so this adds no new dependency to the build graph, only a direct one.
 fancy-regex = "0.18"
+# `future::Shared` backs the model-capabilities registry's in-flight single-flight
+# coalescing (`model-capability-registry.ts`'s `opencodeInFlightByKey` promise map
+# — one probe, many awaiters). Already resolved in the workspace lock.
+futures-util = "0.3"
 # The shared broadcast bus (String frames), the create/turn async orchestration, the codex
 # app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }

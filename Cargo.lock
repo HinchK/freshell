@@ -1320,6 +1320,7 @@ dependencies = [
  "freshell-protocol",
  "freshell-sessions",
  "freshell-terminal",
+ "futures-util",
  "libc",
  "serde",
  "serde_json",
@@ -1337,6 +1338,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",

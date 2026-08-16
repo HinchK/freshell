@@ -42,6 +42,7 @@ pub mod codex;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
+pub mod model_capabilities;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
@@ -314,6 +315,14 @@ pub struct FreshAgentState {
     /// wired (the `rename_persistence` convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
+    /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
+    /// ([`model_capabilities`]): cwd-keyed TTL cache + single-flight coalescing
+    /// over the transient opencode catalog probe, plus the static codex/claude
+    /// catalogs. Constructed with the REAL transport probe in
+    /// [`Self::new`] (there is no wiring ceremony — unlike the Option-until-
+    /// wired fields above, production construction is unconditional); tests
+    /// install a scripted probe via [`Self::with_model_capability_probe`].
+    pub(crate) model_capabilities: Arc<model_capabilities::ModelCapabilityRegistry>,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -407,7 +416,22 @@ impl FreshAgentState {
             rename_persistence: None,
             terminals_revision: None,
             terminal_created_hook: None,
+            model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
+                Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
+            )),
         }
+    }
+
+    /// Install a scripted model-catalog probe (tests) — the registry's
+    /// `opencodeCatalogProvider` injection seam
+    /// (`model-capability-registry.ts:196-202`). Rebuilds the registry around
+    /// the replacement probe; any prior cache entries are discarded with it.
+    pub fn with_model_capability_probe(
+        mut self,
+        probe: Arc<dyn model_capabilities::ModelCatalogProbe>,
+    ) -> Self {
+        self.model_capabilities = Arc::new(model_capabilities::ModelCapabilityRegistry::new(probe));
+        self
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -1483,6 +1507,7 @@ pub fn router(state: FreshAgentState) -> Router {
         .route("/api/panes/{id}/capture", get(capture))
         .route("/api/panes/{id}/wait-for", get(terminal_tabs::wait_for))
         .with_state(state.clone())
+        .merge(model_capabilities::router(state.clone()))
         .merge(pane_ops::router(state))
 }
 
