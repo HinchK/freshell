@@ -52,7 +52,7 @@ Fix the freshell root cause behind broken mouse scrolling and garbage rendering 
 - Consumes: `attachTerminal(tid: string, intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect', opts?: AttachTerminalOptions): void`, `hiddenRef.current: boolean`, existing module-level helper `forgetSentViewport(tid)` (src/components/TerminalView.tsx:507), `lastSentViewportRef` (per-instance ref).
 - Produces: no new exported names; only wire-frame `intent` differs for hidden clamps.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 Add three tests to the hidden-pane attach-intent block of `test/unit/client/components/TerminalView.lifecycle.test.tsx`.
 
@@ -149,13 +149,13 @@ T3 — surface reset at clamped full replay (protects round-1 finding-2 against 
 
 Also update the pre-existing hidden replay-gap test "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output" (~line 8685): change ONLY its attach wait predicate from `intent === 'viewport_hydrate'` to `intent === 'keepalive_delta'` (the production recreate predicate is NOT changed — `currentAttachRef.intent` retains viewport bookkeeping; that is part of the production contract this redesign pins). Any other pre-existing assertion of a hidden wire `viewport_hydrate` gets the same single-word update under the old-contract rule; record every touched test in the task report. Visible-pane assertions (e.g. "recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output" and the reconnect-before-reveal test at ~4635) must stay untouched and green.
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix), FAIL for T2 (reveal resize suppressed pre-fix because the hidden viewport_hydrate attach recorded identical dims), and FAIL for T4 (hide-then-reconnect race: stale hiddenRef leaks a `viewport_hydrate`). T3 and the reconnect-before-reveal test (~4635) must pass pre-fix — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; all failure modes must be assertion-level, not setup errors.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Changes live in two places in `src/components/TerminalView.tsx`.
 
@@ -193,17 +193,17 @@ if (hiddenViewportAttach) {
 
 No other edits. In particular: do not touch the re-promotion conditions, the rejection ladders, the gap predicate, the reveal effect, or requestTerminalLayout.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 Expected: PASS (T1/T2 now green; T3 stays green; every pre-existing test in the file stays green after the allowed predicate updates).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Verify no duplication crept into the attach block; keep the invariant comment within ~8 lines. No other refactor.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Enumerate impacted client files first: `grep -rl "viewport_hydrate\|keepalive_delta" test/unit/client/src test/unit/client 2>/dev/null | sort -u` (then keep only files that exist). Run:
 
@@ -215,7 +215,7 @@ npm run lint
 
 Expected: all PASS. Record the enumerated file list and counts in the task report. Failures whose root cause is an old-contract hidden-viewport assertion may be updated per the Step 1 rule; anything else is a real defect — stop, do not commit, escalate.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 rm crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs
