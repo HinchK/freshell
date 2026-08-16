@@ -329,8 +329,9 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     case 'freshAgent.question.cancelled':
-      // Provider-originated cancellation (the Rust claude/kilroy slice forwards
-      // sdk.question.cancelled): clear the card without inventing a user decision.
+      // Provider-originated cancellation: the Rust claude/kilroy slice forwards
+      // the sidecar's question-cancel edge as this event type. Clear the card
+      // without inventing a user decision.
       dispatch(removeQuestion({
         ...locator,
         requestId: event.requestId as string,
