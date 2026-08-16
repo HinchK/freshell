@@ -7607,10 +7607,139 @@ pub(crate) mod tests {
         )
     }
 
-    /// Serializes every test in this module that mutates the process-global `CODEX_CMD` /
-    /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars (`std::env::set_var` is not safe to race
-    /// across concurrently-running tests in the same binary).
-    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const ISOLATED_CODEX_ENV_KEYS: [&str; 5] = [
+        "CODEX_HOME",
+        "CODEX_CMD",
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        "FAKE_CODEX_APP_SERVER_ARG_LOG",
+        "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+    ];
+
+    /// Serializes tests that mutate Codex process-global environment and gives every holder
+    /// an explicit temporary `CODEX_HOME` plus the fake app-server's fixture-only write opt-in.
+    /// Every variable a holder may mutate is snapshotted and restored by the guard, including
+    /// during unwinding, so test ordering cannot leak configuration or durable fake sessions.
+    pub(crate) struct IsolatedCodexEnvLock {
+        inner: tokio::sync::Mutex<()>,
+    }
+
+    pub(crate) struct IsolatedCodexEnvGuard<'a> {
+        _lock: tokio::sync::MutexGuard<'a, ()>,
+        previous_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _codex_home: tempfile::TempDir,
+    }
+
+    impl IsolatedCodexEnvLock {
+        const fn new() -> Self {
+            Self {
+                inner: tokio::sync::Mutex::const_new(()),
+            }
+        }
+
+        fn install<'a>(&self, lock: tokio::sync::MutexGuard<'a, ()>) -> IsolatedCodexEnvGuard<'a> {
+            let codex_home = tempfile::tempdir().expect("create isolated Codex test home");
+            let previous_env = ISOLATED_CODEX_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            std::env::set_var("CODEX_HOME", codex_home.path());
+            std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+            IsolatedCodexEnvGuard {
+                _lock: lock,
+                previous_env,
+                _codex_home: codex_home,
+            }
+        }
+
+        pub(crate) async fn lock(&self) -> IsolatedCodexEnvGuard<'_> {
+            self.install(self.inner.lock().await)
+        }
+
+        pub(crate) fn blocking_lock(&self) -> IsolatedCodexEnvGuard<'_> {
+            self.install(self.inner.blocking_lock())
+        }
+    }
+
+    impl Drop for IsolatedCodexEnvGuard<'_> {
+        fn drop(&mut self) {
+            for (key, value) in self.previous_env.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    pub(crate) static ENV_LOCK: IsolatedCodexEnvLock = IsolatedCodexEnvLock::new();
+
+    const CODEX_ENV_UNWIND_CHILD: &str = "FRESHELL_CODEX_ENV_UNWIND_CHILD";
+
+    #[test]
+    fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
+        // `ENV_LOCK` coordinates every test that deliberately configures the Codex
+        // sidecar, but production-shaped tests in sibling modules may legitimately read
+        // these variables without taking the test-only lock. Exercise wholesale mutation
+        // in a one-test child process so the panic-safety proof cannot transiently poison
+        // those readers when libtest runs this suite in parallel.
+        if std::env::var_os(CODEX_ENV_UNWIND_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current freshagent test binary"),
+            )
+            .args([
+                "--exact",
+                "codex::tests::isolated_codex_env_restores_every_mutated_variable_during_unwind",
+                "--nocapture",
+            ])
+            .env(CODEX_ENV_UNWIND_CHILD, "1")
+            .output()
+            .expect("run isolated Codex environment unwind test");
+            assert!(
+                output.status.success(),
+                "isolated Codex environment unwind child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let original: Vec<_> = ISOLATED_CODEX_ENV_KEYS
+            .iter()
+            .map(std::env::var_os)
+            .collect();
+        let mut installed_opt_in = None;
+        let mut installed_home = None;
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ENV_LOCK.blocking_lock();
+            installed_opt_in = std::env::var_os("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
+            installed_home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
+            for (index, key) in ISOLATED_CODEX_ENV_KEYS.iter().enumerate() {
+                std::env::set_var(key, format!("mutated-by-unwind-test-{index}"));
+            }
+            panic!("exercise panic-safe environment restoration");
+        }));
+
+        let after_unwind: Vec<_> = ISOLATED_CODEX_ENV_KEYS
+            .iter()
+            .map(std::env::var_os)
+            .collect();
+        // Restore eagerly before asserting so a RED run cannot contaminate another test process.
+        for (key, value) in ISOLATED_CODEX_ENV_KEYS.iter().zip(original.iter()) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        assert!(unwind.is_err(), "the test closure must unwind");
+        assert_eq!(installed_opt_in.as_deref(), Some(std::ffi::OsStr::new("1")));
+        assert!(
+            !installed_home.expect("guard installs CODEX_HOME").exists(),
+            "the temporary Codex home must be removed during unwinding"
+        );
+        assert_eq!(after_unwind, original);
+    }
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob \u2014 see the fixture's `loadBehavior()`).
@@ -9116,10 +9245,9 @@ pub(crate) mod tests {
     /// `sendFreshAgentError`'s generic fallback turns into a plain 500).
     #[tokio::test]
     async fn get_snapshot_with_no_codex_binary_available_is_an_app_server_error() {
-        // Force a definitely-nonexistent binary rather than relying on `CODEX_CMD` being
-        // unset -- another test in this same process may have left it pointed at the fake
-        // app-server (`ENV_LOCK` only serializes ordering, it doesn't restore the previous
-        // value), so asserting on "absence of an override" is not reliable.
+        // Force a definitely-nonexistent binary rather than relying on ambient `CODEX_CMD`:
+        // the guard restores the caller's environment after this test, but the assertion
+        // itself must remain deterministic even when that caller intentionally set an override.
         let _guard = ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",

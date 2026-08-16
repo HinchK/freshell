@@ -327,6 +327,47 @@ describe('Sidebar Component - Session-Centric Display', () => {
     vi.useRealTimers()
   })
 
+  it('explains when the server quarantines conflicted session identities', async () => {
+    const projects: ProjectGroup[] = [{
+      projectPath: '/home/user/healthy',
+      sessions: [{
+        provider: 'claude',
+        sessionId: sessionId('healthy-after-collision'),
+        projectPath: '/home/user/healthy',
+        lastActivityAt: Date.now(),
+        title: 'Healthy session',
+      }],
+    }]
+    const store = createTestStore({
+      projects,
+      sessions: {
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects,
+            lastLoadedAt: Date.now(),
+            integrityError: {
+              kind: 'identity_collision',
+              collisionCount: 2,
+              duplicateItemCount: 4,
+            },
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const alert = screen.getByTestId('session-directory-integrity-error')
+    expect(alert).toHaveAttribute('role', 'alert')
+    expect(alert).toHaveTextContent('2 conflicting saved session identities are hidden')
+    expect(alert).toHaveTextContent('Running terminals remain available')
+    expect(screen.getByRole('button', { name: /Healthy session/ })).toBeInTheDocument()
+  })
+
   describe('displays sessions only (not terminals)', () => {
     it('keeps restored open sessions visible without issuing sidebar directory fetches on mount', () => {
       const store = createTestStore({
@@ -792,6 +833,51 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('pane-based session tracking', () => {
+    it('renders one active button when malformed state repeats the active session identity', async () => {
+      const activeSessionId = sessionId('duplicate-active-session')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/first',
+          sessions: [{
+            provider: 'claude',
+            sessionId: activeSessionId,
+            projectPath: '/home/user/first',
+            lastActivityAt: Date.now(),
+            title: 'Duplicate active session',
+          }],
+        },
+        {
+          projectPath: '/home/user/second',
+          sessions: [{
+            provider: 'claude',
+            sessionId: activeSessionId,
+            projectPath: '/home/user/second',
+            lastActivityAt: Date.now() - 1,
+            title: 'Duplicate active session',
+          }],
+        },
+      ]
+      const tabs = [{
+        id: 'tab-duplicate',
+        mode: 'claude' as const,
+        sessionRef: { provider: 'claude' as const, sessionId: activeSessionId },
+        resumeSessionId: activeSessionId,
+      }]
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-duplicate' })
+
+      renderSidebar(store)
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const rows = Array.from(
+        screen.getByTestId('sidebar-session-list')
+          .querySelectorAll<HTMLButtonElement>(`button[data-session-id="${activeSessionId}"]`),
+      )
+      expect(rows).toHaveLength(1)
+      expect(rows.filter((row) => row.classList.contains('bg-muted'))).toHaveLength(1)
+    })
+
     it('treats pane resumeSessionId as open and active even when tab has none', async () => {
       const session = sessionId('session-pane-open')
       const projects: ProjectGroup[] = [

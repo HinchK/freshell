@@ -462,6 +462,31 @@ describe('visible-first read-model helpers', () => {
     ])
   })
 
+  it('preserves a quarantined identity-collision state in sidebar snapshots', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response).toMatchObject({
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
+  })
+
   it('preserves session-directory running state in sidebar snapshots', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [{
@@ -711,6 +736,31 @@ describe('searchSessions tier forwarding', () => {
     expect(response.partialReason).toBe('budget')
   })
 
+  it('forwards a quarantined identity-collision state without exposing session ids', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 2,
+        duplicateItemCount: 4,
+      },
+    }))
+
+    const response = await searchSessions({ query: 'test', tier: 'title' })
+
+    expect(response).toMatchObject({
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 2,
+        duplicateItemCount: 4,
+      },
+    })
+  })
+
   it('does not include partial fields when server omits them', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
@@ -909,5 +959,14 @@ describe('api error mapping', () => {
     expect(err.status).toBe(429)
     expect(err.retryAfterMs).toBeGreaterThan(20_000)
     expect(err.retryAfterMs).toBeLessThanOrEqual(31_000)
+  })
+
+  it('locks the delete contract the failure-surfacing UI relies on: a 404 JSON body rejects as an ApiError', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(404, { error: 'Not found' }))
+
+    await expect(api.delete('/api/sessions/claude%3Amissing')).rejects.toMatchObject({
+      status: 404,
+      message: 'Not found',
+    })
   })
 })

@@ -61,15 +61,15 @@ describe('server/test-clock (HARNESS-14)', () => {
   })
 
   describe('enabled transitions', () => {
-    it('advance moves LIVE time forward by exactly the delta', () => {
+    it('advance increases the LIVE offset by exactly the delta', () => {
       __setTestClockEnabledOverrideForTests(true)
       resetTestClock()
       const before = testClockSnapshot()
       const r = advanceTestClockMs(90_000)
       expect(r.ok).toBe(true)
       const after = testClockSnapshot()
-      expect(after.nowMs - before.nowMs).toBe(90_000)
-      expect(after.offsetMs).toBe(90_000)
+      expect(after.offsetMs - before.offsetMs).toBe(90_000)
+      expect(after.nowMs).toBeGreaterThanOrEqual(before.nowMs + 90_000)
       expect(after.mode).toBe('live')
     })
 
@@ -99,11 +99,11 @@ describe('server/test-clock (HARNESS-14)', () => {
     it('freeze is idempotent (re-freeze never drifts the held value)', async () => {
       __setTestClockEnabledOverrideForTests(true)
       resetTestClock()
-      const first = testClockSnapshot().nowMs
       freezeTestClock()
+      const heldAt = testClockSnapshot().nowMs
       await new Promise((r) => setTimeout(r, 5))
       freezeTestClock()
-      expect(testClockSnapshot().nowMs).toBe(first)
+      expect(testClockSnapshot().nowMs).toBe(heldAt)
     })
 
     it('resume continues from the held value with no catch-up jump', async () => {

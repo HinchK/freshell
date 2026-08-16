@@ -281,6 +281,10 @@ export const RUST_ONLY_SPECS = [
   // surfaces validated in-browser against hermetic provider fakes (owns
   // per-test RustServers; hard e2eServerKind==='rust' assertion per test).
   /fresh-agent-control-rust\.spec\.ts$/,
+  // SESSION-02/03 soft delete + unmatched-/api/* 404-JSON contract wall:
+  // owns its RustServer (isolated HOME, ephemeral port); the DELETE route
+  // exists only on the Rust server.
+  /session-delete-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -517,6 +521,9 @@ export default defineConfig({
         // AGENT-04/05/06/07/24 (see the RUST_ONLY_SPECS entry): fresh-agent
         // approval/question/compact/fork PW-RUST validation across providers.
         /fresh-agent-control-rust\.spec\.ts$/,
+        // SESSION-02/03 -- soft-delete route + unmatched-/api/* 404-JSON
+        // contract wall (see RUST_ONLY_SPECS entry + the spec's doc comment).
+        /session-delete-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

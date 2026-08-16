@@ -1,4 +1,5 @@
-//! Amplifier session source: `<amplifier_home>/projects/**/sessions/**/metadata.json`.
+//! Amplifier session source:
+//! `<amplifier_home>/projects/<project>/sessions/<session>/metadata.json`.
 //!
 //! 1:1 port of `server/coding-cli/providers/amplifier.ts`'s discovery/parse logic,
 //! feeding the same [`crate::directory_index::SessionSource`] abstraction
@@ -59,10 +60,10 @@ pub fn amplifier_home(home: &Path) -> PathBuf {
     }
 }
 
-/// Amplifier source: recursively walks
-/// `<amplifier_home>/projects/**/sessions/**/metadata.json`. A faithful lift of
-/// `amplifierProvider.listSessionFiles()` (`providers/amplifier.ts:217-224`,
-/// `walkMetadataFiles` at :142-161).
+/// Amplifier source: discovers only the provider's canonical record shape,
+/// `<amplifier_home>/projects/<project>/sessions/<session>/metadata.json`.
+/// Files nested below a session directory (for example
+/// `context-intelligence/metadata.json`) are sidecars, not sessions.
 pub struct AmplifierSource {
     amplifier_home: PathBuf,
 }
@@ -114,55 +115,68 @@ impl SessionSource for AmplifierSource {
 /// per-entry iterator errors propagate (`?`) — a root that fails to open OR
 /// fails mid-iteration is an `Err` (recorded as a scan failure by the sweep),
 /// never a silent `Ok(empty)`. A MISSING root is a genuine empty. NESTED
-/// directories stay tolerant via [`walk_metadata_files`].
+/// directories stay tolerant via [`discover_project_session_metadata`].
 fn discover_amplifier_metadata(amplifier_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
     let projects_dir = amplifier_home.join("projects");
     let Some(entries) = crate::directory_index::open_root_dir(&projects_dir)? else {
         return Ok(Vec::new());
     };
-    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        paths.push(entry?.path());
-    }
-    paths.sort(); // determinism (readdir order is filesystem-dependent)
-    let mut stats = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            walk_metadata_files(&projects_dir, &path, &mut stats);
+        let entry = entry?;
+        // Node's `Dirent.isDirectory()` is non-following: a symlink alias is
+        // not a canonical project directory, even when its target is one.
+        if entry.file_type()?.is_dir() {
+            project_dirs.push(entry.path());
         }
-        // A top-level `metadata.json` directly in `projects/` can never have
-        // a `sessions` path segment in its relative path, so it is excluded
-        // by construction — same as the recursive walk's filter.
+    }
+    project_dirs.sort(); // determinism (readdir order is filesystem-dependent)
+    let mut stats = Vec::new();
+    for project_dir in project_dirs {
+        discover_project_session_metadata(&project_dir, &mut stats);
     }
     Ok(stats)
 }
 
-/// Recursively find every `metadata.json` under `dir` (never
-/// `metadata.json.backup` -- exact filename match only, mirroring
-/// `walkMetadataFiles`'s `entry.name === 'metadata.json'` check,
-/// `providers/amplifier.ts:155`), then keep only files whose path (relative to
-/// `root`, the `projects/` dir) has a `sessions` path segment -- mirroring
-/// `listSessionFiles`'s `path.relative(projectsDir, file).split(path.sep).includes('sessions')`
-/// filter (`providers/amplifier.ts:217-224`). Sorted per directory level for
-/// determinism (readdir order is filesystem-dependent), same convention
-/// `ClaudeSource`/`CodexSource` use.
-fn walk_metadata_files(root: &Path, dir: &Path, out: &mut Vec<FileStat>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Discover canonical metadata one fixed level below a project's `sessions/`
+/// directory. Nested listing/stat failures are best-effort: an unreadable
+/// project or session is skipped without turning the whole provider scan into
+/// a failure. The `projects/` root itself remains strict in
+/// [`discover_amplifier_metadata`].
+fn discover_project_session_metadata(project_dir: &Path, out: &mut Vec<FileStat>) {
+    let Ok(entries) = std::fs::read_dir(project_dir.join("sessions")) else {
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            walk_metadata_files(root, &path, out);
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("metadata.json") {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            let under_sessions = relative.components().any(|c| c.as_os_str() == "sessions");
-            if under_sessions {
-                if let Some(stat) = stat_metadata_file(&path) {
-                    out.push(fold_activity_mtime(stat));
-                }
-            }
+    let mut session_dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            // Same non-following entry-type contract as Node's
+            // `sessionEntry.isDirectory()`.
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect();
+    session_dirs.sort();
+    for session_dir in session_dirs {
+        // Node reads each session directory and accepts metadata.json only
+        // when the returned Dirent is a real file. This excludes symlinks,
+        // directories named metadata.json, and unreadable session dirs.
+        let Ok(entries) = std::fs::read_dir(&session_dir) else {
+            continue;
+        };
+        let has_metadata_file = entries.filter_map(|entry| entry.ok()).any(|entry| {
+            entry.file_name() == std::ffi::OsStr::new("metadata.json")
+                && entry.file_type().is_ok_and(|file_type| file_type.is_file())
+        });
+        if !has_metadata_file {
+            continue;
+        }
+        let metadata_path = session_dir.join("metadata.json");
+        if let Some(stat) = stat_metadata_file(&metadata_path) {
+            out.push(fold_activity_mtime(stat));
         }
     }
 }
@@ -379,6 +393,7 @@ fn indexed_from_meta(
             .session_id
             .clone()
             .unwrap_or_else(|| fallback_session_id.to_string()),
+        legacy_session_id: None,
         provider: "amplifier".to_string(),
         // Raw `cwd`, not git-root-resolved -- matches the established Rust-port
         // convention for `project_path` (`item_from_meta`/`opencode_session_to_indexed`
@@ -445,6 +460,10 @@ mod tests {
     use std::sync::Arc;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_index(sources: Vec<Arc<dyn SessionSource>>) -> SessionIndex {
+        SessionIndex::with_ttl_and_cache_path(sources, std::time::Duration::from_secs(1), None)
+    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -639,6 +658,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn amplifier_source_discovers_only_the_canonical_session_metadata() {
+        let home = unique_temp_dir("canonical-only");
+        let session_dir = write_session(
+            &home,
+            "proj",
+            "sess-1",
+            &sample_metadata("sess-1", "/p", "Canonical"),
+            None,
+        );
+        let nested = session_dir.join("context-intelligence");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("metadata.json"),
+            sample_metadata("sess-1", "/p", "Nested duplicate"),
+        )
+        .unwrap();
+
+        let source = AmplifierSource::new(home.clone());
+        let discovered = source.discover();
+        assert_eq!(
+            discovered.len(),
+            1,
+            "only projects/<project>/sessions/<session>/metadata.json is canonical"
+        );
+        assert_eq!(discovered[0].path, session_dir.join("metadata.json"));
+
+        let items = source.scan();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_id, "sess-1");
+        assert_eq!(items[0].title.as_deref(), Some("Canonical"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amplifier_discovery_ignores_symlink_aliases_and_non_file_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let home = unique_temp_dir("canonical-entry-types");
+        let canonical_session = write_session(
+            &home,
+            "real-project",
+            "real-session",
+            &sample_metadata("real-session", "/p", "Canonical"),
+            None,
+        );
+        let projects_dir = home.join("projects");
+        let canonical_project = projects_dir.join("real-project");
+        let sessions_dir = canonical_project.join("sessions");
+        let canonical_metadata = canonical_session.join("metadata.json");
+
+        // Node's `Dirent.isDirectory()` ignores symlinked project/session
+        // aliases, even when they resolve to otherwise-valid directories.
+        symlink(&canonical_project, projects_dir.join("linked-project")).unwrap();
+        symlink(&canonical_session, sessions_dir.join("linked-session")).unwrap();
+
+        // Node also requires `Dirent.isFile()` for metadata.json itself.
+        let linked_metadata_session = sessions_dir.join("linked-metadata");
+        std::fs::create_dir_all(&linked_metadata_session).unwrap();
+        symlink(
+            &canonical_metadata,
+            linked_metadata_session.join("metadata.json"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(sessions_dir.join("metadata-directory/metadata.json")).unwrap();
+
+        let discovered = AmplifierSource::new(home.clone()).discover();
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|stat| stat.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![canonical_metadata.as_path()],
+            "only real directory entries ending in a real metadata.json file are canonical"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // -- empty/missing ~/.amplifier tolerated silently --
 
     #[test]
@@ -737,7 +836,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = SessionIndex::new(vec![
+        let index = test_index(vec![
             Arc::new(AmplifierSource::new(home.clone())) as Arc<dyn SessionSource>,
             Arc::new(ClaudeSource::new(claude_home)) as Arc<dyn SessionSource>,
         ]);

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
@@ -35,6 +37,12 @@ type FakeServerBehavior = {
 type FakeServerHandle = {
   child: ChildProcessWithoutNullStreams
   wsUrl: string
+  tempDir: string
+}
+
+type FakeServerOptions = {
+  omitCodexHome?: boolean
+  omitDurableWriteOptIn?: boolean
 }
 
 const fakeServers = new Set<FakeServerHandle>()
@@ -72,23 +80,38 @@ async function waitForWebSocketReady(wsUrl: string, timeoutMs = 5_000): Promise<
   throw new Error(`Timed out waiting for fake Codex app-server at ${wsUrl}`)
 }
 
-async function startFakeCodexAppServer(behavior: FakeServerBehavior = {}): Promise<FakeServerHandle> {
+async function startFakeCodexAppServer(
+  behavior: FakeServerBehavior = {},
+  options: FakeServerOptions = {},
+): Promise<FakeServerHandle> {
   const endpoint = await allocateLocalhostPort()
   const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-fake-codex-client-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: tempDir,
+    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify(behavior),
+    FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+  }
+  if (options.omitDurableWriteOptIn) {
+    delete env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES
+  }
+  if (options.omitCodexHome) {
+    delete env.CODEX_HOME
+  } else {
+    env.CODEX_HOME = path.join(tempDir, '.codex')
+  }
   const child = spawn(process.execPath, [
     FAKE_SERVER_PATH,
     'app-server',
     '--listen',
     wsUrl,
   ], {
-    env: {
-      ...process.env,
-      FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify(behavior),
-    },
+    env,
     stdio: 'pipe',
   })
 
-  const handle = { child, wsUrl }
+  const handle = { child, wsUrl, tempDir }
   fakeServers.add(handle)
   await waitForWebSocketReady(wsUrl)
   return handle
@@ -97,15 +120,14 @@ async function startFakeCodexAppServer(behavior: FakeServerBehavior = {}): Promi
 async function stopFakeCodexAppServer(handle: FakeServerHandle): Promise<void> {
   fakeServers.delete(handle)
 
-  if (handle.child.exitCode !== null || handle.child.signalCode !== null) {
-    return
+  if (handle.child.exitCode === null && handle.child.signalCode === null) {
+    handle.child.kill('SIGTERM')
+    await new Promise<void>((resolve) => {
+      handle.child.once('exit', () => resolve())
+      setTimeout(resolve, 1_000)
+    })
   }
-
-  handle.child.kill('SIGTERM')
-  await new Promise<void>((resolve) => {
-    handle.child.once('exit', () => resolve())
-    setTimeout(resolve, 1_000)
-  })
+  await fsp.rm(handle.tempDir, { recursive: true, force: true })
 }
 
 async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1_000): Promise<void> {
@@ -131,6 +153,61 @@ afterEach(async () => {
 })
 
 describe('CodexAppServerClient', () => {
+  it('refuses to write a durable rollout when the fake server lacks explicit CODEX_HOME', async () => {
+    const server = await startFakeCodexAppServer({}, { omitCodexHome: true })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(client.startTurn({
+      threadId: 'thread-new-1',
+      input: [{ type: 'text', text: 'do not touch the user store' }],
+    })).rejects.toThrow(/explicit CODEX_HOME/i)
+    await expect(fsp.stat(path.join(server.tempDir, '.codex', 'sessions')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses to write a durable rollout without the fixture-only opt-in', async () => {
+    const server = await startFakeCodexAppServer({}, { omitDurableWriteOptIn: true })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(client.startTurn({
+      threadId: 'thread-new-1',
+      input: [{ type: 'text', text: 'do not write without an explicit fixture opt-in' }],
+    })).rejects.toThrow(/durable-write opt-in/i)
+    await expect(fsp.stat(path.join(server.tempDir, '.codex', 'sessions')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('encodes thread ids into stable rollout filenames without allowing path traversal', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const threadId = 'nested/../../../../../escaped-traversal'
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+    await client.startTurn({
+      threadId,
+      input: [{ type: 'text', text: 'stay inside the isolated Codex home' }],
+    })
+
+    const sessionsRoot = path.join(server.tempDir, '.codex', 'sessions')
+    let rolloutFiles: string[] = []
+    await waitFor(async () => {
+      rolloutFiles = await fsp.readdir(sessionsRoot, { recursive: true })
+        .then((entries) => entries.filter((entry) => entry.endsWith('.jsonl')))
+        .catch(() => [] as string[])
+      expect(rolloutFiles).toHaveLength(1)
+    })
+    expect(path.basename(rolloutFiles[0])).toBe(`rollout-${encodeURIComponent(threadId)}.jsonl`)
+    await expect(fsp.stat(path.join(server.tempDir, '.codex', 'escaped-traversal.jsonl')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('initializes the app-server and returns the negotiated server metadata', async () => {
     const server = await startFakeCodexAppServer()
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })

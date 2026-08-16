@@ -112,6 +112,258 @@ describe('querySessionDirectory', () => {
     expect(page.revision).toBe(1_500)
   })
 
+  it('quarantines hidden duplicate persisted identities before visibility and page boundaries', async () => {
+    const duplicateProjects = [
+      makeProject('/repo/visible', [
+        makeSession({
+          sessionId: 'duplicate-session',
+          projectPath: '/repo/visible',
+          lastActivityAt: 2_000,
+          title: 'Visible copy',
+        }),
+      ]),
+      makeProject('/repo/hidden', [
+        makeSession({
+          sessionId: 'duplicate-session',
+          projectPath: '/repo/hidden',
+          lastActivityAt: 1_000,
+          title: 'Hidden child copy',
+          isSubagent: true,
+        }),
+      ]),
+    ]
+
+    const page = await querySessionDirectory({
+      projects: duplicateProjects,
+      terminalMeta: [],
+      query: {
+        priority: 'visible',
+        includeSubagents: false,
+        limit: 1,
+        cursor: Buffer.from(JSON.stringify({
+          lastActivityAt: 3_000,
+          key: 'claude:after-this-cursor',
+        })).toString('base64url'),
+      },
+    })
+
+    expect(page.items).toEqual([])
+    expect(page).toMatchObject({
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
+    expect(page.partialReason).toBeUndefined()
+  })
+
+  it('quarantines every row for a collided identity without hiding healthy sessions', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/healthy', [
+          makeSession({
+            sessionId: 'healthy-session',
+            projectPath: '/repo/healthy',
+            lastActivityAt: 500,
+            title: 'Healthy session',
+          }),
+        ]),
+        makeProject('/repo/z-one', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'z-session',
+            projectPath: '/repo/z-one',
+            lastActivityAt: 400,
+          }),
+        ]),
+        makeProject('/repo/a-one', [
+          makeSession({
+            sessionId: 'a-session',
+            projectPath: '/repo/a-one',
+            lastActivityAt: 300,
+          }),
+        ]),
+        makeProject('/repo/z-two', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'z-session',
+            projectPath: '/repo/z-two',
+            lastActivityAt: 200,
+          }),
+        ]),
+        makeProject('/repo/a-two', [
+          makeSession({
+            sessionId: 'a-session',
+            projectPath: '/repo/a-two',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items.map((item) => `${item.provider}:${item.sessionId}`)).toEqual([
+      'claude:healthy-session',
+    ])
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount: 2,
+      duplicateItemCount: 4,
+    })
+  })
+
+  it('keeps a live-only terminal row when its persisted identity is quarantined', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/first-copy', [
+          makeSession({
+            sessionId: 'duplicate-running-session',
+            projectPath: '/repo/first-copy',
+            lastActivityAt: 200,
+            title: 'First conflicting copy',
+          }),
+        ]),
+        makeProject('/repo/second-copy', [
+          makeSession({
+            sessionId: 'duplicate-running-session',
+            projectPath: '/repo/second-copy',
+            lastActivityAt: 100,
+            title: 'Second conflicting copy',
+          }),
+        ]),
+      ],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-conflicted',
+          provider: 'claude',
+          sessionId: 'duplicate-running-session',
+          updatedAt: 300,
+          cwd: '/repo/live-terminal',
+        }),
+      ],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        provider: 'claude',
+        sessionId: 'duplicate-running-session',
+        title: 'Claude CLI',
+        projectPath: '/repo/live-terminal',
+        isRunning: true,
+        runningTerminalId: 'term-conflicted',
+      }),
+    ])
+    expect(page.items[0]?.liveTerminalOnly).not.toBe(true)
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount: 1,
+      duplicateItemCount: 2,
+    })
+  })
+
+  it('keeps a corrupt collision corpus bounded on the response path', async () => {
+    const collisionCount = 1_003
+    const sessions = Array.from({ length: collisionCount }, (_, index) => (
+      `collision-${String(collisionCount - index - 1).padStart(4, '0')}`
+    )).flatMap((sessionId) => [
+      makeSession({
+        sessionId,
+        projectPath: '/repo/corrupt',
+        lastActivityAt: 2,
+      }),
+      makeSession({
+        sessionId,
+        projectPath: '/repo/corrupt',
+        lastActivityAt: 1,
+      }),
+    ])
+
+    const page = await querySessionDirectory({
+      projects: [makeProject('/repo/corrupt', sessions)],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items).toEqual([])
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount,
+      duplicateItemCount: collisionCount * 2,
+    })
+    expect(JSON.stringify(page)).not.toContain('collision-0000')
+    expect(JSON.stringify(page).length).toBeLessThan(500)
+  })
+
+  it('allows the same raw session id across providers', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/claude', [
+          makeSession({
+            provider: 'claude',
+            sessionId: 'shared-id',
+            projectPath: '/repo/claude',
+            lastActivityAt: 200,
+          }),
+        ]),
+        makeProject('/repo/codex', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'shared-id',
+            projectPath: '/repo/codex',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items.map((item) => `${item.provider}:${item.sessionId}`)).toEqual([
+      'claude:shared-id',
+      'codex:shared-id',
+    ])
+  })
+
+  it('allows matching live terminal records for one persisted identity', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/live', [
+          makeSession({
+            sessionId: 'parsed-session',
+            projectPath: '/repo/live',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-one',
+          provider: 'claude',
+          sessionId: 'parsed-session',
+          updatedAt: 200,
+        }),
+        makeTerminalMeta({
+          terminalId: 'term-two',
+          provider: 'claude',
+          sessionId: 'parsed-session',
+          updatedAt: 300,
+        }),
+      ],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]).toMatchObject({
+      provider: 'claude',
+      sessionId: 'parsed-session',
+      isRunning: true,
+    })
+  })
+
   it('searches titles and snippets on the server and bounds snippet length', async () => {
     const page = await querySessionDirectory({
       projects,

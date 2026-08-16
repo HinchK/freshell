@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import http from 'node:http'
 import { EventEmitter } from 'node:events'
 import fsp from 'node:fs/promises'
@@ -40,6 +40,11 @@ const WAIT_HELPER_TIMEOUT_MS = 15_000
 const runtimes = new Set<CodexAppServerRuntime>()
 const blockers = new Set<http.Server>()
 const tempDirs = new Set<string>()
+let fixtureCodexHome: string
+
+beforeEach(async () => {
+  fixtureCodexHome = path.join(await makeTempDir(), 'codex-home')
+})
 
 async function closeBlocker(server: http.Server): Promise<void> {
   blockers.delete(server)
@@ -217,6 +222,11 @@ function createRuntime(options: ConstructorParameters<typeof CodexAppServerRunti
     command: process.execPath,
     commandArgs: [FAKE_SERVER_PATH],
     ...options,
+    env: {
+      CODEX_HOME: fixtureCodexHome,
+      FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+      ...options.env,
+    },
   })
   runtimes.add(runtime)
   return runtime

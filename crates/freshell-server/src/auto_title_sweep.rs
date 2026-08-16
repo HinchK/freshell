@@ -1233,7 +1233,11 @@ mod tests {
             vec![std::sync::Arc::new(
                 freshell_sessions::directory_index::OpencodeSource::new(data_home),
             )];
-        let index = freshell_sessions::directory_index::SessionIndex::new(sources);
+        let index = freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
+            sources,
+            std::time::Duration::from_millis(1_000),
+            None,
+        );
         let items = index.snapshot().await;
         assert_eq!(items.len(), 1);
         assert_eq!(

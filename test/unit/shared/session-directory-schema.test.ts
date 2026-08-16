@@ -73,6 +73,25 @@ describe('SessionDirectoryPageSchema partial fields', () => {
     expect(result.partialReason).toBe('io_error')
   })
 
+  it('carries identity conflicts in the additive integrity object, not a new partialReason enum value', () => {
+    const result = SessionDirectoryPageSchema.parse({
+      ...basePage,
+      partial: true,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
+    expect(result.partial).toBe(true)
+    expect(result.partialReason).toBeUndefined()
+    expect(result.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount: 1,
+      duplicateItemCount: 2,
+    })
+  })
+
   it('omits partial fields when not present', () => {
     const result = SessionDirectoryPageSchema.parse(basePage)
     expect(result.partial).toBeUndefined()

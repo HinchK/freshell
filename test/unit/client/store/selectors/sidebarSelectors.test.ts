@@ -181,6 +181,35 @@ describe('sidebarSelectors', () => {
       expect(items[1].sessionType).toBe('freshclaude')
     })
 
+    it('returns one stable row when malformed state repeats a composite session identity', () => {
+      const projects = [
+        makeProject([{
+          sessionId: 'shared',
+          provider: undefined,
+          title: 'First',
+          isSubagent: true,
+        }], '/first', '#111111'),
+        makeProject([{
+          sessionId: 'shared',
+          provider: 'claude',
+          title: 'Second',
+          isSubagent: false,
+        }], '/second', '#222222'),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0]).toEqual(expect.objectContaining({
+        provider: 'claude',
+        sessionId: 'shared',
+        title: 'First',
+        projectPath: '/first',
+        projectColor: '#111111',
+        isSubagent: true,
+      }))
+    })
+
     it('keeps hasTab correct for layout-backed and no-layout fallback sessions', () => {
       const validClaudeSessionId = '550e8400-e29b-41d4-a716-446655440000'
       const invalidClaudeSessionId = 'not-a-uuid'

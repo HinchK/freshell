@@ -62,6 +62,9 @@ function applyAppDataIsolation(
     HOME: homeDir,
     CLAUDE_HOME: pathImpl.join(homeDir, '.claude'),
     CODEX_HOME: pathImpl.join(homeDir, '.codex'),
+    // The committed fake Codex app-server refuses durable fixture writes unless its
+    // caller proves the whole provider store is test-owned. This helper owns homeDir.
+    FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
     XDG_DATA_HOME: pathImpl.join(homeDir, '.local', 'share'),
     LOCALAPPDATA: pathImpl.join(homeDir, 'AppData', 'Local'),
   }
