@@ -12,6 +12,26 @@ const fixturesDir = path.join(process.cwd(), 'test', 'fixtures', 'coding-cli', '
 const interactiveMetadataPath = path.join(fixturesDir, 'interactive.metadata.json')
 const subagentMetadataPath = path.join(fixturesDir, 'subagent.metadata.json')
 
+async function withAmplifierHome<T>(home: string, run: (provider: typeof amplifierProvider) => Promise<T>): Promise<T> {
+  const previousHome = process.env.AMPLIFIER_HOME
+
+  try {
+    process.env.AMPLIFIER_HOME = home
+    vi.resetModules()
+    const { amplifierProvider: freshProvider } = await import(
+      '../../../../server/coding-cli/providers/amplifier'
+    )
+    return await run(freshProvider)
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.AMPLIFIER_HOME
+    } else {
+      process.env.AMPLIFIER_HOME = previousHome
+    }
+    vi.resetModules()
+  }
+}
+
 describe('amplifier-provider', () => {
   describe('defaultAmplifierHome()', () => {
     const originalEnv = process.env.AMPLIFIER_HOME
@@ -130,10 +150,10 @@ describe('amplifier-provider', () => {
     ])
   })
 
-  it('getSessionGlob targets metadata.json under projects/**/sessions', () => {
+  it('getSessionGlob targets only canonical project session metadata', () => {
     const glob = amplifierProvider.getSessionGlob() as string
     const normalized = glob.split(path.sep).join('/')
-    expect(normalized.endsWith('projects/**/sessions/**/metadata.json')).toBe(true)
+    expect(normalized.endsWith('projects/*/sessions/*/metadata.json')).toBe(true)
   })
 
   it('getSessionRoots targets projects/ and the watch base is the amplifier home', () => {
@@ -252,17 +272,6 @@ describe('amplifier-provider', () => {
   })
 
   describe('listSessionFiles()', () => {
-    const originalEnv = process.env.AMPLIFIER_HOME
-
-    afterEach(() => {
-      if (originalEnv === undefined) {
-        delete process.env.AMPLIFIER_HOME
-      } else {
-        process.env.AMPLIFIER_HOME = originalEnv
-      }
-      vi.resetModules()
-    })
-
     it('skips metadata-less orphan dirs (kill -9 before first prompt:complete)', async () => {
       // Pins the INDEXER POLICY documented in providers/amplifier.ts (plan §7,
       // Phase 0 finding E6): a session dir containing only events.jsonl -- created
@@ -312,14 +321,43 @@ describe('amplifier-provider', () => {
 
         // homeDir is captured at module load, so point AMPLIFIER_HOME at the temp
         // home and re-import a fresh provider instance.
-        process.env.AMPLIFIER_HOME = home
-        vi.resetModules()
-        const { amplifierProvider: freshProvider } = await import(
-          '../../../../server/coding-cli/providers/amplifier'
+        await withAmplifierHome(home, async (freshProvider) => {
+          const files = await freshProvider.listSessionFiles()
+          expect(files).toEqual([path.join(normalDir, 'metadata.json')])
+        })
+      } finally {
+        await fsp.rm(home, { recursive: true, force: true })
+      }
+    })
+
+    it('discovers only canonical metadata and ignores nested context-intelligence copies', async () => {
+      const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-home-'))
+      try {
+        const sessionsDir = path.join(home, 'projects', '-home-dan-code-freshell', 'sessions')
+        const sessionZDir = path.join(sessionsDir, 'session-z')
+        const sessionADir = path.join(sessionsDir, 'session-a')
+        const canonicalA = path.join(sessionADir, 'metadata.json')
+        const canonicalZ = path.join(sessionZDir, 'metadata.json')
+        const nestedCopy = path.join(sessionADir, 'context-intelligence', 'metadata.json')
+
+        await fsp.mkdir(path.dirname(nestedCopy), { recursive: true })
+        await fsp.mkdir(sessionZDir, { recursive: true })
+        await fsp.writeFile(
+          canonicalA,
+          JSON.stringify({ session_id: 'shared-id', working_dir: '/home/dan/code/freshell' }),
+        )
+        await fsp.writeFile(
+          nestedCopy,
+          JSON.stringify({ session_id: 'shared-id', working_dir: '/home/dan/code/freshell' }),
+        )
+        await fsp.writeFile(
+          canonicalZ,
+          JSON.stringify({ session_id: 'session-z', working_dir: '/home/dan/code/freshell' }),
         )
 
-        const files = await freshProvider.listSessionFiles()
-        expect(files).toEqual([path.join(normalDir, 'metadata.json')])
+        await withAmplifierHome(home, async (freshProvider) => {
+          expect(await freshProvider.listSessionFiles()).toEqual([canonicalA, canonicalZ])
+        })
       } finally {
         await fsp.rm(home, { recursive: true, force: true })
       }

@@ -989,7 +989,7 @@ export class CodingCliSessionIndexer {
     }
 
     const projectPath = await provider.resolveProjectPath(filePath, meta)
-    const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
+    const sessionId = provider.extractSessionId(filePath, meta)
     const previous = cached?.lightweight ? undefined : cached?.baseSession
     const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
     const metaKey = makeSessionKey(provider.name, sessionId)
@@ -1297,7 +1297,7 @@ export class CodingCliSessionIndexer {
       const existing = this.fileCache.get(cacheKey)
       if (existing && existing.baseSession) continue
 
-      const sessionId = meta.sessionId || provider.extractSessionId(meta.filePath)
+      const sessionId = provider.extractSessionId(meta.filePath, meta)
       const metaKey = makeSessionKey(provider.name, sessionId)
       const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
       const resolvedTitle = resolveSessionTitle(meta.title, existing?.baseSession?.title, storedTitle)

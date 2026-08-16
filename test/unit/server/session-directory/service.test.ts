@@ -5,7 +5,10 @@ import path from 'path'
 import os from 'os'
 import type { ProjectGroup, CodingCliSession } from '../../../../server/coding-cli/types.js'
 import type { TerminalMeta } from '../../../../server/terminal-metadata-service.js'
-import { querySessionDirectory } from '../../../../server/session-directory/service.js'
+import {
+  querySessionDirectory,
+  SessionDirectoryIdentityCollisionError,
+} from '../../../../server/session-directory/service.js'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude.js'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex.js'
 
@@ -110,6 +113,198 @@ describe('querySessionDirectory', () => {
       runningTerminalId: 'term-1',
     })
     expect(page.revision).toBe(1_500)
+  })
+
+  it('rejects hidden duplicate persisted identities before visibility and page boundaries', async () => {
+    const duplicateProjects = [
+      makeProject('/repo/visible', [
+        makeSession({
+          sessionId: 'duplicate-session',
+          projectPath: '/repo/visible',
+          lastActivityAt: 2_000,
+          title: 'Visible copy',
+        }),
+      ]),
+      makeProject('/repo/hidden', [
+        makeSession({
+          sessionId: 'duplicate-session',
+          projectPath: '/repo/hidden',
+          lastActivityAt: 1_000,
+          title: 'Hidden child copy',
+          isSubagent: true,
+        }),
+      ]),
+    ]
+
+    await expect(querySessionDirectory({
+      projects: duplicateProjects,
+      terminalMeta: [],
+      query: {
+        priority: 'visible',
+        includeSubagents: false,
+        limit: 1,
+        cursor: Buffer.from(JSON.stringify({
+          lastActivityAt: 3_000,
+          key: 'claude:after-this-cursor',
+        })).toString('base64url'),
+      },
+    })).rejects.toThrow('Session directory identity collision')
+  })
+
+  it('reports a small collided identity set in deterministic key order', async () => {
+    await expect(querySessionDirectory({
+      projects: [
+        makeProject('/repo/z-one', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'z-session',
+            projectPath: '/repo/z-one',
+            lastActivityAt: 400,
+          }),
+        ]),
+        makeProject('/repo/a-one', [
+          makeSession({
+            sessionId: 'a-session',
+            projectPath: '/repo/a-one',
+            lastActivityAt: 300,
+          }),
+        ]),
+        makeProject('/repo/z-two', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'z-session',
+            projectPath: '/repo/z-two',
+            lastActivityAt: 200,
+          }),
+        ]),
+        makeProject('/repo/a-two', [
+          makeSession({
+            sessionId: 'a-session',
+            projectPath: '/repo/a-two',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    })).rejects.toMatchObject({
+      name: 'SessionDirectoryIdentityCollisionError',
+      message: 'Session directory identity collision',
+      collisionCount: 2,
+      duplicateItemCount: 4,
+      collisionKeySamples: ['claude:a-session', 'codex:z-session'],
+      collisionKeySamplesTruncated: false,
+    })
+  })
+
+  it('keeps identity-collision errors deterministic and bounded for a corrupt corpus', async () => {
+    const collisionCount = 1_003
+    const sessions = Array.from({ length: collisionCount }, (_, index) => (
+      `collision-${String(collisionCount - index - 1).padStart(4, '0')}`
+    )).flatMap((sessionId) => [
+      makeSession({
+        sessionId,
+        projectPath: '/repo/corrupt',
+        lastActivityAt: 2,
+      }),
+      makeSession({
+        sessionId,
+        projectPath: '/repo/corrupt',
+        lastActivityAt: 1,
+      }),
+    ])
+
+    const error = await querySessionDirectory({
+      projects: [makeProject('/repo/corrupt', sessions)],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    }).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+
+    expect(error).toBeInstanceOf(SessionDirectoryIdentityCollisionError)
+    if (!(error instanceof SessionDirectoryIdentityCollisionError)) {
+      throw new Error('Expected an identity-collision error')
+    }
+
+    expect(error.message).toBe('Session directory identity collision')
+    expect(error.message.length).toBeLessThan(100)
+    expect(error.collisionCount).toBe(collisionCount)
+    expect(error.duplicateItemCount).toBe(collisionCount * 2)
+    expect(error.collisionKeySamples).toEqual(
+      Array.from({ length: 20 }, (_, index) => (
+        `claude:collision-${String(index).padStart(4, '0')}`
+      )),
+    )
+    expect(error.collisionKeySamplesTruncated).toBe(true)
+    expect(error).not.toHaveProperty('collisionKeys')
+  })
+
+  it('allows the same raw session id across providers', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/claude', [
+          makeSession({
+            provider: 'claude',
+            sessionId: 'shared-id',
+            projectPath: '/repo/claude',
+            lastActivityAt: 200,
+          }),
+        ]),
+        makeProject('/repo/codex', [
+          makeSession({
+            provider: 'codex',
+            sessionId: 'shared-id',
+            projectPath: '/repo/codex',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items.map((item) => `${item.provider}:${item.sessionId}`)).toEqual([
+      'claude:shared-id',
+      'codex:shared-id',
+    ])
+  })
+
+  it('allows matching live terminal records for one persisted identity', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/live', [
+          makeSession({
+            sessionId: 'parsed-session',
+            projectPath: '/repo/live',
+            lastActivityAt: 100,
+          }),
+        ]),
+      ],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-one',
+          provider: 'claude',
+          sessionId: 'parsed-session',
+          updatedAt: 200,
+        }),
+        makeTerminalMeta({
+          terminalId: 'term-two',
+          provider: 'claude',
+          sessionId: 'parsed-session',
+          updatedAt: 300,
+        }),
+      ],
+      query: { priority: 'visible' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]).toMatchObject({
+      provider: 'claude',
+      sessionId: 'parsed-session',
+      isRunning: true,
+    })
   })
 
   it('searches titles and snippets on the server and bounds snippet length', async () => {

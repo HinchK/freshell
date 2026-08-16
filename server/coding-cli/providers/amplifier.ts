@@ -139,34 +139,13 @@ async function readFirstUserMessageFromTranscript(transcriptPath: string): Promi
   }
 }
 
-async function walkMetadataFiles(dir: string): Promise<string[]> {
-  let entries
-  try {
-    entries = await fsp.readdir(dir, { withFileTypes: true })
-  } catch {
-    return []
-  }
-
-  const files: string[] = []
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name)
-    if (entry.isDirectory()) {
-      files.push(...(await walkMetadataFiles(full)))
-    } else if (entry.isFile() && entry.name === 'metadata.json') {
-      // Only canonical metadata.json (never metadata.json.backup).
-      files.push(full)
-    }
-  }
-  return files
-}
-
 export const amplifierProvider: CodingCliProvider = {
   name: 'amplifier',
   displayName: 'Amplifier',
   homeDir: defaultAmplifierHome(),
 
   getSessionGlob() {
-    return path.join(this.homeDir, 'projects', '**', 'sessions', '**', 'metadata.json')
+    return path.join(this.homeDir, 'projects', '*', 'sessions', '*', 'metadata.json')
   },
 
   getSessionRoots() {
@@ -221,20 +200,47 @@ export const amplifierProvider: CodingCliProvider = {
     // Root-level guard: ABSENCE of the root is a legitimate empty result; any
     // OTHER root error (EACCES/EIO/EMFILE, ...) must REJECT so the indexer
     // records a scan failure — a provider outage must never read as "no
-    // sessions". ACCEPTED LIMITATION: deeper per-subdirectory errors inside
-    // walkMetadataFiles remain best-effort skips (partial results beat none).
+    // sessions". ACCEPTED LIMITATION: deeper per-project/session errors remain
+    // best-effort skips (partial results beat none).
+    let projectEntries
     try {
-      await fsp.readdir(projectsDir)
+      projectEntries = await fsp.readdir(projectsDir, { withFileTypes: true })
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | null)?.code
       if (code === 'ENOENT' || code === 'ENOTDIR') return []
       throw err
     }
-    const files = await walkMetadataFiles(projectsDir)
-    // Restrict to files under a `sessions` directory (projects/<slug>/sessions/<id>/metadata.json).
-    return files.filter((file) =>
-      path.relative(projectsDir, file).split(path.sep).includes('sessions'),
-    )
+
+    // Canonical persisted identities have exactly this shape. Session directories
+    // also contain derived files such as context-intelligence/metadata.json;
+    // recursively accepting those files duplicates the same session identity.
+    const files: string[] = []
+    for (const projectEntry of projectEntries) {
+      if (!projectEntry.isDirectory()) continue
+      const sessionsDir = path.join(projectsDir, projectEntry.name, 'sessions')
+      let sessionEntries
+      try {
+        sessionEntries = await fsp.readdir(sessionsDir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+
+      for (const sessionEntry of sessionEntries) {
+        if (!sessionEntry.isDirectory()) continue
+        const sessionDir = path.join(sessionsDir, sessionEntry.name)
+        let entries
+        try {
+          entries = await fsp.readdir(sessionDir, { withFileTypes: true })
+        } catch {
+          continue
+        }
+        if (entries.some((entry) => entry.isFile() && entry.name === 'metadata.json')) {
+          files.push(path.join(sessionDir, 'metadata.json'))
+        }
+      }
+    }
+
+    return files.sort((a, b) => a.localeCompare(b))
   },
 
   async parseSessionFile(content: string, filePath: string): Promise<ParsedSessionMeta> {

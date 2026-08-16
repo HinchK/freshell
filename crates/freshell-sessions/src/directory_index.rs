@@ -403,13 +403,20 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<IndexedSession
     // R10b: never index a session with no resolvable `cwd` (the ORIGINAL's
     // discovery-time gate, `session-indexer.ts:756,1124`).
     meta.cwd.as_ref()?;
-    Some(item_from_meta(
+    let mut item = item_from_meta(
         &meta,
         "claude",
         &fallback,
         force_subagent,
         Some(path.to_path_buf()),
-    ))
+    );
+    // Claude's provider identity is the transcript filename. In particular,
+    // real subagent records embed their PARENT's `sessionId`; trusting that
+    // field collapses every child onto the parent key. The basename is the
+    // stable identity used by Claude's on-disk layout for both parents and
+    // `subagents/agent-*.jsonl` children.
+    item.session_id = fallback;
+    Some(item)
 }
 
 fn item_from_meta(
@@ -841,8 +848,9 @@ struct CachedSnapshot {
 /// (module doc comment's "Persistent parse cache" section).
 #[derive(Default)]
 struct PersistState {
-    /// Files parsed (changed/new) or direct-listed sources re-queried since
-    /// the last successful save -- reset to 0 whenever a save happens.
+    /// Files parsed (changed/new), confirmed stale file-cache entries pruned,
+    /// or direct-listed sources re-queried since the last successful save --
+    /// reset to 0 whenever a save happens.
     changed_since_save: u64,
     last_saved_at: Option<Instant>,
     /// Sticky "have we EVER saved" flag: the initial `warm()` build always
@@ -1210,7 +1218,7 @@ impl SessionIndex {
 /// full rule) -- takes its inputs by reference instead of `&self` so a
 /// detached background-refresh task (which owns `Arc`s, not a
 /// `&SessionIndex`) can call it directly. Rule: a save is warranted iff at
-/// least one file changed since the last save AND (this is the very
+/// least one cache entry changed since the last save AND (this is the very
 /// first-ever sweep, OR the cumulative changed-since-save count has reached
 /// `SAVE_CHANGED_THRESHOLD`, OR the debounce window has elapsed since the
 /// last save). On a "yes", resets the changed-since-save counter and
@@ -1295,12 +1303,11 @@ fn refresh_snapshot(
     scan_failures: &mut HashSet<String>,
 ) -> (Vec<IndexedSession>, usize) {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    // Count of files re-parsed + direct-listed sources re-queried this
+    // Count of file-cache mutations + direct-listed sources re-queried this
     // sweep -- the persistent-parse-cache save gate's "how much changed"
     // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
-    // files/tokens don't count; only actual expensive work does.
+    // files/tokens don't count.
     let mut changed = 0usize;
-
     for (idx, source) in sources.iter().enumerate() {
         if let Some(token) = source.direct_change_token() {
             let unchanged = direct_cache.get(&idx).is_some_and(|e| e.token == token);
@@ -1405,8 +1412,14 @@ fn refresh_snapshot(
         }
     }
 
-    // Prune entries for files no longer discovered (deleted since the last sweep).
+    // Prune entries for files no longer discovered (deleted since the last
+    // sweep, no longer canonical, or absent from this sweep after a provider
+    // error). The in-memory cache mutation must contribute to persistence
+    // accounting just like an insertion/reparse; otherwise a cleaned cache
+    // can remain stale on disk indefinitely.
+    let cache_len_before_prune = cache.len();
     cache.retain(|path, _| discovered.contains(path));
+    changed = changed.saturating_add(cache_len_before_prune - cache.len());
 
     let mut items: Vec<IndexedSession> = cache
         .values()
@@ -1535,7 +1548,19 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
     parsed
         .entries
         .into_iter()
-        .map(|(k, v)| (PathBuf::from(k), v))
+        .filter_map(|(key, entry)| {
+            let path = PathBuf::from(key);
+            let has_legacy_claude_identity = entry.item.as_ref().is_some_and(|item| {
+                item.provider == "claude"
+                    && path.file_stem().and_then(|stem| stem.to_str())
+                        != Some(item.session_id.as_str())
+            });
+            // Targeted semantic invalidation for the filename-identity fix:
+            // discard only legacy Claude rows that cached an embedded
+            // (usually parent) sessionId. Matching Claude entries, exclusions
+            // (`item: None`), and every other provider remain warm.
+            (!has_legacy_claude_identity).then_some((path, entry))
+        })
         .collect()
 }
 
@@ -1612,6 +1637,19 @@ mod tests {
 
     fn fixtures_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/sessions")
+    }
+
+    /// Construct an index for tests that do not exercise disk persistence.
+    ///
+    /// Production constructors intentionally resolve a default cache under
+    /// `FRESHELL_HOME`/`HOME`; unit tests must opt out explicitly so synthetic
+    /// sweeps can never load, prune, or overwrite a developer's real cache.
+    fn test_index(sources: Vec<Arc<dyn SessionSource>>) -> SessionIndex {
+        test_index_with_ttl(sources, DEFAULT_TTL)
+    }
+
+    fn test_index_with_ttl(sources: Vec<Arc<dyn SessionSource>>, ttl: Duration) -> SessionIndex {
+        SessionIndex::with_ttl_and_cache_path(sources, ttl, None)
     }
 
     /// A `<home>/.claude/projects/<project>/<name>.jsonl` layout seeded with the
@@ -1726,10 +1764,10 @@ mod tests {
 
     /// Write one minimal, valid claude session file directly (not via a
     /// committed fixture) so the incremental-cache tests can control
-    /// `cwd`/`session_id`/content precisely and touch/modify individual
-    /// files independently of their siblings. `session_id` must look like a
-    /// canonical UUID (`is_canonical_claude_session_id`) to be picked up as
-    /// the session's own id rather than falling back to the filename.
+    /// `cwd`/embedded metadata/content precisely and touch/modify individual
+    /// files independently of their siblings. The provider identity is always
+    /// `filename` without `.jsonl`; `session_id` controls the transcript's
+    /// embedded Claude metadata only.
     fn write_session_file(
         project: &Path,
         filename: &str,
@@ -1784,7 +1822,7 @@ mod tests {
                 mk("m", "claude", 200),
             ],
         };
-        let index = SessionIndex::new(vec![Arc::new(source)]);
+        let index = test_index(vec![Arc::new(source)]);
         let snap = index.snapshot().await;
         let ids: Vec<&str> = snap.iter().map(|s| s.session_id.as_str()).collect();
         // 300s first (key DESC: "claude:z" > "claude:b"), then 200, then 100.
@@ -1800,7 +1838,7 @@ mod tests {
             calls: Arc::clone(&calls),
             items: vec![mk("a", "claude", 1)],
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_secs(60));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(60));
         let _ = index.snapshot().await;
         let _ = index.snapshot().await;
         let _ = index.snapshot().await;
@@ -1824,7 +1862,7 @@ mod tests {
             calls: Arc::clone(&calls),
             items: vec![mk("a", "claude", 1)],
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(20));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(20));
         let _ = index.snapshot().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1845,7 +1883,7 @@ mod tests {
             calls: Arc::clone(&calls),
             items: vec![mk("a", "claude", 1)],
         };
-        let index = Arc::new(SessionIndex::with_ttl(
+        let index = Arc::new(test_index_with_ttl(
             vec![Arc::new(source)],
             Duration::from_secs(60),
         ));
@@ -1873,7 +1911,7 @@ mod tests {
             calls: Arc::clone(&calls),
             items: vec![mk("a", "claude", 1)],
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_secs(60));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(60));
         index.warm().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "warm() performs one scan");
         let _ = index.snapshot().await;
@@ -1923,7 +1961,7 @@ mod tests {
             parse_calls: Arc::clone(&parse_calls),
             ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 3);
@@ -1990,7 +2028,7 @@ mod tests {
             parse_calls: Arc::clone(&parse_calls),
             ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 3);
@@ -2033,7 +2071,7 @@ mod tests {
             parse_calls: Arc::clone(&parse_calls),
             ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         // Only the included file is in the snapshot -- the cwd-less file is excluded.
@@ -2081,7 +2119,7 @@ mod tests {
         );
 
         let source = ClaudeSource::new(claude_home.clone());
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 2);
@@ -2101,7 +2139,7 @@ mod tests {
             snap2 = index.snapshot().await;
         }
         assert_eq!(snap2.len(), 1, "the deleted file's session must be gone");
-        assert_eq!(snap2[0].session_id, synthetic_session_id(1));
+        assert_eq!(snap2[0].session_id, "keep");
 
         std::fs::remove_dir_all(&claude_home).ok();
     }
@@ -2127,7 +2165,7 @@ mod tests {
             parse_calls: Arc::clone(&parse_calls),
             ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -2200,7 +2238,7 @@ mod tests {
         };
         // Short TTL so a `sleep` past it forces a real refresh sweep, exactly
         // like a user browsing more than 1s (the production TTL) apart.
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         // Cold sweep: untimed (warms the OS page/dentry cache AND populates
         // this index's own FileEntry cache for every file).
@@ -2295,7 +2333,7 @@ mod tests {
             items: vec![mk("a", "claude", 1)],
             discover_calls: Arc::clone(&discover_calls),
         };
-        let index = Arc::new(SessionIndex::with_ttl(
+        let index = Arc::new(test_index_with_ttl(
             vec![Arc::new(source)],
             Duration::from_millis(10),
         ));
@@ -2444,7 +2482,7 @@ mod tests {
             parse_calls: Arc::clone(&parse_calls),
             ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let warm_up = index.snapshot().await;
         assert_eq!(warm_up.len(), N, "sanity: every synthetic file indexed");
@@ -2507,7 +2545,7 @@ mod tests {
             "hello b",
         );
 
-        let index = SessionIndex::with_ttl(
+        let index = test_index_with_ttl(
             vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
             Duration::from_millis(10),
         );
@@ -2573,8 +2611,51 @@ mod tests {
         // `healthy.jsonl` has no `cwd` anywhere -> excluded at discovery (R10b),
         // same rule `list_claude_sessions` enforces.
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
+        assert_eq!(items[0].session_id, "0-real-corrupted");
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn claude_subagent_identity_comes_from_its_filename_not_parent_session_id() {
+        let claude_home = unique_temp_dir("claude-subagent-identity");
+        let parent_id = synthetic_session_id(1);
+        let project = claude_home.join("projects").join("-p");
+        let parent_dir = project.join(&parent_id);
+        let subagents = parent_dir.join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        write_session_file(
+            &project,
+            &format!("{parent_id}.jsonl"),
+            &parent_id,
+            "/p",
+            "2025-01-30T10:00:00.000Z",
+            "parent turn",
+        );
+        std::fs::write(
+            subagents.join("agent-child.jsonl"),
+            format!(
+                "{{\"parentUuid\":\"{parent_id}\",\"isSidechain\":true,\"userType\":\"external\",\"cwd\":\"/p\",\"sessionId\":\"{parent_id}\",\"version\":\"1.0.0\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"delegated turn\"}},\"uuid\":\"{}\",\"timestamp\":\"2025-01-30T10:00:01.000Z\"}}\n",
+                synthetic_session_id(2)
+            ),
+        )
+        .unwrap();
+
+        let items = ClaudeSource::new(claude_home.clone()).scan();
+        assert_eq!(items.len(), 2);
+        let child = items
+            .iter()
+            .find(|item| item.session_id == "agent-child")
+            .expect("the child transcript filename is its provider identity");
+        assert!(child.is_subagent);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.session_id == parent_id)
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
     }
 
     // Task 4 additive requirement (a): claude fixture with type:'summary' record
@@ -2585,7 +2666,7 @@ mod tests {
         let sessions = ClaudeSource::new(claude_home.clone()).scan();
         let s = sessions
             .iter()
-            .find(|s| s.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d")
+            .find(|s| s.session_id == "0-real-corrupted")
             .expect("fixture session must be found");
         // Fixture has first user message.
         assert!(s
@@ -2884,7 +2965,7 @@ mod tests {
         );
         let source = CountingWrapper::new(OpencodeSource::new(data_home.clone()));
         let direct_list_calls = Arc::clone(&source.direct_list_calls);
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -2927,7 +3008,7 @@ mod tests {
         );
         let db = data_home.join("opencode.db");
         let source = OpencodeSource::new(data_home.clone());
-        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 1, "sanity: the good db is listed successfully");
@@ -2976,7 +3057,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             items: vec![mk("z", "opencode", 300)],
         };
-        let index = SessionIndex::new(vec![Arc::new(claude), Arc::new(codex), Arc::new(opencode)]);
+        let index = test_index(vec![Arc::new(claude), Arc::new(codex), Arc::new(opencode)]);
         let snap = index.snapshot().await;
         let keys: Vec<String> = snap.iter().map(|s| s.key()).collect();
         // All three "z" sessions tie on lastActivityAt=300 -> key() DESC:
@@ -3150,6 +3231,101 @@ mod tests {
         std::fs::remove_dir_all(&cache_dir).ok();
     }
 
+    #[tokio::test]
+    async fn persisted_cache_reparses_only_claude_entries_with_legacy_embedded_identity() {
+        let claude_home = unique_temp_dir("persist-claude-identity");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let matching_id = synthetic_session_id(1);
+        let legacy_embedded_id = synthetic_session_id(2);
+        write_session_file(
+            &project,
+            &format!("{matching_id}.jsonl"),
+            &matching_id,
+            "/p/matching",
+            "2025-01-30T10:00:00.000Z",
+            "matching",
+        );
+        write_session_file(
+            &project,
+            "agent-child.jsonl",
+            &legacy_embedded_id,
+            "/p/child",
+            "2025-01-30T10:00:01.000Z",
+            "child",
+        );
+
+        let matching_path = project.join(format!("{matching_id}.jsonl"));
+        let child_path = project.join("agent-child.jsonl");
+        let source = ClaudeSource::new(claude_home.clone());
+        let matching_stat = stat_file(&matching_path).expect("matching transcript stat");
+        let child_stat = stat_file(&child_path).expect("child transcript stat");
+        let mut legacy_child = source.parse(&child_path).expect("child transcript parses");
+        // Model a cache written by the pre-fix parser: the subagent row
+        // carried its parent's embedded sessionId instead of its own
+        // filename identity. The matching sibling remains canonical.
+        legacy_child.session_id = legacy_embedded_id;
+        let stale_cache = HashMap::from([
+            (
+                matching_path.clone(),
+                FileEntry {
+                    mtime_ms: matching_stat.mtime_ms,
+                    size: matching_stat.size,
+                    item: source.parse(&matching_path),
+                },
+            ),
+            (
+                child_path.clone(),
+                FileEntry {
+                    mtime_ms: child_stat.mtime_ms,
+                    size: child_stat.size,
+                    item: Some(legacy_child),
+                },
+            ),
+        ]);
+
+        let cache_dir = unique_temp_dir("persist-claude-identity-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        save_cache_file(&cache_path, &stale_cache).unwrap();
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source2 = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source2)],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snapshot = index2.snapshot().await;
+
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            1,
+            "only the identity-mismatched Claude cache entry must be reparsed"
+        );
+        assert!(snapshot.iter().any(|item| item.session_id == matching_id));
+        assert!(snapshot.iter().any(|item| item.session_id == "agent-child"));
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let persisted = load_cache_file(&cache_path);
+                persisted.len() == 2
+                    && persisted.get(&child_path).is_some_and(|entry| {
+                        entry.item.as_ref().is_some_and(|item| {
+                            item.provider == "claude" && item.session_id == "agent-child"
+                        })
+                    })
+            })
+            .await,
+            "the corrected Claude identity must finish persisting before test cleanup"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
     /// C1. A missing cache file loads as an empty cache -- no panic.
     #[test]
     fn load_cache_file_missing_path_returns_empty_cache() {
@@ -3277,9 +3453,88 @@ mod tests {
             1,
             "the deleted file's session must be gone after reload"
         );
-        assert_eq!(snap2[0].session_id, synthetic_session_id(1));
+        assert_eq!(snap2[0].session_id, "keep");
 
         std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// A cache written by the pre-canonical Amplifier traversal can contain a
+    /// derived `context-intelligence/metadata.json` row beside the canonical
+    /// session metadata. The first healthy sweep must not only prune that row
+    /// from memory; it must persist the cleaned cache so every later restart
+    /// does not repeatedly load and discard the same legacy entry.
+    #[tokio::test]
+    async fn persisted_cache_prunes_and_saves_legacy_nested_amplifier_entry() {
+        let amplifier_home = unique_temp_dir("persist-amplifier-nested");
+        let session_dir = amplifier_home
+            .join("projects")
+            .join("-p")
+            .join("sessions")
+            .join("amp-session");
+        let canonical_path = session_dir.join("metadata.json");
+        let nested_path = session_dir
+            .join("context-intelligence")
+            .join("metadata.json");
+        std::fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
+        let metadata = r#"{"session_id":"amp-session","working_dir":"/p","created":1000}"#;
+        std::fs::write(&canonical_path, metadata).unwrap();
+        std::fs::write(&nested_path, metadata).unwrap();
+
+        let source = crate::amplifier::AmplifierSource::new(amplifier_home.clone());
+        let canonical_stat = source
+            .discover()
+            .into_iter()
+            .find(|stat| stat.path == canonical_path)
+            .expect("canonical Amplifier metadata is discovered");
+        let nested_stat = stat_file(&nested_path).expect("nested metadata is stat-able");
+        let stale_cache = HashMap::from([
+            (
+                canonical_path.clone(),
+                FileEntry {
+                    mtime_ms: canonical_stat.mtime_ms,
+                    size: canonical_stat.size,
+                    item: source.parse(&canonical_path),
+                },
+            ),
+            (
+                nested_path.clone(),
+                FileEntry {
+                    mtime_ms: nested_stat.mtime_ms,
+                    size: nested_stat.size,
+                    item: source.parse(&nested_path),
+                },
+            ),
+        ]);
+
+        let cache_dir = unique_temp_dir("persist-amplifier-nested-cache");
+        let cache_path = cache_path_in(&cache_dir);
+        save_cache_file(&cache_path, &stale_cache).unwrap();
+        assert_eq!(
+            load_cache_file(&cache_path).len(),
+            2,
+            "sanity: legacy cache seeded"
+        );
+
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source)],
+            Duration::from_secs(60),
+            Some(cache_path.clone()),
+        );
+        let snapshot = index.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].session_id, "amp-session");
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let persisted = load_cache_file(&cache_path);
+                persisted.len() == 1 && persisted.contains_key(&canonical_path)
+            })
+            .await,
+            "the healthy sweep must persist removal of the stale nested Amplifier row"
+        );
+
+        std::fs::remove_dir_all(&amplifier_home).ok();
         std::fs::remove_dir_all(&cache_dir).ok();
     }
 

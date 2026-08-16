@@ -20,7 +20,11 @@ import {
   KnownSessionMetadataTypeSchema,
   SessionTypeMetadataSourceSchema,
 } from '../shared/session-flavor.js'
-import { querySessionDirectory } from './session-directory/service.js'
+import {
+  querySessionDirectory,
+  SessionDirectoryCursorError,
+  SessionDirectoryIdentityCollisionError,
+} from './session-directory/service.js'
 import {
   ResumeResolveRequestSchema,
   type ResumeResolveProviderError,
@@ -131,8 +135,18 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       if (signal.aborted || isReadModelAbortError(error)) {
         return
       }
+      if (error instanceof SessionDirectoryIdentityCollisionError) {
+        log.error({
+          err: error,
+          collisionCount: error.collisionCount,
+          duplicateItemCount: error.duplicateItemCount,
+          collisionKeySamples: error.collisionKeySamples,
+          collisionKeySamplesTruncated: error.collisionKeySamplesTruncated,
+        }, 'Session directory identity collision')
+        return res.status(500).json({ error: error.message })
+      }
       const message = error instanceof Error ? error.message : 'Session directory query failed'
-      const status = /cursor/i.test(message) ? 400 : 500
+      const status = error instanceof SessionDirectoryCursorError ? 400 : 500
       if (status === 500) {
         log.error({ err: error }, 'Session directory query failed')
       }

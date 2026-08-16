@@ -9,6 +9,20 @@ import { createSessionsRouter } from '../../../server/sessions-router.js'
 import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
 import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return logger
+})
+
+vi.mock('../../../server/logger.js', () => ({ logger: loggerMocks }))
+
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
 describe('GET /api/session-directory', () => {
@@ -40,6 +54,7 @@ describe('GET /api/session-directory', () => {
   ]
 
   beforeEach(() => {
+    loggerMocks.error.mockClear()
     patchSessionOverride = vi.fn().mockResolvedValue({ ok: true })
     deleteSession = vi.fn().mockResolvedValue(undefined)
 
@@ -78,6 +93,122 @@ describe('GET /api/session-directory', () => {
     expect(res.body.items[0].lastActivityAt).toBe(100)
     expect(res.body.nextCursor).toBeTruthy()
     expect(typeof res.body.revision).toBe('number')
+  })
+
+  it('returns 500 when the persisted read model contains an identity collision', async () => {
+    const collisionCount = 1_003
+    const collisionProjects: ProjectGroup[] = Array.from(
+      { length: collisionCount },
+      (_, index) => {
+        const sessionId = `cursor-duplicate-${String(collisionCount - index - 1).padStart(4, '0')}`
+        return {
+          projectPath: `/repo/${index}`,
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId,
+              projectPath: `/repo/${index}`,
+              lastActivityAt: 200,
+              title: 'First copy',
+            },
+            {
+              provider: 'claude',
+              sessionId,
+              projectPath: `/repo/${index}`,
+              lastActivityAt: 100,
+              title: 'Hidden copy',
+              isSubagent: true,
+            },
+          ],
+        }
+      },
+    )
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride,
+        deleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => collisionProjects,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: { list: () => [] },
+    }))
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&includeSubagents=false&limit=1')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(500)
+    expect(res.body).toEqual({
+      error: 'Session directory identity collision',
+    })
+    const expectedSamples = Array.from({ length: 20 }, (_, index) => (
+      `claude:cursor-duplicate-${String(index).padStart(4, '0')}`
+    ))
+    expect(loggerMocks.error).toHaveBeenCalledTimes(1)
+    expect(loggerMocks.error).toHaveBeenCalledWith({
+      err: expect.objectContaining({
+        name: 'SessionDirectoryIdentityCollisionError',
+        message: 'Session directory identity collision',
+      }),
+      collisionCount,
+      duplicateItemCount: collisionCount * 2,
+      collisionKeySamples: expectedSamples,
+      collisionKeySamplesTruncated: true,
+    }, 'Session directory identity collision')
+
+    const loggedFields = loggerMocks.error.mock.calls[0]?.[0]
+    expect(JSON.stringify(loggedFields).length).toBeLessThan(2_000)
+    expect(JSON.stringify(loggedFields)).not.toContain('cursor-duplicate-1002')
+  })
+
+  it('keeps typed cursor failures as a 400 without error logging', async () => {
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&cursor=not-a-cursor')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ error: 'Invalid session-directory cursor' })
+    expect(loggerMocks.error).not.toHaveBeenCalled()
+  })
+
+  it('preserves other query failures as logged 500 responses', async () => {
+    app = express()
+    app.use(express.json())
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride,
+        deleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => {
+          throw new Error('Unexpected index failure')
+        },
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: { list: () => [] },
+    }))
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible')
+
+    expect(res.status).toBe(500)
+    expect(res.body).toEqual({ error: 'Unexpected index failure' })
+    expect(loggerMocks.error).toHaveBeenCalledWith({
+      err: expect.objectContaining({ message: 'Unexpected index failure' }),
+    }, 'Session directory query failed')
   })
 
   it('searches through the same route family', async () => {

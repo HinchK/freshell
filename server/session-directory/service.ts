@@ -33,8 +33,54 @@ type CursorPayload = {
   key: string
 }
 
+const IDENTITY_COLLISION_KEY_SAMPLE_LIMIT = 20
+
 function buildSessionKey(item: { provider: string; sessionId: string }): string {
   return `${item.provider}:${item.sessionId}`
+}
+
+export class SessionDirectoryIdentityCollisionError extends Error {
+  readonly collisionCount: number
+  readonly duplicateItemCount: number
+  readonly collisionKeySamples: readonly string[]
+  readonly collisionKeySamplesTruncated: boolean
+
+  constructor(collisionCounts: ReadonlyArray<readonly [key: string, count: number]>) {
+    const sortedCollisions = [...collisionCounts].sort(([a], [b]) => (
+      a < b ? -1 : a > b ? 1 : 0
+    ))
+    super('Session directory identity collision')
+    this.name = 'SessionDirectoryIdentityCollisionError'
+    this.collisionCount = sortedCollisions.length
+    this.duplicateItemCount = sortedCollisions.reduce((total, [, count]) => total + count, 0)
+    this.collisionKeySamples = sortedCollisions
+      .slice(0, IDENTITY_COLLISION_KEY_SAMPLE_LIMIT)
+      .map(([key]) => key)
+    this.collisionKeySamplesTruncated = sortedCollisions.length > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT
+  }
+}
+
+export class SessionDirectoryCursorError extends Error {
+  constructor() {
+    super('Invalid session-directory cursor')
+    this.name = 'SessionDirectoryCursorError'
+  }
+}
+
+function assertUniquePersistedSessionIdentities(projects: ProjectGroup[]): void {
+  const counts = new Map<string, number>()
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const key = buildSessionKey(session)
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+  }
+
+  const collisions = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+  if (collisions.length > 0) {
+    throw new SessionDirectoryIdentityCollisionError(collisions)
+  }
 }
 
 function encodeCursor(payload: CursorPayload): string {
@@ -49,7 +95,7 @@ function decodeCursor(cursor: string): CursorPayload {
     }
     return { lastActivityAt: payload.lastActivityAt, key: payload.key }
   } catch {
-    throw new Error('Invalid session-directory cursor')
+    throw new SessionDirectoryCursorError()
   }
 }
 
@@ -231,6 +277,9 @@ async function applyFileSearch(
 }
 
 export async function querySessionDirectory(input: QuerySessionDirectoryInput): Promise<SessionDirectoryPage> {
+  throwIfAborted(input.signal)
+  assertUniquePersistedSessionIdentities(input.projects)
+
   const limit = Math.min(input.query.limit ?? MAX_DIRECTORY_PAGE_ITEMS, MAX_DIRECTORY_PAGE_ITEMS)
   const tier = input.query.tier ?? 'title'
   const cursor = input.query.cursor ? decodeCursor(input.query.cursor) : null
@@ -239,8 +288,6 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     ...input.projects.flatMap((project) => project.sessions.map((session) => session.lastActivityAt)),
     ...input.terminalMeta.map((meta) => meta.updatedAt),
   )
-
-  throwIfAborted(input.signal)
 
   let items = toItems(input.projects, input.terminalMeta).sort(compareItems)
 
