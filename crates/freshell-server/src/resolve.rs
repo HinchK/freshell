@@ -469,11 +469,11 @@ fn bounded_fallback<T: Send + 'static>(
 /// Node's override-key lookup for ONE indexed session
 /// (`buildProjectGroups`, `session-indexer.ts:1173-1186`): the composite
 /// `"{provider}:{sessionId}"` key first, then the bare session id; only when
-/// NEITHER hits and the session is a claude transcript whose file basename
-/// differs from its parsed session id (a pre-sessionId-parsing-era override)
-/// do the legacy keys apply — composite `"claude:{basename}"`, then the bare
-/// basename. First PRESENT entry wins, exactly like Node's `||` chain: an
-/// earlier key that maps to an (even empty) object stops the fallthrough.
+/// NEITHER hits and an indexed provider migration supplied a compatibility
+/// identity do the legacy keys apply — composite `"provider:{legacy}"`, then
+/// the bare legacy id. First PRESENT entry wins, exactly like Node's `||`
+/// chain: an earlier key that maps to an (even empty) object stops the
+/// fallthrough.
 fn lookup_session_override<'a>(
     overrides: &'a Map<String, Value>,
     session: &IndexedSession,
@@ -485,17 +485,12 @@ fn lookup_session_override<'a>(
     if let Some(ov) = direct {
         return ov.as_object();
     }
-    if session.provider != "claude" {
-        return None;
-    }
-    // `path.basename(sourceFile, '.jsonl')` (`session-indexer.ts:1176`).
-    let basename = session.source_file.as_deref()?.file_name()?.to_str()?;
-    let legacy_id = basename.strip_suffix(".jsonl").unwrap_or(basename);
+    let legacy_id = session.legacy_session_id.as_deref()?;
     if legacy_id.is_empty() || legacy_id == session.session_id {
         return None;
     }
     overrides
-        .get(&format!("claude:{legacy_id}"))
+        .get(&format!("{}:{legacy_id}", session.provider))
         .or_else(|| overrides.get(legacy_id))
         .filter(|v| !v.is_null())
         .and_then(Value::as_object)
@@ -664,8 +659,8 @@ async fn resolve_session(
 
     // sessionType overlay (Node: `session-indexer.ts:1159-1161`), keyed
     // `"{provider}:{session_id}"`. Only needed when we can match at all.
-    let session_types: HashMap<String, String> = if snapshot.is_some() {
-        state
+    let session_types: HashMap<String, String> = if let Some(sessions) = snapshot.as_ref() {
+        let mut session_types: HashMap<String, String> = state
             .session_metadata
             .get_all()
             .await
@@ -676,7 +671,24 @@ async fn resolve_session(
                     .and_then(Value::as_str)
                     .map(|t| (key, t.to_string()))
             })
-            .collect()
+            .collect();
+        // Preserve metadata written under a former identity while keeping a
+        // newly written canonical key authoritative. The compatibility alias
+        // exists only for safe non-subagent migrations, so a Claude parent's
+        // metadata can never spill onto child sessions.
+        for session in sessions {
+            let canonical_key = session.key();
+            let Some(legacy_id) = session.legacy_session_id.as_deref() else {
+                continue;
+            };
+            let legacy_key = format!("{}:{legacy_id}", session.provider);
+            if !session_types.contains_key(&canonical_key) {
+                if let Some(session_type) = session_types.get(&legacy_key).cloned() {
+                    session_types.insert(canonical_key, session_type);
+                }
+            }
+        }
+        session_types
     } else {
         HashMap::new()
     };
@@ -912,6 +924,7 @@ mod tests {
     fn claude_fixture() -> IndexedSession {
         IndexedSession {
             session_id: CLAUDE_ID.to_string(),
+            legacy_session_id: None,
             provider: "claude".to_string(),
             project_path: "/repo/alpha".to_string(),
             title: Some("Fix the parser".to_string()),
@@ -1426,16 +1439,15 @@ mod tests {
         assert_eq!(body["matches"], serde_json::json!([]));
     }
 
-    /// The pre-parsing-era transcript basename for the legacy-override tests:
-    /// differs from `CLAUDE_ID`, so Node's legacy branch
-    /// (`session-indexer.ts:1175-1186`) fires for it.
+    /// The canonical filename identity for the compatibility-override tests.
     const LEGACY_BASENAME: &str = "11111111-2222-4333-8444-555555555555";
 
-    /// `claude_fixture()` whose transcript file basename differs from its
-    /// parsed session id — the shape that makes Node consult the legacy
-    /// `claude:{basename}` / bare-`{basename}` override keys.
+    /// A non-subagent Claude session whose former embedded identity differs
+    /// from its canonical filename identity.
     fn claude_fixture_with_legacy_source() -> IndexedSession {
         IndexedSession {
+            session_id: LEGACY_BASENAME.to_string(),
+            legacy_session_id: Some(CLAUDE_ID.to_string()),
             source_file: Some(std::path::PathBuf::from(format!(
                 "/home/tester/.claude/projects/-repo-alpha/{LEGACY_BASENAME}.jsonl"
             ))),
@@ -1566,43 +1578,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_claude_composite_basename_deleted_override_hides_the_session() {
-        // Node's legacy branch (`session-indexer.ts:1175-1186`): when neither
-        // the composite nor bare current-id key hits and the claude
-        // transcript's file basename differs from its session id, the
-        // `claude:{basename}` key applies.
+    async fn legacy_claude_composite_identity_deleted_override_hides_the_session() {
+        // A pre-canonicalization override under the old embedded id remains
+        // effective after the filename becomes the canonical identity.
         let dir = temp_dir("legacycomp");
         let index = fixture_index(vec![claude_fixture_with_legacy_source()]).await;
         let st = state(&dir, Some(index));
         st.settings
             .patch_session_override(
-                &format!("claude:{LEGACY_BASENAME}"),
+                &format!("claude:{CLAUDE_ID}"),
                 &[("deleted", Some(serde_json::json!(true)))],
             )
             .await;
-        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        let (status, body) = post(st, serde_json::json!({ "input": LEGACY_BASENAME }), true).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert_eq!(body["matches"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn legacy_claude_bare_basename_deleted_override_hides_the_session() {
-        // The deepest rung of Node's lookup chain
-        // (`session-indexer.ts:1179`): the bare transcript-basename key.
+    async fn legacy_claude_bare_identity_deleted_override_hides_the_session() {
+        // The deepest rung of Node's lookup chain: the bare old identity.
         let dir = temp_dir("legacybare");
         let index = fixture_index(vec![claude_fixture_with_legacy_source()]).await;
         let st = state(&dir, Some(index));
         st.settings
-            .patch_session_override(
-                LEGACY_BASENAME,
-                &[("deleted", Some(serde_json::json!(true)))],
-            )
+            .patch_session_override(CLAUDE_ID, &[("deleted", Some(serde_json::json!(true)))])
             .await;
-        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        let (status, body) = post(st, serde_json::json!({ "input": LEGACY_BASENAME }), true).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_identity_session_type_projects_onto_the_canonical_match() {
+        let dir = temp_dir("legacy-session-type");
+        std::fs::write(
+            dir.join("session-metadata.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {
+                    "claude": {
+                        CLAUDE_ID: {
+                            "sessionType": "freshclaude",
+                            "sessionTypeSource": "explicit"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let index = fixture_index(vec![claude_fixture_with_legacy_source()]).await;
+
+        let (_, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": LEGACY_BASENAME }),
+            true,
+        )
+        .await;
+
+        assert_eq!(body["matches"][0]["sessionId"], LEGACY_BASENAME);
+        assert_eq!(body["matches"][0]["sessionType"], "freshclaude");
     }
 
     #[tokio::test]

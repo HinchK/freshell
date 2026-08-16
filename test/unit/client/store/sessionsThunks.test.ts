@@ -100,6 +100,13 @@ describe('sessionsThunks', () => {
       oldestIncludedTimestamp: 1_000,
       oldestIncludedSessionId: 'claude:session-alpha',
       hasMore: false,
+      partial: true,
+      partialReason: 'identity_collision',
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
     })
 
     const store = createStore()
@@ -116,6 +123,11 @@ describe('sessionsThunks', () => {
     })
     expect(store.getState().sessions.windows.sidebar.projects[0]?.projectPath).toBe('/tmp/project-alpha')
     expect(store.getState().sessions.projects[0]?.projectPath).toBe('/tmp/project-alpha')
+    expect(store.getState().sessions.windows.sidebar.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount: 1,
+      duplicateItemCount: 2,
+    })
   })
 
   it('marks an initial visible load as blocking when no committed data exists', async () => {
@@ -2148,12 +2160,22 @@ describe('sessionsThunks', () => {
         totalScanned: 50,
         partial: true,
         partialReason: 'budget',
+        integrityError: {
+          kind: 'identity_collision',
+          collisionCount: 1,
+          duplicateItemCount: 2,
+        },
       })
 
       await request
 
       expect(store.getState().sessions.windows.sidebar.partial).toBe(true)
       expect(store.getState().sessions.windows.sidebar.partialReason).toBe('budget')
+      expect(store.getState().sessions.windows.sidebar.integrityError).toEqual({
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      })
     })
 
     it('Phase 1 abort prevents Phase 2 from firing', async () => {

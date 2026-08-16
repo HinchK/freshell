@@ -2630,6 +2630,7 @@ mod sessions_sweep_tests {
     fn mk_indexed(last_activity_at: i64) -> IndexedSession {
         IndexedSession {
             session_id: "s".to_string(),
+            legacy_session_id: None,
             provider: "claude".to_string(),
             project_path: "/tmp".to_string(),
             title: None,

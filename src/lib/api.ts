@@ -25,6 +25,7 @@ import {
   type FreshAgentThreadTurnBodyQuery,
   type FreshAgentThreadTurnsQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
+  type SessionDirectoryIntegrityError as ReadModelSessionDirectoryIntegrityError,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
   type TerminalDirectoryQuery,
@@ -576,7 +577,9 @@ export type SearchResponse = {
   /** True when the server has additional matches beyond this page (nextCursor is non-null). */
   hasMore: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error'
+  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  /** Server-detected persisted-session integrity issue; conflicted rows were omitted. */
+  integrityError?: ReadModelSessionDirectoryIntegrityError
   /** SESSION-05: the page's per-project color map (only present when the server emitted one). */
   projectColors?: Record<string, string>
 }
@@ -699,6 +702,9 @@ export async function fetchSidebarSessionsSnapshot(options: {
     oldestIncludedTimestamp: oldest?.lastActivityAt ?? 0,
     oldestIncludedSessionId: oldest ? `${oldest.provider}:${oldest.sessionId}` : '',
     hasMore: page.nextCursor !== null,
+    partial: page.partial,
+    partialReason: page.partialReason,
+    integrityError: page.integrityError,
   }
 }
 
@@ -749,6 +755,9 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
   if (page.partial) {
     response.partial = page.partial
     response.partialReason = page.partialReason
+  }
+  if (page.integrityError) {
+    response.integrityError = page.integrityError
   }
 
   return response

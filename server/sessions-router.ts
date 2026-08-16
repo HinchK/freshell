@@ -23,7 +23,6 @@ import {
 import {
   querySessionDirectory,
   SessionDirectoryCursorError,
-  SessionDirectoryIdentityCollisionError,
 } from './session-directory/service.js'
 import {
   ResumeResolveRequestSchema,
@@ -134,16 +133,6 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) {
         return
-      }
-      if (error instanceof SessionDirectoryIdentityCollisionError) {
-        log.error({
-          err: error,
-          collisionCount: error.collisionCount,
-          duplicateItemCount: error.duplicateItemCount,
-          collisionKeySamples: error.collisionKeySamples,
-          collisionKeySamplesTruncated: error.collisionKeySamplesTruncated,
-        }, 'Session directory identity collision')
-        return res.status(500).json({ error: error.message })
       }
       const message = error instanceof Error ? error.message : 'Session directory query failed'
       const status = error instanceof SessionDirectoryCursorError ? 400 : 500

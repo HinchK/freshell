@@ -5,10 +5,7 @@ import path from 'path'
 import os from 'os'
 import type { ProjectGroup, CodingCliSession } from '../../../../server/coding-cli/types.js'
 import type { TerminalMeta } from '../../../../server/terminal-metadata-service.js'
-import {
-  querySessionDirectory,
-  SessionDirectoryIdentityCollisionError,
-} from '../../../../server/session-directory/service.js'
+import { querySessionDirectory } from '../../../../server/session-directory/service.js'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude.js'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex.js'
 
@@ -115,7 +112,7 @@ describe('querySessionDirectory', () => {
     expect(page.revision).toBe(1_500)
   })
 
-  it('rejects hidden duplicate persisted identities before visibility and page boundaries', async () => {
+  it('quarantines hidden duplicate persisted identities before visibility and page boundaries', async () => {
     const duplicateProjects = [
       makeProject('/repo/visible', [
         makeSession({
@@ -136,7 +133,7 @@ describe('querySessionDirectory', () => {
       ]),
     ]
 
-    await expect(querySessionDirectory({
+    const page = await querySessionDirectory({
       projects: duplicateProjects,
       terminalMeta: [],
       query: {
@@ -148,12 +145,31 @@ describe('querySessionDirectory', () => {
           key: 'claude:after-this-cursor',
         })).toString('base64url'),
       },
-    })).rejects.toThrow('Session directory identity collision')
+    })
+
+    expect(page.items).toEqual([])
+    expect(page).toMatchObject({
+      partial: true,
+      partialReason: 'identity_collision',
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
   })
 
-  it('reports a small collided identity set in deterministic key order', async () => {
-    await expect(querySessionDirectory({
+  it('quarantines every row for a collided identity without hiding healthy sessions', async () => {
+    const page = await querySessionDirectory({
       projects: [
+        makeProject('/repo/healthy', [
+          makeSession({
+            sessionId: 'healthy-session',
+            projectPath: '/repo/healthy',
+            lastActivityAt: 500,
+            title: 'Healthy session',
+          }),
+        ]),
         makeProject('/repo/z-one', [
           makeSession({
             provider: 'codex',
@@ -187,17 +203,19 @@ describe('querySessionDirectory', () => {
       ],
       terminalMeta: [],
       query: { priority: 'visible' },
-    })).rejects.toMatchObject({
-      name: 'SessionDirectoryIdentityCollisionError',
-      message: 'Session directory identity collision',
+    })
+
+    expect(page.items.map((item) => `${item.provider}:${item.sessionId}`)).toEqual([
+      'claude:healthy-session',
+    ])
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
       collisionCount: 2,
       duplicateItemCount: 4,
-      collisionKeySamples: ['claude:a-session', 'codex:z-session'],
-      collisionKeySamplesTruncated: false,
     })
   })
 
-  it('keeps identity-collision errors deterministic and bounded for a corrupt corpus', async () => {
+  it('keeps a corrupt collision corpus bounded on the response path', async () => {
     const collisionCount = 1_003
     const sessions = Array.from({ length: collisionCount }, (_, index) => (
       `collision-${String(collisionCount - index - 1).padStart(4, '0')}`
@@ -214,31 +232,20 @@ describe('querySessionDirectory', () => {
       }),
     ])
 
-    const error = await querySessionDirectory({
+    const page = await querySessionDirectory({
       projects: [makeProject('/repo/corrupt', sessions)],
       terminalMeta: [],
       query: { priority: 'visible' },
-    }).then(
-      () => undefined,
-      (reason: unknown) => reason,
-    )
+    })
 
-    expect(error).toBeInstanceOf(SessionDirectoryIdentityCollisionError)
-    if (!(error instanceof SessionDirectoryIdentityCollisionError)) {
-      throw new Error('Expected an identity-collision error')
-    }
-
-    expect(error.message).toBe('Session directory identity collision')
-    expect(error.message.length).toBeLessThan(100)
-    expect(error.collisionCount).toBe(collisionCount)
-    expect(error.duplicateItemCount).toBe(collisionCount * 2)
-    expect(error.collisionKeySamples).toEqual(
-      Array.from({ length: 20 }, (_, index) => (
-        `claude:collision-${String(index).padStart(4, '0')}`
-      )),
-    )
-    expect(error.collisionKeySamplesTruncated).toBe(true)
-    expect(error).not.toHaveProperty('collisionKeys')
+    expect(page.items).toEqual([])
+    expect(page.integrityError).toEqual({
+      kind: 'identity_collision',
+      collisionCount,
+      duplicateItemCount: collisionCount * 2,
+    })
+    expect(JSON.stringify(page)).not.toContain('collision-0000')
+    expect(JSON.stringify(page).length).toBeLessThan(500)
   })
 
   it('allows the same raw session id across providers', async () => {

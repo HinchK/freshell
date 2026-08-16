@@ -57,6 +57,13 @@ const DEFAULT_TTL: Duration = Duration::from_millis(1000);
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexedSession {
     pub session_id: String,
+    /// A former provider identity that remains readable for user-owned
+    /// overrides and metadata after a canonical-identity migration.  It is
+    /// intentionally absent for Claude subagents: their embedded parent id
+    /// was never an independent child identity and must not make a parent's
+    /// settings spill onto every child.
+    #[serde(default)]
+    pub legacy_session_id: Option<String>,
     pub provider: String,
     pub project_path: String,
     pub title: Option<String>,
@@ -403,34 +410,43 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<IndexedSession
     // R10b: never index a session with no resolvable `cwd` (the ORIGINAL's
     // discovery-time gate, `session-indexer.ts:756,1124`).
     meta.cwd.as_ref()?;
-    let mut item = item_from_meta(
-        &meta,
-        "claude",
-        &fallback,
-        force_subagent,
-        Some(path.to_path_buf()),
-    );
+    let is_subagent = force_subagent || meta.is_subagent.unwrap_or(false);
     // Claude's provider identity is the transcript filename. In particular,
     // real subagent records embed their PARENT's `sessionId`; trusting that
-    // field collapses every child onto the parent key. The basename is the
-    // stable identity used by Claude's on-disk layout for both parents and
-    // `subagents/agent-*.jsonl` children.
-    item.session_id = fallback;
-    Some(item)
+    // field collapses every child onto the parent key. Select the provider's
+    // canonical identity at construction rather than first accepting parsed
+    // metadata and then overwriting it below.
+    //
+    // A non-subagent transcript whose old embedded id differs from its file
+    // name keeps a compatibility alias for user-owned overrides/metadata.
+    // Children deliberately do not: their old embedded id is the parent and
+    // applying it would incorrectly copy the parent's settings to each child.
+    let legacy_session_id = (!is_subagent)
+        .then(|| meta.session_id.as_deref())
+        .flatten()
+        .filter(|session_id| *session_id != fallback)
+        .map(str::to_owned);
+    Some(item_from_meta(
+        &meta,
+        "claude",
+        fallback,
+        force_subagent,
+        Some(path.to_path_buf()),
+        legacy_session_id,
+    ))
 }
 
 fn item_from_meta(
     meta: &ParsedSessionMeta,
     provider: &str,
-    fallback_session_id: &str,
+    session_id: String,
     force_subagent: bool,
     source_file: Option<PathBuf>,
+    legacy_session_id: Option<String>,
 ) -> IndexedSession {
     IndexedSession {
-        session_id: meta
-            .session_id
-            .clone()
-            .unwrap_or_else(|| fallback_session_id.to_string()),
+        session_id,
+        legacy_session_id,
         provider: provider.to_string(),
         project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
         title: meta.title.clone(),
@@ -566,12 +582,14 @@ fn parse_codex_file(path: &Path) -> Option<IndexedSession> {
     let meta = parse_codex_session_content(&content);
     meta.cwd.as_ref()?;
     let fallback = extract_codex_session_id_from_filename(path);
+    let session_id = meta.session_id.clone().unwrap_or(fallback);
     Some(item_from_meta(
         &meta,
         "codex",
-        &fallback,
+        session_id,
         false,
         Some(path.to_path_buf()),
+        None,
     ))
 }
 
@@ -704,6 +722,7 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         .is_some_and(|t| !t.trim().is_empty() && !crate::parse::is_opencode_placeholder_title(t));
     IndexedSession {
         session_id: s.session_id,
+        legacy_session_id: None,
         provider: "opencode".to_string(),
         project_path: s.project_path,
         title: s.title,
@@ -1303,6 +1322,12 @@ fn refresh_snapshot(
     scan_failures: &mut HashSet<String>,
 ) -> (Vec<IndexedSession>, usize) {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // A failed root listing cannot distinguish "everything disappeared" from
+    // "the provider is temporarily unreadable." Skip this sweep's file-cache
+    // prune entirely when any file-backed source fails so an outage cannot
+    // delete and persist an otherwise healthy cache. A later fully healthy
+    // sweep reconciles actual removals normally.
+    let mut file_backed_discovery_failed = false;
     // Count of file-cache mutations + direct-listed sources re-queried this
     // sweep -- the persistent-parse-cache save gate's "how much changed"
     // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
@@ -1368,12 +1393,10 @@ fn refresh_snapshot(
             continue;
         }
 
-        // File-backed: a ROOT-listing failure is recorded, then treated as an
-        // empty listing for this sweep (Node parity -- a throwing
-        // `listSessionFiles()` also yields an empty list and lets the
-        // full-scan prune drop that provider's cached entries,
-        // `session-indexer.ts:1467-1475`, `:1499-1504`; the recorded scan
-        // failure is what keeps the outage visible).
+        // File-backed: a ROOT-listing failure is recorded and preserves the
+        // existing cache. Treating it as an empty listing makes a transient
+        // permission/I/O outage look like mass deletion and can persist a
+        // gutted cache for the next boot.
         let stats = match source.discover_checked() {
             Ok(stats) => {
                 if let Some(name) = source.provider_name() {
@@ -1382,12 +1405,13 @@ fn refresh_snapshot(
                 stats
             }
             Err(err) => {
+                file_backed_discovery_failed = true;
                 if let Some(name) = source.provider_name() {
                     scan_failures.insert(name.to_string());
                 }
                 eprintln!(
                     "session-directory: source #{idx} root listing failed \
-                     (treating as empty this sweep): {err}"
+                     (preserving file cache this sweep): {err}"
                 );
                 Vec::new()
             }
@@ -1412,14 +1436,14 @@ fn refresh_snapshot(
         }
     }
 
-    // Prune entries for files no longer discovered (deleted since the last
-    // sweep, no longer canonical, or absent from this sweep after a provider
-    // error). The in-memory cache mutation must contribute to persistence
-    // accounting just like an insertion/reparse; otherwise a cleaned cache
-    // can remain stale on disk indefinitely.
-    let cache_len_before_prune = cache.len();
-    cache.retain(|path, _| discovered.contains(path));
-    changed = changed.saturating_add(cache_len_before_prune - cache.len());
+    // Prune entries only after every file-backed source completed discovery.
+    // A prune is a real cache mutation and must contribute to persistence
+    // accounting; otherwise a cleaned cache can remain stale on disk.
+    if !file_backed_discovery_failed {
+        let cache_len_before_prune = cache.len();
+        cache.retain(|path, _| discovered.contains(path));
+        changed = changed.saturating_add(cache_len_before_prune - cache.len());
+    }
 
     let mut items: Vec<IndexedSession> = cache
         .values()
@@ -1791,6 +1815,7 @@ mod tests {
     fn mk(session_id: &str, provider: &str, last_activity_at: i64) -> IndexedSession {
         IndexedSession {
             session_id: session_id.to_string(),
+            legacy_session_id: None,
             provider: provider.to_string(),
             project_path: "/p".to_string(),
             title: Some(format!("t-{session_id}")),
@@ -2648,11 +2673,44 @@ mod tests {
             .expect("the child transcript filename is its provider identity");
         assert!(child.is_subagent);
         assert_eq!(
+            child.legacy_session_id, None,
+            "the embedded parent id is not a child compatibility alias"
+        );
+        assert_eq!(
             items
                 .iter()
                 .filter(|item| item.session_id == parent_id)
                 .count(),
             1
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    #[test]
+    fn claude_non_subagent_filename_migration_retains_the_old_embedded_identity() {
+        let claude_home = unique_temp_dir("claude-legacy-identity");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let old_embedded_id = synthetic_session_id(17);
+        write_session_file(
+            &project,
+            "canonical-filename.jsonl",
+            &old_embedded_id,
+            "/p",
+            "2025-01-30T10:00:00.000Z",
+            "normal session",
+        );
+
+        let item = ClaudeSource::new(claude_home.clone())
+            .scan()
+            .into_iter()
+            .next()
+            .expect("normal transcript parses");
+        assert_eq!(item.session_id, "canonical-filename");
+        assert_eq!(
+            item.legacy_session_id.as_deref(),
+            Some(old_embedded_id.as_str())
         );
 
         std::fs::remove_dir_all(&claude_home).ok();
@@ -3987,36 +4045,64 @@ mod tests {
         // route turns them into degraded providerErrors): a source whose
         // discover_checked() errs must be recorded, NOT silently treated as an
         // empty listing.
-        struct FlakyFileSource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        struct FlakyFileSource {
+            broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            item: IndexedSession,
+        }
         impl SessionSource for FlakyFileSource {
             fn discover(&self) -> Vec<FileStat> {
                 Vec::new()
             }
             fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
-                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         "denied",
                     ))
                 } else {
-                    Ok(Vec::new())
+                    Ok(vec![FileStat {
+                        path: PathBuf::from("mem://flaky-file-source"),
+                        mtime_ms: 1,
+                        size: 1,
+                    }])
                 }
             }
-            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
-                None
+            fn parse(&self, path: &Path) -> Option<IndexedSession> {
+                (path == Path::new("mem://flaky-file-source")).then(|| self.item.clone())
             }
             fn provider_name(&self) -> Option<&'static str> {
                 Some("claude")
             }
         }
-        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let index = SessionIndex::with_ttl_and_cache_path(
-            vec![std::sync::Arc::new(FlakyFileSource(std::sync::Arc::clone(&broken))) as _],
+            vec![std::sync::Arc::new(FlakyFileSource {
+                broken: std::sync::Arc::clone(&broken),
+                item: mk("cached-through-outage", "claude", 1),
+            }) as _],
             std::time::Duration::ZERO,
             None,
         );
-        let _ = index.snapshot().await; // cold sweep is INLINE — deterministic
-        assert_eq!(index.scan_failures(), vec!["claude".to_string()]);
+        // First successful sweep seeds a file-cache entry.
+        assert_eq!(index.snapshot().await.len(), 1);
+        assert!(index.scan_failures().is_empty());
+
+        // A later root failure must retain that entry rather than treating the
+        // source as empty and persisting a cache with all its rows removed.
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = index.snapshot().await; // stale-while-revalidate: poll for failure
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || index.scan_failures()
+                == vec!["claude".to_string()])
+            .await,
+            "root listing failure is recorded"
+        );
+        assert_eq!(
+            index.snapshot().await.len(),
+            1,
+            "a root outage must preserve the last known good file-backed snapshot"
+        );
+
         broken.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = index.snapshot().await; // stale-while-revalidate: poll for recovery
         assert!(
@@ -4255,14 +4341,13 @@ mod tests {
 
     /// Finding-3 pin: the snapshot and its scan failures are ONE atomic
     /// generation. A source that strictly alternates between a failing sweep
-    /// (empty listing + failure recorded) and a healthy sweep (one session +
-    /// failure cleared) can only ever be observed in one of those two
-    /// coherent states through the combined accessor — never a failed-scan
-    /// empty snapshot paired with a cleared failure set (a healthy-looking
-    /// `ready + matches: []` lie), and never a recovered snapshot paired
-    /// with stale failures. Structural with the single-lock publish; the
-    /// old split-lock model had a window between the two publishes where
-    /// both incoherent mixes were observable.
+    /// (last-known-good session + failure recorded) and a healthy sweep (one
+    /// session + failure cleared) can only ever be observed in one of those
+    /// two coherent states through the combined accessor — never a retained
+    /// snapshot paired with a cleared failure set, and never a recovered
+    /// snapshot paired with stale failures. Structural with the single-lock
+    /// publish; the old split-lock model had a window between the two
+    /// publishes where both incoherent mixes were observable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_and_scan_failures_publish_as_one_atomic_generation() {
         struct AlternatingSource {
@@ -4308,10 +4393,10 @@ mod tests {
             let (items, failures) = index.snapshot_with_failures().await;
             match (items.len(), failures.as_slice()) {
                 (1, []) => seen_healthy = true,
-                (0, [name]) if name == "claude" => seen_failed = true,
+                (1, [name]) if name == "claude" => seen_failed = true,
                 (len, _) => panic!(
-                    "incoherent generation observed: a failed-scan snapshot must never \
-                     pair with a cleared failure set (items={len}, failures={failures:?})"
+                    "incoherent generation observed: the cached snapshot and its failure \
+                     state must publish together (items={len}, failures={failures:?})"
                 ),
             }
             tokio::time::sleep(Duration::from_millis(2)).await;

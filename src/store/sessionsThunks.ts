@@ -8,6 +8,7 @@ import {
 import { createLogger } from '@/lib/client-logger'
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
+import type { SessionDirectoryIntegrityError } from '@shared/read-models'
 
 const log = createLogger('SessionsThunks')
 import {
@@ -324,7 +325,8 @@ function buildSearchPayload(
   deepSearchPending: boolean,
   opts?: {
     partial?: boolean
-    partialReason?: 'budget' | 'io_error'
+    partialReason?: 'budget' | 'io_error' | 'identity_collision'
+    integrityError?: SessionDirectoryIntegrityError
     hasMore?: boolean
     searchCursor?: string | null
     /** SESSION-05: colors from the freshest search response page. */
@@ -345,6 +347,7 @@ function buildSearchPayload(
     deepSearchPending,
     partial: opts?.partial,
     partialReason: opts?.partialReason,
+    integrityError: opts?.integrityError,
   }
 }
 
@@ -401,6 +404,9 @@ async function refreshVisibleSessionWindowSilently(args: {
     hasMore?: boolean
     query?: string
     searchTier?: SearchOptions['tier']
+    partial?: boolean
+    partialReason?: 'budget' | 'io_error' | 'identity_collision'
+    integrityError?: SessionDirectoryIntegrityError
   }) => {
     if (!canCommit()) {
       log.debug('Discarded refresh result for', surface, '— identity mismatch or generation changed')
@@ -433,6 +439,9 @@ async function refreshVisibleSessionWindowSilently(args: {
         })
         if (!commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, true, {
           projectColors: titleResponse.projectColors,
+          partial: titleResponse.partial,
+          partialReason: titleResponse.partialReason,
+          integrityError: titleResponse.integrityError,
         }))) {
           return
         }
@@ -448,11 +457,15 @@ async function refreshVisibleSessionWindowSilently(args: {
           commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
             partial: deepResponse.partial,
             partialReason: deepResponse.partialReason,
+            integrityError: deepResponse.integrityError ?? titleResponse.integrityError,
             projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
           }))
         } catch {
           commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
             projectColors: titleResponse.projectColors,
+            partial: titleResponse.partial,
+            partialReason: titleResponse.partialReason,
+            integrityError: titleResponse.integrityError,
           }))
         }
         return
@@ -467,6 +480,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
         partial: response.partial,
         partialReason: response.partialReason,
+        integrityError: response.integrityError,
         projectColors: response.projectColors,
       }))
       return
@@ -516,6 +530,9 @@ async function refreshVisibleSessionWindowSilently(args: {
       hasMore: hasDeeperWindow ? prevWindow?.hasMore : response?.hasMore,
       query: identity.query,
       searchTier: identity.searchTier,
+      partial: response?.partial,
+      partialReason: response?.partialReason,
+      integrityError: response?.integrityError,
     })
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
@@ -605,6 +622,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             const pagePayload = buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
               partialReason: response.partialReason,
+              integrityError: response.integrityError,
               hasMore: response.hasMore,
               searchCursor: response.nextCursor,
               projectColors: response.projectColors,
@@ -630,6 +648,9 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
 
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true, {
               projectColors: titleResponse.projectColors,
+              partial: titleResponse.partial,
+              partialReason: titleResponse.partialReason,
+              integrityError: titleResponse.integrityError,
             })))
 
             // Phase 2: file-based search
@@ -646,6 +667,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
                 partialReason: deepResponse.partialReason,
+                integrityError: deepResponse.integrityError ?? titleResponse.integrityError,
                 projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
               })))
             } catch (phase2Error) {
@@ -654,6 +676,9 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               // Clear the pending indicator and report the error.
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false, {
                 projectColors: titleResponse.projectColors,
+                partial: titleResponse.partial,
+                partialReason: titleResponse.partialReason,
+                integrityError: titleResponse.integrityError,
               })))
               dispatch(setSessionWindowError({
                 surface,
@@ -673,6 +698,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
               partialReason: response.partialReason,
+              integrityError: response.integrityError,
               hasMore: response.hasMore,
               searchCursor: response.nextCursor,
               projectColors: response.projectColors,
@@ -706,6 +732,9 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
           hasMore: response?.hasMore,
           query: trimmedQuery,
           searchTier,
+          partial: response?.partial,
+          partialReason: response?.partialReason,
+          integrityError: response?.integrityError,
         }))
       } catch (error) {
         if (controller.signal.aborted) return

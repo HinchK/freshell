@@ -327,6 +327,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
     vi.useRealTimers()
   })
 
+  it('explains when the server quarantines conflicted session identities', async () => {
+    const projects: ProjectGroup[] = [{
+      projectPath: '/home/user/healthy',
+      sessions: [{
+        provider: 'claude',
+        sessionId: sessionId('healthy-after-collision'),
+        projectPath: '/home/user/healthy',
+        lastActivityAt: Date.now(),
+        title: 'Healthy session',
+      }],
+    }]
+    const store = createTestStore({
+      projects,
+      sessions: {
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects,
+            lastLoadedAt: Date.now(),
+            integrityError: {
+              kind: 'identity_collision',
+              collisionCount: 2,
+              duplicateItemCount: 4,
+            },
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(screen.getByTestId('session-directory-integrity-error')).toHaveTextContent(
+      '2 session identities conflict. Conflicted sessions are hidden. Check the server log, then remove or rename the duplicate session file.',
+    )
+    expect(screen.getByRole('button', { name: /Healthy session/ })).toBeInTheDocument()
+  })
+
   describe('displays sessions only (not terminals)', () => {
     it('keeps restored open sessions visible without issuing sidebar directory fetches on mount', () => {
       const store = createTestStore({

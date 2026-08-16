@@ -393,6 +393,7 @@ fn indexed_from_meta(
             .session_id
             .clone()
             .unwrap_or_else(|| fallback_session_id.to_string()),
+        legacy_session_id: None,
         provider: "amplifier".to_string(),
         // Raw `cwd`, not git-root-resolved -- matches the established Rust-port
         // convention for `project_path` (`item_from_meta`/`opencode_session_to_indexed`

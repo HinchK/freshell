@@ -1,5 +1,6 @@
 import type { CodingCliProvider } from '../coding-cli/provider.js'
 import type { ProjectGroup } from '../coding-cli/types.js'
+import { logger } from '../logger.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet, searchSessionFile } from './file-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
@@ -39,25 +40,13 @@ function buildSessionKey(item: { provider: string; sessionId: string }): string 
   return `${item.provider}:${item.sessionId}`
 }
 
-export class SessionDirectoryIdentityCollisionError extends Error {
-  readonly collisionCount: number
-  readonly duplicateItemCount: number
-  readonly collisionKeySamples: readonly string[]
-  readonly collisionKeySamplesTruncated: boolean
-
-  constructor(collisionCounts: ReadonlyArray<readonly [key: string, count: number]>) {
-    const sortedCollisions = [...collisionCounts].sort(([a], [b]) => (
-      a < b ? -1 : a > b ? 1 : 0
-    ))
-    super('Session directory identity collision')
-    this.name = 'SessionDirectoryIdentityCollisionError'
-    this.collisionCount = sortedCollisions.length
-    this.duplicateItemCount = sortedCollisions.reduce((total, [, count]) => total + count, 0)
-    this.collisionKeySamples = sortedCollisions
-      .slice(0, IDENTITY_COLLISION_KEY_SAMPLE_LIMIT)
-      .map(([key]) => key)
-    this.collisionKeySamplesTruncated = sortedCollisions.length > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT
-  }
+type PersistedIdentityCollision = {
+  /** Internal only: used to quarantine every conflicting row, never serialized. */
+  keys: ReadonlySet<string>
+  collisionCount: number
+  duplicateItemCount: number
+  collisionKeySamples: readonly string[]
+  collisionKeySamplesTruncated: boolean
 }
 
 export class SessionDirectoryCursorError extends Error {
@@ -67,7 +56,18 @@ export class SessionDirectoryCursorError extends Error {
   }
 }
 
-function assertUniquePersistedSessionIdentities(projects: ProjectGroup[]): void {
+/**
+ * Detect identity corruption before any visibility/filter/pagination work.
+ *
+ * A collision is still an ERROR-level data-integrity event.  It must not,
+ * however, make every healthy session inaccessible because a user copied one
+ * transcript into a session directory.  Callers quarantine all rows for the
+ * conflicted identities, return the remaining unambiguous rows, and expose a
+ * small actionable integrity state to the client.
+ */
+function findPersistedIdentityCollisions(
+  projects: ProjectGroup[],
+): PersistedIdentityCollision | undefined {
   const counts = new Map<string, number>()
   for (const project of projects) {
     for (const session of project.sessions) {
@@ -78,8 +78,17 @@ function assertUniquePersistedSessionIdentities(projects: ProjectGroup[]): void 
 
   const collisions = [...counts.entries()]
     .filter(([, count]) => count > 1)
-  if (collisions.length > 0) {
-    throw new SessionDirectoryIdentityCollisionError(collisions)
+    .sort(([a], [b]) => a.localeCompare(b))
+  if (collisions.length === 0) return undefined
+
+  return {
+    keys: new Set(collisions.map(([key]) => key)),
+    collisionCount: collisions.length,
+    duplicateItemCount: collisions.reduce((total, [, count]) => total + count, 0),
+    collisionKeySamples: collisions
+      .slice(0, IDENTITY_COLLISION_KEY_SAMPLE_LIMIT)
+      .map(([key]) => key),
+    collisionKeySamplesTruncated: collisions.length > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT,
   }
 }
 
@@ -278,7 +287,15 @@ async function applyFileSearch(
 
 export async function querySessionDirectory(input: QuerySessionDirectoryInput): Promise<SessionDirectoryPage> {
   throwIfAborted(input.signal)
-  assertUniquePersistedSessionIdentities(input.projects)
+  const identityCollision = findPersistedIdentityCollisions(input.projects)
+  if (identityCollision) {
+    logger.error({
+      collisionCount: identityCollision.collisionCount,
+      duplicateItemCount: identityCollision.duplicateItemCount,
+      collisionKeySamples: identityCollision.collisionKeySamples,
+      collisionKeySamplesTruncated: identityCollision.collisionKeySamplesTruncated,
+    }, 'Session directory identity collision; omitting conflicted sessions')
+  }
 
   const limit = Math.min(input.query.limit ?? MAX_DIRECTORY_PAGE_ITEMS, MAX_DIRECTORY_PAGE_ITEMS)
   const tier = input.query.tier ?? 'title'
@@ -289,7 +306,9 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     ...input.terminalMeta.map((meta) => meta.updatedAt),
   )
 
-  let items = toItems(input.projects, input.terminalMeta).sort(compareItems)
+  let items = toItems(input.projects, input.terminalMeta)
+    .filter((item) => !identityCollision?.keys.has(buildSessionKey(item)))
+    .sort(compareItems)
 
   // Server-side visibility pre-filtering to avoid wasting search budget on
   // sessions the client will hide. Matches the client's default sidebar settings.
@@ -368,6 +387,19 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   if (partial) {
     page.partial = partial
     page.partialReason = partialReason
+  }
+  if (identityCollision) {
+    // Do not silently choose one duplicate.  Every ambiguous row is removed
+    // from this response, the structured error is logged above, and the UI
+    // gets enough information to explain how to recover without leaking
+    // session ids or source paths over the wire.
+    page.partial = true
+    page.partialReason ??= 'identity_collision'
+    page.integrityError = {
+      kind: 'identity_collision',
+      collisionCount: identityCollision.collisionCount,
+      duplicateItemCount: identityCollision.duplicateItemCount,
+    }
   }
 
   return page

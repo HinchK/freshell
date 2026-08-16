@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import type { SessionDirectoryIntegrityError } from '@shared/read-models'
 import type { ProjectGroup } from './types'
 import type { TerminalMetaRecord } from './terminalMetaSlice'
 
@@ -23,14 +24,46 @@ export interface SessionWindowState {
   appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error'
+  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  /** Conflicted persisted identities were quarantined by the server. */
+  integrityError?: SessionDirectoryIntegrityError
 }
 
 function sessionKey(s: any): string {
   return `${s.provider || 'claude'}:${s.sessionId}`
 }
 
+/**
+ * The usual session-window path is already valid and identity-unique. Keep
+ * its project and session references intact instead of rebuilding every row
+ * on each WebSocket patch; the slower normalizer below remains the defensive
+ * path for persisted or malformed input.
+ */
+function projectsAreAlreadyNormalized(payload: unknown): payload is ProjectGroup[] {
+  if (!Array.isArray(payload)) return false
+  const seenSessionKeys = new Set<string>()
+  for (const raw of payload) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+    const project = raw as ProjectGroup
+    if (typeof project.projectPath !== 'string' || project.projectPath.length === 0) return false
+    if (!Array.isArray(project.sessions)) return false
+    if (project.color !== undefined && (typeof project.color !== 'string' || project.color.length === 0)) {
+      return false
+    }
+    for (const session of project.sessions) {
+      if (!session || typeof session !== 'object' || Array.isArray(session)) return false
+      if (typeof session.sessionId !== 'string' || session.sessionId.length === 0) return false
+      if (typeof session.provider !== 'string' || session.provider.length === 0) return false
+      const key = sessionKey(session)
+      if (seenSessionKeys.has(key)) return false
+      seenSessionKeys.add(key)
+    }
+  }
+  return true
+}
+
 function normalizeProjects(payload: unknown): ProjectGroup[] {
+  if (projectsAreAlreadyNormalized(payload)) return payload
   if (!Array.isArray(payload)) return []
   const result: ProjectGroup[] = []
   const seenSessionKeys = new Set<string>()
@@ -166,7 +199,8 @@ type SessionWindowCommitPayload = {
   searchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
-  partialReason?: 'budget' | 'io_error'
+  partialReason?: 'budget' | 'io_error' | 'identity_collision'
+  integrityError?: SessionDirectoryIntegrityError
 }
 
 function commitWindowPayload(
@@ -185,6 +219,7 @@ function commitWindowPayload(
   window.deepSearchPending = payload.deepSearchPending ?? false
   window.partial = payload.partial
   window.partialReason = payload.partialReason
+  window.integrityError = payload.integrityError
 }
 
 function syncWindowProjectsFromTopLevel(window: SessionWindowState, state: SessionsState) {

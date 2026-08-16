@@ -59,12 +59,30 @@ export const SessionDirectoryItemSchema = z.object({
   liveTerminalOnly: z.boolean().optional(),
 })
 
+/**
+ * A server-detected read-model integrity issue.  The response deliberately
+ * contains counts only: the server log has the bounded diagnostic samples and
+ * source paths, while a browser response must not expose local filesystem
+ * details.
+ */
+export const SessionDirectoryIntegrityErrorSchema = z.object({
+  kind: z.literal('identity_collision'),
+  collisionCount: z.number().int().positive(),
+  duplicateItemCount: z.number().int().min(2),
+})
+
 export const SessionDirectoryPageSchema = z.object({
   items: z.array(SessionDirectoryItemSchema),
   nextCursor: z.string().nullable(),
   revision: z.number().int().nonnegative(),
   partial: z.boolean().optional(),
-  partialReason: z.enum(['budget', 'io_error']).optional(),
+  partialReason: z.enum(['budget', 'io_error', 'identity_collision']).optional(),
+  /**
+   * Present when conflicted persisted rows were quarantined from this page.
+   * `partial` is also true in that case so existing partial-result consumers
+   * retain their conservative behavior.
+   */
+  integrityError: SessionDirectoryIntegrityErrorSchema.optional(),
   // SESSION-05 (project colors): the resolved per-project color map,
   // present only when at least one color is configured. This page is the
   // channel the client's refetch-after-`sessions.changed` reads to recolor
@@ -125,6 +143,7 @@ export type ReadModelPriority = z.infer<typeof ReadModelPrioritySchema>
 export type ReadModelLane = z.infer<typeof ReadModelLaneSchema>
 export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
 export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
+export type SessionDirectoryIntegrityError = z.infer<typeof SessionDirectoryIntegrityErrorSchema>
 export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
 export type FreshAgentThreadTurnsQuery = z.infer<typeof FreshAgentThreadTurnsQuerySchema>

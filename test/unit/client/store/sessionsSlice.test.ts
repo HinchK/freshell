@@ -537,6 +537,22 @@ describe('sessionsSlice', () => {
   })
 
   describe('applySessionsPatch', () => {
+    it('keeps normalized session references on a no-op WebSocket patch', () => {
+      let state = sessionsReducer(initialState, setProjects(mockProjects))
+      state = sessionsReducer(state, markWsSnapshotReceived())
+      const originalSession = state.projects[0]?.sessions[0]
+
+      const next = sessionsReducer(state, applySessionsPatch({
+        upsertProjects: [],
+        removeProjectPaths: [],
+      }))
+
+      const nextSession = next.projects
+        .flatMap((project) => project.sessions)
+        .find((session) => session.sessionId === originalSession?.sessionId)
+      expect(nextSession).toBe(originalSession)
+    })
+
     it('ignores patches until a WS sessions.updated snapshot has been received', () => {
       const starting = sessionsReducer(undefined, setProjects([
         { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }] },

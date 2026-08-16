@@ -95,7 +95,7 @@ describe('GET /api/session-directory', () => {
     expect(typeof res.body.revision).toBe('number')
   })
 
-  it('returns 500 when the persisted read model contains an identity collision', async () => {
+  it('quarantines persisted identity collisions while serving healthy session rows', async () => {
     const collisionCount = 1_003
     const collisionProjects: ProjectGroup[] = Array.from(
       { length: collisionCount },
@@ -123,6 +123,16 @@ describe('GET /api/session-directory', () => {
         }
       },
     )
+    collisionProjects.push({
+      projectPath: '/repo/healthy',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'healthy-session',
+        projectPath: '/repo/healthy',
+        lastActivityAt: 300,
+        title: 'Healthy session',
+      }],
+    })
     app = express()
     app.use(express.json())
     app.use('/api', (req, res, next) => {
@@ -148,24 +158,29 @@ describe('GET /api/session-directory', () => {
       .get('/api/session-directory?priority=visible&includeSubagents=false&limit=1')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
-    expect(res.status).toBe(500)
-    expect(res.body).toEqual({
-      error: 'Session directory identity collision',
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({
+      items: [expect.objectContaining({ sessionId: 'healthy-session' })],
+      partial: true,
+      partialReason: 'identity_collision',
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount,
+        duplicateItemCount: collisionCount * 2,
+      },
     })
+    expect(res.body.items).toHaveLength(1)
+    expect(JSON.stringify(res.body)).not.toContain('cursor-duplicate-0000')
     const expectedSamples = Array.from({ length: 20 }, (_, index) => (
       `claude:cursor-duplicate-${String(index).padStart(4, '0')}`
     ))
     expect(loggerMocks.error).toHaveBeenCalledTimes(1)
     expect(loggerMocks.error).toHaveBeenCalledWith({
-      err: expect.objectContaining({
-        name: 'SessionDirectoryIdentityCollisionError',
-        message: 'Session directory identity collision',
-      }),
       collisionCount,
       duplicateItemCount: collisionCount * 2,
       collisionKeySamples: expectedSamples,
       collisionKeySamplesTruncated: true,
-    }, 'Session directory identity collision')
+    }, 'Session directory identity collision; omitting conflicted sessions')
 
     const loggedFields = loggerMocks.error.mock.calls[0]?.[0]
     expect(JSON.stringify(loggedFields).length).toBeLessThan(2_000)

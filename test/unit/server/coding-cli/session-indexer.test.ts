@@ -951,6 +951,36 @@ describe('CodingCliSessionIndexer', () => {
     expect(sessionId).toBe('legacy-id')
   })
 
+  it('keeps a non-subagent Claude override written under its former embedded id', async () => {
+    const fileA = path.join(tempDir, 'canonical-filename.jsonl')
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Parsed title' }) + '\n')
+    const oldEmbeddedId = 'embedded-before-canonicalization'
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', oldEmbeddedId)]: {
+          titleOverride: 'Durable user rename',
+          titleSource: 'user',
+        },
+      },
+      settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+    })
+    const provider = makeProvider([fileA], {
+      parseSessionFile: async () => ({
+        cwd: '/project/a',
+        title: 'Parsed title',
+        sessionId: oldEmbeddedId,
+      }),
+    })
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+
+    expect(indexer.getProjects()[0]?.sessions[0]).toMatchObject({
+      sessionId: 'canonical-filename',
+      title: 'Durable user rename',
+    })
+  })
+
   it('uses a real Claude child filename as identity during a full scan even when lines embed the parent id', async () => {
     const claudeHome = path.join(tempDir, '.claude')
     const cwd = path.join(tempDir, 'project')
@@ -2324,6 +2354,30 @@ describe('CodingCliSessionIndexer', () => {
 
       const session = indexer.getProjects()[0]?.sessions[0]
       expect(session?.sessionType).toBe('freshclaude')
+    })
+
+    it('keeps a non-subagent Claude session type written under its former embedded id', async () => {
+      const fileA = path.join(tempDir, 'canonical-filename.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+      const oldEmbeddedId = 'embedded-before-canonicalization'
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Title A',
+          sessionId: oldEmbeddedId,
+        }),
+      })
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', oldEmbeddedId)]: { sessionType: 'freshclaude' },
+      })
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]).toMatchObject({
+        sessionId: 'canonical-filename',
+        sessionType: 'freshclaude',
+      })
     })
 
     it('applies persisted sessionType metadata to indexed sessions for left-panel reopen', async () => {

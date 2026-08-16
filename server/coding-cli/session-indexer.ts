@@ -201,6 +201,24 @@ export function isSubagentSession(filePath: string): boolean {
   return normalized.includes('/.claude/') || normalized.includes('\\.claude\\')
 }
 
+/**
+ * Claude subagent transcripts embed their parent's id, not an old identity
+ * for the child. Keep compatibility aliases only for non-subagent files so a
+ * parent rename, archive, or session type can never leak to every child.
+ */
+function legacyClaudeSessionId(
+  provider: CodingCliProvider,
+  filePath: string,
+  meta: { sessionId?: string; isSubagent?: boolean },
+  canonicalSessionId: string,
+): string | undefined {
+  if (provider.name !== 'claude' || isSubagentSession(filePath) || meta.isSubagent) return undefined
+  const embeddedSessionId = meta.sessionId?.trim()
+  return embeddedSessionId && embeddedSessionId !== canonicalSessionId
+    ? embeddedSessionId
+    : undefined
+}
+
 function applyOverride(
   session: CodingCliSession,
   ov: SessionOverride | undefined,
@@ -425,6 +443,12 @@ type CachedSessionEntry = {
    * (kata v4rw). Undefined for providers that don't expose sidecar activity.
    */
   activityMtimeMs?: number
+  /**
+   * Former identity retained only for safe provider migrations. It is used
+   * for read-only fallback lookups of user-owned overrides/metadata; the
+   * canonical `baseSession.sessionId` always remains the row identity.
+   */
+  legacySessionId?: string
 }
 
 export type SessionIndexerOptions = {
@@ -990,10 +1014,17 @@ export class CodingCliSessionIndexer {
 
     const projectPath = await provider.resolveProjectPath(filePath, meta)
     const sessionId = provider.extractSessionId(filePath, meta)
+    const legacySessionId = legacyClaudeSessionId(provider, filePath, meta, sessionId)
     const previous = cached?.lightweight ? undefined : cached?.baseSession
     const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
     const metaKey = makeSessionKey(provider.name, sessionId)
-    const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
+    const legacyMetaKey = legacySessionId
+      ? makeSessionKey(provider.name, legacySessionId)
+      : undefined
+    const storedTitle = normalizeTitle(
+      sessionMetadata[metaKey]?.derivedTitle
+        ?? (legacyMetaKey ? sessionMetadata[legacyMetaKey]?.derivedTitle : undefined),
+    )
     const parsedTitle = normalizeTitle(meta.title)
     const resolvedTitle = resolveSessionTitle(parsedTitle, sameSession ? previous?.title : undefined, storedTitle)
     let resolvedTitleSource: ParsedSessionTitleSource | undefined
@@ -1051,6 +1082,7 @@ export class CodingCliSessionIndexer {
       baseSession,
       titleSource: resolvedTitleSource,
       activityMtimeMs,
+      legacySessionId,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
@@ -1172,21 +1204,25 @@ export class CodingCliSessionIndexer {
       if (!cached.baseSession) continue
       const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
       let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[cached.baseSession.sessionId]
-      if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
-        const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
-        if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
-          const legacyKey = makeSessionKey(cached.baseSession.provider, legacySessionId)
-          const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[legacySessionId]
-          if (legacyOverride) {
-            logger.warn({ sessionId: cached.baseSession.sessionId, legacySessionId }, 'Using legacy Claude session override')
-            ov = legacyOverride
-          }
+      if (!ov && cached.legacySessionId) {
+        const legacyKey = makeSessionKey(cached.baseSession.provider, cached.legacySessionId)
+        const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[cached.legacySessionId]
+        if (legacyOverride) {
+          logger.debug({
+            sessionId: cached.baseSession.sessionId,
+            legacySessionId: cached.legacySessionId,
+          }, 'Using compatibility session override')
+          ov = legacyOverride
         }
       }
       const merged = applyOverride(cached.baseSession, ov, cached.titleSource)
       if (!merged) continue
       const metaKey = makeSessionKey(merged.provider, merged.sessionId)
+      const legacyMetaKey = cached.legacySessionId
+        ? makeSessionKey(merged.provider, cached.legacySessionId)
+        : undefined
       const meta = sessionMetadata[metaKey]
+        ?? (legacyMetaKey ? sessionMetadata[legacyMetaKey] : undefined)
       if (meta?.sessionType) {
         merged.sessionType = meta.sessionType
       }
@@ -1298,8 +1334,15 @@ export class CodingCliSessionIndexer {
       if (existing && existing.baseSession) continue
 
       const sessionId = provider.extractSessionId(meta.filePath, meta)
+      const legacySessionId = legacyClaudeSessionId(provider, meta.filePath, meta, sessionId)
       const metaKey = makeSessionKey(provider.name, sessionId)
-      const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
+      const legacyMetaKey = legacySessionId
+        ? makeSessionKey(provider.name, legacySessionId)
+        : undefined
+      const storedTitle = normalizeTitle(
+        sessionMetadata[metaKey]?.derivedTitle
+          ?? (legacyMetaKey ? sessionMetadata[legacyMetaKey]?.derivedTitle : undefined),
+      )
       const resolvedTitle = resolveSessionTitle(meta.title, existing?.baseSession?.title, storedTitle)
       const projectPath = meta.cwd ? await resolveGitRepoRoot(meta.cwd) : meta.cwd
       const baseSession: CodingCliSession = {
@@ -1321,6 +1364,7 @@ export class CodingCliSessionIndexer {
         baseSession,
         titleSource: meta.titleSource,
         lightweight: true,
+        legacySessionId,
       })
       this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), meta.filePath)
     }
