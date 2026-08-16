@@ -122,10 +122,22 @@ it('reveal after a clamped hidden attach emits terminal.resize even when fitted 
     ).toBe(true)
   })
 
+  // AS-BUILT (checked): complete the hidden attach generation first
+  // (attach.ready drives deferredAttachStateRef to 'live'), then flip
+  // `hidden` on the SAME TerminalView component (do NOT swap component
+  // types — see as-built note below) and await the reveal effect's resize.
   wsMocks.send.mockClear()
+  act(() => {
+    messageHandler!({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 0, replayFromSeq: 1, replayToSeq: 0,
+      attachRequestId: <sent attach requestId>,
+    })
+  })
   rerender(
     <Provider store={store}>
-      <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={false} />
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden={false} />
     </Provider>,
   )
 
@@ -145,7 +157,7 @@ it('reveal after a clamped hidden attach emits terminal.resize even when fitted 
 })
 ```
 
-T3 — surface reset at clamped full replay (protects round-1 finding-2 against a bookkeeping-degraded implementation; runs green-by-construction on the correct one): mount hidden via T1's shape and drive ONE full attach generation so the mocked surface is non-empty (`term.write` receives `PRIOR-SURFACE-MARKER` once); assert the mocked `term.clear` was called for that attach (clearViewportFirst viewport bookkeeping). Then force a SECOND hidden clamped attach (`onActiveTabReady` again) with its own `attachRequestId` on every frame: attach.ready `{ headSeq: 6, replayFromSeq: 3, replayToSeq: 6 }` and output `{ seqStart: 3, seqEnd: 6, data: 'CLAMPED-REPLAY-MARKER' }`. Assert: (a) the second attach ALSO invoked `term.clear` — proves client bookkeeping kept viewport-hydrate surface-reset semantics under the wire-keepalive token (this FAILS if someone downgrades internal bookkeeping to keepalive semantics, which skips the clear branch); (b) `PRIOR-SURFACE-MARKER` appears exactly once and `CLAMPED-REPLAY-MARKER` exactly once across all `term.write` mock calls.
+T3 — surface reset at clamped full replay (protects round-1 finding-2 against a bookkeeping-degraded implementation; runs green-by-construction on the correct one): mount hidden via T1's shape and drive ONE full attach generation so the mocked surface is non-empty (`term.write` receives `PRIOR-SURFACE-MARKER` once); assert the mocked `term.clear` was called for that attach (clearViewportFirst viewport bookkeeping). Then force a SECOND hidden clamped attach (the hydration queue is one-shot per pane — re-arm via `store.dispatch(requestPaneRefresh({ tabId, paneId }))`, the production hidden re-arm path) with its own `attachRequestId` on every frame: attach.ready `{ headSeq: 6, replayFromSeq: 3, replayToSeq: 6 }` and output `{ seqStart: 3, seqEnd: 6, data: 'CLAMPED-REPLAY-MARKER' }`. Assert: (a) the second attach ALSO invoked `term.clear` — proves client bookkeeping kept viewport-hydrate surface-reset semantics under the wire-keepalive token (this FAILS if someone downgrades internal bookkeeping to keepalive semantics, which skips the clear branch); (b) `PRIOR-SURFACE-MARKER` appears exactly once and `CLAMPED-REPLAY-MARKER` exactly once across all `term.write` mock calls.
 
 Also update the pre-existing hidden replay-gap test "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output" (~line 8685): change ONLY its attach wait predicate from `intent === 'viewport_hydrate'` to `intent === 'keepalive_delta'` (the production recreate predicate is NOT changed — `currentAttachRef.intent` retains viewport bookkeeping; that is part of the production contract this redesign pins). Any other pre-existing assertion of a hidden wire `viewport_hydrate` gets the same single-word update under the old-contract rule; record every touched test in the task report. Visible-pane assertions (e.g. "recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output" and the reconnect-before-reveal test at ~4635) must stay untouched and green.
 
@@ -159,7 +171,7 @@ Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix) and FAIL for T
 
 Changes live in two places in `src/components/TerminalView.tsx`.
 
-3a. **Close the visibility-race window** (round-2 finding 3, round-3 finding 1). `hiddenRef` is currently synced only in a passive effect (~1191-1199). Move the assignment to a **commit-phase layout effect** (`useLayoutEffect`): a layout effect runs synchronously with the commit, before any passive effect and before any separately-scheduled external callback can observe stale visibility — unlike render-phase writes, it cannot leak visibility from an uncommitted/superseded render (round-3's catching of the earlier render-sync proposal). Net change: convert the existing sync to `useLayoutEffect(() => { hiddenRef.current = hidden; ...existing extra side effects unchanged... }, [hidden, paneId])` (imports already include the hooks; keep the effect's cleanup extras as-is). No new T4 race test: act-wrapped rerender flushes passive effects in the harness, so no unit test can witness the window (round-3 finding 2); the change is a defensive commit-phase sync validated by the whole lifecycle suite staying green, and the residual theoretical window is recorded as an accepted residual.
+3a. **Close the visibility-race window** (round-2 finding 3, round-3 finding 1). `hiddenRef` is currently synced only in a passive effect (~1191-1199). Move the assignment to a **commit-phase layout effect** (`useLayoutEffect`): a layout effect runs synchronously with the commit, before any passive effect and before any separately-scheduled external callback can observe stale visibility — unlike render-phase writes, it cannot leak visibility from an uncommitted/superseded render (round-3's catching of the earlier render-sync proposal). Net change: convert the existing sync to `useLayoutEffect(() => { hiddenRef.current = hidden; ...existing extra side effects unchanged... }, [hidden, paneId])` (the import was added — `useLayoutEffect` was NOT previously imported at base; this parenthetical corrects the earlier claim). No new T4 race test: act-wrapped rerender flushes passive effects in the harness, so no unit test can witness the window (round-3 finding 2); the change is a defensive commit-phase sync validated by the whole lifecycle suite staying green, and the residual theoretical window is recorded as an accepted residual.
 
 3b. **The clamp in `attachTerminal`** (~2698):
 
@@ -295,7 +307,7 @@ git commit -m "test(e2e): pin geometry-neutral boot-time background hydration an
 - No tracked file changes. Evidence (screenshots + captured dims) is written to the run logs `reports/` only.
 
 **Interfaces:**
-- Consumes: Tasks 1-2. Scratch dev instance from the worktree per repo process-safety rules: `NODE_ENV=development PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid` from the worktree, teasing out the token, driving via a browser (the agent's browser automation).
+- Consumes: Tasks 1-2. Scratch dev instance from the worktree per repo process-safety rules (runbook mirrors the executed procedure): `NODE_ENV=development PORT=3344 VITE_PORT=5273 setsid npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid` from the worktree (setsid puts the wrapper and all concurrently children in one owned process group; VITE_PORT is pinned because stock 5173 may be occupied — the client dev origin is the Vite port, the Express API is 3344), teasing out the token from `.env`, driving via the browser automation the agent environment provides (Vite origin `http://localhost:5273/?token=...&e2e=1` proxies /api + /ws to 3344).
 
 - [x] **Step 1: Boot + witness setup**
 
@@ -313,7 +325,12 @@ Verify ownership before stopping: `ps -fp "$(cat /tmp/freshell-3344.pid)"` and c
 PGID=$(ps -o pgid= -p "$(cat /tmp/freshell-3344.pid)" | tr -d ' ')
 ps -o cmd= -g "$PGID"   # eyeball: all members must belong to this scratch instance/worktree
 kill -TERM -- "-$PGID"
-sleep 2; (command -v ss >/dev/null && ss -tlnp | grep -E ':(3344|5273)\b' && echo 'STILL BOUND — investigate before proceeding' || true)
+sleep 2
+if command -v ss >/dev/null && ss -tlnp | grep -qE ':(3344|5273)\b'; then
+  echo 'STILL BOUND — do NOT remove the pid file; list the holders and terminate only SCRATCH members' >&2
+  ss -tlnp | grep -E ':(3344|5273)\b' >&2
+  exit 1
+fi
 rm -f /tmp/freshell-3344.pid
 ```
 
