@@ -289,6 +289,76 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
+  it('a deny/errored completion emits sdk.result + idle and NEVER an sdk.turn.complete (D1-F2)', async () => {
+    const eventsLog = path.join(tmp, 'events.jsonl')
+    const fx = launch({
+      rules: [
+        {
+          on: 'msg:send',
+          match: { text: 'RAISE_PERMISSION' },
+          emit: [
+            { kind: 'approval', data: { id: 'req-perm-1', tool: 'Bash', input: { command: 'ls' } } },
+          ],
+        },
+        {
+          on: 'msg:permission.respond',
+          match: { decision: { behavior: 'deny' } },
+          emit: [{ kind: 'completion', data: { subtype: 'error', text: 'The user denied this request.' } }],
+        },
+      ],
+    }, { FRESHELL_FAKE_EVENTS: eventsLog })
+    try {
+      fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
+      const created = await fx.waitLine((o) => o.type === 'created', 'created')
+      const sessionId = created.sessionId as string
+
+      fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION' })
+      await fx.waitLine((o) => o.type === 'sdk.permission.request', 'permission.request')
+      // Parked: NO completion frame may arrive before the respond.
+      expect(fx.stdoutLines().some((o) => o.type === 'sdk.turn.complete')).toBe(false)
+
+      fx.send({ type: 'permission.respond', sessionId, requestId: 'req-perm-1', decision: { behavior: 'deny' } })
+      // Race-free: the errored sdk.result is the terminal marker for the deny
+      // continuation (the following sdk.status idle renders synchronously).
+      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error', 'errored sdk.result')
+
+      const out = fx.stdoutLines()
+      expect(
+        out.filter((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId),
+        'a denied turn must NEVER emit a positive completion edge (AGENTS.md invariant)',
+      ).toEqual([])
+      expect(
+        out.some((o) => o.type === 'sdk.assistant' && o.sessionId === sessionId
+          && o.content?.[0]?.text?.includes('denied')),
+        'the denial assistant frame arrived',
+      ).toBe(true)
+      expect(
+        out.some((o) => o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle'),
+        'the turn still closes to idle',
+      ).toBe(true)
+
+      // The outbound wire audit records exactly what went over stdout.
+      const wires = readJsonl(eventsLog).filter((r) => r.kind === 'wire')
+      expect(
+        wires.some((r) => r.frame?.type === 'sdk.turn.complete'),
+        'the wire audit too shows NO turn.complete for the deny',
+      ).toBe(false)
+      expect(
+        wires.some((r) => r.frame?.type === 'sdk.result' && r.frame?.result === 'error'),
+        'the wire audit records the errored sdk.result',
+      ).toBe(true)
+
+      // A plain turn still completes the positive way (fidelity pin):
+      // sdk.result{success} AND sdk.turn.complete.
+      fx.send({ type: 'send', sessionId, text: 'plain follow-up' })
+      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'positive completion')
+      const out2 = fx.stdoutLines()
+      expect(out2.some((o) => o.type === 'sdk.result' && o.result === 'success')).toBe(true)
+    } finally {
+      await fx.stop()
+    }
+  })
+
   it('writes the durable claude transcript the snapshot route reads (create-touch, user on send, assistant on completion)', async () => {
     const fx = launch(RAISE_PROGRAM)
     try {

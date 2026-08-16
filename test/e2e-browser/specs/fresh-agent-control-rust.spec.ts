@@ -70,6 +70,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
+import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -195,7 +196,10 @@ const CLAUDE_PROGRAM = {
       match: { text: '/compact focus the diff' },
       emit: [
         { kind: 'activity', data: { status: 'compacting' } },
-        { kind: 'completion', delayMs: 300, data: { subtype: 'success' } },
+        // The compacting indicator assertion polls attribute state; under
+        // full-suite multi-worker load the page's rAF polling can stall beyond a
+        // few hundred ms, so the hold must comfortably outlast that (1500ms).
+        { kind: 'completion', delayMs: 1500, data: { subtype: 'success' } },
       ],
     },
     {
@@ -207,6 +211,65 @@ const CLAUDE_PROGRAM = {
 }
 
 // ── Copied helpers (donor: freshclaude-identity-persistence-rust.spec.ts) ────
+
+/**
+ * Raw node-side WS client with a real hello handshake — used to drive the
+ * EXACT `freshAgent.attach` a rehydrating pane would send for a session id
+ * (AGENT-07's source-durability probe: the forked pane rides the child, so
+ * the SOURCE session's resume attach is driven here instead).
+ * (donor: freshagent-settings-resume-rust.spec.ts's WsCapture.)
+ */
+class WsCapture {
+  private ws: WebSocket
+  readonly frames: any[] = []
+  private opened: Promise<void>
+
+  constructor(baseUrl: string, token: string) {
+    const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/ws`
+    this.ws = new WebSocket(wsUrl)
+    this.opened = new Promise((resolve, reject) => {
+      this.ws.on('open', () => {
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 7, token }))
+        resolve()
+      })
+      this.ws.on('error', reject)
+    })
+    this.ws.on('message', (data) => {
+      try {
+        this.frames.push(JSON.parse(String(data)))
+      } catch {
+        // non-JSON frames are not part of this protocol; ignore
+      }
+    })
+  }
+
+  async ready(): Promise<void> {
+    await this.opened
+    await this.waitFor((f) => f.type === 'ready', 10_000, 'ready')
+  }
+
+  async waitFor(pred: (frame: any) => boolean, timeoutMs: number, label: string): Promise<any> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const hit = this.frames.find(pred)
+      if (hit) return hit
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    throw new Error(`WsCapture: timed out waiting for ${label}`)
+  }
+
+  send(frame: unknown): void {
+    this.ws.send(JSON.stringify(frame))
+  }
+
+  close(): void {
+    try {
+      this.ws.close()
+    } catch {
+      // already closed
+    }
+  }
+}
 
 async function selectShellIfPickerShowing(page: Page): Promise<void> {
   const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
@@ -614,6 +677,54 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       expect(
         completions.every((e) => e.data?.subtype === 'error'),
         'a deny must never produce a success completion',
+      ).toBe(true)
+
+      // D1-F2 WIRE TRUTH: the fixture mirrors the real sidecar — the errored
+      // turn emits sdk.result{result:'error'} + sdk.status:idle and NO
+      // sdk.turn.complete, so the browser can never receive a false positive
+      // freshAgent.turn.complete through the Rust rename. Race-free: poll the
+      // outbound ledger until the errored result AND the following idle marker
+      // exist, THEN assert the absence of turn.complete earlier in the log
+      // (the follow-up send below is a LATER, legitimately-completing turn on
+      // the same session — this assertion is fenced BEFORE it).
+      const deniedBridgeId = respond.sessionId as string
+      await expect
+        .poll(
+          () => {
+            const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
+            const resultIdx = wires.findIndex(
+              (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
+                && r.frame?.result === 'error',
+            )
+            if (resultIdx === -1) return false
+            return wires.slice(resultIdx + 1).some(
+              (r) => r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
+                && r.frame?.status === 'idle',
+            )
+          },
+          { timeout: 15_000, message: 'the errored sdk.result + trailing idle marker for the denied turn' },
+        )
+        .toBe(true)
+      const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
+      const resultIdx = wires.findIndex(
+        (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
+          && r.frame?.result === 'error',
+      )
+      expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
+      const idleIdx = wires.findIndex(
+        (r, i) => i > resultIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
+          && r.frame?.status === 'idle',
+      )
+      expect(
+        wires
+          .slice(0, idleIdx + 1)
+          .filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId),
+        'no sdk.turn.complete may exist for the denied session up to its close (never a false completion)',
+      ).toEqual([])
+      expect(
+        wires.some((r) => r.frame?.type === 'sdk.assistant' && r.frame?.sessionId === deniedBridgeId
+          && r.frame?.content?.[0]?.text?.includes('denied')),
+        'the denial assistant frame did arrive on the wire',
       ).toBe(true)
 
       // Prompt-usable again: a plain follow-up send completes normally.
@@ -1376,6 +1487,56 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         expect(ids.sort()).toEqual(['turn-1:row-0', 'turn-1:row-1'])
       }).toPass({ timeout: 30_000 })
 
+      // AGENT-07 (a′, delta-round-1 fix D1-F3): the SOURCE remains independently
+      // durable after the forked repoint + the client's parent-kill. The attach
+      // below must land AFTER the parent's kill (else the kill would reap the
+      // resumed runtime) — gate on the kill frame leaving the page.
+      await expect
+        .poll(async () =>
+          (await lane.harness.getSentWsMessages() as any[])
+            .filter((m) => m?.type === 'freshAgent.kill' && m?.sessionId === 'thread-new-1')
+            .length,
+        { timeout: 30_000, message: 'the client killed the parent after the forked repoint' })
+        .toBe(1)
+      // Drive the SAME resume-attach a rehydrating pane would send for the
+      // source id: the fake must log a thread/resume for it, and its transcript
+      // must render the FULL pre-fork history through the REST snapshot — turns
+      // visible, under a fixture identity DISTINCT from the child's.
+      const sourceAttachWs = new WsCapture(lane.info.baseUrl, lane.info.token)
+      await sourceAttachWs.ready()
+      sourceAttachWs.send({
+        type: 'freshAgent.attach',
+        provider: 'codex',
+        sessionId: 'thread-new-1',
+        sessionType: 'freshcodex',
+        cwd: lane.projectDir,
+        resumeSessionId: 'thread-new-1',
+        sessionRef: { provider: 'codex', sessionId: 'thread-new-1' },
+      })
+      // No thread/resume for the source existed before this attach (create rode
+      // thread/start; the fork handoff's resume named the child), so the FIRST
+      // such op row is the proof of the source's independent resume.
+      const sourceResume = await waitForLogEntry(
+        lane.opLogPath,
+        (o) => o.method === 'thread/resume' && o.params?.threadId === 'thread-new-1',
+        'thread/resume of the SOURCE after its parent-kill',
+        30_000,
+      )
+      // The resumed source sidecar is a fresh process: its resume lands on a
+      // listener distinct from the original parent's.
+      expect(sourceResume.listenUrl).not.toBe(forkOp.listenUrl)
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')
+        expect(snapshot).toBeTruthy()
+        const ids = (snapshot.turns ?? []).map((t: any) => t.turnId ?? t.id).sort()
+        expect(
+          ids,
+          'the source transcript renders BOTH pre-fork turns (unchanged by the fork)',
+        ).toEqual(['turn-1:row-0', 'turn-1:row-1', 'turn-2:row-0', 'turn-2:row-1'])
+      }).toPass({ timeout: 30_000 })
+      expect(childId, 'distinct fixture identities: child ≠ source').not.toBe('thread-new-1')
+      sourceAttachWs.close()
+
       // AGENT-07 (c1) browser-loss durability: reload; the SAME child id
       // re-hydrates (attach succeeds against the live child session).
       await flushPersistence(page)
@@ -1391,6 +1552,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // AGENT-07 (c2) restart durability: abrupt reboot; the reconcile
       // re-drive RESUMES the durable child through the fake (a fresh fake
       // process reads the child's persisted turns from disk).
+      const opCountBeforeRestart = readCodexOps(lane.opLogPath).length
       await lane.server.restartAbrupt()
       await waitForWsReady(page)
       await waitForLogEntry(
@@ -1402,6 +1564,51 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect
         .poll(async () => (await paneLeaf(harness2, tabId2))?.content?.sessionId ?? null, { timeout: 60_000 })
         .toBe(childId)
+
+      // AGENT-07 (a′ cont., D1-F3): after the abrupt restart the SOURCE must
+      // resume too — the pane proves the CHILD, this attach proves the SOURCE.
+      const sourceRestartWs = new WsCapture(lane.info.baseUrl, lane.info.token)
+      await sourceRestartWs.ready()
+      sourceRestartWs.send({
+        type: 'freshAgent.attach',
+        provider: 'codex',
+        sessionId: 'thread-new-1',
+        sessionType: 'freshcodex',
+        cwd: lane.projectDir,
+        resumeSessionId: 'thread-new-1',
+        sessionRef: { provider: 'codex', sessionId: 'thread-new-1' },
+      })
+      await expect
+        .poll(
+          () => readCodexOps(lane.opLogPath)
+            .slice(opCountBeforeRestart)
+            .some((o) => o.method === 'thread/resume' && o.params?.threadId === 'thread-new-1'),
+          { timeout: 60_000, message: 'post-restart thread/resume of the SOURCE' },
+        )
+        .toBe(true)
+      // Resume/read evidence for BOTH ids post-restart (the child's resume
+      // rides its pane re-attach; its read + the source's resume/read are
+      // driven explicitly here, so the op-log window proves BOTH transcripts
+      // still render — the child at the fork pin, the source in full).
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshcodex', 'codex', childId)
+        expect((snapshot.turns ?? []).map((t: any) => t.turnId ?? t.id).sort())
+          .toEqual(['turn-1:row-0', 'turn-1:row-1'])
+      }).toPass({ timeout: 30_000 })
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')
+        expect((snapshot.turns ?? []).map((t: any) => t.turnId ?? t.id).sort())
+          .toEqual(['turn-1:row-0', 'turn-1:row-1', 'turn-2:row-0', 'turn-2:row-1'])
+      }).toPass({ timeout: 30_000 })
+      await expect
+        .poll(() => {
+          const post = readCodexOps(lane.opLogPath).slice(opCountBeforeRestart)
+          return ['thread-new-1', childId].every((id) =>
+            post.some((o) => o.method === 'thread/resume' && o.params?.threadId === id)
+            && post.some((o) => o.method === 'thread/read' && (o.threadId === id || o.params?.threadId === id)))
+        }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
+        .toBe(true)
+      sourceRestartWs.close()
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1623,6 +1830,54 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
         expect((snapshot?.turns ?? []).length).toBe(2) // user1 + assistant1 only
       }).toPass({ timeout: 30_000 })
 
+      // AGENT-07 (a′, delta-round-1 fix D1-F3): the SOURCE remains independently
+      // durable after the forked repoint + the client's parent-kill. The attach
+      // below must land AFTER the parent's kill (else the kill would reap the
+      // resumed runtime) — gate on the kill frame leaving the page.
+      await expect
+        .poll(async () =>
+          (await lane.harness.getSentWsMessages() as any[])
+            .filter((m) => m?.type === 'freshAgent.kill' && m?.sessionId === parentId)
+            .length,
+        { timeout: 30_000, message: 'the client killed the parent after the forked repoint' })
+        .toBe(1)
+      // Drive the SAME resume-attach a rehydrating pane would send for the
+      // source id: the fake serve must log its resume probe (session_get)
+      // POST-fork, and the source transcript renders the FULL pre-fork history
+      // — turns visible, under a fixture identity DISTINCT from the child's.
+      const sourceAttachWs = new WsCapture(lane.info.baseUrl, lane.info.token)
+      await sourceAttachWs.ready()
+      sourceAttachWs.send({
+        type: 'freshAgent.attach',
+        provider: 'opencode',
+        sessionId: parentId,
+        sessionType: 'freshopencode',
+        cwd: lane.projectDir,
+        resumeSessionId: parentId,
+        sessionRef: { provider: 'opencode', sessionId: parentId },
+      })
+      const forkRowIndex = readOpencodeAudit(lane.auditLogPath)
+        .findIndex((e) => e.event === 'fork' && e.sessionId === parentId)
+      await expect
+        .poll(
+          () => readOpencodeAudit(lane.auditLogPath)
+            .slice(forkRowIndex + 1)
+            .some((e) => e.event === 'session_get' && e.sessionId === parentId),
+          { timeout: 30_000, message: 'post-fork resume probe (session_get) of the SOURCE' },
+        )
+        .toBe(true)
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshopencode', 'opencode', parentId)
+        const texts = (snapshot?.turns ?? []).flatMap((t: any) =>
+          (t.items ?? []).map((i: any) => i.text).filter(Boolean),
+        )
+        expect(texts.some((t: string) => t.includes('opencode turn one'))).toBe(true)
+        expect(texts.some((t: string) => t.includes('opencode turn two'))).toBe(true)
+        expect((snapshot?.turns ?? []).length).toBe(4) // both pre-fork turns, unchanged
+      }).toPass({ timeout: 30_000 })
+      expect(childId, 'distinct fixture identities: child ≠ source').not.toBe(parentId)
+      sourceAttachWs.close()
+
       // AGENT-07 (c1) reload durability: the child id re-hydrates.
       await flushPersistence(page)
       await page.reload({ waitUntil: 'domcontentloaded' })
@@ -1634,10 +1889,13 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
         .poll(async () => (await paneLeaf(harness2, tabId2))?.content?.sessionId ?? null, { timeout: 30_000 })
         .toBe(childId)
 
-      // AGENT-07 (c2) restart durability: graceful reboot; the resume probe
-      // lands on the NEW fake serve process (a different pid than the fork's).
+      // AGENT-07 (c2) restart durability: ABRUPT reboot (delta-round-1 fix
+      // D1-F3 hardens the probe from graceful to SIGKILL-class); the resume
+      // probe lands on the NEW fake serve process (a different pid than the
+      // fork's).
       const forkServePid = forkAudit.pid
-      await lane.server.restart()
+      const auditCountBeforeRestart = readOpencodeAudit(lane.auditLogPath).length
+      await lane.server.restartAbrupt()
       await waitForWsReady(page)
       await waitForLogEntry(
         lane.auditLogPath,
@@ -1648,6 +1906,52 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
       await expect
         .poll(async () => (await paneLeaf(harness2, tabId2))?.content?.sessionId ?? null, { timeout: 60_000 })
         .toBe(childId)
+
+      // AGENT-07 (a′ cont., D1-F3): after the abrupt restart the SOURCE resumes
+      // too — the pane proves the CHILD, this attach proves the SOURCE (resume
+      // probe on the new serve process, full transcript still rendering).
+      const sourceRestartWs = new WsCapture(lane.info.baseUrl, lane.info.token)
+      await sourceRestartWs.ready()
+      sourceRestartWs.send({
+        type: 'freshAgent.attach',
+        provider: 'opencode',
+        sessionId: parentId,
+        sessionType: 'freshopencode',
+        cwd: lane.projectDir,
+        resumeSessionId: parentId,
+        sessionRef: { provider: 'opencode', sessionId: parentId },
+      })
+      await expect
+        .poll(
+          () => readOpencodeAudit(lane.auditLogPath)
+            .slice(auditCountBeforeRestart)
+            .some((e) => e.event === 'session_get' && e.sessionId === parentId && e.pid !== forkServePid),
+          { timeout: 60_000, message: 'post-restart resume probe of the SOURCE on the new serve' },
+        )
+        .toBe(true)
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshopencode', 'opencode', parentId)
+        expect(
+          (snapshot?.turns ?? []).length,
+          'the source transcript still renders both pre-fork turns post-restart',
+        ).toBe(4)
+      }).toPass({ timeout: 30_000 })
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshopencode', 'opencode', childId)
+        expect(
+          (snapshot?.turns ?? []).length,
+          'the child transcript still renders exactly its fork-point history post-restart',
+        ).toBe(2)
+      }).toPass({ timeout: 30_000 })
+      await expect
+        .poll(() => {
+          const post = readOpencodeAudit(lane.auditLogPath).slice(auditCountBeforeRestart)
+          return [parentId, childId].every((id) =>
+            post.some((e) => e.event === 'session_get' && e.sessionId === id)
+            && post.some((e) => e.event === 'message_list' && e.sessionId === id))
+        }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
+        .toBe(true)
+      sourceRestartWs.close()
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

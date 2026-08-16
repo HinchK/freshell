@@ -885,6 +885,25 @@ impl FreshOpencodeState {
     /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
     /// error still returns the pane to idle and surfaces the error loudly — never a
     /// false completion.
+    ///
+    /// TURN-SCOPED LIFECYCLE (delta-review round 1, D1-F1): the composer stays
+    /// interactive while a session is busy (queued sends) and the `/compact` slash
+    /// action sends `freshAgent.compact` without a busy gate, so a compact CAN arrive
+    /// mid-turn. Two defenses make a compact a first-class turn:
+    ///
+    /// (a) A compact arriving while the session's `turn_task` (a send OR an earlier
+    ///     compact) is still in flight is REFUSED with a nested
+    ///     `freshAgent.error{INTERNAL_ERROR}` naming the in-flight turn — before
+    ///     touching the shared abort/error flags or opening an idle waiter (one
+    ///     idle/error edge can never settle two operations into a false/duplicate
+    ///     completion). This refusal EXCEEDS legacy: the Node adapter CHAINS compact
+    ///     onto `state.sendQueue` (adapter.ts:992) rather than refusing.
+    /// (b) An accepted compact's driving task (POST + await-idle + settle) is
+    ///     REGISTERED as the session's `turn_task` (mirroring [`Self::handle_send`]'s
+    ///     registration unit), so `freshAgent.kill`/`freshAgent.interrupt` abort a
+    ///     mid-flight compact: dropped mid-await it never reaches the settle tail,
+    ///     and the interrupt's `turn_aborted` flag would gate even a raced settle —
+    ///     killing mid-compact yields NO false `freshAgent.turn.complete`.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_arc = {
@@ -910,24 +929,37 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, model, route, turn_aborted, turn_errored, last_turn_complete_at) = {
-            let session = session_arc.lock().await;
-            let Some(real_id) = session.real_session_id.clone() else {
-                // adapter.ts:992-994 — no server-side session to compact; silent no-op.
-                return;
-            };
-            // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
-            session.turn_aborted.store(false, Ordering::SeqCst);
-            session.turn_errored.store(false, Ordering::SeqCst);
-            (
-                real_id,
-                session.model.clone(),
-                session.cwd.clone(),
-                session.turn_aborted.clone(),
-                session.turn_errored.clone(),
-                session.last_turn_complete_at.clone(),
-            )
+        // Held across the whole preflight (busy-check → flag reset → model pair
+        // resolution) so a compact's refusal check and its own `turn_task`
+        // registration are one atomic unit against handle_send/handle_interrupt (the
+        // same lock discipline handle_send uses across materialization).
+        let mut session = session_arc.lock().await;
+        let Some(real_id) = session.real_session_id.clone() else {
+            // adapter.ts:992-994 — no server-side session to compact; silent no-op.
+            return;
         };
+
+        // D1-F1(a): REFUSE a compact while the session's turn is in flight.
+        if session.turn_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INTERNAL_ERROR",
+                &format!(
+                    "compact while a turn is in progress is not supported (opencode session {session_id})"
+                ),
+            );
+            return;
+        }
+
+        // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
+        session.turn_aborted.store(false, Ordering::SeqCst);
+        session.turn_errored.store(false, Ordering::SeqCst);
+        let model = session.model.clone();
+        let route = session.cwd.clone();
+        let turn_aborted = session.turn_aborted.clone();
+        let turn_errored = session.turn_errored.clone();
+        let last_turn_complete_at = session.last_turn_complete_at.clone();
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
         self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
@@ -950,7 +982,8 @@ impl FreshOpencodeState {
             },
         };
         let Some(model_pair) = model_pair else {
-            // Never leave the pane stuck busy on the failure path.
+            // Never leave the pane stuck busy on the failure path (and nothing was
+            // ever registered on turn_task — the failure is inline, pre-spawn).
             self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
             self.emit_fresh_agent_error(
                 &real_id,
@@ -962,38 +995,55 @@ impl FreshOpencodeState {
             return;
         };
 
-        let result = match manager
-            .compact(
-                &real_id,
-                &model_pair.provider_id,
-                &model_pair.model_id,
-                &route,
-            )
-            .await
-        {
-            Ok(()) => {
-                manager
-                    .await_idle(&real_id, rx, DEFAULT_TURN_TIMEOUT, route)
-                    .await
-            }
-            Err(err) => Err(err),
-        };
+        // D1-F1(b): run the compact's drive (POST + await-idle + settle) in the
+        // session's DETACHED, REGISTERED turn task — mirroring handle_send so
+        // kill/interrupt abort it (aborted mid-await ⇒ no settle ⇒ no chime).
+        let fresh_agent = self.fresh_agent.clone();
+        let compact_id = real_id.clone();
+        let compact_task = tokio::spawn(async move {
+            let result = match manager
+                .compact(
+                    &compact_id,
+                    &model_pair.provider_id,
+                    &model_pair.model_id,
+                    &route,
+                )
+                .await
+            {
+                Ok(()) => {
+                    manager
+                        .await_idle(&compact_id, rx, DEFAULT_TURN_TIMEOUT, route)
+                        .await
+                }
+                Err(err) => Err(err),
+            };
 
-        // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
-        // unconditionally + the gated chime); a serve error additionally surfaces
-        // loudly and never produces a false turn-complete.
-        let succeeded = result.is_ok();
-        settle_turn_outcome(
-            &self.fresh_agent,
-            &real_id,
-            succeeded,
-            &turn_aborted,
-            &turn_errored,
-            &last_turn_complete_at,
-        );
-        if let Err(err) = result {
-            self.emit_fresh_agent_error(&real_id, "OPENCODE_COMPACT_FAILED", &err.to_string());
-        }
+            // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
+            // unconditionally + the gated chime); a serve error additionally surfaces
+            // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
+            // never produces a false turn-complete.
+            let succeeded = result.is_ok();
+            settle_turn_outcome(
+                &fresh_agent,
+                &compact_id,
+                succeeded,
+                &turn_aborted,
+                &turn_errored,
+                &last_turn_complete_at,
+            );
+            if let Err(err) = result {
+                fresh_agent.broadcast(&event_frame(
+                    &compact_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": compact_id,
+                        "code": "OPENCODE_COMPACT_FAILED",
+                        "message": err.to_string(),
+                    }),
+                ));
+            }
+        });
+        session.turn_task = Some(compact_task);
     }
 
     // ── freshAgent.fork (WS, AGENT-07, approval-respond Task 5) ─────────────
@@ -3214,6 +3264,10 @@ mod tests {
         summarize_fails: bool,
         config_body: Vec<u8>,
         bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
+        /// D1-F1: when set, the summarize POST parks on `notified()` AFTER
+        /// recording itself + the order pin — a deterministic "compact in
+        /// flight" window for the kill/interrupt lifecycle tests.
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl CompactFakeHttp {
@@ -3221,6 +3275,7 @@ mod tests {
             config_body: Vec<u8>,
             summarize_fails: bool,
             bus_probe: tokio::sync::broadcast::Receiver<String>,
+            summarize_gate: Option<Arc<tokio::sync::Notify>>,
         ) -> Self {
             Self {
                 next_session: AtomicUsize::new(0),
@@ -3229,6 +3284,7 @@ mod tests {
                 summarize_fails,
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
+                summarize_gate,
             }
         }
 
@@ -3327,7 +3383,13 @@ mod tests {
                     .lock()
                     .expect("busy budget mutex")
                     .insert(id, 2);
-                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"true".to_vec())) });
+                let gate = self.summarize_gate.clone();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(200, b"true".to_vec()))
+                });
             }
             if method == "POST" && req.url.contains("/prompt_async") {
                 let id = req
@@ -3374,12 +3436,27 @@ mod tests {
         Arc<CompactFakeHttp>,
         tokio::sync::broadcast::Receiver<String>,
     ) {
+        compact_state_gated(config_body, summarize_fails, None).await
+    }
+
+    /// [`compact_state`] with an optional summarize gate (D1-F1: a deterministic
+    /// in-flight-compact window for the kill/interrupt lifecycle tests).
+    async fn compact_state_gated(
+        config_body: &str,
+        summarize_fails: bool,
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
         let http = Arc::new(CompactFakeHttp::new(
             config_body.as_bytes().to_vec(),
             summarize_fails,
             tx.subscribe(),
+            summarize_gate,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
@@ -3425,6 +3502,35 @@ mod tests {
         out
     }
 
+    /// Collect bus frames (in arrival order) until `pred` matches one of them,
+    /// returning everything seen INCLUDING the matching frame. Bounded: panics
+    /// after 5s with no match, so a missing terminal frame fails loudly instead
+    /// of hanging the suite. Needed wherever a handler's settle tail runs in a
+    /// DETACHED driving task (D1-F1: a compact's settle lives on the session's
+    /// `turn_task`, exactly like a send turn's).
+    async fn frames_until(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let raw = rx.recv().await.expect("the bus stays open");
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let hit = pred(&v);
+                out.push(v);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a matching frame arrives within the budget");
+        out
+    }
+
     /// `true` when `frame` is a `freshAgent.event` whose inner `event.type == wanted`
     /// (and, when given, whose inner `status == status`).
     fn is_event(frame: &Value, wanted: &str, status: Option<&str>) -> bool {
@@ -3446,6 +3552,10 @@ mod tests {
         msg.instructions = Some("focus the diff".to_string());
         st.handle_compact(msg).await;
 
+        // The drive is detached+registered (D1-F1): await its terminal chime so
+        // the POST/idle assertions below never race the spawned task.
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+
         let summarize = http.summarize_requests();
         assert_eq!(summarize.len(), 1, "exactly one summarize POST");
         assert!(summarize[0].url.contains("/session/ses_1/summarize"));
@@ -3463,8 +3573,6 @@ mod tests {
             0,
             "a splittable session model wins -- /config is NOT consulted"
         );
-
-        let frames = drain_frames(&mut rx);
         assert!(
             frames
                 .iter()
@@ -3498,14 +3606,16 @@ mod tests {
 
         st.handle_compact(compact_msg("ses_1")).await;
 
+        // GET /config ran inline (pre-spawn); the POST runs on the detached
+        // drive — await its terminal chime before asserting over it.
         assert_eq!(http.get_config_count(), 1, "GET /config ran exactly once");
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
         let summarize = http.summarize_requests();
         assert_eq!(summarize.len(), 1);
         let body = summarize[0].body.clone().unwrap();
         assert_eq!(body["providerID"], "conf-prov");
         assert_eq!(body["modelID"], "conf-mdl");
 
-        let frames = drain_frames(&mut rx);
         assert!(
             frames
                 .iter()
@@ -3604,8 +3714,8 @@ mod tests {
 
         st.handle_compact(compact_msg("ses_1")).await;
 
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
         assert_eq!(http.summarize_requests().len(), 1);
-        let frames = drain_frames(&mut rx);
         assert!(
             frames
                 .iter()
@@ -3621,8 +3731,10 @@ mod tests {
 
         st.handle_compact(compact_msg("ses_1")).await;
 
+        // The failure settles on the detached drive (D1-F1): the terminal frame
+        // is the loud error (idle precedes it inside the settle tail).
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
         assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
-        let frames = drain_frames(&mut rx);
         assert!(
             frames
                 .iter()
@@ -3655,6 +3767,214 @@ mod tests {
                 .iter()
                 .any(|f| is_event(f, "freshAgent.turn.complete", None)),
             "a serve error never fabricates a completion: {frames:?}"
+        );
+    }
+
+    // ── D1-F1: compact is turn-scoped — busy refusal + kill/interrupt ──────
+
+    /// Wait (bounded) until the fake has recorded its first summarize POST —
+    /// with the gated fake this is the deterministic "compact parked mid-drive"
+    /// state for the kill/interrupt tests below.
+    async fn await_summarize_posted(http: &Arc<CompactFakeHttp>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !http.summarize_requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the summarize POST lands within the budget");
+    }
+
+    /// D1-F1(a): the composer stays interactive while a session is busy, so a
+    /// `/compact` gesture CAN arrive while a turn is in flight. The compact
+    /// must be REFUSED with a nested `freshAgent.error{INTERNAL_ERROR}` naming
+    /// the in-flight turn — and must never reach the summarize POST (a second
+    /// idle-waiter on one edge would settle both operations and produce a
+    /// false/duplicate completion). This refusal EXCEEDS legacy: the Node
+    /// adapter CHAINS compact onto `state.sendQueue` (adapter.ts:992); we
+    /// refuse loudly instead of queueing.
+    #[tokio::test]
+    async fn compact_while_a_turn_is_in_flight_is_refused_and_never_posts() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+        // A genuinely in-flight turn (never resolves) parked as the session's
+        // driving task — the exact state a queued-send busy pane leaves behind.
+        session_arc.lock().await.turn_task = Some(tokio::spawn(std::future::pending::<()>()));
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert!(
+            http.summarize_requests().is_empty(),
+            "a busy session must NEVER reach the summarize POST"
+        );
+        assert_eq!(
+            http.get_config_count(),
+            0,
+            "a refused compact resolves no model pair"
+        );
+        let frames = drain_frames(&mut rx);
+        let refusal = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the refusal is a LOUD nested freshAgent.error");
+        assert_eq!(refusal["event"]["code"], "INTERNAL_ERROR", "{refusal}");
+        assert!(
+            refusal["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("turn is in progress"),
+            "the message names the in-flight turn: {refusal}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "a refusal never chimes: {frames:?}"
+        );
+        // The in-flight turn's task is untouched — still registered, still running.
+        let task = session_arc
+            .lock()
+            .await
+            .turn_task
+            .take()
+            .expect("the refusal must not steal the turn's task");
+        assert!(
+            !task.is_finished(),
+            "the refused compact left the turn alone"
+        );
+        task.abort();
+    }
+
+    /// D1-F1(b): the compact's driving task is the session's `turn_task`, so a
+    /// `freshAgent.kill` mid-compact aborts it — dropped mid-await, it never
+    /// reaches the settle tail: NO false `freshAgent.turn.complete` (and the
+    /// released gate resurrects nothing).
+    #[tokio::test]
+    async fn kill_during_an_in_flight_compact_aborts_it_without_a_false_completion() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        // The handler spawns + registers the driving task, then returns — the
+        // drive runs DETACHED (a pre-fix regression would block inline on the
+        // gate here, which the timeout turns into a clean failure).
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+
+        {
+            let session = session_arc.lock().await;
+            let task = session
+                .turn_task
+                .as_ref()
+                .expect("the compact's driving task is registered as turn_task");
+            assert!(
+                !task.is_finished(),
+                "the registered compact is parked on the summarize gate"
+            );
+        }
+        // Wait until the summarize POST is parked on the gate — deterministically
+        // in-flight — before the kill lands.
+        await_summarize_posted(&http).await;
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_1").await,
+            "kill removes the session's bookkeeping"
+        );
+        gate.notify_waiters(); // released AFTER the abort: nothing may resume
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("running"))),
+            "the compact's busy snapshot was broadcast: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
+            "the kill frame was broadcast: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "an aborted compact must NEVER fabricate a turn-complete: {frames:?}"
+        );
+    }
+
+    /// D1-F1(b), symmetric interrupt case: `freshAgent.interrupt` mid-compact
+    /// sets `turn_aborted` BEFORE aborting the registered task and issues the
+    /// best-effort serve abort — the pane hears the interrupt's idle and NEVER
+    /// a chime (even a settle that outran the abort would be gated by the flag).
+    #[tokio::test]
+    async fn interrupt_during_an_in_flight_compact_aborts_it_and_emits_idle_without_a_chime() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the driving task");
+        await_summarize_posted(&http).await;
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        gate.notify_waiters(); // the aborted task can never consume this
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the interrupt's own idle snapshot lands: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "an interrupted compact must NEVER fabricate a turn-complete: {frames:?}"
+        );
+        assert!(
+            http.recorded().iter().any(|r| r.url.contains("/abort")),
+            "the best-effort serve abort reached the fake"
+        );
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true),
+            "the interrupt took + aborted the compact's registered task"
         );
     }
 

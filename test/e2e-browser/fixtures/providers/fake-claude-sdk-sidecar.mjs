@@ -12,15 +12,17 @@
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
 //        {"type":"permission.respond",sessionId,requestId,decision}
 //        {"type":"question.respond",sessionId,requestId,answers}
-//   out: {"type":"created",requestId,sessionId} FIRST (claude.rs read_created
+//        out: {"type":"created",requestId,sessionId} FIRST (claude.rs read_created
 //        discards any earlier line), then sdk.* frames:
 //        sdk.session.init {cliSessionId: CANONICAL UUID}, sdk.status,
-//        sdk.assistant (content MUST be an ARRAY), sdk.turn.complete (numeric
-//        `at` + subtype), sdk.permission.request / sdk.question.request
-//        (server sdk-bridge-types.ts shapes), sdk.permission.cancelled /
-//        sdk.question.cancelled (interrupt-time pending cancellation, the real
-//        sidecar's cancelPending — index.mjs:289-295), sdk.turn.waiting (0→≥1
-//        pending edge), sdk.session.snapshot (resume).
+//        sdk.assistant (content MUST be an ARRAY), sdk.result {result} on EVERY
+//        turn result + sdk.turn.complete (numeric `at`) ONLY on subtype
+//        'success' (index.mjs:177-185 — the AGENTS.md invariant), sdk.permission.request
+//        / sdk.question.request (server sdk-bridge-types.ts shapes),
+//        sdk.permission.cancelled / sdk.question.cancelled (interrupt-time
+//        pending cancellation, the real sidecar's cancelPending —
+//        index.mjs:289-295), sdk.turn.waiting (0→≥1 pending edge),
+//        sdk.session.snapshot (resume).
 //
 // Turn semantics: `send` ALWAYS opens with sdk.status running (bookkeeping the
 // real bridge performs unconditionally); a matching program rule then owns
@@ -49,6 +51,21 @@
 // server wrote to the sidecar" and for zero-before-click proofs.
 // (FRESHELL_FAKE_* keys are auto-recorded into the launch ledger.)
 //
+// Wire-truth completion invariant (AGENTS.md; real sidecar index.mjs:177-185):
+// a closing turn emits `sdk.result{result:<subtype>}` ALWAYS and the positive
+// completion edge `sdk.turn.complete{sessionId,at}` ONLY on subtype
+// 'success' — a denied/errored turn must NEVER chime green through the
+// Rust `sdk.turn.complete → freshAgent.turn.complete` rename (D1-F2; the
+// pre-fix fixture emitted turn.complete on every completion, fabricating a
+// success the real sidecar structurally cannot).
+//
+// Wire audit (D1-F2): every OUTBOUND frame is ALSO recorded into the
+// FRESHELL_FAKE_EVENTS ledger as a `{t,pid,provider,kind:'wire',frame}` row,
+// so specs assert on what actually crossed stdout (e.g. the ABSENCE of
+// sdk.turn.complete on a denied turn) instead of trusting the program
+// emission ledger alone. Program rows and wire rows coexist there; filter on
+// `kind === 'wire'` for wire truth (event-kind consumers see no shape change).
+//
 // Transcript realism (AGENT-05 reload-while-pending): the cards render
 // EXCLUSIVELY from the REST snapshot, which 404s without a durable transcript
 // — so `create` ensures an EMPTY JSONL transcript at
@@ -70,7 +87,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import readline from 'node:readline'
-import { appendJsonl, appendLaunchLedger, FixtureEngine, keepAlive, loadProgram } from './fixture-core.mjs'
+import { appendJsonl, appendLaunchLedger, EVENTS_ENV, FixtureEngine, keepAlive, loadProgram } from './fixture-core.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'kilroy'
 const env = process.env
@@ -88,6 +105,9 @@ let activeSessionId = null
 let createCounter = 0
 
 function emit(obj) {
+  // Wire audit (D1-F2, see the header): record the ACTUAL outbound frame so
+  // specs assert on wire truth (what crossed stdout), not just program intent.
+  appendJsonl(env[EVENTS_ENV], { t: Date.now(), pid: process.pid, provider, kind: 'wire', frame: obj })
   process.stdout.write(`${JSON.stringify(obj)}\n`)
 }
 
@@ -211,15 +231,14 @@ async function render(event) {
       })
       const st = sessions.get(sessionId)
       if (st) appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn')
-      emit({
-        type: 'sdk.turn.complete',
-        sessionId,
-        // Real protocol shape is {sessionId, at} only (index.mjs:22);
-        // `subtype` is a fixture EXTENSION (server ignores unknown fields)
-        // so specs can pin scripted success/error completions.
-        subtype: data.subtype ?? 'success',
-        at: Date.now(),
-      })
+      const subtype = data.subtype ?? 'success'
+      // AGENTS.md invariant (real sidecar index.mjs:177-185): sdk.result rides
+      // EVERY turn result; sdk.turn.complete is the positive edge ONLY on
+      // subtype 'success' — a denied/errored turn NEVER chimes green (D1-F2).
+      emit({ type: 'sdk.result', sessionId, result: subtype })
+      if (subtype === 'success') {
+        emit({ type: 'sdk.turn.complete', sessionId, at: Date.now() })
+      }
       emit({ type: 'sdk.status', sessionId, status: 'idle' })
       break
     }
