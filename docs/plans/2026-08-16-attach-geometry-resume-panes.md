@@ -91,34 +91,25 @@ it('a pane hidden at mount hydrates in background with a geometry-neutral keepal
 })
 ```
 
-T2 — heal path (validator-D sequence; pre-fix the resize is suppressed, post-fix it is emitted):
+T2 — heal path (validator-D sequence; pre-fix the resize is suppressed, post-fix it is emitted). Mount-hidden-directly shape (proven by the file's existing hidden-mount tests — no visible→hidden flip, which produces no hidden attach):
 
 ```ts
-it('reveal after a clamped hidden attach emits terminal.resize even when fitted dims equal the pre-hide dims', async () => {
+it('reveal after a clamped hidden attach emits terminal.resize even when fitted dims are unchanged', async () => {
+  // Mounting hidden + hydration trigger produces, PRE-FIX, a wire
+  // viewport_hydrate attach whose dims are the never-fitted xterm defaults —
+  // the same numeric dims the reveal-fit will compute in jsdom (stable
+  // fixture) — so the reveal resize is swallowed by matchesLastSentViewport
+  // pre-fix. Post-fix the clamped attach invalidates the suppression record
+  // and the resize is emitted. This is the RED witness for the heal path.
   const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-hidden-heal-suppression',
+    hidden: true,
     clearSends: false,
     requestId: 'req-hidden-heal-suppression',
   })
-  // visible attach above records the fitted dims (neighboring tests pin this)
 
-  const readPaneContent = () => {
-    const layout = store.getState().panes.layouts[tabId]
-    return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
-  }
-  rerender(
-    <Provider store={store}>
-      <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden />
-    </Provider>,
-  )
-
-  // Produce the hidden background-hydration attach. Today (pre-fix) its
-  // wire intent is viewport_hydrate (red witness). If the hydration queue
-  // alone does not trigger it for this mount shape, drive it exactly as the
-  // neighbor "background hydrates a trusted hidden reconnect" test does —
-  // act(() => reconnectHandler?.()) — and record which trigger was used in
-  // the task report.
+  wsMocks.send.mockClear()
   act(() => {
     getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
   })
@@ -153,7 +144,7 @@ it('reveal after a clamped hidden attach emits terminal.resize even when fitted 
 })
 ```
 
-T3 — surface reset at clamped full replay (green-by-construction guard, protects finding-2's regression): mount hidden via T1's shape, capture the sent attach's `attachRequestId`, then drive `messageHandler!` with `terminal.attach.ready` `{ headSeq: 3, replayFromSeq: 1, replayToSeq: 3, attachRequestId }` plus `terminal.output` `{ seqStart: 1, seqEnd: 3, data: 'CLAMPED-REPLAY-MARKER' }`; assert the mocked terminal write stream contains `CLAMPED-REPLAY-MARKER` exactly once.
+T3 — surface reset at clamped full replay (green-by-construction guard, protects round-1 finding-2's regression): mount hidden via T1's shape and drive one attach generation fully (attach.ready + tagged output writing `PRIOR-SURFACE-MARKER`) so the terminal surface is non-empty; then force a SECOND hidden clamped attach (exactly as the first was produced — `onActiveTabReady` again), and drive its attach.ready `{ headSeq: 6, replayFromSeq: 3, replayToSeq: 6, attachRequestId: <second attach request id> }` plus `terminal.output` `{ seqStart: 3, seqEnd: 6, data: 'CLAMPED-REPLAY-MARKER', attachRequestId: <second attach request id> }`; assert the mocked terminal write stream contains `CLAMPED-REPLAY-MARKER` exactly once AND `PRIOR-SURFACE-MARKER` exactly once (never duplicated by the replay). Every stream frame carries its attachRequestId.
 
 Also update the pre-existing hidden replay-gap test "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output" (~line 8685): change ONLY its attach wait predicate from `intent === 'viewport_hydrate'` to `intent === 'keepalive_delta'` (the production recreate predicate is NOT changed — `currentAttachRef.intent` retains viewport bookkeeping; that is part of the production contract this redesign pins). Any other pre-existing assertion of a hidden wire `viewport_hydrate` gets the same single-word update under the old-contract rule; record every touched test in the task report. Visible-pane assertions (e.g. "recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output" and the reconnect-before-reveal test at ~4635) must stay untouched and green.
 
@@ -161,11 +152,55 @@ Also update the pre-existing hidden replay-gap test "recreates a hidden restored
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
-Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix) and FAIL for T2 (resize suppressed: pre-hidden viewport_hydrate attach re-recorded identical dims). T3 and the reconnect-before-reveal test must already pass — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; both failure modes are assertion-level, not setup errors.
+Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix), FAIL for T2 (reveal resize suppressed pre-fix because the hidden viewport_hydrate attach recorded identical dims), and FAIL for T4 (hide-then-reconnect race: stale hiddenRef leaks a `viewport_hydrate`). T3 and the reconnect-before-reveal test (~4635) must pass pre-fix — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; all failure modes must be assertion-level, not setup errors.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-All changes live in `attachTerminal` in `src/components/TerminalView.tsx` (~2698).
+Changes live in two places in `src/components/TerminalView.tsx`.
+
+3a. **Close the visibility-race window** (round-2 finding 3). `hiddenRef` is currently synced only in a passive effect (~1191-1199). The same file already establishes the render-synchronous precedent at ~1213-1218 ("Sync during render (not in useEffect) so refs always have latest values"). Move the `hiddenRef.current = hidden` assignment into that render-synchronous block (i.e. assign during render); keep ONLY the extra side effects (`clearHoveredUrl`, dataset cleanup on hide) in the effect. No other ref handling changes. Regression-pin this with the new test below — call it T4:
+
+```ts
+it('hide-then-immediate-reconnect still sends a geometry-neutral (keepalive) attach', async () => {
+  // Pin the commit→effect window closed: with legacy passive-effect syncing,
+  // a reconnect dispatched in the commit-before-effects flush observed the
+  // stale visible value and emitted viewport_hydrate.
+  const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-hide-reconnect-race',
+    clearSends: false,
+    requestId: 'req-hide-reconnect-race',
+  })
+  const readPaneContent = () => {
+    const layout = store.getState().panes.layouts[tabId]
+    return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+  }
+  wsMocks.send.mockClear()
+  rerender(
+    <Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden />
+    </Provider>,
+  )
+  act(() => {
+    reconnectHandler?.()
+  })
+  await waitFor(() => {
+    expect(
+      wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId),
+    ).toBe(true)
+  })
+  expect(
+    wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .every((msg) => msg?.type !== 'terminal.attach' || msg?.intent === 'keepalive_delta'),
+    'no attach may claim viewport geometry after the pane committed hidden',
+  ).toBe(true)
+})
+```
+
+3b. **The clamp in `attachTerminal`** (~2698):
 
 1. After the re-promotion block computes `effectiveIntent` (~2740-2751), compute the wire intent:
 
@@ -238,57 +273,57 @@ recreate predicate and reveal planning are unchanged."
 
 ---
 
-### Task 2: e2e regression — REST-created tab stays geometry-neutral until reveal
+### Task 2: e2e regression — REST-created witness tab stays geometry-neutral until reveal
 
 **Files:**
 - Test: `test/e2e-browser/specs/multi-client.spec.ts` (EXTEND — already a MATRIX_SPECS member per playwright.config.ts, so both legacy-chromium and rust-chromium run it with no config change; do NOT create a new spec file).
-- No production changes in this task (Task 1 is the fix). No harness changes needed (validator E verified `getTerminalBuffer(terminalId?)` and matrix helpers suffice).
+- No production changes in this task.
 
 **Interfaces:**
-- Consumes: existing helpers in `specs/multi-client.spec.ts`: `newClientContext` if a second context proves useful, `waitForTabWithTerminalId`, `waitForMarkedPtySize` (:154-165, marker shape `__LABEL__:<rows> <cols>`, so the typed probe must be `echo __AXIS__:$(stty size)`), the file's `test` import and server/token fixtures, plus the page-side `window.__FRESHELL_TEST_HARNESS__` (`getSentWsMessages`, `getTerminalBuffer`) and store dispatch helpers exactly as used elsewhere in that file.
-- Produces: one new test in that file pinning the hidden-hydration geometry-neutral contract end-to-end.
+- Consumes: existing helpers in `specs/multi-client.spec.ts`: `waitForTabWithTerminalId`, `waitForMarkedPtySize` (:154-165, marker shape `__LABEL__:<rows> <cols>` — probe text must be `echo __AXIS__:$(stty size)`), the file's `test` import/fixtures, plus page-side `window.__FRESHELL_TEST_HARNESS__` (`getSentWsMessages`, `getTerminalBuffer`, and store dispatch via the harness as other specs do).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add this test (adapt only call edges to the file's real helper signatures). Test flow:
+Round-2 finding 4 established: a REST-created tab broadcast arrives ACTIVE (tabsSlice addTab selects it), so the witness flow must create AND then un-select. Test flow:
 
-1. In the page, create a shell pane and note its fitted dims (existing helpers). Resize the browser viewport to a distinctive geometry if the file has such a helper; otherwise keep defaults — the marker reading supplies the ground truth.
-2. Create a SECOND tab via REST WITHOUT selecting it: use the harness/evaluate to POST `/api/tabs` with `{ mode: 'shell', name: 'geo-witness' }` against the same server and token. Capture its `terminalId`/`tabId` from the response.
-3. Wait until the hidden tab's background hydration attach is sent (poll `getSentWsMessages` for `terminal.attach` with that terminalId), then assert: its `intent === 'keepalive_delta'` and `priority === 'background'`, and that NO `terminal.attach` with `intent === 'viewport_hydrate'` for that terminalId was sent while hidden.
-4. Select the tab (dispatch select/active-tab action the way other specs do), wait for its visible attach (`viewport_hydrate`), then type `echo __AXIS__:$(stty size)\r` into the pane and `waitForMarkedPtySize('__AXIS__', ...)` — assert the reported rows/cols equal the pane's currently fitted xterm dims (available via harness), NOT the 80x24/120x30 spawn defaults; and that a `terminal.resize` for that terminalId was emitted on reveal.
-5. Assert the FIRST pane's PTY size is unchanged throughout (repeat its stty marker at the end).
+1. In the page, use the harness/store to create or use an initial shell pane (existing helpers); record a `stty size` marker `__PRE__:` and keep the emitted dims.
+2. REST-create the witness tab: `page.evaluate(fetch('/api/tabs', { POST, headers incl. x-auth-token, body: { mode: 'shell', name: 'geo-witness' } }))`; the broadcast makes it ACTIVE (visible) and it may attach visibly — that is expected and outside the assertion.
+3. Switch the client BACK to the original tab (dispatch/tap exactly as other specs switch tabs), so the witness tab becomes hidden; then wait until the witness terminal's hydration attach fires while hidden (poll `getSentWsMessages` for `terminal.attach` frames with the witness terminalId).
+4. Assert the CLAMPED attach: at least one `terminal.attach` for the witness terminalId with `intent === 'keepalive_delta'` arrives after it became hidden; and NO `terminal.attach` with `intent === 'viewport_hydrate'` for that terminalId was sent after the hidden transition. (Frames sent while it was briefly visible pre-switch are expected and excluded by the after-transition window in the log, e.g. by slicing `getSentWsMessages` at the switch dispatch.)
+5. Reveal the witness tab (switch to it). Do NOT expect a new attach. Assert: a `terminal.resize` frame for the witness terminalId is emitted after reveal; capture its cols/rows.
+6. Type `echo __AXIS__:$(stty size)\r` in the witness pane; `waitForMarkedPtySize('__AXIS__', ...)` and assert the reported `rows cols` EQUAL the resize frame's dims (the kernel truth matches what the client claimed — wipe-out of a hidden claim would show the stale dims instead).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: FAIL at step 3's intent assertion (pre-fix wire intent is `viewport_hydrate` for the hidden tab). If setup errors occur, fix the setup only. If Task 1 landed first, this test is green-by-construction — record that honestly and cite the probe/wire-level evidence instead of mangling RED.
+Expected: FAIL at step 4's intent assertion (pre-fix, the hidden hydration attach for the witness terminal is `viewport_hydrate`). Setup errors → fix setup only. If Task 1 landed first the test is green-by-construction: record that and cite the unit-level RED instead.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-None (Task 1 covers production). If the REST-create-in-page flow turns out to exist already as a helper in another spec, reuse it; do not add new e2e infrastructure.
+None (Task 1 covers production). Additionally, in THIS spec file, the pre-existing reconnect test that accepts `transport_reconnect | viewport_hydrate` for its hidden/background branch (round-2 finding 5): update that branch's accepted wire intent to `keepalive_delta` and update its comment rationale (which documented keepalive as a cold-reconnect marker) to the new contract: hidden/background attaches are keepalive_delta BY POLICY (they never claim geometry); visible foreground attaches remain viewport_hydrate/transport_reconnect. Record the edit in the task report.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: PASS on both projects.
+Expected: PASS on both projects, including the updated pre-existing reconnect test.
 
 - [ ] **Step 5: Refactor while green**
 
-Inline share nothing new; reuse the file's helpers. If two or more duplicated setup lines remain, follow the file's local extraction patterns.
+Reuse the file's helper patterns; no new infrastructure.
 
 - [ ] **Step 6: Run impacted-test verification**
 
 Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: PASS (the whole file, both projects).
+Expected: PASS (whole file, both projects).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/multi-client.spec.ts
-git commit -m "test(e2e): pin geometry-neutral hidden hydration attach + reveal heal for REST-created tabs"
+git commit -m "test(e2e): pin geometry-neutral hidden hydration attach and reveal resize heal for REST-created tabs"
 ```
 
 ---
@@ -303,11 +338,11 @@ git commit -m "test(e2e): pin geometry-neutral hidden hydration attach + reveal 
 
 - [ ] **Step 1: Boot + witness setup**
 
-Verify the pid file PID belongs to the worktree (`ps -fp $(cat /tmp/freshell-3344.pid)` and confirm the cwd/command path includes the worktree). Open the dev client URL with token in the browser at a fixed window size. Create TWO panes: (a) a shell pane; (b) an opencode-mode pane via the pane picker/REST. REST-create a third shell tab that is never selected (producing a hidden-hydration tab).
+Verify the pid file PID belongs to the worktree (`ps -fp $(cat /tmp/freshell-3344.pid)` and confirm the cwd/command path includes the worktree). Open the dev client URL with token in the browser at a fixed window size. Create TWO panes: (a) a shell pane; (b) an opencode-mode pane via the pane picker/REST. REST-create a third shell tab, then immediately switch the client back to the shell-pane tab (the broadcast auto-selects the new tab — switch-back makes it hidden; wait for its background hydration attach, ~1-2s).
 
 - [ ] **Step 2: Machine-checkable assertions**
 
-(a) Shell pane: type `echo __AXIS__:$(stty size)` — marker must equal the pane's current fitted xterm dims. (b) Opencode pane: assert via buffer rows (harness) that the footer renders on ONE row and contains both `ctrl+p` and `commands` (no wrap cascade); scroll back a few pages with PgUp and assert rows stay coherent (no right-edge fragment cascade — compare before/after dumps for absence of the known garbage pattern `^ ▀+$` mid-row splits and lone `\d+%)` fragments). (c) Witness tab: assert from `getSentWsMessages` that its hidden attach was `keepalive_delta`. (d) Reveal the witness tab, assert visible attach `viewport_hydrate` and a `terminal.resize` followed; type the stty marker there and confirm it equals its fitted dims. Record all dims + one screenshot per assertion into `reports/live-verify-*.png|json`.
+(a) Shell pane: type `echo __AXIS__:$(stty size)` — marker must equal the pane's current fitted xterm dims. (b) Opencode pane: assert via buffer rows (harness) that the footer renders on ONE row and contains both `ctrl+p` and `commands` (no wrap cascade); scroll back a few pages with PgUp and assert rows stay coherent (no right-edge fragment cascade — compare before/after dumps for absence of the known garbage pattern `^ ▀+$` mid-row splits and lone `\d+%)` fragments). (c) Witness tab: assert from `getSentWsMessages` that its hidden attach was `keepalive_delta`. (d) Reveal the witness tab, assert a `terminal.resize` frame followed the reveal (a new attach is NOT expected once hydration completed), then type the stty marker and confirm its dims equal the emitted resize frame dims (not the 80x24 never-fitted defaults). Record all dims + one screenshot per assertion into `reports/live-verify-*.png|json`.
 
 - [ ] **Step 3: Teardown + record**
 
