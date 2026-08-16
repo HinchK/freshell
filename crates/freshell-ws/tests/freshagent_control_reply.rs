@@ -9,7 +9,8 @@
 //! `"Fork is …"`, `"Compact is …"`) under code `UNSUPPORTED_CAPABILITY`; every handled
 //! cell routes to a real dispatch arm. Task 4 landed the codex/opencode compact arms
 //! (their cells dropped from the table) and pins the unconditional amplifier x op
-//! refusal cells.
+//! refusal cells; Task 5 landed the opencode fork arm (its cell dropped too — the
+//! remaining fork refusals are claude [permanent], codex [until Task 6], amplifier).
 //!
 //! These tests drive a REAL axum server + REAL tokio-tungstenite client (same harness
 //! as `unknown_terminal_reply.rs`, the kata-dtfn precedent).
@@ -236,6 +237,42 @@ async fn opencode_compact_reaches_the_opencode_dispatch_arm() {
             .unwrap()
             .contains("SESSION_NOT_FOUND"),
         "the frame reached the opencode handler (a refusal-table answer would be a freshAgent.event UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Dispatch-matrix cell (Task 5): opencode fork is NO LONGER refused — it reaches
+/// `FreshOpencodeState::handle_fork`, which answers an unknown session with the nested
+/// `freshAgent.error{INVALID_SESSION_ID}` lost-session shape ON THE REQUESTING
+/// CONNECTION (never UNSUPPORTED_CAPABILITY, and never silence — the requesting sink
+/// always gets an answer).
+#[tokio::test]
+async fn opencode_fork_reaches_the_opencode_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.fork",
+            "provider": "opencode",
+            "sessionId": "ses-oc-fork-1",
+            "sessionType": "freshopencode",
+            "requestId": "fork-oc-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("opencode"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshopencode"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the opencode handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
     );
 }
 

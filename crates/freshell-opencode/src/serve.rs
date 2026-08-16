@@ -729,11 +729,23 @@ impl OpencodeServeManager {
         Ok(())
     }
 
-    /// `fork(id, route)` (`serve-manager.ts:411-416`).
-    pub async fn fork(&self, id: &str, route: &Route) -> Result<ForkedSession, ServeError> {
+    /// `fork(id, route)` (`serve-manager.ts:411-416`) + the Task 5 selected-turn knob:
+    /// the probed opencode 1.18.18 `POST /session/:id/fork` body schema is
+    /// `{messageID?: ^msg…}` with `additionalProperties:false` (GET /doc), so the body
+    /// carries EXACTLY `messageID` when `message_id` is `Some` and is omitted entirely
+    /// when `None` (the legacy no-body shape). Callers gate the client-supplied value
+    /// to the `^msg` shape before passing it here — the strict schema must never
+    /// receive an unknown/malformed key.
+    pub async fn fork(
+        &self,
+        id: &str,
+        route: &Route,
+        message_id: Option<&str>,
+    ) -> Result<ForkedSession, ServeError> {
         let path = with_route(&format!("/session/{}/fork", encode_path_segment(id)), route);
+        let body = message_id.map(|mid| json!({ "messageID": mid }));
         let value = self
-            .json_request(HttpMethod::Post, &path, None, None)
+            .json_request(HttpMethod::Post, &path, body, None)
             .await?;
         Ok(ForkedSession {
             id: value
@@ -1145,11 +1157,14 @@ mod tests {
     // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
 
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
-    /// responses: healthy probes, summarize per `summarize_status`, `/config` per
-    /// `config_body`, everything else a benign 200 `{}`.
+    /// responses: healthy probes, summarize per `summarize_status`, fork per
+    /// `fork_status`/`fork_body`, `/config` per `config_body`, everything else a
+    /// benign 200 `{}`.
     struct RecordingHttp {
         requests: Mutex<Vec<(String, String, Option<String>)>>,
         summarize_status: u16,
+        fork_status: u16,
+        fork_body: Vec<u8>,
         config_body: Vec<u8>,
     }
 
@@ -1158,6 +1173,8 @@ mod tests {
             Self {
                 requests: Mutex::new(Vec::new()),
                 summarize_status: 200,
+                fork_status: 200,
+                fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
             }
         }
@@ -1191,6 +1208,11 @@ mod tests {
                 } else {
                     br#"{"error":"providerID is required"}"#.to_vec()
                 };
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            if req.url.contains("/fork") {
+                let status = self.fork_status;
+                let body = self.fork_body.clone();
                 return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/config") {
@@ -1321,5 +1343,90 @@ mod tests {
             .find(|(method, url, _)| method == "GET" && url.contains("/config"))
             .expect("a /config GET was recorded");
         assert!(body.is_none(), "GET /config carries no body");
+    }
+
+    // ── fork (POST /session/:id/fork) ────────────────────────────────────────
+
+    /// The recorded `POST /session/:id/fork` request, if any.
+    fn fork_request(http: &RecordingHttp) -> Option<(String, String, Option<String>)> {
+        http.recorded()
+            .into_iter()
+            .find(|(method, url, _)| method == "POST" && url.contains("/fork"))
+    }
+
+    #[tokio::test]
+    async fn fork_without_a_message_id_posts_no_body_and_parses_the_child() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        let child = mgr
+            .fork("ses_9", &Some("/work dir".to_string()), None)
+            .await
+            .expect("200 fork succeeds");
+
+        assert_eq!(child.id, "ses_child");
+        assert_eq!(child.directory.as_deref(), Some("/tmp/x"));
+        let (_, url, body) = fork_request(&http).expect("a fork POST was recorded");
+        assert!(
+            url.contains("/session/ses_9/fork"),
+            "the fork path carries the session id: {url}"
+        );
+        assert!(
+            url.contains("directory=%2Fwork%20dir"),
+            "the route is preserved: {url}"
+        );
+        assert!(
+            body.is_none(),
+            "no message_id -> the legacy no-POST-body shape (strict additionalProperties:false schema): {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_message_id_posts_exactly_the_message_id_key() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.fork("ses_9", &None, Some("msg_abc"))
+            .await
+            .expect("200 fork succeeds");
+
+        let (_, _, body) = fork_request(&http).expect("a fork POST was recorded");
+        let body: Value =
+            serde_json::from_str(body.as_deref().expect("a message id carries a JSON body"))
+                .unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            1,
+            "additionalProperties:false — EXACTLY the single optional key: {body}"
+        );
+        assert_eq!(body["messageID"], serde_json::json!("msg_abc"));
+    }
+
+    #[tokio::test]
+    async fn fork_surfaces_a_validation_400_as_an_http_error() {
+        let http = Arc::new(RecordingHttp {
+            fork_status: 400,
+            fork_body: br#"{"error":"expected string to match '^msg'"}"#.to_vec(),
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http).await;
+
+        match mgr.fork("ses_9", &None, None).await {
+            Err(ServeError::Http {
+                method,
+                status,
+                body,
+                ..
+            }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(status, 400);
+                assert!(
+                    body.contains("expected string to match '^msg'"),
+                    "the serve error text crosses the surface: {body}"
+                );
+            }
+            other => panic!("expected a 400 Http error, got {other:?}"),
+        }
     }
 }

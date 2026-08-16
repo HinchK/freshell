@@ -17,20 +17,19 @@
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
 //! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
 //! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
+//! | `freshAgent.fork` | AGENT-07 (approval-respond Task 5): `POST /session/:id/fork` (optional `messageID` when the client pins a `^msg` turn), then register the child (bridge + binding row) and answer `freshAgent.forked` ON THE REQUESTING CONNECTION — every failure path also answers on that sink, never silence |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
 //! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
-//! the client folds into `markSessionLost` instead of hanging. **Out of scope entirely
-//! for this slice:** `freshAgent.fork` (approval-respond Task 5).
+//! the client folds into `markSessionLost` instead of hanging.
 //!
 //! The turn this module runs on `freshAgent.send` DOES land in the real opencode session
 //! (via [`freshell_opencode::OpencodeServeManager::run_turn`]) — the pane's live-updating
 //! transcript just isn't wired to the WS bus yet, so nothing streams to the browser
 //! until that turn resolves and a later `freshAgent.attach`/REST read observes it.
-//! **Deferred to PR-4:** `freshAgent.attach`. **Out of scope entirely for this slice:**
-//! `freshAgent.fork` (approval-respond Task 5).
+//! **Deferred to PR-4:** `freshAgent.attach`.
 //!
 //! ## THE continuity fix (AGENT-08)
 //!
@@ -71,10 +70,11 @@ use freshell_opencode::{
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
-    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
-    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
+use freshell_terminal::FrameSink;
 
 use crate::{
     FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
@@ -271,6 +271,26 @@ impl FreshOpencodeState {
 
     fn broadcast(&self, msg: &ServerMessage) {
         self.fresh_agent.broadcast(msg);
+    }
+
+    /// The shared P1.13 binding-row write (materialization row, settings refresh,
+    /// resume refresh, forked child): AWAITED (durable-before-answer), and a write
+    /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
+    /// broadcast but NEVER blocks the caller's reply — the same failure policy at
+    /// every call site.
+    async fn record_binding_row(&self, upsert: crate::identity_sink::FreshAgentBindingUpsert) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        let session_id = upsert.session_id.clone();
+        if let Err(e) = sink.record_binding(upsert).await {
+            tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
+            self.emit_fresh_agent_error(
+                &session_id,
+                "LEDGER_WRITE_FAILED",
+                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            );
+        }
     }
 
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
@@ -598,33 +618,22 @@ impl FreshOpencodeState {
             // P1.13: binding row at materialization (AWAITED BEFORE the materialized
             // broadcast -- durable-before-answer), resolving the create's pending
             // marker. Opencode has no sandbox/permission concepts -- always `None`.
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: durable_id.clone(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: request_id.clone(),
-                        resolves_pending: Some(session.placeholder_id.clone()),
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: session.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: session.effort.clone(),
-                            cwd: session.cwd.clone(),
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        &durable_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: request_id.clone(),
+                resolves_pending: Some(session.placeholder_id.clone()),
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            })
+            .await;
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
@@ -659,33 +668,22 @@ impl FreshOpencodeState {
         // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: acked_session_id.clone(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: None,
-                        resolves_pending: None,
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: session.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: session.effort.clone(),
-                            cwd: session.cwd.clone(),
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %acked_session_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        &acked_session_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: acked_session_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            })
+            .await;
         }
 
         let real_id = acked_session_id.clone();
@@ -981,6 +979,160 @@ impl FreshOpencodeState {
         }
     }
 
+    // ── freshAgent.fork (WS, AGENT-07, approval-respond Task 5) ─────────────
+
+    /// Handle a `freshAgent.fork` for opencode (legacy `fork()` → `forkForState`,
+    /// `adapter.ts:1005-1020,401-409`): `POST /session/:id/fork`, register the child
+    /// session locally (bridge + identity binding row), and answer ON THE REQUESTING
+    /// CONNECTION's sink (`conn_sink`) — unlike the broadcast-only handlers, fork is a
+    /// request/response op (`freshAgent.forked` echoes the request's `requestId`), and
+    /// EVERY failure path also answers on that sink (the silent-hang defect class this
+    /// run exists to kill):
+    ///
+    /// | failure | reply |
+    /// |---|---|
+    /// | session id not tracked at all | nested `freshAgent.error{INVALID_SESSION_ID}` (`requireState` parity, adapter.ts:223) — the lost-session shape the client folds into `markSessionLost`/recovery (`fresh-agent-ws.ts:343`) |
+    /// | placeholder never materialized | nested `freshAgent.error{INVALID_SESSION_ID}` with the legacy parity text (adapter.ts:403) |
+    /// | serve failure (400/500/…) | nested `freshAgent.error{INTERNAL_ERROR}` carrying the serve error text, BEFORE any state change |
+    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&msg.session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INVALID_SESSION_ID",
+                    "message": format!(
+                        "OpenCode fresh-agent session {} is not available.",
+                        msg.session_id
+                    ),
+                }),
+            ));
+            return;
+        };
+
+        let (real_id, route, model, effort) = {
+            let session = session_arc.lock().await;
+            let Some(real_id) = session.real_session_id.clone() else {
+                // Legacy throws FreshAgentLostSessionError BEFORE calling the serve
+                // manager; the port answers the same lost-session code so the client's
+                // recovery path engages.
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "INVALID_SESSION_ID",
+                        "message": format!(
+                            "OpenCode session {} has not materialized; cannot fork.",
+                            session.placeholder_id
+                        ),
+                    }),
+                ));
+                return;
+            };
+            (
+                real_id,
+                session.cwd.clone(),
+                session.model.clone(),
+                session.effort.clone(),
+            )
+        };
+
+        // The selected-turn knob (REVIEWED, fresh-eyes F4/F5): the probed opencode
+        // 1.18.18 `POST /session/:id/fork` body schema is `{messageID?: ^msg…}` with
+        // `additionalProperties:false`, so the client's `input.atTurnId` passes as
+        // `messageID` ONLY when it is opencode-message-shaped (`^msg`); anything else
+        // is dropped and the fork proceeds from the tip.
+        let message_id = msg
+            .input
+            .as_ref()
+            .and_then(|input| input.get("atTurnId"))
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("msg"));
+
+        let manager = self.fresh_agent.ensure_manager().await;
+        let child = match manager.fork(&real_id, &route, message_id).await {
+            Ok(child) => child,
+            Err(err) => {
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "INTERNAL_ERROR",
+                        "message": err.to_string(),
+                    }),
+                ));
+                return;
+            }
+        };
+
+        // adapter.ts fork:1005-1020 — the child lands in the SAME session map (its
+        // placeholder IS its durable id), inherits model/effort from the parent, takes
+        // cwd from `child.directory ?? state.cwd`, and gets its own serve-SSE bridge
+        // (`bindServeStream(childState)`).
+        let child_cwd = child
+            .directory
+            .clone()
+            .filter(|d| !d.is_empty())
+            .or(route.clone());
+        let mut child_session = OpencodeSession::new(
+            child.id.clone(),
+            child_cwd.clone(),
+            model.clone(),
+            effort.clone(),
+        );
+        child_session.real_session_id = Some(child.id.clone());
+        child_session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager,
+            child.id.clone(),
+            child_session.turn_errored.clone(),
+        ));
+        self.sessions
+            .lock()
+            .await
+            .insert(child.id.clone(), Arc::new(TokioMutex::new(child_session)));
+
+        // P1.13: binding row for the child (the materialization record pattern,
+        // `_pattern :600-626`) — AWAITED BEFORE the forked reply
+        // (durable-before-answer). Opencode has no sandbox/permission concepts —
+        // always `None`.
+        self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: PROVIDER.into(),
+            session_id: child.id.clone(),
+            mode: SESSION_TYPE.into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model,
+                sandbox: None,
+                permission_mode: None,
+                effort,
+                cwd: child_cwd.clone(),
+            },
+        })
+        .await;
+
+        reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
+            request_id: msg.request_id.clone(),
+            parent_session_id: msg.session_id.clone(),
+            session_id: child.id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            provider: PROVIDER.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: child.id.clone(),
+            }),
+        }));
+    }
+
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
 
     /// Handle a `freshAgent.attach` for opencode: emit a session snapshot carrying the
@@ -1230,33 +1382,22 @@ impl FreshOpencodeState {
         // (durable-before-answer), and ONLY when a record was actually recovered: never
         // launder a defaults row for a never-recorded session (V7).
         if recovered.is_some() {
-            if let Some(sink) = sink {
-                if let Err(e) = sink
-                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                        provider: PROVIDER.into(),
-                        session_id: session_id.to_string(),
-                        mode: SESSION_TYPE.into(),
-                        create_request_id: None,
-                        resolves_pending: None,
-                        supersedes: None,
-                        settings: crate::identity_sink::FreshAgentSettings {
-                            model: rec.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: rec.effort.clone(),
-                            cwd,
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
-                    self.emit_fresh_agent_error(
-                        session_id,
-                        "LEDGER_WRITE_FAILED",
-                        "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    );
-                }
-            }
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: session_id.to_string(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: rec.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: rec.effort.clone(),
+                    cwd,
+                },
+            })
+            .await;
         }
 
         Ok(session_arc)
@@ -3477,6 +3618,375 @@ mod tests {
                 .iter()
                 .any(|f| is_event(f, "freshAgent.turn.complete", None)),
             "a serve error never fabricates a completion: {frames:?}"
+        );
+    }
+
+    // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
+
+    fn fork_msg(session_id: &str, request_id: &str, at_turn_id: Option<&str>) -> FreshAgentFork {
+        FreshAgentFork {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            input: at_turn_id.map(|id| json!({ "atTurnId": id })),
+            request_id: Some(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    /// A `FrameSink` that records every delivered frame — the requesting
+    /// connection's sink the fork handler answers on (`conn_sink` in terminal.rs).
+    fn capturing_sink() -> (FrameSink, Arc<StdMutex<Vec<ServerMessage>>>) {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let sink: FrameSink = {
+            let captured = captured.clone();
+            Arc::new(move |msg| captured.lock().expect("captured mutex").push(msg))
+        };
+        (sink, captured)
+    }
+
+    /// The fork-suite serve fake: records EVERY request and scripts the
+    /// `POST /session/:id/fork` response (`fork_status` + `fork_body`).
+    struct ForkFakeHttp {
+        requests: StdMutex<Vec<RecordedRequest>>,
+        fork_status: u16,
+        fork_body: Vec<u8>,
+    }
+
+    impl ForkFakeHttp {
+        fn child_ok() -> Self {
+            Self {
+                requests: StdMutex::new(Vec::new()),
+                fork_status: 200,
+                fork_body: br#"{"id":"ses_child","directory":"/forked/dir"}"#.to_vec(),
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn fork_requests(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.contains("/fork"))
+                .collect()
+        }
+    }
+
+    impl ServeHttp for ForkFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body_value = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.requests
+                .lock()
+                .expect("requests mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body: body_value,
+                });
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if method == "POST" && req.url.contains("/fork") {
+                let status = self.fork_status;
+                let body = self.fork_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`ForkFakeHttp`]-backed serve manager.
+    async fn fork_state(http: Arc<ForkFakeHttp>) -> FreshOpencodeState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        FreshOpencodeState::new(fresh_agent)
+    }
+
+    /// Insert a directly-materialized parent session (no send drove it) with the
+    /// given settings.
+    async fn insert_fork_parent(
+        st: &FreshOpencodeState,
+        id: &str,
+        cwd: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        let mut session = OpencodeSession::new(
+            id.to_string(),
+            cwd.map(str::to_string),
+            model.map(str::to_string),
+            effort.map(str::to_string),
+        );
+        session.real_session_id = Some(id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+    }
+
+    #[tokio::test]
+    async fn fork_registers_the_child_and_replies_forked_on_the_requesting_sink() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(
+            &st,
+            "ses_parent",
+            Some("/parent/cwd"),
+            Some("prov-a/mdl-x"),
+            Some("low"),
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), sink)
+            .await;
+
+        // The exact `freshAgent.forked` reply — every field, request_id echoed
+        // (the client matches on requestId + parentSessionId to repoint the pane).
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            frames,
+            vec![ServerMessage::FreshAgentForked(FreshAgentForked {
+                request_id: Some("fork-req-1".to_string()),
+                parent_session_id: "ses_parent".to_string(),
+                session_id: "ses_child".to_string(),
+                session_type: "freshopencode".to_string(),
+                provider: "opencode".to_string(),
+                runtime_provider: "opencode".to_string(),
+                session_ref: Some(SessionLocator {
+                    provider: "opencode".to_string(),
+                    session_id: "ses_child".to_string(),
+                }),
+            })],
+            "exactly one forked reply on the requesting sink"
+        );
+
+        // The child session is registered: bridge started, settings inherited from
+        // the parent, cwd from the fork response's directory (legacy
+        // `child.directory ?? state.cwd`, adapter.ts fork).
+        assert!(st.has_live_session("ses_child").await);
+        let child = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_child")
+            .cloned()
+            .expect("the child is in the session map");
+        {
+            let child = child.lock().await;
+            assert_eq!(child.placeholder_id, "ses_child");
+            assert_eq!(child.real_session_id.as_deref(), Some("ses_child"));
+            assert_eq!(child.cwd.as_deref(), Some("/forked/dir"));
+            assert_eq!(child.model.as_deref(), Some("prov-a/mdl-x"));
+            assert_eq!(child.effort.as_deref(), Some("low"));
+            assert!(
+                child.serve_bridge.is_some(),
+                "the child's serve-SSE bridge started (bindServeStream)"
+            );
+        }
+
+        // The identity row for the child was recorded (materialization pattern).
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == "ses_child")
+            .expect("a binding row for the forked child");
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.mode, "freshopencode");
+        assert_eq!(b.settings.model.as_deref(), Some("prov-a/mdl-x"));
+        assert_eq!(b.settings.effort.as_deref(), Some("low"));
+        assert_eq!(b.settings.cwd.as_deref(), Some("/forked/dir"));
+
+        // No atTurnId → the legacy no-body fork POST.
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1, "exactly one fork POST");
+        assert!(forks[0].url.contains("/session/ses_parent/fork"));
+        assert!(forks[0].body.is_none(), "no atTurnId -> no body: {forks:?}");
+    }
+
+    #[tokio::test]
+    async fn fork_child_inherits_the_parent_cwd_when_the_response_carries_no_directory() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_body = br#"{"id":"ses_child"}"#.to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), sink)
+            .await;
+
+        assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
+        let child = st.sessions.lock().await.get("ses_child").cloned().unwrap();
+        let child = child.lock().await;
+        assert_eq!(
+            child.cwd.as_deref(),
+            Some("/parent/cwd"),
+            "child.directory ?? state.cwd (adapter.ts fork)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_on_an_unmaterialized_placeholder_replies_invalid_session_id_and_posts_nothing() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        st.handle_create(create_msg("req-fork")).await;
+        let placeholder = "freshopencode-req-fork";
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["provider"], "opencode");
+        assert_eq!(v["sessionId"], placeholder);
+        assert_eq!(v["sessionType"], "freshopencode");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INVALID_SESSION_ID");
+        let message = v["event"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("has not materialized; cannot fork"),
+            "the legacy parity text (adapter.ts:403): {message}"
+        );
+        assert!(
+            http.fork_requests().is_empty(),
+            "unmaterialized -> NO POST at all (legacy throws before serveManager.fork)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_on_an_unknown_session_replies_the_lost_session_shape() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "the failure ALWAYS replies on the sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(
+            v["event"]["code"], "INVALID_SESSION_ID",
+            "the lost-session shape the client folds into recovery (never silence): {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_serve_error_replies_internal_error_and_registers_no_child() {
+        let mut fake = ForkFakeHttp::child_ok();
+        fake.fork_status = 500;
+        fake.fork_body = b"fork exploded".to_vec();
+        let http = Arc::new(fake);
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), sink)
+            .await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            frames.len(),
+            1,
+            "failure-without-reply is the exact defect class this kills"
+        );
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["type"], "freshAgent.event");
+        assert_eq!(v["event"]["type"], "freshAgent.error");
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert!(
+            v["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fork exploded"),
+            "the serve error text crosses the reply: {v}"
+        );
+        assert_eq!(http.fork_requests().len(), 1, "the POST did land");
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "no child insert on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_msg_shaped_at_turn_id_passes_it_as_message_id() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), sink)
+            .await;
+
+        assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(
+            forks[0].body.clone().expect("a messageID body"),
+            json!({ "messageID": "msg_abc" }),
+            "the selected-turn knob: the strict-schema body carries EXACTLY messageID"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_a_non_msg_at_turn_id_omits_message_id_entirely() {
+        // A non-`msg` atTurnId is DROPPED and the fork proceeds from the tip — the
+        // strict `additionalProperties:false` 1.18.18 schema must never receive an
+        // unknown/malformed keying (probed: GET /doc `{messageID?: ^msg…}`).
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http.clone()).await;
+        insert_fork_parent(&st, "ses_parent", None, None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg("ses_parent", "fork-req-7", Some("not-a-msg")),
+            sink,
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "the fork still proceeded from the tip"
+        );
+        let forks = http.fork_requests();
+        assert_eq!(forks.len(), 1, "the fork POST landed");
+        assert!(
+            forks[0].body.is_none(),
+            "the strict schema never receives a non-msg id: {forks:?}"
         );
     }
 
