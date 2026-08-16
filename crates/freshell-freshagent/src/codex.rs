@@ -160,14 +160,17 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
-    /// Per-parent-session fork single-flight (delta-review round 2, D2-F2): the
+    /// Per-parent-session fork single-flight (delta-review rounds 2+3, D2-F2): the
     /// client leaves the Fork action enabled while a fork is in flight, so a rapid
     /// duplicate click would otherwise mint TWO children for one parent — once the
     /// first reply re-keys the pane and kills the parent, the second reply can no
     /// longer correlate, leaving its child (a registered sidecar + durable thread
-    /// here) UNOWNED. [`Self::handle_fork`] acquires the clicked id up front; the
-    /// RAII guard releases on every terminal leg (success, refusal, and the
-    /// post-archive containment alike).
+    /// here) UNOWNED. [`Self::handle_fork`] acquires AFTER `ensure_session_alive`,
+    /// under the RESOLVED parent id — on the mint-new respawn route the materialized
+    /// broadcast re-keys the pane mid-flight, so the duplicate click arrives
+    /// addressed to the NEW id (that route holds the clicked id too, atomically —
+    /// round-3). The RAII guard releases on every terminal leg (success, refusal,
+    /// and the post-archive containment alike).
     fork_in_flight: crate::InFlightRegistry,
 }
 
@@ -1376,6 +1379,15 @@ impl FreshCodexState {
     /// uniform with [`Self::handle_send`]/[`Self::handle_compact`]: replies address the live
     /// session the fork actually ran against.
     ///
+    /// Delta-review round 3: the resolved-id keying principle extends to the D2-F2
+    /// fork in-flight guard itself. The guard acquires AFTER ensure-alive, under the
+    /// RESOLVED parent id (plus the clicked id alongside it on the mint-new route) —
+    /// keyed only to the clicked id it never collides with the duplicate click the
+    /// re-keyed pane emits under the NEW id while this fork is parked mid-RPC, and
+    /// both forks would mint children whose replies race the pane's createRequestId
+    /// re-key + parent-kill (the loser leaves its child sidecar + durable thread
+    /// unowned).
+    ///
     /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
     /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
     /// the REVIEWED post-archive containment (fresh-eyes F6) — replies a nested
@@ -1384,20 +1396,6 @@ impl FreshCodexState {
     /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
     /// the parent may be mid-kill), restoring the child's original visibility.
     pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
-        // D2-F2 single-flight: a rapid duplicate Fork click for the SAME parent must
-        // never mint a second child — the first reply's re-key + parent-kill leaves
-        // the second reply uncorrelatable and its child/sidecar/thread unowned. The
-        // refusal answers on the requesting sink; the RAII guard releases on EVERY
-        // terminal path (success, refusal legs below, and the post-archive
-        // containment alike), so a refreshed click can retry once this fork settles.
-        let Some(_fork_guard) = self.fork_in_flight.try_acquire(&msg.session_id) else {
-            reply_sink(fork_error_frame(
-                &msg.session_id,
-                &format!("fork already in progress for {}", msg.session_id),
-            ));
-            return;
-        };
-
         let parent_id = match self.ensure_session_alive(&msg.session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
                 // A resume-recovered parent keeps its ORIGINAL id.
@@ -1425,6 +1423,45 @@ impl FreshCodexState {
                 ));
                 return;
             }
+        };
+
+        // D2-F2 single-flight, keyed to the RESOLVED parent id (delta-review round
+        // 3): a rapid duplicate Fork click for the same parent must never mint a
+        // second child — the first reply's re-key + parent-kill leaves the second
+        // reply uncorrelatable and its child/sidecar/thread unowned. Acquisition
+        // happens AFTER ensure-alive because the respawn the fork may trigger
+        // MINT-NEWS the parent's id: the materialized broadcast re-keys the pane
+        // mid-flight, so the duplicate click arrives addressed to the NEW id — a
+        // guard holding only the clicked id (the round-2 shape) never collides with
+        // it. The mint-new route additionally holds the CLICKED id for the fork's
+        // duration: `try_acquire_pair` is atomic under the registry lock, so neither
+        // key-space admits a racing Fork while this one is parked. The refusal
+        // answers on the requesting sink keyed to the RESOLVED id (the F-1
+        // post-resolution keying principle, identical to every failure leg below);
+        // the RAII guard releases on EVERY terminal path (success, refusal legs,
+        // and the post-archive containment alike), so a refreshed click can retry
+        // once this fork settles.
+        let _fork_guard = if parent_id == msg.session_id {
+            let Some(guard) = self.fork_in_flight.try_acquire(&parent_id) else {
+                reply_sink(fork_error_frame(
+                    &parent_id,
+                    &format!("fork already in progress for {parent_id}"),
+                ));
+                return;
+            };
+            guard
+        } else {
+            let Some(guard) = self
+                .fork_in_flight
+                .try_acquire_pair(&parent_id, &msg.session_id)
+            else {
+                reply_sink(fork_error_frame(
+                    &parent_id,
+                    &format!("fork already in progress for {parent_id}"),
+                ));
+                return;
+            };
+            guard
         };
 
         let looked_up = {
@@ -8827,6 +8864,244 @@ pub(crate) mod tests {
             }
         }
         assert!(saw_materialized, "mint-new must broadcast the OLD→NEW pair");
+    }
+
+    /// Delta-review round-3 Major: the fork single-flight guard keyed ONLY to the
+    /// CLICKED, pre-recovery id (the round-2 shape) misses the duplicate click that
+    /// matters most on the mint-new route. `ensure_session_alive`'s respawn broadcasts
+    /// `freshAgent.session.materialized{OLD→NEW}` and the frozen client re-keys the
+    /// pane MID-FLIGHT while leaving the Fork action enabled, so the second click
+    /// arrives addressed to the NEW id — a guard that holds only OLD never collides
+    /// with it, and both forks mint children whose replies race the pane's
+    /// createRequestId re-key + parent-kill: whichever reply lands second can no
+    /// longer correlate, leaving its child sidecar + durable thread UNOWNED. The guard
+    /// must hold the RESOLVED parent id (plus the clicked id alongside it) for the
+    /// fork's whole duration.
+    ///
+    /// Drives the genuine mint-new route (crash-stale parent + the dead-thread
+    /// negative cache — the F-1 pins' machinery) with the respawned parent's
+    /// `thread/fork` delayed, parking fork #1 mid-RPC (the second click's
+    /// deterministic in-flight window). The duplicate, addressed to the re-keyed id,
+    /// must be refused INLINE with the nested `freshAgent.error{INTERNAL_ERROR,
+    /// "already in progress"}` shape on its own sink and must NEVER reach the wire;
+    /// fork #1 then completes; BOTH guard keys release (a later fork addressed to the
+    /// respawned id succeeds and mints a distinct child).
+    #[tokio::test]
+    async fn fork_in_flight_guard_covers_the_respawn_rekeyed_parent_id() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-mint-rekey-guard-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("fork-mint-rekey-guard-marker-unused");
+
+        // Spawn 1: the parent, crashing right after `thread/start` (a real unrequested
+        // exit observed by the exit-watcher self-heal).
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-mint",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let old_id = create_real_fake_session(&st, &mut rx).await;
+        assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        // Dead-thread negative cache: ensure-alive goes straight to the mint-new
+        // respawn fallback (the F-1 route).
+        st.mark_thread_dead(&old_id).await;
+
+        // Spawns 2+ (the respawned parent and every fork child's own sidecar) share
+        // this config: `thread/start` mints the new parent id; `thread/fork` is
+        // DELAYED long enough to hold fork #1's mid-RPC window deterministically,
+        // minting a distinct `thread-fork-<pid>-<n>` child per call.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-mint",
+                "delayMethodsMs": { "thread/fork": 2000 },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        // Fork #1 — addressed to the CLICKED old id, exactly the pane's pre-respawn id.
+        let (sink1, captured1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            let old_id = old_id.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg(&old_id, "fork-req-g1", None), sink1)
+                    .await;
+            })
+        };
+
+        // The mint-new respawn re-keyed the pane mid-flight: the materialized OLD→NEW
+        // pair went out on the broadcast bus (the re-key this whole finding hinges on).
+        let (previous, minted) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.session.materialized" {
+                    return (
+                        frame["previousSessionId"].clone(),
+                        frame["sessionId"].clone(),
+                    );
+                }
+            }
+        })
+        .await
+        .expect("the mint-new respawn broadcasts the OLD→NEW materialized pair");
+        assert_eq!(previous, json!(old_id), "materialized names the clicked id");
+        assert_eq!(
+            minted,
+            json!("parent-new-mint"),
+            "materialized re-keys the pane"
+        );
+
+        // Deterministic witness that fork #1 cleared ensure-alive and is parked INSIDE
+        // its guarded critical section (its `thread/fork` RPC blocked upstream): the
+        // guard must hold the RESPAWNED id AND the clicked id — a successful probe of
+        // either would prove the guard does not cover that key at all. (A probe that
+        // acquires is dropped immediately, releasing nothing fork #1 holds.)
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if st.fork_in_flight.try_acquire("parent-new-mint").is_none()
+                    && st.fork_in_flight.try_acquire(&old_id).is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "fork #1's in-flight guard must hold BOTH the respawned parent id and the \
+             clicked id — otherwise a click addressed to the re-keyed id forks \
+             concurrently and leaks an unowned child",
+        );
+
+        // Fork #2 — the second click, addressed to the NEW id the pane re-keyed to —
+        // is refused INLINE on its own sink and never reaches the wire.
+        let (sink2, captured2) = capturing_sink();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_fork(fork_msg("parent-new-mint", "fork-req-g2", None), sink2),
+        )
+        .await
+        .expect("the re-keyed duplicate fork is refused inline, never upstream-blocking");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured2),
+            "parent-new-mint",
+            "INTERNAL_ERROR",
+            "already in progress",
+        );
+
+        // Fork #1 rides out its delayed RPC and completes: its reply keys to the
+        // RESOLVED parent id (the F-1 pin) with the fixture-minted child.
+        driver1.await.expect("fork #1 task");
+        let frames1 = captured_frames(&captured1);
+        assert_eq!(
+            frames1.len(),
+            1,
+            "exactly one sink frame for fork #1: {frames1:?}"
+        );
+        assert_eq!(frames1[0]["type"], "freshAgent.forked", "{:?}", frames1[0]);
+        assert_eq!(
+            frames1[0]["parentSessionId"],
+            json!("parent-new-mint"),
+            "fork #1's reply keys to the resolved parent id: {:?}",
+            frames1[0]
+        );
+        let child1 = frames1[0]["sessionId"]
+            .as_str()
+            .expect("child id")
+            .to_string();
+        assert!(
+            child1.starts_with("thread-fork-"),
+            "the fixture minted the child: {child1}"
+        );
+
+        // BOTH guard keys released at the terminal leg: the resolved id and the
+        // clicked id are acquirable again...
+        assert!(
+            st.fork_in_flight.try_acquire("parent-new-mint").is_some(),
+            "the resolved-id guard key released when fork #1 completed"
+        );
+        assert!(
+            st.fork_in_flight.try_acquire(&old_id).is_some(),
+            "the clicked-id guard key released when fork #1 completed"
+        );
+
+        // ...behaviorally: a later fork addressed to the respawned id succeeds and
+        // mints a DISTINCT child (its RPC rides the same 2s fixture delay).
+        let (sink3, captured3) = capturing_sink();
+        let driver3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-new-mint", "fork-req-g3", None), sink3)
+                    .await;
+            })
+        };
+        driver3.await.expect("fork #3 task");
+        let frames3 = captured_frames(&captured3);
+        assert_eq!(
+            frames3.len(),
+            1,
+            "exactly one sink frame for fork #3: {frames3:?}"
+        );
+        assert_eq!(frames3[0]["type"], "freshAgent.forked", "{:?}", frames3[0]);
+        let child2 = frames3[0]["sessionId"]
+            .as_str()
+            .expect("child id")
+            .to_string();
+        assert_ne!(child1, child2, "each successful fork mints its own child");
+
+        // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
+        // post-completion fork #3 — the refused duplicate produced NONE), both
+        // targeting the respawned parent, over exactly four sidecar connections
+        // (crashed spawn + respawned parent + one sidecar per child).
+        assert_eq!(
+            spawn_count(&capture),
+            4,
+            "crashed parent + respawn + two child sidecars: {}",
+            spawn_count(&capture)
+        );
+        let log_text = read_op_log_when_complete(&log_path, 10).await;
+        let fork_targets: Vec<String> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("op log row parses"))
+            .filter(|entry| entry["method"] == "thread/fork")
+            .map(|entry| {
+                entry["params"]["threadId"]
+                    .as_str()
+                    .expect("fork target")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            fork_targets,
+            vec!["parent-new-mint".to_string(), "parent-new-mint".to_string()],
+            "exactly the two legitimate forks hit the wire — the refused duplicate none: {log_text}"
+        );
+        let urls: std::collections::HashSet<String> = log_text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["listenUrl"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            urls.len(),
+            4,
+            "crashed + respawned parent + two child sidecars: {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
     }
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
