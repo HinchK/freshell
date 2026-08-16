@@ -94,38 +94,50 @@ fn thinking_options(model: Option<&str>) -> &'static [&'static str] {
 }
 
 /// `normalizeFreshAgentEffort(freshopencode, 'opencode', model, effort)`
-/// (`fresh-agent-models.ts:131-152`).
+/// (`fresh-agent-models.ts` — the `hasStaticMenu` opencode branch).
 pub fn normalize_opencode_effort(model: Option<&str>, effort: Option<&str>) -> Option<String> {
-    let options = thinking_options(model);
-
-    // opencode-with-no-menu → trim or the freshopencode default (`:138-141`). Defensive:
-    // the populated freshopencode menu never yields an empty option list.
-    if options.is_empty() {
+    // The discriminator is STRICT static-menu membership of the *normalized* model
+    // (`.some(option.value === normalizedModel)`), NOT `resolve_model_option`'s
+    // fallback-to-first: a live-catalog model the static fallback menu does not
+    // know has no declared levels to clamp against. Absent/blank effort there is
+    // the model selector's explicit "Default" row → `None`, so NO `variant` is
+    // sent and opencode applies the model's own provider-side default (this path
+    // previously fabricated `max`). An explicit non-empty effort passes through
+    // verbatim — provider-custom names like minimax-m3's `thinking` included.
+    let normalized_model = normalize_opencode_model(model);
+    let in_static_menu = normalized_model
+        .as_deref()
+        .map(|m| FRESHOPENCODE_MODEL_OPTIONS.iter().any(|o| o.value == m))
+        .unwrap_or(false);
+    if !in_static_menu {
         let trimmed = effort.map(str::trim).unwrap_or("");
-        return Some(if trimmed.is_empty() {
-            FRESHOPENCODE_DEFAULT_EFFORT.to_string()
+        return if trimmed.is_empty() {
+            None
         } else {
-            trimmed.to_string()
-        });
+            Some(trimmed.to_string())
+        };
     }
 
-    // opencode does NOT apply the codex `xhigh→max` rewrite (`:142` guards on codex).
-    let normalized_effort = effort;
-    if let Some(e) = normalized_effort {
+    // Static-menu model → legacy clamp (a blank/unknown model resolved to the
+    // default menu entry above, so it lands here too).
+    let options = thinking_options(normalized_model.as_deref());
+
+    // opencode does NOT apply the codex `xhigh→max` rewrite.
+    if let Some(e) = effort {
         if options.contains(&e) {
             return Some(e.to_string());
         }
     }
 
-    let model_option = normalize_opencode_model(model)
-        .as_deref()
-        .and_then(resolve_model_option);
-    if let Some(opt) = model_option {
+    if let Some(opt) = normalized_model.as_deref().and_then(resolve_model_option) {
         if options.contains(&opt.default_effort) {
             return Some(opt.default_effort.to_string());
         }
     }
-    options.last().map(|s| s.to_string())
+    options
+        .last()
+        .map(|s| s.to_string())
+        .or_else(|| Some(FRESHOPENCODE_DEFAULT_EFFORT.to_string()))
 }
 
 /// A `{ providerID, modelID }` split of a `provider/model` string
@@ -219,16 +231,39 @@ mod tests {
     }
 
     #[test]
-    fn effort_for_unknown_model_uses_default_menu() {
-        // An unknown-but-nonempty model resolves to the first menu option's efforts.
+    fn effort_for_live_catalog_model_not_in_static_menu_passes_through() {
+        // A live-catalog model the static fallback menu does not know has no
+        // declared levels to clamp against (fresh-agent-models.ts
+        // `normalizeFreshAgentEffort` opencode branch, the `hasStaticMenu` guard):
+        // an explicit effort passes through verbatim — including provider-custom
+        // names like minimax-m3's `thinking`…
         let unknown = Some("some-other/model");
         assert_eq!(
-            normalize_opencode_effort(unknown, Some("high")).as_deref(),
-            Some("high")
+            normalize_opencode_effort(unknown, Some("thinking")).as_deref(),
+            Some("thinking")
         );
         assert_eq!(
-            normalize_opencode_effort(unknown, None).as_deref(),
-            Some("max")
+            normalize_opencode_effort(unknown, Some("xhigh")).as_deref(),
+            Some("xhigh")
+        );
+        // …and absent/blank effort is the selector's explicit "Default" row:
+        // `None`, so NO `variant` is sent and opencode applies the model's own
+        // provider-side default. (Previously this path fabricated `max`.)
+        assert_eq!(normalize_opencode_effort(unknown, None), None);
+        assert_eq!(normalize_opencode_effort(unknown, Some("   ")), None);
+    }
+
+    #[test]
+    fn effort_for_blank_model_resolves_via_default_menu_entry() {
+        // normalize_opencode_model(None) → the default menu entry, which IS in the
+        // static menu → legacy clamping still applies (menu default 'max').
+        assert_eq!(
+            normalize_opencode_effort(None, None).as_deref(),
+            Some(FRESHOPENCODE_DEFAULT_EFFORT)
+        );
+        assert_eq!(
+            normalize_opencode_effort(Some("  "), Some("bogus")).as_deref(),
+            Some(FRESHOPENCODE_DEFAULT_EFFORT)
         );
     }
 

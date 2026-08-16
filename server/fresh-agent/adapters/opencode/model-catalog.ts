@@ -4,6 +4,7 @@ import {
   FreshAgentModelCapabilitySchema,
   type FreshAgentModelCapability,
 } from '../../../../shared/fresh-agent-model-capabilities.js'
+import { orderThinkingLevelIds } from '../../../../shared/fresh-agent-thinking-levels.js'
 
 const DEFAULT_HEALTH_TIMEOUT_MS = 20_000
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
@@ -294,6 +295,16 @@ function readModelEntries(provider: Record<string, unknown>): Map<string, unknow
   return models
 }
 
+/** `/config/providers` serves each model's real thinking levels as the keys of
+ * its `variants` object map (opencode 1.18+). A missing, non-object, or empty
+ * `variants` map means the model exposes no selectable levels — the server does
+ * NOT invent placeholder levels for it. */
+function readModelVariantLevelIds(model: Record<string, unknown>): string[] {
+  const variants = model.variants
+  if (!isRecord(variants)) return []
+  return Object.keys(variants)
+}
+
 function compareBySourceThenNameThenId(
   a: FreshAgentModelCapability,
   b: FreshAgentModelCapability,
@@ -325,14 +336,15 @@ export function normalizeOpencodeEnabledModelCatalog(raw: unknown): FreshAgentMo
           ?? readNonEmptyString(model.display_name)
           ?? modelId,
       ) || modelId
+      const supportedEffortLevels = orderThinkingLevelIds(readModelVariantLevelIds(model))
       models.push(FreshAgentModelCapabilitySchema.parse({
         id: `${providerId}/${modelId}`,
         displayName,
         provider: 'opencode',
         source: { id: providerId, displayName: providerDisplayName },
-        supportsEffort: true,
-        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-        supportsAdaptiveThinking: true,
+        supportsEffort: supportedEffortLevels.length > 0,
+        supportedEffortLevels,
+        supportsAdaptiveThinking: supportedEffortLevels.length > 0,
       }))
     }
   }

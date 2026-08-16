@@ -102,6 +102,21 @@ describe('fresh-agent-models freshopencode live catalog normalization', () => {
 
   it('preserves Freshopencode effort for live-catalog models not present in the static fallback list', () => {
     expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', 'high')).toBe('high')
-    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', undefined)).toBe(FRESHOPENCODE_DEFAULT_EFFORT)
+  })
+
+  it('normalizes absent or blank Freshopencode effort to no variant for models without a static menu (explicit Default)', () => {
+    // Models outside the static fallback menu have no declared levels to clamp
+    // against; an empty effort is the "Default" row and must pass through as
+    // undefined so no variant is sent (opencode then applies the model's own
+    // provider-side default).
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', undefined)).toBeUndefined()
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', '')).toBeUndefined()
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', '   ')).toBeUndefined()
+  })
+
+  it('keeps static-menu Freshopencode models clamping to the menu default when effort is absent or off-menu', () => {
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'opencode-go/glm-5.2', undefined)).toBe(FRESHOPENCODE_DEFAULT_EFFORT)
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'opencode-go/glm-5.2', 'bogus')).toBe(FRESHOPENCODE_DEFAULT_EFFORT)
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'opencode-go/glm-5.2', 'low')).toBe('low')
   })
 })

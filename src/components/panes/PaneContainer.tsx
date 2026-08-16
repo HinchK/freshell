@@ -13,7 +13,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -674,6 +674,13 @@ function PickerWrapper({
             : undefined)
           ?? providerConfig?.defaultPermissionMode
           ?? freshAgentType.defaultPermissionMode
+      const createEffort = resolveFreshAgentPaneCreateEffort({
+        sessionType: freshAgentType.sessionType,
+        provider: freshAgentType.runtimeProvider,
+        model,
+        providerEffort: normalizeFreshAgentEffortOverride(providerSettings?.effort),
+        fallbackEffort: freshAgentType.defaultEffort,
+      })
       return {
         kind: 'fresh-agent',
         sessionType: freshAgentType.sessionType,
@@ -686,12 +693,9 @@ function PickerWrapper({
         sandbox: freshAgentType.runtimeProvider === 'codex'
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
           : undefined,
-        effort: normalizeFreshAgentEffort(
-          freshAgentType.sessionType,
-          freshAgentType.runtimeProvider,
-          model,
-          normalizeFreshAgentEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
-        ) ?? freshAgentType.defaultEffort,
+        // Undefined effort is meaningful for opencode live-catalog models:
+        // the Default row (no variant) persists as the provider default.
+        ...(createEffort ? { effort: createEffort } : {}),
         plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
         style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
         ...(cwd ? { initialCwd: cwd } : {}),

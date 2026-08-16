@@ -24,27 +24,19 @@ use crate::serve::{
     ServeProcess, SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
 };
 
-/// `DEFAULT_HEALTH_TIMEOUT_MS` (`model-catalog.ts:8`).
+/// `DEFAULT_HEALTH_TIMEOUT_MS` (`model-catalog.ts:9`).
 pub const CATALOG_HEALTH_TIMEOUT_MS: u64 = 20_000;
 /// The per-probe bound applied to each `/global/health` poll — the SAME DEV-0001
 /// discipline as the sidecar manager (the reference's catalog probe shares the
 /// un-bounded-health bug; we do NOT port it).
 pub const CATALOG_HEALTH_PROBE_TIMEOUT_MS: u64 = 2_000;
-/// `DEFAULT_HEALTH_POLL_INTERVAL_MS` (`model-catalog.ts:10`).
+/// `DEFAULT_HEALTH_POLL_INTERVAL_MS` (`model-catalog.ts:11`).
 pub const CATALOG_HEALTH_RETRY_INTERVAL_MS: u64 = 150;
-/// `DEFAULT_REQUEST_TIMEOUT_MS` (`model-catalog.ts:9`) — 5 s, distinct from the
+/// `DEFAULT_REQUEST_TIMEOUT_MS` (`model-catalog.ts:10`) — 5 s, distinct from the
 /// sidecar manager's 30 s request timeout.
 pub const CATALOG_REQUEST_TIMEOUT_MS: u64 = 5_000;
-/// `MAX_DISPLAY_NAME_LENGTH` (`model-catalog.ts:11`).
+/// `MAX_DISPLAY_NAME_LENGTH` (`model-catalog.ts:12`).
 const MAX_DISPLAY_NAME_LENGTH: usize = 120;
-
-/// The fixed thinking-level list the shared contract serves for opencode models
-/// today (`normalizeOpencodeEnabledModelCatalog`,
-/// `model-catalog.ts:334`): `[minimal, low, medium, high, max]`. NOTE: this is the
-/// known placeholder — per-model real levels (from the `/config/providers`
-/// `variants` map) are a follow-up slice that must land in Node and Rust together.
-pub const OPENCODE_PLACEHOLDER_EFFORT_LEVELS: [&str; 5] =
-    ["minimal", "low", "medium", "high", "max"];
 
 /// One capability row, serialized camelCase to match
 /// `FreshAgentModelCapabilitySchema` (`shared/fresh-agent-model-capabilities.ts`)
@@ -113,10 +105,10 @@ impl Default for CatalogConfig {
 
 /// Spawn the transient probe serve, wait (bounded) for health, fetch
 /// `/config/providers`, normalize the enabled model list, and kill the child —
-/// `getCatalog` (`model-catalog.ts:165-202`) + normalize.
+/// `getCatalog` (`model-catalog.ts:166-204`) + normalize.
 ///
 /// `cwd` (trimmed, non-empty) selects project-config resolution
-/// (`model-catalog.ts:168-170,178`).
+/// (`model-catalog.ts:169-171,179`).
 pub async fn probe_enabled_model_catalog(
     deps: &CatalogDeps,
     config: &CatalogConfig,
@@ -145,7 +137,7 @@ pub async fn probe_enabled_model_catalog(
             cwd: cwd.map(|s| s.to_string()),
         })
         .map_err(ServeError::Spawn)?;
-    // `finally { killChildGroup(child) }` (`model-catalog.ts:199-201`): the guard
+    // `finally { killChildGroup(child) }` (`model-catalog.ts:200-202`): the guard
     // kills on EVERY exit path below — success, health failure, HTTP error, decode
     // error.
     let guard = ChildGuard(process);
@@ -165,7 +157,7 @@ pub async fn probe_enabled_model_catalog(
         }
     };
     if !res.ok() {
-        // `model-catalog.ts:194-196`.
+        // `model-catalog.ts:195-197`.
         return Err(ServeError::Http {
             method: "GET".to_string(),
             url,
@@ -180,18 +172,23 @@ pub async fn probe_enabled_model_catalog(
     Ok(normalize_enabled_model_catalog(&raw))
 }
 
-/// `normalizeOpencodeEnabledModelCatalog` (`model-catalog.ts:308-340`): accept the
+/// `normalizeOpencodeEnabledModelCatalog` (`model-catalog.ts:319-352`): accept the
 /// providers payload as a record OR the 1.17.x array form (`readProvidersField`,
-/// `:245-260`), skip slash-containing provider ids (`:315`), sanitize display names
-/// (`cleanDisplayName`, `:233-240`), and NEVER copy credential-shaped model fields
-/// (api-key/options/headers/description) into the output.
+/// `:246-261`), skip slash-containing provider ids (`:326`), sanitize display names
+/// (`cleanDisplayName`, `:234-241`), NEVER copy credential-shaped model fields
+/// (api-key/options/headers/description) into the output, and derive each model's
+/// real thinking levels from the keys of its `variants` object map
+/// (`readModelVariantLevelIds`, `:302-306`), ordered canonically via
+/// [`order_thinking_level_ids`] — models without variants get an EMPTY levels
+/// list (with `supportsEffort`/`supportsAdaptiveThinking` false), never an
+/// invented placeholder.
 pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
     let mut models = Vec::new();
     for (provider_key, raw_provider) in read_provider_entries(raw) {
         let Some(provider) = raw_provider.as_object() else {
             continue;
         };
-        // `model-catalog.ts:314-316`: id → key fallback; slash ids skipped (they
+        // `model-catalog.ts:325-327`: id → key fallback; slash ids skipped (they
         // would collide with the `provider/model` id join).
         let provider_id = read_non_empty_string(provider.get("id")).unwrap_or(provider_key);
         if provider_id.is_empty() || provider_id.contains('/') {
@@ -219,7 +216,7 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
             if model_id.is_empty() {
                 continue;
             }
-            // `model-catalog.ts:322-327`: name → displayName → display_name → id.
+            // `model-catalog.ts:333-338`: name → displayName → display_name → id.
             let display = clean_display_name(
                 &read_non_empty_string(model.get("name"))
                     .or_else(|| read_non_empty_string(model.get("displayName")))
@@ -231,6 +228,13 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
             } else {
                 display
             };
+            // `model-catalog.ts:339-349`: real per-model thinking levels from the
+            // variants map keys; both booleans derive from the levels list (the
+            // same convention the registry's static catalog uses,
+            // model-capability-registry.ts `createStaticSuccess`).
+            let supported_effort_levels =
+                order_thinking_level_ids(read_model_variant_level_ids(model));
+            let has_levels = !supported_effort_levels.is_empty();
             models.push(ModelCapability {
                 id: format!("{provider_id}/{model_id}"),
                 display_name,
@@ -239,16 +243,13 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
                     id: provider_id.clone(),
                     display_name: provider_display_name.clone(),
                 }),
-                supports_effort: true,
-                supported_effort_levels: OPENCODE_PLACEHOLDER_EFFORT_LEVELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                supports_adaptive_thinking: true,
+                supports_effort: has_levels,
+                supported_effort_levels,
+                supports_adaptive_thinking: has_levels,
             });
         }
     }
-    // `compareBySourceThenNameThenId` (`model-catalog.ts:297-306`): localeCompare
+    // `compareBySourceThenNameThenId` (`model-catalog.ts:308-317`): localeCompare
     // with `sensitivity: 'base'` — case-insensitive ordering, ties fall through.
     models.sort_by(|a, b| {
         let a_src = a.source.as_ref().map(|s| s.id.as_str()).unwrap_or("");
@@ -260,7 +261,7 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
     models
 }
 
-/// `readNonEmptyString` (`model-catalog.ts:227-231`).
+/// `readNonEmptyString` (`model-catalog.ts:228-232`).
 fn read_non_empty_string(value: Option<&Value>) -> Option<String> {
     let trimmed = value?.as_str()?.trim();
     if trimmed.is_empty() {
@@ -270,7 +271,7 @@ fn read_non_empty_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// `cleanDisplayName` (`model-catalog.ts:233-240`): strip C0 control chars + DEL
+/// `cleanDisplayName` (`model-catalog.ts:234-241`): strip C0 control chars + DEL
 /// (`CONTROL_CHAR_PATTERN`), trim, cap at [`MAX_DISPLAY_NAME_LENGTH`].
 fn clean_display_name(value: &str) -> String {
     let stripped: String = value
@@ -290,7 +291,65 @@ fn ci_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     a.to_lowercase().cmp(&b.to_lowercase())
 }
 
-/// `readProvidersField`/`readProviderMap` (`model-catalog.ts:245-284`): the
+/// Port of `CANONICAL_THINKING_LEVEL_RANK`
+/// (`shared/fresh-agent-thinking-levels.ts:15-24`): none/off < minimal < low <
+/// medium < high < xhigh < max. The shared-fixture parity test below (and its
+/// Node sibling) keeps this table in lockstep with the TS module.
+fn canonical_thinking_level_rank(id: &str) -> Option<u8> {
+    match id {
+        "none" | "off" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        _ => None,
+    }
+}
+
+/// Port of `orderThinkingLevelIds`
+/// (`shared/fresh-agent-thinking-levels.ts:35-59`): blank ids dropped, repeats
+/// deduped (first occurrence wins), known ids sorted by canonical rank, unknown
+/// ids ranked after the known ones in served relative order (`slice::sort_by`
+/// is stable, so the `Equal` arms preserve input order).
+fn order_thinking_level_ids(served: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<String> = Vec::new();
+    for raw in served {
+        let id = raw.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        unique.push(id.to_string());
+    }
+    unique.sort_by(|a, b| {
+        match (
+            canonical_thinking_level_rank(a),
+            canonical_thinking_level_rank(b),
+        ) {
+            (Some(ra), Some(rb)) => ra.cmp(&rb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    unique
+}
+
+/// Port of `readModelVariantLevelIds` (`model-catalog.ts:302-306`): the model's
+/// declared thinking-level ids are the keys of its `variants` object map
+/// (opencode 1.18+); a missing, non-object, or empty map means no selectable
+/// levels. serde_json's `preserve_order` feature keeps the served key order for
+/// the unknown-id tiebreak.
+fn read_model_variant_level_ids(model: &serde_json::Map<String, Value>) -> Vec<String> {
+    match model.get("variants") {
+        Some(Value::Object(variants)) => variants.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `readProvidersField`/`readProviderMap` (`model-catalog.ts:246-285`): the
 /// providers field arrives as a record (current) OR a 1.17.x array of Info
 /// objects; array entries key by their own `id`.
 fn read_provider_entries(raw: &Value) -> Vec<(String, Value)> {
@@ -334,7 +393,7 @@ impl Drop for ChildGuard {
 /// [`crate::serve::OpencodeServeManager::wait_for_health`] (each probe bounded by
 /// `health_probe_timeout`, `take_fatal_startup_error`/`exited` checked per poll,
 /// retry cadence, outer deadline → [`ServeError::NotHealthy`]). The reference's
-/// catalog wait (`model-catalog.ts:91-163`) additionally watches an abort signal;
+/// catalog wait (`model-catalog.ts:92-164`) additionally watches an abort signal;
 /// nothing upstream threads one in, so the port omits it.
 async fn wait_for_catalog_health(
     deps: &CatalogDeps,
@@ -688,7 +747,8 @@ mod tests {
     // ── normalization (pure function) ───────────────────────────────────────────
 
     /// Port of "sanitizes enabled provider models and does not copy
-    /// credential-shaped fields or descriptions" (`:70-106`).
+    /// credential-shaped fields or descriptions" (`:70-106`), incl. the real
+    /// variants-derived levels.
     #[test]
     fn normalize_sanitizes_models_and_never_leaks_credentials() {
         let models = normalize_enabled_model_catalog(&json!({
@@ -704,6 +764,10 @@ mod tests {
                             "description": "must-not-leak-description",
                             "options": { "apiKey": "must-not-leak" },
                             "headers": { "authorization": "must-not-leak" },
+                            "variants": {
+                                "high": { "reasoningEffort": "high" },
+                                "max": { "reasoningEffort": "max" },
+                            },
                         },
                     },
                 },
@@ -725,10 +789,7 @@ mod tests {
                     display_name: "deepseek".to_string(),
                 }),
                 supports_effort: true,
-                supported_effort_levels: OPENCODE_PLACEHOLDER_EFFORT_LEVELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                supported_effort_levels: vec!["high".to_string(), "max".to_string()],
                 supports_adaptive_thinking: true,
             }]
         );
@@ -752,14 +813,28 @@ mod tests {
                     "id": "deepseek",
                     "name": "deepseek",
                     "models": {
-                        "deepseek-v4-pro": { "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro" },
-                        "deepseek-v4-flash": { "id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash" },
+                        "deepseek-v4-pro": {
+                            "id": "deepseek-v4-pro",
+                            "name": "DeepSeek V4 Pro",
+                            "variants": { "high": {}, "max": {} },
+                        },
+                        "deepseek-v4-flash": {
+                            "id": "deepseek-v4-flash",
+                            "name": "DeepSeek V4 Flash",
+                            "variants": { "low": {}, "high": {}, "max": {} },
+                        },
                     },
                 },
                 {
                     "id": "opencode-go",
                     "name": "opencode-go",
-                    "models": { "glm-5.2": { "id": "glm-5.2", "name": "GLM 5.2" } },
+                    "models": {
+                        "glm-5.2": {
+                            "id": "glm-5.2",
+                            "name": "GLM 5.2",
+                            "variants": { "high": {}, "max": {} },
+                        },
+                    },
                 },
             ],
             "default": { "opencode-go": "glm-5.2" },
@@ -774,16 +849,173 @@ mod tests {
                 "opencode-go/glm-5.2"
             ]
         );
-        assert!(models.iter().all(|m| m.supports_effort
-            && m.supported_effort_levels
-                == OPENCODE_PLACEHOLDER_EFFORT_LEVELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            && m.supports_adaptive_thinking));
+        let by_id: std::collections::HashMap<&str, &ModelCapability> =
+            models.iter().map(|m| (m.id.as_str(), m)).collect();
+        assert_eq!(
+            by_id["deepseek/deepseek-v4-flash"].supported_effort_levels,
+            ["low", "high", "max"]
+        );
+        assert_eq!(
+            by_id["deepseek/deepseek-v4-pro"].supported_effort_levels,
+            ["high", "max"]
+        );
+        assert_eq!(
+            by_id["opencode-go/glm-5.2"].supported_effort_levels,
+            ["high", "max"]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.supports_effort && m.supports_adaptive_thinking));
     }
 
-    /// `model-catalog.ts:314,320`: empty/missing ids fall back to the MAP KEY; a
+    // ── thinking variants (ported from opencode-model-catalog.test.ts) ───────
+
+    fn normalize_single_model(model: Value) -> ModelCapability {
+        let models = normalize_enabled_model_catalog(&json!({
+            "providers": {
+                "opencode-go": {
+                    "id": "opencode-go",
+                    "name": "OpenCode Go",
+                    "models": { "m": model },
+                },
+            },
+        }));
+        assert_eq!(models.len(), 1);
+        models.into_iter().next().unwrap()
+    }
+
+    /// "derives supportedEffortLevels from the model variants map keys, ordered
+    /// canonically" — the real served order of lunaroute/glm-5.2-vision
+    /// (opencode 1.18.18) must come out low→highest.
+    #[test]
+    fn normalize_orders_variant_levels_canonically() {
+        let model = normalize_single_model(json!({
+            "id": "glm-5.2-vision",
+            "name": "glm-5.2-vision",
+            "variants": {
+                "high": { "reasoningEffort": "high" },
+                "max": { "reasoningEffort": "max" },
+                "off": { "reasoningEffort": "none" },
+                "minimal": { "reasoningEffort": "minimal" },
+                "low": { "reasoningEffort": "low" },
+                "medium": { "reasoningEffort": "medium" },
+                "xhigh": { "reasoningEffort": "xhigh" },
+            },
+        }));
+
+        assert_eq!(
+            model.supported_effort_levels,
+            ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(model.supports_effort);
+        assert!(model.supports_adaptive_thinking);
+    }
+
+    /// "keeps a single-variant model effort-capable" — real:
+    /// opencode-go/kimi-k3 declares { max } only.
+    #[test]
+    fn normalize_keeps_single_variant_models_effort_capable() {
+        let model = normalize_single_model(json!({
+            "id": "kimi-k3",
+            "name": "Kimi K3",
+            "variants": { "max": { "reasoningEffort": "max" } },
+        }));
+
+        assert_eq!(model.supported_effort_levels, ["max"]);
+        assert!(model.supports_effort);
+        assert!(model.supports_adaptive_thinking);
+    }
+
+    /// "ranks unknown variant ids after the known canonical levels" — real:
+    /// opencode-go/minimax-m3 declares { none, thinking }.
+    #[test]
+    fn normalize_ranks_unknown_variant_ids_after_known_levels() {
+        let model = normalize_single_model(json!({
+            "id": "minimax-m3",
+            "name": "MiniMax-M3",
+            "variants": {
+                "none": { "thinking": { "type": "disabled" } },
+                "thinking": { "thinking": { "type": "adaptive" } },
+            },
+        }));
+
+        assert_eq!(model.supported_effort_levels, ["none", "thinking"]);
+        assert!(model.supports_effort);
+        assert!(model.supports_adaptive_thinking);
+    }
+
+    /// "drops blank variant ids".
+    #[test]
+    fn normalize_drops_blank_variant_ids() {
+        let model = normalize_single_model(json!({
+            "id": "m",
+            "name": "M",
+            "variants": { "": {}, "  ": {}, "low": {}, "high": {} },
+        }));
+
+        assert_eq!(model.supported_effort_levels, ["low", "high"]);
+    }
+
+    /// "treats a model with no variants as having no selectable levels" — the
+    /// server does NOT invent levels (the client renders a single "Default"
+    /// row from the empty list).
+    #[test]
+    fn normalize_treats_missing_or_empty_variants_as_no_levels() {
+        let missing_key = normalize_single_model(json!({ "id": "m", "name": "M" }));
+        let empty_object =
+            normalize_single_model(json!({ "id": "m", "name": "M", "variants": {} }));
+
+        for model in [missing_key, empty_object] {
+            assert!(model.supported_effort_levels.is_empty());
+            assert!(!model.supports_effort);
+            assert!(!model.supports_adaptive_thinking);
+        }
+    }
+
+    /// "ignores non-object variants payloads".
+    #[test]
+    fn normalize_ignores_non_object_variants_payloads() {
+        let as_array =
+            normalize_single_model(json!({ "id": "m", "name": "M", "variants": ["low", "high"] }));
+        let as_string =
+            normalize_single_model(json!({ "id": "m", "name": "M", "variants": "low,high" }));
+        let as_number = normalize_single_model(json!({ "id": "m", "name": "M", "variants": 3 }));
+
+        for model in [as_array, as_string, as_number] {
+            assert!(model.supported_effort_levels.is_empty());
+            assert!(!model.supports_effort);
+            assert!(!model.supports_adaptive_thinking);
+        }
+    }
+
+    /// Cross-implementation parity: both the Node normalizer
+    /// (`normalizeOpencodeEnabledModelCatalog`, asserted in
+    /// `opencode-model-catalog.test.ts`) and this port must produce the SAME
+    /// normalized list for the SAME trimmed real `/config/providers` probe
+    /// (opencode 1.18.18) — incl. the canonical level ordering of
+    /// `orderThinkingLevelIds` and the no-variants shape.
+    #[test]
+    fn normalize_matches_the_shared_probe_fixture() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/fixtures/fresh-agent-model-capabilities"
+        );
+        let fixture: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/opencode-config-providers.fixture.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/opencode-config-providers.normalized.json"))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let models = normalize_enabled_model_catalog(&fixture);
+        assert_eq!(serde_json::to_value(&models).unwrap(), expected);
+    }
+
+    /// `model-catalog.ts:325,331`: empty/missing ids fall back to the MAP KEY; a
     /// provider with a slash (or empty id AND key) is skipped; model entries that
     /// are not objects are skipped.
     #[test]
@@ -813,19 +1045,16 @@ mod tests {
                     id: "keyprovider".to_string(),
                     display_name: "keyprovider".to_string(),
                 }),
-                supports_effort: true,
-                supported_effort_levels: OPENCODE_PLACEHOLDER_EFFORT_LEVELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                supports_adaptive_thinking: true,
+                supports_effort: false,
+                supported_effort_levels: Vec::new(),
+                supports_adaptive_thinking: false,
             }]
         );
     }
 
-    /// `cleanDisplayName` (`:233-240`): control characters stripped, trimmed,
+    /// `cleanDisplayName` (`:234-241`): control characters stripped, trimmed,
     /// capped at 120 chars; display-name fallback chain
-    /// name → displayName → display_name → id (`:322-327`).
+    /// name → displayName → display_name → id (`:333-338`).
     #[test]
     fn normalize_cleans_display_names_and_follows_the_fallback_chain() {
         let long = "x".repeat(300);
@@ -863,7 +1092,7 @@ mod tests {
     }
 
     /// A `null`/garbage providers field normalizes to an empty list, not a panic
-    /// (`readProvidersField`, `:245-260`).
+    /// (`readProvidersField`, `:246-261`).
     #[test]
     fn normalize_tolerates_missing_or_wrong_typed_providers_field() {
         assert!(normalize_enabled_model_catalog(&json!({ "providers": null })).is_empty());

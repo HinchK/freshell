@@ -135,9 +135,23 @@ export function normalizeFreshAgentEffort(
   effort: string | undefined,
 ): string | undefined {
   const options = getFreshAgentThinkingOptions(sessionType, provider, model)
-  if (provider === 'opencode' && options.length === 0) {
-    const normalized = typeof effort === 'string' ? effort.trim() : ''
-    return normalized.length > 0 ? normalized : FRESHOPENCODE_DEFAULT_EFFORT
+  if (provider === 'opencode') {
+    const normalizedModel = normalizeFreshAgentModel(sessionType, provider, model)
+    const hasStaticMenu = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode
+      .some((option) => option.value === normalizedModel)
+    if (!hasStaticMenu) {
+      // A live-catalog model the static fallback menu does not know has no
+      // declared levels to clamp against. Absent/blank effort is the explicit
+      // "Default" row from the model selector: pass it through as `undefined`
+      // so NO variant is sent and opencode applies the model's own
+      // provider-side default. (Previously this path force-defaulted to
+      // FRESHOPENCODE_DEFAULT_EFFORT, fabricating a 'max' variant even for
+      // models that declare no levels.) An explicit non-empty effort still
+      // passes through verbatim — the REST `agent=opencode&effort=<level>`
+      // contract is unchanged.
+      const normalized = typeof effort === 'string' ? effort.trim() : ''
+      return normalized.length > 0 ? normalized : undefined
+    }
   }
   const normalizedEffort = provider === 'codex' && effort === 'xhigh' ? 'max' : effort
   if (normalizedEffort && options.some((option) => option.value === normalizedEffort)) {

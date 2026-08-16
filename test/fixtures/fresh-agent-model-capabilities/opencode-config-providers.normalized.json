@@ -1,0 +1,65 @@
+[
+  {
+    "id": "kimi-for-coding/kimi-for-coding-highspeed",
+    "displayName": "Kimi For Coding HighSpeed",
+    "provider": "opencode",
+    "source": { "id": "kimi-for-coding", "displayName": "Kimi For Coding" },
+    "supportsEffort": false,
+    "supportedEffortLevels": [],
+    "supportsAdaptiveThinking": false
+  },
+  {
+    "id": "kimi-for-coding/k3-256k",
+    "displayName": "Kimi K3-256K",
+    "provider": "opencode",
+    "source": { "id": "kimi-for-coding", "displayName": "Kimi For Coding" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["low", "high", "max"],
+    "supportsAdaptiveThinking": true
+  },
+  {
+    "id": "lunaroute/glm-5.2-vision",
+    "displayName": "glm-5.2-vision",
+    "provider": "opencode",
+    "source": { "id": "lunaroute", "displayName": "LunaRoute" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "supportsAdaptiveThinking": true
+  },
+  {
+    "id": "opencode-go/glm-5.2",
+    "displayName": "GLM-5.2",
+    "provider": "opencode",
+    "source": { "id": "opencode-go", "displayName": "OpenCode Go" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["high", "max"],
+    "supportsAdaptiveThinking": true
+  },
+  {
+    "id": "opencode-go/kimi-k2.7-code",
+    "displayName": "Kimi K2.7 Code",
+    "provider": "opencode",
+    "source": { "id": "opencode-go", "displayName": "OpenCode Go" },
+    "supportsEffort": false,
+    "supportedEffortLevels": [],
+    "supportsAdaptiveThinking": false
+  },
+  {
+    "id": "opencode-go/kimi-k3",
+    "displayName": "Kimi K3",
+    "provider": "opencode",
+    "source": { "id": "opencode-go", "displayName": "OpenCode Go" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["max"],
+    "supportsAdaptiveThinking": true
+  },
+  {
+    "id": "opencode-go/minimax-m3",
+    "displayName": "MiniMax-M3",
+    "provider": "opencode",
+    "source": { "id": "opencode-go", "displayName": "OpenCode Go" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["none", "thinking"],
+    "supportsAdaptiveThinking": true
+  }
+]
