@@ -43,6 +43,21 @@ function getCodexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
 }
 
+function hasExplicitCodexHome() {
+  return typeof process.env.CODEX_HOME === 'string' && process.env.CODEX_HOME.trim().length > 0
+}
+
+function allowsDurableFixtureWrites() {
+  return process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES === '1'
+}
+
+function rolloutFilename(threadId) {
+  // Thread ids are data, never path segments. Percent encoding keeps the familiar
+  // rollout-<id>.jsonl shape for ordinary Codex ids while escaping path separators
+  // and filesystem metacharacters into one stable safe filename component.
+  return `rollout-${encodeURIComponent(threadId)}.jsonl`
+}
+
 function getRolloutSessionDir() {
   const now = new Date()
   const year = String(now.getUTCFullYear())
@@ -54,7 +69,7 @@ function getRolloutSessionDir() {
 function getThreadHandle(threadId) {
   return {
     id: threadId,
-    path: path.join(getRolloutSessionDir(), `rollout-${threadId}.jsonl`),
+    path: path.join(getRolloutSessionDir(), rolloutFilename(threadId)),
     ephemeral: false,
   }
 }
@@ -481,6 +496,24 @@ wss.on('connection', (socket) => {
     }
 
     if (behavior.ignoreMethods?.includes(method)) {
+      return
+    }
+
+    // This fixture writes realistic rollout files on turn/start. Require BOTH a test-owned
+    // CODEX_HOME and a fixture-only opt-in so an ambient or production CODEX_HOME can never
+    // accidentally authorize durable-looking fake sessions.
+    if (
+      method === 'turn/start'
+      && message.params?.threadId
+      && (!hasExplicitCodexHome() || !allowsDurableFixtureWrites())
+    ) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32002,
+          message: 'Fake Codex app-server requires an explicit CODEX_HOME and fixture-only durable-write opt-in before writing a durable rollout.',
+        },
+      }))
       return
     }
 
