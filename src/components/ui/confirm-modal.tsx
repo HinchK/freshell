@@ -9,6 +9,9 @@ type ConfirmModalProps = {
   body: React.ReactNode
   confirmLabel: string
   confirmVariant?: ButtonVariant
+  /** Failure text from a previous confirm attempt (e.g. a delete the server
+   * rejected) — announced via role="alert" while the dialog stays open. */
+  error?: string
   onConfirm: () => void
   onCancel: () => void
 }
@@ -32,6 +35,7 @@ export function ConfirmModal({
   body,
   confirmLabel,
   confirmVariant = 'destructive',
+  error,
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
@@ -117,6 +121,11 @@ export function ConfirmModal({
       >
         <h2 className="text-lg font-semibold">{title}</h2>
         <div className="mt-3 text-sm text-muted-foreground">{body}</div>
+        {error ? (
+          <p role="alert" className="mt-3 text-sm text-destructive">
+            {error}
+          </p>
+        ) : null}
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onCancel}>
             Cancel
