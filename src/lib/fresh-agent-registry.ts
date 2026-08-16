@@ -189,3 +189,25 @@ export function getEffectiveFreshAgentEffort(
     content.effort ?? providerDefaults?.effort,
   )
 }
+
+/**
+ * The effort a NEW pane starts with. Non-opencode providers fall back to the
+ * registry default when nothing is staged. For opencode, `normalizeFreshAgentEffort`
+ * alone is authoritative: static-menu models clamp to their menu default, while
+ * live-catalog models with no staged level resolve to NO effort — the selector's
+ * explicit Default must not be re-fabricated as 'max' for new panes.
+ */
+export function resolveFreshAgentPaneCreateEffort(args: {
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  model: string | undefined
+  providerEffort: string | undefined
+  fallbackEffort: string
+}): string | undefined {
+  const { sessionType, provider, model, providerEffort, fallbackEffort } = args
+  if (provider === 'opencode') {
+    return normalizeFreshAgentEffort(sessionType, provider, model, providerEffort)
+  }
+  return normalizeFreshAgentEffort(sessionType, provider, model, providerEffort ?? fallbackEffort)
+    ?? fallbackEffort
+}

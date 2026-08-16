@@ -3802,7 +3802,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('lets Freshcodex settings choose model and thinking substrings verbatim from the gear popover', async () => {
+  it('lets Freshcodex settings choose model and thinking level from the gear popover’s Change… dialog', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -3826,22 +3826,32 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
-    expect(screen.getByRole('radiogroup', { name: 'Model' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.4 Flash' }))
+    // Retired from the freshcodex popover: the radio model list and the
+    // separate Thinking dropdown. Only the compact Model row remains.
+    expect(screen.queryByRole('radiogroup', { name: 'Model' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPT-5\.5 · max.*Change/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /Change/ }))
+    await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+
+    // GPT-5.4 Flash declares none..high (no xhigh/max); levels arrive in
+    // canonical order.
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const levelTexts = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
+    expect(levelTexts.map((text) => text?.replace(/last used|highest|current|●/g, '').trim())).toEqual(
+      ['none', 'minimal', 'low', 'medium', 'high'],
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
+
     await waitFor(() => {
-      expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).toBeChecked()
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout?.type).toBe('leaf')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
     })
-
-    const thinking = screen.getByRole('combobox', { name: 'Thinking level' })
-    expect(thinking).toHaveValue('high')
-    expect(screen.queryByRole('option', { name: 'xhigh' })).not.toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument()
-
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout?.type).toBe('leaf')
-    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
-    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
@@ -3879,9 +3889,14 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
-      target: { value: 'high' },
-    })
+    // Thinking now persists through the Change… dialog, not a retired dropdown.
+    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.4 Flash · medium.*Change/ }))
+    await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const highOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('high'))
+    expect(highOption).toBeDefined()
+    fireEvent.click(highOption!)
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
     fireEvent.change(screen.getByRole('combobox', { name: 'Permission mode' }), {
       target: { value: 'never' },
     })
@@ -3889,7 +3904,10 @@ describe('FreshAgentView', () => {
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
-          freshcodex: { effort: 'high' },
+          freshcodex: {
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            effort: 'high',
+          },
         },
       },
     })
@@ -3982,7 +4000,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('lets Freshopencode settings choose model and thinking controls from the gear popover', async () => {
+  it('lets Freshopencode settings choose model and thinking level from the gear popover’s Change… dialog', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -4013,26 +4031,28 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: /Current model: DeepSeek V4 Flash/i })).toBeVisible()
-    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('max')
+    // The popover keeps only a compact Model row now; tiles, the one-column
+    // browser, and the separate Thinking dropdown are retired.
+    expect(await screen.findByRole('button', { name: /DeepSeek V4 Flash · max.*Change/ })).toBeVisible()
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
 
-    fireEvent.focus(screen.getByRole('searchbox', { name: /Search enabled models/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /GLM 5\.1/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Change/ }))
+    await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    fireEvent.click(screen.getByRole('option', { name: /GLM 5\.1/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GLM 5.1' })
+    const highOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('high'))
+    expect(highOption).toBeDefined()
+    fireEvent.click(highOption!)
+    fireEvent.click(screen.getByRole('button', { name: 'Use GLM 5.1 · high' }))
+
     await waitFor(() => {
-      const layout = store.getState().panes.layouts['tab-1']
-      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null)
-        .toBe('opencode-go/glm-5.1')
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('fresh-agent')
+      if (paneContent.kind === 'fresh-agent') {
+        expect(paneContent.model).toBe('opencode-go/glm-5.1')
+        expect(paneContent.effort).toBe('high')
+      }
     })
-    fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
-      target: { value: 'high' },
-    })
-
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout?.type).toBe('leaf')
-    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null)
-      .toBe('opencode-go/glm-5.1')
-    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
   })
 
   it('promotes Freshopencode placeholders to durable OpenCode session ids from snapshots', async () => {

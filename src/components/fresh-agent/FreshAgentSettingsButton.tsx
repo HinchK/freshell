@@ -6,12 +6,14 @@ import { mergePaneContent } from '@/store/panesSlice'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
+  getEffectiveFreshAgentEffort,
   getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
-  normalizeFreshAgentModel,
+  resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { getFreshAgentModelCapabilities } from '@/lib/api'
+import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { cn } from '@/lib/utils'
 import {
   DEFAULT_FRESH_AGENT_STYLE,
@@ -19,32 +21,10 @@ import {
   normalizeFreshAgentStyle,
   type FreshAgentStyle,
 } from '@shared/settings'
-import { FreshOpencodeModelSettings } from './FreshOpencodeModelSettings'
+import { FreshAgentModelDialog } from './FreshAgentModelDialog'
 import type {
   FreshAgentModelCapabilitiesResponse,
 } from '@shared/fresh-agent-model-capabilities'
-
-function resolveEffectiveFreshAgentModel(
-  content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
-): string | undefined {
-  const configuredModel = content.model
-    ?? content.modelSelection?.modelId
-    ?? providerDefaults?.modelSelection?.modelId
-  return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
-}
-
-function getEffectiveFreshAgentEffort(
-  content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
-): string | undefined {
-  return normalizeFreshAgentEffort(
-    content.sessionType,
-    content.provider,
-    resolveEffectiveFreshAgentModel(content, providerDefaults),
-    content.effort ?? providerDefaults?.effort,
-  )
-}
 
 type PermissionModeOption = { value: string; label: string; description?: string }
 
@@ -67,6 +47,18 @@ const PERMISSION_MODES_BY_PROVIDER: Record<string, PermissionModeOption[]> = {
   ],
 }
 
+function makeUnavailableCapabilitiesResponse(): FreshAgentModelCapabilitiesResponse {
+  return {
+    ok: false,
+    sessionType: 'freshopencode',
+    runtimeProvider: 'opencode',
+    status: 'unavailable',
+    fetchedAt: Date.now(),
+    models: [],
+    error: { code: 'CAPABILITY_PROBE_FAILED', message: 'Catalog fetch failed' },
+  }
+}
+
 export function FreshAgentSettingsButton({
   tabId,
   paneId,
@@ -85,20 +77,21 @@ export function FreshAgentSettingsButton({
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [opencodeCapabilities, setOpencodeCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
+  const [modelDialogOpen, setModelDialogOpen] = useState(false)
 
   const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const modelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
   const modelValue = activeModel ?? ''
   const isFreshopencode = paneContent.sessionType === 'freshopencode'
+  // freshclaude/kilroy keep the simple radio list + Thinking dropdown, exactly
+  // as before; freshopencode and freshcodex get the compact Model row that
+  // opens the shared two-column dialog.
+  const keepsSimpleModelList = paneContent.provider === 'claude'
+  const opensModelDialog = paneContent.sessionType === 'freshopencode' || paneContent.sessionType === 'freshcodex'
 
-  // For freshopencode, fetch capabilities so the Thinking dropdown can derive
-  // effort options from the live model's supported effort levels.
-  const catalogModel = isFreshopencode && opencodeCapabilities?.ok
-    ? opencodeCapabilities.models.find((m) => m.id === activeModel)
-    : undefined
-  const thinkingOptions = catalogModel
-    ? catalogModel.supportedEffortLevels.map((value) => ({ value, label: value }))
-    : getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
+  const thinkingOptions = keepsSimpleModelList
+    ? getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
+    : []
   const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const permissionModeVisible = descriptor?.settingsVisibility.permissionMode === true
@@ -113,6 +106,16 @@ export function FreshAgentSettingsButton({
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
 
+  const opencodeCatalogUnavailable = isFreshopencode && opencodeCapabilities?.ok === false
+  const modelDisplayName = isFreshopencode
+    ? (opencodeCapabilities?.ok
+        ? opencodeCapabilities.models.find((model) => model.id === activeModel)?.displayName ?? activeModel
+        : activeModel)
+    : (modelOptions.find((option) => option.value === activeModel)?.label ?? activeModel)
+  const effortLabel = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'
+  const modelRowLabel = `${modelDisplayName ?? 'Unknown model'} · ${effortLabel}`
+
+  const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
   const close = useCallback(() => setOpen(false), [])
   const persistProviderDefaults = useCallback((defaults: {
     modelSelection?: { kind: 'exact'; modelId: string }
@@ -129,14 +132,14 @@ export function FreshAgentSettingsButton({
     }))
   }, [dispatch, paneContent.sessionType])
 
-  // Fetch live capabilities when the popover opens so the Thinking dropdown
-  // reflects the selected model's supported effort levels, not the static list.
+  // freshopencode: fetch the live catalog when the popover opens so the Model
+  // row can render the real display name and report catalog unavailability.
   useEffect(() => {
     if (!open || !isFreshopencode) return
     let cancelled = false
     void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
       .then((result) => { if (!cancelled) setOpencodeCapabilities(result) })
-      .catch(() => {})
+      .catch(() => { if (!cancelled) setOpencodeCapabilities(makeUnavailableCapabilitiesResponse()) })
     return () => { cancelled = true }
   }, [open, isFreshopencode, paneContent.initialCwd])
 
@@ -213,7 +216,7 @@ export function FreshAgentSettingsButton({
               </select>
             </label>
 
-            {!isFreshopencode && modelOptions.length > 0 ? (
+            {keepsSimpleModelList && modelOptions.length > 0 ? (
               <fieldset className="space-y-1">
                 <legend className="font-medium">Model</legend>
                 <div className="space-y-1" role="radiogroup" aria-label="Model">
@@ -284,12 +287,27 @@ export function FreshAgentSettingsButton({
               </label>
             ) : null}
 
-            {isFreshopencode ? (
-              <FreshOpencodeModelSettings
-                tabId={tabId}
-                paneId={paneId}
-                paneContent={paneContent}
-              />
+            {opensModelDialog ? (
+              opencodeCatalogUnavailable ? (
+                <div className="space-y-1">
+                  <span className="font-medium">Model</span>
+                  <p className="text-[11px] text-muted-foreground">
+                    {FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE}
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <span className="font-medium">Model</span>
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-2 rounded border border-border/70 px-2 py-1.5 text-left hover:bg-accent/50"
+                    onClick={() => setModelDialogOpen(true)}
+                  >
+                    <span className="min-w-0 truncate">{modelRowLabel}</span>
+                    <span className="shrink-0 text-muted-foreground">Change…</span>
+                  </button>
+                </div>
+              )
             ) : null}
 
             {permissionModes.length > 0 ? (
@@ -326,6 +344,16 @@ export function FreshAgentSettingsButton({
             ) : null}
           </div>
         </div>
+      ) : null}
+
+      {opensModelDialog ? (
+        <FreshAgentModelDialog
+          tabId={tabId}
+          paneId={paneId}
+          paneContent={paneContent}
+          open={modelDialogOpen}
+          onClose={closeModelDialog}
+        />
       ) : null}
     </div>
   )

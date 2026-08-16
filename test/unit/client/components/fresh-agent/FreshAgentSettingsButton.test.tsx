@@ -27,6 +27,34 @@ vi.mock('@/lib/api', async (importOriginal) => {
   }
 })
 
+const CATALOG_RESPONSE = {
+  ok: true as const,
+  sessionType: 'freshopencode' as const,
+  runtimeProvider: 'opencode' as const,
+  status: 'fresh' as const,
+  fetchedAt: 1_234,
+  models: [
+    {
+      id: 'opencode-go/glm-5.2',
+      displayName: 'GLM 5.2',
+      provider: 'opencode' as const,
+      source: { id: 'opencode-go', displayName: 'OpenCode Go' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high', 'max'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'deepseek/deepseek-v4-pro',
+      displayName: 'DeepSeek V4 Pro',
+      provider: 'opencode' as const,
+      source: { id: 'deepseek', displayName: 'DeepSeek' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high'],
+      supportsAdaptiveThinking: true,
+    },
+  ],
+}
+
 function createStore() {
   return configureStore({
     reducer: {
@@ -36,24 +64,21 @@ function createStore() {
   })
 }
 
-function createFreshopencodeStoreWithModel(model: string) {
-  const store = createStore()
+function seedPane(
+  store: ReturnType<typeof createStore>,
+  content: Record<string, unknown>,
+) {
   store.dispatch(initLayout({
     tabId: 'tab-1',
     paneId: 'pane-1',
     content: {
       kind: 'fresh-agent',
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      createRequestId: 'req-opencode-settings',
-      sessionId: 'thread-opencode-settings',
+      createRequestId: 'req-settings',
+      sessionId: 'thread-settings',
       status: 'idle',
-      initialCwd: '/repo/project-a',
-      model,
-      effort: 'max',
+      ...content,
     },
   }))
-  return store
 }
 
 function StoreBackedFreshAgentSettingsButton({
@@ -73,10 +98,22 @@ function StoreBackedFreshAgentSettingsButton({
   return <FreshAgentSettingsButton tabId={tabId} paneId={paneId} paneContent={paneContent} />
 }
 
+function renderButton(store: ReturnType<typeof createStore>) {
+  return render(
+    <Provider store={store}>
+      <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+    </Provider>,
+  )
+}
+
 beforeEach(() => {
   saveServerSettingsPatchSpy.mockClear()
   getFreshAgentModelCapabilitiesSpy.mockReset()
+  getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CATALOG_RESPONSE)
   window.localStorage.removeItem('freshopencode.modelMru.v2')
+  window.localStorage.removeItem('freshcodex.modelMru.v2')
+  window.localStorage.removeItem('freshopencode.modelLevelMru.v1')
+  window.localStorage.removeItem('freshcodex.modelLevelMru.v1')
 })
 
 afterEach(() => {
@@ -84,300 +121,117 @@ afterEach(() => {
 })
 
 describe('FreshAgentSettingsButton', () => {
-  it('persists model changes as fresh-agent provider model selections', async () => {
+  it('keeps the simple model radio list and Thinking dropdown for freshclaude', () => {
     const store = createStore()
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        createRequestId: 'req-model-settings',
-        sessionId: 'thread-model-settings',
-        status: 'idle',
-        model: 'gpt-5.5',
-        effort: 'max',
-      },
-    }))
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+      effort: 'high',
+    })
 
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
+    renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.4 Flash' }))
 
-    await waitFor(() => {
-      expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).toBeChecked()
-    })
-
-    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      freshAgent: {
-        providers: {
-          freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
-            effort: 'high',
-          },
-        },
-      },
-    })
+    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toBeInTheDocument()
+    // the shared dialog path is not offered to freshclaude
+    expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
   })
 
-  it('shows Freshopencode MRU in the settings popover and opens grouped search on focus', async () => {
-    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
-      ok: true,
-      sessionType: 'freshopencode',
-      runtimeProvider: 'opencode',
-      status: 'fresh',
-      fetchedAt: 1_234,
-      models: [
-        {
-          id: 'opencode-go/glm-5.2',
-          displayName: 'GLM 5.2',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'opencode-go/deepseek-v4-flash',
-          displayName: 'DeepSeek V4 Flash',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'deepseek/deepseek-v4-pro',
-          displayName: 'DeepSeek V4 Pro',
-          provider: 'opencode',
-          source: { id: 'deepseek', displayName: 'deepseek' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-      ],
-    })
-    window.localStorage.setItem('freshopencode.modelMru.v2', JSON.stringify([
-      {
-        id: 'opencode-go/deepseek-v4-flash',
-        displayName: 'DeepSeek V4 Flash',
-        source: { id: 'opencode-go', displayName: 'opencode-go' },
-        cwdKey: '/repo/project-a',
-        lastVerifiedAt: Date.now(),
-      },
-      {
-        id: 'deepseek/deepseek-v4-pro',
-        displayName: 'DeepSeek V4 Pro',
-        source: { id: 'deepseek', displayName: 'deepseek' },
-        cwdKey: '/repo/project-a',
-        lastVerifiedAt: Date.now(),
-      },
-    ]))
+  it('shows a compact Model row for freshcodex and retires the radio list and Thinking dropdown', () => {
     const store = createStore()
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        createRequestId: 'req-opencode-settings',
-        sessionId: 'thread-opencode-settings',
-        status: 'idle',
-        initialCwd: '/repo/project-a',
-        model: 'opencode-go/glm-5.2',
-        effort: 'max',
-      },
-    }))
+    seedPane(store, {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'max',
+    })
 
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
+    renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
 
-    expect(screen.getByRole('button', { name: /DeepSeek V4 Flash/i })).toBeVisible()
-    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshopencode', expect.objectContaining({ cwd: '/repo/project-a' }))
-    expect(await screen.findByRole('button', { name: /Current model: GLM 5\.2/i })).toBeVisible()
-    expect(screen.getByRole('button', { name: /DeepSeek V4 Flash/i })).toBeVisible()
-    expect(screen.queryByRole('button', { name: /DeepSeek V4 Pro/i })).toBeVisible()
-    expect(screen.queryByRole('button', { name: /Refresh/i })).not.toBeInTheDocument()
-    expect(screen.queryByText(/Command|⌘K/i)).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: /Choose Freshopencode model/i })).not.toBeInTheDocument()
-
-    fireEvent.focus(screen.getByRole('searchbox', { name: /Search enabled models/i }))
-
-    expect(await screen.findByRole('dialog', { name: /Choose Freshopencode model/i })).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'deepseek' })).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'opencode-go' })).toBeVisible()
-
-    fireEvent.change(screen.getByRole('searchbox', { name: /Filter enabled models/i }), { target: { value: 'pro' } })
-    expect(screen.getByRole('button', { name: /DeepSeek V4 Pro/i })).toBeVisible()
-    expect(screen.queryByRole('button', { name: /GLM 5\.2/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPT-5\.5 · max.*Change/ })).toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-5.4 Flash' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
   })
 
-  it('persists a Freshopencode modal selection as an exact provider-qualified model and updates MRU', async () => {
-    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
-      ok: true,
-      sessionType: 'freshopencode',
-      runtimeProvider: 'opencode',
-      status: 'fresh',
-      fetchedAt: 1_234,
-      models: [
-        {
-          id: 'opencode-go/glm-5.2',
-          displayName: 'GLM 5.2',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'deepseek/deepseek-v4-pro',
-          displayName: 'DeepSeek V4 Pro',
-          provider: 'opencode',
-          source: { id: 'deepseek', displayName: 'deepseek' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-      ],
+  it('opens the shared dialog from the freshcodex Change… button and persists the committed choice', async () => {
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'max',
     })
-    const store = createFreshopencodeStoreWithModel('opencode-go/glm-5.2')
 
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
+    renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    fireEvent.focus(await screen.findByRole('searchbox', { name: /Search enabled models/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /DeepSeek V4 Pro/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Change/ }))
+
+    await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const lowOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))
+    expect(lowOption).toBeDefined()
+    fireEvent.click(lowOption!)
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }))
 
     await waitFor(() => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
         freshAgent: {
           providers: {
-            freshopencode: {
-              modelSelection: { kind: 'exact', modelId: 'deepseek/deepseek-v4-pro' },
-              effort: 'high',
+            freshcodex: {
+              modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+              effort: 'low',
             },
           },
         },
       })
     })
-    expect(JSON.parse(window.localStorage.getItem('freshopencode.modelMru.v2') ?? '[]')[0]).toMatchObject({
-      id: 'deepseek/deepseek-v4-pro',
-      displayName: 'DeepSeek V4 Pro',
-    })
+    expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
   })
 
-  it('shows stale cached Freshopencode MRU tiles as disabled when the catalog fetch fails', async () => {
-    getFreshAgentModelCapabilitiesSpy.mockRejectedValue(new Error('Network down'))
-    window.localStorage.setItem('freshopencode.modelMru.v2', JSON.stringify([
-      {
-        id: 'opencode-go/deepseek-v4-flash',
-        displayName: 'DeepSeek V4 Flash',
-        source: { id: 'opencode-go', displayName: 'opencode-go' },
-        cwdKey: '/repo/project-a',
-        lastVerifiedAt: Date.now(),
-      },
-    ]))
-    const store = createFreshopencodeStoreWithModel('opencode-go/glm-5.2')
-
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-
-    const tile = await screen.findByRole('button', { name: /Use model: DeepSeek V4 Flash/i })
-    expect(tile).toBeVisible()
-    expect(tile).toBeDisabled()
-    expect(screen.getByText(/Model catalog unavailable/i)).toBeInTheDocument()
-    expect(screen.queryByRole('searchbox', { name: /Search enabled models/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: /Choose Freshopencode model/i })).not.toBeInTheDocument()
-  })
-
-  it('traps Tab focus in the Freshopencode model modal, closes on Escape, and restores focus', async () => {
-    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
-      ok: true,
+  it('shows a compact Model row for freshopencode fed by the live catalog, and opens the dialog from Change…', async () => {
+    const store = createStore()
+    seedPane(store, {
       sessionType: 'freshopencode',
-      runtimeProvider: 'opencode',
-      status: 'fresh',
-      fetchedAt: 1_234,
-      models: [
-        {
-          id: 'opencode-go/glm-5.2',
-          displayName: 'GLM 5.2',
-          provider: 'opencode',
-          source: { id: 'opencode-go', displayName: 'opencode-go' },
-          supportsEffort: true,
-          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
-          supportsAdaptiveThinking: true,
-        },
-        {
-          id: 'deepseek/deepseek-v4-pro',
-          displayName: 'DeepSeek V4 Pro',
-          provider: 'opencode',
-          source: { id: 'deepseek', displayName: 'deepseek' },
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
-        },
-      ],
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+      effort: 'max',
+      initialCwd: '/repo/project-a',
     })
-    const store = createFreshopencodeStoreWithModel('opencode-go/glm-5.2')
 
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
+    renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    const entrySearch = await screen.findByRole('searchbox', { name: /Search enabled models/i })
-    fireEvent.focus(entrySearch)
 
-    const dialog = await screen.findByRole('dialog', { name: /Choose Freshopencode model/i })
-    expect(dialog).toBeVisible()
+    expect(await screen.findByRole('button', { name: /GLM 5\.2 · max.*Change/ })).toBeInTheDocument()
+    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshopencode', expect.objectContaining({ cwd: '/repo/project-a' }))
+    // retired: recent-model tiles and the modal search entry point
+    expect(screen.queryByRole('searchbox', { name: /Search enabled models/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Use model:/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
 
-    const filterInput = screen.getByRole('searchbox', { name: /Filter enabled models/i })
-    const focusables = Array.from(
-      dialog.querySelectorAll<HTMLElement>('button, input, [href], select, textarea, [tabindex]:not([tabindex="-1"])'),
-    ).filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
-    const first = focusables[0]
-    const last = focusables[focusables.length - 1]
-    expect(first).toBe(filterInput)
+    fireEvent.click(screen.getByRole('button', { name: /Change/ }))
+    expect(await screen.findByRole('dialog', { name: 'Model and thinking level' })).toBeInTheDocument()
+    expect(screen.getByRole('searchbox', { name: 'Filter models' })).toBeInTheDocument()
+  })
 
-    expect(filterInput).toHaveFocus()
-
-    last.focus()
-    expect(document.activeElement).toBe(last)
-    fireEvent.keyDown(dialog, { key: 'Tab' })
-    expect(document.activeElement).toBe(first)
-
-    first.focus()
-    expect(document.activeElement).toBe(first)
-    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
-    expect(document.activeElement).toBe(last)
-
-    fireEvent.keyDown(document, { key: 'Escape' })
-    await waitFor(() => {
-      expect(screen.queryByRole('dialog', { name: /Choose Freshopencode model/i })).not.toBeInTheDocument()
+  it('replaces the freshopencode Model row with the unavailable notice when the catalog probe fails', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockRejectedValue(new Error('network down'))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+      effort: 'max',
+      initialCwd: '/repo/project-a',
     })
-    expect(screen.getByRole('dialog', { name: 'Agent settings' })).toBeVisible()
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    expect(await screen.findByText('Model catalog unavailable — try again')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
   })
 })
