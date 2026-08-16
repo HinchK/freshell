@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1188,7 +1189,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
   }, [terminalContent?.terminalId])
 
-  useEffect(() => {
+  // Sync visibility at commit phase (layout effect, not passive effect): a
+  // passive effect would leave a window where a queued attach callback could
+  // read a stale hiddenRef; a layout effect runs synchronously with the
+  // commit, before any separately-scheduled external callback can observe it.
+  useLayoutEffect(() => {
     hiddenRef.current = hidden
     if (hidden) {
       clearHoveredUrl(paneId)
@@ -2749,6 +2754,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       clearViewportFirst = true
       fullHydrateFallbackReason = checkpointDecision.reason
     }
+    // Geometry authority invariant (attach-geometry-resume-panes): a pane that
+    // is not visible must never CLAIM viewport geometry on the wire — servers
+    // resize the PTY unconditionally for viewport_hydrate regardless of who
+    // else is attached, so a hidden hydrating tab stamps stale/never-fitted
+    // dims over the visible pane's size. The swap is wire-token-only: all
+    // bookkeeping keeps viewport_hydrate semantics (sinceSeq 0, surface reset,
+    // currentAttachRef/deferredAttachState intents); keepalive_delta is
+    // replay-identical (replay keys off since_seq) and never resizes.
+    const hiddenViewportAttach = effectiveIntent === 'viewport_hydrate' && hiddenRef.current
+    const wireIntent = hiddenViewportAttach ? 'keepalive_delta' : effectiveIntent
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
     const surfaceQuarantined = hasInFlightWrites
@@ -2844,7 +2859,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send(buildTerminalAttachMessage({
       content: contentRef.current,
       terminalId: tid,
-      intent: effectiveIntent,
+      intent: wireIntent,
       cols,
       rows,
       sinceSeq,
@@ -2854,6 +2869,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }))
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
+    if (hiddenViewportAttach) {
+      // The server did not apply these dims; do not let them suppress the next
+      // visible-pane resize (reveal-time heal path).
+      forgetSentViewport(tid)
+      lastSentViewportRef.current = null
+    }
     if (surfaceQuarantined) {
       scheduleQuarantineRepair(tid, attachRequestId)
     }

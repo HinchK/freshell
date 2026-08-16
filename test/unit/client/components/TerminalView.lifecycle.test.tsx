@@ -8720,7 +8720,7 @@ describe('TerminalView lifecycle updates', () => {
           .find((msg) =>
             msg?.type === 'terminal.attach'
             && msg?.terminalId === terminalId
-            && msg?.intent === 'viewport_hydrate'
+            && msg?.intent === 'keepalive_delta'
             && msg?.priority === 'background'
           )
         expect(attach?.attachRequestId).toBeTruthy()
@@ -8791,6 +8791,222 @@ describe('TerminalView lifecycle updates', () => {
           restore: true,
         }))
       })
+    })
+
+    it('a pane hidden at mount hydrates in background with a geometry-neutral keepalive attach', async () => {
+      const { terminalId, tabId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hidden-mount-geo-neutral',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-hidden-mount-geo-neutral',
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
+      })
+
+      await waitFor(() => {
+        const attach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(attach, 'background hydration must send an attach').toBeTruthy()
+        expect(attach.intent).toBe('keepalive_delta')
+        expect(attach.priority).toBe('background')
+        expect(attach.sinceSeq).toBe(0)
+        expect(attach.cols).toBeGreaterThan(0)
+        expect(attach.rows).toBeGreaterThan(0)
+      })
+      expect(
+        wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'viewport_hydrate'),
+      ).toBe(false)
+    })
+
+    it('reveal after a clamped hidden attach emits terminal.resize even when fitted dims are unchanged', async () => {
+      // Mounting hidden + hydration trigger produces, PRE-FIX, a wire
+      // viewport_hydrate attach whose dims are the never-fitted xterm defaults —
+      // the same numeric dims the reveal-fit will compute in jsdom (stable
+      // fixture) — so the reveal resize is swallowed by matchesLastSentViewport
+      // pre-fix. Post-fix the clamped attach invalidates the suppression record
+      // and the resize is emitted. This is the RED witness for the heal path.
+      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hidden-heal-suppression',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-hidden-heal-suppression',
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
+      })
+      let hydrationAttach: any
+      await waitFor(() => {
+        hydrationAttach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'keepalive_delta')
+        expect(hydrationAttach, 'clamped background attach must be geometry-neutral').toBeTruthy()
+      })
+
+      // Complete the clamped hydration so the pane is live before the reveal;
+      // reveal must then heal via resize alone (no new attach generation).
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: hydrationAttach.attachRequestId,
+        })
+      })
+
+      wsMocks.send.mockClear()
+      // Flip visibility on the SAME mounted component: rerendering with
+      // TerminalViewFromStore would swap the component type at the same JSX
+      // position, remounting the pane and legitimately producing a fresh
+      // foreground hydrate attach instead of the heal resize this test pins.
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+      rerender(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden={false} />
+        </Provider>,
+      )
+
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls
+            .map(([msg]) => msg)
+            .some((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId),
+        ).toBe(true)
+      })
+      // No NEW attach on reveal (deferred mode is 'live'); the resize is the heal.
+      expect(
+        wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .filter((msg) => msg?.type === 'terminal.attach'),
+      ).toHaveLength(0)
+    })
+
+    it('clamped hidden attaches keep viewport_hydrate surface-reset bookkeeping across replay generations', async () => {
+      // Both hidden attach generations must reset the mocked surface
+      // (term.clear) and replay only their own seq window — proof that client
+      // bookkeeping kept viewport_hydrate semantics under the wire keepalive
+      // token. A bookkeeping-degraded implementation (deriving clear/replay
+      // from the wire intent) skips the clear branch and FAILS this test.
+      //
+      // The second generation is forced via a pane refresh — the production
+      // re-arm path for a hidden pane (runRefreshAttach ->
+      // registerForBackgroundHydration({ queueIfStarted: true })) — because
+      // the hydration queue's onActiveTabReady is one-shot per queue
+      // instance, so calling it again cannot pump a second attach. The
+      // surface checkpoint saved by generation 1's parser-applied replay is
+      // reset so generation 2 takes the same full-hydrate branch a fresh
+      // profile takes, matching the plan's clamped-full-replay shape.
+      const { store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hidden-clamped-replay',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-hidden-clamped-replay',
+      })
+
+      term.write.mockClear()
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
+      })
+
+      let firstAttach: any
+      await waitFor(() => {
+        firstAttach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(firstAttach?.attachRequestId, 'background hydration must send a first attach').toBeTruthy()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId: firstAttach.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'PRIOR-SURFACE-MARKER',
+          attachRequestId: firstAttach.attachRequestId,
+        })
+      })
+
+      await waitFor(() => {
+        expect(terminalWriteStrings(term).some((data) => data.includes('PRIOR-SURFACE-MARKER'))).toBe(true)
+      })
+      // First generation's clearViewportFirst viewport bookkeeping fired.
+      expect(term.clear).toHaveBeenCalledTimes(1)
+
+      // Drop the checkpoint generation 1 recorded so generation 2's delta
+      // decision is missing_checkpoint again (the same full-hydrate branch a
+      // fresh profile takes for this shape).
+      clearLocalStorageForTest()
+      __resetTerminalCursorCacheForTests()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+
+      let secondAttach: any
+      await waitFor(() => {
+        const attaches = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        secondAttach = attaches.find((msg) => msg?.attachRequestId !== firstAttach.attachRequestId)
+        expect(secondAttach?.attachRequestId, 'refresh must force a second hidden attach generation').toBeTruthy()
+      })
+      expect(secondAttach.priority).toBe('background')
+      expect(secondAttach.sinceSeq).toBe(0)
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 3,
+          replayToSeq: 6,
+          attachRequestId: secondAttach.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 3,
+          seqEnd: 6,
+          data: 'CLAMPED-REPLAY-MARKER',
+          attachRequestId: secondAttach.attachRequestId,
+        })
+      })
+
+      // (a) BOTH generations cleared the surface — the second attach did not
+      // degrade into keepalive bookkeeping (which skips the clear branch).
+      expect(term.clear).toHaveBeenCalledTimes(2)
+      // (b) Each generation replayed only its own seq window, exactly once.
+      const writes = terminalWriteStrings(term)
+      expect(writes.filter((data) => data.includes('PRIOR-SURFACE-MARKER'))).toHaveLength(1)
+      expect(writes.filter((data) => data.includes('CLAMPED-REPLAY-MARKER'))).toHaveLength(1)
     })
 
     it('does not send terminal.resize when an already-live terminal is hidden and revealed with unchanged geometry', async () => {
