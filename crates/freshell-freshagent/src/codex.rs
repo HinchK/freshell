@@ -1292,6 +1292,11 @@ impl FreshCodexState {
     /// sidecar, and post-owner-exit resume was probed to work, SIGKILL stale locks
     /// included).
     ///
+    /// Deliberate override narrowing vs. legacy: `input` overrides ONLY `cwd`/`model`
+    /// — the legacy adapter also honored `input.sandbox`/`input.permissionMode`
+    /// (`adapter.ts:1062-1067`); those are NOT honored here (the client's fork frame
+    /// never sends them — it carries only `input.atTurnId`).
+    ///
     /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
     /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
     /// the REVIEWED post-archive containment (fresh-eyes F6) — replies a nested
@@ -5601,6 +5606,8 @@ pub(crate) mod tests {
         assert_eq!(params["threadId"], json!("child-spawn-fail"));
         peer.respond(&id, json!({}));
         driver.await.expect("fork task");
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
 
         assert_single_fork_error_frame(
             &captured_frames(&captured),
