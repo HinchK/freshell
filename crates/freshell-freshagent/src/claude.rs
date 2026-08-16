@@ -3266,6 +3266,66 @@ rl.on('line', (line) => {
         drop(env);
     }
 
+    /// Task 7 (AGENT-24 ride-through): a KILROY session's approval respond LANDS —
+    /// the happy path is identical to the freshclaude case
+    /// (`approval_respond_writes_the_frame_and_removes_the_pending_entry`): the handler
+    /// writes the exact `permission.respond` stdin frame (sidecar-keyed sessionId,
+    /// VERBATIM decision) and removes the pending entry. Kilroy rides the claude
+    /// provider path; this pins that the respond is not freshclaude-only.
+    #[tokio::test]
+    async fn kilroy_approval_respond_lands_and_removes_the_pending_entry() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let mut create = dedup_create_msg("req-kilroy-approval-lands");
+        create.session_type = SessionType::Kilroy;
+        st.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "req-kilroy-approval-lands").await;
+        assert_eq!(
+            created["sessionType"], "kilroy",
+            "the created frame keeps the kilroy flavour"
+        );
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // consumer folds it into the kilroy session's pending set.
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        let decision =
+            json!({ "behavior": "deny", "message": "Denied by user", "interrupt": false });
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Kilroy,
+            "req-1",
+            decision.clone(),
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "permission.respond")
+            .expect("permission.respond frame written to the sidecar");
+        assert_eq!(
+            respond["sessionId"],
+            json!(session_id),
+            "sidecar-keyed sessionId"
+        );
+        assert_eq!(respond["requestId"], "req-1");
+        assert_eq!(
+            respond["decision"], decision,
+            "the decision payload is a VERBATIM passthrough"
+        );
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert!(
+            !permissions.iter().any(|id| id == "req-1"),
+            "the resolved entry leaves the pending set"
+        );
+        drop(env);
+    }
+
     /// Task 2 (f): the stdout consumer folds the sidecar's pending-state frames into the
     /// per-session pending set BEFORE normalize/broadcast: request frames push (resend of
     /// the same requestId REPLACES), cancelled frames remove.
