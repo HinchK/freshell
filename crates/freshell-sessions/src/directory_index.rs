@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::meta::ParsedSessionMeta;
+use crate::provider_layout::ProviderLayout;
 use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
 
 /// Default snapshot freshness window: a request that lands within this window
@@ -323,7 +324,7 @@ impl SessionSource for ClaudeSource {
 /// scan failure by the sweep), never a silent `Ok(empty)`. A MISSING root is
 /// a genuine empty. Per-project/nested errors stay tolerant (Node parity).
 fn discover_claude_home(claude_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
-    let projects_dir = claude_home.join("projects");
+    let projects_dir = crate::provider_layout::ClaudeLayout.session_root(claude_home);
     let Some(project_entries) = open_root_dir(&projects_dir)? else {
         return Ok(Vec::new());
     };
@@ -527,7 +528,7 @@ impl SessionSource for CodexSource {
 /// a genuine empty. NESTED directories stay tolerant via
 /// [`walk_jsonl_recursive`] (Node parity: `walkJsonlFiles`).
 fn discover_codex_sessions(codex_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
-    let root = codex_home.join("sessions");
+    let root = crate::provider_layout::CodexLayout.session_root(codex_home);
     let Some(entries) = open_root_dir(&root)? else {
         return Ok(Vec::new());
     };

@@ -2245,10 +2245,12 @@ fn transcript_definitively_absent(
     provider: &str,
     session_id: &str,
 ) -> bool {
+    use freshell_sessions::provider_layout::ProviderLayout;
     match provider {
         "claude" => {
             // ~/.claude/projects/<proj>/<session_id>.jsonl — any match means present.
-            let projects = home.join(".claude").join("projects");
+            let projects = freshell_sessions::provider_layout::ClaudeLayout
+                .session_root(&session_directory::claude_home(home));
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
@@ -2269,7 +2271,8 @@ fn transcript_definitively_absent(
         "codex" => {
             // ~/.codex/sessions/** rollout files carry the session UUID in the
             // filename — walk and match (bounded: sessions tree only).
-            let root = home.join(".codex").join("sessions");
+            let root = freshell_sessions::provider_layout::CodexLayout
+                .session_root(&session_directory::codex_home(home));
             if !root.is_dir() {
                 return false; // unreadable/missing home => defer
             }
@@ -2282,7 +2285,8 @@ fn transcript_definitively_absent(
             // as-is when set and non-empty, else `<home>/.amplifier`;
             // `AMPLIFIER_HOME` is never consulted broker-side) main.rs
             // already computes for the `AmplifierSource` construction above.
-            let projects = freshell_sessions::amplifier::amplifier_home(home).join("projects");
+            let projects = freshell_sessions::provider_layout::AmplifierLayout
+                .session_root(&freshell_sessions::amplifier::amplifier_home(home));
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
