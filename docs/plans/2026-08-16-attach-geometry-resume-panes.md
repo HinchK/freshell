@@ -24,7 +24,7 @@ Fix the freshell root cause behind broken mouse scrolling and garbage rendering 
 
 **Goal:** A terminal pane's PTY size is always governed by the visible client; hidden/background-hydration attaches replay scrollback without ever resizing the PTY.
 
-**Architecture:** One invariant in the client attach path: a pane that is not visible (`hiddenRef.current === true`) must never claim viewport geometry. Enforced at the single choke point `attachTerminal` (`src/components/TerminalView.tsx` ~2698): when hidden, the attach runs as a **geometry-neutral full replay** — `effectiveIntent = 'keepalive_delta'`, `sinceSeq` forced to `0` — independent of the caller's requested intent. This avoids three verified collisions with the naive clamp: (1) the internal re-promotion of non-viewport intents to `viewport_hydrate` (~2743-2751) is bypassed for hidden attaches; (2) the warm-delta rejection ladders in the `terminal.attach.ready` handler (4108/4143) can only fire when `sinceSeq > 0`, so forcing `sinceSeq = 0` prevents a clamp→reject→reattach loop in multi-client scenarios where `attach.ready` stamps `geometryAuthority: 'multi_client_unknown'`; (3) the client-side viewport bookkeeping (`syncGeometryEpochForViewport` ~2728, `rememberSentViewport`/`lastSentViewportRef` ~2855-2856) is skipped for hidden attaches, so a later visible-pane `terminal.resize` is not suppressed by `matchesLastSentViewport` (~1643-1650). Servers never resize for `keepalive_delta` (`registry.rs` contract) and wire replay keys off `since_seq` only (validator A confirmed: intent never reaches replay selection), so hidden panes still warm up with the full stream. Reveal attaches of visible panes stay `viewport_hydrate`. Two validator-falsified adjacencies are fixed in the same task: (i) the reveal `fit+resize` path can be suppressed by `matchesLastSentViewport` when the reveal-fit dims equal the pre-hide recorded dims — the reveal effect therefore requests the resize with an explicit force flag that bypasses both suppression gates in `flushScheduledLayout`; (ii) the unrecoverable-replay-gap recreate predicate (`isUnrecoverableOpenCodeViewportHydrate` ~3964) keys on wire intent `viewport_hydrate` — broadened to also accept `'keepalive_delta'` with `sinceSeq === 0` so hidden restored opencode panes keep their recreate-on-replay-gap behavior.
+**Architecture (v3, after plan-review round 1):** One invariant in the client attach path: a pane that is not visible must never claim viewport geometry on the wire. Enforced at the single choke point `attachTerminal` (`src/components/TerminalView.tsx` ~2698) with a **wire-token-only swap**: when `intent === 'viewport_hydrate'` while `hiddenRef.current` is true, the sent frame carries `intent: 'keepalive_delta'` while ALL client-side bookkeeping retains viewport-hydrate semantics (sinceSeq 0, `resetParserAppliedSurface`, viewport clear, `currentAttachRef.intent`/`deferredAttachStateRef.pendingIntent` unchanged) — so the replay path, the replay-gap recreate predicate, the rejection ladders, and reveal planning are all byte-for-byte unaffected, and the server simply never resizes (`registry.rs`: `KeepaliveDelta => false`; attach replay keys off `since_seq` only — validator A/C/B confirmed). Alongside the swap, the hidden-clamped attach **invalidates the this-client suppression records** (`lastSentViewportRef.current = null; forgetSentViewport(tid)` — the helper already exists at src/components/TerminalView.tsx:507) so the next visible-pane fit+resize is never suppressed by dims the server never applied (validator D falsified "no-op is enough"; this restores reveal-time convergence without touching suppression semantics for any existing flow). No new flags, no predicate broadening, no force-resize path, and no changes to natural `keepalive_delta`/`transport_reconnect` attaches.
 
 **Tech Stack:** React 18 / TypeScript client (xterm.js), Vitest + Testing Library (`test/unit/client/components/`), Playwright e2e (`test/e2e-browser/`), Rust ws/terminal crates only for the evidence probe (no Rust change).
 
@@ -40,28 +40,31 @@ Fix the freshell root cause behind broken mouse scrolling and garbage rendering 
 
 ---
 
-### Task 1: Hide-gated attach intent (RED witness test + choke-point implementation)
+### Task 1: Hide-gated attach intent (wire-token clamp + suppression-record invalidation)
 
 **Files:**
-- Delete: `crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs` (pre-plan probe; evidence retained in run logs `reports/`; it asserts only current-server contract, which stays unchanged)
-- Modify: `src/components/TerminalView.tsx` (`attachTerminal` ~line 2698)
-- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (extend existing attach-intent suite)
+- Delete: `crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs` (pre-plan probe; evidence retained in run logs `reports/`; it asserts only the current-server contract, which stays unchanged)
+- Modify: `src/components/TerminalView.tsx` (`attachTerminal` ~line 2698; the only production change)
+- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (extend the hidden-pane attach-intent block; reuse `renderTerminalHarness`, `wsMocks`, `messageHandler`, `restoreMocks`, `getHydrationQueue().onActiveTabReady`, `reconnectHandler`, `TerminalView`/`TerminalViewFromStore` exactly as neighboring tests do)
 
 **Interfaces:**
-- Consumes: `attachTerminal(tid: string, intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect', opts?: AttachTerminalOptions): void` and `hiddenRef.current: boolean` (both already in `TerminalView.tsx`).
-- Produces: no new exported names; changes the wire frame's `intent` field for attaches sent while the pane is hidden.
+- Consumes: `attachTerminal(tid: string, intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect', opts?: AttachTerminalOptions): void`, `hiddenRef.current: boolean`, existing module-level helper `forgetSentViewport(tid)` (src/components/TerminalView.tsx:507), `lastSentViewportRef` (per-instance ref).
+- Produces: no new exported names; only wire-frame `intent` differs for hidden clamps.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Write the failing behavioral tests**
 
-Add to `test/unit/client/components/TerminalView.lifecycle.test.tsx`, in the existing describe block containing the hidden-pane hydration tests (the block around line 8685 that uses `renderTerminalHarness({ hidden: true, ... })` plus `getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])`). Reuse `renderTerminalHarness`, `wsMocks`, `messageHandler`, `TerminalViewFromStore`, `act`, `waitFor` exactly as those tests do. New tests:
+Add three tests to the hidden-pane attach-intent block of `test/unit/client/components/TerminalView.lifecycle.test.tsx`.
+
+T1 — wire pin (RED witness):
 
 ```ts
-it('hidden background hydration attach does not claim viewport geometry', async () => {
-  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
+it('a pane hidden at mount hydrates in background with a geometry-neutral keepalive attach', async () => {
+  const { terminalId, tabId } = await renderTerminalHarness({
     status: 'running',
-    terminalId: 'term-hidden-geo-clamp',
+    terminalId: 'term-hidden-mount-geo-neutral',
     hidden: true,
-    requestId: 'req-hidden-geo-clamp',
+    clearSends: false,
+    requestId: 'req-hidden-mount-geo-neutral',
   })
 
   wsMocks.send.mockClear()
@@ -73,57 +76,49 @@ it('hidden background hydration attach does not claim viewport geometry', async 
     const attach = wsMocks.send.mock.calls
       .map(([msg]) => msg)
       .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-    expect(attach, 'a background hydration attach frame must be sent').toBeTruthy()
-    expect(attach.intent, 'hidden hydration must not claim viewport geometry').toBe('keepalive_delta')
+    expect(attach, 'background hydration must send an attach').toBeTruthy()
+    expect(attach.intent).toBe('keepalive_delta')
     expect(attach.priority).toBe('background')
-    expect(attach.cols).toBeGreaterThan(0) // frame schema unchanged
+    expect(attach.sinceSeq).toBe(0)
+    expect(attach.cols).toBeGreaterThan(0)
     expect(attach.rows).toBeGreaterThan(0)
-    expect(
-      wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'viewport_hydrate'),
-    ).toBe(false)
   })
+  expect(
+    wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'viewport_hydrate'),
+  ).toBe(false)
 })
+```
 
-it('reveal after hidden hydration heals geometry via a forced resize, not a new geometry-claiming attach', async () => {
-  // Validator-D scenario pinned: pane first VISIBLE at fitted dims V1 (its
-  // attach records V1 as last-sent viewport), then hidden (hydration attach
-  // is clamped and records nothing), then revealed — the reveal-fit dims are
-  // again V1, so without the force flag `matchesLastSentViewport` would
-  // suppress the resize and a foreign (server-side) geometry change would
-  // never heal.
+T2 — heal path (validator-D sequence; pre-fix the resize is suppressed, post-fix it is emitted):
+
+```ts
+it('reveal after a clamped hidden attach emits terminal.resize even when fitted dims equal the pre-hide dims', async () => {
   const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
     status: 'running',
-    terminalId: 'term-hidden-then-visible',
-    hidden: false,
-    requestId: 'req-hidden-then-visible',
+    terminalId: 'term-hidden-heal-suppression',
+    clearSends: false,
+    requestId: 'req-hidden-heal-suppression',
   })
+  // visible attach above records the fitted dims (neighboring tests pin this)
 
-  await waitFor(() => {
-    expect(
-      wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'viewport_hydrate'),
-    ).toBe(true)
-  })
-
+  const readPaneContent = () => {
+    const layout = store.getState().panes.layouts[tabId]
+    return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+  }
   rerender(
     <Provider store={store}>
-      <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={true} />
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden />
     </Provider>,
   )
-  act(() => {
-    getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
-  })
-  await waitFor(() => {
-    expect(
-      wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.intent === 'keepalive_delta'),
-    ).toBe(true)
-  })
 
+  // Produce the hidden background-hydration attach. Today (pre-fix) its
+  // wire intent is viewport_hydrate (red witness). If the hydration queue
+  // alone does not trigger it for this mount shape, drive it exactly as the
+  // neighbor "background hydrates a trusted hidden reconnect" test does —
+  // act(() => reconnectHandler?.()) — and record which trigger was used in
+  // the task report.
   act(() => {
     getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
   })
@@ -142,204 +137,190 @@ it('reveal after hidden hydration heals geometry via a forced resize, not a new 
     </Provider>,
   )
 
-  // Contract: reveal of a pane that attached while hidden does NOT send
-  // another attach (deferred mode is 'live', not 'waiting_for_geometry');
-  // the reveal effect emits terminal.resize with the real fitted dims EVEN
-  // THOUGH they equal the pre-hide recorded dims (the force flag bypasses
-  // the suppression gates).
   await waitFor(() => {
-    expect(
-      wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .filter((msg) => msg?.type === 'terminal.attach'),
-    ).toHaveLength(0)
     expect(
       wsMocks.send.mock.calls
         .map(([msg]) => msg)
         .some((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId),
     ).toBe(true)
   })
+  // No NEW attach on reveal (deferred mode is 'live'); the resize is the heal.
+  expect(
+    wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.attach'),
+  ).toHaveLength(0)
 })
 ```
 
-And one more test pinning the recreate-path predicate broaden (validator F):
+T3 — surface reset at clamped full replay (green-by-construction guard, protects finding-2's regression): mount hidden via T1's shape, capture the sent attach's `attachRequestId`, then drive `messageHandler!` with `terminal.attach.ready` `{ headSeq: 3, replayFromSeq: 1, replayToSeq: 3, attachRequestId }` plus `terminal.output` `{ seqStart: 1, seqEnd: 3, data: 'CLAMPED-REPLAY-MARKER' }`; assert the mocked terminal write stream contains `CLAMPED-REPLAY-MARKER` exactly once.
 
-```ts
-it('hidden restored OpenCode pane whose clamped hydration attach hits replay_window_exceeded still kills and recreates the terminal', async () => {
-  // Mirror the pre-existing replay-gap test (~8685) shape with the SAME
-  // opencode sessionRef fixtures, but the attach is the clamped hidden one:
-  // intent keepalive_delta, sinceSeq 0, priority background, then drive
-  // terminal.attach.ready + terminal.output.gap {reason:'replay_window_exceeded'}
-  // for the SAME attachRequestId and assert the existing terminate+respawn
-  // contract fires (terminal.kill WS frame AND the replacement create flow,
-  // exactly as that test asserts today). This test REPLACES the old test's
-  // viewport_hydrate predicate per Step 1's rule.
-})
-```
+Also update the pre-existing hidden replay-gap test "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output" (~line 8685): change ONLY its attach wait predicate from `intent === 'viewport_hydrate'` to `intent === 'keepalive_delta'` (the production recreate predicate is NOT changed — `currentAttachRef.intent` retains viewport bookkeeping; that is part of the production contract this redesign pins). Any other pre-existing assertion of a hidden wire `viewport_hydrate` gets the same single-word update under the old-contract rule; record every touched test in the task report. Visible-pane assertions (e.g. "recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output" and the reconnect-before-reveal test at ~4635) must stay untouched and green.
 
-(Adjust identifiers at the call edges only — e.g. if `renderTerminalHarness` returns differently named keys or needs `sessionRef`/`mode`, mirror the neighboring tests. The assertions are the contract.)
-
-Also update the pre-existing hidden-hydration replay-gap test (~line 8685, "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output"): its attach predicate filters on `intent === 'viewport_hydrate' && priority === 'background'`. That encoded the old contract; change ONLY the predicate's intent to `'keepalive_delta'` so it keeps testing the recreate-on-replay-gap behavior under the new intent. The kill/recreate behavior contract of that test is unchanged. Do not weaken its assertions. Any other pre-existing test that fails for asserting hidden-pane `viewport_hydrate` must be reviewed individually: update it only if its purpose is the same (hidden-path contract), record each touched test in the task report. The "hidden split create keeps viewport_hydrate intent when reconnect fires before reveal" test (~line 4635) must be verified by reading its rerender order first: it rerenders with `hidden={false}` after the reconnect tick, so its awaited attach is sent while visible and must stay `viewport_hydrate` — if it fails, that failure is real information about stale `hiddenRef` handling; stop and escalate to the coordinator rather than loosening it.
-
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
-Expected: FAIL because the hidden background-hydration attach frame carries `intent: 'viewport_hydrate'` today (the new first test fails on the intent assertion; the pre-existing replay-gap test will also fail after its predicate update — both failures are intent-level). Failure must be assertion-level, not mount/setup breakage.
+Expected: FAIL for T1 (wire intent is `viewport_hydrate` pre-fix) and FAIL for T2 (resize suppressed: pre-hidden viewport_hydrate attach re-recorded identical dims). T3 and the reconnect-before-reveal test must already pass — if they fail, the harness setup is wrong; fix the setup, not the assertions. The replay-gap test fails pre-fix only after its predicate update; both failure modes are assertion-level, not setup errors.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `src/components/TerminalView.tsx`, inside `attachTerminal` (~line 2698), apply four coordinated edits, all gated on one boolean captured at entry. Do not touch the visible-pane paths.
+All changes live in `attachTerminal` in `src/components/TerminalView.tsx` (~2698).
+
+1. After the re-promotion block computes `effectiveIntent` (~2740-2751), compute the wire intent:
 
 ```ts
-// at the top of attachTerminal, right after existing early returns (~2717):
-const isHiddenAttach = hiddenRef.current
+// Geometry authority invariant (attach-geometry-resume-panes): a pane that
+// is not visible must never CLAIM viewport geometry on the wire — servers
+// resize the PTY unconditionally for viewport_hydrate regardless of who
+// else is attached, so a hidden hydrating tab stamps stale/never-fitted
+// dims over the visible pane's size. The swap is wire-token-only: all
+// bookkeeping keeps viewport_hydrate semantics (sinceSeq 0, surface reset,
+// currentAttachRef/deferredAttachState intents); keepalive_delta is
+// replay-identical (replay keys off since_seq) and never resizes.
+const hiddenViewportAttach = effectiveIntent === 'viewport_hydrate' && hiddenRef.current
+const wireIntent = hiddenViewportAttach ? 'keepalive_delta' : effectiveIntent
 ```
 
-1. **Intent + replay clamp.** Replace the initial `let effectiveIntent = intent` assignment (~2740) so that when `isHiddenAttach`, `effectiveIntent` becomes `'keepalive_delta'` and both re-promotion branches (~2743-2751) are skipped (guard them with `!isHiddenAttach`). Force full replay for hidden attaches: when `isHiddenAttach`, treat `explicitSinceSeq` as `undefined` and the checkpoint decision as not-ok for the `deltaSeq`/`sinceSeq` derivation (~2752-2753), yielding `sinceSeq === 0`. This is what prevents the warm-delta rejection ladders (which require `sinceSeq > 0`) and any clamp→reject→reattach loop. Do NOT force `clearViewportFirst` either way for hidden attaches; keep the caller's value (cosmetic on a hidden surface).
-2. **Skip geometry bookkeeping for hidden attaches.** Guard with `!isHiddenAttach`: the `syncGeometryEpochForViewport(tid, cols, rows)` call (~2728) and the `rememberSentViewport(tid, cols, rows)` + `lastSentViewportRef.current = ...` pair (~2855-2856). A hidden attach never resizes server-side, so its dims must not become the "last sent viewport" that future visible resizes are suppressed against. Compute `cols`/`rows` as today (they stay in the frame — the schema is unchanged; the server ignores them for keepalive).
-3. Keep `deferredAttachStateRef.current` (~2794) and `currentAttachRef.current` (~2801) recording `pendingIntent`/`intent` = the SENT intent (`effectiveIntent`), so the reveal plan and ready-handler see the true wire semantics.
-4. **Broaden the recreate predicate.** In the `terminal.output.gap` handler, broaden `isUnrecoverableOpenCodeViewportHydrate` (~3964) to additionally accept `currentAttachRef.current?.intent === 'keepalive_delta'` while keeping `sinceSeq === 0`, `mode === 'opencode'`, and `sessionRef.provider === 'opencode'` unchanged (validator F: the recreate path otherwise silently dies for hidden restored opencode panes under the new contract). Update the comment to say both intents identify a full-surface replay attach — visible (`viewport_hydrate`) or hidden-clamped (`keepalive_delta`, sinceSeq 0). Acceptable-leak check: a visible checkpoint-arm keepalive attach has sinceSeq > 0 and stays excluded; do not change that.
-5. Add a code comment on the clamp stating the invariant and why sinceSeq must be 0 and viewport bookkeeping skipped (this is the load-bearing summary of the run's evidence; reference that `resize_for_attach` resizes unconditionally for viewport_hydrate).
+2. Use `wireIntent` (not `effectiveIntent`) in the `ws.send(buildTerminalAttachMessage({ ... }))` call. Do NOT change `deferredAttachStateRef.current.pendingIntent`, `currentAttachRef.current.intent`, seq-state handling, or any clearing.
 
-- [ ] **Step 3b (same task, same commit): reveal resize bypass gate.** Validator D falsified "skip-recording is enough": when the reveal-fit dims equal the pre-hide recorded dims, `matchesLastSentViewport` (~1643-1650) suppresses the reveal resize and the server-side mismatch persists. Implement an explicit force path: extend `requestTerminalLayout`'s options with `forceResize?: boolean` (~1599-1611, also extend `pendingLayoutWorkRef` shape), have ONLY the reveal layout effect (~2973) call `requestTerminalLayout({ fit: true, resize: true, forceResize: true })`, and in `flushScheduledLayout` (~1613-1658) skip the `matchesSuppressedViewport` and `matchesLastSentViewport` gates when the force flag is set — still fit() first, still record via `rememberSentViewport`/`lastSentViewportRef` after a forced send, still respect `suppressNetworkEffects` and the `tid` guard.
+3. Immediately after the `rememberSentViewport(tid, cols, rows)` / `lastSentViewportRef.current = ...` pair (~2855-2856):
+
+```ts
+if (hiddenViewportAttach) {
+  // The server did not apply these dims; do not let them suppress the next
+  // visible-pane resize (reveal-time heal path).
+  forgetSentViewport(tid)
+  lastSentViewportRef.current = null
+}
+```
+
+No other edits. In particular: do not touch the re-promotion conditions, the rejection ladders, the gap predicate, the reveal effect, or requestTerminalLayout.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
-Expected: PASS (both new tests; the whole file stays green).
+Expected: PASS (T1/T2 now green; T3 stays green; every pre-existing test in the file stays green after the allowed predicate updates).
 
 - [ ] **Step 5: Refactor while green**
 
-Review call-site text: with the choke point in place, the background-hydration effect's explicit `'viewport_hydrate'` argument remains accurate intent-from-caller vocabulary (the clamp site handles gating); add the same one-line comment pointer at the hydration effect call site (TerminalView.tsx ~2992) to keep the invariant discoverable. No other refactor; do not touch the reveal-plan policy file.
+Verify no duplication crept into the attach block; keep the invariant comment within ~8 lines. No other refactor.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: all client tests that cover attach intents, hydration, reveal attach, geometry epochs, and resize suppression. Enumerate them (verify with `ls test/unit/client/lib/ test/unit/client/components/ | grep -iE "attach|hydration|lifecycle|view-utils|terminal"` and include every attach/hydration/terminal-view file plus the policy file).
+Enumerate impacted client files first: `grep -rl "viewport_hydrate\|keepalive_delta" test/unit/client/src test/unit/client 2>/dev/null | sort -u` (then keep only files that exist). Run:
 
-Run: `npm run test:vitest -- run <each enumerated file>` (one invocation with the full enumerated list).
+```bash
+npm run test:vitest -- run <each enumerated file>
+npm run typecheck
+npm run lint
+```
 
-Expected: PASS with zero failures; record the file list and counts in the task report. Any failure whose root cause is the intent change must either be an old-contract assertion (update per Step 1's rule) or a real behavior defect (stop, do not commit; escalate to the coordinator with evidence).
+Expected: all PASS. Record the enumerated file list and counts in the task report. Failures whose root cause is an old-contract hidden-viewport assertion may be updated per the Step 1 rule; anything else is a real defect — stop, do not commit, escalate.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-rm crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs  # untracked probe — plain rm, evidence retained in run logs
+rm crates/freshell-ws/tests/zz_probe_attach_resume_geometry.rs
 git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "fix(client): hidden panes never claim viewport geometry on attach
+git commit -m "fix(client): hidden panes never claim viewport geometry on the wire
 
-A hidden pane's fitted dims are stale; viewport_hydrate hydration attaches
-from any client applied them as the PTY size unconditionally, stomping the
-visible pane's geometry (opencode TUI wrap-garbage on scroll, stale bands).
-Downgrade viewport_hydrate to keepalive_delta at the attachTerminal choke
-point while the pane is hidden; reveal attaches of visible panes are
-unchanged and keep healing geometry."
+A hidden/background-hydrating tab attached with viewport_hydrate and stale
+(or never-fitted) dims; servers resize the PTY unconditionally for that
+intent, stomping the visible pane's geometry (opencode TUI wrap-garbage on
+scroll, dead regions). Swap the wire intent to keepalive_delta for such
+attaches — replay-identical, resize-free — and invalidate this client's
+suppression records so reveal-time fit+resize actually reaches the server.
+Client-side bookkeeping keeps viewport_hydrate semantics, so the replay-gap
+recreate predicate and reveal planning are unchanged."
 ```
 
 ---
 
-### Task 2: Multi-client e2e regression — hidden hydration does not stomp the visible pane's PTY
+### Task 2: e2e regression — REST-created tab stays geometry-neutral until reveal
 
 **Files:**
-- Test: `test/e2e-browser/specs/multi-client.spec.ts` (EXTEND this file — validator E confirmed it is already in MATRIX_SPECS (playwright.config.ts:13-170), so the matrix runs it on both legacy-chromium and rust-chromium with no config change. A NEW spec file would need MATRIX_SPECS registration — do not create one).
-- Modify: `src/lib/test-harness.ts` ONLY if the e2e cannot otherwise read the real PTY size — precedent uses `getTerminalBuffer` + typed `stty size` markers, which needs no harness change; prefer that. No production client changes in this task.
+- Test: `test/e2e-browser/specs/multi-client.spec.ts` (EXTEND — already a MATRIX_SPECS member per playwright.config.ts, so both legacy-chromium and rust-chromium run it with no config change; do NOT create a new spec file).
+- No production changes in this task (Task 1 is the fix). No harness changes needed (validator E verified `getTerminalBuffer(terminalId?)` and matrix helpers suffice).
 
 **Interfaces:**
-- Consumes: Task 1's behavior; `window.__FRESHELL_TEST_HARNESS__` (`getTerminalBuffer(terminalId?) → string|null` per src/lib/test-harness.ts:113-119); from `specs/multi-client.spec.ts`: `newClientContext` (:10-14) for the second context, `waitForTabWithTerminalId` (:88-139, leaves the tab hidden on B), `waitForMarkedPtySize` (:154-165), whose marker regex expects `__LABEL__:<rows> <cols>`.
-- Produces: a new test inside `specs/multi-client.spec.ts` asserting that a second client's hidden hydration attach does not change the PTY size reported by the owning pane (kernel truth via `stty size` markers read from the pane's xterm buffer).
+- Consumes: existing helpers in `specs/multi-client.spec.ts`: `newClientContext` if a second context proves useful, `waitForTabWithTerminalId`, `waitForMarkedPtySize` (:154-165, marker shape `__LABEL__:<rows> <cols>`, so the typed probe must be `echo __AXIS__:$(stty size)`), the file's `test` import and server/token fixtures, plus the page-side `window.__FRESHELL_TEST_HARNESS__` (`getSentWsMessages`, `getTerminalBuffer`) and store dispatch helpers exactly as used elsewhere in that file.
+- Produces: one new test in that file pinning the hidden-hydration geometry-neutral contract end-to-end.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add the test in `test/e2e-browser/specs/multi-client.spec.ts`, reusing its existing helpers verbatim (no new fixtures). The test contract (adapt only call-edge details to the file's actual helper signatures):
+Add this test (adapt only call edges to the file's real helper signatures). Test flow:
 
-```ts
-test('hidden hydration attach on client B does not change client A pane PTY size', async (...) => {
-  // 1. Client A creates a shell pane and lets it fit; resize A's browser
-  //    viewport to a distinctive size per existing helpers; record the PTY
-  //    size on A by typing `echo __AXIS__:$(stty size)` and awaiting
-  //    waitForMarkedPtySize('__AXIS__', ...) on A's harness buffer.
-  // 2. Open client B on the same server; DO NOT select A's tab; wait for
-  //    B's background hydration of A's tab to fire (B's inventory contains
-  //    the tab — waitForTabWithTerminalId on B's context — then the attach
-  //    frame: observable via B's harness getSentWsMessages filtered to
-  //    terminal.attach for A's terminalId; its intent field is also the
-  //    secondary assertion: pre-fix 'viewport_hydrate', post-fix
-  //    'keepalive_delta').
-  // 3. Type `echo __AXIS2__:$(stty size)` on A and assert via
-  //    waitForMarkedPtySize that the PTY size is UNCHANGED from step 1.
-  //
-  // Pre-fix failure mode: B's hidden hydration sends viewport_hydrate with
-  // stale dims and the PTY flips (probe evidence in the run's reports/).
-  // Post-fix B attaches keepalive_delta (no resize).
-})
-```
+1. In the page, create a shell pane and note its fitted dims (existing helpers). Resize the browser viewport to a distinctive geometry if the file has such a helper; otherwise keep defaults — the marker reading supplies the ground truth.
+2. Create a SECOND tab via REST WITHOUT selecting it: use the harness/evaluate to POST `/api/tabs` with `{ mode: 'shell', name: 'geo-witness' }` against the same server and token. Capture its `terminalId`/`tabId` from the response.
+3. Wait until the hidden tab's background hydration attach is sent (poll `getSentWsMessages` for `terminal.attach` with that terminalId), then assert: its `intent === 'keepalive_delta'` and `priority === 'background'`, and that NO `terminal.attach` with `intent === 'viewport_hydrate'` for that terminalId was sent while hidden.
+4. Select the tab (dispatch select/active-tab action the way other specs do), wait for its visible attach (`viewport_hydrate`), then type `echo __AXIS__:$(stty size)\r` into the pane and `waitForMarkedPtySize('__AXIS__', ...)` — assert the reported rows/cols equal the pane's currently fitted xterm dims (available via harness), NOT the 80x24/120x30 spawn defaults; and that a `terminal.resize` for that terminalId was emitted on reveal.
+5. Assert the FIRST pane's PTY size is unchanged throughout (repeat its stty marker at the end).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium` (validator E verified this passthrough reaches playwright via scripts/e2e-cloud.sh:340-342; if the selector differs, confirm with `npm run test:e2e:local -- --list` and use the resolved form, still both matrix projects)
+Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: FAIL because client B's hidden hydration attach flips the PTY away from client A's size. If the setup itself errors (context/tokens/hydration), fix the setup — the RED must be the PTY-size assertion.
-
-Note for the implementer: if Task 1's fix lands first, this test arrives GREEN by construction; that is acceptable for Task 2 because its purpose is the durable regression pin. Record in the task report whether RED was observed (stash Task 1 HEAD~ to demonstrate RED if the reviewer wants evidence: `git stash`/checkout dance is NOT required in the default flow; documenting probe evidence from `reports/` suffices).
+Expected: FAIL at step 3's intent assertion (pre-fix wire intent is `viewport_hydrate` for the hidden tab). If setup errors occur, fix the setup only. If Task 1 landed first, this test is green-by-construction — record that honestly and cite the probe/wire-level evidence instead of mangling RED.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-None — Task 1's production change is the fix. This task adds only the e2e. If the e2e cannot be expressed without a tiny harness accessor, add exactly one method to `src/lib/test-harness.ts` (e.g. `getTerminalProps(terminalId)` returning xterm cols/rows) with an accompanying focused vitest addition in the harness's existing unit test file, and use it in the e2e instead of weakening the assertion.
+None (Task 1 covers production). If the REST-create-in-page flow turns out to exist already as a helper in another spec, reuse it; do not add new e2e infrastructure.
 
 - [ ] **Step 4: Run the focused test**
 
-Run: the same e2e command from Step 2.
+Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: PASS.
+Expected: PASS on both projects.
 
 - [ ] **Step 5: Refactor while green**
 
-Deduplicate any new setup code with `multi-client.spec.ts` helpers (share them via that file's existing helper module if one exists; do not create a new shared module for a single caller).
+Inline share nothing new; reuse the file's helpers. If two or more duplicated setup lines remain, follow the file's local extraction patterns.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium` (do not opt into cloud).
+Run: `npm run test:e2e:local -- specs/multi-client.spec.ts --project=legacy-chromium --project=rust-chromium`
 
-Expected: PASS for both.
+Expected: PASS (the whole file, both projects).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/ (changed/new spec + any harness/new helper files)
-git commit -m "test(e2e): pin that hidden hydration attaches cannot stomp the visible pane's PTY size"
+git add test/e2e-browser/specs/multi-client.spec.ts
+git commit -m "test(e2e): pin geometry-neutral hidden hydration attach + reveal heal for REST-created tabs"
 ```
 
 ---
 
-### Task 3: Geometry-convergence live verification against the live root-cause scenario (opencode TUI garbage)
+### Task 3: Live end-to-end verification on a scratch worktree instance
 
 **Files:**
-- No tracked file changes; verification entry only (playwright-driven or manual harness steps against a scratch local server instance on a unique port per AGENTS.md process-safety rules).
+- No tracked file changes. Evidence (screenshots + captured dims) is written to the run logs `reports/` only.
 
 **Interfaces:**
-- Consumes: Tasks 1-2. A throwaway freshell instance started from the worktree with `NODE_ENV=development PORT=3344 npm run dev` (PID-recorded, killed afterwards), a real `opencode` TUI pane, and the test Chrome harness.
+- Consumes: Tasks 1-2. Scratch dev instance from the worktree per repo process-safety rules: `NODE_ENV=development PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid` from the worktree, teasing out the token, driving via a browser (the agent's browser automation).
 
-- [ ] **Step 1: Reproduce the production symptom pre-fix (sanity)**
+- [ ] **Step 1: Boot + witness setup**
 
-On the scratch instance WITHOUT the fix (e.g. `git stash` of Task 1-2 in a SECOND checkout is not allowed in-repo; instead verify at base in the worktree by... — implementer: if demonstrating pre/post deltas in one worktree is awkward, SKIP this step and rely on the recorded live evidence in the run logs: wiring two clients with different window sizes against one opencode pane was already shown to produce the wrapped garbage capture `/tmp/opencode/chrome-*.png` and the ws geometry stomp from the probe run). Restate the observed pre-fix facts in the task report instead of re-producing.
+Verify the pid file PID belongs to the worktree (`ps -fp $(cat /tmp/freshell-3344.pid)` and confirm the cwd/command path includes the worktree). Open the dev client URL with token in the browser at a fixed window size. Create TWO panes: (a) a shell pane; (b) an opencode-mode pane via the pane picker/REST. REST-create a third shell tab that is never selected (producing a hidden-hydration tab).
 
-- [ ] **Step 2: Post-fix convergence check**
+- [ ] **Step 2: Machine-checkable assertions**
 
-With the fix committed: start the scratch server from the worktree (unique port 3344; record `/tmp/freshell-3344.pid`), open two window-sized contexts, run a real `opencode` TUI pane in client A at a fitted size; let client B's background hydration attach; force scrolls in A; assert via the harness buffer that the render stays intact (no wrapped-footer cascades) and that `stty size` matches A's fitted dims. Then switch visibility: select the tab in B and assert its reveal-attach heal (fresh `stty size` matches B's fitted dims after one resize tick).
+(a) Shell pane: type `echo __AXIS__:$(stty size)` — marker must equal the pane's current fitted xterm dims. (b) Opencode pane: assert via buffer rows (harness) that the footer renders on ONE row and contains both `ctrl+p` and `commands` (no wrap cascade); scroll back a few pages with PgUp and assert rows stay coherent (no right-edge fragment cascade — compare before/after dumps for absence of the known garbage pattern `^ ▀+$` mid-row splits and lone `\d+%)` fragments). (c) Witness tab: assert from `getSentWsMessages` that its hidden attach was `keepalive_delta`. (d) Reveal the witness tab, assert visible attach `viewport_hydrate` and a `terminal.resize` followed; type the stty marker there and confirm it equals its fitted dims. Record all dims + one screenshot per assertion into `reports/live-verify-*.png|json`.
 
-- [ ] **Step 3: Tear down and record**
+- [ ] **Step 3: Teardown + record**
 
-Kill the scratch instance with `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`; record observed sizes and screenshots under the run's `logs_dir/reports/`; write the task report with evidence paths.
+Verify ownership before stopping: `ps -fp "$(cat /tmp/freshell-3344.pid)"` and confirm the process's cwd/binary is inside the worktree; only then `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`. Write `reports/live-verify.md` with the evidence list and the assertion outcomes.
 
 - [ ] **Step 4: No commit**
 
-This task produces no tracked artifacts (AGENTS.md forbids committing scratch logs; the durable record is the run logs).
+This task produces no tracked artifacts (the evidence lives in the run logs).
 
 ---
 
 ## Addon: plan scope check vs User Request
 
-- Primary fix targets the established mechanism and satisfies "never claim viewport geometry while hidden" via the single choke point -> constraint satisfied; Node/Rust parity untouched (no server diff).
-- Reveal-time convergence is explicitly pinned by Task 1's second test and Task 2's step 2 second half.
-- Residuals honored: no server hardening, no fresh-agent identity work, base failures recorded not fixed.
+- Primary fix targets the established mechanism and satisfies "never claim viewport geometry while hidden" via the single choke point — wire intent swap to keepalive_delta — server parity untouched (no server diff).
+- Reveal-time convergence is restored through suppression-record invalidation on clamped attaches, explicitly pinned by Task 1's T2 and Task 2's step 4; Task 3 verifies it live (including the opencode visual integrity a human would notice as "garbage").
+- Residuals honored: no server hardening, no fresh-agent identity work, base failures recorded not fixed. Known accepted transient (validator AC): a hidden clamped replay paints over the stale hidden surface until reveal; invisible to users, verified safe.
