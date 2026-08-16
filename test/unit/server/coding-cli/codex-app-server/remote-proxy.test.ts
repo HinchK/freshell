@@ -177,15 +177,42 @@ function nextMessageWithin(socket: WebSocket, ms: number): Promise<any> {
   ])
 }
 
-function nextResponseWithId(socket: WebSocket, id: number): Promise<any> {
-  return new Promise((resolve) => {
-    const onMessage = (raw: WebSocket.RawData) => {
-      const message = JSON.parse(raw.toString())
-      if (message?.id !== id) return
+function nextResponseWithId(socket: WebSocket, id: number, timeoutMs = 5_000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout)
       socket.off('message', onMessage)
+      socket.off('close', onClose)
+      socket.off('error', onError)
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error(`Socket closed before response ${id}.`))
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
+      if (isBinary) return
+      let message: any
+      try {
+        message = JSON.parse(rawDataToBuffer(raw).toString('utf8'))
+      } catch {
+        return
+      }
+      if (message?.id !== id) return
+      cleanup()
       resolve(message)
     }
+    timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error(`Timed out waiting ${timeoutMs}ms for response ${id}.`))
+    }, timeoutMs)
     socket.on('message', onMessage)
+    socket.once('close', onClose)
+    socket.once('error', onError)
   })
 }
 
