@@ -9,6 +9,8 @@ import {
   FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS as FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS_VALUE,
   FreshAgentModelCapabilitiesResponseSchema,
 } from '@shared/fresh-agent-model-capabilities'
+import type { FreshAgentSessionType } from '@shared/fresh-agent'
+import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
 
 export const FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS = FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS_VALUE
 
@@ -362,4 +364,34 @@ export function capFreshAgentModelSourceRows(
     if (models.length > 0) cappedGroups.push({ source: group.source, models })
   }
   return { groups: cappedGroups, hiddenCount }
+}
+
+/**
+ * Map a provider's baked-in model menu into the live-catalog capability shape
+ * so the shared model+thinking dialog treats baked-in and probed catalogs as
+ * data-only differences. Only freshcodex has a meaningful static table today;
+ * freshopencode models come from the probed catalog and freshclaude/kilroy
+ * keep their simple popover list.
+ */
+export function getFreshAgentStaticModelCapabilities(
+  sessionType: FreshAgentSessionType,
+): FreshAgentModelCapabilities | undefined {
+  if (sessionType !== 'freshcodex') return undefined
+  const models: FreshAgentModelCapability[] = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex
+    .map((option) => ({
+      id: option.value,
+      displayName: option.label,
+      provider: 'codex' as const,
+      source: { id: 'openai', displayName: 'openai' },
+      supportsEffort: (option.thinkingEfforts?.length ?? 0) > 0,
+      supportedEffortLevels: [...(option.thinkingEfforts ?? [])],
+      supportsAdaptiveThinking: false,
+    }))
+  return {
+    sessionType: 'freshcodex',
+    runtimeProvider: 'codex',
+    status: 'fresh',
+    fetchedAt: 0,
+    models,
+  }
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
+  getFreshAgentStaticModelCapabilities,
   FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
   capFreshAgentModelSourceRows,
   filterFreshAgentModelCapabilitiesByQuery,
@@ -391,5 +392,39 @@ describe('fresh-agent-model-capabilities opencode catalog helpers', () => {
 
     expect(capped.groups.flatMap((group) => group.models)).toHaveLength(250)
     expect(capped.hiddenCount).toBe(50)
+  })
+})
+
+describe('fresh-agent-model-capabilities static catalog mapping', () => {
+  it('maps the freshcodex static menu into the shared capability shape', () => {
+    const capabilities = getFreshAgentStaticModelCapabilities('freshcodex')
+
+    expect(capabilities).toMatchObject({
+      sessionType: 'freshcodex',
+      runtimeProvider: 'codex',
+      status: 'fresh',
+    })
+    expect(capabilities?.models.map((model) => model.id)).toEqual([
+      'gpt-5.5',
+      'gpt-5.4-flash',
+      'gpt-5.3-codex-spark',
+    ])
+    expect(capabilities?.models[0]).toMatchObject({
+      displayName: 'GPT-5.5',
+      provider: 'codex',
+      supportsEffort: true,
+      supportedEffortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+      supportsAdaptiveThinking: false,
+    })
+    expect(capabilities?.models[1]?.supportedEffortLevels).toEqual(['none', 'minimal', 'low', 'medium', 'high'])
+    for (const model of capabilities?.models ?? []) {
+      expect(model.source).toEqual({ id: 'openai', displayName: 'openai' })
+    }
+  })
+
+  it('does not fabricate a static catalog for session types without one', () => {
+    expect(getFreshAgentStaticModelCapabilities('freshopencode')).toBeUndefined()
+    expect(getFreshAgentStaticModelCapabilities('freshclaude')).toBeUndefined()
+    expect(getFreshAgentStaticModelCapabilities('kilroy')).toBeUndefined()
   })
 })
