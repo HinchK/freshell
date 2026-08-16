@@ -307,7 +307,17 @@ Verify the pid file PID belongs to the worktree (`ps -fp $(cat /tmp/freshell-334
 
 - [x] **Step 3: Teardown + record**
 
-Verify ownership before stopping: `ps -fp "$(cat /tmp/freshell-3344.pid)"` and confirm the process's cwd/binary is inside the worktree; only then `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`. Write `/home/dan/code/freshell/.worktrees/.the-usual-logs/attach-geometry-resume-panes/reports/live-verify.md` with the evidence list and the assertion outcomes.
+Verify ownership before stopping: `ps -fp "$(cat /tmp/freshell-3344.pid)"` and confirm the process's cwd/binary is inside the worktree. The recorded PID is the npm/concurrently wrapper — its children (Vite, server) survive a plain kill (observed live), so terminate the OWNED PROCESS GROUP and verify the ports are released before removing the pid file:
+
+```bash
+PGID=$(ps -o pgid= -p "$(cat /tmp/freshell-3344.pid)" | tr -d ' ')
+ps -o cmd= -g "$PGID"   # eyeball: all members must belong to this scratch instance/worktree
+kill -TERM -- "-$PGID"
+sleep 2; (command -v ss >/dev/null && ss -tlnp | grep -E ':(3344|5273)\b' && echo 'STILL BOUND — investigate before proceeding' || true)
+rm -f /tmp/freshell-3344.pid
+```
+
+Write `/home/dan/code/freshell/.worktrees/.the-usual-logs/attach-geometry-resume-panes/reports/live-verify.md` with the evidence list and the assertion outcomes.
 
 - [x] **Step 4: No commit**
 
