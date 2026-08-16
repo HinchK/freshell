@@ -33,18 +33,51 @@ function sessionKey(s: any): string {
 function normalizeProjects(payload: unknown): ProjectGroup[] {
   if (!Array.isArray(payload)) return []
   const result: ProjectGroup[] = []
+  const seenSessionKeys = new Set<string>()
   for (const raw of payload as any[]) {
     if (!raw || typeof raw !== 'object') continue
     const projectPath = (raw as any).projectPath
     if (typeof projectPath !== 'string' || projectPath.length === 0) continue
     const sessionsRaw = (raw as any).sessions
-    const sessions = Array.isArray(sessionsRaw)
+    const validSessions = Array.isArray(sessionsRaw)
       ? sessionsRaw.filter((s) => !!s && typeof s === 'object' && !Array.isArray(s))
       : []
+    const sessions = validSessions.flatMap((session) => {
+      const normalized = {
+        ...session,
+        provider: session.provider || 'claude',
+      }
+      const key = sessionKey(normalized)
+      if (seenSessionKeys.has(key)) return []
+      seenSessionKeys.add(key)
+      return [normalized]
+    })
+    // Keep intentionally empty groups, but prune a group whose candidates
+    // were all duplicates of an earlier authoritative appearance.
+    if (validSessions.length > 0 && sessions.length === 0) continue
     const color = typeof (raw as any).color === 'string' ? (raw as any).color : undefined
     result.push({ projectPath, sessions, ...(color ? { color } : {}) } as ProjectGroup)
   }
   return result
+}
+
+function collectSessionKeys(projects: ProjectGroup[]): Set<string> {
+  return new Set(
+    projects.flatMap((project) => (project.sessions ?? []).map(sessionKey)),
+  )
+}
+
+function removeSessionKeys(
+  projects: ProjectGroup[],
+  keys: Set<string>,
+): ProjectGroup[] {
+  if (keys.size === 0) return projects
+  return projects.flatMap((project) => {
+    const sourceSessions = project.sessions ?? []
+    const sessions = sourceSessions.filter((session) => !keys.has(sessionKey(session)))
+    if (sourceSessions.length > 0 && sessions.length === 0) return []
+    return [{ ...project, sessions }]
+  })
 }
 
 function projectNewestLastActivityAt(project: ProjectGroup): number {
@@ -367,12 +400,16 @@ export const sessionsSlice = createSlice({
     },
     mergeProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
       const incoming = normalizeProjects(action.payload)
+      const staleProjects = removeSessionKeys(
+        normalizeProjects(state.projects),
+        collectSessionKeys(incoming),
+      )
       // Merge incoming projects with existing ones by projectPath
-      const projectMap = new Map(state.projects.map((p) => [p.projectPath, p]))
+      const projectMap = new Map(staleProjects.map((p) => [p.projectPath, p]))
       for (const project of incoming) {
         projectMap.set(project.projectPath, project)
       }
-      state.projects = Array.from(projectMap.values())
+      state.projects = normalizeProjects(Array.from(projectMap.values()))
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
@@ -385,13 +422,16 @@ export const sessionsSlice = createSlice({
       if (!state.wsSnapshotReceived) return
       const remove = new Set(action.payload.removeProjectPaths || [])
       const incoming = normalizeProjects(action.payload.upsertProjects)
-
-      const projectMap = new Map(state.projects.map((p) => [p.projectPath, p]))
+      const staleProjects = removeSessionKeys(
+        normalizeProjects(state.projects),
+        collectSessionKeys(incoming),
+      )
+      const projectMap = new Map(staleProjects.map((p) => [p.projectPath, p]))
 
       for (const key of remove) projectMap.delete(key)
       for (const project of incoming) projectMap.set(project.projectPath, project)
 
-      state.projects = sortProjectsByRecency(Array.from(projectMap.values()))
+      state.projects = sortProjectsByRecency(normalizeProjects(Array.from(projectMap.values())))
       state.lastLoadedAt = Date.now()
 
       const valid = new Set(state.projects.map((p) => p.projectPath))
@@ -438,16 +478,17 @@ export const sessionsSlice = createSlice({
       syncActiveWindowFromTopLevel(state)
     },
     appendSessionsPage: (state, action: PayloadAction<ProjectGroup[]>) => {
+      const existingProjects = normalizeProjects(state.projects)
       const incoming = normalizeProjects(action.payload)
       // Build a set of existing session keys for deduplication
       const existingKeys = new Set<string>()
-      for (const project of state.projects) {
+      for (const project of existingProjects) {
         for (const session of project.sessions) {
           existingKeys.add(sessionKey(session))
         }
       }
       // Merge incoming sessions into existing projects, deduplicating
-      const projectMap = new Map(state.projects.map((p) => [p.projectPath, { ...p, sessions: [...p.sessions] }]))
+      const projectMap = new Map(existingProjects.map((p) => [p.projectPath, { ...p, sessions: [...p.sessions] }]))
       for (const project of incoming) {
         const existing = projectMap.get(project.projectPath)
         if (existing) {
@@ -471,7 +512,7 @@ export const sessionsSlice = createSlice({
           }
         }
       }
-      state.projects = sortProjectsByRecency(Array.from(projectMap.values()))
+      state.projects = sortProjectsByRecency(normalizeProjects(Array.from(projectMap.values())))
       state.lastLoadedAt = Date.now()
       state.loadingMore = false
       state.loadingKind = undefined

@@ -565,6 +565,13 @@ describe('sessionsThunks', () => {
             sessions: [
               {
                 provider: 'claude',
+                sessionId: 'session-newer',
+                projectPath: '/tmp/project-alpha',
+                lastActivityAt: 3_000,
+                title: 'Newer',
+              },
+              {
+                provider: 'claude',
                 sessionId: 'session-alpha',
                 projectPath: '/tmp/project-alpha',
                 lastActivityAt: 2_000,
@@ -583,6 +590,13 @@ describe('sessionsThunks', () => {
           {
             projectPath: '/tmp/project-beta',
             sessions: [
+              {
+                provider: 'claude',
+                sessionId: 'session-alpha',
+                projectPath: '/tmp/project-beta',
+                lastActivityAt: 1_500,
+                title: 'Stale duplicate from page 2',
+              },
               {
                 provider: 'claude',
                 sessionId: 'session-beta',
@@ -623,6 +637,18 @@ describe('sessionsThunks', () => {
       '/tmp/project-alpha',
       '/tmp/project-beta',
     ])
+    expect(store.getState().sessions.windows.sidebar.projects.flatMap((project) => project.sessions)).toEqual([
+      expect.objectContaining({ sessionId: 'session-newer' }),
+      expect.objectContaining({
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        title: 'Alpha',
+      }),
+      expect.objectContaining({ sessionId: 'session-beta' }),
+    ])
+    // The adapter reports page size (2), while the window has accumulated
+    // three unique sessions across the two pages.
+    expect(store.getState().sessions.windows.sidebar.totalSessions).toBe(3)
   })
 
   it('classifies append fetches as silent pagination work until they settle', async () => {
@@ -1306,6 +1332,84 @@ describe('sessionsThunks', () => {
     // viewport backfill does not re-walk pages after every refresh.
     expect(windowState.oldestLoadedTimestamp).toBe(1_000)
     expect(windowState.oldestLoadedSessionId).toBe('claude:session-old')
+    expect(windowState.hasMore).toBe(false)
+    expect(windowState.totalSessions).toBe(2)
+  })
+
+  it('moves an overlapping session to its fresh project while preserving the deep window and cursor', async () => {
+    const staleMovedProject = {
+      projectPath: '/tmp/old-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-moved',
+        projectPath: '/tmp/old-project',
+        lastActivityAt: 5_000,
+        title: 'Stale title',
+      }],
+    }
+    const deepProject = {
+      projectPath: '/tmp/deep-project',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'session-deep',
+        projectPath: '/tmp/deep-project',
+        lastActivityAt: 1_000,
+        title: 'Deep session',
+      }],
+    }
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: [staleMovedProject, deepProject],
+      lastLoadedAt: 5_000,
+      windows: {
+        sidebar: {
+          projects: [staleMovedProject, deepProject],
+          lastLoadedAt: 5_000,
+          query: '',
+          searchTier: 'title',
+          appliedQuery: '',
+          appliedSearchTier: 'title',
+          loading: false,
+          hasMore: false,
+          oldestLoadedTimestamp: 1_000,
+          oldestLoadedSessionId: 'codex:session-deep',
+        },
+      },
+    })
+
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [{
+        projectPath: '/tmp/new-project',
+        sessions: [{
+          provider: 'claude',
+          sessionId: 'session-moved',
+          projectPath: '/tmp/new-project',
+          lastActivityAt: 6_000,
+          title: 'Fresh title',
+        }],
+      }],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 6_000,
+      oldestIncludedSessionId: 'claude:session-moved',
+      hasMore: true,
+    })
+
+    await store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    const windowState = store.getState().sessions.windows.sidebar
+    expect(windowState.projects.map((project: any) => project.projectPath))
+      .toEqual(['/tmp/new-project', '/tmp/deep-project'])
+    expect(windowState.projects.flatMap((project: any) => project.sessions)).toEqual([
+      expect.objectContaining({
+        provider: 'claude',
+        sessionId: 'session-moved',
+        projectPath: '/tmp/new-project',
+        title: 'Fresh title',
+      }),
+      expect.objectContaining({ provider: 'codex', sessionId: 'session-deep' }),
+    ])
+    expect(windowState.oldestLoadedTimestamp).toBe(1_000)
+    expect(windowState.oldestLoadedSessionId).toBe('codex:session-deep')
     expect(windowState.hasMore).toBe(false)
     expect(windowState.totalSessions).toBe(2)
   })

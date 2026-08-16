@@ -164,47 +164,52 @@ function mergeProjects(
 ): ProjectGroup[] {
   const preferIncomingColors = opts?.preferColorsFrom !== 'existing'
   const projectMap = new Map<string, ProjectGroup>()
-  const seenKeys = new Map<string, Set<string>>()
+  const seenKeys = new Set<string>()
 
-  for (const project of existing) {
-    projectMap.set(project.projectPath, {
-      ...project,
-      sessions: [...project.sessions],
-    })
-    seenKeys.set(project.projectPath, new Set(project.sessions.map(sessionKey)))
-  }
-
-  for (const project of incoming) {
-    const current = projectMap.get(project.projectPath)
-    if (!current) {
-      projectMap.set(project.projectPath, {
-        ...project,
-        sessions: [...project.sessions],
+  const addProjects = (projects: ProjectGroup[], side: 'existing' | 'incoming') => {
+    for (const project of projects) {
+      const sourceSessions = project.sessions ?? []
+      const uniqueSessions = sourceSessions.filter((session) => {
+        const key = sessionKey(session)
+        if (seenKeys.has(key)) return false
+        seenKeys.add(key)
+        return true
       })
-      seenKeys.set(project.projectPath, new Set(project.sessions.map(sessionKey)))
-      continue
-    }
+      const current = projectMap.get(project.projectPath)
 
-    const keys = seenKeys.get(project.projectPath) ?? new Set<string>()
-    for (const session of project.sessions) {
-      const key = sessionKey(session)
-      if (keys.has(key)) continue
-      keys.add(key)
-      current.sessions.push(session)
+      if (!current) {
+        // Preserve groups that were genuinely empty, but do not leave behind
+        // a second project whose only sessions lost a global identity clash.
+        if (sourceSessions.length === 0 || uniqueSessions.length > 0) {
+          projectMap.set(project.projectPath, {
+            ...project,
+            sessions: uniqueSessions,
+          })
+        }
+        continue
+      }
+
+      current.sessions.push(...uniqueSessions)
+      // SESSION-05: the later-fetched page is server-authoritative for
+      // color. The previous additive-only adoption (`&& !current.color`)
+      // silently kept a STALE color when another browser changed it — the
+      // refetch after `sessions.changed` is the only recolor channel, so a
+      // fresher fetched color must win. Which side that is depends on the
+      // caller (see the `preferColorsFrom` option doc). (Removal is
+      // unobservable: no server path deletes a project color, matching the
+      // legacy no-clear-UI surface.)
+      if (
+        side === 'incoming'
+        && project.color
+        && (preferIncomingColors || !current.color)
+      ) {
+        current.color = project.color
+      }
     }
-    // SESSION-05: the later-fetched page is server-authoritative for
-    // color. The previous additive-only adoption (`&& !current.color`)
-    // silently kept a STALE color when another browser changed it — the
-    // refetch after `sessions.changed` is the only recolor channel, so a
-    // fresher fetched color must win. Which side that is depends on the
-    // caller (see the `preferColorsFrom` option doc). (Removal is
-    // unobservable: no server path deletes a project color, matching the
-    // legacy no-clear-UI surface.)
-    if (project.color && (preferIncomingColors || !current.color)) {
-      current.color = project.color
-    }
-    seenKeys.set(project.projectPath, keys)
   }
+
+  addProjects(existing, 'existing')
+  addProjects(incoming, 'incoming')
 
   return Array.from(projectMap.values())
 }
@@ -695,7 +700,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
         dispatch(commitSessionWindowReplacement({
           surface,
           projects,
-          totalSessions: response?.totalSessions,
+          totalSessions: append ? countSessions(projects) : response?.totalSessions,
           oldestLoadedTimestamp: response?.oldestIncludedTimestamp,
           oldestLoadedSessionId: response?.oldestIncludedSessionId,
           hasMore: response?.hasMore,

@@ -167,7 +167,6 @@ export function buildSessionItems(
   worktreeGrouping: WorktreeGrouping = 'repo',
   paneLastInputAt: Record<string, number | undefined> = EMPTY_PANE_LAST_INPUT_AT,
 ): SidebarSessionItem[] {
-  const items: SidebarSessionItem[] = []
   const itemsByKey = new Map<string, SidebarSessionItem>()
   const runningSessionMap = new Map<string, RunningSessionInfo>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
@@ -277,8 +276,11 @@ export function buildSessionItems(
         codexDurabilityState: runningTerminal?.codexDurabilityState,
         codexDurabilityReason: runningTerminal?.codexDurabilityReason,
       }
-      items.push(item)
-      itemsByKey.set(key, item)
+      // Persisted project order is authoritative. Keep the first appearance
+      // if malformed/preloaded state bypasses reducer normalization.
+      if (!itemsByKey.has(key)) {
+        itemsByKey.set(key, item)
+      }
     }
   }
 
@@ -367,7 +369,6 @@ export function buildSessionItems(
       codexDurabilityState: input.codexDurabilityState ?? runningTerminal?.codexDurabilityState,
       codexDurabilityReason: input.codexDurabilityReason ?? runningTerminal?.codexDurabilityReason,
     }
-    items.push(item)
     itemsByKey.set(key, item)
   }
 
@@ -520,11 +521,10 @@ export function buildSessionItems(
       isRestorable: false,
       isSubagent: terminal.resumeTargetIsSubagent === true ? true : undefined,
     }
-    items.push(item)
     itemsByKey.set(key, item)
   }
 
-  return items
+  return Array.from(itemsByKey.values())
 }
 
 function filterSessionItems(items: SidebarSessionItem[], filter: string): SidebarSessionItem[] {
