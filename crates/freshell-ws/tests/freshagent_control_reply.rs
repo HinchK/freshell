@@ -9,8 +9,8 @@
 //! `"Fork is …"`, `"Compact is …"`) under code `UNSUPPORTED_CAPABILITY`; every handled
 //! cell routes to a real dispatch arm. Task 4 landed the codex/opencode compact arms
 //! (their cells dropped from the table) and pins the unconditional amplifier x op
-//! refusal cells; Task 5 landed the opencode fork arm (its cell dropped too — the
-//! remaining fork refusals are claude [permanent], codex [until Task 6], amplifier).
+//! refusal cells; Task 5 landed the opencode fork arm, Task 6 the codex fork arm (both
+//! cells dropped — the remaining fork refusals are claude [permanent] and amplifier).
 //!
 //! These tests drive a REAL axum server + REAL tokio-tungstenite client (same harness
 //! as `unknown_terminal_reply.rs`, the kata-dtfn precedent).
@@ -273,6 +273,44 @@ async fn opencode_fork_reaches_the_opencode_dispatch_arm() {
         frame["event"]["code"],
         serde_json::json!("INVALID_SESSION_ID"),
         "the frame reached the opencode handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
+    );
+}
+
+/// Dispatch-matrix cell (Task 6): codex fork is NO LONGER refused — it reaches
+/// `FreshCodexState::handle_fork`, which answers an unknown parent session with the
+/// nested `freshAgent.error{INVALID_SESSION_ID}` lost-session shape ON THE REQUESTING
+/// CONNECTION (never UNSUPPORTED_CAPABILITY, and never silence — the requesting sink
+/// always gets an answer). This pin began life (Task-5 carried minor) as
+/// `codex_fork_is_refused_with_the_parity_capability_message` and flipped when Task 6
+/// inverted the cell.
+#[tokio::test]
+async fn codex_fork_reaches_the_codex_dispatch_arm() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "freshAgent.fork",
+            "provider": "codex",
+            "sessionId": "ses-cx-fork-1",
+            "sessionType": "freshcodex",
+            "requestId": "fork-cx-1",
+        }),
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+    assert_eq!(frame["provider"], serde_json::json!("codex"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshcodex"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the codex handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
     );
 }
 

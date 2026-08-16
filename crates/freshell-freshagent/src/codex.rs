@@ -64,14 +64,15 @@ use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
     normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
     CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
-    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
-    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage,
-    SessionLocator,
+    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
+use freshell_terminal::FrameSink;
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
@@ -1270,6 +1271,272 @@ impl FreshCodexState {
         if let Err(err) = client.compact_thread(&session_id).await {
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
+    }
+
+    // ── freshAgent.fork (WS, AGENT-07) ───────────────────────────────────────
+
+    /// Handle a `freshAgent.fork` for codex: `thread/fork` on the PARENT's app-server,
+    /// then move the child onto its OWN sidecar via the VALIDATED (LB-01, real 0.147.0
+    /// probe) while-alive handoff — **archive on parent → spawn the child sidecar →
+    /// unarchive on child → resume on child**. A direct cross-process `thread/resume`
+    /// while the parent owns the child is rejected outright (`-32600 "thread … already
+    /// has an active writer"`; thread-writer locks under CODEX_HOME), and a post-`fork`
+    /// `result.thread.turns` keeps full history because 0.147.0 removed `excludeTurns`
+    /// from the schema (it is NEVER sent here).
+    ///
+    /// Deliberate divergence from legacy: Node pins the child to the PARENT's
+    /// app-server connection (`adapter.ts:1070` `rememberRuntimeThread`); this port
+    /// registers the child on its own sidecar, preserving the one-thread-per-sidecar
+    /// invariant (the pane kills the parent immediately after `forked`; a resumed child
+    /// on a killed parent's connection would die with it — here the child owns its
+    /// sidecar, and post-owner-exit resume was probed to work, SIGKILL stale locks
+    /// included).
+    ///
+    /// Fork is a request/response op answered ON THE REQUESTING CONNECTION
+    /// (`reply_sink`, the opencode fork arm's shape): every failure path — including
+    /// the REVIEWED post-archive containment (fresh-eyes F6) — replies a nested
+    /// `freshAgent.error`, so a Fork click never dies silently. After the child is
+    /// archived on the parent, ANY later failure additionally BEST-EFFORT
+    /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
+    /// the parent may be mid-kill), restoring the child's original visibility.
+    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+        let looked_up = {
+            let guard = self.sessions.lock().await;
+            guard.get(&msg.session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.cwd.clone(),
+                    s.sandbox.clone(),
+                    s.permission_mode.clone(),
+                )
+            })
+        };
+        let Some((
+            parent_client,
+            parent_model,
+            parent_effort,
+            parent_cwd,
+            parent_sandbox,
+            parent_permission_mode,
+        )) = looked_up
+        else {
+            // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
+            // answers the same lost-session shape on the requesting connection so the
+            // client's recovery path engages.
+            reply_sink(lost_session_frame(&msg.session_id));
+            return;
+        };
+
+        // Effective fork params: the parent's stored settings (model/effort/cwd/
+        // sandbox/permission_mode), with `input` overriding ONLY cwd/model (the legacy
+        // adapter spread, narrowed per the Task-6 plan). `lastTurnId` comes from
+        // `input.atTurnId` with the synthetic `:row-<digits>` split suffix stripped
+        // (the snapshot's split turn ids vs. codex's raw provider turn ids — round-3
+        // F6, `build_codex_turn_json`).
+        let input = msg.input.as_ref();
+        let input_str = |key: &str| {
+            input
+                .and_then(|v| v.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let eff_cwd = input_str("cwd").or(parent_cwd);
+        let eff_model = input_str("model").unwrap_or(parent_model);
+        let last_turn_id = input_str("atTurnId").map(|id| strip_codex_row_suffix(&id).to_string());
+
+        let fork_result = match parent_client
+            .fork_thread(ThreadForkParams {
+                thread_id: msg.session_id.clone(),
+                last_turn_id,
+                model: Some(eff_model.clone()),
+                cwd: eff_cwd.clone(),
+                approval_policy: parent_permission_mode.clone(),
+                sandbox: parent_sandbox.clone(),
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                // e.g. the PROBED empty-parent rejection (`-32600 "no rollout found
+                // for thread id"`). No state changes on this path.
+                reply_sink(fork_error_frame(&msg.session_id, &err.to_string()));
+                return;
+            }
+        };
+        let child_id = fork_result
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string);
+        let Some(child_id) = child_id else {
+            // A pathological 200 without a usable thread.id — never register or
+            // repoint the pane at a garbage child (the opencode malformed-id guard's
+            // sibling).
+            reply_sink(fork_error_frame(
+                &msg.session_id,
+                &format!(
+                    "codex thread/fork of session {} returned a malformed response: missing thread \"id\".",
+                    msg.session_id
+                ),
+            ));
+            return;
+        };
+
+        // Release the child's writer lock on the parent so the child sidecar can own
+        // it. An archive failure leaves the child attached to the PARENT connection
+        // (still usable there; no handoff was attempted), so nothing more happens.
+        if let Err(err) = parent_client.archive_thread(&child_id).await {
+            reply_sink(fork_error_frame(&msg.session_id, &err.to_string()));
+            return;
+        }
+
+        // ── post-archive (failure containment applies to every step below) ──
+        let child_parts = match self.spawn_sidecar(eff_cwd.as_deref()).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.fail_fork_after_archive(
+                    &parent_client,
+                    &child_id,
+                    &msg.session_id,
+                    &reply_sink,
+                    &err,
+                )
+                .await;
+                return;
+            }
+        };
+        let (child_client, child_notifs, child_ownership_id, mut child_proc) = child_parts;
+
+        if let Err(err) = child_client.unarchive_thread(&child_id).await {
+            shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &msg.session_id,
+                &reply_sink,
+                &err.to_string(),
+            )
+            .await;
+            return;
+        }
+
+        let resumed = child_client
+            .resume_thread(
+                &child_id,
+                StartThreadParams {
+                    cwd: eff_cwd.clone(),
+                    model: Some(eff_model.clone()),
+                    sandbox: parent_sandbox.clone(),
+                    approval_policy: parent_permission_mode.clone(),
+                },
+            )
+            .await;
+        let resumed = match resumed {
+            Ok(resumed) => resumed,
+            Err(err) => {
+                shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+                self.fail_fork_after_archive(
+                    &parent_client,
+                    &child_id,
+                    &msg.session_id,
+                    &reply_sink,
+                    &err.to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+        // TERM-25's wrong-thread guard, on the child's own connection.
+        if resumed.thread_id != child_id {
+            let message = format!(
+                "codex thread/resume returned wrong thread id {} (expected {child_id}); \
+                 refusing to adopt the wrong thread",
+                resumed.thread_id
+            );
+            shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &msg.session_id,
+                &reply_sink,
+                &message,
+            )
+            .await;
+            return;
+        }
+
+        // Register the child on its OWN sidecar (the shared registration tail, the
+        // ensure_session_resumable shape), inheriting the parent's settings.
+        self.register_live_session(
+            &child_id,
+            child_client,
+            child_notifs,
+            child_ownership_id,
+            child_proc,
+            eff_model.clone(),
+            parent_effort.clone(),
+            eff_cwd.clone(),
+            parent_sandbox.clone(),
+            parent_permission_mode.clone(),
+        )
+        .await;
+
+        // P1.13: the child's binding row, AWAITED before the forked reply
+        // (durable-before-answer). Fork is not a create: no create_request_id.
+        self.record_codex_binding(
+            &child_id,
+            None,
+            &eff_model,
+            parent_sandbox.as_deref(),
+            parent_permission_mode.as_deref(),
+            parent_effort.as_deref(),
+            eff_cwd.as_deref(),
+            None,
+        )
+        .await;
+
+        // DIAG-01: lifecycle metadata only.
+        tracing::info!(
+            provider = PROVIDER,
+            session_id = %child_id,
+            parent_session_id = %msg.session_id,
+            "freshagent.session.forked"
+        );
+
+        reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
+            request_id: msg.request_id.clone(),
+            parent_session_id: msg.session_id.clone(),
+            session_id: child_id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            provider: PROVIDER.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: child_id,
+            }),
+        }));
+    }
+
+    /// REVIEWED post-archive failure containment (fresh-eyes F6): after the child was
+    /// archived on the parent, ANY later failure (child-sidecar spawn, child
+    /// unarchive/resume) (a) replies the nested `freshAgent.error` on the requesting
+    /// sink with the failing step's text AND (b) BEST-EFFORT `thread/unarchive`s the
+    /// child on the PARENT client, restoring the child's original visibility. The
+    /// unarchive's own error is IGNORED — the parent may be mid-kill — and the child
+    /// stays recoverable via post-owner-exit resume.
+    async fn fail_fork_after_archive(
+        &self,
+        parent_client: &CodexAppServerClient,
+        child_id: &str,
+        session_id: &str,
+        reply_sink: &FrameSink,
+        message: &str,
+    ) {
+        reply_sink(fork_error_frame(session_id, message));
+        let _ = parent_client.unarchive_thread(child_id).await;
     }
 
     // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
@@ -2513,42 +2780,24 @@ impl FreshCodexState {
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
 
-        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
-        let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
-        let (kill_tx, kill_rx) = oneshot::channel();
-        let watcher = spawn_exit_watcher(
-            child,
-            ownership_id,
-            thread_id.to_string(),
-            self.broadcast_tx.clone(),
-            kill_rx,
-            exited.clone(),
-            Arc::clone(&self.leases),
-        );
-        {
-            let mut guard = self.sessions.lock().await;
-            guard.insert(
-                thread_id.to_string(),
-                CodexSession {
-                    client: client.clone(),
-                    // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
-                    // only when no record was recoverable (never-recorded historical
-                    // sessions resume on defaults, exactly as before this fix).
-                    model: rec.model.clone().unwrap_or_default(),
-                    // (lease completion happens right after this insert -- see below)
-                    effort: rec.effort.clone(),
-                    cwd: cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
-                    sandbox: rec.sandbox.clone(),
-                    permission_mode: rec.permission_mode.clone(),
-                    active_turn: active_turn.clone(),
-                    consumer,
-                    kill_tx: Some(kill_tx),
-                    watcher,
-                    exited,
-                },
-            );
-        }
+        // Registration tail (shared with `handle_fork`). P1.13 (Task 5, R3): the ledger
+        // record's settings snapshot -- blank only when no record was recoverable
+        // (never-recorded historical sessions resume on defaults, exactly as before
+        // this fix). (Lease completion happens right after the insert -- see below.)
+        let active_turn = self
+            .register_live_session(
+                thread_id,
+                client.clone(),
+                notifs,
+                ownership_id,
+                child,
+                rec.model.clone().unwrap_or_default(),
+                rec.effort.clone(),
+                cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                rec.sandbox.clone(),
+                rec.permission_mode.clone(),
+            )
+            .await;
 
         // Task 13: bind the durable thread id to this live session + release the lease.
         if let Some(mut g) = lease_guard.take() {
@@ -2593,6 +2842,58 @@ impl FreshCodexState {
             client,
             active_turn,
         })
+    }
+
+    /// The shared "register a freshly-resumed/forked session on its new sidecar" tail of
+    /// [`Self::ensure_session_resumable`] and [`Self::handle_fork`]: notification
+    /// consumer + exit-watcher + insert, built from the caller-resolved settings
+    /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
+    /// AROUND this insert (watcher ownership of the child, lease completion in
+    /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn register_live_session(
+        &self,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        ownership_id: String,
+        child: tokio::process::Child,
+        model: String,
+        effort: Option<String>,
+        cwd: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+    ) -> Arc<StdMutex<Option<String>>> {
+        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let exited = Arc::new(AtomicBool::new(false));
+        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id,
+            thread_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+            Arc::clone(&self.leases),
+        );
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                client,
+                model,
+                effort,
+                cwd,
+                sandbox,
+                permission_mode,
+                active_turn: active_turn.clone(),
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+                exited,
+            },
+        );
+        active_turn
     }
 
     /// Fast-path lookup: is `thread_id` already tracked (created, or previously resumed by
@@ -3502,6 +3803,57 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
     })
+}
+
+/// The nested `freshAgent.event{freshAgent.error{code:'INTERNAL_ERROR'}}` envelope every
+/// codex fork failure rides on (approval-respond run, Task 6): delivered on the REQUESTING
+/// connection's sink (never silence for a user action — the Fork click's pane banner gets
+/// the message text), keyed to the PARENT session id the fork was clicked on.
+fn fork_error_frame(session_id: &str, message: &str) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": "INTERNAL_ERROR",
+            "message": message,
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: SESSION_TYPE.to_string(),
+    })
+}
+
+/// Tear down a fork-child sidecar whose registration never completed (close the client,
+/// kill the child, sweep by ownership id) — the same teardown `ensure_session_resumable`
+/// runs on its resume failure paths.
+async fn shut_down_fork_child(
+    client: &CodexAppServerClient,
+    child: &mut tokio::process::Child,
+    ownership_id: &str,
+) {
+    client.close().await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    reap_owned_codex_sidecars(ownership_id);
+}
+
+/// Codex fork's `lastTurnId` normalization (fresh-eyes round-3 F6): the REST snapshot
+/// renders synthetic SPLIT turn ids of the form `{raw_turn_id}:row-{index}`
+/// (`build_codex_turn_json`), but `thread/fork` expects the RAW provider turn id —
+/// strip exactly ONE trailing `:row-<digits>` suffix; a non-split id passes VERBATIM.
+fn strip_codex_row_suffix(turn_id: &str) -> &str {
+    let Some(idx) = turn_id.rfind(':') else {
+        return turn_id;
+    };
+    let (head, tail) = turn_id.split_at(idx);
+    let Some(digits) = tail[1..].strip_prefix("row-") else {
+        return turn_id;
+    };
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        head
+    } else {
+        turn_id
+    }
 }
 
 // ── PATCH /api/settings (fresh-clients enable toggle) ────────────────────────
@@ -4815,6 +5167,695 @@ pub(crate) mod tests {
                 .contains("codex session not found"),
             "{frame}"
         );
+    }
+
+    // ── freshAgent.fork (AGENT-07, approval-respond Task 6) ────────────────
+
+    fn fork_msg(session_id: &str, request_id: &str, input: Option<Value>) -> FreshAgentFork {
+        FreshAgentFork {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            input,
+            request_id: Some(request_id.to_string()),
+            cwd: None,
+        }
+    }
+
+    /// A `FrameSink` that records every delivered frame — the requesting connection's
+    /// sink the fork handler answers on (`conn_sink` in terminal.rs).
+    fn capturing_sink() -> (
+        freshell_terminal::FrameSink,
+        Arc<StdMutex<Vec<ServerMessage>>>,
+    ) {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let sink: freshell_terminal::FrameSink = {
+            let captured = captured.clone();
+            Arc::new(move |msg| captured.lock().expect("captured mutex").push(msg))
+        };
+        (sink, captured)
+    }
+
+    fn captured_frames(captured: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<Value> {
+        captured
+            .lock()
+            .expect("captured mutex")
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("frame serializes"))
+            .collect()
+    }
+
+    fn assert_single_fork_error_frame(
+        frames: &[Value],
+        session_id: &str,
+        code: &str,
+        message_fragment: &str,
+    ) {
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let frame = &frames[0];
+        assert_eq!(frame["type"], "freshAgent.event", "{frame}");
+        assert_eq!(frame["provider"], "codex", "{frame}");
+        assert_eq!(frame["sessionType"], "freshcodex", "{frame}");
+        assert_eq!(frame["sessionId"], session_id, "{frame}");
+        assert_eq!(frame["event"]["type"], "freshAgent.error", "{frame}");
+        assert_eq!(frame["event"]["code"], code, "{frame}");
+        assert!(
+            frame["event"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message_fragment),
+            "sink error must carry the failing step's text ({message_fragment}): {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_unknown_parent_replies_the_lost_session_shape_on_the_sink() {
+        let (st, _rx_boot) = state_with_bus();
+        let (sink, captured) = capturing_sink();
+
+        st.handle_fork(fork_msg("does-not-exist", "fork-req-x", None), sink)
+            .await;
+
+        // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
+        // answers the same lost-session code ON THE REQUESTING CONNECTION so the
+        // client's recovery path engages (never silence, never the refusal table).
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "does-not-exist",
+            "INVALID_SESSION_ID",
+            "codex session does-not-exist not found",
+        );
+        assert!(
+            st.sessions.lock().await.is_empty(),
+            "no fork machinery ran for an unknown parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_rpc_error_replies_on_the_sink_without_archiving_or_spawning() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-fork-err",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-err",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-fork-err", "fork-req-e", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["threadId"], json!("parent-fork-err"));
+        // The PROBED empty-parent rejection (0.147.0 real binary).
+        peer.respond_error(&id, -32600, "no rollout found for thread id");
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-fork-err",
+            "INTERNAL_ERROR",
+            "no rollout found for thread id",
+        );
+
+        // A failed fork changes NO state: no archive RPC follows, no child registers.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a failed thread/fork must produce NO archive call"
+        );
+        assert!(
+            st.sessions.lock().await.len() == 1,
+            "only the parent remains registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_archive_failure_replies_on_the_sink_and_never_spawns() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-arch-err",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-arch-err",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-arch-err", "fork-req-a", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-arch-err" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-arch-err"));
+        peer.respond_error(&id, -32000, "archive denied");
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-arch-err",
+            "INTERNAL_ERROR",
+            "archive denied",
+        );
+
+        // The child stays attached to the PARENT connection (an archive failure is
+        // pre-handoff, so there is nothing to restore): nothing further crosses the
+        // wire and no child registers.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a failed thread/archive must produce NO unarchive/spawn"
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_malformed_fork_result_replies_and_never_archives() {
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-malformed",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-malformed",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-malformed", "fork-req-m", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        // A pathological 200 without a usable thread.id must NEVER be registered or
+        // repointed at (same guard class as the opencode malformed-child-id pin).
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-malformed",
+            "INTERNAL_ERROR",
+            "malformed",
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a malformed fork result must produce NO archive call"
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_builds_params_from_parent_settings_input_overrides_and_strips_row_suffix()
+    {
+        // Case A+B share a parent with EVERY setting stored; case C is bare defaults.
+        for (case, overrides, expected) in [
+            (
+                "A",
+                Some(
+                    json!({ "cwd": "/override/cwd", "model": "override-model", "atTurnId": "turn-42:row-2" }),
+                ),
+                ("/override/cwd", "override-model", Some("turn-42")),
+            ),
+            (
+                "B",
+                Some(json!({ "atTurnId": "turn-9:row-0" })),
+                ("/stored/cwd", "stored-model", Some("turn-9")),
+            ),
+        ] {
+            let (st, _rx_boot) = state_with_bus();
+            let (transport, peer) = freshell_codex::new_channel_transport();
+            let (client, _notifs) = CodexAppServerClient::connect(transport);
+            insert_fake_session(
+                &st,
+                "parent-params",
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                spawn_sleeper(),
+                "codex-sidecar-test-fork-params",
+            )
+            .await;
+            {
+                let mut guard = st.sessions.lock().await;
+                let s = guard.get_mut("parent-params").expect("parent session");
+                s.model = "stored-model".to_string();
+                s.cwd = Some("/stored/cwd".to_string());
+                s.sandbox = Some("workspace-write".to_string());
+                s.permission_mode = Some("on-request".to_string());
+                s.effort = Some("high".to_string());
+            }
+
+            let (sink, captured) = capturing_sink();
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.handle_fork(fork_msg("parent-params", "fork-req-p", overrides), sink)
+                        .await;
+                })
+            };
+
+            answer_initialize(&peer).await;
+            let (id, method, params) = peer.expect_request().await;
+            assert_eq!(method, "thread/fork", "case {case}");
+            let (exp_cwd, exp_model, exp_last_turn) = expected;
+            assert_eq!(params["threadId"], json!("parent-params"), "case {case}");
+            assert_eq!(params["cwd"], json!(exp_cwd), "case {case} cwd");
+            assert_eq!(params["model"], json!(exp_model), "case {case} model");
+            assert_eq!(
+                params["sandbox"],
+                json!("workspace-write"),
+                "case {case}: parent sandbox flows verbatim"
+            );
+            assert_eq!(
+                params["approvalPolicy"],
+                json!("on-request"),
+                "case {case}: parent permissionMode flows verbatim"
+            );
+            match exp_last_turn {
+                Some(raw) => assert_eq!(
+                    params["lastTurnId"],
+                    json!(raw),
+                    "case {case}: atTurnId normalizes to the raw provider turn id"
+                ),
+                None => assert!(
+                    params.get("lastTurnId").is_none(),
+                    "case {case}: no atTurnId → no lastTurnId"
+                ),
+            }
+            assert!(
+                params.get("excludeTurns").is_none(),
+                "case {case}: excludeTurns is removed from 0.147.0, never sent"
+            );
+            let obj = params.as_object().expect("params object");
+            assert_eq!(obj.len(), 6, "case {case} exact key set: {params}");
+            // Stop the flow AFTER the params probe: a fork RPC error ends it cleanly.
+            peer.respond_error(&id, -32000, "stop after param probe");
+            driver.await.expect("fork task");
+            assert_single_fork_error_frame(
+                &captured_frames(&captured),
+                "parent-params",
+                "INTERNAL_ERROR",
+                "stop after param probe",
+            );
+        }
+
+        // Case C: bare stored defaults + no input → only {threadId, model} cross the wire.
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-bare",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-bare",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-bare", "fork-req-c", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        let obj = params.as_object().expect("params object");
+        assert_eq!(
+            obj.len(),
+            2,
+            "defaults + no input → {{threadId, model}} ONLY: {params}"
+        );
+        assert_eq!(params["threadId"], json!("parent-bare"));
+        assert_eq!(params["model"], json!("gpt-5.3-codex-spark"));
+        peer.respond_error(&id, -32000, "stop after param probe");
+        driver.await.expect("fork task");
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-bare",
+            "INTERNAL_ERROR",
+            "stop after param probe",
+        );
+    }
+
+    #[test]
+    fn codex_fork_last_turn_id_strips_exactly_one_trailing_row_suffix() {
+        // The snapshot surface renders synthetic split turn ids `{raw}:row-{index}`
+        // (`build_codex_turn_json`, round-3 F6); codex expects the RAW provider turn id.
+        assert_eq!(strip_codex_row_suffix("turn-1:row-2"), "turn-1");
+        assert_eq!(strip_codex_row_suffix("turn-9:row-0"), "turn-9");
+        // A non-split id passes VERBATIM — including lookalikes.
+        assert_eq!(strip_codex_row_suffix("turn-9"), "turn-9");
+        assert_eq!(strip_codex_row_suffix("turn-1:row-"), "turn-1:row-");
+        assert_eq!(strip_codex_row_suffix("turn-1:row-x"), "turn-1:row-x");
+        assert_eq!(strip_codex_row_suffix("raw:row-12"), "raw");
+    }
+
+    #[tokio::test]
+    async fn handle_fork_child_spawn_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(
+            "CODEX_CMD",
+            "definitely-missing-codex-binary-freshell-fork-test",
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-spawn-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-spawn-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-spawn-fail", "fork-req-s", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-spawn-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-spawn-fail"));
+        peer.respond(&id, json!({}));
+
+        // Post-archive containment (fresh-eyes F6): the spawn failure replies on the
+        // sink AND best-effort unarchives the child on the PARENT client, restoring the
+        // child's original visibility (post-owner-exit resume stays possible).
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-spawn-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-spawn-fail",
+            "INTERNAL_ERROR",
+            "spawn failed",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_unarchive_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/unarchive": { "error": { "code": -32000, "message": "unarchive kaput" } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-ua-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-ua-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-ua-fail", "fork-req-u", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-ua-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-ua-fail"));
+        peer.respond(&id, json!({}));
+
+        // The child sidecar (a REAL scripted fake) spawns and its thread/unarchive
+        // fails — containment: sink error with the step text + the parent's
+        // best-effort unarchive of the child.
+        let (id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), peer.expect_request())
+                .await
+                .expect("the best-effort parent unarchive arrives");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-ua-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-ua-fail",
+            "INTERNAL_ERROR",
+            "unarchive kaput",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_resume_failure_replies_and_best_effort_unarchives_the_child() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": { "error": { "code": -32600, "message": "resume kaput" } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-resume-fail",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-resume-fail",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(fork_msg("parent-resume-fail", "fork-req-r", None), sink)
+                    .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-resume-fail" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-resume-fail"));
+        peer.respond(&id, json!({}));
+
+        // Child sidecar spawns, unarchive succeeds, thread/resume fails → containment.
+        let (id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), peer.expect_request())
+                .await
+                .expect("the best-effort parent unarchive arrives");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!("child-resume-fail"));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            "parent-resume-fail",
+            "INTERNAL_ERROR",
+            "resume kaput",
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_threads_fork_archive_then_child_unarchive_resume_across_two_sidecars_and_replies_forked(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "freshell-fork-oplog-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-thread-1" } } }
+                },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session(&st, &mut rx).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-1", None), sink)
+            .await;
+
+        // The exact `freshAgent.forked` reply — every field, request_id echoed (the
+        // client matches on requestId + parentSessionId to repoint the pane).
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        let forked = &frames[0];
+        assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+        assert_eq!(forked["requestId"], json!("fork-req-1"), "{forked}");
+        assert_eq!(forked["parentSessionId"], json!(parent_id), "{forked}");
+        assert_eq!(forked["sessionId"], json!("child-thread-1"), "{forked}");
+        assert_eq!(forked["sessionType"], json!("freshcodex"), "{forked}");
+        assert_eq!(forked["provider"], json!("codex"), "{forked}");
+        assert_eq!(forked["runtimeProvider"], json!("codex"), "{forked}");
+        assert_eq!(
+            forked["sessionRef"],
+            json!({ "provider": "codex", "sessionId": "child-thread-1" }),
+            "{forked}"
+        );
+
+        // The child is registered on its OWN sidecar (one-thread-per-sidecar
+        // invariant), inheriting the parent's stored settings verbatim.
+        let (child_settings, parent_settings) = {
+            let guard = st.sessions.lock().await;
+            let child = guard
+                .get("child-thread-1")
+                .expect("the child session is registered");
+            let parent = guard.get(&parent_id).expect("the parent session stays");
+            (
+                (
+                    child.model.clone(),
+                    child.effort.clone(),
+                    child.cwd.clone(),
+                    child.sandbox.clone(),
+                    child.permission_mode.clone(),
+                ),
+                (
+                    parent.model.clone(),
+                    parent.effort.clone(),
+                    parent.cwd.clone(),
+                    parent.sandbox.clone(),
+                    parent.permission_mode.clone(),
+                ),
+            )
+        };
+        assert_eq!(
+            child_settings, parent_settings,
+            "the child inherits the parent's stored settings verbatim"
+        );
+
+        // P1.13: a binding row durable-before-answer for the child.
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-thread-1")
+            .expect("a binding row for the child");
+        assert_eq!(row.provider, "codex");
+        assert_eq!(row.mode, "freshcodex");
+        assert_eq!(row.create_request_id, None, "fork is not a create");
+        drop(bindings);
+
+        // RPC call order, per connection (the op log tags every thread/* call with
+        // its process's listenUrl): parent = thread/start → thread/fork →
+        // thread/archive; child (spawn #2) = thread/unarchive → thread/resume.
+        let log_text = std::fs::read_to_string(&log_path).expect("the op log exists");
+        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for line in log_text.lines() {
+            let entry: Value = serde_json::from_str(line).expect("op log line parses");
+            by_url
+                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
+                .or_default()
+                .push(entry["method"].as_str().expect("method").to_string());
+        }
+        assert_eq!(
+            by_url.len(),
+            2,
+            "exactly two sidecar connections (parent + one child spawn): {log_text}"
+        );
+        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
+        sequences.sort();
+        assert_eq!(
+            sequences[0],
+            vec!["thread/start", "thread/fork", "thread/archive"],
+            "the parent connection's RPC order: {log_text}"
+        );
+        assert_eq!(
+            sequences[1],
+            vec!["thread/unarchive", "thread/resume"],
+            "the child sidecar's RPC order (the archive→unarchive→resume handoff): {log_text}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
     }
 
     #[tokio::test]

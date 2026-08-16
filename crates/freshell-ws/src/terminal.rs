@@ -1065,21 +1065,28 @@ async fn handle_client_text(
             }
             true
         }
-        // Task 5 (approval-respond run) added the opencode fork arm. Fork is a
-        // request/response op — the handler answers `freshAgent.forked` (or a failure
-        // `freshAgent.error`, e.g. INVALID_SESSION_ID / INTERNAL_ERROR) ON THE
-        // REQUESTING CONNECTION (`conn_sink`, same shape as `create_gate.rs`'s
-        // `CreateOutput::Channel(&sink)`), so a Fork click never dies silently. The
-        // refusal table already answered the remaining unsupported cells (claude
-        // permanently, codex until Task 6, amplifier unconditionally), so only the
-        // opencode provider reaches this arm. Detached task, same shape as the
-        // FreshAgentCompact arm (the serve POST never blocks the select loop).
+        // Task 5 (approval-respond run) added the opencode fork arm; Task 6 added the
+        // codex fork arm. Fork is a request/response op — the handler answers
+        // `freshAgent.forked` (or a failure `freshAgent.error`, e.g.
+        // INVALID_SESSION_ID / INTERNAL_ERROR) ON THE REQUESTING CONNECTION
+        // (`conn_sink`, same shape as `create_gate.rs`'s `CreateOutput::Channel(&sink)`),
+        // so a Fork click never dies silently. The refusal table already answered the
+        // remaining unsupported cells (claude permanently, amplifier unconditionally).
+        // Detached task, same shape as the FreshAgentCompact arm (the fork RPC chain
+        // never blocks the select loop).
         ClientMessage::FreshAgentFork(fork) => {
             if fork.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
                     async move { fresh_opencode.handle_fork(fork, conn_sink).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else if is_codex_provider(fork.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_fork(fork, conn_sink).await }
                         .instrument(tracing::Span::current()),
                 );
             }
@@ -4695,9 +4702,9 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
 /// `"Fork is …"`, `"Compact is …"`): approvals/questions are claude-only, fork is
-/// refused for claude (permanently — the claude path has no fork), for codex (its
-/// Task 6 arm lands later), and for amplifier (always); the opencode fork arm landed
-/// in Task 5. Compact is refused ONLY for amplifier (every other provider has a real
+/// refused for claude (permanently — the claude path has no fork) and amplifier
+/// (always); the opencode fork arm landed in Task 5 and the codex arm in Task 6.
+/// Compact is refused ONLY for amplifier (every other provider has a real
 /// arm since Task 4). There is no amplifier
 /// FRESH-AGENT runtime at all, so the amplifier x op cells are unconditional
 /// refusals. Every other combo returns `None` and routes to a real dispatch arm. The
@@ -4720,11 +4727,11 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
             m.session_id.as_str(),
             m.session_type,
         ),
-        // Fork has NO claude arm (permanent — capabilities fork:false); the opencode
-        // arm landed in Task 5 and codex's lands in Task 6 — until then the claude,
-        // codex, and amplifier cells are refused here.
+        // Fork has NO claude arm (permanent — capabilities fork:false) and there is
+        // no amplifier fresh-agent runtime at all; the opencode arm landed in Task 5
+        // and codex's in Task 6, so only the claude + amplifier cells refuse here.
         ClientMessage::FreshAgentFork(m) => (
-            m.provider != AgentProvider::Opencode,
+            matches!(m.provider, AgentProvider::Claude | AgentProvider::Amplifier),
             "Fork is",
             m.provider,
             m.session_id.as_str(),
