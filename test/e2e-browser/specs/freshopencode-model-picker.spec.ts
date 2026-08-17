@@ -149,16 +149,23 @@ async function routeFileApis(page: Page, cwd: string): Promise<void> {
   })
 }
 
-/** Create a freshopencode pane through the picker (network effects suppressed)
- * and hand it an idle session id so the composer becomes usable. */
+/** Create a freshopencode pane through the picker and hand it an idle session
+ * id so the composer becomes usable. Sweeping caveat: the picker pane is
+ * REPLACED by the real fresh-agent pane with a NEW pane id on selection, so
+ * both the suppression flag and the idle-session handoff must target the
+ * post-creation active pane (state.panes.activePane[tabId]), never an id
+ * captured from the picker DOM (same pattern as fresh-agent.spec.ts).
+ */
 async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
+  // Suppress ALL fresh-agent network effects BEFORE the pane exists: creation
+  // fires its session-create effect immediately, and a per-pane flag set after
+  // the fact races it — livelocked as "Fresh clients are disabled" (server
+  // rejection of the unsuppressed request) followed by a stuck `ended` state.
+  await page.evaluate(() => {
+    window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true)
+  })
   const picker = await openPanePicker(page)
   await expect(picker.getByRole('button', { name: /^Freshopencode$/i })).toBeVisible({ timeout: 10_000 })
-  const targetPaneId = await picker.getAttribute('data-pane-id')
-  expect(targetPaneId).toBeTruthy()
-  await page.evaluate((paneId) => {
-    window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
-  }, targetPaneId!)
   await picker.getByRole('button', { name: /^Freshopencode$/i }).click({ force: true })
   const directoryInput = page.getByLabel(/^Starting directory for Freshopencode$/i)
   await expect(directoryInput).toBeVisible({ timeout: 15_000 })
@@ -166,28 +173,43 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
   await directoryInput.press('Enter')
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
 
-  await page.evaluate((paneId) => {
+  await page.evaluate(() => {
     const harness = window.__FRESHELL_TEST_HARNESS__
-    if (!harness || !paneId) return
-    const panes = harness.getState().panes
-    const tabId = Object.keys(panes.layouts).find((key) => JSON.stringify(panes.layouts[key]).includes(paneId))
+    if (!harness) return
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId as string | undefined
     if (!tabId) return
-    const layout = panes.layouts[tabId]
-    if (layout?.type !== 'leaf' || layout.content?.kind !== 'fresh-agent') return
+    // The tab may be a SPLIT (terminal + fresh pane), so the top layout node is
+    // a 'split' — walk the tree for the fresh-agent leaf rather than assuming
+    // the root is a leaf.
+    type LayoutNode = { id: string; type: string; content?: { kind?: string }; children?: LayoutNode[] }
+    const findFreshLeaf = (node: LayoutNode | undefined): LayoutNode | undefined => {
+      if (!node) return undefined
+      if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+      for (const child of node.children ?? []) {
+        const found = findFreshLeaf(child)
+        if (found) return found
+      }
+      return undefined
+    }
+    const leaf = findFreshLeaf(state.panes.layouts[tabId] as LayoutNode | undefined)
+    if (!leaf) return
     harness.dispatch({
       type: 'panes/updatePaneContent',
       payload: {
         tabId,
-        paneId,
-        content: { ...layout.content, sessionId: 'ses_e2e', status: 'idle' },
+        paneId: leaf.id,
+        content: { ...leaf.content, sessionId: 'ses_e2e', status: 'idle' },
       },
     })
-  }, targetPaneId)
+  })
 }
 
 async function openFreshAgentSettings(page: Page) {
   const pane = page.getByRole('group').filter({
-    has: page.getByText('Freshopencode', { exact: true }),
+    // The pane banner badge renders the provider lowercase ("freshopencode");
+    // fresh-agent.spec.ts's identical helper filters on providerName.toLowerCase().
+    has: page.getByText('freshopencode', { exact: true }),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 

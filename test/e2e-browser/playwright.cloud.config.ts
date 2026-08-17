@@ -29,8 +29,9 @@ import baseConfig from './playwright.config.js'
 // rendering/timing that differs in cloud.
 const CLOUD_SKIP_SPECS = [
   // Requires opencode binary
+  // (freshopencode-model-picker.spec.ts is cloud-legal: every fetch is routed
+  // and the sidecar is suppressed via the test harness, so it needs no binary)
   'freshopencode-db-history.spec.ts',
-  'freshopencode-model-picker.spec.ts',
   'freshopencode-restart-recovery.spec.ts',
   'freshopencode-first-send-reload-repro.spec.ts',
   'opencode-restart-recovery.spec.ts',
