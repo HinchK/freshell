@@ -180,6 +180,8 @@ npm run test:e2e:cloud      # Force cloud
 
 **If `FRESHELL_E2E_BACKEND` is not set, ask the user which way to set it** before running e2e tests. Explain that cloud is much faster (parallel shards, ~2-3 min vs ~28 min) but is a paid Google Cloud service (~$0.03/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
 
+**Before filing any PR, ensure the affected e2e specs actually pass on the configured `FRESHELL_E2E_BACKEND` backend** — a spec sitting in `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`) or a filter that matched no tests is not coverage.
+
 ## Architecture
 
 ### Tech Stack
