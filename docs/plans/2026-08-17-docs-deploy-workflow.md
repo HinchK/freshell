@@ -114,7 +114,7 @@ Every input mirrors the observed legacy invocation (checkout fetch-depth 1; arti
 
 Run: `/tmp/actionlint-dl/actionlint /home/dan/code/freshell/.worktrees/docs-deploy-workflow/.github/workflows/docs-pages-deploy.yml`
 
-Expected: PASS (no output, exit 0). actionlint validates syntax, event/trigger semantics, permissions values, the `environment.url` expression, and every input name against the actions' published `action.yml` schemas.
+Expected: PASS (no output, exit 0). actionlint 1.7.12 validates workflow syntax, event/trigger semantics, the `permissions` values, the `environment.url` expression, and inputs for actions in its embedded popular-action database (which covers `actions/checkout` and `actions/deploy-pages@v5`). It does NOT cover `actions/upload-pages-artifact`, so its three inputs (`path`, `name`, `retention-days`) rest on separate evidence: they are byte-identical to the inputs observed in the live legacy pipeline's own `upload-pages-artifact@v3` invocation (run 32056407228 logs, Stage 1 exploration report) and match the action.yml input names at `v3` (checked in both Stage 2 and plan review rounds).
 
 - [ ] **Step 4: Refactor while green**
 
@@ -146,18 +146,17 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
    `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow -f cname=freshell.net -F https_enforced=true`
 3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
-5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, and recovery is verified against the exact build that was requested (Fresh Eyes rounds 1–2 findings):
-   a. Disable the repo-owned workflow and stop its outstanding runs, so no queued or in-flight Actions deployment can fire after the source flips back (the deploy-pages security contract may permit Actions-originated deployments to a source-branch site from an allowed branch — do not rely on it failing):
+5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, cancellation is awaited to terminal state (GitHub returns only `202 Accepted` from `gh run cancel`), and recovery is verified against the exact requested build (Fresh Eyes rounds 1–3 findings):
+   a. Disable the repo-owned workflow and cancel its outstanding runs across ALL nonterminal statuses (not just `queued`/`in_progress` — also `requested`, `waiting`, `pending`):
       `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
-      `gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --status queued --json databaseId --jq '.[].databaseId' | xargs -r gh run cancel -R danshapiro/freshell`
-      `gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --status in_progress --json databaseId --jq '.[].databaseId' | xargs -r gh run cancel -R danshapiro/freshell`
+      `for s in queued in_progress requested waiting pending; do gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --status "$s" --json databaseId --jq '.[].databaseId'; done | xargs -r -n1 gh run cancel -R danshapiro/freshell`
+      Then AWAIT terminal state for every cancelled run before flipping anything — poll each run until `gh run view -R danshapiro/freshell <id> --json status --jq .status` reports `completed` or `cancelled` (cancellation normally settles in seconds; the 30s deploy step cannot still be mid-flight after the run is terminal). Do not proceed to b while any run of this workflow is in a nonterminal state.
    b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
       `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
-   c. Record the source tip and explicitly request a legacy build of it (config updates and build requests are separate operations; only `POST /pages/builds` queues a legacy build):
-      `MAIN_SHA=$(gh api repos/danshapiro/freshell/branches/main --jq .commit.sha)`
-      `gh api -X POST repos/danshapiro/freshell/pages/builds`
-   d. Verify recovery against THAT build — the site-wide `/pages` status can describe an older deployment and is insufficient: poll `gh api repos/danshapiro/freshell/pages/builds/latest --jq '{commit,status}'` until `commit` equals `$MAIN_SHA` and `status` is `built` (legacy builds take ~30s). If `status` becomes `errored`, abort and report; do not declare rollback complete.
-   e. Confirm the site serves: `curl -sI https://freshell.net/` returns 200.
+   c. Request a legacy build and correlate recovery to the current source tip with movement detection (a bare `/pages/builds/latest` read can describe a stale or superseded build):
+      1. `gh api -X POST repos/danshapiro/freshell/pages/builds` (queues a build of the current source-branch tip)
+      2. loop until success: read `TIP=$(gh api repos/danshapiro/freshell/branches/main --jq .commit.sha)` and `BUILD=$(gh api repos/danshapiro/freshell/pages/builds/latest --jq '{commit,status}')`. Success requires `BUILD.commit == $TIP` and `BUILD.status == 'built'`. If `BUILD.status == 'errored'`, abort and report — do not declare rollback complete. If `main` advanced past the built commit (i.e. `BUILD.commit != $TIP` while a new push landed), `POST /pages/builds` again and continue polling.
+   d. Confirm the site serves: `curl -sI https://freshell.net/` returns 200.
 
 ## Parity notes (what "replicate the existing experience" means, exactly)
 
