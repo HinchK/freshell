@@ -1139,7 +1139,7 @@ impl SessionIndex {
                 // roots and deleted sessions are discovered.
                 if require_fresh {
                     let last = self.last_full_at.lock().unwrap();
-                    if last.map_or(true, |at| at.elapsed() >= self.ttl) {
+                    if last.is_none_or(|at| at.elapsed() >= self.ttl) {
                         return None;
                     }
                 }
@@ -1217,6 +1217,7 @@ impl SessionIndex {
     /// any `&SessionIndex` borrow -- every input is an owned `Arc`/value --
     /// so it runs identically whether awaited inline (cold start) or inside
     /// a detached `tokio::spawn` (warm, stale-while-revalidate refresh).
+    #[allow(clippy::too_many_arguments)]
     async fn perform_refresh(
         sources: Vec<Arc<dyn SessionSource>>,
         file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
@@ -1236,7 +1237,7 @@ impl SessionIndex {
         let force_full = {
             let snapshot_exists = snapshot.lock().unwrap().is_some();
             let last = *last_full_at.lock().unwrap();
-            !snapshot_exists || last.map_or(true, |at| at.elapsed() >= ttl)
+            !snapshot_exists || last.is_none_or(|at| at.elapsed() >= ttl)
         };
 
         let sweep_result = tokio::task::spawn_blocking({
@@ -1329,7 +1330,7 @@ impl SessionIndex {
             *last_full_at.lock().unwrap() = Some(Instant::now());
         }
         if changed > 0 {
-            let _ = change_tx.send_modify(|gen| *gen += 1);
+            change_tx.send_modify(|gen| *gen += 1);
         }
         // Opportunistic persistence: gated (threshold/debounce) and, when
         // warranted, saved via a DETACHED task -- never awaited here, so
