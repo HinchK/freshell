@@ -1294,11 +1294,13 @@ fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
 }
 ```
 
+Add the ordering pin alongside the flip, in claude.rs's `#[cfg(test)]` mod: a direct-call unit test named `attach_durable_id_prefers_session_ref_over_legacy` covering (i) both carriers set with DIFFERENT canonical UUIDs → returns the sessionRef's id, (ii) sessionRef-only → its id, (iii) legacy-only → its id (test-compat lane), (iv) neither → None. Use canonical-UUID shapes (e.g. `11111111-2222-4333-8444-555555555555` / `aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`) — the helper's `is_canonical_claude_uuid` gate rejects anything else. Red evidence: against the pre-flip legacy-first ordering, case (i) returns the legacy id and fails.
+
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-ws --test freshagent_claude_attach legacy_reject_freshagent_attach && cargo test -p freshell-ws --test freshagent_session_lease legacy_reject_freshagent_create && cargo test -p freshell-ws --test cross_kind_liveness freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session && cargo test -p freshell-freshagent attach_durable_id`
+Run: `cargo test -p freshell-ws --test freshagent_claude_attach legacy_reject_freshagent_attach && cargo test -p freshell-ws --test freshagent_session_lease legacy_reject_freshagent_create && cargo test -p freshell-ws --test cross_kind_liveness freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session && cargo test -p freshell-freshagent attach_durable_id && cargo test -p freshell-freshagent attach_untracked_without_any_durable_id_still_emits_lost_frame && cargo test -p freshell-freshagent concurrent_attaches_for_the_same_durable_id_spawn_at_most_one_sidecar && cargo test -p freshell-freshagent attach_with_durable_id_already_indexed_rebinds_and_acks`
 
-Expected: PASS
+Expected: PASS. The `attach_durable_id` filter selects the Step-3 ordering pin (`attach_durable_id_prefers_session_ref_over_legacy`) — bare helper-name filters match zero pre-existing tests, so the three durable-id attach tests are invoked by their real names to exercise the changed sessionRef-first selection through the handler.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -2571,15 +2573,21 @@ If Step 2 found sweep violations that required fixes, commit those fixes first. 
 Then — the kata/User-Request contract requires BOTH servers' rejections (+ the reconcile client promotion, codingcli promotion, and rejection tests) to LAND TOGETHER, not as a sequence of partially-rejecting main-history commits. Task-sequenced commits 5–12 are correct locally for review/TDD, but before the PR opens, squash them into ONE behavior commit. Do it with a soft reset (the branch is unpushed during execution):
 
 ```bash
-# Find the first behavior commit (Task 5's) — tasks 1-4 are contract-neutral
-# prep and stay separate:
-BEHAVIOR_BASE=$(git rev-list --max-parents=0 --no-merges HEAD -- server/ crates/ | tail -n +1 >/dev/null; git log --oneline --reverse origin/main..HEAD | awk '/ejh6.*Rust REST reject/{print $1; exit}')
-git reset --soft "${BEHAVIOR_BASE}^"
+# The behavior base is the Task-5 commit. Take its SHA from the progress
+# ledger entry recorded at Task 5 completion ("Task 5: complete — impl
+# <task5-sha> ...") — do NOT grep commit subjects for it. Tasks 1-4 are
+# contract-neutral prep and stay separate.
+TASK5_SHA=<task5-sha-from-ledger>
+# Verify BEFORE resetting: this range must list exactly the behavior-task
+# commits (Tasks 5-12) — the oldest entry carries Task 5's subject ("feat(ejh6):
+# Rust REST door-top presence reject ...") and no prep-task commit appears:
+git log --format='%H %s' "${TASK5_SHA}^..HEAD"
+git reset --soft "${TASK5_SHA}^"
 git commit -m "feat(ejh6): reject the legacy resumeSessionId wire field on every create-class door (both servers)"
 git rebase origin/main # keep current-base lineage clean; plan docs/commits 1-4 are already behind
 ```
 
-(Harness note: capture the Task-5 commit SHA in the progress ledger at Task 5 completion and use it directly rather than re-deriving with the awk above. If the squash reveals a mixed file staged from a prep task, unstage and recommit it separately — the verification gate already ran before this step.)
+(Harness note: the Task-5 commit SHA captured in the progress ledger at Task 5 completion is the single source of truth; use it directly rather than re-deriving the base from commit subjects — subject patterns drift and a pattern that matches nothing yields an empty base and a `git reset --soft "^"` abort. If the squash reveals a mixed file staged from a prep task, unstage and recommit it separately — the verification gate already ran before this step.)
 
 ```bash
 # Only if sweep fixes were needed:
