@@ -37,7 +37,7 @@ Implement kata issue ejh6 (revised 2026-08-16 spec: "Remove the legacy resumeSes
 - **Never weaken tests:** never delete a behavior test without a replacement; never mark tests skip; never simplify assertions to get green.
 - **Coordinated runners:** Node tests via `npm run test:vitest -- run <paths> --config <config>` (default config `config/vitest/vitest.config.ts`, server config `config/vitest/vitest.server.config.ts`); Rust via `cargo test -p <crate>` focused, `cargo test --workspace` as gate; `npm run check` (typecheck + coordinated full suite) as final gate.
 - **Rejection mechanism:** handler-level only. Never use `.strict()`/`deny_unknown_fields`/serde field removal as the rejection mechanism (zod non-strict strips silently; `.strict()` rejects with a generic unrecognized-key error that cannot carry the frozen text). The field stays DECLARED in every schema/struct.
-- **Presence-based rejection (coordinator ruling, review finding 2):** rejection is PRESENCE-based, not non-empty. The contract is "any create that CARRIES the field." Rust WS structs reject when `resume_session_id.is_some()` (covers `""`); Rust REST `Value` bodies reject when `body.get("resumeSessionId").is_some()` (any JSON value — string, empty, null, number, object); Node rejects when `m.resumeSessionId !== undefined` / `req.body?.resumeSessionId !== undefined`. Serde `Option<String>` cannot see JSON `null` deserialize-to-`None` — this is an accepted WS edge where the WS schema level is a typed struct (JSON `null` on REST `Value` bodies IS rejected since REST reads raw `Value`). All draft checks and tests must use presence, not `is_some_and(|s| !s.is_empty())` / `isNonEmptyString` / truthiness. Tests must cover `resumeSessionId: ""` on each door plus REST `{resumeSessionId: null}` and `{resumeSessionId: 42}`.
+- **Presence-based rejection (coordinator ruling, review findings 2+8+T6-redesign):** rejection is PRESENCE-based, not non-empty. The contract is "any create that CARRIES the field." **REST doors** (raw `Value`/`req.body`, full presence — string, empty, null, number, object): reject at handler with the frozen text (`body.get("resumeSessionId").is_some()` in Rust; `req.body?.resumeSessionId !== undefined` in Node). **WS doors:** the two servers differ by construction library behavior and both are loud: (i) **Node** — typed `z.string().optional()` fields: any string (incl. `""`) reaches the handler reject (`m.resumeSessionId !== undefined` → frozen text); a non-string (null, 42, object) fails zod parse at the boundary BEFORE the handler and gets `error{INVALID_MESSAGE}` with the parser's generic text (verified `server/ws-handler.ts:1913-1916`) — code loud, text generic, by design (frozen text names the legacy migration for string-typed callers). Tests null/42 pin the CODE on `terminal.create` only. (ii) **Rust** — the typed-struct approach is UNACCEPTABLE there (verified: serde `Option<String>` absorbs JSON `null` into `None` → silent accept; and a non-string value fails the `from_value` parse into the accept-and-strip `else { return true }` arm at `crates/freshell-ws/src/terminal.rs:651` → total silent drop, no terminal, no error). Rust therefore implements a **raw-Value pre-parse guard** in `terminal.rs` dispatch (before the typed `from_value`, before dedupe/restore planning): `value.get("type") ∈ {terminal.create, codingcli.create} + resumeSessionId key present (any JSON value, incl. null) → error INVALID_MESSAGE + frozen text; Task 7 extends the same guard with the freshAgent arms (create.failed envelope / event channel). Rust WS presence is full (any value) with frozen text for all of them; pin cases: `"legacy"`, `""`, `null`, `42` all → INVALID_MESSAGE + frozen text on terminal.create. All draft checks and tests must use presence, not `is_some_and(|s| !s.is_empty())` / `isNonEmptyString` / truthiness.
 - **Door-top REST rejection (coordinator ruling, review finding 3):** REST rejection runs at the TOP of each route handler in BOTH servers, BEFORE any branch (agent/browser/editor/terminal) and BEFORE `layout.split_pane` in the split route. In Node, check `req.body?.resumeSessionId !== undefined` at the top of `POST /tabs`, `POST /panes/:id/split`, `POST /panes/:id/respawn`; `requestedResumeSessionIdForMode` keeps its sessionRef-resolution role but no longer throws (single check at door-top for KISS). In Rust, check `body.get("resumeSessionId").is_some()` at each axum handler entry in `terminal_tabs.rs`/`pane_ops.rs` before any branch or layout mutation. Tests: pane/layout unchanged on rejected split; browser/editor branches also 400.
 - **Section 3c doc comment:** every retained `resumeSessionId`/`resume_session_id` field in a wire schema/struct gets the comment `Retained solely so the handler can detect-and-reject; see kata ejh6.` — EXCEPT `ReconcilePane.resume_session_id` which gets the PERMANENT compat-door comment.
 - **`restoreKey` gating:** blanket REST reject does NOT gate on `restoreKey` — no production producer emits it (verified), so blanket reject regresses nothing live (binding correction A).
@@ -291,7 +291,7 @@ git commit -m "test(ejh6): convert Node WS freshAgent wire-send tests to session
 
 Mechanical conversions. For each site, replace the legacy carrier with the canonical `sessionRef`/`session_ref` carrier. The asserted behavior (registry directory fills, spawn argv, frame assertions, ledger non-mutation) is carrier-agnostic and stays green.
 
-**REST POST bodies in `terminal_tabs.rs` test mod** — each `json!({... "resumeSessionId": "<id>" ...})` becomes `json!({... "sessionRef": {"provider": "<mode>", "sessionId": "<id>"} ...})` where `<mode>` is the `mode` field on the same body. The 10 test fns at `:4490,:4543,:4592,:5824,:5856,:5896,:5936,:5978,:6018,:6060` each get their POST body converted. Example for `create_tab_resume_session_id_flows_to_registry_directory_for_non_codex_mode` (`:4490`, body at `:4504`):
+**REST POST bodies in `terminal_tabs.rs` test mod** — each `json!({... "resumeSessionId": "<id>" ...})` becomes `json!({... "sessionRef": {"provider": "<mode>", "sessionId": "<id>"} ...})` where `<mode>` is the `mode` field on the same body. The 7 test fns at `:4490,:4543,:4592,:5824,:5856,:5896,:6060` each get their POST body converted (review round 2 finding 1: the three EDEV-07 plausibility-negative tests at `:5936,:5978,:6018` are NOT converted here — a sessionRef send bypasses the plausibility branch and would invert their premise on an unmodified server; they route to Task 5 as rejection assertions). Example for `create_tab_resume_session_id_flows_to_registry_directory_for_non_codex_mode` (`:4490`, body at `:4504`):
 
 ```rust
 // BEFORE:
@@ -431,7 +431,7 @@ git commit -m "test(ejh6): convert e2e-browser Rust wire-send tests to sessionRe
 - Modify: `crates/freshell-freshagent/src/lib.rs:1620-1633` (`create_tab` handler — insert door-top presence check BEFORE the agent/browser/editor/terminal branch) and `crates/freshell-freshagent/src/terminal_tabs.rs:117-136` (`requested_resume_session_id_for_mode` — remove the legacy throw; keep sessionRef resolution only; the door-top check is the single rejection point for KISS)
 - Modify: `crates/freshell-freshagent/src/pane_ops.rs:144-149` (`split_pane` handler — insert door-top check BEFORE `resolve_pane_target` and `layout.split_pane` at `:175`, so a rejection returns 400 with NO layout mutation) and `:699-745` (`respawn_pane` handler — insert door-top check BEFORE `spawn_terminal_pane` at `:719`)
 - Modify: `crates/freshell-protocol/src/client_messages.rs:231-235,:409-411,:445,:511,:527` (section 3c doc comments — same as before)
-- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs:6334` (flip from 200 to 400)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs:6334` (`create_tab_with_identity_or_shell_mode_does_not_warn_invariant` — re-carrier the positive amplifier create to sessionRef; see review-round-2 finding 4 restructure in Step 1) and `:5936-6080` (the three EDEV-07 plausibility-negative tests — moved here from Task 3 per review-round-2 finding 1; they become 400-rejection assertions, see Step 1)
 - Modify: `test/e2e-browser/specs/remote-tab-linkage-rust.spec.ts` (finding 6: RE-CARRIER sends to sessionRef, KEEP all ~110 lines of downstream behavior assertions, APPEND one new rejection case; do NOT delete behavior coverage)
 - Modify: `test/e2e-browser/playwright.config.ts:176` (`RUST_ONLY_SPECS` — add `/remote-tab-linkage-rust\.spec\.ts$/`)
 - Test: `crates/freshell-freshagent/src/terminal_tabs.rs` (test mod — add per-mode, dual-carrier, presence-edge, browser/editor rejection tests)
@@ -496,27 +496,73 @@ async fn legacy_reject_rest_create_presence_edge_cases() {
 }
 
 /// ejh6 finding 3: browser/editor branches also 400 when carrying the field.
+/// (review round 2 finding 2: serde_json json! has NO spread syntax — build
+/// the Value with explicit insert.)
 #[tokio::test]
 async fn legacy_reject_rest_browser_editor_branches() {
     let state = state_with_registry();
     let app = crate::router(state);
-    for (label, extra) in [
+    for (label, mut body) in [
         ("browser", json!({"browser": "https://example.com"})),
         ("editor", json!({"editor": "/tmp/file.ts"})),
     ] {
-        let (status, body) = post(
-            app.clone(), "/api/tabs",
-            json!({"resumeSessionId": "legacy", ...extra}),
-            true,
-        ).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} branch must reject: {body}");
+        body.as_object_mut().unwrap().insert("resumeSessionId".into(), json!("legacy"));
+        let (status, resp) = post(app.clone(), "/api/tabs", body, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} branch must reject: {resp}");
+        assert_eq!(resp["message"], json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."));
     }
 }
 ```
 
-Flip the `:6334` test (`create_tab_with_identity_or_shell_mode_does_not_warn_invariant`) — change `assert_eq!(status, StatusCode::OK, ...)` to `assert_eq!(status, StatusCode::BAD_REQUEST, ...)` + frozen text assert.
+Restructure the `:6334` test (`create_tab_with_identity_or_shell_mode_does_not_warn_invariant` — review round 2 finding 4: its remainder unwraps `body["data"]["terminalId"]` and kills it, so a 200→400 flip would panic and silently drop the positive identity/invariant coverage). Instead:
+1. Re-carrier the first create from `"resumeSessionId": "sess-no-warn-1"` to `"sessionRef": {"provider": "amplifier", "sessionId": "sess-no-warn-1"}` — every subsequent assertion (OK status, terminalId, no-warn invariant, kill) stays identical.
+2. The legacy-rejection case for amplifier REST is already covered by `legacy_reject_rest_create_all_modes` above — nothing more to add.
 
-Add to `crates/freshell-freshagent/src/pane_ops_tests.rs` — split test with layout-unchanged assertion (finding 3):
+Route the three EDEV-07 plausibility-negative tests (moved out of Task 3 — review round 2 finding 1) into rejection assertions, replacing the full bodies at `:5936-5983`, `:5985-6024`, and `:6026-6080` (approx; verify the exact fn spans while editing). The pattern for all three — `create_claude_tab_with_non_canonical_resume_id_does_not_synthesize`, `create_amplifier_tab_with_whitespace_resume_id_does_not_synthesize`, `create_opencode_tab_with_non_ses_resume_id_does_not_synthesize` (keep names — they can stay, the "_does_not_synthesize" suffix now reads as "the create is refused"):
+
+```rust
+#[tokio::test]
+async fn create_claude_tab_with_non_canonical_resume_id_does_not_synthesize() {
+    // ejh6: wire-level legacy resumeSessionId is REFUSED at the door — the
+    // implausible-id "no-synthesize/keep" EDEV-07 branch is now wire-
+    // unreachable; the branch stays in production code (content concern,
+    // out of scope for ejh6) with a comment. This test pins the refusal:
+    // 400 + frozen text, and NO ui.command frame is broadcast (no spawn).
+    let argv_file = unique_argv_file("claude-implausible");
+    let state =
+        state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+            "claude", &argv_file,
+        )]));
+    let mut rx = state.broadcast_tx.subscribe();
+    let tmp = std::env::temp_dir();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "mode": "claude",
+            "cwd": tmp.to_string_lossy(),
+            "resumeSessionId": "not-a-canonical-uuid"
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.")
+    );
+    // No spawn -> no ui.command broadcast. subscribe-before-post means any
+    // frame would land in rx; a short timeout proves none arrived.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await.is_err(),
+        "no broadcast frame may arrive for a rejected create"
+    );
+    let _ = std::fs::remove_file(&argv_file);
+}
+```
+(Same shape for the amplifier and opencode twins with their respective argv_file/spec mode names and legacy id strings `"not a plausible id"` / `"foo"`. One-paste exemplar count: write all three fns fully in the edit — do not template them away.)
+
+Add to `crates/freshell-freshagent/src/pane_ops_tests.rs` — split test with layout-unchanged assertion (finding 3; review round 2 finding 3 rulings: `state` is moved by `crate::router(state)`, `LayoutStore` has no `snapshot()`, and `UiSnapshot` lacks `PartialEq` — instead fetch the layout view via the EXISTING `get(router, uri, auth)` helper (`pane_ops_tests.rs:106`) from the before/after `:2302` `list_tabs` route and compare the `["tabs"]` payload — `serde_json::Value` implements `PartialEq`). Per R9, presence-edge values are looped in: string, empty, null, number all 400 with frozen text:
 
 ```rust
 #[tokio::test]
@@ -524,16 +570,26 @@ async fn legacy_reject_split() {
     let state = state_with_registry();
     let app = crate::router(state);
     let (_tab_id, pane_id, _terminal_id) = create_shell_tab(app.clone()).await;
-    let layout_before = state.layout.snapshot();
-    let (status, body) = post(
-        app, &format!("/api/panes/{pane_id}/split"),
-        json!({"direction": "horizontal", "mode": "claude", "resumeSessionId": "legacy-split"}),
-        true,
-    ).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "split legacy reject: {body}");
-    assert_eq!(body["message"], json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."));
-    // Finding 3: layout MUST be unchanged — the door-top check fires BEFORE layout.split_pane.
-    assert_eq!(state.layout.snapshot(), layout_before, "layout must not mutate on a rejected split");
+    for (label, val) in [
+        ("string", json!("legacy-split")),
+        ("empty-string", json!("")),
+        ("null", json!(null)),
+        ("number", json!(42)),
+    ] {
+        let (s1, before) = get(app.clone(), "/api/tabs", true).await;
+        assert_eq!(s1, StatusCode::OK);
+        let (status, body) = post(
+            app.clone(), &format!("/api/panes/{pane_id}/split"),
+            json!({"direction": "horizontal", "mode": "claude", "resumeSessionId": val}),
+            true,
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} split legacy reject: {body}");
+        assert_eq!(body["message"], json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."));
+        let (s2, after) = get(app.clone(), "/api/tabs", true).await;
+        assert_eq!(s2, StatusCode::OK);
+        // Finding 3: layout MUST be unchanged — the door-top check fires BEFORE layout.split_pane.
+        assert_eq!(before["tabs"], after["tabs"], "{label}: layout must not mutate on a rejected split");
+    }
 }
 
 #[tokio::test]
@@ -541,13 +597,20 @@ async fn legacy_reject_respawn() {
     let state = state_with_registry();
     let app = crate::router(state);
     let (_tab_id, pane_id, _terminal_id) = create_shell_tab(app.clone()).await;
-    let (status, body) = post(
-        app, &format!("/api/panes/{pane_id}/respawn"),
-        json!({"mode": "claude", "resumeSessionId": "legacy-respawn"}),
-        true,
-    ).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "respawn legacy reject: {body}");
-    assert_eq!(body["message"], json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."));
+    for (label, val) in [
+        ("string", json!("legacy-respawn")),
+        ("empty-string", json!("")),
+        ("null", json!(null)),
+        ("number", json!(42)),
+    ] {
+        let (status, body) = post(
+            app.clone(), &format!("/api/panes/{pane_id}/respawn"),
+            json!({"mode": "claude", "resumeSessionId": val}),
+            true,
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} respawn legacy reject: {body}");
+        assert_eq!(body["message"], json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."));
+    }
 }
 ```
 
@@ -577,6 +640,8 @@ Run: `cargo test -p freshell-freshagent legacy_reject_`
 Expected: FAIL because the non-codex modes silently accept the legacy field, the browser/editor branches bypass the check entirely, and the split door mutates the layout before reaching `spawn_terminal_pane` — the tests get 200/approx instead of 400, and the layout-unchanged assertion fails.
 
 - [ ] **Step 3: Add the minimal production implementation**
+
+First, imports (review round 2 finding 5 — without these the snippets don't compile): in `crates/freshell-freshagent/src/lib.rs` add `use freshell_protocol::LEGACY_RESUME_IDENTITY_REFUSAL;` alongside the existing `freshell_protocol` use group (mirror terminal_tabs.rs's import); in `crates/freshell-freshagent/src/pane_ops.rs` add the same `use freshell_protocol::LEGACY_RESUME_IDENTITY_REFUSAL;` to its use block.
 
 Add a door-top presence check at the TOP of `create_tab` in `crates/freshell-freshagent/src/lib.rs:1620-1633` (BEFORE the `if agent.is_empty()` branch delegation at `:1632`):
 
@@ -723,6 +788,29 @@ async fn legacy_reject_ws_terminal_create() {
             "cwd": std::env::temp_dir().to_string_lossy(),
             "resumeSessionId": "",
         })),
+        // ejh6 review round 2 finding 8 + T6 raw-guard redesign: Rust WS is
+        // FULL presence — the raw-Value guard sees ANY JSON value, including
+        // null (which serde Option<String> would absorb into None) and
+        // non-strings (which accept-and-strip would silently drop). All get
+        // the frozen text.
+        ("null-presence", "req-blanket-5", json!({
+            "type": "terminal.create", "requestId": "req-blanket-5",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "resumeSessionId": null,
+        })),
+        ("number-presence", "req-blanket-6", json!({
+            "type": "terminal.create", "requestId": "req-blanket-6",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "resumeSessionId": 42,
+        })),
+        ("object-presence", "req-blanket-7", json!({
+            "type": "terminal.create", "requestId": "req-blanket-7",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "resumeSessionId": {"nested": true},
+        })),
     ];
     for (label, req_id, body) in cases {
         send_create(&mut ws, body).await;
@@ -730,7 +818,7 @@ async fn legacy_reject_ws_terminal_create() {
         assert_eq!(err["code"], json!("INVALID_MESSAGE"), "{label}: {err}");
         assert_eq!(
             err["message"],
-            json!("Restore requires sessionId; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
             "{label}: frozen text must be byte-exact: {err}"
         );
     }
@@ -838,6 +926,31 @@ In `crates/freshell-ws/tests/codex_session_ref_resume.rs:363-381` (Phase 3, V5 p
 
 Phase 1/2 sessionRef argv coverage survives (those sends use sessionRef, not legacy). Delete the spawn-argv `resume <raw_id>` pins for Phase 3 (no spawn occurs on a 400).
 
+Pin the codingcli arm of the raw guard (Rust has no codingcli handler, so the guard is the only rejector; add to `crates/freshell-ws/tests/live_session_ref_guard.rs`):
+
+```rust
+/// ejh6: a codingcli.create carrying the legacy field hits the raw-Value
+/// guard with INVALID_MESSAGE + frozen text (Rust has no codingcli handler —
+/// without the guard this silently no-ops; the guard is the loud rejector).
+#[tokio::test]
+async fn legacy_reject_ws_codingcli_create() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+    send_json(&mut ws, &json!({
+        "type": "codingcli.create", "requestId": "req-codingcli-legacy",
+        "prompt": "hi", "provider": "claude",
+        "resumeSessionId": "legacy-codingcli",
+    })).await;
+    let err = expect_refusal_for(&mut ws, "req-codingcli-legacy").await;
+    assert_eq!(err["code"], json!("INVALID_MESSAGE"), "{err}");
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+    );
+}
+```
+(Verify `connect_and_capture_inventory`/`send_json`/`expect_refusal_for` exist in that file's own helper set before pasting — adapt names if the file's harness differs.)
+
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-ws --test live_session_ref_guard legacy_reject_ && cargo test -p freshell-ws --test live_session_ref_guard legacy_resume_session_id_create_is_refused`
@@ -846,32 +959,50 @@ Expected: FAIL because the current scoped gate at `:2441` only rejects restore+n
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Hoist the blanket reject to the EARLIEST post-parse point in the `ClientMessage::TerminalCreate` dispatch arm at `crates/freshell-ws/src/terminal.rs:693` — BEFORE `create_dedupe.begin` at `:699` and BEFORE `spawn_gated_restore_create` at `:735` (finding 4: a restore:true codex carrying legacy must be rejected before any disk-gate planning). Insert at the very top of the `ClientMessage::TerminalCreate(create) =>` arm, before the `match state.create_dedupe.begin(...)` block:
+Insert a raw-Value pre-parse guard in the WS dispatch in `crates/freshell-ws/src/terminal.rs` — review round 2 finding 8 demands the raw layer, because the typed path cannot deliver the contract: serde `Option<String>` absorbs JSON `null` into `None` (silent accept of `resumeSessionId: null`) and a non-string value fails the `from_value` parse into the accept-and-strip `else { return true }` arm at `:651` (total silent drop of `resumeSessionId: 42`). The guard fires BEFORE the typed parse, hence also BEFORE `create_dedupe.begin` (finding 4: duplicate-rid replay gets INVALID_MESSAGE, not cached `terminal.created`) and BEFORE `spawn_gated_restore_create`/`prepare_launch` (restore:true codex carrying legacy rejected before any disk-gate planning). Insert IMMEDIATELY after the `tabs.sync.*` fast-path block (`:638-648`) and before `let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {`:
 
 ```rust
-        ClientMessage::TerminalCreate(create) => {
-            // ejh6 (finding 4): reject the legacy `resume_session_id` wire field
-            // at the EARLIEST post-parse point — BEFORE create_dedupe.begin
-            // (so a duplicate-requestId replay gets INVALID_MESSAGE, not cached
-            // terminal.created) and BEFORE spawn_gated_restore_create /
-            // prepare_launch (so a restore:true codex carrying legacy is
-            // rejected before any disk-gate planning). Presence-based (finding 2):
-            // `is_some()` covers `""` — serde Option<String> cannot see JSON null
-            // deserialize-to-None, an accepted WS edge where the schema level is
-            // a typed struct.
-            if create.resume_session_id.is_some() {
-                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx.clone());
-                return send_create_error(
-                    &mut out,
-                    ErrorCode::InvalidMessage,
-                    LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
-                    &create.request_id,
-                )
-                .await;
+    // ejh6 (review round 2 findings 2/4/8): raw-Value legacy-resume guard.
+    // Reject ANY create-class message carrying a top-level `resumeSessionId`
+    // with ANY JSON value (string, empty, null, number, object) at the raw
+    // layer. The typed structs' Option<String> READS CANNOT DO THIS JOB:
+    // serde absorbs JSON `null` into None (silent accept), and a non-string
+    // carry fails the whole typed parse into the accept-and-strip arm below
+    // (silent drop, no terminal, no error). Presence must be read here, at
+    // the raw layer, before dedupe/restore planning (zero side effects on
+    // reject). This task arms the two INVALID_MESSAGE families
+    // (terminal.create, codingcli.create); Task 7 arms the freshAgent
+    // families (create.failed envelope / attach event channel).
+    if let Some(resume_value) = value.get("resumeSessionId") {
+        let _ = resume_value; // presence is what matters; value never read
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("terminal.create") | Some("codingcli.create") => {
+                let reply = ServerMessage::Error(ErrorMsg {
+                    code: ErrorCode::InvalidMessage,
+                    message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: value
+                        .get("requestId")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string),
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                });
+                return send(ws_tx, &reply).await;
             }
-            // Server-wide requestId dedupe ...
-            match state.create_dedupe.begin(
+            _ => {} // freshAgent.* armed in Task 7; all other types unaffected
+        }
+    }
+
+    let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
+        return true;
+    };
 ```
+
+Add the imports to `terminal.rs`'s use block at `:62-67`: `ErrorMsg` joins `freshell_protocol::{...}` (verify the exact re-export surface — `freshell_protocol::ErrorMsg`, `ErrorCode`, and `LEGACY_RESUME_IDENTITY_REFUSAL` are all re-exported via `pub use` per Task 1 + existing server_messages/common re-exports); `crate::now_iso()` exists (used at `:1629`).
 
 Remove the now-redundant scoped gate at `:2441-2457`. Comment the legacy rungs at `:1543-1544` and `:1883-1886` as dead-from-wire (same as before). Add the permanent-compat doc to `reconcile.rs:162-177` (same as before).
 
@@ -905,14 +1036,14 @@ git commit -m "feat(ejh6): Rust WS terminal.create blanket reject (pre-dedupe) +
 ### Task 7: Rust WS freshAgent.create/attach reject + `attach_durable_id` hygiene
 
 **Files:**
-- Modify: `crates/freshell-ws/src/terminal.rs:62-67` (import `FreshAgentCreateFailed`), `:4768` (`fresh_agent_control_refusal` — add create/attach legacy-field arms)
+- Modify: `crates/freshell-ws/src/terminal.rs:62-67` (import `FreshAgentCreateFailed`, `FreshAgentEvent`) and extend the Task-6 raw-Value guard (inserted after the tabs.sync fast-path in dispatch) with the freshAgent arms — NOT the typed `fresh_agent_control_refusal` (review round 2 finding 8: the typed layer cannot see JSON null/non-string carries)
 - Modify: `crates/freshell-freshagent/src/claude.rs:1809-1819` (`attach_durable_id` — flip to sessionRef-first with comment)
 - Test: `crates/freshell-ws/tests/freshagent_claude_attach.rs` (add legacy-carrying attach rejection test — use the file's own harness APIs per V3: `CLAUDE_ENV_LOCK`, `FakeClaudeResumeEnv::install(<durable>)`, `spawn_server() -> String`, `connect_and_complete_handshake(&url)`, `request_log_rows()`)
 - Test: `crates/freshell-ws/tests/freshagent_session_lease.rs` (add legacy-carrying create rejection test — use the file's own harness APIs per V3: `LEASE_ENV_LOCK`, `FakeLeaseSidecarEnv::install()`, `spawn_server() -> String`, `connect(&url, true)`, `create_rows()`)
 - Test: `crates/freshell-ws/tests/cross_kind_liveness.rs:411,:460` (V5 premise-inversion: `freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session` at `:411` sends dual-carrier `freshAgent.create` asserting `freshAgent.create.failed{code: SESSION_RESERVED}` — post Task 7 the refusal fires earlier with the create-failed envelope code `FRESH_AGENT_CREATE_FAILED` + frozen text; `terminal_create_is_refused_while_a_live_sidecar_owns_the_session` at `:444` setup create at `:460` sends dual-carrier expecting success — rejected outright, so the D7 scenario it stages never materializes. Mechanically re-carrier the setup sends (drop the legacy line — sessionRef already present) and re-target the `:411` assertion from `SESSION_RESERVED` to `FRESH_AGENT_CREATE_FAILED` + frozen text.)
 
 **Interfaces:**
-- Consumes: `LEGACY_RESUME_IDENTITY_REFUSAL` (from Task 1); `ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed{code,message,request_id,retryable})` (`server_messages.rs:618-627`); `ServerMessage::FreshAgentEvent(FreshAgentEvent{event,provider,session_id,session_type})`; `agent_provider_wire`/`session_type_wire` helpers (`terminal.rs:4731,:4741`); `fresh_agent_control_refusal` runs before the dispatch match at `:661`.
+- Consumes: `LEGACY_RESUME_IDENTITY_REFUSAL` (from Task 1); the Task-6 raw-Value guard in `terminal.rs` dispatch (extended here); `ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed{code,message,request_id,retryable})` (`server_messages.rs:618-627`); `ServerMessage::FreshAgentEvent(FreshAgentEvent{event,provider,session_id,session_type})`; `send(ws_tx, &msg)` (`terminal.rs:85`).
 - Produces: `freshAgent.create` carrying `resume_session_id` then `freshAgent.create.failed{code:"FRESH_AGENT_CREATE_FAILED", message:<frozen>, retryable:false}`; `freshAgent.attach` carrying `resume_session_id` then `freshAgent.event{freshAgent.error{code:"FRESH_AGENT_CREATE_FAILED", message:<frozen>}}` keyed by session id; no sidecar spawn.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -931,33 +1062,36 @@ async fn legacy_reject_freshagent_attach() {
     let url = spawn_server().await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
-    send_json(
-        &mut ws,
-        &json!({
-            "type": "freshAgent.attach",
-            "sessionId": "cli-session-legacy-attach",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "resumeSessionId": "legacy-durable-id",
-        }),
-    )
-    .await;
+    // ejh6 presence (finding 9): rejection fires for any string, including "".
+    for (label, legacy) in [("string", "legacy-durable-id"), ("empty-string", "")] {
+        send_json(
+            &mut ws,
+            &json!({
+                "type": "freshAgent.attach",
+                "sessionId": "cli-session-legacy-attach",
+                "sessionType": "freshclaude",
+                "provider": "claude",
+                "resumeSessionId": legacy,
+            }),
+        )
+        .await;
 
-    let err = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.event"
-            && v["event"]["type"] == "freshAgent.error"
-            && v["sessionId"] == "cli-session-legacy-attach"
-    })
-    .await;
-    assert_eq!(
-        err["event"]["code"], json!("FRESH_AGENT_CREATE_FAILED"),
-        "attach legacy reject must use the create-failed family code: {err}"
-    );
-    assert_eq!(
-        err["event"]["message"],
-        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
-        "frozen text: {err}"
-    );
+        let err = await_frame(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.error"
+                && v["sessionId"] == "cli-session-legacy-attach"
+        })
+        .await;
+        assert_eq!(
+            err["event"]["code"], json!("FRESH_AGENT_CREATE_FAILED"),
+            "{label}: attach legacy reject must use the create-failed family code: {err}"
+        );
+        assert_eq!(
+            err["event"]["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: frozen text: {err}"
+        );
+    }
     // V3: this file has NO create_rows(); use request_log_rows() and filter for create rows.
     let create_count = env
         .request_log_rows()
@@ -982,30 +1116,36 @@ async fn legacy_reject_freshagent_create() {
     let url = spawn_server().await;
     let mut ws = connect(&url, true).await;
 
-    send_json(
-        &mut ws,
-        &json!({
-            "type": "freshAgent.create",
-            "requestId": "req-fa-legacy-create",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-            "cwd": "/tmp",
-            "resumeSessionId": "legacy-durable-id",
-        }),
-    )
-    .await;
+    // ejh6 presence (finding 9): rejection fires for any string, including "".
+    for (label, legacy, req_id) in [
+        ("string", "legacy-durable-id", "req-fa-legacy-create"),
+        ("empty-string", "", "req-fa-legacy-create-empty"),
+    ] {
+        send_json(
+            &mut ws,
+            &json!({
+                "type": "freshAgent.create",
+                "requestId": req_id,
+                "sessionType": "freshclaude",
+                "provider": "claude",
+                "cwd": "/tmp",
+                "resumeSessionId": legacy,
+            }),
+        )
+        .await;
 
-    let failed = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.create.failed" && v["requestId"] == "req-fa-legacy-create"
-    })
-    .await;
-    assert_eq!(failed["code"], json!("FRESH_AGENT_CREATE_FAILED"), "create-failed family code: {failed}");
-    assert_eq!(
-        failed["message"],
-        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
-        "frozen text: {failed}"
-    );
-    assert_eq!(failed["retryable"], json!(false));
+        let failed = await_frame(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "freshAgent.create.failed" && v["requestId"].as_str() == Some(req_id)
+        })
+        .await;
+        assert_eq!(failed["code"], json!("FRESH_AGENT_CREATE_FAILED"), "{label}: create-failed family code: {failed}");
+        assert_eq!(
+            failed["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: frozen text: {failed}"
+        );
+        assert_eq!(failed["retryable"], json!(false));
+    }
     assert!(
         env.create_rows().is_empty(),
         "no sidecar may spawn for a rejected legacy create: {:?}", env.create_rows()
@@ -1013,7 +1153,7 @@ async fn legacy_reject_freshagent_create() {
 }
 ```
 
-Re-target `crates/freshell-ws/tests/cross_kind_liveness.rs:411` (V5 premise-inversion, `freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session`): the test at `:411` sends dual-carrier `freshAgent.create` (BOTH `resumeSessionId` AND `sessionRef`) and currently asserts `freshAgent.create.failed{code: SESSION_RESERVED}` (`:425`). Post Task 7, the refusal fires earlier — the `fresh_agent_control_refusal` legacy-field arm returns `FRESH_AGENT_CREATE_FAILED` + frozen text BEFORE the dispatch reaches the per-provider handler (which would have emitted `SESSION_RESERVED`). KEEP the legacy line in the `:411` send (so the legacy-field arm fires) and re-target the assertion:
+Re-target `crates/freshell-ws/tests/cross_kind_liveness.rs:411` (V5 premise-inversion, `freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session`): the test at `:411` sends dual-carrier `freshAgent.create` (BOTH `resumeSessionId` AND `sessionRef`) and currently asserts `freshAgent.create.failed{code: SESSION_RESERVED}` (`:425`). Post Task 7, the refusal fires earlier — the raw-Value ejh6 guard's freshAgent.create arm returns `FRESH_AGENT_CREATE_FAILED` + frozen text BEFORE the typed parse reaches the per-provider handler (which would have emitted `SESSION_RESERVED`). KEEP the legacy line in the `:411` send (so the legacy-field arm fires) and re-target the assertion:
 
 ```rust
     assert_eq!(
@@ -1021,7 +1161,7 @@ Re-target `crates/freshell-ws/tests/cross_kind_liveness.rs:411` (V5 premise-inve
         "a live terminal PTY owns {session_id}: the fresh-agent resume must be refused, got {failed}"
     );
     // ejh6: the legacy field is rejected at the door BEFORE the SESSION_RESERVED
-    // cross-kind guard fires (the blanket reject in fresh_agent_control_refusal
+    // cross-kind guard fires (the raw-Value ejh6 guard's freshAgent.create arm
     // runs first). The code is FRESH_AGENT_CREATE_FAILED + frozen text, not
     // SESSION_RESERVED.
     assert_eq!(failed["code"], "FRESH_AGENT_CREATE_FAILED");
@@ -1053,44 +1193,64 @@ use freshell_protocol::{
 };
 ```
 
-Add create/attach legacy-field arms at the TOP of `fresh_agent_control_refusal` at `:4768`, before the existing tuple match:
+Extend the Task-6 raw-Value guard in `crates/freshell-ws/src/terminal.rs` dispatch with the freshAgent arms — NOT the typed `fresh_agent_control_refusal` (review round 2 finding 8: the typed layer sits AFTER `from_value`, so JSON `null` deserializes to `None` before it and non-string values get swallowed by the accept-and-strip arm — the raw layer is the only full-presence read). Change the guard's tail (currently `_ => {}`):
 
 ```rust
-pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
-    // ejh6: reject the legacy `resume_session_id` wire field on every
-    // fresh-agent create-class door BEFORE dispatch. Create returns the
-    // `freshAgent.create.failed` envelope (it carries requestId); attach has
-    // NO requestId, so its rejection rides the `freshAgent.error` event
-    // channel keyed by sessionId. Both use the `FRESH_AGENT_CREATE_FAILED`
-    // family code + the frozen sessionRef-naming text.
-    if let ClientMessage::FreshAgentCreate(m) = message {
-        if m.resume_session_id.is_some() {
-            return Some(ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
-                code: "FRESH_AGENT_CREATE_FAILED".to_string(),
-                message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
-                request_id: m.request_id.clone(),
-                retryable: Some(false),
-            }));
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("terminal.create") | Some("codingcli.create") => {
+                // ... unchanged Task-6 INVALID_MESSAGE + frozen text arm ...
+            }
+            // Task 7: freshAgent arms. The legacy field on a freshAgent
+            // create-class message gets the per-family envelope. Create
+            // returns `freshAgent.create.failed` (it carries requestId);
+            // attach has NO requestId, so its rejection rides the
+            // `freshAgent.error` event channel keyed by sessionId — the same
+            // shape claude.rs:265-282 broadcasts today. Built from the raw
+            // frame: presence already proven by the guard condition.
+            Some("freshAgent.create") => {
+                let reply = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                    code: "FRESH_AGENT_CREATE_FAILED".to_string(),
+                    message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+                    request_id: value
+                        .get("requestId")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    retryable: Some(false),
+                });
+                return send(ws_tx, &reply).await;
+            }
+            Some("freshAgent.attach") => {
+                let session_id = value
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+                let reply = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event: serde_json::json!({
+                        "type": "freshAgent.error",
+                        "sessionId": session_id,
+                        "code": "FRESH_AGENT_CREATE_FAILED",
+                        "message": LEGACY_RESUME_IDENTITY_REFUSAL,
+                    }),
+                    provider: value
+                        .get("provider")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    session_id: session_id.to_string(),
+                    session_type: value
+                        .get("sessionType")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+                return send(ws_tx, &reply).await;
+            }
+            _ => {} // not a create-class type; fall through to typed parse
         }
-    }
-    if let ClientMessage::FreshAgentAttach(m) = message {
-        if m.resume_session_id.is_some() {
-            return Some(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: serde_json::json!({
-                    "type": "freshAgent.error",
-                    "sessionId": m.session_id,
-                    "code": "FRESH_AGENT_CREATE_FAILED",
-                    "message": LEGACY_RESUME_IDENTITY_REFUSAL,
-                }),
-                provider: agent_provider_wire(m.provider).to_string(),
-                session_id: m.session_id.clone(),
-                session_type: session_type_wire(m.session_type).to_string(),
-            }));
-        }
-    }
-    let (refused, wording, provider, session_id, session_type) = match message {
-        // ... existing arms unchanged ...
 ```
+
+(If the Task-6 guard was written as a single `if let Some(...)` around the match, keep that form — this edit only replaces the `_ => {}` tail with the two freshAgent arms plus the non-create fallthrough.)
 
 Flip `attach_durable_id` in `crates/freshell-freshagent/src/claude.rs:1809-1819` to sessionRef-first (the legacy-first read is dead for external input after the wire reject; the test helper `attach_msg_with_resume` at `:2228` was converted to sessionRef in Task 3):
 
@@ -1120,7 +1280,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-The `fresh_agent_control_refusal` function now handles both control-frame capability refusals AND legacy-field rejections. The function name still accurately describes its role (a pre-dispatch refusal for fresh-agent control/create/attach frames). No further refactor needed.
+The raw-Value ejh6 guard now covers all four create-class families at one site (terminal.create + codingcli.create in Task 6; freshAgent.create + freshAgent.attach here). `fresh_agent_control_refusal` is untouched — its control-frame capability table is orthogonal. No further refactor needed.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1144,7 +1304,7 @@ git commit -m "feat(ejh6): Rust WS freshAgent create/attach reject legacy field 
 **Files:**
 - Modify: `server/agent-api/router.ts:695` (top of `POST /tabs` — insert door-top check before agent/browser/editor/terminal branch), `:1250` (top of `POST /panes/:id/split`), `:1546` (top of `POST /panes/:id/respawn`); `:214-228` (`requestedResumeSessionIdForMode` — remove the legacy throw; keep sessionRef resolution only; single check at door-top for KISS per finding 3)
 - Test: `test/server/agent-tabs-write.test.ts:413` (add `it.each` for all modes + dual-carrier + presence-edge + browser/editor tests)
-- Test: `test/server/agent-panes-write.test.ts:132,:327` (widen to all modes + layout-unchanged on split)
+- Test: `test/server/agent-panes-write.test.ts:132,:327` (widen to all modes + layout-unchanged on split) AND `:339` (finding 7: door-top respawn rejection now returns BEFORE target resolution — flip the existing `expect(resolveTarget).toHaveBeenCalledWith('pane_1')` to `expect(resolveTarget).not.toHaveBeenCalled()`)
 
 **Interfaces:**
 - Consumes: `INVALID_RAW_CODEX_RESUME_MESSAGE` (`restore-decision.ts:27-28`); `fail(message)` returns `{status:'error',message}` (`response.ts:6`).
@@ -1215,6 +1375,14 @@ Add to `test/server/agent-tabs-write.test.ts` (after the existing codex-reject t
     expect(res.body).toEqual({ status: 'error', message: INVALID_RAW_CODEX_RESUME_MESSAGE })
   })
 ```
+
+Lockstep edit (review round 2 finding 7): in `test/server/agent-panes-write.test.ts` the existing codex respawn rejection test (`:311-340`, 'rejects raw Codex resume ids before respawning a pane') ends its not-called chain with `expect(resolveTarget).toHaveBeenCalledWith('pane_1')` at `:339`. With this task's door-top guard the rejection returns BEFORE target resolution — change that one assertion to:
+
+```ts
+  expect(resolveTarget).not.toHaveBeenCalled()
+```
+
+Leave the rest of that test untouched (`planCreateCalls` empty, `registryCreate`/`attachPaneContent` not called, 400 + frozen text). Also widen the split/respawn rejection tests at `:132`/`:327` to it.each over modes `['claude','codex','opencode','amplifier']` with presence-edge bodies per Global Constraints (`'legacy-x'`, `''`, `null`, `42` — Node REST reads `req.body`, so unlike WS these DO reject with the frozen text), and keep the existing 400+message assertions.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -1372,6 +1540,29 @@ Add presence-edge and dual-intent tests (findings 2, 5):
       await closeWebSocket(ws)
     }
   })
+
+  // ejh6 review round 2 finding 8 (layered WS presence): a NON-STRING legacy
+  // value never reaches the handler — the dynamic `.strict()` schema's
+  // `resumeSessionId: z.string().optional()` fails zod parse first, producing
+  // error{INVALID_MESSAGE} with the parser's generic text (ws-handler.ts:1913-1916).
+  // Pin the CODE loudly, NOT the text (frozen text belongs to string carries).
+  it.each([['null', null], ['number', 42], ['object', { nested: true }]])(
+    'rejects non-string resumeSessionId (%s) at the parse boundary with INVALID_MESSAGE', async (_label, val) => {
+      const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+      try {
+        await waitForOpen(ws)
+        await waitForReady(ws)
+        const requestId = `legacy-reject-nonstr-${_label}`
+        const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+        ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'claude', shell: 'system', resumeSessionId: val }))
+        const error = await errorPromise
+        expect(error).toMatchObject({ type: 'error', code: 'INVALID_MESSAGE', requestId })
+        expect(registry.createCalls).toHaveLength(0)
+      } finally {
+        await closeWebSocket(ws)
+      }
+    },
+  )
 ```
 
 Repurpose `test/server/ws-terminal-create-session-repair.test.ts:1048` (the "sessionRef wins over legacy" precedence test) — after the blanket reject, sending BOTH `resumeSessionId` and `sessionRef` gets INVALID_MESSAGE. Replace the precedence assertion with:
@@ -1487,7 +1678,7 @@ Insert the blanket reject at the VERY TOP of the `case 'terminal.create':` block
         // TOP, BEFORE recordSessionLifecycleEvent and the fresh_after_restore_
         // unavailable validation — a message carrying both intents gets
         // INVALID_MESSAGE with frozen text (the mandatory error wins).
-        // Presence-based (finding 2): `!== undefined` covers "", null, 42.
+        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
         if (m.resumeSessionId !== undefined) {
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
@@ -1569,7 +1760,9 @@ git commit -m "feat(ejh6): Node WS terminal.create blanket reject (pre-recovery-
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add to `test/unit/server/ws-handler-fresh-agent.test.ts` (model on the existing `connectAndAuth` + `seenMessages` + `vi.waitFor` pattern at `:87+` — that file has NO `waitForMessage` helper; use the file's own `seenMessages` array + `vi.waitFor` pattern):
+Add to `test/unit/server/ws-handler-fresh-agent.test.ts` (model on the existing `connectAndAuth` + `seenMessages` + `vi.waitFor` pattern at `:87+` — that file has NO `waitForMessage` helper; use the file's own `seenMessages` array + `vi.waitFor` pattern).
+
+Presence coverage (finding 9): BOTH tests below wrap their send in a `for (const legacy of ['legacy-durable-id', ''])` loop (unique requestId/sessionId per iteration) — an empty string carries MUST also reject with the frozen text (`!== undefined` presence):
 
 ```ts
   it('rejects freshAgent.create carrying resumeSessionId with freshAgent.create.failed', async () => {
@@ -1662,7 +1855,7 @@ Insert at the head of the `freshAgent.create` case at `server/ws-handler.ts:3424
         // ejh6: reject the legacy resumeSessionId wire field. The canonical
         // carrier is sessionRef; resumeSessionId stays declared on the shared
         // schema solely so the handler can detect-and-reject (see kata ejh6).
-        // Presence-based (finding 2): `!== undefined` covers "", null, 42.
+        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
         if (m.resumeSessionId !== undefined) {
           this.send(ws, {
             type: 'freshAgent.create.failed',
@@ -1686,7 +1879,7 @@ Insert at the head of the `freshAgent.attach` case at `server/ws-handler.ts:3543
         // attach error frame shape (sendError) with the FRESH_AGENT_CREATE_
         // FAILED code — the create-failed family code on the attach error
         // channel (see kata ejh6, binding correction D).
-        // Presence-based (finding 2): `!== undefined` covers "", null, 42.
+        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
         if (m.resumeSessionId !== undefined) {
           this.sendError(ws, {
             code: 'FRESH_AGENT_CREATE_FAILED',
@@ -1761,6 +1954,10 @@ Add to `test/server/ws-coding-cli-events.test.ts` (model on the existing `create
 
 ```ts
   it('rejects codingcli.create carrying resumeSessionId with INVALID_MESSAGE + frozen text', async () => {
+    // Review round 2 finding 10a: the rejection must ALSO assert no spawn — expose
+    // the suite fake manager's create spy (create the suite's default fake with a
+    // create: vi.fn() spy held in a suite-level binding, or do the same wsHandler
+    // swap the promote test uses; assert `createMock not called` after the error).
     const ws = await createAuthenticatedWs()
     const requestId = 'cli-legacy-reject-1'
     const errorPromise = new Promise<any>((resolve) => {
@@ -1779,8 +1976,13 @@ Add to `test/server/ws-coding-cli-events.test.ts` (model on the existing `create
       message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
       requestId,
     })
+    expect(createMock).not.toHaveBeenCalled() // no spawn on reject (finding 10a)
     ws.close()
   })
+
+  // Finding 9 (presence on this door too): wrap the rejection test above in
+  // `it.each([['string', 'legacy-cli-id'], ['empty-string', '']])` — an empty
+  // string carries MUST also reject with the frozen text (`!== undefined`).
 
   it('promotes a provider-matched sessionRef into the spawn-time resume id for codingcli.create', async () => {
     // V4: NEVER instantiate a real CodingCliSessionManager + real claudeProvider —
@@ -1831,6 +2033,43 @@ Add to `test/server/ws-coding-cli-events.test.ts` (model on the existing `create
     expect(createMock).toHaveBeenCalledWith('claude', expect.objectContaining({
       resumeSessionId: 'canonical-cli-session',
     }))
+    ws.close()
+  })
+
+  it('does NOT promote a provider-mismatched sessionRef into the spawn-time resume id', async () => {
+    // Review round 2 finding 10b: a sessionRef whose provider ≠ m.provider is
+    // NOT promoted — the spawn proceeds without a resume id. Same fake-manager
+    // wsHandler swap as the promote test above.
+    const createMock = vi.fn()
+    class FakeSession extends EventEmitter {
+      id = 'cli-session-2'
+      provider = { name: 'claude' }
+    }
+    const fakeManager = {
+      create: (...args: any[]) => { createMock(...args); return new FakeSession() },
+      hasProvider: (name: string) => name === 'claude',
+      get: vi.fn(),
+      remove: vi.fn(),
+    } as unknown as CodingCliSessionManager
+    wsHandler.close()
+    wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
+
+    const ws = await createAuthenticatedWs()
+    const requestId = 'cli-sref-mismatch-1'
+    const createdPromise = new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'codingcli.created') resolve()
+      })
+    })
+    ws.send(JSON.stringify({
+      type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
+      sessionRef: { provider: 'codex', sessionId: 'wrong-provider-session' },
+    }))
+    await createdPromise
+    expect(createMock).toHaveBeenCalledTimes(1)
+    const spawnOptions = createMock.mock.calls[0][1]
+    expect(spawnOptions.resumeSessionId).toBeUndefined()
     ws.close()
   })
 ```
@@ -1915,7 +2154,7 @@ Insert the reject + promotion at `server/ws-handler.ts:3280` UNCONDITIONALLY FIR
         // the reject is config-independent. The canonical carrier is sessionRef;
         // resumeSessionId stays declared on the schema solely so the handler
         // can detect-and-reject (see kata ejh6).
-        // Presence-based (finding 2): `!== undefined` covers "", null, 42.
+        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
         if (m.resumeSessionId !== undefined) {
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
@@ -2201,7 +2440,7 @@ Expected: output shows ONLY these categories:
 2. The `pane.reconcile` compat door (`crates/freshell-ws/src/reconcile.rs` `promoted_legacy_claim`, `src/lib/pane-reconcile.ts` `effectiveReconcileSessionRef`).
 3. Alias conversion sites (CLI `promoteResumeFlag` in `server/cli/index.ts`, MCP `freshell-tool.ts` `resume`/`resumeSessionId` param handling).
 4. Retained-for-rejection schema/struct fields (each carrying the section 3c comment): `shared/ws-protocol.ts` (`TerminalCreateSchema` at `:319-332`, `CodingCliCreateSchema`, `FreshAgentCreateSchema`, `FreshAgentAttachSchema`, `ReconcilePaneSchema`), `server/ws-handler.ts` (dynamic terminal.create + codingcli schemas), `crates/freshell-protocol/src/client_messages.rs` (`TerminalCreate`, `CodingCliCreate`, `FreshAgentCreate`, `FreshAgentAttach`, `ReconcilePane`).
-5. Rejection handlers: `crates/freshell-freshagent/src/terminal_tabs.rs` (`requested_resume_session_id_for_mode`), `crates/freshell-ws/src/terminal.rs` (head-of-`handle_create` blanket reject, `fresh_agent_control_refusal` create/attach arms), `server/ws-handler.ts` (terminal.create/freshAgent.create/freshAgent.attach/codingcli.create head-of-case rejects), `server/agent-api/router.ts` (`requestedResumeSessionIdForMode`).
+5. Rejection handlers: `crates/freshell-freshagent/src/lib.rs` (create_tab door-top presence check), `crates/freshell-freshagent/src/pane_ops.rs` (split/respawn door-top presence checks), `crates/freshell-ws/src/terminal.rs` (raw-Value pre-parse legacy-resume guard, all four create-class families), `server/ws-handler.ts` (terminal.create/freshAgent.create/freshAgent.attach/codingcli.create head-of-case rejects), `server/agent-api/router.ts` (door-top presence checks on all three routes).
 6. Sidecar-protocol file class (V5 ruling — NOT Freshell-wire input, EXCLUDE from rejection scope): `crates/freshell-claude-sidecar/index.mjs:10,:240` (reader), `claude.rs:469`/`:1294` + Node `sdk-bridge.ts:85,:168,:193` (writers), embedded fake sidecars in `test/e2e-browser/fixtures/` and in-crate `tests/*.rs` fake-sidecar JS, and the ~8 sidecar-log-reading specs (`freshagent-settings-resume-rust.spec.ts:545,:551`, `hidden-pane-rebind-rust.spec.ts:365-367`, `freshclaude-restart-parity-rust.spec.ts:309`, `freshclaude-identity-persistence-rust.spec.ts:313,:410`, `wavea-interactions-rust.spec.ts:403-407`, `restore-contract-wall-rust.spec.ts:1040,:1304`, `restore-matrix.spec.ts:400,:1099`). None are Freshell-wire input — the adapter still emits `resumeSessionId` on the internal sidecar protocol post-conversion, and these readers stay green because the ID VALUE is preserved. Production internal-name readers (`codex.rs:500`, `claude.rs:348/:1809`, `layout_store_content.rs:254`, `tabs_store_model.rs:484`, `pane_ops.rs:686`) are also in this category.
 
 If any hit falls outside these categories, add a section 3c doc comment, convert it to sessionRef, or document it as an allowed internal — then re-run.
