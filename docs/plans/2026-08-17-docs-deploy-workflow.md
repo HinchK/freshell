@@ -128,7 +128,7 @@ Run: `git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow status --sh
 
 Expected: `.github/workflows/docs-pages-deploy.yml` as the only new untracked file, and no tracked modifications (`??` entries besides it). This plan file is already committed in earlier commits, so it does not appear in `git status`; the PR delta is judged by `git diff origin/main --stat` showing only this plan file plus the workflow.
 
-The full coordinated suite gate is run ONCE by the run orchestrator (not the task implementer) at the end of execution, on the final HEAD: command `npm run check` (cloud backends configured in this environment). Pass criterion: green, excluding the 25 rust-family e2e-browser failures recorded as pre-existing in the baseline ledger (reproduction receipt: cloud execution freshell-vitest-2r4s2 at base_ref 8ea471de0; see the run's baseline ledger). Any failure outside that recorded set is triaged as run-introduced and fixed before the gate can pass.
+The full coordinated suite gate is run ONCE by the run orchestrator (not the task implementer) at the end of execution, on the final HEAD: command `FRESHELL_VITEST_BACKEND=local npm run check` (typecheck + client/server Vitest suites + Electron suite; `config/vitest/vitest.config.ts` excludes `test/e2e-browser/**`, so no e2e specs are part of this gate). Pass criterion: green, excluding only failures that reproduce at base_ref and are recorded by name in the run's baseline ledger (`/home/dan/code/freshell/.worktrees/.the-usual-logs/docs-deploy-workflow/run-state.md`, see also `reports/workspace-baseline.md` in the same logs directory). Any other failure is triaged as run-introduced and fixed before the gate passes. Backend note: the cloud Vitest backend is unusable as of 2026-08-17 — every execution of the shared `freshell-vitest` Cloud Run job on that date ran the Playwright e2e entrypoint despite `TEST_MODE=vitest` being confirmed present in the execution's container env (observed on executions freshell-vitest-2r4s2, -7rdvn, -7czbm, -l6rbp; the image was built 2026-08-16 and its baked entrypoint demonstrably does not honor `TEST_MODE`, so cloud executions run the wrong suite; exact provenance of that drift was not determined). The local backend is the repo-supported equivalent and was used for both the baseline and the gate in this run.
 
 - [ ] **Step 6: Commit the task**
 
@@ -146,11 +146,18 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
    `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow -f cname=freshell.net -F https_enforced=true`
 3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
-5. Rollback if anything is wrong. Three steps — the PUT re-asserts source, cname, and HTTPS explicitly (schema-silence finding), then a legacy build is explicitly requested and monitored (config updates and build requests are separate operations; only `POST /pages/builds` queues a legacy build — Fresh Eyes finding F1):
-   a. `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
-   b. `gh api -X POST repos/danshapiro/freshell/pages/builds`
-   c. Monitor until service is restored: poll `gh api repos/danshapiro/freshell/pages --jq .status` until it reads `built` (legacy builds take ~30s), then require `curl -sI https://freshell.net/` to return 200 before declaring the rollback complete.
-   The workflow file merged on `main` is inert under legacy `build_type` (it only produces Actions runs, which do not deploy anything Pages will serve while the source is branch-based), so no file removal is needed to roll back.
+5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, and recovery is verified against the exact build that was requested (Fresh Eyes rounds 1–2 findings):
+   a. Disable the repo-owned workflow and stop its outstanding runs, so no queued or in-flight Actions deployment can fire after the source flips back (the deploy-pages security contract may permit Actions-originated deployments to a source-branch site from an allowed branch — do not rely on it failing):
+      `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
+      `gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --status queued --json databaseId --jq '.[].databaseId' | xargs -r gh run cancel -R danshapiro/freshell`
+      `gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --status in_progress --json databaseId --jq '.[].databaseId' | xargs -r gh run cancel -R danshapiro/freshell`
+   b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
+      `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
+   c. Record the source tip and explicitly request a legacy build of it (config updates and build requests are separate operations; only `POST /pages/builds` queues a legacy build):
+      `MAIN_SHA=$(gh api repos/danshapiro/freshell/branches/main --jq .commit.sha)`
+      `gh api -X POST repos/danshapiro/freshell/pages/builds`
+   d. Verify recovery against THAT build — the site-wide `/pages` status can describe an older deployment and is insufficient: poll `gh api repos/danshapiro/freshell/pages/builds/latest --jq '{commit,status}'` until `commit` equals `$MAIN_SHA` and `status` is `built` (legacy builds take ~30s). If `status` becomes `errored`, abort and report; do not declare rollback complete.
+   e. Confirm the site serves: `curl -sI https://freshell.net/` returns 200.
 
 ## Parity notes (what "replicate the existing experience" means, exactly)
 
