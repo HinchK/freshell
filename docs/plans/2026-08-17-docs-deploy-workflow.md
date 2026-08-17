@@ -150,8 +150,7 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
 5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, cancellation is awaited to terminal state (GitHub returns only `202 Accepted` from `gh run cancel`), and recovery is verified against the exact requested build (Fresh Eyes rounds 1–3 findings):
    a. Disable the repo-owned workflow (prevents pushes from queueing new runs mid-rollback), then cancel every nonterminal run to a VERIFIED fixpoint — cancelling the active run can promote a queued one, so snapshot+cancel loops until a fresh snapshot shows zero nonterminal runs. The LIST call uses the raw REST endpoint `GET /actions/workflows/{file}/runs` instead of `gh run list --workflow` so behavior cannot depend on the installed gh version's workflow-resolution rules (verified against gh v2.45.0 source: NAME selectors resolve against active workflows only, `.yml` file selectors happen to bypass that filter, and `--status` rejects values such as `pending` — the raw endpoint avoids all three). The loop is fail-closed (a listing failure aborts the rollback before any flip) and paginates the entire run history:
-      `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
-      (Skipped automatically below if the workflow is not yet on `main`, e.g. a rollback after a failed/stalled merge.)
+      The script below disables the workflow itself, inside a default-branch presence probe: when the workflow is not yet on `main` (e.g. a rollback after a failed/stalled merge) the disable/cancellation phase is skipped automatically.
       ```bash
       set -o pipefail   # an interrupted `gh api | sort` must fail the pipeline, not silently
                         # yield an empty/partial candidate set (Bash manual: pipeline status
@@ -170,6 +169,20 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
       esac
 
       if [[ "$hdr" == *" 200"* ]]; then
+      # Disable FIRST so no new run can queue behind the sweep (a push during rollback
+      # otherwise creates a run the snapshot/cancel loop can finish without). pipefail is
+      # not -e: every fallible command needs an explicit check, so the disable gets
+      # retries and a persistent failure ABORTS the rollback (fail-closed) rather than
+      # racing a late run against the restored legacy pipeline.
+      for i in 1 2 3; do
+        if gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell; then break; fi
+        if [ "$i" -ge 3 ]; then
+          echo "ERROR: could not disable the workflow after 3 attempts — aborting rollback; do NOT flip Pages settings" >&2
+          rm -f "$CANDS"; exit 1
+        fi
+        sleep 5
+      done
+
       # Seed candidates from the ENTIRE run history of this workflow, not only runs we
       # happen to observe nonterminal: a run terminal before the first snapshot (e.g.
       # GitHub force-terminated it) can still own a nonterminal Pages deployment. Both
@@ -201,8 +214,10 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
       # (REST docs: "You can also give the commit SHA of the deployment"), so no log scraping
       # or deployment-id format guessing is needed. Every API failure except a clean 404 is
       # FATAL to the rollback (fail-closed — no "all clear" can print on unproven evidence).
-      # ACTIVE = every status not proven final per the pinned action source (see prose below):
-      ACTIVE_RE='^(pending|deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn|deployment_attempt_error|unknown_status|not_found)$'
+      # Final-and-only-final statuses per REST docs + the pinned action source (see prose
+      # below); EVERYTHING else — including any status a future v5 minor under the mutable
+      # tag might add — is treated as active: cancelled, then polled to a final status.
+      FINAL_RE='^(succeed|deployment_cancelled|deployment_failed|deployment_content_failed|deployment_lost)$'
       RC=0
       while read -r sha; do
         hdr=$(gh api -i "repos/danshapiro/freshell/pages/deployments/$sha" 2>/dev/null | head -1)
@@ -212,11 +227,13 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
           *) echo "ERROR: unexpected response checking deployment $sha ($hdr) — aborting rollback" >&2; RC=1; break ;;
         esac
         st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status) || { echo "ERROR: status read failed for $sha — aborting" >&2; RC=1; break; }
-        if [[ "$st" =~ $ACTIVE_RE ]]; then
+        if [[ ! "$st" =~ $FINAL_RE ]]; then
           gh api -X POST "repos/danshapiro/freshell/pages/deployments/$sha/cancel" || { echo "ERROR: cancel failed for $sha — aborting" >&2; RC=1; break; }
+          n=0
           while :; do
             st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status) || { echo "ERROR: status poll failed for $sha — aborting" >&2; RC=1; break; }
-            [[ "$st" =~ $ACTIVE_RE ]] || break
+            [[ "$st" =~ $FINAL_RE ]] && break
+            n=$((n+1)); if [ "$n" -ge 24 ]; then echo "ERROR: deployment $sha still not final ~2 min after cancel — aborting" >&2; RC=1; break; fi
             sleep 5
           done
           [ "$RC" -eq 0 ] || break
@@ -224,10 +241,10 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
       done < "$CANDS"
       [ "$RC" -eq 0 ] || { rm -f "$CANDS"; exit 1; }
       rm -f "$CANDS"
-      echo "Pages-side sweep complete: no non-final Actions deployments remain"
+      echo "Pages-side sweep complete: every Actions deployment is in a final status or does not exist"
       fi
       ```
-      The sweep is the authority, not the Actions-side cancellation: a cancelled deploy-pages run only *attempts* to cancel its Pages deployment (its handler swallows API errors), and a force-terminated run skips the handler entirely. Candidate SHAs are seeded from the workflow's ENTIRE run history, so even a run that was already terminal before the first snapshot (e.g. force-killed before rollback began) is checked. Cancelled-late deployments that already succeeded are harmless — the legacy rebuild in step c deploys byte-identical docs content over them; every non-final one is cancelled here and polled to a final status. Status classification: ACTIVE (cancel + poll) = `pending`, `deployment_in_progress`, `syncing_files`, `finished_file_sync`, `updating_pages`, `purging_cdn`, `deployment_attempt_error`, `unknown_status`, `not_found`; final (leave alone) = `succeed`, `deployment_cancelled`, `deployment_failed`, `deployment_content_failed`, `deployment_lost`. This is verified against the REST docs AND the pinned action source `deploy-pages@cd2ce8fcbc...` `src/internal/deployment.js`: its `temporaryErrorStatus` map lists `deployment_attempt_error` ("a retry will be automatically scheduled"), `unknown_status`, and `not_found` as temporary — the action's `check()` loop only warns on them and keeps polling, so a deployment observed in one of them can still proceed; treating them as terminal (an earlier draft's bug) could let an auto-retried Actions deployment race the restored legacy pipeline.
+      The sweep is the authority, not the Actions-side cancellation: a cancelled deploy-pages run only *attempts* to cancel its Pages deployment (its handler swallows API errors), and a force-terminated run skips the handler entirely. Candidate SHAs are seeded from the workflow's ENTIRE run history, so even a run that was already terminal before the first snapshot (e.g. force-killed before rollback began) is checked. Cancelled-late deployments that already succeeded are harmless — the legacy rebuild in step c deploys byte-identical docs content over them; every non-final one is cancelled here and polled to a final status. Status classification: final (leave alone) = `succeed`, `deployment_cancelled`, `deployment_failed`, `deployment_content_failed`, `deployment_lost`; EVERYTHING else — `pending`, `deployment_in_progress`, `syncing_files`, `finished_file_sync`, `updating_pages`, `purging_cdn`, `deployment_attempt_error`, `unknown_status`, `not_found`, or any status not yet invented — is treated as active and cancelled/polled. This is verified against the REST docs AND the pinned action source `deploy-pages@cd2ce8fcbc...` `src/internal/deployment.js`: its `temporaryErrorStatus` map lists `deployment_attempt_error` ("a retry will be automatically scheduled"), `unknown_status`, and `not_found` as temporary — the action's `check()` loop only warns on them and keeps polling, and its fallback branch logs any other unrecognized status and keeps polling too (deployment.js L151-166: the loop exits only on `succeed` or a `finalErrorStatus` value). Because the REST docs publish no exhaustive status enum and the workflow follows the mutable `deploy-pages@v5` tag, an allowlist of "known active" statuses would silently treat a newly introduced non-final status as final; the denylist cannot. Treating any non-final status as done (an earlier draft's bug) could let an auto-retried Actions deployment race the restored legacy pipeline.
    b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
       `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
    c. Request a legacy build and correlate recovery to the current source tip with movement detection (a bare `/pages/builds/latest` read can describe a stale or superseded build):
