@@ -95,7 +95,7 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
         sessionType: 'freshclaude',
         provider: 'claude',
         cwd: '/repo',
-        resumeSessionId: 'cli-session-parity',
+        sessionRef: { provider: 'claude', sessionId: 'cli-session-parity' },
         model: 'claude-sonnet-4-6',
         modelSelection: { kind: 'fixed', modelId: 'claude-sonnet-4-6' },
         permissionMode: 'acceptEdits',
@@ -109,7 +109,7 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
           sessionType: 'freshclaude',
           provider: 'claude',
           cwd: '/repo',
-          resumeSessionId: 'cli-session-parity',
+          sessionRef: { provider: 'claude', sessionId: 'cli-session-parity' },
           model: 'claude-sonnet-4-6',
           modelSelection: { kind: 'fixed', modelId: 'claude-sonnet-4-6' },
           permissionMode: 'acceptEdits',
@@ -198,7 +198,7 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
         requestId: 'req-gated-create',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'cli-existing',
+        sessionRef: { provider: 'claude', sessionId: 'cli-existing' },
       }))
 
       await vi.waitFor(() => {
@@ -245,7 +245,7 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
         sessionId: 'claude-session-missing',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'cli-missing',
+        sessionRef: { provider: 'claude', sessionId: 'cli-missing' },
       }))
 
       await vi.waitFor(() => {

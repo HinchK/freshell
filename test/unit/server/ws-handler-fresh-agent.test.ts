@@ -956,7 +956,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionId: 'claude-session-attached',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'cli-session-attached',
+        sessionRef: { provider: 'claude', sessionId: 'cli-session-attached' },
         cwd: '/repo/restored-worktree',
       }))
 
@@ -965,6 +965,7 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'claude-session-attached',
           sessionType: 'freshclaude',
           provider: 'claude',
+          sessionRef: { provider: 'claude', sessionId: 'cli-session-attached' },
           cwd: '/repo/restored-worktree',
         })
         expect(runtimeManager.subscribe).toHaveBeenCalledWith(
