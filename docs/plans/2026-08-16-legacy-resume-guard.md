@@ -37,7 +37,7 @@ Implement kata issue ejh6 (revised 2026-08-16 spec: "Remove the legacy resumeSes
 - **Never weaken tests:** never delete a behavior test without a replacement; never mark tests skip; never simplify assertions to get green.
 - **Coordinated runners:** Node tests via `npm run test:vitest -- run <paths> --config <config>` (default config `config/vitest/vitest.config.ts`, server config `config/vitest/vitest.server.config.ts`); Rust via `cargo test -p <crate>` focused, `cargo test --workspace` as gate; `npm run check` (typecheck + coordinated full suite) as final gate.
 - **Rejection mechanism:** handler-level only. Never use `.strict()`/`deny_unknown_fields`/serde field removal as the rejection mechanism (zod non-strict strips silently; `.strict()` rejects with a generic unrecognized-key error that cannot carry the frozen text). The field stays DECLARED in every schema/struct.
-- **Presence-based rejection (coordinator ruling, review findings 2+8+T6-redesign):** rejection is PRESENCE-based, not non-empty. The contract is "any create that CARRIES the field." **REST doors** (raw `Value`/`req.body`, full presence — string, empty, null, number, object): reject at handler with the frozen text (`body.get("resumeSessionId").is_some()` in Rust; `req.body?.resumeSessionId !== undefined` in Node). **WS doors:** the two servers differ by construction library behavior and both are loud: (i) **Node** — typed `z.string().optional()` fields: any string (incl. `""`) reaches the handler reject (`m.resumeSessionId !== undefined` → frozen text); a non-string (null, 42, object) fails zod parse at the boundary BEFORE the handler and gets `error{INVALID_MESSAGE}` with the parser's generic text (verified `server/ws-handler.ts:1913-1916`) — code loud, text generic, by design (frozen text names the legacy migration for string-typed callers). Tests null/42 pin the CODE on `terminal.create` only. (ii) **Rust** — the typed-struct approach is UNACCEPTABLE there (verified: serde `Option<String>` absorbs JSON `null` into `None` → silent accept; and a non-string value fails the `from_value` parse into the accept-and-strip `else { return true }` arm at `crates/freshell-ws/src/terminal.rs:651` → total silent drop, no terminal, no error). Rust therefore implements a **raw-Value pre-parse guard** in `terminal.rs` dispatch (before the typed `from_value`, before dedupe/restore planning): `value.get("type") ∈ {terminal.create, codingcli.create} + resumeSessionId key present (any JSON value, incl. null) → error INVALID_MESSAGE + frozen text; Task 7 extends the same guard with the freshAgent arms (create.failed envelope / event channel). Rust WS presence is full (any value) with frozen text for all of them; pin cases: `"legacy"`, `""`, `null`, `42` all → INVALID_MESSAGE + frozen text on terminal.create. All draft checks and tests must use presence, not `is_some_and(|s| !s.is_empty())` / `isNonEmptyString` / truthiness.
+- **Presence-based rejection (coordinator ruling, review findings 2+8+R3.1 — UNIFORM raw pre-parse presence guard):** rejection is PRESENCE-based, not non-empty: "any create that CARRIES the field", at every door, with the frozen text and the door-family envelope for EVERY JSON value type (string, empty, null, number, object). **REST doors** (raw `Value`/`req.body`): reject at the door-top (`body.get("resumeSessionId").is_some()` in Rust; `req.body && 'resumeSessionId' in req.body` / presence in Node). **WS doors on BOTH servers: a raw pre-parse presence guard**, placed BEFORE schema/typed parse, BEFORE dedupe/restore planning (zero side effects on reject): key-presence on the raw parsed frame decides. Rationale: typed layers cannot do this — zod `z.string().optional()` rejects null/42 generically (loses the required frozen text and, for freshAgent doors, the required create-failed family envelope), and serde `Option<String>` absorbs `null` into `None` while non-strings get silently dropped by the accept-and-strip arm. Node guard site: `server/ws-handler.ts` right before `this.clientMessageSchema.safeParse(msg)` (`:1913`); Rust guard site: after the `tabs.sync.*` fast-path and before `from_value` (`crates/freshell-ws/src/terminal.rs` dispatch). Per-family envelopes from the raw frame: `terminal.create` + `codingcli.create` → `error{INVALID_MESSAGE}` + frozen text; `freshAgent.create` → `freshAgent.create.failed{code FRESH_AGENT_CREATE_FAILED, frozen text, retryable:false}` (requestId from raw); `freshAgent.attach` → Rust rides `freshAgent.event{freshAgent.error}` (keyed by sessionId; UI-visible), Node rides `error{code FRESH_AGENT_CREATE_FAILED}` (socket-loud/UI-invisible — accepted asymmetry, coordinator ruling A). Wire schemas/structs keep `resumeSessionId: z.string().optional()`/`Option<String>` declared for parse retention only — the guard, not the schema, owns the contract. All draft checks use presence, never truthiness/`isNonEmptyString`/`is_some_and(non-empty)`. Tests: every door pins frozen text for `""` + ordinary strings; terminal.create null/42/object pinned on both servers (frozen text — the guard is raw); REST null/42 on all three routes both servers.
 - **Door-top REST rejection (coordinator ruling, review finding 3):** REST rejection runs at the TOP of each route handler in BOTH servers, BEFORE any branch (agent/browser/editor/terminal) and BEFORE `layout.split_pane` in the split route. In Node, check `req.body?.resumeSessionId !== undefined` at the top of `POST /tabs`, `POST /panes/:id/split`, `POST /panes/:id/respawn`; `requestedResumeSessionIdForMode` keeps its sessionRef-resolution role but no longer throws (single check at door-top for KISS). In Rust, check `body.get("resumeSessionId").is_some()` at each axum handler entry in `terminal_tabs.rs`/`pane_ops.rs` before any branch or layout mutation. Tests: pane/layout unchanged on rejected split; browser/editor branches also 400.
 - **Section 3c doc comment:** every retained `resumeSessionId`/`resume_session_id` field in a wire schema/struct gets the comment `Retained solely so the handler can detect-and-reject; see kata ejh6.` — EXCEPT `ReconcilePane.resume_session_id` which gets the PERMANENT compat-door comment.
 - **`restoreKey` gating:** blanket REST reject does NOT gate on `restoreKey` — no production producer emits it (verified), so blanket reject regresses nothing live (binding correction A).
@@ -61,6 +61,8 @@ J) Repo rules: worktree-only; coordinated runners (`npm run test:vitest -- run <
 K) V5's six-site omission correction: Task 3 must absorb `amplifier_launcher_identity.rs:148` (mechanical re-carrier), `claude_session_rebind.rs:546` (mechanical), `freshagent_claude_attach.rs:559` (third attach site, mechanical), and `terminal_tabs.rs:6334` (11th REST body — mechanical IF contract-neutral, else into Task 5 as a rejection assertion). Three premise-inversion sites route to behavior tasks: `amplifier_launcher_identity.rs:341` (expects RESTORE_UNAVAILABLE → becomes INVALID_MESSAGE — into Task 6), `codex_session_ref_resume.rs:363-381` (codex raw-legacy acceptance — into Task 6 as a rejection test), `cross_kind_liveness.rs:411,:460` (dual-carrier freshAgent.create sends — into Task 7: the SESSION_RESERVED dual-carrier assertion flips to the create-failed envelope; setup carry gets mechanically re-carriered).
 L) Uniform any-carry REST ruling (coordinator final): REST seams (`derive_resume_identity`, `requestedResumeSessionIdForMode`) throw whenever the wire `resumeSessionId` is present, even when `sessionRef` is also present — no first-party sender dual-carries. The codex dual-carrier tolerance at `server/coding-cli/codex-app-server/restore-decision.ts:40` is retired by this change. Tasks 5 and 8 check legacy BEFORE the sessionRef early-return. Existing REST dual-carrier acceptance assertions, if any, become rejection assertions.
 M) `ErrorCode` enum addition (validator V2 found Task 10's draft would not typecheck): add `FRESH_AGENT_CREATE_FAILED` to the shared `ErrorCode` enum in `shared/ws-protocol.ts:20-37`. Node attach rejection emits `error{FRESH_AGENT_CREATE_FAILED}` matching the existing attach error shape. Note the asymmetry: Node attach rejection is socket-loud but UI-invisible (no client consumer for requestId-less `error` frames — verified by V2's exhaustive sweep), while Rust's rides `freshAgent.event{freshAgent.error}` which the client renders. Kata §1c is satisfied (code family is what it names). Task 13 adds a typecheck step to catch drift.
+
+N) **Final WS door design (post-rounds-2/3; supersedes the "head-of-case"-style wording in B/D above):** BOTH servers reject at a raw pre-parse presence guard — Rust in `crates/freshell-ws/src/terminal.rs` dispatch after the tabs.sync fast-path and before `from_value` (Task 6 arms terminal.create + codingcli.create; Task 7 arms freshAgent.create/.attach), Node in `server/ws-handler.ts` after JSON.parse and before `clientMessageSchema.safeParse(msg)` at :1913 (Task 9 arms terminal.create; Task 10 arms freshAgent.*; Task 11 arms codingcli.create). Full presence for every JSON value incl. null/42 with frozen text + per-family envelopes; typed schemas keep the field DECLARED (retention + section 3c comments) but the guard, not the schema, owns the contract. (The typed-layer first attempt was invalidated by review round 2 finding 8 — serde absorbs `null` into `None` and accept-and-strip drops non-strings — and review round 3 finding 1, which ruled Node's zod parse-boundary generic-text residual non-compliant for family envelopes.)
 
 ---
 
@@ -617,17 +619,37 @@ async fn legacy_reject_respawn() {
 Re-carrier `test/e2e-browser/specs/remote-tab-linkage-rust.spec.ts` (finding 6: DO NOT delete the ~110 lines of behavior coverage. RE-CARRIER the send at `:197-206` from `resumeSessionId: SEEDED_SESSION_ID` to `sessionRef: { provider: 'amplifier', sessionId: SEEDED_SESSION_ID }`, KEEP every downstream assertion (resume argv, live broadcast, sidebar linkage, click dedupe, title sync, persisted sessionRef, restart/reload restoration, post-restart resume) as sessionRef-carrier behavior coverage, then APPEND one new rejection-focused case at the end of the describe block:
 
 ```ts
-  it('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async () => {
-    const res = await fetch(`${info.baseUrl}/api/tabs`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
-      body: JSON.stringify({ mode: 'amplifier', cwd: projectDir, resumeSessionId: SEEDED_SESSION_ID, name: 'legacy-reject-case' }),
+  // Review round 3 findings 3/7: this spec imports `test` (not `it`) from
+  // '../helpers/fixtures.js'; the big test's locals (info, projectDir,
+  // SEEDED_SESSION_ID) are out of scope here, so this case boots its OWN
+  // minimal rust server (no amplifier fixtures needed — the rejection fires
+  // at the door before any mode work), and asserts frozen text PLUS no
+  // visible creation: /api/tabs before/after equality (no spawn, no tab).
+  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async ({ e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {}, // no fixtures: door-top reject needs no provider state — verify the construct type allows empty at implementation time and seed minimally if not
     })
-    expect(res.status).toBe(400)
-    const body = await res.json()
-    expect(body.status).toBe('error')
-    expect(body.message).toContain('sessionRef')
-    expect(body.message).toContain('resumeSessionId')
+    const info = await server.start()
+    try {
+      const before = await (await fetch(`${info.baseUrl}/api/tabs`, { headers: { 'x-auth-token': info.token } })).json()
+      const res = await fetch(`${info.baseUrl}/api/tabs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
+        body: JSON.stringify({ mode: 'amplifier', cwd: '/tmp', resumeSessionId: 'amp-legacy-reject-0001', name: 'legacy-reject-case' }),
+      })
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body).toEqual({
+        status: 'error',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      })
+      const after = await (await fetch(`${info.baseUrl}/api/tabs`, { headers: { 'x-auth-token': info.token } })).json()
+      expect(after).toEqual(before) // no tab/terminal side effects on reject
+    } finally {
+      await server.stop()
+    }
   })
 ```
 
@@ -635,9 +657,9 @@ Add `/remote-tab-linkage-rust\.spec\.ts$/` to `RUST_ONLY_SPECS` at `test/e2e-bro
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent legacy_reject_`
+Run: `cargo test -p freshell-freshagent legacy_reject_ && cargo test -p freshell-freshagent does_not_synthesize`
 
-Expected: FAIL because the non-codex modes silently accept the legacy field, the browser/editor branches bypass the check entirely, and the split door mutates the layout before reaching `spawn_terminal_pane` — the tests get 200/approx instead of 400, and the layout-unchanged assertion fails.
+Expected: FAIL because the non-codex modes silently accept the legacy field, the browser/editor branches bypass the check entirely, and the split door mutates the layout before reaching `spawn_terminal_pane` — the tests get 200/approx instead of 400, the layout-unchanged assertion fails, and the EDEV-07 trio (now rejection assertions) gets 200 instead of 400.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -731,7 +753,7 @@ git commit -m "feat(ejh6): Rust REST door-top presence reject + section 3c docs 
 
 ---
 
-### Task 6: Rust WS `terminal.create` reject — hoist blanket gate to head of `handle_create` + reconcile permanent-compat doc
+### Task 6: Rust WS `terminal.create`/codingcli reject — raw-Value pre-parse guard at dispatch + reconcile permanent-compat doc
 
 **Files:**
 - Modify: `crates/freshell-ws/src/terminal.rs:693` (insert blanket reject at the EARLIEST post-parse point in the `ClientMessage::TerminalCreate` dispatch arm — BEFORE `create_dedupe.begin` at `:699` and BEFORE `spawn_gated_restore_create` at `:735`, per finding 4: a restore:true codex carrying legacy must be rejected before any disk-gate planning)
@@ -1541,13 +1563,12 @@ Add presence-edge and dual-intent tests (findings 2, 5):
     }
   })
 
-  // ejh6 review round 2 finding 8 (layered WS presence): a NON-STRING legacy
-  // value never reaches the handler — the dynamic `.strict()` schema's
-  // `resumeSessionId: z.string().optional()` fails zod parse first, producing
-  // error{INVALID_MESSAGE} with the parser's generic text (ws-handler.ts:1913-1916).
-  // Pin the CODE loudly, NOT the text (frozen text belongs to string carries).
+  // ejh6 review round 3 finding 1: the raw pre-parse guard intercepts ANY
+  // JSON value with key-presence BEFORE zod ever runs — non-string carries
+  // get the SAME INVALID_MESSAGE + frozen-text envelope as strings on Node
+  // (no generic-text residual). Every value pinned with frozen text.
   it.each([['null', null], ['number', 42], ['object', { nested: true }]])(
-    'rejects non-string resumeSessionId (%s) at the parse boundary with INVALID_MESSAGE', async (_label, val) => {
+    'rejects non-string resumeSessionId (%s) with INVALID_MESSAGE + frozen text (raw guard)', async (_label, val) => {
       const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
       try {
         await waitForOpen(ws)
@@ -1556,7 +1577,11 @@ Add presence-edge and dual-intent tests (findings 2, 5):
         const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
         ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'claude', shell: 'system', resumeSessionId: val }))
         const error = await errorPromise
-        expect(error).toMatchObject({ type: 'error', code: 'INVALID_MESSAGE', requestId })
+        expect(error).toMatchObject({
+          type: 'error', code: 'INVALID_MESSAGE',
+          message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+          requestId,
+        })
         expect(registry.createCalls).toHaveLength(0)
       } finally {
         await closeWebSocket(ws)
@@ -1624,8 +1649,8 @@ import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
     const handler = new WsHandler(server, registry, { codexLaunchPlanner } as never)
     await new Promise<void>((resolve) => server.listen(0, () => resolve()))
     const { port } = server.address() as { port: number }
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       await new Promise<void>((resolve, reject) => {
         ws.on('open', () => {
           ws.send(JSON.stringify({ type: 'hello', token: 'test-token', protocolVersion: WS_PROTOCOL_VERSION }))
@@ -1670,26 +1695,35 @@ Expected: FAIL because the current scoped gate only rejects restore+non-codex+le
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Insert the blanket reject at the VERY TOP of the `case 'terminal.create':` block at `server/ws-handler.ts:2041` (finding 5: BEFORE `recordSessionLifecycleEvent` at `:2048` and BEFORE the `fresh_after_restore_unavailable` validation at `:2060` — so a message carrying both `recoveryIntent` and `resumeSessionId` gets `INVALID_MESSAGE` with frozen text, not `INVALID_CREATE_REQUEST`). Per finding 2: presence check (`!== undefined`), not truthiness (`if (m.resumeSessionId)` would miss `""` and `null`):
+Insert the Node raw pre-parse presence guard in `server/ws-handler.ts` immediately AFTER the JSON.parse of the raw frame and BEFORE `const parsed = this.clientMessageSchema.safeParse(msg)` at `:1913`. This task arms ONLY the `terminal.create` family arm (Tasks 10/11 arm freshAgent.*/codingcli.create). Review round 3 finding 1 motivates the raw placement: the field's typed schema (`z.string().optional()`) rejects `null`/`42` at parse time with GENERIC text, losing the frozen text every string carry deserves — a raw key-presence check intercepts ANY JSON value before that, and its timing also answers finding 5 (a message carrying both `recoveryIntent` and `resumeSessionId` gets `INVALID_MESSAGE` + frozen text, not the `INVALID_CREATE_REQUEST` the recovery-intent validation would have produced) and finding-4-style side-effect-freedom (**BEFORE** `recordSessionLifecycleEvent`).
 
 ```ts
-      case 'terminal.create': {
-        // ejh6 (finding 5): reject the legacy resumeSessionId field at the VERY
-        // TOP, BEFORE recordSessionLifecycleEvent and the fresh_after_restore_
-        // unavailable validation — a message carrying both intents gets
-        // INVALID_MESSAGE with frozen text (the mandatory error wins).
-        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
-        if (m.resumeSessionId !== undefined) {
-          this.sendError(ws, {
-            code: 'INVALID_MESSAGE',
-            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-            requestId: m.requestId,
-          })
-          return
+      // (insertion point: ws-handler.ts immediately before `const parsed = this.clientMessageSchema.safeParse(msg)` at :1913 — msg here is the raw JSON.parse result)
+      // ejh6 (R3) raw pre-parse presence guard: ANY create-class message
+      // carrying a top-level resumeSessionId — string, empty, null, number,
+      // object — is rejected HERE, before zod parse, so the frozen text and
+      // per-family envelope survive every value type (zod would reject
+      // non-strings generically; a typed field reads strings only). The
+      // wire schemas keep the field declared (retention, comments in this
+      // task) — the guard, not the schema, owns the contract.
+      if (typeof msg === 'object' && msg !== null && 'resumeSessionId' in msg) {
+        const rawMsg = msg as Record<string, unknown>
+        switch (rawMsg.type) {
+          case 'terminal.create': {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : undefined,
+            })
+            return
+          }
+          // freshAgent.create / freshAgent.attach armed in Task 10;
+          // codingcli.create armed in Task 11.
         }
-        log.debug({
-          // ... existing code unchanged ...
+      }
 ```
+
+Then remove the now-redundant scoped gates at `:2160-2168` and `:2170-2186` (as before — the raw guard fires long before either).
 
 Add the shared `TerminalCreateSchema` field at `shared/ws-protocol.ts:319-332` (finding 1):
 
@@ -1748,7 +1782,7 @@ git commit -m "feat(ejh6): Node WS terminal.create blanket reject (pre-recovery-
 ### Task 10: Node WS `freshAgent.create`/`freshAgent.attach` reject + ErrorCode enum extension
 
 **Files:**
-- Modify: `server/ws-handler.ts:3424` (head of `freshAgent.create` case — insert reject), `:3543` (head of `freshAgent.attach` case — insert reject)
+- Modify: `server/ws-handler.ts:1913` (the Task-9 raw pre-parse guard — extend with the freshAgent.create/freshAgent.attach arms; replaces the per-door head-of-case inserts)
 - Modify: `shared/ws-protocol.ts:20-37` (`ErrorCode` enum — add `FRESH_AGENT_CREATE_FAILED` per V2 finding: Task 10's `sendError({code:'FRESH_AGENT_CREATE_FAILED',...})` would not typecheck against `ErrorCode` without this addition), `:482,:497` (section 3c doc comments)
 - Test: `test/unit/server/ws-handler-fresh-agent.test.ts` (add legacy-carrying create/attach rejection tests)
 
@@ -1848,47 +1882,37 @@ export const ErrorCode = z.enum([
 
 Use the enum's existing alphabetical or logical ordering convention (inspect the current list at `:20-37` and insert in the appropriate position). The string value `'FRESH_AGENT_CREATE_FAILED'` matches the code family kata §1c names and the code Rust uses in its `FreshAgentCreateFailed` envelope.
 
-Insert at the head of the `freshAgent.create` case at `server/ws-handler.ts:3424` (before the manager-missing check at `:3425`):
+Extend the Task-9 raw pre-parse guard in `server/ws-handler.ts` with the freshAgent arms (R3.1 — the head-of-case layer can't see null/42 carries, and review round 3 finding 1 requires the family envelope on every value type). Replace the Task-9 guard's comment tail with:
 
 ```ts
-      case 'freshAgent.create': {
-        // ejh6: reject the legacy resumeSessionId wire field. The canonical
-        // carrier is sessionRef; resumeSessionId stays declared on the shared
-        // schema solely so the handler can detect-and-reject (see kata ejh6).
-        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
-        if (m.resumeSessionId !== undefined) {
-          this.send(ws, {
-            type: 'freshAgent.create.failed',
-            requestId: m.requestId,
-            code: 'FRESH_AGENT_CREATE_FAILED',
-            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-            retryable: false,
-          })
-          return
+        switch (rawMsg.type) {
+          case 'terminal.create': {
+            // ... unchanged Task-9 arm ...
+          }
+          // Task 10: freshAgent families. Create rides the provider's
+          // create-failed envelope (requestId from the raw frame); attach has
+          // NO requestId — its rejection rides the attach error frame shape
+          // (sendError) with the FRESH_AGENT_CREATE_FAILED family code (kata
+          // §1c names the code family; binding correction D/ruling A
+          // documents the socket-loud/UI-invisible asymmetry).
+          case 'freshAgent.create': {
+            this.send(ws, {
+              type: 'freshAgent.create.failed',
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : '',
+              code: 'FRESH_AGENT_CREATE_FAILED',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              retryable: false,
+            })
+            return
+          }
+          case 'freshAgent.attach': {
+            this.sendError(ws, {
+              code: 'FRESH_AGENT_CREATE_FAILED',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+            })
+            return
+          }
         }
-        const manager = this.freshAgentRuntimeManager
-        // ... rest unchanged ...
-```
-
-Insert at the head of the `freshAgent.attach` case at `server/ws-handler.ts:3543` (before the manager-missing check at `:3544`):
-
-```ts
-      case 'freshAgent.attach': {
-        // ejh6: reject the legacy resumeSessionId wire field. Attach has no
-        // requestId, so the create-failed family rejection rides the existing
-        // attach error frame shape (sendError) with the FRESH_AGENT_CREATE_
-        // FAILED code — the create-failed family code on the attach error
-        // channel (see kata ejh6, binding correction D).
-        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
-        if (m.resumeSessionId !== undefined) {
-          this.sendError(ws, {
-            code: 'FRESH_AGENT_CREATE_FAILED',
-            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-          })
-          return
-        }
-        const manager = this.freshAgentRuntimeManager
-        // ... rest unchanged ...
 ```
 
 Add section 3c doc comments at `shared/ws-protocol.ts:482` (`FreshAgentCreateSchema.resumeSessionId`) and `:497` (`FreshAgentAttachSchema.resumeSessionId`):
@@ -1929,7 +1953,7 @@ git commit -m "feat(ejh6): Node WS freshAgent create/attach reject legacy field"
 
 **Files:**
 - Modify: `shared/ws-protocol.ts:447-458` (`CodingCliCreateSchema` — add `sessionRef`)
-- Modify: `server/ws-handler.ts:802-813` (dynamic codingcli schema — add `sessionRef`), `:808` (section 3c doc comment), `:3290+` (head of `codingcli.create` case — insert reject), `:3318-3326` (promote sessionRef into spawn-time resume id)
+- Modify: `server/ws-handler.ts:802-813` (dynamic codingcli schema — add `sessionRef`), `:808` (section 3c doc comment), `:1913` (the Task-9 raw pre-parse guard — extend with the codingcli.create arm; the reject is config-independent, coordinator ruling J), `:3318-3326` (promote sessionRef into spawn-time resume id)
 - Modify: `crates/freshell-protocol/src/client_messages.rs:429-448` (`CodingCliCreate` — add `session_ref` field; section 3c doc on `resume_session_id`)
 - Modify: `crates/freshell-protocol/tests/roundtrip.rs:309` (extend codingcli roundtrip to include `sessionRef`)
 - Test: `test/server/ws-coding-cli-events.test.ts` (new legacy-reject + sessionRef-promote tests)
@@ -1953,36 +1977,48 @@ Rationale: The spec's scope is `terminal.create`'s spawn-time id, and the sectio
 Add to `test/server/ws-coding-cli-events.test.ts` (model on the existing `createAuthenticatedWs` + `responsePromise` pattern at `:88-128` — that file uses `createAuthenticatedWs()` and `new Promise<any>((resolve) => ws.on('message', ...))`, NOT `connectAndAuth`/`waitForMessage`):
 
 ```ts
-  it('rejects codingcli.create carrying resumeSessionId with INVALID_MESSAGE + frozen text', async () => {
-    // Review round 2 finding 10a: the rejection must ALSO assert no spawn — expose
-    // the suite fake manager's create spy (create the suite's default fake with a
-    // create: vi.fn() spy held in a suite-level binding, or do the same wsHandler
-    // swap the promote test uses; assert `createMock not called` after the error).
-    const ws = await createAuthenticatedWs()
-    const requestId = 'cli-legacy-reject-1'
-    const errorPromise = new Promise<any>((resolve) => {
-      ws.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'error' && msg.requestId === requestId) resolve(msg)
-      })
-    })
-    ws.send(JSON.stringify({
-      type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
-      resumeSessionId: 'legacy-cli-id',
-    }))
-    const error = await errorPromise
-    expect(error).toMatchObject({
-      type: 'error', code: 'INVALID_MESSAGE',
-      message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
-      requestId,
-    })
-    expect(createMock).not.toHaveBeenCalled() // no spawn on reject (finding 10a)
-    ws.close()
-  })
+  // Finding 9 (presence on this door too): it.each over string + empty-string.
+  // Finding 10a + review round 3 finding 5: no spawn on reject, with createMock
+  // DECLARED here and the same mid-test wsHandler swap the promote test uses
+  // (the suite's default is a real manager — never instantiate it, V4).
+  it.each([['string', 'legacy-cli-id'], ['empty-string', '']])(
+    'rejects codingcli.create resumeSessionId (%s) with INVALID_MESSAGE + frozen text and no spawn', async (_label, legacy) => {
+      const createMock = vi.fn()
+      class FakeSession extends EventEmitter {
+        id = 'cli-session-reject'
+        provider = { name: 'claude' }
+      }
+      const fakeManager = {
+        create: (...args: any[]) => { createMock(...args); return new FakeSession() },
+        hasProvider: (name: string) => name === 'claude',
+        get: vi.fn(),
+        remove: vi.fn(),
+      } as unknown as CodingCliSessionManager
+      wsHandler.close()
+      wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
 
-  // Finding 9 (presence on this door too): wrap the rejection test above in
-  // `it.each([['string', 'legacy-cli-id'], ['empty-string', '']])` — an empty
-  // string carries MUST also reject with the frozen text (`!== undefined`).
+      const ws = await createAuthenticatedWs()
+      const requestId = `cli-legacy-reject-${_label}`
+      const errorPromise = new Promise<any>((resolve) => {
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type === 'error' && msg.requestId === requestId) resolve(msg)
+        })
+      })
+      ws.send(JSON.stringify({
+        type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
+        resumeSessionId: legacy,
+      }))
+      const error = await errorPromise
+      expect(error).toMatchObject({
+        type: 'error', code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        requestId,
+      })
+      expect(createMock).not.toHaveBeenCalled() // no spawn on reject
+      ws.close()
+    },
+  )
 
   it('promotes a provider-matched sessionRef into the spawn-time resume id for codingcli.create', async () => {
     // V4: NEVER instantiate a real CodingCliSessionManager + real claudeProvider —
@@ -2145,24 +2181,23 @@ Add `sessionRef` to the dynamic codingcli schema at `server/ws-handler.ts:802-81
     }).strict()
 ```
 
-Insert the reject + promotion at `server/ws-handler.ts:3280` UNCONDITIONALLY FIRST (coordinator ruling J — before the manager-missing check at `:3281-3288`, so the reject is config-independent: `{no manager} + {resumeSessionId}` answers `INVALID_MESSAGE` + frozen text, not `INTERNAL_ERROR`). The reject runs before `endCodingTimer` is defined — move `endCodingTimer` above it OR use a plain `return` (the timer is a perf wrapper; an early reject before it is acceptable and matches Task 10's freshAgent ordering). Concretely, insert at the very head of the `case 'codingcli.create':` block, before the `if (!this.codingCliManager)` check:
+Extend the Task-9 raw pre-parse guard in `server/ws-handler.ts` with the codingcli.create arm (R3.1 + coordinator ruling J: the reject is config-independent — it fires before the manager-missing check exists at the raw layer, so `{no manager} + {resumeSessionId}` answers INVALID_MESSAGE + frozen text, not INTERNAL_ERROR):
+
+```ts
+          case 'codingcli.create': {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : undefined,
+            })
+            return
+          }
+```
+
+The codingcli.create handler case keeps only the PROMOTION (legacy rejection now lives in the raw guard) — at `server/ws-handler.ts:3280` the head of `case 'codingcli.create':` becomes:
 
 ```ts
       case 'codingcli.create': {
-        // ejh6 (coordinator ruling J): reject the legacy resumeSessionId wire
-        // field UNCONDITIONALLY FIRST — before the manager-missing check, so
-        // the reject is config-independent. The canonical carrier is sessionRef;
-        // resumeSessionId stays declared on the schema solely so the handler
-        // can detect-and-reject (see kata ejh6).
-        // LAYERED presence (Global Constraints): `!== undefined` catches any string including ""; null/42 are rejected at the zod parse boundary with INVALID_MESSAGE (generic text).
-        if (m.resumeSessionId !== undefined) {
-          this.sendError(ws, {
-            code: 'INVALID_MESSAGE',
-            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-            requestId: m.requestId,
-          })
-          return
-        }
         if (!this.codingCliManager) {
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
@@ -2312,6 +2347,26 @@ Add to `test/unit/client/lib/pane-reconcile.fresh-agent.test.ts` (per V4: drive 
   })
 ```
 
+And in `test/unit/client/lib/pane-reconcile.test.ts` add the shell boundary case (review round 3, finding 6 — mirrors the server's exclusion):
+
+```ts
+  it('never promotes a shell-mode legacy resumeSessionId (a stateless shell has no durable identity)', () => {
+    let state = emptyPanesState()
+    state = addTerminalPane(state, 'tab_1', 'pane_1', {
+      mode: 'shell', createRequestId: 'req-sh-1',
+      resumeSessionId: 'legacy-shell-id',
+    } as Partial<TerminalPaneContent>)
+
+    const req = buildReconcileRequest(asRootState(state))
+    expect(req).not.toBeNull()
+    const pane = req!.panes.find((p) => p.createRequestId === 'req-sh-1')
+    expect(pane).toBeDefined()
+    expect(pane!.sessionRef).toBeUndefined()
+    expect(pane!.resumeSessionId).toBeUndefined()
+  })
+```
+(Verify the file's terminal-pane fixture helper name before pasting — the existing first test uses the same shape; if it's not `addTerminalPane`, use the file's actual helper.)
+
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/pane-reconcile.test.ts test/unit/client/lib/pane-reconcile.fresh-agent.test.ts --config config/vitest/vitest.config.ts`
@@ -2335,7 +2390,13 @@ function effectiveReconcileSessionRef(
   mode: string,
 ): { provider: string; sessionId: string } | undefined {
   if (sessionRef) return sessionRef
-  if (resumeSessionId) return { provider: mode, sessionId: resumeSessionId }
+  // Mirror the server's promoted_legacy_claim exclusion
+  // (crates/freshell-ws/src/reconcile.rs:~165-177): shell/empty modes NEVER
+  // promote — a stateless shell has no durable identity (review round 3,
+  // finding 6 — the client must match or a stale shell pane becomes a
+  // structured sessionRef{provider:'shell'} and bypasses the server's
+  // fresh-verdict rule).
+  if (resumeSessionId && mode !== 'shell' && mode !== '') return { provider: mode, sessionId: resumeSessionId }
   return undefined
 }
 ```
@@ -2503,9 +2564,22 @@ Run: `npm run check && cargo test --workspace`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 7: Commit the task, then squash behavior commits (R3 finding 2)**
 
-If Step 2 found sweep violations that required fixes, commit those fixes. Otherwise, no commit — the verification task produces no code change.
+If Step 2 found sweep violations that required fixes, commit those fixes first. Otherwise the verification task itself produces no code change.
+
+Then — the kata/User-Request contract requires BOTH servers' rejections (+ the reconcile client promotion, codingcli promotion, and rejection tests) to LAND TOGETHER, not as a sequence of partially-rejecting main-history commits. Task-sequenced commits 5–12 are correct locally for review/TDD, but before the PR opens, squash them into ONE behavior commit. Do it with a soft reset (the branch is unpushed during execution):
+
+```bash
+# Find the first behavior commit (Task 5's) — tasks 1-4 are contract-neutral
+# prep and stay separate:
+BEHAVIOR_BASE=$(git rev-list --max-parents=0 --no-merges HEAD -- server/ crates/ | tail -n +1 >/dev/null; git log --oneline --reverse origin/main..HEAD | awk '/ejh6.*Rust REST reject/{print $1; exit}')
+git reset --soft "${BEHAVIOR_BASE}^"
+git commit -m "feat(ejh6): reject the legacy resumeSessionId wire field on every create-class door (both servers)"
+git rebase origin/main # keep current-base lineage clean; plan docs/commits 1-4 are already behind
+```
+
+(Harness note: capture the Task-5 commit SHA in the progress ledger at Task 5 completion and use it directly rather than re-deriving with the awk above. If the squash reveals a mixed file staged from a prep task, unstage and recommit it separately — the verification gate already ran before this step.)
 
 ```bash
 # Only if sweep fixes were needed:
