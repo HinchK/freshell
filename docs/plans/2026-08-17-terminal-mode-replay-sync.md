@@ -1,4 +1,4 @@
-# Terminal mode replay sync — plan (v5, four load-bearing rounds closed)
+# Terminal mode replay sync — plan (v6, implemented; four load-bearing rounds + hazard resolution)
 
 ## Context
 
@@ -35,6 +35,24 @@ After any browser page load, a pane's xterm is recreated and rehydrated from the
 - **B FALSIFIED → no rescan; keyed rebirth, premise corrected.** Whole-ring rescan would inject old-process modes when the new process is silent. Round-3's premise was itself wrong: candidate-PTY output pre-publication is DROPPED at the registry (guards terminal-registry.ts:3826, :1752), publication+emit are one synchronous block (:3727-3728), and appends stamp the CURRENT identity at call time — ring content is strictly streamId-partitioned, and the production replay already filters to current-stream frames (`filterReplayFramesForStream`, broker.ts:1067-1089). Final rule: on replace, reset tracker to defaults (key (terminalId, streamId); old key dies, new key born — exactly the L5 lifecycle). No retrospective truth exists to lose.
 - **C: survives with two strengthened pins (tests):** `output_frame_meta(&modes_sync).is_none()` at crates/freshell-terminal/src/output_queue.rs (location correction from round 3: freshell-terminal, not freshell-ws) PLUS `ConnectionOutputQueue::route(modes_sync).is_some()` (covers the TerminalExit carve-out refactor path at backpressure.rs).
 - **D small additions:** plan tasks now include threading `surfaceReset` through both servers' attach ingress (ws-handler.ts:2786-2838 structural type + call sites; broker attach signatures; terminal.rs ingress; registry.attach params). Server skips emission when sync data is empty (with completion-clear this is provably safe). Emission keys on `surfaceReset` REGARDLESS of wire intent — hidden fresh surfaces attach as keepalive_delta sinceSeq=0 and must receive sync (background hydration is exactly where recreated hidden panes get modes before reveal).
+
+### Round 5 / implementation-era resolution (hazard closure)
+
+- **xterm 6.0.0 fires an immediate focus report on EVERY `?1004` arm**
+  (InputHandler DECSET-1004 → `_onRequestSendFocus` → `_reportFocus` emits
+  `ESC[I`/`ESC[O` gated only on the surface's current focus class, not on a
+  real transition). Consequences: (a) the sync preamble must NEVER emit
+  `?1004h` — landed as track-but-never-emit in both synthesis sets (README
+  rule 2 updated; fixture f11 + unit expectations carry the rationale);
+  (b) a pre-existing leak where replaying the ORIGINAL arming byte from the
+  retained window re-fires the report — not in this branch's scope; tracked
+  as kata 9gy8.
+- Happy-path e2e claim-count relaxed post-boot supersession: multiple fresh
+  claims are legal (claim clears only on marker completion), assertions pin
+  all-claims-full-hydrate + post-hydration non-claim instead.
+- Renderer-recreate e2e leg folded: construction is a single code site
+  (unit-pinned); e2e covers reload + refresh classes instead. Rust-leg
+  Emitted-sync exclusion verified live for chromium/legacy/rust e2e legs.
 
 ## Design (final)
 
