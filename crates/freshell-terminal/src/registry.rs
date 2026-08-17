@@ -3176,7 +3176,16 @@ mod tests {
 
         // (a) legacy subscriber (no capability) — must get `terminal.output` only.
         let (legacy_sink, legacy_seen) = collector();
-        let _ = reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            legacy_sink,
+            Some("legacy".into()),
+            0,
+            false,
+            None,
+            None,
+        );
         let legacy = outputs(&legacy_seen);
         assert!(
             !legacy.is_empty(),
@@ -3199,7 +3208,16 @@ mod tests {
         // `terminal.output.batch`, reassembling to the SAME bytes, with UTF-16
         // endOffsets and a self-consistent serializedBytes.
         let (batch_sink, batch_seen) = collector();
-        let _ = reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true, None, None);
+        let _ = reg.attach(
+            "T",
+            2,
+            batch_sink,
+            Some("batch".into()),
+            0,
+            true,
+            None,
+            None,
+        );
         let bs = batches(&batch_seen);
         assert!(
             !bs.is_empty(),
@@ -3904,7 +3922,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None); // conn 1 is attached
-                                                                            // conn 2 reconnects with another socket attached and no prior attachment of its own.
+                                                                                  // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
         assert_eq!(out, AttachResizeStatus::Skipped);
         assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
@@ -4024,7 +4042,16 @@ mod tests {
         reg.feed("T", frame(2, "app banner\r\n", "S"));
 
         let (sink, seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("att-1".into()), 0, false, None, Some(true));
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("att-1".into()),
+            0,
+            false,
+            None,
+            Some(true),
+        );
         assert!(outcome.found);
 
         let msgs = seen.lock().unwrap().clone();
@@ -4097,7 +4124,16 @@ mod tests {
         let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None, None);
         // … and explicitly false: no sync either way (fixture f14's gating).
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None, Some(false));
+        let _ = reg.attach(
+            "T",
+            2,
+            sink_b,
+            Some("b".into()),
+            0,
+            false,
+            None,
+            Some(false),
+        );
 
         assert!(modes_syncs(&seen_a).is_empty(), "flag absent => no sync");
         assert!(modes_syncs(&seen_b).is_empty(), "flag false => no sync");

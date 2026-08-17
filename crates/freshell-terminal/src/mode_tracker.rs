@@ -21,7 +21,6 @@
 //! `CSI_PAYLOAD_SUFFIX_LIMIT`, `barrier_scanner.rs`). `U+FFFD` inside a pending
 //! escape ABORTS it and re-enters ground state (it is text, not structure).
 
-
 use indexmap::IndexMap;
 use tracing::warn;
 
@@ -362,7 +361,10 @@ mod tests {
     #[test]
     fn mouse_family_last_wins_including_multi_param_and_family_clear_is_unconditional() {
         // Last-wins across separate sequences.
-        assert_eq!(synth_after(&["\u{1b}[?9h", "\u{1b}[?1002h"]), "\u{1b}[?1002h");
+        assert_eq!(
+            synth_after(&["\u{1b}[?9h", "\u{1b}[?1002h"]),
+            "\u{1b}[?1002h"
+        );
         // Last-wins within ONE multi-param list (f01 shape, isolated).
         assert_eq!(synth_after(&["\u{1b}[?1000;1002;1003h"]), "\u{1b}[?1003h");
         // W-L-W: the reset need not name the leader.
@@ -434,7 +436,12 @@ mod tests {
     fn xtmodifykeys_are_tracked_but_never_emitted() {
         // f08 shape plus the `> Pm ; 0 m` clear form.
         assert_eq!(
-            synth_after(&["\u{1b}[?1000h", "\u{1b}[>4;1m", "\u{1b}[>5;2m", "\u{1b}[>4;m"]),
+            synth_after(&[
+                "\u{1b}[?1000h",
+                "\u{1b}[>4;1m",
+                "\u{1b}[>5;2m",
+                "\u{1b}[>4;m"
+            ]),
             "\u{1b}[?1000h"
         );
         assert_eq!(synth_after(&["\u{1b}[>4;1m", "\u{1b}[>4;0m"]), "");
@@ -498,7 +505,10 @@ mod tests {
 
     #[test]
     fn wraparound_disable_restores_with_trailing_reset() {
-        assert_eq!(synth_after(&["\u{1b}[?7l", "\u{1b}[?1000h"]), "\u{1b}[?1000h\u{1b}[?7l");
+        assert_eq!(
+            synth_after(&["\u{1b}[?7l", "\u{1b}[?1000h"]),
+            "\u{1b}[?1000h\u{1b}[?7l"
+        );
         assert_eq!(synth_after(&["\u{1b}[?7l", "\u{1b}[?7h"]), "\u{1b}[?7h");
     }
 
@@ -582,9 +592,9 @@ mod tests {
     #[test]
     fn pending_carry_beyond_64_code_points_aborts_the_sequence() {
         let long_payload = format!("\u{1b}[?1003{}", ";0".repeat(40)); // ~80 cp of params
-        // Overflow aborts: none of the params in the overlong sequence apply
-        // (the 'h' arrives in ground as text), and the NEXT well-formed
-        // sequence still works.
+                                                                       // Overflow aborts: none of the params in the overlong sequence apply
+                                                                       // (the 'h' arrives in ground as text), and the NEXT well-formed
+                                                                       // sequence still works.
         assert_eq!(
             synth_after(&[&long_payload, "h\u{1b}[?2004h"]),
             "\u{1b}[?2004h"
@@ -656,7 +666,6 @@ mod tests {
     fn mode_preamble_baseline_fixtures_match_expected_synthesis() {
         use std::path::PathBuf;
 
-
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../port/oracle/baselines/mode-preamble");
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -672,8 +681,8 @@ mod tests {
         );
 
         for path in files {
-            let raw =
-                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?} unreadable: {e}"));
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{path:?} unreadable: {e}"));
             let v: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path:?} bad json: {e}"));
             let name = v["name"].as_str().expect("fixture name").to_string();
@@ -684,7 +693,9 @@ mod tests {
                 .map(|c| c.as_str().expect("chunk string"))
                 .collect();
             let surface_reset = v["surfaceReset"].as_bool().expect("surfaceReset bool");
-            let expected = v["expectedSyncData"].as_str().expect("expectedSyncData string");
+            let expected = v["expectedSyncData"]
+                .as_str()
+                .expect("expectedSyncData string");
 
             let mut tracker = ModeTracker::new();
             for chunk in chunks {
@@ -692,7 +703,7 @@ mod tests {
             }
             let synthesized = tracker.synthesize();
 
-if !surface_reset {
+            if !surface_reset {
                 // Server-gating fixture (f14): emission suppression lives in
                 // the registry's attach path, not the tracker. Skip here.
                 continue;
