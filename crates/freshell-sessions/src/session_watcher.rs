@@ -88,35 +88,33 @@ fn make_watcher_callback(
     provider_name: String,
     is_direct: bool,
 ) -> impl Fn(Result<notify::Event, notify::Error>) + Send {
-    move |res: Result<notify::Event, _>| {
-        match res {
-            Ok(event) => {
-                if !is_relevant(&event) {
-                    return;
-                }
-                let rescan = is_direct || event.need_rescan();
-                if rescan {
-                    let _ = tx.send(WatchEvent::ProviderRescan {
-                        provider: provider_name.clone(),
-                    });
-                } else {
-                    for path in &event.paths {
-                        let _ = tx.send(WatchEvent::FileChanged {
-                            path: path.clone(),
-                            provider: provider_name.clone(),
-                        });
-                    }
-                }
+    move |res: Result<notify::Event, _>| match res {
+        Ok(event) => {
+            if !is_relevant(&event) {
+                return;
             }
-            Err(e) => {
-                tracing::warn!(
-                    provider = %provider_name, error = %e,
-                    "session-watcher: watcher error"
-                );
+            let rescan = is_direct || event.need_rescan();
+            if rescan {
                 let _ = tx.send(WatchEvent::ProviderRescan {
                     provider: provider_name.clone(),
                 });
+            } else {
+                for path in &event.paths {
+                    let _ = tx.send(WatchEvent::FileChanged {
+                        path: path.clone(),
+                        provider: provider_name.clone(),
+                    });
+                }
             }
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider_name, error = %e,
+                "session-watcher: watcher error"
+            );
+            let _ = tx.send(WatchEvent::ProviderRescan {
+                provider: provider_name.clone(),
+            });
         }
     }
 }
@@ -273,10 +271,8 @@ async fn run_watcher_loop(
     // File-level events keyed by (path, provider) → last-seen instant.
     let mut pending: HashMap<(PathBuf, String), Instant> = HashMap::new();
     // Providers that need a full rescan (direct-listed change, rescan flag, or error).
-    let mut pending_rescans: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut rearm_interval =
-        tokio::time::interval(Duration::from_secs(rearm_interval_secs));
+    let mut pending_rescans: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rearm_interval = tokio::time::interval(Duration::from_secs(rearm_interval_secs));
     rearm_interval.tick().await; // consume the immediate first tick
 
     loop {
@@ -473,22 +469,19 @@ mod tests {
         )));
         assert!(is_relevant(&data_event));
 
-        let create_event = notify::Event::new(notify::EventKind::Create(
-            notify::event::CreateKind::File,
-        ));
+        let create_event =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File));
         assert!(is_relevant(&create_event));
 
-        let remove_event = notify::Event::new(notify::EventKind::Remove(
-            notify::event::RemoveKind::File,
-        ));
+        let remove_event =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File));
         assert!(is_relevant(&remove_event));
     }
 
     #[test]
     fn is_relevant_rejects_access_events() {
-        let access_event = notify::Event::new(notify::EventKind::Access(
-            notify::event::AccessKind::Read,
-        ));
+        let access_event =
+            notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Read));
         assert!(!is_relevant(&access_event));
     }
 
@@ -671,10 +664,7 @@ mod tests {
         write_claude_session(&claude_home, sid, "/p/rearm");
 
         let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
-        assert!(
-            changed.is_ok(),
-            "re-armed watcher must detect the new file"
-        );
+        assert!(changed.is_ok(), "re-armed watcher must detect the new file");
 
         let mut found = false;
         for _ in 0..20 {

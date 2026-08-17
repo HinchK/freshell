@@ -22,14 +22,14 @@ pub mod amplifier_stub;
 pub mod bundle_config;
 pub mod codex_locator;
 pub mod directory_index;
-pub mod provider_layout;
-pub mod session_watcher;
 pub mod meta;
 pub mod opencode_locator;
 pub mod parse;
+pub mod provider_layout;
 pub mod resume_input;
 pub mod resume_resolve;
 pub mod search;
+pub mod session_watcher;
 pub mod text;
 pub mod time;
 

@@ -204,10 +204,7 @@ impl ProviderLayout for AmplifierLayout {
             Some(p) => p,
             None => return false,
         };
-        sessions_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            == Some("sessions")
+        sessions_dir.file_name().and_then(|n| n.to_str()) == Some("sessions")
     }
 }
 
@@ -255,9 +252,7 @@ mod tests {
     #[test]
     fn claude_layout_rejects_non_jsonl() {
         let layout = ClaudeLayout;
-        assert!(!layout.qualifies(Path::new(
-            "/home/user/.claude/projects/myproj/abc-123.json"
-        )));
+        assert!(!layout.qualifies(Path::new("/home/user/.claude/projects/myproj/abc-123.json")));
     }
 
     #[test]
@@ -289,7 +284,9 @@ mod tests {
 
     #[test]
     fn codex_layout_qualifies_any_depth_jsonl() {
-        assert!(CodexLayout.qualifies(Path::new("/home/user/.codex/sessions/2026/08/16/rollout.jsonl")));
+        assert!(CodexLayout.qualifies(Path::new(
+            "/home/user/.codex/sessions/2026/08/16/rollout.jsonl"
+        )));
         assert!(CodexLayout.qualifies(Path::new("/home/user/.codex/sessions/flat.jsonl")));
     }
 

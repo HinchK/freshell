@@ -1251,8 +1251,7 @@ impl SessionIndex {
                 } else {
                     let sp: HashMap<PathBuf, String> =
                         dirty_paths.lock().unwrap().drain().collect();
-                    let sprov: HashSet<String> =
-                        dirty_providers.lock().unwrap().drain().collect();
+                    let sprov: HashSet<String> = dirty_providers.lock().unwrap().drain().collect();
                     (sp, sprov)
                 };
                 let mut cache = file_cache.lock().unwrap();
@@ -1333,9 +1332,9 @@ impl SessionIndex {
             let _ = change_tx.send_modify(|gen| *gen += 1);
         }
         // Opportunistic persistence: gated (threshold/debounce) and, when
-          // warranted, saved via a DETACHED task -- never awaited here, so
-          // neither an HTTP request handler NOR this refresh itself is
-          // delayed by a disk write.
+        // warranted, saved via a DETACHED task -- never awaited here, so
+        // neither an HTTP request handler NOR this refresh itself is
+        // delayed by a disk write.
         if let Some((path, cache_snapshot)) = take_pending_save_from_parts(
             &persist_path,
             &persist_state,
@@ -1443,10 +1442,7 @@ fn parse_scoped_path(
     provider_hint: Option<&str>,
 ) -> (Option<IndexedSession>, Option<String>) {
     if let Some(name) = provider_hint {
-        if let Some(source) = sources
-            .iter()
-            .find(|s| s.provider_name() == Some(name))
-        {
+        if let Some(source) = sources.iter().find(|s| s.provider_name() == Some(name)) {
             return (source.parse(path), Some(name.to_owned()));
         }
     }
@@ -1455,10 +1451,7 @@ fn parse_scoped_path(
             continue;
         }
         if let Some(item) = source.parse(path) {
-            return (
-                Some(item),
-                source.provider_name().map(str::to_owned),
-            );
+            return (Some(item), source.provider_name().map(str::to_owned));
         }
     }
     (None, None)
@@ -4959,7 +4952,11 @@ mod tests {
         let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(3600));
 
         let _ = index.snapshot().await;
-        assert_eq!(discover_calls.load(Ordering::SeqCst), 1, "warm = 1 discover");
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "warm = 1 discover"
+        );
 
         // Rewrite the file to change mtime/size.
         write_session_file(
@@ -5064,19 +5061,12 @@ mod tests {
         index.mark_dirty(&[(deleted_path, "claude".to_string())]);
 
         // Wait for the scoped refresh to process the deletion.
-        let settled = wait_until(Duration::from_secs(2), || {
-            !index.has_dirty()
-        })
-        .await;
+        let settled = wait_until(Duration::from_secs(2), || !index.has_dirty()).await;
         assert!(settled, "dirty flag must clear");
 
         // Force a snapshot read (the background refresh already ran).
         let snap2 = index.snapshot().await;
-        assert_eq!(
-            snap2.len(),
-            1,
-            "deleted file must be removed from snapshot"
-        );
+        assert_eq!(snap2.len(), 1, "deleted file must be removed from snapshot");
 
         std::fs::remove_dir_all(&claude_home).ok();
     }
