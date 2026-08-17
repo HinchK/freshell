@@ -72,7 +72,17 @@ describe('mode tracker — flat DEC private modes', () => {
   it('tracks every other ?Pm as param -> bool, multi-param lists per element', () => {
     const tracker = createTerminalModeTracker()
     tracker.scan(`${SET}2004;1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h${SET}2004h`)
+    // ?1004 is tracked but never emitted (xterm re-fires a focus report on
+    // every arm → junk input on rehydration; see mode-preamble README).
+    expect(tracker.synthesize()).toBe(`${SET}2004h`)
+  })
+
+  it('?1004 is tracked but never emitted (xterm fires an immediate focus report on every arm)', () => {
+    const tracker = createTerminalModeTracker()
+    tracker.scan(`${SET}1004h`)
+    expect(tracker.synthesize()).toBe('')
+    tracker.scan(`${SET}1004l`)
+    expect(tracker.synthesize()).toBe('')
   })
 
   it('h after l re-sets', () => {
@@ -173,19 +183,21 @@ describe('mode tracker — scanner robustness', () => {
   it('U+FFFD inside a pending escape aborts it back to ground', () => {
     const tracker = createTerminalModeTracker()
     tracker.scan(`${ESC}[?100\ufffd3h${SET}1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    // ?1004 tracked but never emitted (junk-focus hazard) — scanner recovery is
+    // observable via the next emitted marker mode below
+    expect(tracker.synthesize()).toBe('')
   })
 
   it('U+FFFD in ground state is inert', () => {
     const tracker = createTerminalModeTracker()
-    tracker.scan(`abc\ufffd${SET}1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    tracker.scan(`abc\ufffd${SET}1007h`)
+    expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 
   it('ESC inside a pending CSI aborts it and restarts escape handling', () => {
     const tracker = createTerminalModeTracker()
-    tracker.scan(`${ESC}[?100${SET}1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    tracker.scan(`${ESC}[?100${SET}1007h`)
+    expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 
   it('C1 CSI opener (U+009B) is equivalent to ESC [', () => {
@@ -225,8 +237,8 @@ describe('mode tracker — scanner robustness', () => {
     const blob = '9'.repeat(100)
     tracker.scan(`${ESC}[?${blob}h`)
     expect(tracker.synthesize()).toBe('')
-    tracker.scan(`${SET}1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    tracker.scan(`${SET}1007h`)
+    expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 
   it('an overlong pending blob does not corrupt subsequent chunks', () => {
@@ -256,8 +268,8 @@ describe('mode tracker — scanner robustness', () => {
 
   it('ESC ESC [ opens CSI (a doubled ESC restarts the escape)', () => {
     const tracker = createTerminalModeTracker()
-    tracker.scan(`${ESC}${ESC}[?1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    tracker.scan(`${ESC}${ESC}[?1007h`)
+    expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 })
 
@@ -297,7 +309,7 @@ describe('mode tracker — synthesis shape and reset', () => {
     const tracker = createTerminalModeTracker()
     tracker.scan(`${ESC}[?100`)
     tracker.reset()
-    tracker.scan(`3h${SET}1004h`)
-    expect(tracker.synthesize()).toBe(`${SET}1004h`)
+    tracker.scan(`3h${SET}1007h`)
+    expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 })

@@ -62,7 +62,16 @@ const CURSOR_VISIBILITY_MODE = 25
 // ?2026 (synchronized output) is a per-frame rendering hint: re-arming it on a
 // wedged mid-frame state could stall paints, and its absence is never a
 // user-visible regression, so it is tracked but never synthesized.
-const NEVER_EMITTED_FLAT_MODES = new Set([2026])
+//
+// ?1004 (focus in/out reporting) is tracked but never synthesized for a
+// harder reason: xterm 6.0.0 fires onRequestSendFocus on EVERY arm
+// (InputHandler DECSET-1004 case), and _reportFocus immediately emits
+// ESC[I/ESC[O gated only on the surface's current focus class. Re-arming
+// from the preamble on a fresh FOCUSED surface would deterministically
+// inject a junk focus report into the app's stdin (caught by the
+// multi-client hazard e2e). Apps that want focus reporting can re-arm;
+// bash/vim/opencode do not arm 1004 in practice.
+const NEVER_EMITTED_FLAT_MODES = new Set([2026, 1004])
 
 const DEC_PRIVATE_BODY_PATTERN = /^[0-9;]*$/
 const XTM_BODY_PATTERN = /^[0-9;]*$/

@@ -62,6 +62,12 @@ const CURSOR_VISIBILITY: u32 = 25;
 /// rendering hint; arming a wedge-prone mid-frame state on a fresh surface
 /// could stall paints; absence is never a user-visible regression).
 const SYNCHRONIZED_OUTPUT: u32 = 2026;
+/// `?1004` (focus in/out reporting) is tracked but never replayed: xterm
+/// 6.0.0 fires `onRequestSendFocus` on EVERY arm (`InputHandler` DECSET 1004
+/// case) and `_reportFocus` then immediately emits `ESC[I`/`ESC[O` gated only
+/// on the surface's focus class — arming from the preamble on a fresh focused
+/// surface deterministically injects junk into the app's stdin.
+const SEND_FOCUS: u32 = 1004;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
@@ -298,7 +304,7 @@ impl ModeTracker {
         }
         let cursor_hidden = matches!(self.flat.get(&CURSOR_VISIBILITY), Some(false));
         for (&pm, &on) in &self.flat {
-            if on && pm != SYNCHRONIZED_OUTPUT {
+            if on && pm != SYNCHRONIZED_OUTPUT && pm != SEND_FOCUS {
                 enables.push(pm);
             }
         }
@@ -478,6 +484,18 @@ mod tests {
         assert_eq!(synth_after(&["\u{1b}[?1004h", "\u{9b}!p"]), "");
     }
 
+    #[test]
+    fn send_focus_is_tracked_but_never_emitted() {
+        // ?1004h arms DEC "send focus" mode, and xterm 6.0.0 fires an
+        // IMMEDIATE focus report (ESC[I on a focused surface) on every arm —
+        // replaying it from the preamble deterministically injects junk into
+        // the app's stdin. Tracked for fidelity, never synthesized.
+        assert_eq!(synth_after(&["\u{1b}[?1004h"]), "");
+        // still tracked: DECSTR deletes it from the flat map (harmless),
+        // and clearing it is also never emitted.
+        assert_eq!(synth_after(&["\u{1b}[?1004h", "\u{1b}[?1004l"]), "");
+    }
+
     // ── Scanner mechanics ────────────────────────────────────────────────
 
     #[test]
@@ -515,7 +533,7 @@ mod tests {
                 "\u{fffd}\u{1b}[?10",
                 "06h",
             ]),
-            "\u{1b}[?1004h\u{1b}[?1006h"
+            "\u{1b}[?1006h"
         );
         // Ground-state U+FFFD in isolation is harmless text.
         assert_eq!(synth_after(&["plain \u{fffd} text"]), "");

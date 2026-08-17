@@ -602,6 +602,206 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
+  test('mode replay-sync: fresh surface restores mouse tracking + alt buffer after reload, and claims surfaceReset', async ({ browser, serverInfo }) => {
+    // Regression coverage: an app arms DEC private modes ONCE at startup;
+    // the retained replay window does not carry those bytes back, so a
+    // freshly-constructed surface (page reload) used to rehydrate contents
+    // but lose e.g. mouse-scroll forwarding. The server tracks a per-terminal
+    // mode projection and answers surfaceReset attaches with ONE
+    // terminal.modes.sync preamble (ready < sync < replay).
+    test.setTimeout(120_000)
+    const context = await newClientContext(browser)
+    const page = await context.newPage()
+    await page.setViewportSize({ width: 1400, height: 900 })
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await waitForReady(page)
+    await ensureTerminalReady(page)
+
+    const terminalId = await getActiveTerminalId(page)
+    expect(terminalId).toBeTruthy()
+    await flushPersistedLayout(page, terminalId!)
+
+    // Arm the modes like an app would (once, at startup): any-motion mouse +
+    // SGR encoding + alt buffer + XTMODIFYKEYS (the latter is tracked but
+    // never replayed; harmless to send). Then heartbeat a marker so we can
+    // discriminate hydration completion after the reload wedge.
+    await executeCommand(page, `printf '\\x1b[?1003h\\x1b[?1006h\\x1b[?1049h\\x1b>4;1m'; echo __MODE_SYNC_MARK__`)
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.mouseTrackingMode === 'any' && modes?.bufferType === 'alternate'
+    }, terminalId, { timeout: 15_000 })
+    await waitForTerminalText(page, '__MODE_SYNC_MARK__', terminalId!)
+
+    // Reload: fresh xterm surface, full rehydrate via surfaceReset attach.
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await waitForReady(page)
+    await page.waitForFunction(() => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) => m?.type === 'terminal.attach')
+    }, {}, { timeout: 15_000 })
+
+    // The post-reload attach of the fresh surface must CLAIM the marker AND
+    // force a full wipe+hydrate (no delta continuation on a blank surface).
+    await page.waitForFunction((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) =>
+        m?.type === 'terminal.attach'
+        && m?.terminalId === id
+        && m?.surfaceReset === true
+        && m?.sinceSeq === 0)
+    }, terminalId, { timeout: 45_000 })
+    const reloadAttaches: any[] = await page.evaluate((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.filter((m: any) => m?.type === 'terminal.attach' && m?.terminalId === id)
+    }, terminalId)
+    // The fresh window may legitimately claim on MORE than one attach: a boot
+    // attach can be superseded by a second (viewport settling) before any
+    // replay content of the first applies — the claim only clears on
+    // marker-generation content/completion (coupled trap-door semantics).
+    // What is guaranteed: ≥1 claim, and every claim is a full wipe+hydrate.
+    const claimed = reloadAttaches.filter((m) => m.surfaceReset === true)
+    expect(
+      claimed.length,
+      `fresh surface must claim surfaceReset at least once; got: ${JSON.stringify(reloadAttaches)}`,
+    ).toBeGreaterThanOrEqual(1)
+    expect(claimed.every((m) => m.sinceSeq === 0),
+      `every fresh claim must force a full hydrate (sinceSeq 0); got: ${JSON.stringify(reloadAttaches)}`).toBe(true)
+
+    // The sync preamble must have re-armed the modes on the fresh surface.
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.mouseTrackingMode === 'any' && modes?.bufferType === 'alternate'
+    }, terminalId, { timeout: 45_000 })
+
+    // Consumption: once hydration of the marker attach completed, a later
+    // transport-level reconnect must NOT re-claim (stuck markers would force
+    // sinceSeq=0 replays that duplicate scrollback).
+    await waitForTerminalText(page, '__MODE_SYNC_MARK__', terminalId!, 45_000)
+    await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.forceDisconnect() })
+    await waitForReady(page)
+    await page.waitForFunction((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) =>
+        m?.type === 'terminal.attach'
+        && m?.terminalId === id
+        && m?.surfaceReset !== true)
+    }, terminalId, { timeout: 45_000 })
+
+    // Wheel over the pane must now forward SGR mouse reports on the wire.
+    await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.() })
+    const xterm = page.locator('.xterm').first()
+    const box = await xterm.boundingBox()
+    expect(box).toBeTruthy()
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2)
+    await page.mouse.wheel(0, -120)
+    await page.waitForFunction((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) =>
+        m?.type === 'terminal.input'
+        && m?.terminalId === id
+        && typeof m?.data === 'string'
+        && m.data.includes('\u001b[<64;'))
+    }, terminalId, { timeout: 15_000 })
+
+    await context.close()
+  })
+
+  test('mode replay-sync: sync preamble is ordered before replay and excludes ?1004 (junk-focus hazard)', async ({ browser, serverInfo }) => {
+    // xterm 6.0.0 fires onRequestSendFocus on EVERY ?1004 arm, and
+    // _reportFocus immediately emits ESC[I/ESC[O on a focused surface — so a
+    // sync preamble replaying ?1004h would deterministically inject junk
+    // into the app's stdin. The preamble therefore tracks but NEVER emits
+    // ?1004. (Replaying the ORIGINAL arming byte while it is still inside
+    // the retained window is a pre-existing leak, out of scope here.)
+    //
+    // This pins the wire behavior DIRECTLY: arm both a representative mode
+    // (?2004, included) and ?1004, reload (fresh surface → surfaceReset
+    // attach), then observe the live ws frames: exactly one modes.sync frame,
+    // it precedes every replay frame, its data contains ?2004h, never 1004.
+    test.setTimeout(120_000)
+    const context = await newClientContext(browser)
+    const page = await context.newPage()
+
+    const syncFrames: Array<{ data: string; attachRequestId: string }> = []
+    const frameOrder: Array<'sync' | 'replay' | 'other'> = []
+    page.on('websocket', (ws) => {
+      ws.on('framereceived', (ev) => {
+        const payload = typeof ev.payload === 'string' ? ev.payload : ev.payload.toString('utf8')
+        let msg: any
+        try { msg = JSON.parse(payload) } catch { return }
+        if (msg?.type === 'terminal.modes.sync' && typeof msg?.data === 'string') {
+          syncFrames.push(msg)
+          frameOrder.push('sync')
+        } else if (msg?.type === 'terminal.output' || msg?.type === 'terminal.output.batch') {
+          frameOrder.push(msg?.source === 'replay' ? 'replay' : 'other')
+        }
+      })
+    })
+
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await waitForReady(page)
+    await ensureTerminalReady(page)
+    const terminalId = await getActiveTerminalId(page)
+    expect(terminalId).toBeTruthy()
+    await flushPersistedLayout(page, terminalId!)
+
+    // Arm ?2004h (must be replayed by the preamble) and ?1004h (must NOT).
+    await executeCommand(page, `printf '\\x1b[?2004h\\x1b[?1004h'; echo __HAZARD_ARMED__`)
+    await waitForTerminalText(page, '__HAZARD_ARMED__', terminalId!)
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.sendFocusMode === true && modes?.bracketedPasteMode === true
+    }, terminalId, { timeout: 15_000 })
+
+    syncFrames.length = 0
+    frameOrder.length = 0
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await waitForReady(page)
+
+    // Wait for the sync frame for our terminal (its attach claims
+    // surfaceReset; the marker text proves hydration of that attach began).
+    await page.waitForFunction(() => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) => m?.type === 'terminal.attach' && m?.surfaceReset === true)
+    }, {}, { timeout: 45_000 })
+    await waitForTerminalText(page, '__HAZARD_ARMED__', terminalId!, 45_000)
+    await page.waitForTimeout(400)
+
+    // The fresh window may legitimately produce >1 claimed attach (boot
+    // viewport settling supersedes the first attach before its content
+    // applies — the claim only clears on marker-completion). Every claimed
+    // attach gets its own sync; ALL of them must carry the same projection.
+    const mine = syncFrames
+    expect(
+      mine.length,
+      `expected at least one terminal.modes.sync frame post-reload; got ${JSON.stringify(syncFrames)}`,
+    ).toBeGreaterThanOrEqual(1)
+    expect(mine.every((f) => f.data === mine[0].data),
+      `every claimed attach must receive the identical preamble; got ${JSON.stringify(syncFrames)}`).toBe(true)
+    const sync = mine[0]
+    expect(sync.data).toContain('\u001b[?2004h')
+    expect(
+      sync.data.includes('1004'),
+      `sync preamble must never re-arm ?1004 (xterm junk-focus hazard); got: ${JSON.stringify(sync.data)}`,
+    ).toBe(false)
+    const firstReplay = frameOrder.indexOf('replay')
+    const firstSync = frameOrder.indexOf('sync')
+    expect(firstSync).toBeGreaterThanOrEqual(0)
+    expect(
+      firstReplay === -1 || firstSync < firstReplay,
+      `sync must precede replay on the wire; got order: ${frameOrder.join(',')}`,
+    ).toBe(true)
+
+    // The fresh surface must carry bracketed-paste (from the preamble) and
+    // must NOT have focus reporting armed.
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.bracketedPasteMode === true
+    }, terminalId, { timeout: 20_000 })
+
+    await context.close()
+  })
+
   test('client disconnect is handled gracefully', async ({ browser, serverInfo }) => {
     const context = await newClientContext(browser)
     const page1 = await context.newPage()

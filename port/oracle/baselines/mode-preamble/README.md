@@ -24,7 +24,10 @@ state (it is text, not structure).
   leader's literal bytes (emit-as-tracked).
 - **flat DEC private modes**: every other `?Pm` seen, param → bool
   (h sets, l clears). Multi-param lists apply per element. `?25` is special
-  only at synthesis time (below). `?2026` is tracked but never emitted.
+  only at synthesis time (below). `?2026` and `?1004` are tracked but never
+  emitted (`?1004` because xterm 6.0.0 fires an immediate focus report on
+  EVERY arm — replaying it would deterministically inject `ESC[I` junk into
+  the app's stdin on a fresh focused surface; caught by the hazard e2e).
 - **XTMODIFYKEYS resource map**: `CSI > Pm ; Pv m` sets resource Pm=Pv;
   `CSI > Pm ; m` or `CSI > Pm ; 0 m` sets Pv=0 (clear). Tracked for fidelity,
   never emitted (xterm 6.0.0 has no modifyOtherKeys handling).
@@ -43,7 +46,8 @@ state (it is text, not structure).
 
 1. Collect enables: protocol slot leader, encoding slot leader, alt leader,
    every flat param with value true.
-2. Emit ascending numeric order as `ESC [ ? Pm h`.
+2. Emit ascending numeric order as `ESC [ ? Pm h`, EXCLUDING `?2026` and
+   `?1004` (see above).
 3. If `?25` is explicitly tracked as FALSE, append `ESC [ ? 2 5 l` after all
    enables (default surface is cursor-visible; an explicit `?25h` is emitted
    like any other enable when tracked as true).
