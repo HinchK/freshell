@@ -693,6 +693,43 @@ async fn main() -> ExitCode {
         ]))
     });
 
+    // Start the session-directory file watcher. This replaces the continuous
+    // 1s-TTL polling with event-driven inotify watching. The TTL (now 15
+    // minutes) serves as a reconciliation sweep for the ~1.8% of events
+    // the watcher misses.
+    // Session-directory watcher — must live for the process lifetime (dropping
+    // the SessionWatcher sends the stop signal, killing the watcher loop).
+    let _session_watcher = if let Some(ref index) = session_index {
+        session_directory::provider_home().map(|home| {
+            let providers = vec![
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::ClaudeLayout),
+                    home: session_directory::claude_home(&home),
+                },
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::CodexLayout),
+                    home: session_directory::codex_home(&home),
+                },
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::OpencodeLayout),
+                    home: freshell_sessions::parse::default_opencode_data_home(),
+                },
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::AmplifierLayout),
+                    home: freshell_sessions::amplifier::amplifier_home(&home),
+                },
+            ];
+            let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
+                Arc::clone(index),
+                providers,
+            );
+            watcher.start();
+            watcher
+        })
+    } else {
+        None
+    };
+
     // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
     // registry tap (installed right below), broadcasts *.activity.updated /
     // terminal.turn.complete / terminal.idle on the shared bus, and answers
@@ -2245,10 +2282,12 @@ fn transcript_definitively_absent(
     provider: &str,
     session_id: &str,
 ) -> bool {
+    use freshell_sessions::provider_layout::ProviderLayout;
     match provider {
         "claude" => {
             // ~/.claude/projects/<proj>/<session_id>.jsonl — any match means present.
-            let projects = home.join(".claude").join("projects");
+            let projects = freshell_sessions::provider_layout::ClaudeLayout
+                .session_root(&session_directory::claude_home(home));
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
@@ -2269,7 +2308,8 @@ fn transcript_definitively_absent(
         "codex" => {
             // ~/.codex/sessions/** rollout files carry the session UUID in the
             // filename — walk and match (bounded: sessions tree only).
-            let root = home.join(".codex").join("sessions");
+            let root = freshell_sessions::provider_layout::CodexLayout
+                .session_root(&session_directory::codex_home(home));
             if !root.is_dir() {
                 return false; // unreadable/missing home => defer
             }
@@ -2282,7 +2322,8 @@ fn transcript_definitively_absent(
             // as-is when set and non-empty, else `<home>/.amplifier`;
             // `AMPLIFIER_HOME` is never consulted broker-side) main.rs
             // already computes for the `AmplifierSource` construction above.
-            let projects = freshell_sessions::amplifier::amplifier_home(home).join("projects");
+            let projects = freshell_sessions::provider_layout::AmplifierLayout
+                .session_root(&freshell_sessions::amplifier::amplifier_home(home));
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
@@ -2402,12 +2443,14 @@ fn resolve_client_dir() -> PathBuf {
     PathBuf::from("dist/client")
 }
 
-/// SESSION-09 sweep cadence: >= `SessionIndex`'s own TTL (`DEFAULT_TTL`, 1s)
-/// so every tick's `snapshot()` call re-validates the on-disk corpus rather
-/// than reading a stale cached snapshot. See [`spawn_sessions_sweep`]'s doc
-/// comment for the full rationale (why a plain interval poll substitutes for
-/// legacy's filesystem watcher, and why 2s also subsumes legacy's ~150ms
-/// coalescing window).
+/// SESSION-09 sweep cadence (identity ticker fallback). The sessions sweep is
+/// now event-driven: `SessionWatcher` feeds inotify events into the index's
+/// dirty-marking, and `subscribe_changes()` wakes the sweep loop on each
+/// refresh. This interval serves as an identity-ticker fallback — it fires
+/// a `snapshot()` every 2s so that terminal identity and session metadata
+/// changes propagate to the sidebar without waiting for the index's
+/// 15-minute TTL (`DEFAULT_TTL`). The watcher handles the ~98.2% of
+/// filesystem events it catches; this ticker and the TTL cover the rest.
 const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// The opencode/codex locators' poll cadence. Well under their ~2s
@@ -2471,9 +2514,9 @@ const IDENTITY_INVARIANT_SWEEP_INTERVAL: std::time::Duration = std::time::Durati
 ///    to leave both `len()` and the max `lastActivityAt` unchanged, this
 ///    signature cannot distinguish the pre/post corpus. This requires a
 ///    coincidental timestamp match across two unrelated sessions landing in
-///    the same tick -- accepted as out of scope for a v1 poll-based sweep;
-///    a filesystem watcher (not introduced here, see the FENCE note below)
-///    would not have this gap either.
+///    the same tick -- accepted as out of scope. Note: the SessionWatcher
+///    still triggers the same signature-based broadcast; it does not close
+///    this gap on its own.
 ///
 /// 3. **External-process override edits (bake-in with the legacy Node
 ///    server writing the SAME `config.json`) -- ACCEPTED for bake-in.** The
@@ -2536,62 +2579,59 @@ fn sessions_sweep_signature(
     (items.len(), max_last_activity_at, hasher.finish())
 }
 
-/// SESSION-09: periodic sweep that detects session-directory changes and
-/// broadcasts `sessions.changed` so the sidebar (`src/App.tsx:924-932`)
-/// refetches its active session window WITHOUT a page reload. Legacy's
-/// `SessionsSyncService` (`server/sessions-sync/service.ts:31-73`) watches
-/// the directory with a real filesystem watcher and coalesces bursts of
-/// writes into ONE broadcast (a ~150ms debounce); this port has no
-/// filesystem watcher wired to the session directory (see
-/// `freshell_sessions::directory_index` module docs -- the index is
-/// request-pull / TTL-refreshed, not push-driven), so this sweep
-/// substitutes a plain `tokio::time::interval` poll for "was there a
-/// change" instead.
+/// SESSION-09: event-driven sweep that detects session-directory changes and
+/// broadcasts `sessions.changed` so the sidebar refetches its active session
+/// window WITHOUT a page reload.
 ///
-/// The interval (`SESSIONS_SWEEP_INTERVAL`, 2s) is deliberately >= the
-/// `SessionIndex`'s own TTL (1s) so every tick's `snapshot()` call
-/// re-validates the corpus against disk -- a cheap stat-only pass over
-/// every file when nothing changed (see the incremental-cache design on
-/// `SessionIndex`'s module doc: only a file whose `(mtime, size)` changed
-/// since the last sweep gets re-parsed; an unchanged file costs one
-/// `fs::metadata` call, not a re-read + re-parse). The 2s cadence also
-/// subsumes legacy's ~150ms coalescing window: any burst of writes that
-/// lands inside one tick collapses into a single broadcast -- same end
-/// result, coarser granularity.
+/// Two wake sources:
+/// 1. `subscribe_changes()` — the SessionWatcher feeds inotify events into
+///    SessionIndex::mark_dirty, which bumps the change generation. This
+///    covers ~98.2% of file changes with sub-second latency.
+/// 2. A 2s identity ticker — terminal identity changes (provider/session_id
+///    bindings) don't flow through the file watcher, so we poll for them.
 ///
-/// `MissedTickBehavior::Skip` (rather than tokio's default `Burst`): if a
-/// tick is delayed (e.g. the sweep's own `snapshot()` call runs long on an
-/// exceptionally large corpus), catch up by skipping the missed ticks
-/// instead of firing them back-to-back -- there's nothing to gain from
-/// re-sweeping the same on-disk state twice in quick succession.
-///
-/// Seeds `last_token` from a snapshot taken BEFORE the loop starts so boot
-/// never emits a spurious broadcast: the client's own initial HTTP fetch
-/// already reflects this exact corpus, so a `sessions.changed` firing
-/// immediately after boot would trigger a redundant (harmless but
-/// wasteful) refetch.
-///
-/// FENCE: no filesystem watcher (inotify/`notify`) is introduced here, and
-/// `freshell_sessions::directory_index`'s internals are untouched -- this
-/// function only calls the existing public `SessionIndex::snapshot()` API.
+/// NOTE: The FENCE prohibiting filesystem watchers in this function is now
+/// superseded — the SessionWatcher (started above) feeds inotify events
+/// into SessionIndex::mark_dirty, and this sweep subscribes to
+/// snapshot-change notifications instead of polling.
 fn spawn_sessions_sweep(
     session_index: Arc<freshell_sessions::directory_index::SessionIndex>,
     ws_state: WsState,
     identity: freshell_ws::identity::TerminalIdentityRegistry,
-    interval: std::time::Duration,
+    _interval: std::time::Duration, // kept for API compat; ignored
 ) {
     tokio::spawn(async move {
+        let mut rx = session_index.subscribe_changes();
         let mut last_signature =
             sessions_sweep_signature(&session_index.snapshot().await, &identity.list());
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Also check identity changes on a slower interval (identities
+        // don't flow through the file watcher).
+        let mut identity_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        identity_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            ticker.tick().await;
-            let items = session_index.snapshot().await;
-            let signature = sessions_sweep_signature(&items, &identity.list());
-            if signature != last_signature {
-                last_signature = signature;
-                freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
+            tokio::select! {
+                result = rx.changed() => {
+                    if result.is_err() {
+                        break; // sender dropped
+                    }
+                    let items = session_index.snapshot().await;
+                    let signature = sessions_sweep_signature(&items, &identity.list());
+                    if signature != last_signature {
+                        last_signature = signature;
+                        freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
+                    }
+                }
+                _ = identity_ticker.tick() => {
+                    // Check if identity changes alone moved the signature.
+                    let items = session_index.snapshot().await;
+                    let signature = sessions_sweep_signature(&items, &identity.list());
+                    if signature != last_signature {
+                        last_signature = signature;
+                        freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
+                    }
+                }
             }
         }
     });

@@ -504,23 +504,47 @@ fn overlay_session_title(
         .or_else(|| parsed_title.map(str::to_string))
 }
 
-/// The background loop — same shape as `spawn_sessions_sweep` (main.rs):
-/// `tokio::time::interval` with `MissedTickBehavior::Skip`; per tick,
-/// snapshot the index with the SAME accessor (`SessionIndex::snapshot`),
-/// map `IndexedSession` -> [`SweepSession`] (the `title` is the
-/// OVERRIDE-APPLIED title via [`overlay_session_title`], which mirrors
-/// `applyOverride`'s provider-generated suppression), then
-/// [`run_auto_title_pass`].
+/// The background loop — subscribes to `SessionIndex::subscribe_changes()`
+/// notifications (fed by the SessionWatcher's inotify events) and runs the
+/// auto-title pass on each change. Throttled to at most once per 5s to
+/// avoid hammering the Gemini API during rapid file activity. Also wakes
+/// periodically (every 5s) to catch non-index-driven changes like terminal
+/// identity updates and settings changes.
+///
+/// The `_interval` parameter is kept for API compatibility but ignored;
+/// the sweep's cadence is now driven by change notifications + the 5s
+/// minimum interval.
 pub fn spawn_auto_title_sweep(
     state: AutoTitleSweepState,
     index: Arc<freshell_sessions::directory_index::SessionIndex>,
-    interval: std::time::Duration,
+    _interval: std::time::Duration, // kept for API compat
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rx = index.subscribe_changes();
+        // Minimum interval between auto-title passes. 5s balances
+        // responsiveness (terminal identity changes, settings) against
+        // API rate pressure (Gemini title generation).
+        let min_interval = std::time::Duration::from_secs(5);
+        let mut last_run = tokio::time::Instant::now() - min_interval;
+
         loop {
-            ticker.tick().await;
+            // Wait for either a change notification or the minimum interval.
+            tokio::select! {
+                result = rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(min_interval) => {}
+            }
+
+            // Throttle: don't run more often than min_interval.
+            let elapsed = last_run.elapsed();
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+
+            last_run = tokio::time::Instant::now();
             let items = index.snapshot().await;
             let overrides = state.settings.session_overrides();
             let sessions: Vec<SweepSession> = items

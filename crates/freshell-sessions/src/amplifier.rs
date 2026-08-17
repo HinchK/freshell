@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use crate::directory_index::{FileStat, IndexedSession, SessionSource};
 use crate::meta::ParsedSessionMeta;
+use crate::provider_layout::ProviderLayout;
 use crate::text::normalize_first_user_message;
 use crate::time::parse_timestamp_ms;
 
@@ -117,7 +118,7 @@ impl SessionSource for AmplifierSource {
 /// never a silent `Ok(empty)`. A MISSING root is a genuine empty. NESTED
 /// directories stay tolerant via [`discover_project_session_metadata`].
 fn discover_amplifier_metadata(amplifier_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
-    let projects_dir = amplifier_home.join("projects");
+    let projects_dir = crate::provider_layout::AmplifierLayout.session_root(amplifier_home);
     let Some(entries) = crate::directory_index::open_root_dir(&projects_dir)? else {
         return Ok(Vec::new());
     };

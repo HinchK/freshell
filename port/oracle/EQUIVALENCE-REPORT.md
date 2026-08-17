@@ -168,7 +168,7 @@ The workspace has **11 Rust crates + 1 Node sidecar** (`cargo metadata --no-deps
 | 4 | `freshell-ws` | Rust | 8 | **T0/T1** wire |
 | 5 | `freshell-api` | Rust | 2 | **T0** REST surface |
 | 6 | `freshell-server` | Rust | 18 | **T0/T1/T3** — boots the SUT |
-| 7 | `freshell-sessions` | Rust | 28 (unit 6, claude-parity 10, codex-parity 2, **late_root_watcher_liveness 4 = DEV-0002**, opencode_sqlite 6) | **T2** transcript + **DEV-0002** liveness |
+| 7 | `freshell-sessions` | Rust | 28 (unit 6, claude-parity 10, codex-parity 2, **session_watcher late-root = DEV-0002**, opencode_sqlite 6) | **T2** transcript + **DEV-0002** liveness |
 | 8 | `freshell-opencode` | Rust | 34 (unit 25, **serve_health_bounded 3 = DEV-0001**, serve_idle_edge 6) | **T2 opencode** + **DEV-0001** bounded probe |
 | 9 | `freshell-codex` | Rust | 55 (unit 48, app_server_drive 4, completion_gating 3) | **T2 codex** + **DEV-0003** (verbatim effort) |
 | 10 | `freshell-freshagent` | Rust | 24 | **T2** fresh-agent spine |
@@ -346,7 +346,7 @@ Source of truth: `port/oracle/DEVIATIONS.md` (DEV-*) and `port/machine/architect
 | Id | Verdict | Pinning test (this sweep) | Original source |
 |---|---|---|---|
 | **DEV-0001** — opencode cold-serve health probe unbounded | **ACCEPTED**; fixed in the **port** (2 s per-probe AbortController + 150 ms retry, outer deadline unchanged). *Original-source edit was REJECTED by the antagonist and reverted.* | `crates/freshell-opencode/tests/serve_health_bounded.rs` → **3/3 GREEN** | pristine |
-| **DEV-0002** — coding-CLI session-indexer crashes whole process on late provider session-root (chokidar close-during-add) | **ACCEPTED**; port guards the late-root watcher (log+degrade+rescan, process stays alive). Carried **solely** by a port liveness test (T2 differ is blind by construction). | `crates/freshell-sessions/tests/late_root_watcher_liveness.rs` → **4/4 GREEN** | pristine |
+| **DEV-0002** — coding-CLI session-indexer crashes whole process on late provider session-root (chokidar close-during-add) | **ACCEPTED**; port guards the late-root watcher (log+degrade+rescan, process stays alive). Carried **solely** by a port liveness test (T2 differ is blind by construction). | `crates/freshell-sessions/src/session_watcher.rs` (`watcher_handles_late_root_appearance`) → **GREEN** (relocated from `late_root_watcher_liveness.rs` in kata v0h9) | pristine |
 | **DEV-0003** — freshcodex `none`/`minimal` effort “silent stall” | **REJECTED** (contradicted by freshell’s own committed codex schema; not an objective defect). Differ grants **zero tolerance**; port forwards `none`/`minimal` **verbatim**, no clamp. | n/a (rejected). Verified by `freshell-codex` unit `model::tests::unsupported_effort_errors_like_the_reference` (green) + T2 codex structural match. | pristine |
 
 Zero-tolerance for DEV-0003 is honored: no whitelist matcher is registered, and the T2 codex slice matched the baseline without any effort remap.
