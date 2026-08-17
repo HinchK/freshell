@@ -152,23 +152,45 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
    a. Disable the repo-owned workflow (prevents pushes from queueing new runs mid-rollback), then cancel every nonterminal run to a VERIFIED fixpoint — cancelling the active run can promote a queued one, so snapshot+cancel loops until a fresh snapshot shows zero nonterminal runs. The LIST call uses the raw REST endpoint `GET /actions/workflows/{file}/runs` instead of `gh run list --workflow` so behavior cannot depend on the installed gh version's workflow-resolution rules (verified against gh v2.45.0 source: NAME selectors resolve against active workflows only, `.yml` file selectors happen to bypass that filter, and `--status` rejects values such as `pending` — the raw endpoint avoids all three). The loop is fail-closed (a listing failure aborts the rollback before any flip) and paginates the entire run history:
       `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
       ```bash
+      CANDS=$(mktemp)   # "<run-id> <head-sha>" pairs of every run ever seen nonterminal
       while true; do
         LIST=$(mktemp)
         if ! gh api --paginate "repos/danshapiro/freshell/actions/workflows/docs-pages-deploy.yml/runs?per_page=100" \
-             --jq '.workflow_runs[] | select(.status | test("^(queued|in_progress|requested|waiting|pending)$")) | .id' > "$LIST"; then
+             --jq '.workflow_runs[] | select(.status | test("^(queued|in_progress|requested|waiting|pending)$")) | "\(.id) \(.head_sha)"' > "$LIST"; then
           echo "ERROR: run listing failed — aborting rollback; do NOT flip Pages settings" >&2
           exit 1
         fi
         if [ ! -s "$LIST" ]; then rm -f "$LIST"; break; fi
-        while read -r id; do
+        cat "$LIST" >> "$CANDS"
+        while read -r id sha; do
           gh run cancel -R danshapiro/freshell "$id" || echo "WARN: cancel of $id failed; the loop will re-verify" >&2
         done < "$LIST"
         rm -f "$LIST"
         sleep 5
       done
-      echo "fixpoint reached: zero nonterminal runs"
+      echo "run fixpoint reached: zero nonterminal runs"
+
+      # Pages-side sweep (always runs, even if cancellation looked clean): any run that was
+      # nonterminal at any point may have created a Pages deployment — including runs GitHub
+      # force-terminated (which skips the action's own cancellation handler). The deployment
+      # endpoints accept the commit SHA as the identifier, and the run listing already recorded
+      # every candidate SHA, so no log scraping or deployment-id format guessing is needed.
+      sort -u -k2,2 "$CANDS" | while read -r id sha; do
+        st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status 2>/dev/null) || continue  # 404: no deployment for this sha
+        case "$st" in
+          deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn)
+            gh api -X POST "repos/danshapiro/freshell/pages/deployments/$sha/cancel"
+            while :; do
+              st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status 2>/dev/null || true)
+              case "$st" in deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn) sleep 5 ;; *) break ;; esac
+            done
+            ;;
+        esac
+      done
+      rm -f "$CANDS"
+      echo "Pages-side sweep complete: no nonterminal Actions deployments remain"
       ```
-      A cancelled in-flight deploy-pages run attempts to cancel its Pages deployment on termination; the fixpoint (terminal runs only) covers the ordinary path. If a run hangs nonterminal past GitHub's ~5-minute forced-termination bound (the one path that can skip the action's cancellation handler), extract the deployment id from that run's logs: deploy-pages@v5 prints `Created deployment for <sha>, ID: <n>` in the deploy step (verified against its source). Read the logs with `gh run view -R danshapiro/freshell <run_id> --log`, which unpacks the zipped-log archive transparently (the plain `…/actions/runs/<id>/logs` API returns only a redirect to the archive — delta round 3 finding). If an `ID: [0-9]+` match exists, cancel that deployment via the supported endpoint `gh api -X POST repos/danshapiro/freshell/pages/deployments/<n>/cancel`, then verify `gh api repos/danshapiro/freshell/pages/deployments/<n> --jq .status` leaves `in_progress`. If the logs contain no `Created deployment` line, no Pages deployment was created and no late-race exists.
+      The sweep is the authority, not the Actions-side cancellation: a cancelled deploy-pages run only *attempts* to cancel its Pages deployment (its handler swallows API errors), and a force-terminated run skips the handler entirely. Cancelled-late deployments that already succeeded are harmless — the legacy rebuild in step c deploys byte-identical docs content over them; nonterminal ones are cancelled here. Deployment status vocabulary (verified against the REST docs): nonterminal = `deployment_in_progress`, `syncing_files`, `finished_file_sync`, `updating_pages`, `purging_cdn`; terminal = `succeed`, `deployment_cancelled`, `deployment_failed`, `deployment_content_failed`, `deployment_attempt_error`, `deployment_lost`.
    b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
       `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
    c. Request a legacy build and correlate recovery to the current source tip with movement detection (a bare `/pages/builds/latest` read can describe a stale or superseded build):
