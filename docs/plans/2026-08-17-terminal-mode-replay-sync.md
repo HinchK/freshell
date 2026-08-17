@@ -75,7 +75,7 @@ After any browser page load, a pane's xterm is recreated and rehydrated from the
 
 ### 2. Preamble synthesis + sync emission
 
-- Byte shape from tracker state: deterministic param-sorted sequence of `CSI ? Pm h/l` (protocol slot leader h or family-clear l; encoding likewise; then flat modes; then XTMODIFYKEYS `>Pm m`), `?1049h` placed before any other cursor-affecting bytes (only 1048 interplay; none emitted standalone).
+- Byte shape from tracker state: deterministic param-sorted sequence of `CSI ? Pm h` enables (protocol slot leader; encoding slot leader; then flat modes ascending), `?1049h` placed before any other cursor-affecting bytes (only 1048 interplay; none emitted standalone). XTMODIFYKEYS `>Pm m` is TRACKED but never emitted (round-3 narrowing: xterm 6.0.0 has no modifyOtherKeys handling), as is `?2026` (per-frame rendering hint) and `?1004` (round-5: xterm fires an immediate focus report on every arm → deterministic stdin junk).
 - Emission condition: `attach.surfaceReset === true` only. Node insertion broker.ts:520-522 (after ready guard, pre-gap); Rust insertion registry.rs:1262 (after `sink(ready)`) — including the dead-terminal Exited path (sync of frozen state is correct for retained-tail rendering; client must tolerate sync-immediately-followed-by-exit edge).
 - Payload: `{ type:'terminal.modes.sync', terminalId, attachRequestId, streamId, data }`. No seq fields (control-plane).
 - Direct-channel pin (Rust): test that output_frame_meta returns None for TerminalModesSync.

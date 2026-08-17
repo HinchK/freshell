@@ -632,10 +632,10 @@ test.describe('Multi-Client', () => {
     await flushPersistedLayout(page, terminalId!)
 
     // Arm the modes like an app would (once, at startup): any-motion mouse +
-    // SGR encoding + alt buffer + XTMODIFYKEYS (the latter is tracked but
+    // SGR encoding + alt buffer + XTMODIFYKEYS (tracked per fixture f08 but
     // never replayed; harmless to send). Then heartbeat a marker so we can
     // discriminate hydration completion after the reload wedge.
-    await executeCommand(page, `printf '\\x1b[?1003h\\x1b[?1006h\\x1b[?1049h\\x1b>4;1m'; echo __MODE_SYNC_MARK__`)
+    await executeCommand(page, `printf '\\x1b[?1003h\\x1b[?1006h\\x1b[?1049h\\x1b[>4;1m'; echo __MODE_SYNC_MARK__`)
     await page.waitForFunction((id) => {
       const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
       return modes?.mouseTrackingMode === 'any' && modes?.bufferType === 'alternate'

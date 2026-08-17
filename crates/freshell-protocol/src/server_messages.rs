@@ -1035,7 +1035,7 @@ pub struct TerminalMetaUpdated {
 /// attach, ordered ready < sync < replay < live on the requesting socket.
 /// Carries the attach's request id and the CURRENT stream id so the client
 /// can fold it through the same generation gates as replay content. `data`
-/// holds the synthesized DEC private mode / XTMODIFYKEYS bytes projected
+/// holds the synthesized DEC private mode bytes projected
 /// from the retained output stream (empty data => not emitted).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
