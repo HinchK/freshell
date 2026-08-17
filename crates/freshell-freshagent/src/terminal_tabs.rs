@@ -48,7 +48,7 @@ use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
     RealFileProbe, ShellType, SpawnSpec,
 };
-use freshell_protocol::{LEGACY_RESUME_IDENTITY_REFUSAL, ServerMessage, SessionLocator, UiCommand};
+use freshell_protocol::{ServerMessage, SessionLocator, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{

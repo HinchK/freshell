@@ -60,10 +60,10 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent,
-    LEGACY_RESUME_IDENTITY_REFUSAL, Pong, ServerMessage, SessionLocator, SessionType, Shell,
-    TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
-    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent, Pong, ServerMessage,
+    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
+    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
+    TerminalKill, TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
