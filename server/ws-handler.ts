@@ -2795,6 +2795,7 @@ export class WsHandler {
             maxReplayBytes?: number,
             priority?: 'foreground' | 'background',
             terminalOutputBatchV1?: boolean,
+            surfaceReset?: boolean,
           ) => Promise<any>
           attachWithExpectedSession?: (
             ws: LiveWebSocket,
@@ -2808,6 +2809,7 @@ export class WsHandler {
             maxReplayBytes?: number,
             priority?: 'foreground' | 'background',
             terminalOutputBatchV1?: boolean,
+            surfaceReset?: boolean,
           ) => Promise<any>
         }
         const attachResult = typeof attachBroker.attachWithExpectedSession === 'function'
@@ -2823,6 +2825,7 @@ export class WsHandler {
             m.maxReplayBytes,
             m.priority ?? 'foreground',
             state.supportsTerminalOutputBatchV1,
+            m.surfaceReset,
           )
           : await attachBroker.attach(
             ws,
@@ -2835,6 +2838,7 @@ export class WsHandler {
             m.maxReplayBytes,
             m.priority ?? 'foreground',
             state.supportsTerminalOutputBatchV1,
+            m.surfaceReset,
           )
         if (attachResult === 'invalid_attach_request_id') {
           this.sendError(ws, {

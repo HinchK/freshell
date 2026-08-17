@@ -4,6 +4,7 @@ import {
   type TerminalOutputBarrierReason,
   type TerminalOutputScannerState,
 } from './output-barrier-scanner.js'
+import { createTerminalModeTracker, type TerminalModeTracker } from './mode-tracker.js'
 import { ReplayDeque } from './replay-deque.js'
 
 export type ReplayFrame = {
@@ -46,6 +47,7 @@ export class ReplayRing {
   private maxBytes: number
   private readonly utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true })
   private readonly barrierScanner = createTerminalOutputBarrierScanner()
+  private readonly modeTracker = createTerminalModeTracker()
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
@@ -61,6 +63,10 @@ export class ReplayRing {
 
   append(data: string, metadata: { streamId: string }): ReplayFrame {
     const streamClassification = this.barrierScanner.scan(data)
+    // Mode projection scans the PRE-normalize data, immediately beside the
+    // barrier scan — port/oracle/baselines/mode-preamble/README.md input
+    // domain ("feed chunks in order through the ring's append sequence").
+    this.modeTracker.scan(data)
     const normalizedData = this.normalizeFrameData(data)
     const wasTruncated = Buffer.byteLength(normalizedData, 'utf8') < Buffer.byteLength(data, 'utf8')
     const barrierClassification = wasTruncated
@@ -80,6 +86,24 @@ export class ReplayRing {
 
   consumeRetentionLoss(): boolean {
     return this.storage.consumeRetentionLoss()
+  }
+
+  /**
+   * The emulator-mode preamble a freshly constructed surface needs
+   * re-asserted, synthesized from this ring's observed output ('' when the
+   * projection is empty — callers must not emit a sync frame for it).
+   */
+  synthesizeModes(): string {
+    return this.modeTracker.synthesize()
+  }
+
+  /**
+   * Keyed rebirth on stream replacement: ring frames are strictly
+   * streamId-partitioned, so the old stream's mode projection is dead at
+   * replacement time. Reset to defaults; the new stream's bytes repopulate.
+   */
+  resetModeTracker(): void {
+    this.modeTracker.reset()
   }
 
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {
