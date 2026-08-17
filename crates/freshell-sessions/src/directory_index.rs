@@ -853,10 +853,11 @@ pub struct SessionIndex {
     /// background refresh needs to update the save-debounce bookkeeping
     /// without borrowing `&SessionIndex`.
     persist_state: Arc<StdMutex<PersistState>>,
-    /// Paths marked dirty by an external watcher. A dirty path is
-    /// re-stat'd (and re-parsed if mtime/size changed) on the next
-    /// refresh, even if the TTL hasn't expired yet.
-    dirty_paths: Arc<StdMutex<HashSet<PathBuf>>>,
+    /// Paths marked dirty by an external watcher, keyed by path with the
+    /// provider name that qualified the path. A dirty path is re-stat'd
+    /// (and re-parsed if mtime/size changed) on the next refresh, even
+    /// if the TTL hasn't expired yet.
+    dirty_paths: Arc<StdMutex<HashMap<PathBuf, String>>>,
     /// Providers marked fully dirty (e.g. its root directory appeared/disappeared).
     /// Triggers a full discover() for that provider on next refresh.
     dirty_providers: Arc<StdMutex<HashSet<String>>>,
@@ -944,7 +945,7 @@ impl SessionIndex {
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
             persist_path,
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
-            dirty_paths: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_paths: Arc::new(StdMutex::new(HashMap::new())),
             dirty_providers: Arc::new(StdMutex::new(HashSet::new())),
             change_tx,
             change_rx,
@@ -990,15 +991,16 @@ impl SessionIndex {
     /// re-stat these paths (and re-parse any that actually changed) even
     /// if the TTL hasn't expired. Paths not tracked by any source are
     /// harmlessly ignored during the refresh.
-    pub fn mark_dirty(&self, paths: &[PathBuf]) {
+    pub fn mark_dirty(&self, paths: &[(PathBuf, String)]) {
         if paths.is_empty() {
             return;
         }
         {
             let mut dirty = self.dirty_paths.lock().unwrap();
-            dirty.extend(paths.iter().cloned());
+            for (path, provider) in paths {
+                dirty.insert(path.clone(), provider.clone());
+            }
         }
-        // Trigger a background refresh if one isn't already running.
         self.request_refresh();
     }
 
@@ -1202,7 +1204,7 @@ impl SessionIndex {
         snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
         persist_path: Option<PathBuf>,
         persist_state: Arc<StdMutex<PersistState>>,
-        dirty_paths: Arc<StdMutex<HashSet<PathBuf>>>,
+        dirty_paths: Arc<StdMutex<HashMap<PathBuf, String>>>,
         dirty_providers: Arc<StdMutex<HashSet<String>>>,
         change_tx: tokio::sync::watch::Sender<u64>,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
@@ -1211,12 +1213,7 @@ impl SessionIndex {
             let direct_cache = Arc::clone(&direct_cache);
             let snapshot = Arc::clone(&snapshot);
             move || {
-                // Drain dirty sets so the `is_dirty()` gate in
-                // `cached_pair()` resets. Any new dirty paths arriving
-                // after this drain trigger another refresh cycle.
-                // The drained sets flow into `refresh_snapshot` so it
-                // can scope the sweep to only the changed paths/providers.
-                let scoped_paths: HashSet<PathBuf> =
+                let scoped_paths: HashMap<PathBuf, String> =
                     dirty_paths.lock().unwrap().drain().collect();
                 let scoped_providers: HashSet<String> =
                     dirty_providers.lock().unwrap().drain().collect();
@@ -1392,15 +1389,19 @@ struct DirectEntry {
 }
 
 /// Parse a scoped dirty path by finding the right source. Prefers the
-/// source matching `cached_source_name` (from a prior sweep's cache entry),
-/// then falls back to trying each file-backed source. Returns `(item, source_name)`
-/// where `item` is `None` for an exclusion (e.g. R10b cwd-less rule).
+/// Parse a single dirty path using the provider hint from the watcher.
+/// The hint is authoritative — the watcher knows which provider's watch
+/// base produced the event, so trying other parsers would misclassify
+/// files (e.g. a Codex `.jsonl` parsed as Claude). Falls back to trying
+/// each file-backed source only when no hint is available (cold cache
+/// migration). Returns `(item, source_name)` where `item` is `None` for
+/// an exclusion (e.g. R10b cwd-less rule).
 fn parse_scoped_path(
     path: &Path,
     sources: &[Arc<dyn SessionSource>],
-    cached_source_name: Option<&str>,
+    provider_hint: Option<&str>,
 ) -> (Option<IndexedSession>, Option<String>) {
-    if let Some(name) = cached_source_name {
+    if let Some(name) = provider_hint {
         if let Some(source) = sources
             .iter()
             .find(|s| s.provider_name() == Some(name))
@@ -1451,12 +1452,9 @@ fn refresh_snapshot(
     cache: &mut HashMap<PathBuf, FileEntry>,
     direct_cache: &mut HashMap<usize, DirectEntry>,
     scan_failures: &mut HashSet<String>,
-    scoped_paths: HashSet<PathBuf>,
+    scoped_paths: HashMap<PathBuf, String>,
     scoped_providers: HashSet<String>,
 ) -> (Vec<IndexedSession>, usize) {
-    // A full reconciliation (TTL expiry with no dirty marks) discovers
-    // every provider. A scoped refresh (watcher-driven) only touches
-    // the specific paths/providers that changed — the CPU-savings core.
     let is_full = scoped_paths.is_empty() && scoped_providers.is_empty();
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut fully_discovered_providers = HashSet::<String>::new();
@@ -1608,7 +1606,7 @@ fn refresh_snapshot(
     // discover above. These paths came from the watcher (already
     // qualified), so we only need to re-stat and re-parse on change.
     if !is_full {
-        for path in &scoped_paths {
+        for (path, watcher_provider) in &scoped_paths {
             if discovered.contains(path) {
                 continue;
             }
@@ -1619,15 +1617,12 @@ fn refresh_snapshot(
                         .get(path)
                         .is_some_and(|e| e.mtime_ms == stat.mtime_ms && e.size == stat.size);
                     if !unchanged {
-                        let cached_source = cache
-                            .get(path)
-                            .and_then(|e| e.source_name.clone());
                         let (item, resolved_source) =
-                            parse_scoped_path(path, sources, cached_source.as_deref());
+                            parse_scoped_path(path, sources, Some(watcher_provider));
                         cache.insert(
                             path.clone(),
                             FileEntry {
-                                source_name: resolved_source.or(cached_source),
+                                source_name: resolved_source,
                                 mtime_ms: stat.mtime_ms,
                                 size: stat.size,
                                 item,
@@ -2702,7 +2697,7 @@ mod tests {
             Arc::clone(&snapshot),
             None,
             Arc::clone(&persist_state),
-            Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashSet::new())),
             change_tx,
         )
@@ -4782,9 +4777,7 @@ mod tests {
             "hello a — updated with much longer content to change file size",
         );
 
-        // Mark it dirty — this should trigger a re-stat and re-parse
-        // even though we're well within the 1-hour TTL.
-        index.mark_dirty(&[project.join("a.jsonl")]);
+        index.mark_dirty(&[(project.join("a.jsonl"), "claude".to_string())]);
 
         // The dirty-triggered refresh is background; poll for it.
         assert!(
@@ -4822,8 +4815,7 @@ mod tests {
         let _ = index.snapshot().await;
         assert_eq!(parse_calls.load(Ordering::SeqCst), 1);
 
-        // Mark dirty but DON'T change the file — mtime/size are the same.
-        index.mark_dirty(&[project.join("a.jsonl")]);
+        index.mark_dirty(&[(project.join("a.jsonl"), "claude".to_string())]);
         assert!(index.has_dirty(), "mark_dirty must set the dirty flag");
 
         // The dirty flag triggers a refresh on the next snapshot().
@@ -4932,8 +4924,7 @@ mod tests {
             "updated content that changes the file size for the test",
         );
 
-        // Mark only a specific path dirty (not the whole provider).
-        index.mark_dirty(&[project.join("a.jsonl")]);
+        index.mark_dirty(&[(project.join("a.jsonl"), "claude".to_string())]);
 
         assert!(
             wait_until(Duration::from_secs(2), || !index.has_dirty()).await,
@@ -5023,7 +5014,7 @@ mod tests {
         // Delete one file and mark it dirty.
         let deleted_path = project.join("b.jsonl");
         std::fs::remove_file(&deleted_path).unwrap();
-        index.mark_dirty(&[deleted_path]);
+        index.mark_dirty(&[(deleted_path, "claude".to_string())]);
 
         // Wait for the scoped refresh to process the deletion.
         let settled = wait_until(Duration::from_secs(2), || {

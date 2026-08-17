@@ -28,9 +28,20 @@ use crate::provider_layout::{ProviderLayout, WatchMode};
 const DEBOUNCE_MS: u64 = 200;
 
 /// How often (seconds) to re-check absent providers whose roots didn't
-/// exist at startup. When a provider's root appears, a watcher is armed
-/// for it — no waiting for the 15-minute TTL reconciliation.
+/// exist at startup (or whose watchers failed to arm). When a provider's
+/// root appears, a watcher is armed for it. Also checks if any armed
+/// provider's watch base disappeared at runtime (e.g. provider uninstall).
 const REARM_INTERVAL_SECS: u64 = 60;
+
+/// Events from watcher callbacks, carrying provider identity so the
+/// flush logic can scope dirty marks to the correct provider.
+enum WatchEvent {
+    /// A specific file changed under this provider's watch base.
+    FileChanged { path: PathBuf, provider: String },
+    /// This provider needs a full re-discovery (direct-listed db change,
+    /// `need_rescan()` flag, or watcher error).
+    ProviderRescan { provider: String },
+}
 
 /// A configured provider with its resolved home directory.
 pub struct WatchedProvider {
@@ -59,6 +70,47 @@ fn is_relevant(event: &notify::Event) -> bool {
                 | notify::EventKind::Remove(_)
                 | notify::EventKind::Any
         )
+}
+
+/// Build a watcher callback that sends events to the given channel,
+/// tagged with the provider's identity. Shared by initial arming and
+/// re-arming.
+fn make_watcher_callback(
+    tx: mpsc::UnboundedSender<WatchEvent>,
+    provider_name: String,
+    is_direct: bool,
+) -> impl Fn(Result<notify::Event, notify::Error>) + Send {
+    move |res: Result<notify::Event, _>| {
+        match res {
+            Ok(event) => {
+                if !is_relevant(&event) {
+                    return;
+                }
+                let rescan = is_direct || event.need_rescan();
+                if rescan {
+                    let _ = tx.send(WatchEvent::ProviderRescan {
+                        provider: provider_name.clone(),
+                    });
+                } else {
+                    for path in &event.paths {
+                        let _ = tx.send(WatchEvent::FileChanged {
+                            path: path.clone(),
+                            provider: provider_name.clone(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_name, error = %e,
+                    "session-watcher: watcher error"
+                );
+                let _ = tx.send(WatchEvent::ProviderRescan {
+                    provider: provider_name.clone(),
+                });
+            }
+        }
+    }
 }
 
 impl SessionWatcher {
@@ -107,13 +159,16 @@ async fn run_watcher_loop(
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     rearm_interval_secs: u64,
 ) {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PathBuf, bool)>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WatchEvent>();
 
     // Arm one watcher per provider, per watch base.
     // Keep watchers alive for the loop's lifetime — dropping them unwatches.
     let mut _watchers: Vec<notify::RecommendedWatcher> = Vec::new();
-    // Providers whose roots didn't exist at startup. Checked periodically
-    // so watchers are armed once the provider is installed.
+    // Track which provider indices have active watchers for each base.
+    let mut armed_bases: Vec<(usize, PathBuf)> = Vec::new();
+    // Providers whose roots didn't exist at startup OR whose watchers
+    // failed to arm. Checked periodically so watchers are armed once the
+    // provider is installed or the transient error resolves.
     let mut absent: Vec<(usize, PathBuf)> = Vec::new();
     for (prov_idx, provider) in providers.iter().enumerate() {
         let watch_bases = provider.layout.watch_bases(&provider.home);
@@ -134,8 +189,6 @@ async fn run_watcher_loop(
                 // watch the user's entire home directory).
                 let candidate = nearest_existing_ancestor(base, &provider.home);
                 if !candidate.exists() {
-                    // Provider home itself doesn't exist (e.g. tool not
-                    // installed). Track for periodic re-arming.
                     tracing::info!(
                         provider = %name,
                         path = %base.display(),
@@ -148,31 +201,8 @@ async fn run_watcher_loop(
                 candidate
             };
 
-            let tx = event_tx.clone();
-            let cb_name = name.clone();
-            match notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-                match res {
-                    Ok(event) => {
-                        if !is_relevant(&event) {
-                            return;
-                        }
-                        let rescan = is_direct || event.need_rescan();
-                        if event.paths.is_empty() && rescan {
-                            let _ = tx.send((PathBuf::new(), true));
-                        } else {
-                            for path in event.paths {
-                                let _ = tx.send((path, rescan));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(provider = %cb_name, error = %e, "session-watcher: watcher error");
-                        // Signal a full rescan so the next TTL reconciliation
-                        // picks up whatever the watcher missed.
-                        let _ = tx.send((PathBuf::new(), true));
-                    }
-                }
-            }) {
+            let cb = make_watcher_callback(event_tx.clone(), name.clone(), is_direct);
+            match notify::recommended_watcher(cb) {
                 Ok(mut watcher) => {
                     if let Err(e) = watcher.watch(&watch_target, mode) {
                         tracing::warn!(
@@ -182,8 +212,10 @@ async fn run_watcher_loop(
                             "session-watcher: failed to arm watch",
                         );
                         index.mark_provider_dirty(&name);
+                        absent.push((prov_idx, base.clone()));
                     } else {
                         _watchers.push(watcher);
+                        armed_bases.push((prov_idx, base.clone()));
                     }
                 }
                 Err(e) => {
@@ -193,29 +225,30 @@ async fn run_watcher_loop(
                         "session-watcher: failed to create watcher",
                     );
                     index.mark_provider_dirty(&name);
+                    absent.push((prov_idx, base.clone()));
                 }
             }
         }
     }
 
     // Keep the sender alive for re-arming absent providers.
-    // The stop signal (not channel closure) is the primary shutdown path.
     let rearm_tx = event_tx;
 
     // Coalescing event loop.
     let debounce = Duration::from_millis(DEBOUNCE_MS);
-    let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
-    let mut needs_full_dirty = false;
+    // File-level events keyed by (path, provider) → last-seen instant.
+    let mut pending: HashMap<(PathBuf, String), Instant> = HashMap::new();
+    // Providers that need a full rescan (direct-listed change, rescan flag, or error).
+    let mut pending_rescans: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut rearm_interval =
         tokio::time::interval(Duration::from_secs(rearm_interval_secs));
     rearm_interval.tick().await; // consume the immediate first tick
 
     loop {
-        let flush_deadline = if pending.is_empty() && !needs_full_dirty {
-            // No pending events — wait indefinitely for the next one.
+        let flush_deadline = if pending.is_empty() && pending_rescans.is_empty() {
             None
         } else {
-            // Flush after debounce window.
             Some(tokio::time::Instant::now() + debounce)
         };
 
@@ -223,14 +256,13 @@ async fn run_watcher_loop(
             _ = &mut stop_rx => break,
             event = event_rx.recv() => {
                 match event {
-                    Some((path, is_rescan)) => {
-                        if is_rescan {
-                            needs_full_dirty = true;
-                        } else {
-                            pending.insert(path, Instant::now());
-                        }
+                    Some(WatchEvent::FileChanged { path, provider }) => {
+                        pending.insert((path, provider), Instant::now());
                     }
-                    None => break, // all senders dropped
+                    Some(WatchEvent::ProviderRescan { provider }) => {
+                        pending_rescans.insert(provider);
+                    }
+                    None => break,
                 }
             }
             _ = async {
@@ -240,32 +272,26 @@ async fn run_watcher_loop(
                 }
             } => {
                 // Debounce timer fired — flush.
-                if needs_full_dirty {
-                    for provider in &providers {
-                        index.mark_provider_dirty(provider.layout.name());
-                    }
-                    needs_full_dirty = false;
+                // Provider-level rescans: only mark the specific providers dirty.
+                for provider_name in pending_rescans.drain() {
+                    index.mark_provider_dirty(&provider_name);
                 }
                 if !pending.is_empty() {
-                    let dirty_paths: Vec<PathBuf> = pending.drain().map(|(p, _)| p).collect();
-                    let mut qualified = Vec::new();
+                    let events: Vec<((PathBuf, String), Instant)> =
+                        pending.drain().collect();
+                    let mut qualified: Vec<(PathBuf, String)> = Vec::new();
                     let mut dirty_provider_names = std::collections::HashSet::new();
-                    for p in dirty_paths {
-                        if providers.iter().any(|prov| prov.layout.qualifies(&p)) {
-                            qualified.push(p);
+                    for ((path, provider_name), _) in events {
+                        let prov = providers
+                            .iter()
+                            .find(|p| p.layout.name() == provider_name);
+                        let qualifies = prov
+                            .map(|p| p.layout.qualifies(&path))
+                            .unwrap_or(false);
+                        if qualifies {
+                            qualified.push((path, provider_name));
                         } else {
-                            // Not a session file — likely a directory event
-                            // (create/remove of a project or session dir).
-                            // Mark any provider whose watch base is an
-                            // ancestor of this path as dirty so it re-discovers.
-                            for prov in &providers {
-                                for base in prov.layout.watch_bases(&prov.home) {
-                                    if p.starts_with(&base) {
-                                        dirty_provider_names
-                                            .insert(prov.layout.name().to_owned());
-                                    }
-                                }
-                            }
+                            dirty_provider_names.insert(provider_name);
                         }
                     }
                     if !qualified.is_empty() {
@@ -275,9 +301,25 @@ async fn run_watcher_loop(
                         index.mark_provider_dirty(&name);
                     }
                 }
-                pending.clear();
             }
-            _ = rearm_interval.tick(), if !absent.is_empty() => {
+            _ = rearm_interval.tick(), if !absent.is_empty() || !armed_bases.is_empty() => {
+                // Detect armed watch bases that disappeared at runtime
+                // (e.g. provider uninstall) and move them to absent.
+                armed_bases.retain(|(prov_idx, base)| {
+                    if base.exists() {
+                        return true; // still present
+                    }
+                    let name = providers[*prov_idx].layout.name();
+                    tracing::info!(
+                        provider = %name,
+                        path = %base.display(),
+                        "session-watcher: armed watch base disappeared, tracking for re-arm",
+                    );
+                    absent.push((*prov_idx, base.clone()));
+                    index.mark_provider_dirty(name);
+                    false
+                });
+
                 // Re-check absent providers: arm watchers for any whose
                 // root has appeared since the last check.
                 absent.retain(|(prov_idx, base)| {
@@ -291,37 +333,16 @@ async fn run_watcher_loop(
                         WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
                     };
                     let name = prov.layout.name().to_owned();
-                    let tx = rearm_tx.clone();
-                    let cb_name = name.clone();
-                    let armed = match notify::recommended_watcher(
-                        move |res: Result<notify::Event, _>| {
-                            match res {
-                                Ok(event) => {
-                                    if !is_relevant(&event) {
-                                        return;
-                                    }
-                                    let rescan = is_direct || event.need_rescan();
-                                    if event.paths.is_empty() && rescan {
-                                        let _ = tx.send((PathBuf::new(), true));
-                                    } else {
-                                        for path in event.paths {
-                                            let _ = tx.send((path, rescan));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        provider = %cb_name, error = %e,
-                                        "session-watcher: re-armed watcher error"
-                                    );
-                                    let _ = tx.send((PathBuf::new(), true));
-                                }
-                            }
-                        },
-                    ) {
+                    let cb = make_watcher_callback(
+                        rearm_tx.clone(),
+                        name.clone(),
+                        is_direct,
+                    );
+                    let armed = match notify::recommended_watcher(cb) {
                         Ok(mut watcher) => {
                             if watcher.watch(base, mode).is_ok() {
                                 _watchers.push(watcher);
+                                armed_bases.push((*prov_idx, base.clone()));
                                 true
                             } else {
                                 false

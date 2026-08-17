@@ -167,12 +167,17 @@ Every entry requires:
   subdir created at runtime}, never on a message payload.
 - **pinning_test (SATISFIED — Phase 3.5, relocated in kata v0h9):** port-side liveness test —
   `crates/freshell-sessions/src/session_watcher.rs` (`watcher_handles_late_root_appearance` test:
-  a real-`notify` end-to-end that arranges an absent provider root, starts the watcher on the nearest
-  existing ancestor, creates the root + a session file at runtime, and asserts the new session becomes
-  visible). The original 4-test `late_root_watcher_liveness.rs` was replaced when the dead `indexer.rs`
-  module (which the tests pinned) was deleted in favour of the event-driven `SessionWatcher`. Companion:
-  the 15-minute TTL reconciliation covers any events the watcher misses. Interim TS
-  red-documenting-original mirror (optional, proves the ledger's claim about the reference):
+  a real-`notify` end-to-end that arranges a provider home that exists but whose session root subdir
+  is absent, starts the watcher on the nearest existing ancestor, creates the root + a session file
+  at runtime, and asserts the new session becomes visible via inotify). This test verifies the happy
+  path of the late-root lifecycle (the process stays alive and indexes the new session). It does NOT
+  cover injected watcher-arm failure, backend error propagation, or watcher reconfiguration — those
+  error paths are guarded structurally: arm failures add the provider to the absent-retry list (tested
+  by `watcher_rearms_when_absent_provider_appears`), and watcher errors send a `ProviderRescan` event
+  that triggers a full provider re-discovery. The original 4-test `late_root_watcher_liveness.rs` was
+  replaced when the dead `indexer.rs` module (which the tests pinned) was deleted in favour of the
+  event-driven `SessionWatcher`. The 15-minute TTL reconciliation covers any events the watcher misses.
+  Interim TS red-documenting-original mirror (optional, proves the ledger's claim about the reference):
   `test/unit/port/oracle/session-indexer-late-root-liveness.test.ts` asserting the *current* TS original
   crashes/emits-uncaught under the precondition. The authoritative green assertion lives in the Rust
   session_watcher test.

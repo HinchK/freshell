@@ -168,7 +168,8 @@ impl ProviderLayout for OpencodeLayout {
 }
 
 /// Amplifier: `<amplifier_home>/projects/<project>/sessions/<session>/metadata.json`.
-/// The canonical record is `metadata.json`, not `events.jsonl` or `transcript.jsonl`.
+/// Only `metadata.json` qualifies — sidecar `events.jsonl`/`transcript.jsonl`
+/// changes fall to the directory-event handler which marks amplifier dirty.
 pub struct AmplifierLayout;
 
 impl ProviderLayout for AmplifierLayout {
@@ -190,7 +191,7 @@ impl ProviderLayout for AmplifierLayout {
 
     fn qualifies(&self, path: &Path) -> bool {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !matches!(name, "metadata.json" | "events.jsonl" | "transcript.jsonl") {
+        if name != "metadata.json" {
             return false;
         }
         // Must be at: projects/<project>/sessions/<session>/<file>
@@ -335,23 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_layout_accepts_events_jsonl() {
-        assert!(AmplifierLayout.qualifies(Path::new(
+    fn amplifier_layout_rejects_events_jsonl() {
+        assert!(!AmplifierLayout.qualifies(Path::new(
             "/home/user/.amplifier/projects/myproj/sessions/abc/events.jsonl"
         )));
     }
 
     #[test]
-    fn amplifier_layout_accepts_transcript_jsonl() {
-        assert!(AmplifierLayout.qualifies(Path::new(
-            "/home/user/.amplifier/projects/myproj/sessions/abc/transcript.jsonl"
-        )));
-    }
-
-    #[test]
-    fn amplifier_layout_rejects_nested_events_jsonl() {
+    fn amplifier_layout_rejects_transcript_jsonl() {
         assert!(!AmplifierLayout.qualifies(Path::new(
-            "/home/user/.amplifier/projects/myproj/sessions/abc/sub/events.jsonl"
+            "/home/user/.amplifier/projects/myproj/sessions/abc/transcript.jsonl"
         )));
     }
 
