@@ -45,6 +45,8 @@ Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claud
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 
+Use your built-in shell and file tools for general work; reach for this MCP only when a user or a skill explicitly asks you to orchestrate the user's live Freshell session (tabs, panes, demos).
+
 FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 
 ## Mental model

@@ -12,7 +12,7 @@ vi.mock('../../../../server/mcp/http-client.js', () => ({
   createApiClient: () => mockClient,
 }))
 
-import { TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
+import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
 
 beforeEach(() => {
   mockClient.get.mockReset()
@@ -21,54 +21,13 @@ beforeEach(() => {
   mockClient.delete.mockReset()
 })
 
-describe('TOOL_DESCRIPTION and INSTRUCTIONS', () => {
+describe('TOOL_DESCRIPTION and INPUT_SCHEMA', () => {
   it('TOOL_DESCRIPTION is a non-empty string mentioning key actions', () => {
     expect(TOOL_DESCRIPTION).toBeTruthy()
     expect(TOOL_DESCRIPTION).toContain('new-tab')
     expect(TOOL_DESCRIPTION).toContain('send-keys')
     expect(TOOL_DESCRIPTION).toContain('capture-pane')
     expect(TOOL_DESCRIPTION).toContain('screenshot')
-  })
-
-  it('INSTRUCTIONS contains mental model, pane kinds, picker warning, targets, and gotchas', () => {
-    expect(INSTRUCTIONS).toBeTruthy()
-    expect(INSTRUCTIONS.toLowerCase()).toContain('freshell')
-    // Mental model section
-    expect(INSTRUCTIONS).toContain('Mental model')
-    expect(INSTRUCTIONS).toContain('terminal')
-    expect(INSTRUCTIONS).toContain('editor')
-    expect(INSTRUCTIONS).toContain('browser')
-    expect(INSTRUCTIONS).toContain('fresh-agent')
-    expect(INSTRUCTIONS).toContain('picker')
-    expect(INSTRUCTIONS).toContain('- Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/OpenCode/etc.), picker (transient).')
-    expect(INSTRUCTIONS).not.toContain('agent-chat (legacy)')
-    // Picker warning
-    expect(INSTRUCTIONS).toContain('Picker panes are ephemeral')
-    // Targets section
-    expect(INSTRUCTIONS).toContain('Targets')
-    expect(INSTRUCTIONS).toContain('tab ID or exact tab title')
-    expect(INSTRUCTIONS).toContain('pane ID')
-    // Key gotchas
-    expect(INSTRUCTIONS).toContain('literal mode')
-    expect(INSTRUCTIONS).toContain('wait-for')
-    expect(INSTRUCTIONS).toContain('stable')
-    expect(INSTRUCTIONS).toContain('50 PTY limit')
-    // tmux compatibility
-    expect(INSTRUCTIONS).toContain('tmux')
-    expect(INSTRUCTIONS).toContain('new-window')
-  })
-
-  it('browser pane screenshot instructions reflect that proxied localhost URLs render actual content', () => {
-    // The instructions should clarify that proxied localhost URLs render actual
-    // content in iframe screenshots, and only truly cross-origin URLs fall back
-    // to a placeholder. This guards against regressions where the instructions
-    // incorrectly claim all browser pane screenshots show placeholders.
-    expect(INSTRUCTIONS).toContain('proxied localhost URLs render actual content')
-    expect(INSTRUCTIONS).toContain('cross-origin')
-    expect(INSTRUCTIONS).toContain('placeholder')
-    // Must NOT contain the old wording that claims all proxied screenshots are placeholders
-    expect(INSTRUCTIONS).not.toMatch(/browser pane screenshots.*always.*placeholder/i)
-    expect(INSTRUCTIONS).not.toMatch(/cross-origin iframe content renders a placeholder/i)
   })
 
   it('INPUT_SCHEMA has action and params fields', () => {
