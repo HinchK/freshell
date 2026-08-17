@@ -380,3 +380,63 @@ describe('createTerminalWriteQueue', () => {
     })).toBe(true)
   })
 })
+
+describe('onItemApplied marker hook', () => {
+  it('fires once per applied write item; never for stale generations or tasks', () => {
+    const applied: Array<{ mode: string; generation: string | undefined }> = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-onitemapplied',
+      write: (_chunk, onWritten) => onWritten?.(),
+      onItemApplied: (item) => applied.push({ mode: item.mode, generation: item.generation }),
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('A', undefined, { mode: 'replay', generation: 'gen-1', coalesce: false })
+    queue.enqueue('B', undefined, { mode: 'live', generation: 'gen-1', coalesce: false })
+    queue.enqueue('S', undefined, { mode: 'replay', generation: 'stale-gen' })
+    queue.enqueueTask(() => applied.push({ mode: 'task', generation: 'gen-1' }), {
+      mode: 'replay',
+      generation: 'gen-1',
+    })
+
+    rafCallbacks.shift()?.(0)
+
+    expect(applied).toEqual([
+      { mode: 'replay', generation: 'gen-1' },
+      { mode: 'live', generation: 'gen-1' },
+      { mode: 'task', generation: 'gen-1' },
+    ])
+  })
+
+  it('does not fire when the item goes stale between submit and completion', () => {
+    const applied: Array<{ mode: string; generation: string | undefined }> = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let pendingWritten: (() => void) | undefined
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-onitemapplied-stale',
+      write: (_chunk, onWritten) => {
+        pendingWritten = onWritten
+      },
+      onItemApplied: (item) => applied.push({ mode: item.mode, generation: item.generation }),
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('A', undefined, { mode: 'replay', generation: 'gen-1' })
+    rafCallbacks.shift()?.(0) // write submitted, completion pending
+    queue.setActiveGeneration('gen-2') // rolls generation before the write completes
+    pendingWritten?.()
+
+    expect(applied).toEqual([])
+  })
+})

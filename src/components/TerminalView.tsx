@@ -802,6 +802,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   } | null>(null)
   const abandonedAttachRequestIdsRef = useRef(new Set<string>())
   const attachCounterRef = useRef(0)
+  // Emulator-mode freshness (terminal.modes.sync): a freshly-constructed xterm
+  // surface starts with DEFAULT DEC private state (no mouse tracking etc.);
+  // retained replay does not carry an app's once-at-startup mode bytes back,
+  // so the next attach must be flagged surfaceReset to receive the server's
+  // one-shot preamble. surfaceFreshMarkerRef couples the claim's consumption
+  // to the marker-bearing attach generation (plan round-3/4 coupled rule):
+  // it is recorded when an attach is SENT with the claim and cleared only
+  // when replay content of that same generation applies, or when that attach
+  // completes (no-pending-replay / completeAttachGeneration edges).
+  const surfaceFreshRef = useRef(false)
+  const surfaceFreshMarkerRef = useRef<{ attachRequestId: string } | null>(null)
   const currentAttachRef = useRef<{
     requestId: string
     intent: AttachIntent
@@ -2047,8 +2058,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     termRef.current = term
     runtimeRef.current = runtime
+    // Fresh surface → fresh DEC-private-mode state (construction is the only
+    // xterm birth site: covers mount-fresh AND renderer recreation).
+    surfaceFreshRef.current = true
+    surfaceFreshMarkerRef.current = null
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
+      onItemApplied: (item) => {
+        // Coupled clear (plan round-3): the marker-bearing attach's own
+        // replay content applied ⇒ the delivered mode preamble is on the
+        // surface ⇒ the fresh claim is consumed. 'live'-mode local notices
+        // and stale generations can never clear (excluded at the hook site).
+        const marker = surfaceFreshMarkerRef.current
+        if (marker && item.mode === 'replay' && item.generation === marker.attachRequestId) {
+          surfaceFreshRef.current = false
+          surfaceFreshMarkerRef.current = null
+        }
+      },
       write: (data, onWritten) => {
         const recordForTest = (phase: 'submitted' | 'written') => {
           try {
@@ -2213,6 +2239,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       reset: () => {
         if (!allowCurrentTerminalAction()) return
         term.reset()
+        // Fresh DEC-private-mode surface: the next attach re-claims
+        // surfaceReset, and any pre-reset in-flight marker must never satisfy
+        // a post-reset clear (round-4 A(iii) hardening).
+        surfaceFreshRef.current = true
+        surfaceFreshMarkerRef.current = null
       },
       scrollToBottom: () => {
         if (!allowCurrentTerminalAction()) return
@@ -2745,6 +2776,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     let effectiveIntent = intent
     let clearViewportFirst = opts?.clearViewportFirst === true
     let fullHydrateFallbackReason: string | null = null
+    if (surfaceFreshRef.current && effectiveIntent !== 'viewport_hydrate') {
+      // A fresh surface has NO usable delta window: any checkpointed sinceSeq
+      // would continue content onto a blank xterm (data hole). Force a wiped
+      // full hydrate; the wipe also self-heals a wedged stale marker.
+      effectiveIntent = 'viewport_hydrate'
+      clearViewportFirst = true
+      fullHydrateFallbackReason = 'surface_fresh'
+    } else if (surfaceFreshRef.current) {
+      // Already a viewport hydrate: still wipe (same self-healing rule).
+      clearViewportFirst = true
+    }
     if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
@@ -2856,6 +2898,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       ? { terminalId: tid, cols, rows }
       : null
 
+    // surfaceReset is claimed on the wire whenever the surface is fresh —
+    // independently of the wire intent swap (hidden panes attach as
+    // keepalive_delta yet still need the preamble: background hydration is
+    // exactly where a recreated hidden pane receives its mode bytes).
+    const claimSurfaceReset = surfaceFreshRef.current
+    if (claimSurfaceReset) {
+      surfaceFreshMarkerRef.current = { attachRequestId }
+    }
     ws.send(buildTerminalAttachMessage({
       content: contentRef.current,
       terminalId: tid,
@@ -2866,6 +2916,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       attachRequestId,
       priority: opts?.priority ?? 'foreground',
       ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
+      ...(claimSurfaceReset ? { surfaceReset: true } : {}),
     }))
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
@@ -3569,6 +3620,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const activeScope = getTerminalOutputWriteScope(input.terminalInstanceId)
             if (!input.allowWithoutWriteScope || activeScope) return false
           }
+          // Completion-clear (plan round-4 A(ii)): the marker-bearing attach
+          // COMPLETED. Synchronous server emission guarantees the sync frame
+          // either arrived with this attach or was provably empty — never
+          // leave the marker stuck (a stuck marker forces sinceSeq=0 replays
+          // that append onto the hydrated surface, duplicating scrollback).
+          if (surfaceFreshMarkerRef.current?.attachRequestId === input.attachRequestId) {
+            surfaceFreshRef.current = false
+            surfaceFreshMarkerRef.current = null
+          }
           setIsAttaching(false)
           markAttachComplete()
           return true
@@ -4217,6 +4277,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           applySeqState(nextSeqState)
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
           if (!nextSeqState.pendingReplay) {
+            // Completion-clear edge for empty-tracker / no-replay attaches
+            // (same round-4 A(ii) rule as completeAttachGeneration).
+            if (surfaceFreshMarkerRef.current?.attachRequestId === msg.attachRequestId) {
+              surfaceFreshRef.current = false
+              surfaceFreshMarkerRef.current = null
+            }
             markAttachComplete()
           }
 
@@ -4232,6 +4298,36 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             writeLocalXtermNotice(term, pendingLossNoticeRef.current)
             pendingLossNoticeRef.current = null
           }
+        }
+
+        if (msg.type === 'terminal.modes.sync' && msg.terminalId === tid) {
+          // Control-plane emulator-mode preamble (server emits it once per
+          // surfaceReset attach, ordered ready < sync < replay). Fold through
+          // the replay queue with generation + side-effect suppression; fail
+          // closed on any tag anomaly.
+          if (!currentAttachRef.current) return
+          if (!isCurrentAttachStreamMessage(msg)) return
+          if (typeof msg.attachRequestId !== 'string' || msg.attachRequestId.length === 0) {
+            log.warn('Rejecting terminal.modes.sync without attachRequestId', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+            })
+            return
+          }
+          if (typeof msg.data !== 'string' || msg.data.length === 0) return
+          const syncQueue = writeQueueRef.current
+          if (!syncQueue) {
+            // Transient recreation gap: the queue is reborn with the surface;
+            // the coupled clear rule keeps the fresh claim alive, so the next
+            // attach re-claims and re-receives the preamble.
+            log.warn('Dropping terminal.modes.sync: write queue unavailable', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+            })
+            return
+          }
+          syncQueue.enqueue(msg.data, undefined, { mode: 'replay', generation: msg.attachRequestId })
+          return
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {

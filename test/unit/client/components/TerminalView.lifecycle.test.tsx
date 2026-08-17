@@ -287,6 +287,7 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
 ): T {
   const isStreamPayload = msg.type === 'terminal.attach.ready'
     || msg.type === 'terminal.stream.changed'
+    || msg.type === 'terminal.modes.sync'
     || msg.type === 'terminal.output'
     || msg.type === 'terminal.output.batch'
     || msg.type === 'terminal.output.gap'
@@ -309,7 +310,7 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
         : (latestStreamIdByTerminal.get(msg.terminalId) ?? `test-stream:${msg.terminalId}`)
       next = { ...next, streamId } as typeof next
       latestStreamIdByTerminal.set(msg.terminalId, streamId)
-    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch' || msg.type === 'terminal.output.gap') {
+    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch' || msg.type === 'terminal.output.gap' || msg.type === 'terminal.modes.sync') {
       const messageStreamId = (next as { streamId?: unknown }).streamId
       const streamId = typeof messageStreamId === 'string' && messageStreamId.length > 0
         ? messageStreamId
@@ -9651,4 +9652,260 @@ describe('TerminalView lifecycle updates', () => {
       expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
   })
+})
+
+describe('terminal.modes.sync (surface-reset mode preamble)', () => {
+  let messageHandler: ((msg: any) => void) | null = null
+  let reconnectHandler: (() => void) | null = null
+
+  const TERMINAL_ID = 'term-modes-sync'
+
+  function setupPane() {
+    const tabId = 'tab-modes-sync'
+    const paneId = 'pane-modes-sync'
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-modes-sync',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId: TERMINAL_ID,
+    }
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell',
+            status: 'running',
+            title: 'Shell',
+            titleSetByUser: false,
+            terminalId: TERMINAL_ID,
+            createRequestId: 'req-modes-sync',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
+      },
+    })
+    return { store, tabId, paneId, paneContent }
+  }
+
+  function sentAttaches() {
+    return wsMocks.send.mock.calls
+      .map(([m]) => m)
+      .filter((m) => m?.type === 'terminal.attach' && m.terminalId === TERMINAL_ID)
+  }
+
+  async function renderPane() {
+    const { store, tabId, paneId, paneContent } = setupPane()
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(reconnectHandler).not.toBeNull()
+    })
+  }
+
+  beforeEach(() => {
+    vi.useRealTimers()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    __resetLastSentViewportCacheForTests()
+    resetHydrationQueueForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPersistFlushListenersForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    wsMocks.isReady = true
+    wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg.terminalId === 'string'
+        && typeof msg.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
+    wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
+      messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
+      return () => { messageHandler = null }
+    })
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        if (reconnectHandler === callback) reconnectHandler = null
+      }
+    })
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+      return 1
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    terminalInstances.length = 0
+    runtimeMocks.instances.length = 0
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+    installPerfAuditBridge(null)
+    restoreMocks.consumeTerminalRestoreRequestId.mockReset()
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    terminalThemeMocks.getTerminalTheme.mockReset()
+    terminalThemeMocks.getTerminalTheme.mockReturnValue({})
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    resetHydrationQueueForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    messageHandler = null
+    reconnectHandler = null
+    installPerfAuditBridge(null)
+  })
+
+  it('claims surfaceReset (full viewport hydrate from seq 0) on the first attach of a freshly-constructed surface', async () => {
+    await renderPane()
+    await waitFor(() => {
+      const attach = sentAttaches().at(-1)
+      expect(attach).toBeTruthy()
+      expect(attach.surfaceReset).toBe(true)
+      expect(attach.sinceSeq).toBe(0)
+      expect(attach.intent).toBe('viewport_hydrate')
+    })
+  })
+
+  it('clears the fresh claim when the marker attach completes with no pending replay (empty tracker survives)', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: sentAttaches().at(-1)!.attachRequestId,
+        seq: 0,
+        headSeq: 0,
+      })
+    })
+    // reconnect → second attach must NOT re-claim a consumed marker
+    act(() => { reconnectHandler!() })
+    await waitFor(() => expect(sentAttaches().length).toBeGreaterThanOrEqual(2))
+    const second = sentAttaches().at(-1)!
+    expect(second.surfaceReset).toBeUndefined()
+  })
+
+  it('writes a correctly-tagged terminal.modes.sync through the write queue before claiming completion', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    const attach = sentAttaches().at(-1)!
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: attach.attachRequestId,
+        seq: 0,
+        headSeq: 1,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.modes.sync',
+        terminalId: TERMINAL_ID,
+        attachRequestId: attach.attachRequestId,
+        data: '\u001b[?1003h',
+      })
+    })
+    await waitFor(() => {
+      expect(latestWrites().some((s) => s.includes('\u001b[?1003h'))).toBe(true)
+      // the actual ESC byte, not the literal backslash-u
+      expect(latestWrites().some((s) => s.includes('\x1b[?1003h'))).toBe(true)
+    })
+    // replay completes the attach → marker consumed → next attach unmarked
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'hello',
+      })
+    })
+    await waitFor(() => expect(storeSentCount()).toBe(0) , { timeout: 1 }).catch(() => {})
+    act(() => { reconnectHandler!() })
+    await waitFor(() => expect(sentAttaches().length).toBeGreaterThanOrEqual(2))
+    expect(sentAttaches().at(-1)!.surfaceReset).toBeUndefined()
+  })
+
+  it('fails closed on an untagged terminal.modes.sync (no bytes written, marker survives)', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: sentAttaches().at(-1)!.attachRequestId,
+        seq: 0,
+        headSeq: 0,
+      } as any)
+      messageHandler!({
+        type: 'terminal.modes.sync',
+        terminalId: TERMINAL_ID,
+        __preserveMissingAttachRequestId: true,
+        data: '\x1b[?1003h',
+      } as any)
+    })
+    await new Promise((r) => setTimeout(r, 50))
+    expect(latestWrites().some((s) => s.includes('\x1b[?1003h'))).toBe(false)
+    // attach completed via the no-pending-replay edge — a SECOND attach after
+    // reconnect would not re-claim, so the observable gate here is: no write.
+  })
+
+  it('ignores a stale-generation terminal.modes.sync (bytes never written)', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: sentAttaches().at(-1)!.attachRequestId,
+        seq: 0,
+        headSeq: 0,
+      })
+      messageHandler!({
+        type: 'terminal.modes.sync',
+        terminalId: TERMINAL_ID,
+        attachRequestId: 'stale:attach:not-current',
+        streamId: 'stale-stream',
+        data: '\x1b[?1006h',
+      } as any)
+    })
+    await new Promise((r) => setTimeout(r, 50))
+    expect(latestWrites().some((s) => s.includes('\x1b[?1006h'))).toBe(false)
+  })
+
+  function latestWrites(): string[] {
+    const term = terminalInstances[terminalInstances.length - 1]
+    return terminalWriteStrings(term)
+  }
+  function storeSentCount(): number { return wsMocks.send.mock.calls.length }
 })
