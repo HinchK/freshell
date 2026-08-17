@@ -3033,10 +3033,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_with_resume_session_id_rebinds_the_durable_session() {
+    async fn create_with_session_ref_rebinds_the_durable_session() {
         // V2/A4: the frozen client's ONLY post-reload resume vehicle is
-        // freshAgent.create{resumeSessionId: ses_*} -- donor shape: codex's
-        // handle_create_with_resume_session_id_resumes_the_same_thread.
+        // freshAgent.create{sessionRef: {provider: "opencode", sessionId: ses_*}}
+        // -- donor shape: codex's
+        // handle_create_with_session_ref_resumes_the_same_thread.
         let (state, mut rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         fake.seed(
@@ -3053,7 +3054,10 @@ mod tests {
         state.set_identity_sink(fake);
 
         let mut create = create_msg("req-resume-oc");
-        create.resume_session_id = Some(DURABLE_ID.to_string());
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
         state.handle_create(create).await;
 
         let sessions = state.sessions.lock().await;

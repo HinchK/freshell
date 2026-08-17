@@ -7026,14 +7026,15 @@ pub(crate) mod tests {
 
     // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
 
-    /// FINDING 1 (CODEX-FIRST triage): `freshAgent.create` carrying `resumeSessionId` must
-    /// RESUME the existing thread (mirroring the reference's resume-first create path,
-    /// `runtime-manager.ts:103-112` -> `adapter.ts:843-869`), never mint a brand-new one.
-    /// The fake app-server's `thread/start` is configured to return an OBVIOUSLY WRONG id
-    /// (`thread-should-never-be-minted`) so a passing assertion on the requested resume id
-    /// proves `thread/resume` was used, not `thread/start`.
+    /// FINDING 1 (CODEX-FIRST triage): `freshAgent.create` carrying a provider-matched
+    /// `sessionRef` must RESUME the existing thread (mirroring the reference's
+    /// resume-first create path, `runtime-manager.ts:103-112` -> `adapter.ts:843-869`),
+    /// never mint a brand-new one. The fake app-server's `thread/start` is configured to
+    /// return an OBVIOUSLY WRONG id (`thread-should-never-be-minted`) so a passing
+    /// assertion on the requested resume id proves `thread/resume` was used, not
+    /// `thread/start`.
     #[tokio::test]
-    async fn handle_create_with_resume_session_id_resumes_the_same_thread() {
+    async fn handle_create_with_session_ref_resumes_the_same_thread() {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
@@ -7044,8 +7045,11 @@ pub(crate) mod tests {
             provider: Some(freshell_protocol::AgentProvider::Codex),
             cwd: None,
             legacy_restore_context: None,
-            resume_session_id: Some("thread-existing-durable".to_string()),
-            session_ref: None,
+            resume_session_id: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "thread-existing-durable".to_string(),
+            }),
             model: None,
             model_selection: None,
             permission_mode: None,
@@ -7089,7 +7093,7 @@ pub(crate) mod tests {
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
     /// ONLY identity is a provider-matched `sessionRef` must resume the thread
     /// exactly like the legacy `resumeSessionId` carrier. Same wrong-mint
-    /// canary as the legacy-carrier test above: `thread/start` is pinned to an
+    /// canary as the sessionRef resume test above: `thread/start` is pinned to an
     /// obviously wrong id, so a passing sessionId assertion proves
     /// `thread/resume` was used.
     #[tokio::test]
@@ -7148,7 +7152,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// FINDING 1 (CODEX-FIRST triage): when the caller-supplied `resumeSessionId` is
+    /// FINDING 1 (CODEX-FIRST triage): when the caller-supplied resume id is
     /// genuinely gone (`thread/resume` reports "not found"), the legacy reference has NO
     /// mint-new fallback inside `freshAgent.create`'s resume branch -- `runtime-manager.ts:
     /// 103-112` propagates the adapter's `resume()` failure unwrapped, and
@@ -7178,8 +7182,11 @@ pub(crate) mod tests {
             provider: Some(freshell_protocol::AgentProvider::Codex),
             cwd: None,
             legacy_restore_context: None,
-            resume_session_id: Some("thread-truly-gone".to_string()),
-            session_ref: None,
+            resume_session_id: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "thread-truly-gone".to_string(),
+            }),
             model: None,
             model_selection: None,
             permission_mode: None,
@@ -7237,8 +7244,11 @@ pub(crate) mod tests {
             provider: Some(freshell_protocol::AgentProvider::Codex),
             cwd: None,
             legacy_restore_context: None,
-            resume_session_id: Some("thread-A-requested".to_string()),
-            session_ref: None,
+            resume_session_id: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "thread-A-requested".to_string(),
+            }),
             model: None,
             model_selection: None,
             permission_mode: None,

@@ -418,7 +418,6 @@ fn claude_create_resume(request_id: &str, durable: &str) -> Value {
         "sessionType": "freshclaude",
         "provider": "claude",
         "cwd": "/tmp",
-        "resumeSessionId": durable,
         "sessionRef": { "provider": "claude", "sessionId": durable },
     })
 }
@@ -599,7 +598,6 @@ async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
             "sessionType": "freshcodex",
             "provider": "codex",
             "cwd": "/tmp",
-            "resumeSessionId": thread,
             "sessionRef": { "provider": "codex", "sessionId": thread },
         })
     };
@@ -756,7 +754,6 @@ async fn loser_attach_after_winner_binds_converges_to_the_live_session() {
         "provider": "claude",
         "sessionId": durable,
         "sessionType": "freshclaude",
-        "resumeSessionId": durable,
         "sessionRef": { "provider": "claude", "sessionId": durable },
     });
     send_json(&mut ws_b, &attach).await;

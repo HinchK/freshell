@@ -360,7 +360,6 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
             "provider": "claude",
             "sessionId": "gone-after-restart",
             "sessionType": "freshclaude",
-            "resumeSessionId": durable,
             "sessionRef": { "provider": "claude", "sessionId": durable },
         }),
     )
@@ -466,7 +465,6 @@ async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
             "provider": "claude",
             "sessionId": DURABLE_FALLBACK,
             "sessionType": "freshclaude",
-            "resumeSessionId": DURABLE_FALLBACK,
             "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
         }),
     )
@@ -556,7 +554,6 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
             "provider": "claude",
             "sessionId": DURABLE_FALLBACK,
             "sessionType": "freshclaude",
-            "resumeSessionId": DURABLE_FALLBACK,
             "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
         }),
     )

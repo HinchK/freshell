@@ -4493,7 +4493,7 @@ mod tests {
             json!({
                 "mode": "amplifier",
                 "cwd": tmp.to_string_lossy(),
-                "resumeSessionId": "legacy-resume-id-xyz"
+                "sessionRef": { "provider": "amplifier", "sessionId": "legacy-resume-id-xyz" }
             }),
             true,
         )
@@ -4532,7 +4532,7 @@ mod tests {
     // `port/oracle/DEVIATIONS.md`).
 
     #[tokio::test]
-    async fn create_amplifier_tab_with_legacy_resume_synthesizes_session_ref() {
+    async fn create_amplifier_tab_with_session_ref_flows_into_tab_create_frame() {
         let argv_file = unique_argv_file("amplifier-synth");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -4547,7 +4547,7 @@ mod tests {
             json!({
                 "mode": "amplifier",
                 "cwd": tmp.to_string_lossy(),
-                "resumeSessionId": "web-1737000000000-abc123"
+                "sessionRef": { "provider": "amplifier", "sessionId": "web-1737000000000-abc123" }
             }),
             true,
         )
@@ -4581,7 +4581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_claude_tab_with_canonical_resume_id_synthesizes_session_ref() {
+    async fn create_claude_tab_with_session_ref_flows_into_pane_content() {
         let argv_file = unique_argv_file("claude-synth");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -4595,7 +4595,7 @@ mod tests {
             json!({
                 "mode": "claude",
                 "cwd": tmp.to_string_lossy(),
-                "resumeSessionId": "550e8400-e29b-41d4-a716-446655440000"
+                "sessionRef": { "provider": "claude", "sessionId": "550e8400-e29b-41d4-a716-446655440000" }
             }),
             true,
         )
@@ -5804,13 +5804,13 @@ mod tests {
         registry.kill(&tid);
     }
 
-    // ── D7/D8 promotion of the legacy resumeSessionId rung ──────────────────
+    // ── D7/D8 409 ladder on the sessionRef carrier (REST rung) ─────────────
     // The 2026-08-16 duplicate-tab incident: a legacy-only carrier (the
     // `freshell` CLI's `new-tab --resume`) walked past both guards and spawned
-    // a second `opencode --session <sid>` writer onto a live session. A legacy
-    // `mode` + `resumeSessionId` pair IS a sessionRef claim (the reconcile
-    // door's §5.2 uniform promotion rule, reconcile.rs `promoted_legacy_claim`),
-    // so the guards must arm on it exactly as they do on the sessionRef rung.
+    // a second `opencode --session <sid>` writer onto a live session. The tests
+    // below pin the SAME D7/LEASE ladder via the canonical `sessionRef` carrier
+    // (kata ejh6 Task 3 re-carriered them off the legacy field; the legacy
+    // field's own door-level rejection coverage lands with the REST reject).
 
     #[tokio::test]
     async fn rest_create_legacy_resume_onto_live_session_is_refused_409() {
@@ -5827,7 +5827,7 @@ mod tests {
             json!({
                 "mode": "claude",
                 "cwd": std::env::temp_dir().to_string_lossy(),
-                "resumeSessionId": LIVE_SESSION,
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
             }),
             true,
         )
@@ -5838,7 +5838,7 @@ mod tests {
         assert_eq!(
             registry.identity_probe_rows().len(),
             rows_before,
-            "no duplicate spawn on the legacy rung"
+            "no duplicate spawn"
         );
 
         registry.kill("t-legacy-live-owner");
@@ -5872,7 +5872,7 @@ mod tests {
             json!({
                 "mode": "claude",
                 "cwd": std::env::temp_dir().to_string_lossy(),
-                "resumeSessionId": LIVE_SESSION,
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
             }),
             true,
         )
@@ -5904,7 +5904,7 @@ mod tests {
             json!({
                 "mode": "claude",
                 "cwd": std::env::temp_dir().to_string_lossy(),
-                "resumeSessionId": LIVE_SESSION,
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
             }),
             true,
         )
@@ -5918,7 +5918,7 @@ mod tests {
         assert_eq!(
             registry.bound_terminal_for_session_ref(&locator),
             Some(tid.clone()),
-            "a legacy-rung resume spawn must complete its lease into a sessionRef binding"
+            "a resume spawn must complete its lease into a sessionRef binding"
         );
 
         registry.kill(&tid);
@@ -6049,7 +6049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_opencode_tab_with_ses_prefixed_resume_id_synthesizes_session_ref() {
+    async fn create_opencode_tab_with_session_ref_flows_into_pane_content() {
         let argv_file = unique_argv_file("opencode-synth");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -6063,7 +6063,7 @@ mod tests {
             json!({
                 "mode": "opencode",
                 "cwd": tmp.to_string_lossy(),
-                "resumeSessionId": "ses_abc123"
+                "sessionRef": { "provider": "opencode", "sessionId": "ses_abc123" }
             }),
             true,
         )

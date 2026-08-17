@@ -157,7 +157,7 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
         "requestId": "req-resume-loser",
         "mode": "claude",
         "shell": "system",
-        "resumeSessionId": session_id,
+        "sessionRef": { "provider": "claude", "sessionId": session_id },
         "cwd": std::env::temp_dir().to_string_lossy(),
     });
     ws.send(WsMessage::Text(create.to_string())).await.unwrap();

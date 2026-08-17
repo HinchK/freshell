@@ -29,18 +29,18 @@ fn wire_session_ref_restore_is_from_wire() {
 }
 
 #[test]
-fn wire_legacy_resume_session_id_is_from_wire() {
+fn wire_session_ref_is_from_wire() {
     let create = create_from_json(serde_json::json!({
-        "requestId": "r-wire-legacy",
+        "requestId": "r-wire-sref",
         "mode": "amplifier",
         "shell": "system",
         "restore": true,
-        "resumeSessionId": "stale-amp-id"
+        "sessionRef": { "provider": "amplifier", "sessionId": "stale-amp-id" }
     }));
     let prep = derive_launch_prep(&create, "amplifier");
     assert!(
         prep.resume_id_from_wire,
-        "legacy resumeSessionId carrier is wire-originated"
+        "sessionRef carrier is wire-originated"
     );
     assert_eq!(prep.resume_session_id.as_deref(), Some("stale-amp-id"));
 }

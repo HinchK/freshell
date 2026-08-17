@@ -145,7 +145,7 @@ async fn requested_amplifier_resume_with_missing_dir_is_restubbed_under_same_id(
             "mode": "amplifier",
             "shell": "system",
             "cwd": cwd.to_string_lossy(),
-            "resumeSessionId": requested,
+            "sessionRef": { "provider": "amplifier", "sessionId": requested },
         })
         .to_string(),
     ))

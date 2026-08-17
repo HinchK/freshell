@@ -2227,7 +2227,10 @@ pub(crate) mod tests {
 
     fn attach_msg_with_resume(session_id: &str, durable: &str) -> FreshAgentAttach {
         let mut msg = attach_msg(session_id);
-        msg.resume_session_id = Some(durable.to_string());
+        msg.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: durable.to_string(),
+        });
         msg
     }
 
