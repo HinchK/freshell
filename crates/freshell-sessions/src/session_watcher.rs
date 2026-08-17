@@ -27,6 +27,11 @@ use crate::provider_layout::{ProviderLayout, WatchMode};
 /// well under human-perceptible latency.
 const DEBOUNCE_MS: u64 = 200;
 
+/// How often (seconds) to re-check absent providers whose roots didn't
+/// exist at startup. When a provider's root appears, a watcher is armed
+/// for it — no waiting for the 15-minute TTL reconciliation.
+const REARM_INTERVAL_SECS: u64 = 60;
+
 /// A configured provider with its resolved home directory.
 pub struct WatchedProvider {
     pub layout: Box<dyn ProviderLayout>,
@@ -38,6 +43,7 @@ pub struct SessionWatcher {
     index: Arc<SessionIndex>,
     providers: Vec<WatchedProvider>,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    rearm_interval_secs: u64,
 }
 
 /// Event filter: same logic as `activity.rs::fs_event_is_relevant` —
@@ -61,7 +67,14 @@ impl SessionWatcher {
             index,
             providers,
             stop_tx: None,
+            rearm_interval_secs: REARM_INTERVAL_SECS,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_rearm_interval(mut self, secs: u64) -> Self {
+        self.rearm_interval_secs = secs;
+        self
     }
 
     /// Start the watcher background task. Returns a `JoinHandle` for the
@@ -72,9 +85,10 @@ impl SessionWatcher {
 
         let index = Arc::clone(&self.index);
         let providers: Vec<_> = self.providers.drain(..).collect();
+        let rearm_secs = self.rearm_interval_secs;
 
         tokio::spawn(async move {
-            run_watcher_loop(index, providers, stop_rx).await;
+            run_watcher_loop(index, providers, stop_rx, rearm_secs).await;
         })
     }
 
@@ -91,13 +105,17 @@ async fn run_watcher_loop(
     index: Arc<SessionIndex>,
     providers: Vec<WatchedProvider>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    rearm_interval_secs: u64,
 ) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PathBuf, bool)>();
 
     // Arm one watcher per provider, per watch base.
     // Keep watchers alive for the loop's lifetime — dropping them unwatches.
     let mut _watchers: Vec<notify::RecommendedWatcher> = Vec::new();
-    for provider in &providers {
+    // Providers whose roots didn't exist at startup. Checked periodically
+    // so watchers are armed once the provider is installed.
+    let mut absent: Vec<(usize, PathBuf)> = Vec::new();
+    for (prov_idx, provider) in providers.iter().enumerate() {
         let watch_bases = provider.layout.watch_bases(&provider.home);
         let is_direct = provider.layout.is_direct_listed();
         let mode = match provider.layout.watch_mode() {
@@ -117,13 +135,13 @@ async fn run_watcher_loop(
                 let candidate = nearest_existing_ancestor(base, &provider.home);
                 if !candidate.exists() {
                     // Provider home itself doesn't exist (e.g. tool not
-                    // installed). Skip — the 15-minute TTL reconciliation
-                    // will discover it if it appears later.
+                    // installed). Track for periodic re-arming.
                     tracing::info!(
                         provider = %name,
                         path = %base.display(),
-                        "session-watcher: provider root absent, skipping watch",
+                        "session-watcher: provider root absent, will re-check periodically",
                     );
+                    absent.push((prov_idx, base.clone()));
                     index.mark_provider_dirty(&name);
                     continue;
                 }
@@ -180,13 +198,17 @@ async fn run_watcher_loop(
         }
     }
 
-    // Drop the sender so the loop can detect when all watchers are gone.
-    drop(event_tx);
+    // Keep the sender alive for re-arming absent providers.
+    // The stop signal (not channel closure) is the primary shutdown path.
+    let rearm_tx = event_tx;
 
     // Coalescing event loop.
     let debounce = Duration::from_millis(DEBOUNCE_MS);
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut needs_full_dirty = false;
+    let mut rearm_interval =
+        tokio::time::interval(Duration::from_secs(rearm_interval_secs));
+    rearm_interval.tick().await; // consume the immediate first tick
 
     loop {
         let flush_deadline = if pending.is_empty() && !needs_full_dirty {
@@ -226,17 +248,97 @@ async fn run_watcher_loop(
                 }
                 if !pending.is_empty() {
                     let dirty_paths: Vec<PathBuf> = pending.drain().map(|(p, _)| p).collect();
-                    // Filter through provider layouts — only deliver paths
-                    // that actually look like session files.
-                    let qualified: Vec<PathBuf> = dirty_paths
-                        .into_iter()
-                        .filter(|p| providers.iter().any(|prov| prov.layout.qualifies(p)))
-                        .collect();
+                    let mut qualified = Vec::new();
+                    let mut dirty_provider_names = std::collections::HashSet::new();
+                    for p in dirty_paths {
+                        if providers.iter().any(|prov| prov.layout.qualifies(&p)) {
+                            qualified.push(p);
+                        } else {
+                            // Not a session file — likely a directory event
+                            // (create/remove of a project or session dir).
+                            // Mark any provider whose watch base is an
+                            // ancestor of this path as dirty so it re-discovers.
+                            for prov in &providers {
+                                for base in prov.layout.watch_bases(&prov.home) {
+                                    if p.starts_with(&base) {
+                                        dirty_provider_names
+                                            .insert(prov.layout.name().to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !qualified.is_empty() {
                         index.mark_dirty(&qualified);
                     }
+                    for name in dirty_provider_names {
+                        index.mark_provider_dirty(&name);
+                    }
                 }
                 pending.clear();
+            }
+            _ = rearm_interval.tick(), if !absent.is_empty() => {
+                // Re-check absent providers: arm watchers for any whose
+                // root has appeared since the last check.
+                absent.retain(|(prov_idx, base)| {
+                    if !base.exists() {
+                        return true; // still absent
+                    }
+                    let prov = &providers[*prov_idx];
+                    let is_direct = prov.layout.is_direct_listed();
+                    let mode = match prov.layout.watch_mode() {
+                        WatchMode::Recursive => notify::RecursiveMode::Recursive,
+                        WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
+                    };
+                    let name = prov.layout.name().to_owned();
+                    let tx = rearm_tx.clone();
+                    let cb_name = name.clone();
+                    let armed = match notify::recommended_watcher(
+                        move |res: Result<notify::Event, _>| {
+                            match res {
+                                Ok(event) => {
+                                    if !is_relevant(&event) {
+                                        return;
+                                    }
+                                    let rescan = is_direct || event.need_rescan();
+                                    if event.paths.is_empty() && rescan {
+                                        let _ = tx.send((PathBuf::new(), true));
+                                    } else {
+                                        for path in event.paths {
+                                            let _ = tx.send((path, rescan));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        provider = %cb_name, error = %e,
+                                        "session-watcher: re-armed watcher error"
+                                    );
+                                    let _ = tx.send((PathBuf::new(), true));
+                                }
+                            }
+                        },
+                    ) {
+                        Ok(mut watcher) => {
+                            if watcher.watch(base, mode).is_ok() {
+                                _watchers.push(watcher);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Err(_) => false,
+                    };
+                    if armed {
+                        tracing::info!(
+                            provider = %name,
+                            path = %base.display(),
+                            "session-watcher: provider appeared, armed watcher",
+                        );
+                        index.mark_provider_dirty(&name);
+                    }
+                    !armed // keep in absent list if arming failed
+                });
             }
         }
     }
@@ -482,6 +584,78 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(found, "late-appearing session must be visible in the index");
+
+        watcher.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn watcher_rearms_when_absent_provider_appears() {
+        // Create a base dir but NOT the provider home (simulates a
+        // provider that isn't installed at startup).
+        let base = unique_temp_dir("rearm");
+        let claude_home = base.join(".claude");
+        // Don't create claude_home — the watcher should track it as absent.
+
+        let source = ClaudeSource::new(claude_home.clone());
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source) as Arc<dyn SessionSource>],
+            Duration::from_secs(3600),
+            None,
+        ));
+
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 0);
+
+        let mut rx = index.subscribe_changes();
+        let _ = *rx.borrow_and_update();
+
+        let mut watcher = SessionWatcher::new(
+            Arc::clone(&index),
+            vec![WatchedProvider {
+                layout: Box::new(crate::provider_layout::ClaudeLayout),
+                home: claude_home.clone(),
+            }],
+        )
+        .with_rearm_interval(1); // 1 second for fast test
+        let handle = watcher.start();
+
+        // Give the watcher time to start and register the absent provider.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // "Install" the provider — create its root directory.
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Wait for the re-arm timer to fire and arm the new watcher.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // NOW write a session file. If the watcher re-armed, it should
+        // detect this file via inotify (not via TTL reconciliation).
+        let sid = "550e8400-e29b-41d4-a716-446655440004";
+        write_claude_session(&claude_home, sid, "/p/rearm");
+
+        // Wait for the watcher to detect the new file.
+        let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+        assert!(
+            changed.is_ok(),
+            "re-armed watcher must detect the new file"
+        );
+
+        let mut found = false;
+        for _ in 0..20 {
+            let snap = index.snapshot().await;
+            if snap.iter().any(|s| s.session_id == sid) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            found,
+            "session from a re-armed provider must appear in the index"
+        );
 
         watcher.stop();
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;

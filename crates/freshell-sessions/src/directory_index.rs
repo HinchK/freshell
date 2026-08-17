@@ -1214,11 +1214,12 @@ impl SessionIndex {
                 // Drain dirty sets so the `is_dirty()` gate in
                 // `cached_pair()` resets. Any new dirty paths arriving
                 // after this drain trigger another refresh cycle.
-                // Currently the refresh is a full scan regardless of
-                // which paths changed — incremental path-scoped refresh
-                // is a future optimisation.
-                dirty_paths.lock().unwrap().clear();
-                dirty_providers.lock().unwrap().clear();
+                // The drained sets flow into `refresh_snapshot` so it
+                // can scope the sweep to only the changed paths/providers.
+                let scoped_paths: HashSet<PathBuf> =
+                    dirty_paths.lock().unwrap().drain().collect();
+                let scoped_providers: HashSet<String> =
+                    dirty_providers.lock().unwrap().drain().collect();
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
                 // Seed the failure set from the last PUBLISHED generation in
@@ -1238,8 +1239,14 @@ impl SessionIndex {
                     .as_ref()
                     .map(|c| c.scan_failures.clone())
                     .unwrap_or_default();
-                let (items, changed) =
-                    refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures);
+                let (items, changed) = refresh_snapshot(
+                    &sources,
+                    &mut cache,
+                    &mut direct,
+                    &mut failures,
+                    scoped_paths,
+                    scoped_providers,
+                );
                 (items, changed, failures)
             }
         })
@@ -1384,6 +1391,37 @@ struct DirectEntry {
     items: Vec<IndexedSession>,
 }
 
+/// Parse a scoped dirty path by finding the right source. Prefers the
+/// source matching `cached_source_name` (from a prior sweep's cache entry),
+/// then falls back to trying each file-backed source. Returns `(item, source_name)`
+/// where `item` is `None` for an exclusion (e.g. R10b cwd-less rule).
+fn parse_scoped_path(
+    path: &Path,
+    sources: &[Arc<dyn SessionSource>],
+    cached_source_name: Option<&str>,
+) -> (Option<IndexedSession>, Option<String>) {
+    if let Some(name) = cached_source_name {
+        if let Some(source) = sources
+            .iter()
+            .find(|s| s.provider_name() == Some(name))
+        {
+            return (source.parse(path), Some(name.to_owned()));
+        }
+    }
+    for source in sources {
+        if source.direct_change_token().is_some() {
+            continue;
+        }
+        if let Some(item) = source.parse(path) {
+            return (
+                Some(item),
+                source.provider_name().map(str::to_owned),
+            );
+        }
+    }
+    (None, None)
+}
+
 /// One incremental refresh sweep across all sources:
 ///
 /// 1. File-based sources: `discover()` the current `(path, mtime, size)` set
@@ -1413,8 +1451,15 @@ fn refresh_snapshot(
     cache: &mut HashMap<PathBuf, FileEntry>,
     direct_cache: &mut HashMap<usize, DirectEntry>,
     scan_failures: &mut HashSet<String>,
+    scoped_paths: HashSet<PathBuf>,
+    scoped_providers: HashSet<String>,
 ) -> (Vec<IndexedSession>, usize) {
+    // A full reconciliation (TTL expiry with no dirty marks) discovers
+    // every provider. A scoped refresh (watcher-driven) only touches
+    // the specific paths/providers that changed — the CPU-savings core.
+    let is_full = scoped_paths.is_empty() && scoped_providers.is_empty();
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut fully_discovered_providers = HashSet::<String>::new();
     // A failed root listing cannot distinguish "everything disappeared" from
     // "this provider is temporarily unreadable." Remember failures by source
     // so their rows stay cached while healthy providers still reconcile real
@@ -1487,11 +1532,24 @@ fn refresh_snapshot(
             continue;
         }
 
-        // File-backed: a ROOT-listing failure is recorded and preserves the
-        // existing cache. Treating it as an empty listing makes a transient
+        // File-backed: skip full discover when a scoped refresh covers
+        // only specific paths (not this provider). Full reconciliation
+        // and provider-level dirty marks do the full discover.
+        let source_name = source.provider_name().map(str::to_owned);
+        let should_discover = is_full
+            || source_name
+                .as_deref()
+                .is_some_and(|n| scoped_providers.contains(n));
+        if !should_discover {
+            continue;
+        }
+        if let Some(ref name) = source_name {
+            fully_discovered_providers.insert(name.clone());
+        }
+        // A ROOT-listing failure is recorded and preserves the existing
+        // cache. Treating it as an empty listing makes a transient
         // permission/I/O outage look like mass deletion and can persist a
         // gutted cache for the next boot.
-        let source_name = source.provider_name().map(str::to_owned);
         let stats = match source.discover_checked() {
             Ok(stats) => {
                 if let Some(name) = source.provider_name() {
@@ -1545,22 +1603,78 @@ fn refresh_snapshot(
         }
     }
 
-    // A prune is a real cache mutation and must contribute to persistence
-    // accounting; otherwise a cleaned cache can remain stale on disk. A
-    // failed provider retains only its own known cache entries; a healthy
-    // provider's deleted files still disappear this sweep. Unattributed
-    // legacy entries stay only while any source failed, because their owner is
-    // unknowable until a healthy discovery above migrates them.
+    // Scoped-path handling: stat + conditionally re-parse individual
+    // dirty paths that weren't already covered by a provider-level
+    // discover above. These paths came from the watcher (already
+    // qualified), so we only need to re-stat and re-parse on change.
+    if !is_full {
+        for path in &scoped_paths {
+            if discovered.contains(path) {
+                continue;
+            }
+            match stat_file(path) {
+                Some(stat) => {
+                    discovered.insert(path.clone());
+                    let unchanged = cache
+                        .get(path)
+                        .is_some_and(|e| e.mtime_ms == stat.mtime_ms && e.size == stat.size);
+                    if !unchanged {
+                        let cached_source = cache
+                            .get(path)
+                            .and_then(|e| e.source_name.clone());
+                        let (item, resolved_source) =
+                            parse_scoped_path(path, sources, cached_source.as_deref());
+                        cache.insert(
+                            path.clone(),
+                            FileEntry {
+                                source_name: resolved_source.or(cached_source),
+                                mtime_ms: stat.mtime_ms,
+                                size: stat.size,
+                                item,
+                            },
+                        );
+                        changed += 1;
+                    }
+                }
+                None => {
+                    if cache.remove(path).is_some() {
+                        changed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Prune: a real cache mutation that must contribute to persistence
+    // accounting. During a full reconciliation, prune everything not
+    // discovered (existing behavior). During a scoped refresh, only
+    // prune for providers that had a full discover — other providers'
+    // cache entries are untouched. Scoped-path deletions are handled
+    // inline above (stat_file returns None → cache.remove).
     let cache_len_before_prune = cache.len();
-    cache.retain(|path, entry| {
-        if discovered.contains(path) {
-            return true;
-        }
-        match entry.source_name.as_deref() {
-            Some(source_name) => failed_file_source_names.contains(source_name),
-            None => file_backed_discovery_failed,
-        }
-    });
+    if is_full {
+        cache.retain(|path, entry| {
+            if discovered.contains(path) {
+                return true;
+            }
+            match entry.source_name.as_deref() {
+                Some(source_name) => failed_file_source_names.contains(source_name),
+                None => file_backed_discovery_failed,
+            }
+        });
+    } else if !fully_discovered_providers.is_empty() {
+        cache.retain(|path, entry| {
+            if discovered.contains(path) {
+                return true;
+            }
+            match entry.source_name.as_deref() {
+                Some(name) if fully_discovered_providers.contains(name) => {
+                    failed_file_source_names.contains(name)
+                }
+                _ => true,
+            }
+        });
+    }
     changed = changed.saturating_add(cache_len_before_prune - cache.len());
 
     let mut items: Vec<IndexedSession> = cache
@@ -1901,6 +2015,15 @@ mod tests {
         fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
             self.direct_list_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.direct_list()
+        }
+
+        fn provider_name(&self) -> Option<&'static str> {
+            self.inner.provider_name()
+        }
+
+        fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+            self.discover_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.discover_checked()
         }
     }
 
@@ -4770,6 +4893,151 @@ mod tests {
         assert!(
             new_gen > initial_gen,
             "generation must advance: {new_gen} > {initial_gen}"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_path_skips_full_discover() {
+        let claude_home = unique_temp_dir("scoped-skip-discover");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            discover_calls: Arc::clone(&discover_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(3600));
+
+        let _ = index.snapshot().await;
+        assert_eq!(discover_calls.load(Ordering::SeqCst), 1, "warm = 1 discover");
+
+        // Rewrite the file to change mtime/size.
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T12:00:00.000Z",
+            "updated content that changes the file size for the test",
+        );
+
+        // Mark only a specific path dirty (not the whole provider).
+        index.mark_dirty(&[project.join("a.jsonl")]);
+
+        assert!(
+            wait_until(Duration::from_secs(2), || !index.has_dirty()).await,
+            "dirty flag must clear after refresh"
+        );
+
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "a scoped dirty path must NOT trigger a full discover()"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_provider_triggers_discover_for_that_provider() {
+        let claude_home = unique_temp_dir("scoped-provider-discover");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            discover_calls: Arc::clone(&discover_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_secs(3600));
+
+        let _ = index.snapshot().await;
+        assert_eq!(discover_calls.load(Ordering::SeqCst), 1);
+
+        // Mark the whole provider dirty (e.g. a directory event).
+        index.mark_provider_dirty("claude");
+
+        assert!(
+            wait_until(Duration::from_secs(2), || !index.has_dirty()).await,
+            "dirty flag must clear after refresh"
+        );
+
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            2,
+            "mark_provider_dirty must trigger a full discover()"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_path_handles_deleted_file() {
+        let claude_home = unique_temp_dir("scoped-deleted");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T11:00:00.000Z",
+            "hello b",
+        );
+
+        let index = test_index_with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_secs(3600),
+        );
+
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 2);
+
+        // Delete one file and mark it dirty.
+        let deleted_path = project.join("b.jsonl");
+        std::fs::remove_file(&deleted_path).unwrap();
+        index.mark_dirty(&[deleted_path]);
+
+        // Wait for the scoped refresh to process the deletion.
+        let settled = wait_until(Duration::from_secs(2), || {
+            !index.has_dirty()
+        })
+        .await;
+        assert!(settled, "dirty flag must clear");
+
+        // Force a snapshot read (the background refresh already ran).
+        let snap2 = index.snapshot().await;
+        assert_eq!(
+            snap2.len(),
+            1,
+            "deleted file must be removed from snapshot"
         );
 
         std::fs::remove_dir_all(&claude_home).ok();
