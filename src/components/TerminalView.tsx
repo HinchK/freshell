@@ -1194,9 +1194,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         return lines.join('\n')
       },
     )
+    window.__FRESHELL_TEST_HARNESS__.registerTerminalModes(tid, () => {
+      const t = termRef.current
+      if (!t) {
+        return {
+          mouseTrackingMode: 'none',
+          bracketedPasteMode: false,
+          sendFocusMode: false,
+          bufferType: 'normal',
+        }
+      }
+      return {
+        mouseTrackingMode: t.modes.mouseTrackingMode,
+        bracketedPasteMode: t.modes.bracketedPasteMode,
+        sendFocusMode: t.modes.sendFocusMode,
+        bufferType: t.buffer.active.type,
+      }
+    })
 
     return () => {
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalModes(tid)
     }
   }, [terminalContent?.terminalId])
 

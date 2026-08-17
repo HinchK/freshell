@@ -30,6 +30,27 @@ export interface FreshellTestHarness {
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
+  /**
+   * Additive xterm-mode snapshot for replay-sync e2e coverage: returns the
+   * xterm IModes-derived fields the renderer gates mouse forwarding on, plus
+   * the active buffer. null when no terminal is registered for the id.
+   */
+  getTerminalModes: (terminalId?: string) => {
+    mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
+    bracketedPasteMode: boolean
+    sendFocusMode: boolean
+    bufferType: 'normal' | 'alternate'
+  } | null
+  registerTerminalModes: (
+    terminalId: string,
+    accessor: () => {
+      mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
+      bracketedPasteMode: boolean
+      sendFocusMode: boolean
+      bufferType: 'normal' | 'alternate'
+    },
+  ) => void
+  unregisterTerminalModes: (terminalId: string) => void
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
@@ -78,6 +99,12 @@ export function installTestHarness(
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
+  const terminalModes = new Map<string, () => {
+    mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
+    bracketedPasteMode: boolean
+    sendFocusMode: boolean
+    bufferType: 'normal' | 'alternate'
+  }>()
   const suppressedFreshAgentPaneIds = new Set<string>()
   let suppressAllFreshAgentNetworkEffects = window.__FRESHELL_TEST_HARNESS__?.suppressAllFreshAgentNetworkEffects === true
     || (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ === true
@@ -141,6 +168,21 @@ export function installTestHarness(
     },
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
+    },
+    getTerminalModes: (terminalId?: string) => {
+      if (terminalId) {
+        const accessor = terminalModes.get(terminalId)
+        return accessor ? accessor() : null
+      }
+      const first = terminalModes.values().next()
+      if (first.done) return null
+      return first.value()
+    },
+    registerTerminalModes: (terminalId, accessor) => {
+      terminalModes.set(terminalId, accessor)
+    },
+    unregisterTerminalModes: (terminalId: string) => {
+      terminalModes.delete(terminalId)
     },
     getPerfAuditSnapshot: resolvedGetPerfAuditSnapshot,
     getSentWsMessages: () => [...sentWsMessages],
