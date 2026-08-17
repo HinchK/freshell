@@ -135,6 +135,9 @@ async fn run_watcher_loop(
                     }
                     Err(e) => {
                         eprintln!("session-watcher: watcher error for {cb_name}: {e}");
+                        // Signal a full rescan so the next TTL reconciliation
+                        // picks up whatever the watcher missed.
+                        let _ = tx.send((PathBuf::new(), true));
                     }
                 }
             }) {
@@ -144,6 +147,7 @@ async fn run_watcher_loop(
                             "session-watcher: failed to watch {} for {name}: {e}",
                             watch_target.display(),
                         );
+                        index.mark_provider_dirty(&name);
                     } else {
                         _watchers.push(watcher);
                     }
@@ -152,6 +156,7 @@ async fn run_watcher_loop(
                     eprintln!(
                         "session-watcher: failed to create watcher for {name}: {e}",
                     );
+                    index.mark_provider_dirty(&name);
                 }
             }
         }
@@ -407,7 +412,10 @@ mod tests {
     async fn watcher_handles_late_root_appearance() {
         let base = unique_temp_dir("late-root");
         let claude_home = base.join(".claude");
-        // Deliberately do NOT create the projects dir yet.
+        // Create the provider home but NOT the session root (projects/).
+        // The watcher can watch claude_home and detect when projects/
+        // appears inside it via recursive inotify.
+        std::fs::create_dir_all(&claude_home).unwrap();
 
         let source = ClaudeSource::new(claude_home.clone());
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
@@ -416,14 +424,14 @@ mod tests {
             None,
         ));
 
-        // Warm — empty, since the directory doesn't exist.
+        // Warm — empty, since projects/ doesn't exist.
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 0);
 
         let mut rx = index.subscribe_changes();
+        // Mark the initial generation seen.
+        let _ = *rx.borrow_and_update();
 
-        // Start watcher — it should watch the nearest existing ancestor.
-        std::fs::create_dir_all(&base).unwrap();
         let mut watcher = SessionWatcher::new(
             Arc::clone(&index),
             vec![WatchedProvider {
@@ -434,16 +442,28 @@ mod tests {
         let handle = watcher.start();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Now create the root AND a session file.
+        // Now create the session root AND a session file.
         let sid = "550e8400-e29b-41d4-a716-446655440003";
         write_claude_session(&claude_home, sid, "/p/late");
 
-        // The watcher should detect the root appearing and the session file.
+        // The watcher should detect the new file and trigger a refresh.
         let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
         assert!(
             changed.is_ok(),
-            "watcher must detect a late-appearing provider root (DEV-0002 liveness)"
+            "watcher must detect a late-appearing session (DEV-0002 liveness)"
         );
+
+        // Verify the session actually appears in the index.
+        let mut found = false;
+        for _ in 0..20 {
+            let snap = index.snapshot().await;
+            if snap.iter().any(|s| s.session_id == sid) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(found, "late-appearing session must be visible in the index");
 
         watcher.stop();
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;

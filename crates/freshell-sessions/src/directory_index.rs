@@ -1022,7 +1022,7 @@ impl SessionIndex {
     }
 
     /// Whether any dirty paths or providers are pending.
-    fn has_dirty(&self) -> bool {
+    pub fn has_dirty(&self) -> bool {
         !self.dirty_paths.lock().unwrap().is_empty()
             || !self.dirty_providers.lock().unwrap().is_empty()
     }
@@ -4673,7 +4673,7 @@ mod tests {
             "mark_dirty must trigger a reparse of the dirty file"
         );
 
-        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&claude_home).ok();
     }
 
     #[tokio::test]
@@ -4702,10 +4702,16 @@ mod tests {
 
         // Mark dirty but DON'T change the file — mtime/size are the same.
         index.mark_dirty(&[project.join("a.jsonl")]);
+        assert!(index.has_dirty(), "mark_dirty must set the dirty flag");
 
-        // Give the background refresh time to run.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The dirty flag triggers a refresh on the next snapshot().
         let _ = index.snapshot().await;
+
+        // Wait for the background refresh to settle.
+        assert!(
+            wait_until(Duration::from_secs(2), || !index.has_dirty()).await,
+            "dirty flag must be cleared after the refresh completes"
+        );
 
         // The file was re-stat'd (dirty path) but not re-parsed (mtime/size unchanged).
         assert_eq!(
@@ -4714,7 +4720,7 @@ mod tests {
             "an unchanged dirty file should be re-stat'd but not re-parsed"
         );
 
-        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&claude_home).ok();
     }
 
     #[tokio::test]
@@ -4740,18 +4746,23 @@ mod tests {
         let mut rx = index.subscribe_changes();
         let _ = index.snapshot().await; // initial snapshot — publishes gen 1
 
-        // The receiver should have been notified.
-        let initial_gen = *rx.borrow();
+        // Mark the initial generation seen so `changed()` only wakes on NEW ones.
+        let initial_gen = *rx.borrow_and_update();
         assert!(initial_gen > 0, "initial snapshot should bump generation");
 
         // Wait for TTL to expire, then trigger another snapshot.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = index.snapshot().await;
 
-        // Poll for the generation to advance.
+        // Poll for the generation to advance past the initial one.
         let changed = tokio::time::timeout(Duration::from_secs(2), rx.changed()).await;
         assert!(changed.is_ok(), "subscriber should wake on new snapshot");
+        let new_gen = *rx.borrow_and_update();
+        assert!(
+            new_gen > initial_gen,
+            "generation must advance: {new_gen} > {initial_gen}"
+        );
 
-        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&claude_home).ok();
     }
 }

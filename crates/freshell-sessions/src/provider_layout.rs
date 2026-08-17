@@ -189,12 +189,11 @@ impl ProviderLayout for AmplifierLayout {
     }
 
     fn qualifies(&self, path: &Path) -> bool {
-        // Must be named metadata.json
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name != "metadata.json" {
+        if !matches!(name, "metadata.json" | "events.jsonl" | "transcript.jsonl") {
             return false;
         }
-        // Must be at: projects/<project>/sessions/<session>/metadata.json
+        // Must be at: projects/<project>/sessions/<session>/<file>
         // Check that the grandparent is named "sessions"
         let session_dir = match path.parent() {
             Some(p) => p,
@@ -336,9 +335,23 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_layout_rejects_events_jsonl() {
-        assert!(!AmplifierLayout.qualifies(Path::new(
+    fn amplifier_layout_accepts_events_jsonl() {
+        assert!(AmplifierLayout.qualifies(Path::new(
             "/home/user/.amplifier/projects/myproj/sessions/abc/events.jsonl"
+        )));
+    }
+
+    #[test]
+    fn amplifier_layout_accepts_transcript_jsonl() {
+        assert!(AmplifierLayout.qualifies(Path::new(
+            "/home/user/.amplifier/projects/myproj/sessions/abc/transcript.jsonl"
+        )));
+    }
+
+    #[test]
+    fn amplifier_layout_rejects_nested_events_jsonl() {
+        assert!(!AmplifierLayout.qualifies(Path::new(
+            "/home/user/.amplifier/projects/myproj/sessions/abc/sub/events.jsonl"
         )));
     }
 

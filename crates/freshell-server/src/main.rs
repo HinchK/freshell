@@ -2443,12 +2443,14 @@ fn resolve_client_dir() -> PathBuf {
     PathBuf::from("dist/client")
 }
 
-/// SESSION-09 sweep cadence: >= `SessionIndex`'s own TTL (`DEFAULT_TTL`, 1s)
-/// so every tick's `snapshot()` call re-validates the on-disk corpus rather
-/// than reading a stale cached snapshot. See [`spawn_sessions_sweep`]'s doc
-/// comment for the full rationale (why a plain interval poll substitutes for
-/// legacy's filesystem watcher, and why 2s also subsumes legacy's ~150ms
-/// coalescing window).
+/// SESSION-09 sweep cadence (identity ticker fallback). The sessions sweep is
+/// now event-driven: `SessionWatcher` feeds inotify events into the index's
+/// dirty-marking, and `subscribe_changes()` wakes the sweep loop on each
+/// refresh. This interval serves as an identity-ticker fallback — it fires a
+/// `snapshot()` every 2s to catch the ~1.8% of events the watcher misses
+/// (measured in a 24h observer). The index's 15-minute TTL
+/// (`DEFAULT_TTL`) ensures that even without dirty-marks, the on-disk
+/// corpus is reconciled periodically.
 const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// The opencode/codex locators' poll cadence. Well under their ~2s
