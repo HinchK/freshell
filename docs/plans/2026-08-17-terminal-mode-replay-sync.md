@@ -101,7 +101,15 @@ One shared JSON family `port/oracle/baselines/mode-preamble/*.json` (input: trac
 ### 5. E2E (multi-client.spec.ts, both matrix legs)
 
 - Happy path: emitter pane sets `?1003h ?1006h ?1049h >4;1m` once, heartbeats; reload page; via new harness accessor `getTerminalModes(terminalId)` (additive, per G5 sketch — returns IModes + bufferType) assert `mouseTrackingMode==='any'` + `'alternate'`; `page.mouse.wheel` over pane → `terminal.input` with `\x1b[<64;` on wire.
-- Hazard closure: tracked-`?1004h` pane, harness dispatch `panes/requestPaneRefresh` (after content-terminalId fold), settle 400ms, assert zero `terminal.input` containing `\x1b[I`/`\x1b[O`.
+- Hazard closure (SHIPPED FORM, updated): the ?1004 focus-report hazard is
+  pinned at WIRE level — the reload path's sync frame must exist, be ordered
+  before replay, contain the armed-mode bytes (?2004h), and NEVER contain
+  1004. The original plan's "dispatch panes/requestPaneRefresh and assert
+  zero focus junk" shape was abandoned because xterm 6.0.0 re-fires a focus
+  report on ANY arm — including the REPLAY of the original arming byte while
+  it is still inside the retained window — a pre-existing leak (kata 9gy8)
+  that would make any junk-free window assertion conflate two distinct
+  mechanisms. The sync-exclusion wire pin is the property this branch owns.
 - Marker-forcing rule coverage: renderer-recreate (settings change) → next attach has surfaceReset=true AND sinceSeq=0 (no delta-on-blank-surface).
 
 ### 6. Live verification (same shape as PR#649 Task 3)

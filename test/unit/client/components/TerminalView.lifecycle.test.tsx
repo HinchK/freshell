@@ -20,6 +20,7 @@ import {
   saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
 import { getHydrationQueue, resetHydrationQueueForTests } from '@/lib/hydration-queue'
+import { getTerminalActions } from '@/lib/pane-action-registry'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 import {
@@ -110,6 +111,7 @@ vi.mock('@xterm/xterm', () => {
     })
     writeln = vi.fn()
     clear = vi.fn()
+    reset = vi.fn()
     dispose = vi.fn()
     onData = vi.fn()
     onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
@@ -9878,6 +9880,57 @@ describe('terminal.modes.sync (surface-reset mode preamble)', () => {
     expect(latestWrites().some((s) => s.includes('\x1b[?1003h'))).toBe(false)
     // attach completed via the no-pending-replay edge — a SECOND attach after
     // reconnect would not re-claim, so the observable gate here is: no write.
+  })
+
+  it('wipes a reset-then-written fresh surface before its forced full replay (fresheyes round 4: user-reset + reconnect duplication)', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    const firstAttach = sentAttaches().at(-1)!
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: firstAttach.attachRequestId,
+        seq: 0,
+        headSeq: 0,
+      })
+    })
+    const term = terminalInstances[terminalInstances.length - 1]
+    term.clear.mockClear()
+
+    // User Reset marks the surface fresh (marker nulled by round-4 A(iii)
+    // hardening); subsequent LIVE output makes the surface non-blank. A later
+    // reconnect forces sinceSeq=0 — the forced replay MUST wipe that content
+    // first, or the surface shows the post-reset live tail duplicated on top
+    // of full history.
+    const actions = getTerminalActions('pane-modes-sync')!
+    act(() => { actions.reset() })
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'post-reset live line\r\n',
+      })
+    })
+    await new Promise((r) => setTimeout(r, 30))
+
+    act(() => { reconnectHandler!() })
+    await waitFor(() => expect(sentAttaches().length).toBeGreaterThanOrEqual(2))
+    const second = sentAttaches().at(-1)!
+    expect(second.surfaceReset).toBe(true)
+    expect(second.sinceSeq).toBe(0)
+    await waitFor(() => {
+      expect(term.clear).toHaveBeenCalled()
+    })
+  })
+
+  it('does NOT wipe the genuinely blank surface of a first-ever fresh attach', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    const term = terminalInstances[terminalInstances.length - 1]
+    expect(term.clear).not.toHaveBeenCalled()
   })
 
   it('ignores a stale-generation terminal.modes.sync (bytes never written)', async () => {

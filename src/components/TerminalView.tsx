@@ -813,6 +813,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // completes (no-pending-replay / completeAttachGeneration edges).
   const surfaceFreshRef = useRef(false)
   const surfaceFreshMarkerRef = useRef<{ attachRequestId: string } | null>(null)
+  // Number of write-queue items APPLIED to the current surface since its
+  // construction/user-reset marking. Controls the downgrade wipe: a fresh
+  // surface is blank by construction, but live output after a user reset (or
+  // partial replay after an abandoned claim) leaves content that a forced
+  // sinceSeq=0 replay must wipe first or it duplicates (fresheyes round 4).
+  const surfaceWritesSinceFreshRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
     intent: AttachIntent
@@ -2080,9 +2086,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     // xterm birth site: covers mount-fresh AND renderer recreation).
     surfaceFreshRef.current = true
     surfaceFreshMarkerRef.current = null
+    surfaceWritesSinceFreshRef.current = 0
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
       onItemApplied: (item) => {
+        surfaceWritesSinceFreshRef.current += 1
         // Coupled clear (plan round-3): the marker-bearing attach's own
         // replay content applied ⇒ the delivered mode preamble is on the
         // surface ⇒ the fresh claim is consumed. 'live'-mode local notices
@@ -2262,6 +2270,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         // a post-reset clear (round-4 A(iii) hardening).
         surfaceFreshRef.current = true
         surfaceFreshMarkerRef.current = null
+        surfaceWritesSinceFreshRef.current = 0
       },
       scrollToBottom: () => {
         if (!allowCurrentTerminalAction()) return
@@ -2806,7 +2815,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         effectiveIntent = 'viewport_hydrate'
         fullHydrateFallbackReason = 'surface_fresh'
       }
-      if (surfaceFreshMarkerRef.current !== null) {
+      if (surfaceFreshMarkerRef.current !== null || surfaceWritesSinceFreshRef.current > 0) {
+        // Wipe before the forced full replay whenever the surface may hold
+        // content: an abandoned in-flight claim (marker set) or ANY applied
+        // write since the fresh marking (e.g. live output after a user
+        // reset). A genuinely blank fresh surface pays neither.
         clearViewportFirst = true
       }
     }

@@ -139,7 +139,10 @@ export function createTerminalModeTracker(): TerminalModeTracker {
       const enable = finalChar === 'h'
       for (const segment of body.split(';')) {
         const param = Number.parseInt(segment, 10)
-        if (!Number.isFinite(param)) continue
+        // Rust-side parity: params outside the u32 range are rejected there;
+        // an oversized JS number would also stringify into exponential
+        // notation during synthesis — drop it identically.
+        if (!Number.isFinite(param) || param > 0xffffffff) continue
         applyPrivateMode(param, enable)
       }
       return
@@ -154,9 +157,9 @@ export function createTerminalModeTracker(): TerminalModeTracker {
       // so this corner has no observable output either way).
       const [resourceText, valueText] = body.split(';')
       const resource = Number.parseInt(resourceText, 10)
-      if (!Number.isFinite(resource)) return
+      if (!Number.isFinite(resource) || resource > 0xffffffff) return
       const value = valueText === undefined || valueText === '' ? 0 : Number.parseInt(valueText, 10)
-      if (!Number.isFinite(value)) return
+      if (!Number.isFinite(value) || value > 0xffffffff) return
       xtModifyKeys.set(resource, value)
       return
     }

@@ -313,3 +313,18 @@ describe('mode tracker — synthesis shape and reset', () => {
     expect(tracker.synthesize()).toBe(`${SET}1007h`)
   })
 })
+
+describe('u32 range parity (Rust rejects out-of-range params)', () => {
+  it('drops a param above u32::MAX without corrupting the rest of the list', () => {
+    const tracker = createTerminalModeTracker()
+    tracker.scan(`${SET}1004;4294967296;2004h`)
+    expect(tracker.synthesize()).toBe(`${SET}2004h`)
+  })
+
+  it('drops oversized XTMODIFYKEYS resource/value params', () => {
+    const tracker = createTerminalModeTracker()
+    tracker.scan(`${ESC}[>4294967296;1m`)
+    tracker.scan(`${SET}2004h`)
+    expect(tracker.synthesize()).toBe(`${SET}2004h`)
+  })
+})
