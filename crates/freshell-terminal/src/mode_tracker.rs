@@ -21,7 +21,6 @@
 //! `CSI_PAYLOAD_SUFFIX_LIMIT`, `barrier_scanner.rs`). `U+FFFD` inside a pending
 //! escape ABORTS it and re-enters ground state (it is text, not structure).
 
-use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use tracing::warn;
