@@ -1518,7 +1518,6 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         sessionId: 'thread-new-1',
         sessionType: 'freshcodex',
         cwd: lane.projectDir,
-        resumeSessionId: 'thread-new-1',
         sessionRef: { provider: 'codex', sessionId: 'thread-new-1' },
       })
       // No thread/resume for the source existed before this attach (create rode
@@ -1583,7 +1582,6 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         sessionId: 'thread-new-1',
         sessionType: 'freshcodex',
         cwd: lane.projectDir,
-        resumeSessionId: 'thread-new-1',
         sessionRef: { provider: 'codex', sessionId: 'thread-new-1' },
       })
       await expect
@@ -1861,7 +1859,6 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
         sessionId: parentId,
         sessionType: 'freshopencode',
         cwd: lane.projectDir,
-        resumeSessionId: parentId,
         sessionRef: { provider: 'opencode', sessionId: parentId },
       })
       const forkRowIndex = readOpencodeAudit(lane.auditLogPath)
@@ -1926,7 +1923,6 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
         sessionId: parentId,
         sessionType: 'freshopencode',
         cwd: lane.projectDir,
-        resumeSessionId: parentId,
         sessionRef: { provider: 'opencode', sessionId: parentId },
       })
       await expect
