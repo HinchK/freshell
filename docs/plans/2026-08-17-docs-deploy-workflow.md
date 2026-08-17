@@ -18,7 +18,7 @@ Move the GitHub Pages deployment of the freshell docs site (source: `main` branc
 
 **Goal:** freshell.net keeps serving exactly the `docs/` tree, but the build+deploy runs from a workflow file in this repo instead of GitHub's hidden legacy pipeline, so failures are visible, re-runnable, and owned by us.
 
-**Architecture:** One new workflow, `.github/workflows/docs-pages-deploy.yml`, that mirrors the observed legacy pipeline exactly: checkout (fetch-depth 1) → `actions/upload-pages-artifact` on `./docs` (artifact `github-pages`, retention 1 day) → `actions/deploy-pages`. No build step (legacy has none; `.nojekyll` present; no `_config.yml`). Single job against the pre-existing `github-pages` environment (branch policy already allows `main`). Triggers: pushes to `main` touching `docs/**` or the workflow file itself, plus `workflow_dispatch` (replaces legacy's only manual option, "Re-run jobs"). Adoption (outside the PR): flip the repo's Pages `build_type` from `legacy` to `workflow` immediately before merging, then verify by triggering the workflow and checking freshell.net.
+**Architecture:** One new workflow, `.github/workflows/docs-pages-deploy.yml`, that mirrors the observed legacy pipeline exactly: checkout (fetch-depth 1) → `actions/upload-pages-artifact` on `./docs` (artifact `github-pages`, retention 1 day) → `actions/deploy-pages`. No build step (legacy has none; `.nojekyll` present; no `_config.yml`). Single job against the pre-existing `github-pages` environment (branch policy already allows `main`). Triggers: pushes to `main` touching `docs/**`, plus `workflow_dispatch` (replaces legacy's only manual option, "Re-run jobs"). Adoption (outside the PR): flip the repo's Pages `build_type` from `legacy` to `workflow` immediately before merging, then verify by triggering the workflow and checking freshell.net.
 
 **Tech Stack:** GitHub Actions (`actions/checkout@v4`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v5` — the exact major versions the legacy pipeline itself runs), GitHub Pages, actionlint for static validation.
 
@@ -145,13 +145,31 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
 1. Push `the-usual/docs-deploy-workflow`, open PR targeting `main` (explicit user approval first).
 2. Immediately before merging, flip the repo's Pages source so the merge's own deploy run uses the new pipeline and legacy stops racing it. The PUT documents no "omitted fields are preserved" guarantee (Stage 2 finding), so the call re-asserts the current values idempotently:
    `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow -f cname=freshell.net -F https_enforced=true`
+   Keep the flip→merge window to minutes: with `build_type: workflow` but the workflow file not yet on `main`, nothing can deploy from either pipeline (legacy is off; Actions manual dispatch requires the workflow file on the default branch per GitHub's docs) — the site keeps serving its last successful build, but no new deploy is possible. If the merge is rejected or stalls, restore legacy immediately with steps 5(b-d) below (they work in this state) and retry the merge at a calm moment; do not sit in the flipped-not-merged state.
 3. Merge the PR. The merge commit touches `docs/plans/` (this plan) → the `paths: docs/**` filter self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
 5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, cancellation is awaited to terminal state (GitHub returns only `202 Accepted` from `gh run cancel`), and recovery is verified against the exact requested build (Fresh Eyes rounds 1–3 findings):
    a. Disable the repo-owned workflow (prevents pushes from queueing new runs mid-rollback), then cancel every nonterminal run to a VERIFIED fixpoint — cancelling the active run can promote a queued one, so snapshot+cancel loops until a fresh snapshot shows zero nonterminal runs. The LIST call uses the raw REST endpoint `GET /actions/workflows/{file}/runs` instead of `gh run list --workflow` so behavior cannot depend on the installed gh version's workflow-resolution rules (verified against gh v2.45.0 source: NAME selectors resolve against active workflows only, `.yml` file selectors happen to bypass that filter, and `--status` rejects values such as `pending` — the raw endpoint avoids all three). The loop is fail-closed (a listing failure aborts the rollback before any flip) and paginates the entire run history:
       `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
+      (Skipped automatically below if the workflow is not yet on `main`, e.g. a rollback after a failed/stalled merge.)
       ```bash
+      set -o pipefail   # an interrupted `gh api | sort` must fail the pipeline, not silently
+                        # yield an empty/partial candidate set (Bash manual: pipeline status
+                        # defaults to the LAST command's status unless pipefail is set)
       CANDS=$(mktemp)
+
+      # Probe the workflow's presence on the default branch first (fail-closed probe).
+      # If it is not there (rollback before the merge landed), no run or Pages deployment
+      # of this workflow can exist — workflow_dispatch and push triggers both require the
+      # file on the default branch — so proceed straight to the Pages-settings restore.
+      hdr=$(gh api -i repos/danshapiro/freshell/actions/workflows/docs-pages-deploy.yml 2>/dev/null | head -1)
+      case "$hdr" in
+        *" 404"*) echo "workflow not on default branch: no Actions runs/deployments can exist — skipping cancellation"; rm -f "$CANDS" ;;
+        *" 200"*) ;;
+        *)        echo "ERROR: cannot verify workflow presence ($hdr) — aborting rollback; do NOT flip Pages settings" >&2; rm -f "$CANDS"; exit 1 ;;
+      esac
+
+      if [[ "$hdr" == *" 200"* ]]; then
       # Seed candidates from the ENTIRE run history of this workflow, not only runs we
       # happen to observe nonterminal: a run terminal before the first snapshot (e.g.
       # GitHub force-terminated it) can still own a nonterminal Pages deployment. Both
@@ -159,7 +177,7 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
       if ! gh api --paginate "repos/danshapiro/freshell/actions/workflows/docs-pages-deploy.yml/runs?per_page=100" \
            --jq '.workflow_runs[] | .head_sha' | sort -u > "$CANDS"; then
         echo "ERROR: run listing failed — aborting rollback; do NOT flip Pages settings" >&2
-        exit 1
+        rm -f "$CANDS"; exit 1
       fi
 
       while true; do
@@ -167,7 +185,7 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
         if ! gh api --paginate "repos/danshapiro/freshell/actions/workflows/docs-pages-deploy.yml/runs?per_page=100" \
              --jq '.workflow_runs[] | select(.status | test("^(queued|in_progress|requested|waiting|pending)$")) | .id' > "$LIST"; then
           echo "ERROR: run listing failed — aborting rollback; do NOT flip Pages settings" >&2
-          exit 1
+          rm -f "$LIST" "$CANDS"; exit 1
         fi
         if [ ! -s "$LIST" ]; then rm -f "$LIST"; break; fi
         while read -r id; do
@@ -183,6 +201,8 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
       # (REST docs: "You can also give the commit SHA of the deployment"), so no log scraping
       # or deployment-id format guessing is needed. Every API failure except a clean 404 is
       # FATAL to the rollback (fail-closed — no "all clear" can print on unproven evidence).
+      # ACTIVE = every status not proven final per the pinned action source (see prose below):
+      ACTIVE_RE='^(pending|deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn|deployment_attempt_error|unknown_status|not_found)$'
       RC=0
       while read -r sha; do
         hdr=$(gh api -i "repos/danshapiro/freshell/pages/deployments/$sha" 2>/dev/null | head -1)
@@ -192,21 +212,22 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
           *) echo "ERROR: unexpected response checking deployment $sha ($hdr) — aborting rollback" >&2; RC=1; break ;;
         esac
         st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status) || { echo "ERROR: status read failed for $sha — aborting" >&2; RC=1; break; }
-        case "$st" in
-          deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn)
-            gh api -X POST "repos/danshapiro/freshell/pages/deployments/$sha/cancel" || { echo "ERROR: cancel failed for $sha — aborting" >&2; RC=1; break; }
-            while :; do
-              st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status) || { echo "ERROR: status poll failed for $sha — aborting" >&2; RC=1; break; }
-              case "$st" in deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn) sleep 5 ;; *) break ;; esac
-            done
-            ;;
-        esac
+        if [[ "$st" =~ $ACTIVE_RE ]]; then
+          gh api -X POST "repos/danshapiro/freshell/pages/deployments/$sha/cancel" || { echo "ERROR: cancel failed for $sha — aborting" >&2; RC=1; break; }
+          while :; do
+            st=$(gh api "repos/danshapiro/freshell/pages/deployments/$sha" --jq .status) || { echo "ERROR: status poll failed for $sha — aborting" >&2; RC=1; break; }
+            [[ "$st" =~ $ACTIVE_RE ]] || break
+            sleep 5
+          done
+          [ "$RC" -eq 0 ] || break
+        fi
       done < "$CANDS"
       [ "$RC" -eq 0 ] || { rm -f "$CANDS"; exit 1; }
       rm -f "$CANDS"
-      echo "Pages-side sweep complete: no nonterminal Actions deployments remain"
+      echo "Pages-side sweep complete: no non-final Actions deployments remain"
+      fi
       ```
-      The sweep is the authority, not the Actions-side cancellation: a cancelled deploy-pages run only *attempts* to cancel its Pages deployment (its handler swallows API errors), and a force-terminated run skips the handler entirely. Candidate SHAs are seeded from the workflow's ENTIRE run history, so even a run that was already terminal before the first snapshot (e.g. force-killed before rollback began) is checked. Cancelled-late deployments that already succeeded are harmless — the legacy rebuild in step c deploys byte-identical docs content over them; nonterminal ones are cancelled here. Deployment status vocabulary (verified against the REST docs): nonterminal = `deployment_in_progress`, `syncing_files`, `finished_file_sync`, `updating_pages`, `purging_cdn`; terminal = `succeed`, `deployment_cancelled`, `deployment_failed`, `deployment_content_failed`, `deployment_attempt_error`, `deployment_lost`.
+      The sweep is the authority, not the Actions-side cancellation: a cancelled deploy-pages run only *attempts* to cancel its Pages deployment (its handler swallows API errors), and a force-terminated run skips the handler entirely. Candidate SHAs are seeded from the workflow's ENTIRE run history, so even a run that was already terminal before the first snapshot (e.g. force-killed before rollback began) is checked. Cancelled-late deployments that already succeeded are harmless — the legacy rebuild in step c deploys byte-identical docs content over them; every non-final one is cancelled here and polled to a final status. Status classification: ACTIVE (cancel + poll) = `pending`, `deployment_in_progress`, `syncing_files`, `finished_file_sync`, `updating_pages`, `purging_cdn`, `deployment_attempt_error`, `unknown_status`, `not_found`; final (leave alone) = `succeed`, `deployment_cancelled`, `deployment_failed`, `deployment_content_failed`, `deployment_lost`. This is verified against the REST docs AND the pinned action source `deploy-pages@cd2ce8fcbc...` `src/internal/deployment.js`: its `temporaryErrorStatus` map lists `deployment_attempt_error` ("a retry will be automatically scheduled"), `unknown_status`, and `not_found` as temporary — the action's `check()` loop only warns on them and keeps polling, so a deployment observed in one of them can still proceed; treating them as terminal (an earlier draft's bug) could let an auto-retried Actions deployment race the restored legacy pipeline.
    b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
       `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
    c. Request a legacy build and correlate recovery to the current source tip with movement detection (a bare `/pages/builds/latest` read can describe a stale or superseded build):
