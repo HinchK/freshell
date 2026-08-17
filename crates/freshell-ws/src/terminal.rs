@@ -60,10 +60,11 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent, Pong, ServerMessage,
-    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
-    TerminalKill, TerminalResize,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
+    Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
+    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
+    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
+    LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -644,6 +645,87 @@ async fn handle_client_text(
                 return true;
             }
             _ => {}
+        }
+    }
+
+    // ejh6 (review round 2 findings 2/4/8): raw-Value legacy-resume guard.
+    // Reject ANY create-class message carrying a top-level `resumeSessionId`
+    // with ANY JSON value (string, empty, null, number, object) at the raw
+    // layer. The typed structs' Option<String> READS CANNOT DO THIS JOB:
+    // serde absorbs JSON `null` into None (silent accept), and a non-string
+    // carry fails the whole typed parse into the accept-and-strip arm below
+    // (silent drop, no terminal, no error). Presence must be read here, at
+    // the raw layer, before dedupe/restore planning (zero side effects on
+    // reject). The two INVALID_MESSAGE families (terminal.create,
+    // codingcli.create) were armed in Task 6; Task 7 armed the freshAgent
+    // families (create.failed envelope / attach event channel).
+    if let Some(resume_value) = value.get("resumeSessionId") {
+        let _ = resume_value; // presence is what matters; the value is never read
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("terminal.create") | Some("codingcli.create") => {
+                let reply = ServerMessage::Error(ErrorMsg {
+                    code: ErrorCode::InvalidMessage,
+                    message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: value
+                        .get("requestId")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string),
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                });
+                return send(ws_tx, &reply).await;
+            }
+            // Task 7: freshAgent arms. The legacy field on a freshAgent
+            // create-class message gets the per-family envelope. Create
+            // returns `freshAgent.create.failed` (it carries requestId);
+            // attach has NO requestId, so its rejection rides the
+            // `freshAgent.error` event channel keyed by sessionId — the same
+            // shape claude.rs:265-282 broadcasts today. Built from the raw
+            // frame: presence already proven by the guard condition.
+            Some("freshAgent.create") => {
+                let reply = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                    code: "FRESH_AGENT_CREATE_FAILED".to_string(),
+                    message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+                    request_id: value
+                        .get("requestId")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    retryable: Some(false),
+                });
+                return send(ws_tx, &reply).await;
+            }
+            Some("freshAgent.attach") => {
+                let session_id = value
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+                let reply = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event: serde_json::json!({
+                        "type": "freshAgent.error",
+                        "sessionId": session_id,
+                        "code": "FRESH_AGENT_CREATE_FAILED",
+                        "message": LEGACY_RESUME_IDENTITY_REFUSAL,
+                    }),
+                    provider: value
+                        .get("provider")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    session_id: session_id.to_string(),
+                    session_type: value
+                        .get("sessionType")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+                return send(ws_tx, &reply).await;
+            }
+            _ => {} // not a create-class type; fall through to typed parse
         }
     }
 
@@ -1513,24 +1595,6 @@ impl Drop for KeyedCreateGuard {
 /// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
 /// the P0.4 restore ladder) are freshly minted or single-source and carry no
 /// concurrent-duplicate shape, so they claim nothing.
-/// Node's legacy-restore refusal text (`server/ws-handler.ts:2181`; the SAME
-/// frozen string the REST door's codex rejection reuses,
-/// `freshell-freshagent/terminal_tabs.rs` `INVALID_RAW_CODEX_RESUME_MESSAGE`)
-/// -- byte-identical so clients see one contract across doors and servers.
-const LEGACY_RESTORE_IDENTITY_REFUSAL: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
-
-/// Node parity (`server/terminal-registry.ts:186-189` `modeSupportsResume`):
-/// a non-shell mode whose CLI spec declares `resumeArgs`. Mirrors Node's
-/// truthiness check on the array (`!!resumeArgs` -- present counts, even
-/// empty), so the two servers refuse the same set of modes.
-fn mode_supports_resume(state: &WsState, mode: &str) -> bool {
-    mode != "shell"
-        && state
-            .cli_commands
-            .iter()
-            .any(|s| s.name == mode && s.resume_args.is_some())
-}
-
 fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
     if create.mode == "shell" {
         return None;
@@ -1540,6 +1604,9 @@ fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
         .as_ref()
         .filter(|r| r.provider == create.mode)
         .map(|r| r.session_id.clone())
+        // ejh6: DEAD FROM THE WIRE — the raw pre-parse guard rejects any
+        // `resumeSessionId` carry before dispatch. Retained so the rung table
+        // stays total if this fn is ever fed an internally-built create.
         .or_else(|| create.resume_session_id.clone())
         .filter(|s| !s.is_empty())?;
     Some(SessionLocator {
@@ -1882,6 +1949,10 @@ pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchP
             // 'resume' (`tr:1570-1571`).
             resume_session_id = requested_ref
                 .map(|r| r.session_id.clone())
+                // ejh6: DEAD FROM THE WIRE — the raw pre-parse guard rejects
+                // any `resumeSessionId` carry before dispatch, so this
+                // `.or_else` legacy rung can only fire for an
+                // internally-built create. Retained for rung-table totality.
                 .or_else(|| create.resume_session_id.clone())
                 .filter(|s| !s.is_empty());
             // Everything this arm can produce came from the wire (or the
@@ -2426,36 +2497,12 @@ pub(crate) async fn handle_create(
     // reject loudly when nothing can resolve. Claude-only: gemini/kimi
     // behavior is deliberately untouched, and fresh (non-restore)
     // claude keeps the preallocation branch above.
-    // Node parity (`server/ws-handler.ts:2170-2186`): a `restore:true` create
-    // for a resume-supporting non-codex mode whose ONLY identity is the
-    // legacy `resumeSessionId` is refused loudly -- restore identity must be
-    // a `sessionRef` (PR #318's durable-session contract). The Rust door
-    // previously fell through to `<cli> --resume <sid>` for this shape.
-    // Node's `!hasReusableRequestedLiveTerminal` arm has no Rust analog:
-    // `create.live_terminal` is a legacy repair hint the Rust server
-    // deliberately ignores (superseded by `pane.reconcile` verdicts -- see
-    // the field's doc in freshell-protocol/client_messages.rs), so no
-    // reuse path exists to exempt. Placed BEFORE the claude P0.4 restore
-    // ladder, matching Node's ordering (the refusal wins over ladder
-    // healing).
-    if create.restore == Some(true)
-        && mode != "codex"
-        && mode_supports_resume(state, &mode)
-        && create
-            .resume_session_id
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        && create.session_ref.is_none()
-    {
-        return send_create_error(
-            out,
-            ErrorCode::InvalidMessage,
-            LEGACY_RESTORE_IDENTITY_REFUSAL.to_string(),
-            &create.request_id,
-        )
-        .await;
-    }
-
+    // ejh6 Task 6: the scoped legacy-field refusal gate that lived here
+    // (restore + non-codex + legacy-only carrier) moved UP to the raw
+    // pre-parse guard in `handle_client_text` — EVERY `resumeSessionId`
+    // carry (any mode, any restore state, companion sessionRef included)
+    // is rejected there with INVALID_MESSAGE + the frozen text, before
+    // dedupe and before any planning.
     if mode == "claude" && create.restore == Some(true) {
         // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
         // a client-supplied claude id that is not canonical-UUID-shaped

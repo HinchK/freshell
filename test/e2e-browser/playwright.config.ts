@@ -285,6 +285,10 @@ export const RUST_ONLY_SPECS = [
   // owns its RustServer (isolated HOME, ephemeral port); the DELETE route
   // exists only on the Rust server.
   /session-delete-rust\.spec\.ts$/,
+  // Remote tab linkage (STATE-SYNC FIX 1 / EDEV-07) — boots its own
+  // RustServers, hard e2eServerKind==='rust' assertion per test; the legacy
+  // tree has no amplifier provider registered at all (pre-existing gap fix).
+  /remote-tab-linkage-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({

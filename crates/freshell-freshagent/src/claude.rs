@@ -1806,15 +1806,19 @@ fn request_id_string(request_id: &freshell_protocol::StringOrNumber) -> String {
 /// `codex.rs`/`opencode_ws.rs` (both document the duplication) -- but unlike those two this
 /// one cannot hardcode the session type: provider `claude` covers BOTH `freshclaude` and
 /// `kilroy`, so the envelope's sessionType comes from the attach message.
-/// The durable claude id an attach carries: `resumeSessionId` first, then
-/// `sessionRef.sessionId` -- both written by the FROZEN client
-/// (`FreshAgentView.tsx:303-313`). Only canonical UUIDs qualify
-/// (`shared/session-contract.ts:34`) -- a nanoid here would just miss the store.
+/// The durable claude id an attach carries: `sessionRef.sessionId` first,
+/// then the legacy `resumeSessionId` fallback — flipped from legacy-first
+/// (kata ejh6 section 4b hygiene). After the wire-level reject on
+/// `freshAgent.attach`, the legacy field is dead for external input; the
+/// fallback remains only for internal/test constructions. Only canonical
+/// UUIDs qualify (`shared/session-contract.ts:34`) — a nanoid here would
+/// just miss the store.
 fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
     let candidate = msg
-        .resume_session_id
-        .clone()
-        .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))?;
+        .session_ref
+        .as_ref()
+        .map(|r| r.session_id.clone())
+        .or_else(|| msg.resume_session_id.clone())?;
     is_canonical_claude_uuid(&candidate).then_some(candidate)
 }
 
@@ -2227,8 +2231,41 @@ pub(crate) mod tests {
 
     fn attach_msg_with_resume(session_id: &str, durable: &str) -> FreshAgentAttach {
         let mut msg = attach_msg(session_id);
-        msg.resume_session_id = Some(durable.to_string());
+        msg.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: durable.to_string(),
+        });
         msg
+    }
+
+    /// Delta review round-2 pin (kata ejh6 section 4b): `attach_durable_id` reads
+    /// sessionRef-first after the Task-7 flip. A legacy-first ordering (pre-flip)
+    /// returns the legacy id in the dual-carrier case — this test fails there.
+    #[test]
+    fn attach_durable_id_prefers_session_ref_over_legacy() {
+        const REF_ID: &str = "11111111-2222-4333-8444-555555555555";
+        const LEGACY_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+        // (i) both carriers set with different canonical UUIDs → sessionRef wins
+        let mut both = attach_msg("s");
+        both.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: REF_ID.to_string(),
+        });
+        both.resume_session_id = Some(LEGACY_ID.to_string());
+        assert_eq!(attach_durable_id(&both), Some(REF_ID.to_string()));
+
+        // (ii) sessionRef only → its id
+        let ref_only = attach_msg_with_resume("s", REF_ID);
+        assert_eq!(attach_durable_id(&ref_only), Some(REF_ID.to_string()));
+
+        // (iii) legacy only → its id (internal/test-compat lane)
+        let mut legacy_only = attach_msg("s");
+        legacy_only.resume_session_id = Some(LEGACY_ID.to_string());
+        assert_eq!(attach_durable_id(&legacy_only), Some(LEGACY_ID.to_string()));
+
+        // (iv) neither → None
+        assert_eq!(attach_durable_id(&attach_msg("s")), None);
     }
 
     fn write_fake_transcript(home: &std::path::Path, durable: &str) {

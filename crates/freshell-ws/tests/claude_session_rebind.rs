@@ -543,7 +543,6 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
             "sessionType": "freshclaude",
             "provider": "claude",
             "cwd": "/tmp",
-            "resumeSessionId": sidecar_sid,
             "sessionRef": { "provider": "claude", "sessionId": sidecar_sid },
         })
         .to_string(),

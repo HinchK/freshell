@@ -6,8 +6,13 @@
 //!
 //! Two directions, two guards:
 //! 1. A `freshAgent.create` resuming S while a live terminal PTY owns S is refused
-//!    with `freshAgent.create.failed { code: "SESSION_RESERVED", retryable: true }`
-//!    and ZERO sidecar spawns (the terminal may be closing -- retryable).
+//!    and spawns ZERO sidecars. Post-ejh6 (Task 7) the refusal code depends on the
+//!    carrier: a legacy/dual-carrier create (`resumeSessionId` present) is rejected
+//!    at the raw-Value ejh6 guard with `freshAgent.create.failed { code:
+//!    "FRESH_AGENT_CREATE_FAILED" }` + frozen text, while a sessionRef-ONLY create
+//!    reaches the typed cross-kind live-guard and is refused with
+//!    `freshAgent.create.failed { code: "SESSION_RESERVED", retryable: true }`
+//!    (the terminal may be closing -- retryable).
 //! 2. A `terminal.create` whose wire sessionRef names S while a live sidecar owns S
 //!    is refused with the D7 guard's EXISTING rejection frame
 //!    (`error { code: "RESTORE_UNAVAILABLE" }`), same as a live PTY.
@@ -15,7 +20,7 @@
 //! Harness: the lease-suite fake claude sidecar (request-log knob) + the common
 //! sleeper CLI spec so terminal claude creates genuinely spawn a Running PTY.
 //! Run via `scripts/sandbox-test.sh` per the destructive-suite convention of the
-//! sibling lease suite (shared file-level ruling; these two tests kill nothing).
+//! sibling lease suite (shared file-level ruling; these tests kill nothing).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -367,8 +372,11 @@ async fn await_frame(
 // ── the red tests ────────────────────────────────────────────────────────────────────
 
 /// Direction 1 (V7 scenario B): a live terminal PTY owns `(claude, S)`; a
-/// `freshAgent.create { resumeSessionId: S }` must be refused with
-/// `SESSION_RESERVED { retryable: true }` and spawn ZERO sidecars.
+/// `freshAgent.create { resumeSessionId: S }` must be refused and spawn ZERO
+/// sidecars. Post-ejh6 (Task 7) the refusal fires at the raw-Value ejh6 guard
+/// (the create carries the legacy field) BEFORE the typed dispatch reaches the
+/// SESSION_RESERVED cross-kind guard, so the code is
+/// `FRESH_AGENT_CREATE_FAILED` + frozen text.
 #[tokio::test]
 async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
@@ -422,10 +430,89 @@ async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
         failed["type"], "freshAgent.create.failed",
         "a live terminal PTY owns {session_id}: the fresh-agent resume must be refused, got {failed}"
     );
+    // ejh6: the legacy field is rejected at the door BEFORE the SESSION_RESERVED
+    // cross-kind guard fires (the raw-Value ejh6 guard's freshAgent.create arm
+    // runs first). The code is FRESH_AGENT_CREATE_FAILED + frozen text, not
+    // SESSION_RESERVED.
+    assert_eq!(failed["code"], "FRESH_AGENT_CREATE_FAILED");
+    assert_eq!(
+        failed["message"],
+        "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."
+    );
+
+    // 3. ZERO sidecar spawns.
+    assert!(
+        env.create_rows().is_empty(),
+        "no sidecar may spawn while the terminal owns the session: {:?}",
+        env.create_rows()
+    );
+}
+
+/// Direction 1, sessionRef-only variant (whole-branch review finding 1): the ejh6
+/// retarget of the test above left the STILL-REACHABLE production path unpinned --
+/// a `freshAgent.create` carrying ONLY `sessionRef` (no legacy `resumeSessionId`)
+/// passes the raw-Value ejh6 guard, reaches the typed dispatch, and must be
+/// refused by the Task 13b cross-kind live-guard with
+/// `freshAgent.create.failed { code: "SESSION_RESERVED", retryable: true }` and
+/// ZERO sidecar spawns (the terminal may be closing -- retryable).
+#[tokio::test]
+async fn freshagent_session_ref_resume_is_refused_while_a_terminal_pty_owns_the_session() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+
+    let (url, _registry) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // 1. A fresh claude terminal reaches Running, owning preallocated session S.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-term-owner-2",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-term-owner-2"
+    })
+    .await;
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("fresh claude terminal carries a sessionRef")
+        .to_string();
+
+    // 2. A sessionRef-ONLY fresh-agent resume of the SAME session id carries no
+    //    legacy field, so it passes the raw-Value ejh6 guard and must be refused
+    //    by the cross-kind live-guard -- never a second writer on S's JSONL.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.create",
+            "requestId": "req-fa-cross-2",
+            "sessionType": "freshclaude",
+            "provider": "claude",
+            "cwd": "/tmp",
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+        }),
+    )
+    .await;
+    let failed = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        (v["type"] == "freshAgent.create.failed" || v["type"] == "freshAgent.created")
+            && v["requestId"] == "req-fa-cross-2"
+    })
+    .await;
+    assert_eq!(
+        failed["type"], "freshAgent.create.failed",
+        "a live terminal PTY owns {session_id}: the sessionRef-only resume must be refused, got {failed}"
+    );
     assert_eq!(failed["code"], "SESSION_RESERVED");
     assert_eq!(
-        failed["retryable"], true,
-        "retryable -- the terminal may be closing"
+        failed["retryable"],
+        serde_json::json!(true),
+        "the terminal may be closing -- the cross-kind refusal must be retryable: {failed}"
     );
 
     // 3. ZERO sidecar spawns.
@@ -449,6 +536,8 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
     let mut ws = connect(&url).await;
 
     // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
+    //    (ejh6 Task 7: sessionRef-only -- a legacy `resumeSessionId` carry is now
+    //    rejected at the raw-Value guard, which would break this setup create.)
     send_json(
         &mut ws,
         &json!({
@@ -457,7 +546,6 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
             "sessionType": "freshclaude",
             "provider": "claude",
             "cwd": "/tmp",
-            "resumeSessionId": durable,
             "sessionRef": { "provider": "claude", "sessionId": durable },
         }),
     )

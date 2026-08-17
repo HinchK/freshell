@@ -247,9 +247,10 @@ async fn create_codex_terminal(ws: &mut TestWs, request_id: &str, cwd: &str) -> 
     }
 }
 
-/// Create a codex terminal with a `resumeSessionId` (the raw WS-path resume field,
-/// same shape as `codex_session_ref_resume.rs`'s create message) and return the
-/// `terminal.created` frame (or the `error` frame, panicking with it for diagnosis).
+/// Create a codex terminal with a `sessionRef` (the canonical WS-path resume
+/// carrier, same shape as `codex_session_ref_resume.rs`'s create message) and
+/// return the `terminal.created` frame (or the `error` frame, panicking with it
+/// for diagnosis).
 async fn create_codex_terminal_resume(
     ws: &mut TestWs,
     request_id: &str,
@@ -263,7 +264,7 @@ async fn create_codex_terminal_resume(
             "mode": "codex",
             "shell": "system",
             "cwd": cwd,
-            "resumeSessionId": resume_session_id,
+            "sessionRef": { "provider": "codex", "sessionId": resume_session_id },
         })
         .to_string(),
     ))

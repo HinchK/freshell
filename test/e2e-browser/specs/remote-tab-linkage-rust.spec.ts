@@ -12,11 +12,14 @@ import { TestHarness } from '../helpers/test-harness.js'
  * must be fully LINKED, not a grey orphan.
  *
  * This is the user's exact 2026-07-19 incident chain
- * (`docs/plans/2026-07-19-state-sync-cartography.md` Part 1), replayed and
- * now expected GREEN because the rust server synthesizes the canonical
+ * (`docs/plans/2026-07-19-state-sync-cartography.md` Part 1), replayed
+ * (kata ejh6: with the canonical `sessionRef {provider, sessionId}` carrier —
+ * the legacy bare `resumeSessionId` wire field is now rejected at the REST
+ * door, see the rejection case at the end of this describe) and expected
+ * GREEN because the rust server stamps the canonical
  * `sessionRef {provider: mode, sessionId}` onto the `ui.command{tab.create}`
  * payload (`crates/freshell-freshagent/src/terminal_tabs.rs`,
- * `spawn_terminal_pane`) instead of forwarding the legacy bare
+ * `spawn_terminal_pane`) instead of the legacy bare
  * `resumeSessionId` the frozen client's matchers are blind to for every
  * mode but `claude` (`src/lib/session-utils.ts:135-139`):
  *
@@ -191,8 +194,14 @@ test.describe('Remote tab linkage (Rust only)', () => {
         const tabCountBeforeCreate = await harness.getTabCount()
 
         // ------------------------------------------------------------------
-        // Step 2: the incident's exact trigger -- REST create with a bare
-        // legacy `resumeSessionId` (no sessionRef in the request).
+        // Step 2: the incident's trigger, re-carriered -- REST create with the
+        // canonical `sessionRef {provider, sessionId}` (kata ejh6: the legacy
+        // bare `resumeSessionId` wire field is now REJECTED at the door; see
+        // the rejection case at the end of this describe block). Every
+        // downstream assertion below (resume argv, live broadcast, sidebar
+        // linkage, click dedupe, title sync, persisted sessionRef,
+        // restart/reload restoration, post-restart resume) is unchanged
+        // sessionRef-carrier behavior coverage.
         // ------------------------------------------------------------------
         const res = await fetch(`${info.baseUrl}/api/tabs`, {
           method: 'POST',
@@ -200,7 +209,7 @@ test.describe('Remote tab linkage (Rust only)', () => {
           body: JSON.stringify({
             mode: 'amplifier',
             cwd: projectDir,
-            resumeSessionId: SEEDED_SESSION_ID,
+            sessionRef: { provider: 'amplifier', sessionId: SEEDED_SESSION_ID },
             name: TAB_NAME,
           }),
         })
@@ -328,6 +337,39 @@ test.describe('Remote tab linkage (Rust only)', () => {
       }
     } finally {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // kata ejh6: the legacy `resumeSessionId` wire field is REJECTED at the
+  // `POST /api/tabs` door — 400 with the exact frozen text, and no visible
+  // creation (`/api/tabs` before/after equality proves no spawn, no tab).
+  // This case boots its OWN minimal rust server (no amplifier fixtures
+  // needed — the rejection fires at the door before any mode work), unlike
+  // the big linkage test above whose locals are out of scope here.
+  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async ({ e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {}, // no fixtures: door-top reject needs no provider state
+    })
+    const info = await server.start()
+    try {
+      const before = await (await fetch(`${info.baseUrl}/api/tabs`, { headers: { 'x-auth-token': info.token } })).json()
+      const res = await fetch(`${info.baseUrl}/api/tabs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
+        body: JSON.stringify({ mode: 'amplifier', cwd: '/tmp', resumeSessionId: 'amp-legacy-reject-0001', name: 'legacy-reject-case' }),
+      })
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body).toEqual({
+        status: 'error',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      })
+      const after = await (await fetch(`${info.baseUrl}/api/tabs`, { headers: { 'x-auth-token': info.token } })).json()
+      expect(after).toEqual(before) // no tab/terminal side effects on reject
+    } finally {
+      await server.stop()
     }
   })
 })

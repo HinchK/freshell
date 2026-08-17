@@ -340,10 +340,10 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
         // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
         // the canonical sessionRef shape IS accepted (pinned by
         // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
-        // "fix" the rejection -- use the canonical shape for codex.
-        data: mode === 'codex'
-          ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
-          : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+        // "fix" the rejection -- use the canonical shape. kata ejh6: claude
+        // rides sessionRef too -- sessionRef is the canonical resume carrier
+        // for EVERY mode.
+        data: { mode, cwd: PROJECT_DIR, sessionRef: { provider: mode, sessionId } },
       })
       expect(res.ok(), `POST /api/tabs ${mode} resume: ${res.status()} ${await res.text()}`).toBe(true)
 
@@ -420,10 +420,10 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
         // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
         // the canonical sessionRef shape IS accepted (pinned by
         // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
-        // "fix" the rejection -- use the canonical shape for codex.
-        data: mode === 'codex'
-          ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
-          : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+        // "fix" the rejection -- use the canonical shape. kata ejh6: claude
+        // rides sessionRef too -- sessionRef is the canonical resume carrier
+        // for EVERY mode.
+        data: { mode, cwd: PROJECT_DIR, sessionRef: { provider: mode, sessionId } },
       })
       expect(res.ok(), `POST /api/tabs ${mode} resume: ${res.status()} ${await res.text()}`).toBe(true)
       await expect(page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`))
@@ -615,7 +615,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // Open a claude resume pane so there is something to lose + recover.
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
       headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
-      data: { mode: 'claude', cwd: PROJECT_DIR, resumeSessionId: SEEDED_CLAUDE_ID },
+      data: { mode: 'claude', cwd: PROJECT_DIR, sessionRef: { provider: 'claude', sessionId: SEEDED_CLAUDE_ID } },
     })
     expect(res.ok()).toBe(true)
     const restTabId: string = (await res.json())?.data?.tabId

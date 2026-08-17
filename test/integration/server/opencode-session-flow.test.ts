@@ -381,6 +381,38 @@ describe('opencode session flow (integration)', () => {
     }
   })
 
+  it('rejects the legacy raw resumeSessionId field for opencode non-restore creates', async () => {
+    const ws = await createAuthenticatedWs(port)
+
+    try {
+      const requestId = 'opencode-non-restore-legacy'
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'opencode',
+        resumeSessionId: 'probe-non-restore',
+      }))
+
+      const response = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === requestId
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'INVALID_MESSAGE',
+      })
+      expect(response.message).toContain('sessionRef')
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('uses the canonical durable opencode session id when restore is explicit', async () => {
     const ws = await createAuthenticatedWs(port)
 

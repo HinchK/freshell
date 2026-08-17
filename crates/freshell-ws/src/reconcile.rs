@@ -161,6 +161,14 @@ fn resolve_authoritative_ref(
 
 /// §5.2's ONE uniform promotion rule: a legacy `mode` + `resumeSessionId`
 /// pair IS a sessionRef claim — `{provider: mode, sessionId: resumeSessionId}`.
+///
+/// PERMANENT legacy-compat door (kata ejh6): `pane.reconcile` is the SOLE
+/// ingress where a wire `resumeSessionId` remains honored — old persisted
+/// pane content can carry a legacy-only claim INDEFINITELY, so this
+/// promotion stays forever with NO later-removal plan. Every create-class
+/// door (WS `terminal.create` / `codingcli.create` / `freshAgent.*`, REST
+/// `/api/tabs`·split·respawn) rejects the field outright with the frozen
+/// refusal text; this one alone promotes it.
 fn promoted_legacy_claim(pane: &ReconcilePane) -> Option<SessionLocator> {
     let mode = pane
         .mode

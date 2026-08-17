@@ -116,9 +116,32 @@ export function collectTerminalPaneTargets(
   return targets
 }
 
+/// The ONE durable-identity claim a reconcile pane carries: the canonical
+/// sessionRef, with a legacy-only pane's `resumeSessionId` promoted into it
+/// ({provider, sessionId} — the same promotion rule the server's
+/// `promoted_legacy_claim` in `reconcile.rs` applies). The legacy wire field
+/// is NOT sent; the server-side reconcile door is the permanent compat
+/// exception (kata ejh6 section 2).
+function effectiveReconcileSessionRef(
+  sessionRef: { provider: string; sessionId: string } | undefined,
+  resumeSessionId: string | undefined,
+  mode: string,
+): { provider: string; sessionId: string } | undefined {
+  if (sessionRef) return sessionRef
+  // Mirror the server's promoted_legacy_claim exclusion
+  // (crates/freshell-ws/src/reconcile.rs:~165-177): shell/empty modes NEVER
+  // promote — a stateless shell has no durable identity (review round 3,
+  // finding 6 — the client must match or a stale shell pane becomes a
+  // structured sessionRef{provider:'shell'} and bypasses the server's
+  // fresh-verdict rule).
+  if (resumeSessionId && mode !== 'shell' && mode !== '') return { provider: mode, sessionId: resumeSessionId }
+  return undefined
+}
+
 function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneContent): ReconcilePane | null {
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
+  const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.mode)
   return {
     paneKey: paneKeyFor(tabId, paneId),
     kind: 'terminal',
@@ -126,8 +149,7 @@ function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneCon
     createRequestId: content.createRequestId,
     ...(content.terminalId ? { terminalId: content.terminalId } : {}),
     ...(content.serverInstanceId ? { serverInstanceId: content.serverInstanceId } : {}),
-    ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
-    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+    ...(sessionRef ? { sessionRef } : {}),
     ...(content.status ? { status: content.status } : {}),
   }
 }
@@ -144,13 +166,13 @@ function toFreshAgentReconcilePane(
 ): ReconcilePane | null {
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
+  const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.provider)
   return {
     paneKey: paneKeyFor(tabId, paneId),
     kind: 'fresh-agent',
     mode: content.provider,
     createRequestId: content.createRequestId,
-    ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
-    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+    ...(sessionRef ? { sessionRef } : {}),
     ...(content.status ? { status: content.status } : {}),
   }
 }

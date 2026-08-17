@@ -39,7 +39,7 @@ use axum::response::Response;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use freshell_protocol::{ServerMessage, UiCommand};
+use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
 
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
@@ -149,6 +149,15 @@ pub(crate) async fn split_pane(
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+    // ejh6 (finding 3): door-top presence check BEFORE `resolve_pane_target`
+    // and `layout.split_pane` so a rejection returns 400 with NO layout
+    // mutation.
+    if body.get("resumeSessionId").is_some() {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+        );
     }
 
     let pane_id = match resolve_pane_target(&state, &raw_pane_id) {
@@ -704,6 +713,13 @@ pub(crate) async fn respawn_pane(
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+    // ejh6 (finding 3): door-top presence check BEFORE `spawn_terminal_pane`.
+    if body.get("resumeSessionId").is_some() {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+        );
     }
 
     let Some(tab_id) = state

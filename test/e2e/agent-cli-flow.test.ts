@@ -8,6 +8,10 @@ import http from 'http'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { LayoutStore } from '../../server/agent-api/layout-store'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import WebSocket from 'ws'
+import { WsHandler } from '../../server/ws-handler.js'
+import { TerminalRegistry } from '../../server/terminal-registry.js'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 
 function startTestServer(
   layoutStoreOverrides: Partial<Record<string, any>> = {},
@@ -148,6 +152,68 @@ function findPaneContent(node: any, paneId: string): any | undefined {
 }
 
 describe('cli e2e flow', () => {
+  // ejh6: the WS door rejects a raw legacy `resumeSessionId` carry on
+  // terminal.create with INVALID_MESSAGE + the frozen text. This reuses the
+  // existing WsHandler + http.createServer infrastructure (not a new harness).
+  it('rejects a raw legacy WS terminal.create with INVALID_MESSAGE + frozen text', async () => {
+    const previousAuthToken = process.env.AUTH_TOKEN
+    process.env.AUTH_TOKEN = 'test-token'
+    const layoutStore = new LayoutStore()
+    const app = express()
+    app.use(express.json())
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    let terminalCount = 0
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry: { create: () => ({ terminalId: `term_${++terminalCount}` }), get: () => undefined, input: () => {} },
+      codexLaunchPlanner,
+    }))
+    const server = http.createServer(app)
+    const registry = new TerminalRegistry()
+    const handler = new WsHandler(server, registry, { codexLaunchPlanner } as never)
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()))
+    const { port } = server.address() as { port: number }
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ws.on('open', () => {
+          ws.send(JSON.stringify({ type: 'hello', token: 'test-token', protocolVersion: WS_PROTOCOL_VERSION }))
+        })
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type === 'ready') resolve()
+        })
+        ws.on('error', reject)
+      })
+      const requestId = 'raw-legacy-ws-1'
+      const errorPromise = new Promise<any>((resolve) => {
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type === 'error' && msg.requestId === requestId) resolve(msg)
+        })
+      })
+      ws.send(JSON.stringify({
+        type: 'terminal.create', requestId, mode: 'claude', shell: 'system',
+        resumeSessionId: 'legacy-ws-id',
+      }))
+      const error = await errorPromise
+      expect(error).toMatchObject({
+        type: 'error', code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        requestId,
+      })
+    } finally {
+      ws.close()
+      handler.close?.()
+      if (previousAuthToken === undefined) {
+        delete process.env.AUTH_TOKEN
+      } else {
+        process.env.AUTH_TOKEN = previousAuthToken
+      }
+      await new Promise<void>((done) => server.close(() => done()))
+    }
+  })
+
   it('runs list-tabs end-to-end', async () => {
     const { url, close } = await startTestServer()
     try {

@@ -214,17 +214,13 @@ type ResolvedSpawnProviderSettings = Awaited<ReturnType<typeof resolveSpawnProvi
 function requestedResumeSessionIdForMode(
   sessionRef: ReturnType<typeof sanitizeSessionRef>,
   mode: string,
-  legacyResumeSessionId: unknown,
+  _legacyResumeSessionId: unknown,
 ): string | undefined {
+  // ejh6 (finding 3): the legacy-field throw moved to a door-top presence check
+  // in each create route handler; this function keeps sessionRef resolution only.
   const acceptedSessionRef = acceptedSessionRefForMode(sessionRef, mode)
   if (acceptedSessionRef) return acceptedSessionRef.sessionId
-  if (mode === 'codex') {
-    if (isNonEmptyString(legacyResumeSessionId)) {
-      throw new AgentRouteInputError(INVALID_RAW_CODEX_RESUME_MESSAGE)
-    }
-    return undefined
-  }
-  return typeof legacyResumeSessionId === 'string' ? legacyResumeSessionId : undefined
+  return undefined
 }
 
 function acceptedSessionRefForMode(
@@ -233,10 +229,6 @@ function acceptedSessionRefForMode(
 ): ReturnType<typeof sanitizeSessionRef> {
   if (!sessionRef || sessionRef.provider !== mode) return undefined
   return sessionRef
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0
 }
 
 function normalizeTerminalInputPayload(payload: Record<string, unknown>): string {
@@ -693,6 +685,10 @@ export function createAgentApiRouter({
   }
 
   router.post('/tabs', async (req, res) => {
+    // ejh6 (finding 3): door-top presence check BEFORE any branch (agent/browser/editor/terminal).
+    if (req.body?.resumeSessionId !== undefined) {
+      return res.status(400).json(fail(INVALID_RAW_CODEX_RESUME_MESSAGE))
+    }
     const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
     const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
     if (typeof req.body?.agent === 'string') {
@@ -1248,6 +1244,10 @@ export function createAgentApiRouter({
   })
 
   router.post('/panes/:id/split', async (req, res) => {
+    // ejh6 (finding 3): door-top presence check BEFORE any branch or layout mutation.
+    if (req.body?.resumeSessionId !== undefined) {
+      return res.status(400).json(fail(INVALID_RAW_CODEX_RESUME_MESSAGE))
+    }
     let launch: ResolvedSpawnProviderSettings | undefined
     let createdTerminalId: string | undefined
     try {
@@ -1544,6 +1544,10 @@ export function createAgentApiRouter({
   })
 
   router.post('/panes/:id/respawn', async (req, res) => {
+    // ejh6 (finding 3): door-top presence check BEFORE target resolution or spawn.
+    if (req.body?.resumeSessionId !== undefined) {
+      return res.status(400).json(fail(INVALID_RAW_CODEX_RESUME_MESSAGE))
+    }
     let launch: ResolvedSpawnProviderSettings | undefined
     let createdTerminalId: string | undefined
     try {

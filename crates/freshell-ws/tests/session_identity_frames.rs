@@ -67,7 +67,7 @@ async fn resume_created_terminal_frames_carry_session_ref() {
             "mode": "amplifier",
             "shell": "system",
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "resumeSessionId": "sess-identity-1",
+            "sessionRef": { "provider": "amplifier", "sessionId": "sess-identity-1" },
         })
         .to_string(),
     ))

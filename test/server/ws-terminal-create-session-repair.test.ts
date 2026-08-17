@@ -1045,7 +1045,10 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
-  it('uses sessionRef as canonical restore identity over legacy resumeSessionId', async () => {
+  // ejh6: presence-based rejection — a terminal.create carrying the legacy
+  // resumeSessionId field is rejected even when a canonical sessionRef is
+  // also present (no dual-carrier tolerance on the WS door).
+  it('rejects a legacy resumeSessionId even when sessionRef is also present', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -1053,7 +1056,7 @@ describe('terminal.create session repair wait', () => {
       await waitForReady(ws)
 
       const requestId = 'resume-session-ref-wins'
-      const createdPromise = waitForCreated(ws, requestId)
+      const responsePromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -1065,11 +1068,11 @@ describe('terminal.create session repair wait', () => {
         },
       }))
 
-      await createdPromise
-
-      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
-      expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
-      expect(sessionRepairService.waitForSessionCalls).not.toContain('legacy_wrong_session')
+      const response = await responsePromise
+      expect(response).toMatchObject({
+        type: 'error', code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      })
     } finally {
       await closeWebSocket(ws)
     }

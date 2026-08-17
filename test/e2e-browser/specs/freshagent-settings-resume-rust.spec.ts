@@ -310,7 +310,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         requestId: 'req-codex-settings-resume',
         sessionType: 'freshcodex',
         provider: 'codex',
-        resumeSessionId: threadId,
+        sessionRef: { provider: 'codex', sessionId: threadId },
       })
       await ws.waitFor(
         (f) => f.type === 'freshAgent.created' && f.requestId === 'req-codex-settings-resume',
@@ -411,7 +411,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         requestId: 'req-opencode-settings-resume',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        resumeSessionId: sesId,
+        sessionRef: { provider: 'opencode', sessionId: sesId },
       })
       const created = await ws.waitFor(
         (f) => f.type === 'freshAgent.created' && f.requestId === 'req-opencode-settings-resume',
@@ -533,7 +533,6 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         provider: 'claude',
         sessionId: durable,
         sessionType: 'freshclaude',
-        resumeSessionId: durable,
         sessionRef: { provider: 'claude', sessionId: durable },
       })
 
