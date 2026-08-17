@@ -2514,9 +2514,9 @@ const IDENTITY_INVARIANT_SWEEP_INTERVAL: std::time::Duration = std::time::Durati
 ///    to leave both `len()` and the max `lastActivityAt` unchanged, this
 ///    signature cannot distinguish the pre/post corpus. This requires a
 ///    coincidental timestamp match across two unrelated sessions landing in
-///    the same tick -- accepted as out of scope for a v1 poll-based sweep;
-///    a filesystem watcher (now introduced via SessionWatcher)
-///    would not have this gap either.
+///    the same tick -- accepted as out of scope. Note: the SessionWatcher
+///    still triggers the same signature-based broadcast; it does not close
+///    this gap on its own.
 ///
 /// 3. **External-process override edits (bake-in with the legacy Node
 ///    server writing the SAME `config.json`) -- ACCEPTED for bake-in.** The

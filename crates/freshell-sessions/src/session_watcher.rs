@@ -106,6 +106,7 @@ async fn run_watcher_loop(
         };
         let name = provider.layout.name().to_owned();
 
+        let ancestor_bound = provider.home.parent().unwrap_or(&provider.home);
         for base in &watch_bases {
             let watch_target = if base.exists() {
                 base.clone()
@@ -113,7 +114,7 @@ async fn run_watcher_loop(
                 // Late-root: watch the nearest existing ancestor. The
                 // 15-minute TTL reconciliation covers providers whose
                 // root never appears during the watcher's lifetime.
-                nearest_existing_ancestor(base, &provider.home)
+                nearest_existing_ancestor(base, ancestor_bound)
             };
 
             let tx = event_tx.clone();
@@ -134,7 +135,7 @@ async fn run_watcher_loop(
                         }
                     }
                     Err(e) => {
-                        eprintln!("session-watcher: watcher error for {cb_name}: {e}");
+                        tracing::warn!(provider = %cb_name, error = %e, "session-watcher: watcher error");
                         // Signal a full rescan so the next TTL reconciliation
                         // picks up whatever the watcher missed.
                         let _ = tx.send((PathBuf::new(), true));
@@ -143,9 +144,11 @@ async fn run_watcher_loop(
             }) {
                 Ok(mut watcher) => {
                     if let Err(e) = watcher.watch(&watch_target, mode) {
-                        eprintln!(
-                            "session-watcher: failed to watch {} for {name}: {e}",
-                            watch_target.display(),
+                        tracing::warn!(
+                            provider = %name,
+                            path = %watch_target.display(),
+                            error = %e,
+                            "session-watcher: failed to arm watch",
                         );
                         index.mark_provider_dirty(&name);
                     } else {
@@ -153,8 +156,10 @@ async fn run_watcher_loop(
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "session-watcher: failed to create watcher for {name}: {e}",
+                    tracing::warn!(
+                        provider = %name,
+                        error = %e,
+                        "session-watcher: failed to create watcher",
                     );
                     index.mark_provider_dirty(&name);
                 }

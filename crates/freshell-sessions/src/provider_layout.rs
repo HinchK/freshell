@@ -68,7 +68,7 @@ impl ProviderLayout for ClaudeLayout {
     }
 
     fn watch_bases(&self, home: &Path) -> Vec<PathBuf> {
-        vec![home.to_path_buf()]
+        vec![self.session_root(home)]
     }
 
     fn watch_mode(&self) -> WatchMode {
@@ -120,7 +120,7 @@ impl ProviderLayout for CodexLayout {
     }
 
     fn watch_bases(&self, home: &Path) -> Vec<PathBuf> {
-        vec![home.to_path_buf()]
+        vec![self.session_root(home)]
     }
 
     fn watch_mode(&self) -> WatchMode {
@@ -181,7 +181,7 @@ impl ProviderLayout for AmplifierLayout {
     }
 
     fn watch_bases(&self, amplifier_home: &Path) -> Vec<PathBuf> {
-        vec![amplifier_home.to_path_buf()]
+        vec![self.session_root(amplifier_home)]
     }
 
     fn watch_mode(&self) -> WatchMode {
@@ -269,10 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_layout_watch_bases_returns_home() {
+    fn claude_layout_watch_bases_returns_session_root() {
         let layout = ClaudeLayout;
         let bases = layout.watch_bases(Path::new("/home/user/.claude"));
-        assert_eq!(bases, vec![Path::new("/home/user/.claude")]);
+        assert_eq!(bases, vec![Path::new("/home/user/.claude/projects")]);
     }
 
     #[test]

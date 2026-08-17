@@ -519,9 +519,10 @@ pub fn spawn_auto_title_sweep(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = index.subscribe_changes();
-        // Minimum interval between auto-title passes — no need to run
-        // faster than this even if the index is changing rapidly.
-        let min_interval = std::time::Duration::from_secs(30);
+        // Minimum interval between auto-title passes. 5s balances
+        // responsiveness (terminal identity changes, settings) against
+        // API rate pressure (Gemini title generation).
+        let min_interval = std::time::Duration::from_secs(5);
         let mut last_run = tokio::time::Instant::now() - min_interval;
 
         loop {
