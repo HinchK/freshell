@@ -30,7 +30,18 @@ docs/development/
 installers/
 electron/
 examples/
-port/
+# port/ stays excluded (7.4M oracle corpus belongs to the config-excluded
+# vitest.port.config.ts suites), EXCEPT the tiny 80K fixture dir the
+# coordinated suite's mode-preamble-fixtures test reads. gitignore-syntax
+# note (identical for .gcloudignore): to re-include a path under an excluded
+# directory, fence each level with `dir/*` exclusions and `!dir` re-includes
+# — `port/` alone cannot be selectively re-included beneath.
+port/*
+!port/oracle/
+port/oracle/*
+!port/oracle/baselines/
+port/oracle/baselines/*
+!port/oracle/baselines/mode-preamble/
 assets/
 
 # Editor / IDE
