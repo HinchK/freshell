@@ -18,6 +18,7 @@
 //! | [`barrier_scanner`] | `output-barrier-scanner.ts` | stateful VT parser (batch merge boundaries) |
 //! | [`batch`] | `output-batch.ts` + broker wire projection | `terminal.output.batch` framing (UTF-16 offsets, `serializedBytes`) |
 //! | [`chunk_ring`] | `ChunkRingBuffer` (`terminal-registry.ts:810-853`) | char-measured scrollback + snapshot seed |
+//! | [`mode_tracker`] | mode-preamble contract (`port/oracle/baselines/mode-preamble/README.md`) | per-terminal emulator-mode projection → `terminal.modes.sync` preamble |
 //!
 //! ## Two framing variants (capability-gated, `§4.1`/`§4.2`)
 //!
@@ -41,6 +42,7 @@ pub mod decode;
 pub mod fragment;
 pub mod framing;
 mod idle_noise;
+pub mod mode_tracker;
 pub mod output_queue;
 pub mod pty;
 pub mod registry;
@@ -56,6 +58,7 @@ pub use batch::{
 pub use chunk_ring::{snapshot_seed_if_ring_empty, ChunkRingBuffer};
 pub use decode::Utf8StreamDecoder;
 pub use framing::{reassemble_stream, OutputFramer};
+pub use mode_tracker::ModeTracker;
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};
 pub use registry::{
     compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, FrameSink,
