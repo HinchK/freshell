@@ -21,7 +21,9 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Exceeds the deploy step's 600000 ms timeout so checkout + artifact upload
+    # can never eat into the deploy step's documented budget.
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
