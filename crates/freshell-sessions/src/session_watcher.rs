@@ -106,15 +106,28 @@ async fn run_watcher_loop(
         };
         let name = provider.layout.name().to_owned();
 
-        let ancestor_bound = provider.home.parent().unwrap_or(&provider.home);
         for base in &watch_bases {
             let watch_target = if base.exists() {
                 base.clone()
             } else {
-                // Late-root: watch the nearest existing ancestor. The
-                // 15-minute TTL reconciliation covers providers whose
-                // root never appears during the watcher's lifetime.
-                nearest_existing_ancestor(base, ancestor_bound)
+                // Late-root: walk up toward the provider home looking
+                // for an existing ancestor. Bound at provider.home so
+                // we never climb above it (which could recursively
+                // watch the user's entire home directory).
+                let candidate = nearest_existing_ancestor(base, &provider.home);
+                if !candidate.exists() {
+                    // Provider home itself doesn't exist (e.g. tool not
+                    // installed). Skip — the 15-minute TTL reconciliation
+                    // will discover it if it appears later.
+                    tracing::info!(
+                        provider = %name,
+                        path = %base.display(),
+                        "session-watcher: provider root absent, skipping watch",
+                    );
+                    index.mark_provider_dirty(&name);
+                    continue;
+                }
+                candidate
             };
 
             let tx = event_tx.clone();

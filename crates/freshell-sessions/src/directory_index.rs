@@ -1284,10 +1284,9 @@ impl SessionIndex {
                 scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
-          // Notify subscribers that the snapshot changed.
-          // (Bump unconditionally for now — a future optimization could
-          // compare content, but the generation counter is cheap.)
-        let _ = change_tx.send_modify(|gen| *gen += 1);
+        if changed > 0 {
+            let _ = change_tx.send_modify(|gen| *gen += 1);
+        }
         // Opportunistic persistence: gated (threshold/debounce) and, when
           // warranted, saved via a DETACHED task -- never awaited here, so
           // neither an HTTP request handler NOR this refresh itself is
@@ -4749,6 +4748,16 @@ mod tests {
         // Mark the initial generation seen so `changed()` only wakes on NEW ones.
         let initial_gen = *rx.borrow_and_update();
         assert!(initial_gen > 0, "initial snapshot should bump generation");
+
+        // Add a new session file so the next refresh detects real changes.
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T11:00:00.000Z",
+            "hello b",
+        );
 
         // Wait for TTL to expire, then trigger another snapshot.
         tokio::time::sleep(Duration::from_millis(100)).await;

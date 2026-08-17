@@ -506,11 +506,13 @@ fn overlay_session_title(
 
 /// The background loop — subscribes to `SessionIndex::subscribe_changes()`
 /// notifications (fed by the SessionWatcher's inotify events) and runs the
-/// auto-title pass on each change. Throttled to at most once per 30s to
-/// avoid hammering the Gemini API during rapid file activity.
+/// auto-title pass on each change. Throttled to at most once per 5s to
+/// avoid hammering the Gemini API during rapid file activity. Also wakes
+/// periodically (every 5s) to catch non-index-driven changes like terminal
+/// identity updates and settings changes.
 ///
 /// The `_interval` parameter is kept for API compatibility but ignored;
-/// the sweep's cadence is now driven by change notifications + the 30s
+/// the sweep's cadence is now driven by change notifications + the 5s
 /// minimum interval.
 pub fn spawn_auto_title_sweep(
     state: AutoTitleSweepState,

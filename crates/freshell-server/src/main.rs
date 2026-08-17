@@ -2446,11 +2446,11 @@ fn resolve_client_dir() -> PathBuf {
 /// SESSION-09 sweep cadence (identity ticker fallback). The sessions sweep is
 /// now event-driven: `SessionWatcher` feeds inotify events into the index's
 /// dirty-marking, and `subscribe_changes()` wakes the sweep loop on each
-/// refresh. This interval serves as an identity-ticker fallback — it fires a
-/// `snapshot()` every 2s to catch the ~1.8% of events the watcher misses
-/// (measured in a 24h observer). The index's 15-minute TTL
-/// (`DEFAULT_TTL`) ensures that even without dirty-marks, the on-disk
-/// corpus is reconciled periodically.
+/// refresh. This interval serves as an identity-ticker fallback — it fires
+/// a `snapshot()` every 2s so that terminal identity and session metadata
+/// changes propagate to the sidebar without waiting for the index's
+/// 15-minute TTL (`DEFAULT_TTL`). The watcher handles the ~98.2% of
+/// filesystem events it catches; this ticker and the TTL cover the rest.
 const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// The opencode/codex locators' poll cadence. Well under their ~2s
