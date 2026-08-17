@@ -56,9 +56,9 @@ tar -xzf /tmp/actionlint-dl/actionlint_*_linux_amd64.tar.gz -C /tmp/actionlint-d
 
 Expected: FAIL because `docs-pages-deploy.yml` does not exist yet (actionlint reports the file as unreadable). This proves the check is live before implementation.
 
-- [ ] **Step 2: Add the minimal production implementation**
+- [ ] **Step 2: Add the workflow implementation**
 
-Create `.github/workflows/docs-pages-deploy.yml` with exactly this content:
+Create `.github/workflows/docs-pages-deploy.yml` with exactly this content (this exact YAML already passed actionlint 1.7.12 with zero diagnostics in Stage 2's green probe):
 
 ```yaml
 name: Docs Pages Deploy
@@ -108,7 +108,7 @@ jobs:
           timeout: 600000
 ```
 
-Every input mirrors the observed legacy invocation (checkout fetch-depth 1; artifact name `github-pages`, path `./docs`, retention 1 day; deploy timeout 600000 ms). Major tags `@v4`/`@v3`/`@v5` match both legacy's observed actions and repo no-SHA-pinning style.
+Every input mirrors the observed legacy invocation (checkout fetch-depth 1; artifact name `github-pages`, path `./docs`, retention 1 day; deploy timeout 600000 ms — Stage 2 confirmed `timeout`'s default is 600000 ms and equals the fixed Pages-side deploy cap, so the explicit value is pure documentation). Major tags `@v4`/`@v3`/`@v5` match both legacy's observed actions and repo no-SHA-pinning style; Stage 2 confirmed `actions/deploy-pages@v5.0.0`'s `action.yml` defines `artifact_name` and `timeout` in milliseconds, and that the 21 MiB `docs/` tree has ~48x headroom under Pages limits.
 
 - [ ] **Step 3: Run the focused verification**
 
@@ -142,12 +142,13 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
 ## Merge and adoption runbook (outside the PR; executed after the user approves PR creation)
 
 1. Push `the-usual/docs-deploy-workflow`, open PR targeting `main` (explicit user approval first).
-2. Immediately before merging, flip the repo's Pages source so the merge's own deploy run uses the new pipeline and legacy stops racing it:
-   `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow`
-   (Preserves cname/https/cert; site keeps serving the last good build in the seconds-long gap.)
-3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → triggers `Docs Pages Deploy` → verify the run succeeds: `gh run list --workflow docs-pages-deploy.yml --limit 1`.
-4. Verify the site: `curl -sI https://freshell.net/` returns 200 and Pages headers; `gh api repos/danshapiro/freshell/pages` shows `build_type: workflow`, `status: built`.
-5. Rollback if anything is wrong: `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy` restores the legacy pipeline instantly; site content is preserved either way.
+2. Immediately before merging, flip the repo's Pages source so the merge's own deploy run uses the new pipeline and legacy stops racing it. The PUT documents no "omitted fields are preserved" guarantee (Stage 2 finding), so the call re-asserts the current values idempotently:
+   `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow -f cname=freshell.net -F https_enforced=true`
+3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
+4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
+5. Rollback if anything is wrong — re-asserts source, cname, and HTTPS explicitly for the same schema-silence reason:
+   `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
+   This restores the legacy pipeline instantly; site content is preserved either way.
 
 ## Parity notes (what "replicate the existing experience" means, exactly)
 
