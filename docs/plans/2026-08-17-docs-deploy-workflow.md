@@ -126,9 +126,9 @@ The change is one additive CI YAML file; no application code, tests, or package 
 
 Run: `git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow status --short`
 
-Expected: only `.github/workflows/docs-pages-deploy.yml` (and this plan file) as new files. No tracked modifications.
+Expected: `.github/workflows/docs-pages-deploy.yml` as the only new untracked file, and no tracked modifications (`??` entries besides it). This plan file is already committed in earlier commits, so it does not appear in `git status`; the PR delta is judged by `git diff origin/main --stat` showing only this plan file plus the workflow.
 
-The full coordinated suite gate runs once at the end of execution per the workflow contract (cloud backend), covering any residual doubt that base_ref stayed coherent.
+The full coordinated suite gate is run ONCE by the run orchestrator (not the task implementer) at the end of execution, on the final HEAD: command `npm run check` (cloud backends configured in this environment). Pass criterion: green, excluding the 25 rust-family e2e-browser failures recorded as pre-existing in the baseline ledger (reproduction receipt: cloud execution freshell-vitest-2r4s2 at base_ref 8ea471de0; see the run's baseline ledger). Any failure outside that recorded set is triaged as run-introduced and fixed before the gate can pass.
 
 - [ ] **Step 6: Commit the task**
 
@@ -146,9 +146,11 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
    `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=workflow -f cname=freshell.net -F https_enforced=true`
 3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
-5. Rollback if anything is wrong — re-asserts source, cname, and HTTPS explicitly for the same schema-silence reason:
-   `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
-   This restores the legacy pipeline instantly; site content is preserved either way.
+5. Rollback if anything is wrong. Three steps — the PUT re-asserts source, cname, and HTTPS explicitly (schema-silence finding), then a legacy build is explicitly requested and monitored (config updates and build requests are separate operations; only `POST /pages/builds` queues a legacy build — Fresh Eyes finding F1):
+   a. `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
+   b. `gh api -X POST repos/danshapiro/freshell/pages/builds`
+   c. Monitor until service is restored: poll `gh api repos/danshapiro/freshell/pages --jq .status` until it reads `built` (legacy builds take ~30s), then require `curl -sI https://freshell.net/` to return 200 before declaring the rollback complete.
+   The workflow file merged on `main` is inert under legacy `build_type` (it only produces Actions runs, which do not deploy anything Pages will serve while the source is branch-based), so no file removal is needed to roll back.
 
 ## Parity notes (what "replicate the existing experience" means, exactly)
 
