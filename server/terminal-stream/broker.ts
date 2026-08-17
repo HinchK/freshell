@@ -1,7 +1,7 @@
 import WebSocket from 'ws'
 import type { LiveWebSocket } from '../ws-handler.js'
 import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-registry.js'
-import type { SessionLocator } from '../../shared/ws-protocol.js'
+import type { SessionLocator, TerminalModesSyncMessage } from '../../shared/ws-protocol.js'
 import {
   buildSessionIdentityMismatchDetails,
   terminalMatchesExpectedSession,
@@ -137,6 +137,7 @@ type AttachRequest = {
   maxReplayBytes?: number
   priority: AttachPriority
   terminalOutputBatchV1: boolean
+  surfaceReset?: boolean
 }
 type ReplayGapReason = 'replay_window_exceeded' | 'replay_budget_exceeded' | 'queue_overflow'
 type ReplayBackpressurePayloadFields = {
@@ -267,6 +268,7 @@ export class TerminalStreamBroker {
     maxReplayBytes?: number,
     priority: AttachPriority = 'foreground',
     terminalOutputBatchV1 = false,
+    surfaceReset = false,
   ): Promise<AttachResult> {
     return this.attachInternal({
       ws,
@@ -279,6 +281,7 @@ export class TerminalStreamBroker {
       maxReplayBytes,
       priority,
       terminalOutputBatchV1,
+      surfaceReset,
     })
   }
 
@@ -294,6 +297,7 @@ export class TerminalStreamBroker {
     maxReplayBytes?: number,
     priority: AttachPriority = 'foreground',
     terminalOutputBatchV1 = false,
+    surfaceReset = false,
   ): Promise<AttachResult> {
     return this.attachInternal({
       ws,
@@ -307,6 +311,7 @@ export class TerminalStreamBroker {
       maxReplayBytes,
       priority,
       terminalOutputBatchV1,
+      surfaceReset,
     })
   }
 
@@ -322,6 +327,7 @@ export class TerminalStreamBroker {
     maxReplayBytes,
     priority,
     terminalOutputBatchV1,
+    surfaceReset,
   }: AttachRequest): Promise<AttachResult> {
     if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
       return 'invalid_attach_request_id'
@@ -517,6 +523,33 @@ export class TerminalStreamBroker {
         ...(sessionRef ? { sessionRef } : {}),
       })) {
         return
+      }
+
+      // terminal.modes.sync — control-plane emulator-mode preamble for
+      // freshly constructed surfaces (DEC private modes are emitted once at
+      // app startup and scroll out of the retained window). This send must
+      // stay synchronous with the attach.ready send above: ZERO awaits
+      // between them is what guarantees ready < sync < replay < live on the
+      // wire. Sync is seq-less and never enters the output queue, so queue
+      // overflow / supersede / detaches cannot lose it.
+      // Keys ONLY on surfaceReset (regardless of intent — hidden fresh
+      // surfaces hydrate via keepalive deltas and need it too), requires
+      // attachRequestId (the client fails closed without one), and skips
+      // empty projections (no frame is sent for empty data).
+      if (surfaceReset === true && attachRequestId) {
+        const modesSyncData = terminalState.replayRing.synthesizeModes()
+        if (modesSyncData.length > 0) {
+          const modesSyncMessage: TerminalModesSyncMessage = {
+            type: 'terminal.modes.sync',
+            terminalId,
+            attachRequestId,
+            streamId,
+            data: modesSyncData,
+          }
+          if (!this.safeSend(ws, modesSyncMessage)) {
+            return
+          }
+        }
       }
 
       if (effectiveMissedFromSeq !== undefined) {
@@ -2176,6 +2209,15 @@ export class TerminalStreamBroker {
     const streamId = this.streamIdentity.replaceStream(terminalId, reason)
     const state = this.terminals.get(terminalId)
     if (state) {
+      // Mode-projection keyed rebirth (plan 2026-08-17-terminal-mode-replay-sync
+      // round-4 B): ring frames are strictly streamId-partitioned — the registry
+      // drops candidate-PTY output before 'terminal.stream.replaced' publishes,
+      // and replay-ring appends stamp the current stream identity at call time —
+      // so the old stream's projection is dead here, and re-scanning retained
+      // old-stream frames would resurrect modes the new process never set. The
+      // ring itself survives replacement by design; reset to defaults and let
+      // the new stream's own bytes repopulate the tracker.
+      state.replayRing.resetModeTracker()
       for (const attachment of state.clients.values()) {
         this.sendStreamChanged(
           attachment.ws,

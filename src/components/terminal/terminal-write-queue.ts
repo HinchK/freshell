@@ -23,6 +23,12 @@ type TerminalWriteQueueArgs = {
   terminalInstanceId: string
   write: (data: string, onWritten?: () => void) => void
   onDrain?: () => void
+  /**
+   * Fired once per applied write item (write COMPLETED and generation still
+   * current — items dropped stale before/during the write never fire it).
+   * Used by TerminalView to consume generation-scoped one-shot markers.
+   */
+  onItemApplied?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
   budgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
@@ -132,6 +138,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       try {
         if (!isStaleGeneration(item.generation)) {
           for (const callback of item.callbacks) callback()
+          args.onItemApplied?.({ mode: item.mode, generation: item.generation })
         }
       } finally {
         scope.complete()

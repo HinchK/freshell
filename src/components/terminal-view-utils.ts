@@ -95,6 +95,7 @@ export function buildTerminalAttachMessage(input: {
   attachRequestId: string
   priority: 'foreground' | 'background'
   maxReplayBytes?: number
+  surfaceReset?: boolean
 }): {
   type: 'terminal.attach'
   terminalId: string
@@ -106,6 +107,7 @@ export function buildTerminalAttachMessage(input: {
   priority: 'foreground' | 'background'
   maxReplayBytes?: number
   expectedSessionRef?: SessionLocator
+  surfaceReset?: boolean
 } {
   const expectedSessionRef = getExpectedSessionRefForTerminalOperation(input.content)
   return {
@@ -118,6 +120,7 @@ export function buildTerminalAttachMessage(input: {
     attachRequestId: input.attachRequestId,
     priority: input.priority,
     ...(input.maxReplayBytes ? { maxReplayBytes: input.maxReplayBytes } : {}),
+    ...(input.surfaceReset ? { surfaceReset: true } : {}),
     ...(expectedSessionRef ? { expectedSessionRef } : {}),
   }
 }

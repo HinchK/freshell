@@ -1,0 +1,9 @@
+{
+  "name": "f14-surface-reset-false",
+  "chunks": [
+    "\u001b[?1003;1006h\u001b[?1049h"
+  ],
+  "surfaceReset": false,
+  "expectedSyncData": "",
+  "note": "No terminal.modes.sync frame may be emitted: flag absent/false skips emission entirely."
+}

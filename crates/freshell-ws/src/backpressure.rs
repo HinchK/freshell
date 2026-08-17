@@ -334,4 +334,47 @@ mod tests {
             "a non-output frame must be handed straight back for direct send"
         );
     }
+
+    /// Mode replay-sync DIRECT-CHANNEL PIN (plan round-4 pin): unlike
+    /// `terminal.exit`'s deliberate carve-out INTO the queue (to preserve
+    /// output-then-exit order), `terminal.modes.sync` must route the DIRECT
+    /// channel — its whole contract is ready < sync < replay emitted inside
+    /// the attach critical section, and queueing it would both reorder it
+    /// behind prior live output and expose it to overflow eviction. Covers
+    /// the `route` path that the TerminalExit carve-out refactor could
+    /// otherwise capture it through.
+    #[test]
+    fn terminal_modes_sync_routes_direct_channel_never_queued() {
+        let q = ConnectionOutputQueue::new(1_000_000);
+        // ... even with output already pending in the queue.
+        let output = ServerMessage::TerminalOutput(freshell_protocol::TerminalOutput {
+            data: "pending output".to_string(),
+            seq_end: 0,
+            seq_start: 0,
+            stream_id: "s".to_string(),
+            terminal_id: "t".to_string(),
+            attach_request_id: None,
+            source: None,
+        });
+        assert!(q.route(output).is_none(), "output frame is queued");
+
+        let sync = ServerMessage::TerminalModesSync(freshell_protocol::TerminalModesSync {
+            attach_request_id: "req-1".to_string(),
+            data: "\u{1b}[?1003h".to_string(),
+            stream_id: "s".to_string(),
+            terminal_id: "t".to_string(),
+        });
+        let bounced = q.route(sync.clone());
+        assert_eq!(
+            bounced,
+            Some(sync),
+            "modes.sync must be handed back for direct send, never queued"
+        );
+        let drained = q.drain_all();
+        assert_eq!(
+            drained.len(),
+            1,
+            "only the output frame may be retained: {drained:?}"
+        );
+    }
 }

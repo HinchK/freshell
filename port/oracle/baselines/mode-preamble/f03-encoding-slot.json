@@ -1,0 +1,10 @@
+{
+  "name": "f03-encoding-slot",
+  "chunks": [
+    "\u001b[?1006h",
+    "\u001b[?1016h",
+    "\u001b[?1000l"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1016h"
+}

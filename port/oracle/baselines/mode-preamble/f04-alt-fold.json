@@ -1,0 +1,9 @@
+{
+  "name": "f04-alt-fold",
+  "chunks": [
+    "\u001b[?47h",
+    "\u001b[?1049h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1049h"
+}

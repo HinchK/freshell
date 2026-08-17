@@ -47,3 +47,9 @@ jobs:
 
       - name: Rust T0 surface (freshell-protocol)
         run: cargo test -p freshell-protocol --locked
+
+      # The mode-preamble baselines (port/oracle/baselines/mode-preamble/)
+      # are consumed by freshell-terminal's fixture test — without this step
+      # the cross-language tracker contract is unpinned in CI (G5-A1).
+      - name: Mode-preamble fixture contract (freshell-terminal)
+        run: cargo test -p freshell-terminal --locked

@@ -969,6 +969,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "surfaceReset": {
+              "type": "boolean"
+            },
             "terminalId": {
               "minLength": 1,
               "type": "string"
@@ -4376,6 +4379,9 @@
           "maximum": 9007199254740991,
           "minimum": 0,
           "type": "integer"
+        },
+        "surfaceReset": {
+          "type": "boolean"
         },
         "terminalId": {
           "minLength": 1,

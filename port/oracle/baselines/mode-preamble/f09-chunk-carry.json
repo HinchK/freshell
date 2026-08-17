@@ -1,0 +1,11 @@
+{
+  "name": "f09-chunk-carry",
+  "chunks": [
+    "abc\u001b[?100",
+    "3h def \u001b",
+    "[?2004h more \u001b[?104",
+    "9h tail"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1003h\u001b[?1049h\u001b[?2004h"
+}

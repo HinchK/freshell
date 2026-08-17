@@ -1,0 +1,11 @@
+{
+  "name": "f11-garbage-resync",
+  "chunks": [
+    "\u001b[?100\ufffd3h\u001b[?1004h",
+    "\ufffd\u001b[?10",
+    "06h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1006h",
+  "note": "?1004 is tracked but NEVER emitted (xterm emits an immediate focus report on every 1004 arm \u2014 junk input; see README synthesis rules)."
+}

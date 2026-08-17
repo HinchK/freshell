@@ -312,6 +312,29 @@ mod tests {
         );
     }
 
+    /// Mode replay-sync DIRECT-CHANNEL PIN (plan round-4 pin): a
+    /// `terminal.modes.sync` frame is control-plane by wire contract — the
+    /// registry emits it inside the attach critical section, strictly between
+    /// `attach.ready` and the replay, and it carries no seq fields. The whole
+    /// ready < sync < replay ordering guarantee relies on it NEVER entering
+    /// this queue (where overflow eviction or supersede/detach discards could
+    /// lose or reorder it). If a future edit teaches `output_frame_meta` to
+    /// match this variant, this test must fail — the reroute would be a wire
+    /// regression, not a refactor.
+    #[test]
+    fn modes_sync_is_never_treated_as_queueable_output() {
+        let sync = ServerMessage::TerminalModesSync(freshell_protocol::TerminalModesSync {
+            attach_request_id: "req-1".to_string(),
+            data: "\u{1b}[?1003h".to_string(),
+            stream_id: "s".to_string(),
+            terminal_id: "t".to_string(),
+        });
+        assert!(
+            output_frame_meta(&sync).is_none(),
+            "terminal.modes.sync must stay on the direct channel, never the output queue"
+        );
+    }
+
     #[test]
     fn frames_within_cap_are_all_retained_in_order_with_no_gap() {
         let mut q = OutputQueue::new(1_000_000);

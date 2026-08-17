@@ -4582,6 +4582,10 @@ fn handle_attach(
         attach.since_seq.unwrap_or(0),
         terminal_output_batch_v1,
         canonical_session_ref,
+        // Mode replay-sync: the client's positive surface-fresh marker
+        // (xterm recreation / user reset). Forwards the wire field 1:1; the
+        // registry owns the emit-vs-skip gating.
+        attach.surface_reset,
     );
     if outcome.found {
         return None;

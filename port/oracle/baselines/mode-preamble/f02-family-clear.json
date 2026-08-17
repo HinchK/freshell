@@ -1,0 +1,10 @@
+{
+  "name": "f02-family-clear",
+  "chunks": [
+    "\u001b[?9h",
+    "\u001b[?1002h",
+    "\u001b[?1003l"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": ""
+}

@@ -50,7 +50,8 @@ use std::sync::{Arc, Mutex};
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
-    TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
+    TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
+    TerminalRunStatus,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -60,6 +61,7 @@ use crate::batch::{
 };
 use crate::fragment::terminal_stream_batch_max_bytes;
 use crate::idle_noise::NoiseScanner;
+use crate::mode_tracker::ModeTracker;
 use crate::pty::{MessageSink, PtyTerminal};
 
 /// Deliver one server→client message to a single attached connection's socket.
@@ -201,6 +203,19 @@ struct TerminalShared {
     /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
     /// each ingested frame in order; its mode/CSI/string state persists across frames.
     scanner: BarrierScanner,
+    /// Per-terminal emulator-mode projection ([`ModeTracker`] — mode
+    /// replay-sync). Fed the SAME decoded frame data as `scanner` in `ingest`
+    /// (never re-decode bytes) and read once per surface-reset `attach` to
+    /// synthesize the `terminal.modes.sync` preamble.
+    ///
+    /// Lifecycle invariant: keyed to this ROW, i.e. effectively
+    /// (terminalId, streamId) — the Rust port has no stream-replace lifecycle
+    /// (auto-resume spawns a NEW terminal id; a live row's `stream_id` never
+    /// mutates), so the tracker dies exactly when the row does
+    /// (`kill_internal` is the only row-removal site; `finish_pty_exit`
+    /// RETAINS the row and therefore the frozen mode state, which is exactly
+    /// what an attach to an exited terminal must sync to render its tail).
+    modes: ModeTracker,
     /// Per-terminal repaint-noise fingerprinter feeding
     /// `last_meaningful_activity_at` (DEV-0009). Independent of the barrier
     /// scanner: separate state, separate concern (reaping, not batching).
@@ -1045,6 +1060,7 @@ impl TerminalRegistry {
             // from `settings.terminal.scrollback` at boot).
             max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
+            modes: ModeTracker::new(),
             noise: NoiseScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
@@ -1182,11 +1198,15 @@ impl TerminalRegistry {
     /// `reconcileTerminalSessionAssociation`, a repair channel that was dead
     /// while this frame hardcoded `None`).
     ///
-    /// 8 arguments (`clippy::too_many_arguments`): every one is a distinct,
+    /// 9 arguments (`clippy::too_many_arguments`): every one is a distinct,
     /// non-optional attach input with exactly one call site outside tests
     /// (`freshell_ws::terminal::handle_attach`, which forwards the parsed
     /// `terminal.attach` frame fields 1:1) — a params struct would just
     /// restate the wire message this crate deliberately doesn't own.
+    /// `surface_reset` is the client's positive "my xterm surface is fresh"
+    /// marker (mode replay-sync); when `Some(true)` and an
+    /// `attach_request_id` is present, the tracker-synthesized mode preamble
+    /// is emitted once, strictly between `attach.ready` and the replay.
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
@@ -1197,6 +1217,7 @@ impl TerminalRegistry {
         since_seq: i64,
         terminal_output_batch_v1: bool,
         session_ref: Option<SessionLocator>,
+        surface_reset: Option<bool>,
     ) -> AttachOutcome {
         // Take the terminal's shared Arc under the registry lock, then drop the
         // registry lock so we hold ONLY the per-terminal lock during the handoff.
@@ -1259,6 +1280,38 @@ impl TerminalRegistry {
             session_ref,
         });
         sink(ready);
+
+        // terminal.modes.sync (mode replay-sync): a surface-reset attach gets
+        // ONE control-plane emulator-mode preamble, ordered ready < sync <
+        // replay < live by construction — the per-terminal lock `s` is held
+        // for the whole attach, so the output reader (blocked on this same
+        // lock) cannot interleave a live frame. The sync travels the DIRECT
+        // channel only (`output_frame_meta` returns None for it — pinned in
+        // output_queue tests — so `freshell-ws`'s queue router hands it
+        // straight back); it never enters the output queue/ring, so overflow
+        // eviction and supersede/detach discards can never lose it. Gating:
+        //  * flag Some(true) — this attach's surface is fresh;
+        //  * attachRequestId present — the schema keeps it optional, but the
+        //    client fails closed (`missing_attach_request_id`) on an untagged
+        //    sync, so building one here would be pure waste;
+        //  * non-empty synthesis — nothing to arm (fixture f15 shape), and
+        //    with the client's completion-clear the skip is provably safe.
+        // This single block ALSO serves the already-Exited attach path below
+        // (sync < synthesized exit is legal on the wire; the frozen tail's
+        // modes are exactly what a fresh surface needs to render it).
+        if surface_reset == Some(true) {
+            if let Some(arid) = attach_request_id.as_deref() {
+                let data = s.modes.synthesize();
+                if !data.is_empty() {
+                    sink(ServerMessage::TerminalModesSync(TerminalModesSync {
+                        terminal_id: terminal_id.to_string(),
+                        attach_request_id: arid.to_string(),
+                        stream_id: s.stream_id.clone(),
+                        data,
+                    }));
+                }
+            }
+        }
 
         // Batch framing is used only with the capability AND an attachRequestId present
         // (`broker.ts:1315-1343`); otherwise legacy per-frame `terminal.output` (T1).
@@ -1917,6 +1970,7 @@ impl TerminalRegistry {
             replay_chars: 0,
             max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
+            modes: ModeTracker::new(),
             noise: NoiseScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
@@ -2612,6 +2666,10 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // `replay-ring.ts:62-79`). Non-truncated frames (every graded chunk) classify by
     // the scan result directly.
     let classification = s.scanner.scan(&frame.data);
+    // Mode replay-sync projection: scan the SAME decoded frame data (never
+    // re-decode bytes) so a later surface-reset attach can synthesize the
+    // emulator-mode preamble. Stateless wrt framing; stateful across frames.
+    s.modes.scan(&frame.data);
     let retained = RetainedFrame {
         output: frame,
         barrier: classification.barrier,
@@ -3118,7 +3176,16 @@ mod tests {
 
         // (a) legacy subscriber (no capability) — must get `terminal.output` only.
         let (legacy_sink, legacy_seen) = collector();
-        let _ = reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            legacy_sink,
+            Some("legacy".into()),
+            0,
+            false,
+            None,
+            None,
+        );
         let legacy = outputs(&legacy_seen);
         assert!(
             !legacy.is_empty(),
@@ -3141,7 +3208,16 @@ mod tests {
         // `terminal.output.batch`, reassembling to the SAME bytes, with UTF-16
         // endOffsets and a self-consistent serializedBytes.
         let (batch_sink, batch_seen) = collector();
-        let _ = reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true, None);
+        let _ = reg.attach(
+            "T",
+            2,
+            batch_sink,
+            Some("batch".into()),
+            0,
+            true,
+            None,
+            None,
+        );
         let bs = batches(&batch_seen);
         assert!(
             !bs.is_empty(),
@@ -3188,7 +3264,7 @@ mod tests {
         reg.feed("T", frame(1, "a\u{1F600}b\r\n", "S")); // a😀b␍␊
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("m".into()), 0, true, None);
+        let _ = reg.attach("T", 1, sink, Some("m".into()), 0, true, None, None);
         let bs = batches(&seen);
         assert_eq!(bs.len(), 1);
         let b = &bs[0];
@@ -3209,7 +3285,7 @@ mod tests {
         reg.feed("T", frame(3, "three\r\n", "S"));
 
         let (sink, seen) = collector();
-        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0, false, None);
+        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0, false, None, None);
         assert!(out.found);
 
         // attach.ready first, then the 3 replayed frames.
@@ -3241,7 +3317,7 @@ mod tests {
         reg.insert_headless("T", "S");
 
         let (sink_a, seen_a) = collector();
-        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None, None);
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
 
@@ -3257,7 +3333,7 @@ mod tests {
 
         // A fresh attach replays the FULL scrollback (both frames).
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None);
+        let _ = reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None, None);
         let replayed = outputs(&seen_b);
         assert_eq!(
             replayed.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
@@ -3272,9 +3348,9 @@ mod tests {
 
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false, None, None);
         // Second attach: geometry authority flips to multi_client_unknown.
-        let _ = reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false, None);
+        let _ = reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false, None, None);
         let ready_b = attach_ready(&seen_b).unwrap();
         assert_eq!(
             ready_b.geometry_authority,
@@ -3298,7 +3374,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink_a, seen_a) = collector();
-        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None, None);
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
         }
@@ -3308,7 +3384,7 @@ mod tests {
         // with sinceSeq=3. Only frames 4 and 5 are replayed (seqStart > 3).
         reg.detach("T", 1);
         let (sink_r, seen_r) = collector();
-        let _ = reg.attach("T", 2, sink_r, Some("a2".into()), 3, false, None);
+        let _ = reg.attach("T", 2, sink_r, Some("a2".into()), 3, false, None, None);
         let ready = attach_ready(&seen_r).unwrap();
         assert_eq!(ready.effective_since_seq, Some(3));
         assert_eq!(ready.replay_from_seq, 4);
@@ -3327,7 +3403,7 @@ mod tests {
         reg.feed("T", frame(1, "old\r\n", "S"));
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 7, sink, Some("z".into()), 0, false, None);
+        let _ = reg.attach("T", 7, sink, Some("z".into()), 0, false, None, None);
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
 
@@ -3349,7 +3425,7 @@ mod tests {
     fn attach_to_unknown_terminal_reports_not_found() {
         let reg = TerminalRegistry::new();
         let (sink, seen) = collector();
-        let out = reg.attach("nope", 1, sink, None, 0, false, None);
+        let out = reg.attach("nope", 1, sink, None, 0, false, None, None);
         assert!(!out.found);
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -3379,7 +3455,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let rev_before = reg.revision();
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
 
         assert!(reg.kill("T"));
         assert!(!reg.is_running("T"), "killed terminal is removed");
@@ -3407,8 +3483,8 @@ mod tests {
         reg.insert_headless("T-b", "S2");
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, None);
-        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, None);
+        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, None, None);
+        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, None, None);
         let rev_before = reg.revision();
 
         let killed = reg.kill_all();
@@ -3694,7 +3770,7 @@ mod tests {
         assert!(!dir[0].has_clients);
 
         let (sink, _seen) = collector();
-        let _ = reg.attach("T", 9, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 9, sink, Some("a".into()), 0, false, None, None);
         assert!(reg.directory()[0].has_clients);
         reg.detach("T", 9);
         assert!(!reg.directory()[0].has_clients);
@@ -3845,8 +3921,8 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
-                                                                            // conn 2 reconnects with another socket attached and no prior attachment of its own.
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None); // conn 1 is attached
+                                                                                  // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
         assert_eq!(out, AttachResizeStatus::Skipped);
         assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
@@ -3858,8 +3934,8 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink1, _seen1) = collector();
         let (sink2, _seen2) = collector();
-        let _ = reg.attach("T", 1, sink1, Some("a".into()), 0, false, None);
-        let _ = reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink1, Some("a".into()), 0, false, None, None);
+        let _ = reg.attach("T", 2, sink2, Some("b".into()), 0, false, None, None);
         // conn 2 already has an attachment -> resize even though conn 1 is also attached
         // (Node: existingAttachment wins over hasOtherAttachedSockets).
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
@@ -3895,8 +3971,8 @@ mod tests {
         reg.insert_headless("T2", "S2");
         let (sink1, seen1) = collector();
         let (sink2, seen2) = collector();
-        let _ = reg.attach("T1", 42, sink1, Some("a".into()), 0, false, None);
-        let _ = reg.attach("T2", 42, sink2, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T1", 42, sink1, Some("a".into()), 0, false, None, None);
+        let _ = reg.attach("T2", 42, sink2, Some("a".into()), 0, false, None, None);
 
         reg.remove_connection(42);
         // Both terminals survive; the swept connection receives no further output.
@@ -3922,7 +3998,7 @@ mod tests {
         assert!(reg.finish_pty_exit("T", 7));
 
         let (sink, seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         assert!(outcome.found);
 
         let exit = seen.lock().unwrap().iter().find_map(|m| match m {
@@ -3932,6 +4008,200 @@ mod tests {
         let exit = exit.expect("attach to an already-exited terminal must deliver terminal.exit");
         assert_eq!(exit.exit_code, 7);
         assert_eq!(exit.terminal_id, "T");
+    }
+
+    // ── terminal.modes.sync (mode replay-sync) ─────────────────────────
+    //
+    // On a `surfaceReset: true` attach (the client's positive "my xterm
+    // surface is fresh" marker) the server emits ONE control-plane
+    // `terminal.modes.sync` — the mode tracker synthesis of the terminal's
+    // retained output stream — strictly after `terminal.attach.ready` and
+    // before any replay/live output on that socket (direct channel; the
+    // per-terminal lock held here is the same one the output reader takes,
+    // so ordering is by construction). Gating: flag Some(true) AND an
+    // attachRequestId AND non-empty synthesis.
+
+    fn modes_syncs(seen: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<TerminalModesSync> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalModesSync(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn surface_reset_attach_emits_modes_sync_between_ready_and_replay() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // The app arms mouse + alt screen once at startup (the f01 shape),
+        // then writes ordinary output that becomes the replayed scrollback.
+        reg.feed("T", frame(1, "\u{1b}[?1003h\u{1b}[?1049h", "S"));
+        reg.feed("T", frame(2, "app banner\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("att-1".into()),
+            0,
+            false,
+            None,
+            Some(true),
+        );
+        assert!(outcome.found);
+
+        let msgs = seen.lock().unwrap().clone();
+        assert!(
+            matches!(msgs[0], ServerMessage::TerminalAttachReady(_)),
+            "attach.ready is first: {msgs:?}"
+        );
+        let ServerMessage::TerminalModesSync(sync) = &msgs[1] else {
+            panic!("modes.sync must immediately follow attach.ready: {msgs:?}")
+        };
+        assert_eq!(sync.terminal_id, "T");
+        assert_eq!(sync.attach_request_id, "att-1");
+        assert_eq!(sync.stream_id, "S");
+        assert_eq!(sync.data, "\u{1b}[?1003h\u{1b}[?1049h");
+        // Required order: sync strictly BEFORE every replayed output frame.
+        assert!(
+            msgs.len() > 2
+                && msgs[2..]
+                    .iter()
+                    .all(|m| matches!(m, ServerMessage::TerminalOutput(_))),
+            "replayed scrollback follows the sync frame: {msgs:?}"
+        );
+        assert_eq!(
+            modes_syncs(&seen).len(),
+            1,
+            "exactly one sync frame per attach"
+        );
+    }
+
+    /// The invariant is identical on the batch-capable attach path: sync
+    /// precedes the first `terminal.output.batch`.
+    #[test]
+    fn surface_reset_attach_emits_sync_before_replay_in_batch_mode() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "\u{1b}[?2004h", "S"));
+        reg.feed("T", frame(2, "banner\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("b1".into()), 0, true, None, Some(true));
+        assert!(outcome.found);
+
+        let msgs = seen.lock().unwrap().clone();
+        let sync_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalModesSync(_)))
+            .expect("sync emitted");
+        let first_batch_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalOutputBatch(_)))
+            .expect("batch replay emitted");
+        let ready_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalAttachReady(_)))
+            .expect("ready emitted");
+        assert!(
+            ready_pos < sync_pos && sync_pos < first_batch_pos,
+            "ready < sync < batch replay: ready={ready_pos} sync={sync_pos} batch={first_batch_pos}"
+        );
+    }
+
+    #[test]
+    fn attach_without_the_surface_reset_marker_never_emits_modes_sync() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "\u{1b}[?1003h", "S"));
+
+        // Flag absent (None) …
+        let (sink_a, seen_a) = collector();
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None, None);
+        // … and explicitly false: no sync either way (fixture f14's gating).
+        let (sink_b, seen_b) = collector();
+        let _ = reg.attach(
+            "T",
+            2,
+            sink_b,
+            Some("b".into()),
+            0,
+            false,
+            None,
+            Some(false),
+        );
+
+        assert!(modes_syncs(&seen_a).is_empty(), "flag absent => no sync");
+        assert!(modes_syncs(&seen_b).is_empty(), "flag false => no sync");
+    }
+
+    #[test]
+    fn surface_reset_with_nothing_to_synthesize_emits_no_sync() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Plain text only: the tracker synthesis is empty (fixture f15's
+        // shape), and empty data must never produce a frame.
+        reg.feed("T", frame(1, "just plain text\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, Some(true));
+        assert!(modes_syncs(&seen).is_empty(), "empty synthesis => no sync");
+    }
+
+    #[test]
+    fn surface_reset_without_attach_request_id_emits_no_sync() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "\u{1b}[?1003h", "S"));
+
+        // The client fails closed on a sync lacking attachRequestId
+        // (`missing_attach_request_id`), so the server never builds one.
+        let (sink, seen) = collector();
+        let _ = reg.attach("T", 1, sink, None, 0, false, None, Some(true));
+        assert!(
+            modes_syncs(&seen).is_empty(),
+            "no attachRequestId => no sync"
+        );
+    }
+
+    /// The Exited-row attach path also emits the sync: a frozen tail still
+    /// needs its modes for faithful rendering. The client tolerates
+    /// sync-immediately-followed-by-exit (accepted residual in the plan).
+    #[test]
+    fn surface_reset_attach_to_exited_terminal_emits_sync_then_exit() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "\u{1b}[?1006h", "S"));
+        assert!(reg.finish_pty_exit("T", 3));
+
+        let (sink, seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, Some(true));
+        assert!(outcome.found);
+
+        let msgs = seen.lock().unwrap().clone();
+        let ready_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalAttachReady(_)))
+            .expect("ready emitted");
+        let sync_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalModesSync(_)))
+            .expect("sync emitted for the exited attach too");
+        let exit_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalExit(_)))
+            .expect("synthetic exit delivered");
+        assert!(
+            ready_pos < sync_pos && sync_pos < exit_pos,
+            "ready < sync < exit: ready={ready_pos} sync={sync_pos} exit={exit_pos}"
+        );
+        let syncs = modes_syncs(&seen);
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].data, "\u{1b}[?1006h");
     }
 
     // `enforce_idle_kills` (TERM-11, `autoKillIdleMinutes`): legacy parity port
@@ -3984,7 +4254,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
         // Far past any threshold, but a client is attached -- legacy:
@@ -4161,7 +4431,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
         reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
@@ -4188,7 +4458,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         assert!(outcome.found);
         // A second, already-detached terminal whose countdown must NOT be
         // disturbed by conn 1's disconnect.
@@ -4219,7 +4489,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None)
                 .found
         );
         reg.set_auto_kill_idle_minutes(15); // the shipped default
@@ -4245,7 +4515,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None)
                 .found
         );
         reg.set_auto_kill_idle_minutes(15);
@@ -4265,13 +4535,13 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, None)
+            reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None)
                 .found
         );
         reg.detach("T", 1); // explicitly released — fast-reap eligible
         let (sink2, _seen2) = collector();
         assert!(
-            reg.attach("T", 2, sink2, Some("b".into()), 0, false, None)
+            reg.attach("T", 2, sink2, Some("b".into()), 0, false, None, None)
                 .found
         );
         reg.set_auto_kill_idle_minutes(15);
@@ -4363,7 +4633,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S")); // another 10 bytes -> over cap
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         let replayed = outputs(&seen);
         // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
         // must have been evicted once the second pushed bytes over the cap.
@@ -4381,7 +4651,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S"));
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
         let replayed = outputs(&seen);
         assert_eq!(
             replayed.len(),
@@ -4413,7 +4683,7 @@ mod tests {
         reg_ascii.feed("A", frame(1, "abcdef", "S")); // 6 chars, 6 bytes
         reg_ascii.feed("A", frame(2, "ghijkl", "S")); // 6 chars, 6 bytes -> 12 total, at cap
         let (sink_a, seen_a) = collector();
-        let _ = reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false, None);
+        let _ = reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false, None, None);
         let ascii_chars: usize = outputs(&seen_a)
             .iter()
             .map(|f| f.data.chars().count())
@@ -4432,7 +4702,7 @@ mod tests {
             frame(2, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", "S"),
         );
         let (sink_b, seen_b) = collector();
-        let _ = reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false, None);
+        let _ = reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false, None, None);
         let box_chars: usize = outputs(&seen_b)
             .iter()
             .map(|f| f.data.chars().count())
@@ -4692,7 +4962,7 @@ mod tests {
         }
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("r".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("r".into()), 0, false, None, None);
         let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
         assert!(
             retained_chars as i64 <= cap,

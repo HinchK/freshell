@@ -357,6 +357,12 @@ export const TerminalAttachSchema = z.object({
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
+  /** Positive marker: the attaching xterm surface was freshly constructed
+   * (page load / renderer recreation / user reset). Servers that know this
+   * field answer with one control-plane `terminal.modes.sync` frame; older
+   * servers accept-and-strip it (WS_PROTOCOL_VERSION deliberately not
+   * bumped — additive optional, all four old/new quadrants valid). */
+  surfaceReset: z.boolean().optional(),
   intent: TerminalAttachIntentSchema,
   priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),
@@ -869,6 +875,22 @@ export type TerminalTitleUpdatedMessage = {
   title: string
 }
 
+/**
+ * Control-plane emulator-mode preamble. Emitted ONLY on attaches marked
+ * `surfaceReset: true`, strictly ordered after `terminal.attach.ready` and
+ * before any replay/live output on the same socket. Seq-less by design; the
+ * client folds it through the same generation gates as replay content and
+ * fails closed when `attachRequestId` is absent/foreign. Additive,
+ * server→client only, not client-validated (WS_PROTOCOL_VERSION stays).
+ */
+export type TerminalModesSyncMessage = {
+  type: 'terminal.modes.sync'
+  terminalId: string
+  attachRequestId: string
+  streamId: string
+  data: string
+}
+
 export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
@@ -1134,6 +1156,7 @@ export type ServerMessage =
   | ErrorMessage
   | TerminalCreatedMessage
   | TerminalAttachReadyMessage
+  | TerminalModesSyncMessage
   | TerminalStreamChangedMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
