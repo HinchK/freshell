@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 27 discriminants).
+//! Client → server messages (`ClientMessage`, 30 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -266,6 +266,12 @@ pub struct TerminalAttach {
     pub rows: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+    /// Positive marker: the attaching xterm surface is freshly constructed
+    /// (page load / renderer recreation / user reset) and needs an
+    /// emulator-mode preamble. Accept-and-strip on older servers; the wire
+    /// field is camelCase `surfaceReset`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_reset: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]

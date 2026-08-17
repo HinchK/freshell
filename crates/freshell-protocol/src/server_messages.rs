@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 52 discriminants).
+//! Server → client messages (`ServerMessage`, 58 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -120,6 +120,8 @@ pub enum ServerMessage {
     TerminalInventory(TerminalInventory),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
+    #[serde(rename = "terminal.modes.sync")]
+    TerminalModesSync(TerminalModesSync),
     #[serde(rename = "terminal.output")]
     TerminalOutput(TerminalOutput),
     #[serde(rename = "terminal.output.batch")]
@@ -146,7 +148,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 57] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 58] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -193,6 +195,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 57] = [
     "terminal.input.blocked",
     "terminal.inventory",
     "terminal.meta.updated",
+    "terminal.modes.sync",
     "terminal.output",
     "terminal.output.batch",
     "terminal.output.gap",
@@ -1026,6 +1029,21 @@ pub struct TerminalInventory {
 pub struct TerminalMetaUpdated {
     pub remove: Vec<String>,
     pub upsert: Vec<TerminalMetaRecord>,
+}
+
+/// Control-plane emulator-mode preamble emitted once per surface-fresh
+/// attach, ordered ready < sync < replay < live on the requesting socket.
+/// Carries the attach's request id and the CURRENT stream id so the client
+/// can fold it through the same generation gates as replay content. `data`
+/// holds the synthesized DEC private mode / XTMODIFYKEYS bytes projected
+/// from the retained output stream (empty data => not emitted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalModesSync {
+    pub terminal_id: String,
+    pub attach_request_id: String,
+    pub stream_id: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
