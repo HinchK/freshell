@@ -84,6 +84,8 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # 15-minute job budget: deploy step reserves 10 min (600000 ms, the Pages-side
+    # cap); checkout + upload observed ~20s, leaving a ~5-minute margin.
     timeout-minutes: 15
     environment:
       name: github-pages
@@ -108,7 +110,7 @@ jobs:
           timeout: 600000
 ```
 
-Every input mirrors the observed legacy invocation (checkout fetch-depth 1; artifact name `github-pages`, path `./docs`, retention 1 day; deploy timeout 600000 ms — Stage 2 confirmed `timeout`'s default is 600000 ms and equals the fixed Pages-side deploy cap, so the explicit value is pure documentation). The job-level `timeout-minutes: 15` deliberately exceeds the deploy step's 10-minute budget so a slow deploy is never cut short by checkout/upload overhead (delta Fresh Eyes finding). Major tags `@v4`/`@v3`/`@v5` match both legacy's observed actions and repo no-SHA-pinning style; Stage 2 confirmed `actions/deploy-pages@v5.0.0`'s `action.yml` defines `artifact_name` and `timeout` in milliseconds, and that the 21 MiB `docs/` tree has ~48x headroom under Pages limits.
+Every input mirrors the observed legacy invocation (checkout fetch-depth 1; artifact name `github-pages`, path `./docs`, retention 1 day; deploy timeout 600000 ms — Stage 2 confirmed `timeout`'s default is 600000 ms and equals the fixed Pages-side deploy cap, so the explicit value is pure documentation). The job-level `timeout-minutes: 15` gives the deploy step's 10-minute budget a ~5-minute margin (checkout + upload observed ~20s in legacy runs) — a margin, not a guarantee, since the job clock covers all steps. Major tags `@v4`/`@v3`/`@v5` match both legacy's observed actions and repo no-SHA-pinning style; Stage 2 confirmed `actions/deploy-pages@v5.0.0`'s `action.yml` defines `artifact_name` and `timeout` in milliseconds, and that the 21 MiB `docs/` tree has ~48x headroom under Pages limits.
 
 - [x] **Step 3: Run the focused verification**
 
@@ -147,25 +149,34 @@ git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow commit -m "ci: ad
 3. Merge the PR. The merge commit touches `docs/plans/` (this plan) and the workflow file → self-triggers `Docs Pages Deploy` (verified in Stage 2: newly added workflow files are live for the push that adds them). Fallback if the self-trigger does not appear: `gh workflow run docs-pages-deploy.yml`.
 4. Watch until the site reports deployed: `gh run list --workflow docs-pages-deploy.yml --limit 1` for a success, and `gh api repos/danshapiro/freshell/pages --jq '{build_type, status, cname}'` showing `build_type: workflow`, `status: built`, `cname: freshell.net`. Poll `curl -sI https://freshell.net/` (expect 200) across the flip→deploy window; a brief outage in that window is a known accepted residual (no official doc settles it; the window is seconds-to-minutes and fully reversible).
 5. Rollback if anything is wrong. Ordered so the repo-owned workflow cannot race the recovered legacy pipeline, cancellation is awaited to terminal state (GitHub returns only `202 Accepted` from `gh run cancel`), and recovery is verified against the exact requested build (Fresh Eyes rounds 1–3 findings):
-   a. Disable the repo-owned workflow, then cancel every nonterminal run and await terminal state — cancelling the active run can promote a queued one, so snapshot+cancel must loop to a clean fixpoint. Filter client-side by the status FIELD (the installed gh rejects some `--status` values, e.g. `pending`, which is exactly what a concurrency-blocked run of this workflow carries):
+   a. Disable the repo-owned workflow, then cancel every nonterminal run to a VERIFIED fixpoint — cancelling the active run can promote a queued one, so snapshot+cancel loops until a fresh snapshot shows zero nonterminal runs. The loop aborts the rollback on a listing failure (fail-closed, not fail-open), filters client-side by the status field (gh 2.45.0 rejects some `--status` values such as `pending` — exactly the status a concurrency-blocked run of this workflow carries), and scans the full run history (`--limit 1000`, de facto exhaustive for a workflow that has existed minutes-to-days):
       `gh workflow disable docs-pages-deploy.yml -R danshapiro/freshell`
       ```bash
       while true; do
-        IDS=$(gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --limit 50 \
-              --json databaseId,status \
-              --jq '.[] | select(.status | test("^(queued|in_progress|requested|waiting|pending)$")) | .databaseId')
-        if [ -z "$IDS" ]; then break; fi
-        printf '%s\n' "$IDS" | xargs -r -n1 gh run cancel -R danshapiro/freshell
+        LIST=$(mktemp)
+        if ! gh run list -R danshapiro/freshell --workflow docs-pages-deploy.yml --limit 1000 \
+             --json databaseId,status \
+             --jq '.[] | select(.status | test("^(queued|in_progress|requested|waiting|pending)$")) | .databaseId' > "$LIST"; then
+          echo "ERROR: gh run list failed — aborting rollback; do NOT flip Pages settings" >&2
+          exit 1
+        fi
+        if [ ! -s "$LIST" ]; then rm -f "$LIST"; break; fi
+        while read -r id; do
+          gh run cancel -R danshapiro/freshell "$id" || echo "WARN: cancel of $id failed; the loop will re-verify" >&2
+        done < "$LIST"
+        rm -f "$LIST"
         sleep 5
       done
+      echo "fixpoint reached: zero nonterminal runs"
       ```
-      Loop exit means zero nonterminal runs remain NOW (a fresh snapshot), not merely that cancellation was requested. A cancelled in-flight deploy-pages run attempts to cancel its Pages deployment on termination; awaiting terminal run state covers it. If a run hangs nonterminal for >5 minutes under cancellation (GitHub's forced-termination bound), verify Pages-side instead before proceeding: `gh api repos/danshapiro/freshell/pages/deployments --jq '.[0:3] | .[] | {id,status}'` — if any deployment shows `in_progress`, cancel it: `gh api -X POST repos/danshapiro/freshell/pages/deployments/<id>/cancel`.
+      A cancelled in-flight deploy-pages run attempts to cancel its Pages deployment on termination; the fixpoint (terminal runs only) covers the ordinary path. If a run hangs nonterminal past GitHub's ~5-minute forced-termination bound (the one path that can skip the action's cancellation handler), the Pages REST API offers no deployments LIST endpoint — get the deployment id from the stuck run's logs instead (`gh api repos/danshapiro/freshell/actions/runs/<run_id>/logs` — deploy-pages prints `Deployment ID: <n>` in its deploy step output), then cancel it: `gh api -X POST repos/danshapiro/freshell/pages/deployments/<n>/cancel`.
    b. Flip the source back, re-asserting source/cname/HTTPS explicitly (the PUT documents no "omitted fields are preserved" guarantee):
       `gh api -X PUT repos/danshapiro/freshell/pages -f build_type=legacy -f 'source[branch]=main' -f 'source[path]=/docs' -f cname=freshell.net -F https_enforced=true`
    c. Request a legacy build and correlate recovery to the current source tip with movement detection (a bare `/pages/builds/latest` read can describe a stale or superseded build):
       1. `gh api -X POST repos/danshapiro/freshell/pages/builds` (queues a build of the current source-branch tip)
       2. loop until success: read `TIP=$(gh api repos/danshapiro/freshell/branches/main --jq .commit.sha)` and `BUILD=$(gh api repos/danshapiro/freshell/pages/builds/latest --jq '{commit,status}')`. Success requires `BUILD.commit == $TIP` and `BUILD.status == 'built'`. If `BUILD.status == 'errored'`, abort and report — do not declare rollback complete. If `main` advanced past the built commit (i.e. `BUILD.commit != $TIP` while a new push landed), `POST /pages/builds` again and continue polling.
    d. Confirm the site serves: `curl -sI https://freshell.net/` returns 200.
+   e. Stability re-check 5 minutes later: `gh api repos/danshapiro/freshell/pages/builds/latest --jq '{commit,status}'` still shows the verified legacy build for the current tip and `curl -sI https://freshell.net/` still returns 200. This guards the deploy-record ownership (both pipelines ship byte-identical `docs/` content, so even a hypothetical late-completing Actions deployment could not change served bytes — but ownership must rest with the legacy pipeline after rollback).
 
 ## Parity notes (what "replicate the existing experience" means, exactly)
 

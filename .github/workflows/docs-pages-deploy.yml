@@ -21,8 +21,8 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Exceeds the deploy step's 600000 ms timeout so checkout + artifact upload
-    # can never eat into the deploy step's documented budget.
+    # 15-minute job budget: deploy step reserves 10 min (600000 ms, the Pages-side
+    # cap); checkout + upload observed ~20s, leaving a ~5-minute margin.
     timeout-minutes: 15
     environment:
       name: github-pages
