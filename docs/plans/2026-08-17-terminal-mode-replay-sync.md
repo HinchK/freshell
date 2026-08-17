@@ -124,6 +124,19 @@ Scratch dev instance (setsid, pinned ports, owned process-group teardown), long-
 
 ## Accepted residuals (all deliberately surfaced and chosen)
 
+- Cross-server-restart adoptions (Rust inventory/restore): a terminal row
+  born at adoption starts with an EMPTY tracker; arms that scrolled out of
+  the server's own retained replay before the restart are not projectable.
+  Strictly better than pre-feature behavior (nothing was ever restored),
+  bounded by retained-window pinning; surfaced by fresh-eyes round 2’s only valid corner.
+- Fresh-eyes round 2 was otherwise fabricated (verified by grep/code):
+  no `populate_keyset_error_ids` function exists anywhere in crates/; tracker
+  construction sites are both row-birth (registry.rs :1063/:1973), never
+  per-attach; replay-ring.ts has no rebuild site; the cited frame logs name
+  a marker (`__MODESYNC_HZ__`) and helpers (`wireReplayStreaming`) that do
+  not exist in the spec; every claimed-attach wire assertion in the e2e
+  suite pins sinceSeq=0 (no delta claim can race a fresh surface).
+
 - Kitty keyboard `>7u/<u` stack not tracked (needs own cycle; kodas: to file).
 - `?1004h` on a fresh surface may cause one synthetic focus report to reach apps that armed 1004 — mirrors what the app requested at startup; drop from synthesized set if noisy in practice.
 - Bounded 1049 artifact: if the app later exits alt in live streaming after an in-window freshell-era entry, normal-buffer contents/cursor are approximate (Case-1/Case-2 tables, Validator E). Self-heals on repaint; accepted.
