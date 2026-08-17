@@ -1,0 +1,8 @@
+{
+  "name": "f10-c1-opener",
+  "chunks": [
+    "\u001b?1003h\u001b?2004h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1003h\u001b[?2004h"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "f01-opencode-startup",
+  "chunks": [
+    "\u001b[?1000;1002;1003;1006;2004h\u001b[?1049h",
+    "\r\n\u001b[2K\u001b[1G\u001b[1Gopencode 1.18.18 ready\r\n"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1003h\u001b[?1006h\u001b[?1049h\u001b[?2004h"
+}

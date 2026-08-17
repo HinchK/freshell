@@ -1,0 +1,9 @@
+{
+  "name": "f13-cursor-visibility-restore",
+  "chunks": [
+    "\u001b[?25l",
+    "\u001b[?25h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?25h"
+}

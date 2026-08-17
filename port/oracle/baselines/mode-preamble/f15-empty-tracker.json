@@ -1,0 +1,9 @@
+{
+  "name": "f15-empty-tracker",
+  "chunks": [
+    "just plain text\r\nno escapes here\r\n"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "",
+  "note": "surfaceReset true but synthesized data is empty: emission skipped."
+}

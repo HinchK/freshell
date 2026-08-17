@@ -1,0 +1,11 @@
+{
+  "name": "f08-xtmodifykeys",
+  "chunks": [
+    "\u001b[?1000h",
+    "\u001b[>4;1m",
+    "\u001b[>5;2m",
+    "\u001b[>4;;m"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1000h"
+}

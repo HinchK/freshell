@@ -1,0 +1,10 @@
+{
+  "name": "f11-garbage-resync",
+  "chunks": [
+    "\u001b[?100\ufffd3h\u001b[?1004h",
+    "\ufffd\u001b[?10",
+    "06h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1004h\u001b[?1006h"
+}

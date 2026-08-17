@@ -1,0 +1,10 @@
+{
+  "name": "f06-ris",
+  "chunks": [
+    "\u001b[?1003h\u001b[?1006h",
+    "\u001b[?25l\u001b[?2004h\u001b[?1004h\u001b[?1049h",
+    "\u001bc"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?25l"
+}
