@@ -172,9 +172,13 @@ Every entry requires:
   at runtime, and asserts the new session becomes visible via inotify). This test verifies the happy
   path of the late-root lifecycle (the process stays alive and indexes the new session). It does NOT
   cover injected watcher-arm failure, backend error propagation, or watcher reconfiguration — those
-  error paths are guarded structurally: arm failures add the provider to the absent-retry list (tested
-  by `watcher_rearms_when_absent_provider_appears`), and watcher errors send a `ProviderRescan` event
-  that triggers a full provider re-discovery. The original 4-test `late_root_watcher_liveness.rs` was
+  error paths are guarded structurally by code inspection: arm failures add the provider to the
+  absent-retry list for periodic re-arming (`run_watcher_loop`), watcher errors send a
+  `ProviderRescan` event that marks the specific provider dirty for a full re-discovery, and the
+  15-minute TTL reconciliation provides a safety net for any missed events. The
+  `watcher_rearms_when_absent_provider_appears` test covers the re-arm happy path (provider root
+  appears → watcher armed → sessions detected) but does NOT inject watcher construction or arm
+  failures. The original 4-test `late_root_watcher_liveness.rs` was
   replaced when the dead `indexer.rs` module (which the tests pinned) was deleted in favour of the
   event-driven `SessionWatcher`. The 15-minute TTL reconciliation covers any events the watcher misses.
   Interim TS red-documenting-original mirror (optional, proves the ledger's claim about the reference):

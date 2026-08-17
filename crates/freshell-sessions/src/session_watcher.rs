@@ -184,10 +184,15 @@ async fn run_watcher_loop(
                 base.clone()
             } else {
                 // Late-root: walk up toward the provider home looking
-                // for an existing ancestor. Bound at provider.home so
-                // we never climb above it (which could recursively
-                // watch the user's entire home directory).
-                let candidate = nearest_existing_ancestor(base, &provider.home);
+                // for an existing ancestor. For NonRecursive watchers
+                // (OpenCode), allow climbing one level above provider.home
+                // so we can observe when the data directory is created.
+                let ancestor_bound = if mode == notify::RecursiveMode::NonRecursive {
+                    provider.home.parent().unwrap_or(&provider.home)
+                } else {
+                    &provider.home
+                };
+                let candidate = nearest_existing_ancestor(base, ancestor_bound);
                 if !candidate.exists() {
                     tracing::info!(
                         provider = %name,

@@ -861,6 +861,11 @@ pub struct SessionIndex {
     /// Providers marked fully dirty (e.g. its root directory appeared/disappeared).
     /// Triggers a full discover() for that provider on next refresh.
     dirty_providers: Arc<StdMutex<HashSet<String>>>,
+    /// When the last full reconciliation completed (all providers discovered).
+    /// `None` means no full reconciliation has ever run. Used to ensure the
+    /// TTL-based full sweep fires even when scoped refreshes keep the
+    /// snapshot's `fetched_at` fresh.
+    last_full_at: Arc<StdMutex<Option<Instant>>>,
     /// Monotonic generation counter, bumped on every snapshot publish.
     /// Subscribers (via `subscribe_changes`) wake on changes.
     change_tx: tokio::sync::watch::Sender<u64>,
@@ -947,6 +952,7 @@ impl SessionIndex {
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
             dirty_paths: Arc::new(StdMutex::new(HashMap::new())),
             dirty_providers: Arc::new(StdMutex::new(HashSet::new())),
+            last_full_at: Arc::new(StdMutex::new(None)),
             change_tx,
             change_rx,
         }
@@ -1152,6 +1158,8 @@ impl SessionIndex {
             Arc::clone(&self.persist_state),
             Arc::clone(&self.dirty_paths),
             Arc::clone(&self.dirty_providers),
+            Arc::clone(&self.last_full_at),
+            self.ttl,
             self.change_tx.clone(),
         )
         .await;
@@ -1173,6 +1181,8 @@ impl SessionIndex {
         let persist_state = Arc::clone(&self.persist_state);
         let dirty_paths = Arc::clone(&self.dirty_paths);
         let dirty_providers = Arc::clone(&self.dirty_providers);
+        let last_full_at = Arc::clone(&self.last_full_at);
+        let ttl = self.ttl;
         let change_tx = self.change_tx.clone();
         tokio::spawn(async move {
             let _ = Self::perform_refresh(
@@ -1184,6 +1194,8 @@ impl SessionIndex {
                 persist_state,
                 dirty_paths,
                 dirty_providers,
+                last_full_at,
+                ttl,
                 change_tx,
             )
             .await;
@@ -1206,17 +1218,35 @@ impl SessionIndex {
         persist_state: Arc<StdMutex<PersistState>>,
         dirty_paths: Arc<StdMutex<HashMap<PathBuf, String>>>,
         dirty_providers: Arc<StdMutex<HashSet<String>>>,
+        last_full_at: Arc<StdMutex<Option<Instant>>>,
+        ttl: Duration,
         change_tx: tokio::sync::watch::Sender<u64>,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        // Force a full reconciliation when:
+        // - no snapshot has been published yet (cold start), or
+        // - the TTL has elapsed since the last full reconciliation
+        let force_full = {
+            let snapshot_exists = snapshot.lock().unwrap().is_some();
+            let last = *last_full_at.lock().unwrap();
+            !snapshot_exists || last.map_or(true, |at| at.elapsed() >= ttl)
+        };
+
         let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
             let direct_cache = Arc::clone(&direct_cache);
             let snapshot = Arc::clone(&snapshot);
             move || {
-                let scoped_paths: HashMap<PathBuf, String> =
-                    dirty_paths.lock().unwrap().drain().collect();
-                let scoped_providers: HashSet<String> =
-                    dirty_providers.lock().unwrap().drain().collect();
+                let (scoped_paths, scoped_providers) = if force_full {
+                    dirty_paths.lock().unwrap().clear();
+                    dirty_providers.lock().unwrap().clear();
+                    (HashMap::new(), HashSet::new())
+                } else {
+                    let sp: HashMap<PathBuf, String> =
+                        dirty_paths.lock().unwrap().drain().collect();
+                    let sprov: HashSet<String> =
+                        dirty_providers.lock().unwrap().drain().collect();
+                    (sp, sprov)
+                };
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
                 // Seed the failure set from the last PUBLISHED generation in
@@ -1288,6 +1318,9 @@ impl SessionIndex {
                 scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
+        if force_full {
+            *last_full_at.lock().unwrap() = Some(Instant::now());
+        }
         if changed > 0 {
             let _ = change_tx.send_modify(|gen| *gen += 1);
         }
@@ -1472,7 +1505,11 @@ fn refresh_snapshot(
     let mut changed = 0usize;
     for (idx, source) in sources.iter().enumerate() {
         if let Some(token) = source.direct_change_token() {
-            let unchanged = direct_cache.get(&idx).is_some_and(|e| e.token == token);
+            let provider_dirty = source
+                .provider_name()
+                .is_some_and(|n| scoped_providers.contains(n));
+            let unchanged =
+                !provider_dirty && direct_cache.get(&idx).is_some_and(|e| e.token == token);
             if unchanged {
                 // HEALTH evidence must be refreshed EVERY sweep (Node parity:
                 // `refreshDirectProvider()` runs on every full scan and
@@ -2699,6 +2736,8 @@ mod tests {
             Arc::clone(&persist_state),
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashSet::new())),
+            Arc::new(StdMutex::new(Some(Instant::now()))),
+            Duration::from_secs(3600),
             change_tx,
         )
         .await;
