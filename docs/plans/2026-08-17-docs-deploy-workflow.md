@@ -43,7 +43,7 @@ Move the GitHub Pages deployment of the freshell docs site (source: `main` branc
 - Consumes: the existing `github-pages` environment (branch policy: `main` allowed); repo Pages config (cname `freshell.net`, https enforced); `docs/CNAME` + `docs/.nojekyll` (carried through the artifact).
 - Produces: workflow `Docs Pages Deploy` (id `docs-pages-deploy.yml`) that creates Pages deployments the same way the legacy pipeline does; manual trigger via `gh workflow run docs-pages-deploy.yml`.
 
-- [ ] **Step 1: Write the failing verification**
+- [x] **Step 1: Write the failing verification**
 
 Obtain actionlint (`gh release download` without a tag fetches the latest release; Stage 2 validation confirms the toolchain works on this machine) and run it against the not-yet-existing workflow:
 
@@ -56,7 +56,7 @@ tar -xzf /tmp/actionlint-dl/actionlint_*_linux_amd64.tar.gz -C /tmp/actionlint-d
 
 Expected: FAIL because `docs-pages-deploy.yml` does not exist yet (actionlint reports the file as unreadable). This proves the check is live before implementation.
 
-- [ ] **Step 2: Add the workflow implementation**
+- [x] **Step 2: Add the workflow implementation**
 
 Create `.github/workflows/docs-pages-deploy.yml` with exactly this content (this exact YAML already passed actionlint 1.7.12 with zero diagnostics in Stage 2's green probe):
 
@@ -110,17 +110,17 @@ jobs:
 
 Every input mirrors the observed legacy invocation (checkout fetch-depth 1; artifact name `github-pages`, path `./docs`, retention 1 day; deploy timeout 600000 ms — Stage 2 confirmed `timeout`'s default is 600000 ms and equals the fixed Pages-side deploy cap, so the explicit value is pure documentation). Major tags `@v4`/`@v3`/`@v5` match both legacy's observed actions and repo no-SHA-pinning style; Stage 2 confirmed `actions/deploy-pages@v5.0.0`'s `action.yml` defines `artifact_name` and `timeout` in milliseconds, and that the 21 MiB `docs/` tree has ~48x headroom under Pages limits.
 
-- [ ] **Step 3: Run the focused verification**
+- [x] **Step 3: Run the focused verification**
 
 Run: `/tmp/actionlint-dl/actionlint /home/dan/code/freshell/.worktrees/docs-deploy-workflow/.github/workflows/docs-pages-deploy.yml`
 
 Expected: PASS (no output, exit 0). actionlint 1.7.12 validates workflow syntax, event/trigger semantics, the `permissions` values, the `environment.url` expression, and inputs for actions in its embedded popular-action database (which covers `actions/checkout` and `actions/deploy-pages@v5`). It does NOT cover `actions/upload-pages-artifact`, so its three inputs (`path`, `name`, `retention-days`) rest on separate evidence: they are byte-identical to the inputs observed in the live legacy pipeline's own `upload-pages-artifact@v3` invocation (run 32056407228 logs, Stage 1 exploration report) and match the action.yml input names at `v3` (checked in both Stage 2 and plan review rounds).
 
-- [ ] **Step 4: Refactor while green**
+- [x] **Step 4: Refactor while green**
 
 No refactor: the file is a single 40-line declarative workflow; each line is load-bearing (permissions, concurrency, environment, artifact/deploy inputs) or style-mandated (name, timeout-minutes).
 
-- [ ] **Step 5: Run impacted-set verification**
+- [x] **Step 5: Run impacted-set verification**
 
 The change is one additive CI YAML file; no application code, tests, or package configuration change. Impact analysis: vitest/jest suites do not read `.github/workflows/`; eslint configs lint JS/TS only; the port-contract and clippy workflows are unaffected by a new sibling file. Run the cheapest repo-owned confirmation that the tree is still coherent — the diff-scope guard and YAML sanity already covered by actionlint:
 
@@ -130,7 +130,7 @@ Expected: `.github/workflows/docs-pages-deploy.yml` as the only new untracked fi
 
 The full coordinated suite gate is run ONCE by the run orchestrator (not the task implementer) at the end of execution, on the final HEAD: command `FRESHELL_VITEST_BACKEND=local npm run check` (typecheck + client/server Vitest suites + Electron suite; `config/vitest/vitest.config.ts` excludes `test/e2e-browser/**`, so no e2e specs are part of this gate). Pass criterion: green, excluding only failures that reproduce at base_ref and are recorded by name in the run's baseline ledger (`/home/dan/code/freshell/.worktrees/.the-usual-logs/docs-deploy-workflow/run-state.md`, see also `reports/workspace-baseline.md` in the same logs directory). Any other failure is triaged as run-introduced and fixed before the gate passes. Backend note: the cloud Vitest backend is unusable as of 2026-08-17 — every execution of the shared `freshell-vitest` Cloud Run job on that date ran the Playwright e2e entrypoint despite `TEST_MODE=vitest` being confirmed present in the execution's container env (observed on executions freshell-vitest-2r4s2, -7rdvn, -7czbm, -l6rbp; the image was built 2026-08-16 and its baked entrypoint demonstrably does not honor `TEST_MODE`, so cloud executions run the wrong suite; exact provenance of that drift was not determined). The local backend is the repo-supported equivalent and was used for both the baseline and the gate in this run.
 
-- [ ] **Step 6: Commit the task**
+- [x] **Step 6: Commit the task**
 
 ```bash
 git -C /home/dan/code/freshell/.worktrees/docs-deploy-workflow add .github/workflows/docs-pages-deploy.yml
