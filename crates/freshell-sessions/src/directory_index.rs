@@ -1130,10 +1130,18 @@ impl SessionIndex {
         let guard = self.snapshot.lock().unwrap();
         match guard.as_ref() {
             Some(c) if !require_fresh || c.fetched_at.elapsed() < self.ttl => {
-                // Even within TTL, if paths are dirty, treat as stale
-                // so the caller triggers a background refresh.
                 if require_fresh && self.has_dirty() {
                     return None;
+                }
+                // Scoped refreshes keep fetched_at fresh, but a full
+                // reconciliation may still be overdue. Force a refresh
+                // when last_full_at exceeds the TTL so new provider
+                // roots and deleted sessions are discovered.
+                if require_fresh {
+                    let last = self.last_full_at.lock().unwrap();
+                    if last.map_or(true, |at| at.elapsed() >= self.ttl) {
+                        return None;
+                    }
                 }
                 Some((Arc::clone(&c.items), sorted_names(&c.scan_failures)))
             }

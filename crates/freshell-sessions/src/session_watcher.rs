@@ -29,8 +29,8 @@ const DEBOUNCE_MS: u64 = 200;
 
 /// How often (seconds) to re-check absent providers whose roots didn't
 /// exist at startup (or whose watchers failed to arm). When a provider's
-/// root appears, a watcher is armed for it. Also checks if any armed
-/// provider's watch base disappeared at runtime (e.g. provider uninstall).
+/// root appears, a watcher is armed for it. Also detects ancestor
+/// watchers that should be replaced by precise-root watchers.
 const REARM_INTERVAL_SECS: u64 = 60;
 
 /// Events from watcher callbacks, carrying provider identity so the
@@ -47,6 +47,14 @@ enum WatchEvent {
 pub struct WatchedProvider {
     pub layout: Box<dyn ProviderLayout>,
     pub home: PathBuf,
+}
+
+/// An active watcher with its metadata.
+struct ArmedWatch {
+    _watcher: notify::RecommendedWatcher,
+    prov_idx: usize,
+    requested_base: PathBuf,
+    actual_target: PathBuf,
 }
 
 /// The session-directory file watcher.
@@ -113,6 +121,41 @@ fn make_watcher_callback(
     }
 }
 
+/// Create and arm a watcher for the given target. Returns the watcher
+/// on success, or None on failure (after logging).
+fn arm_watcher(
+    tx: &mpsc::UnboundedSender<WatchEvent>,
+    provider_name: &str,
+    is_direct: bool,
+    target: &Path,
+    mode: notify::RecursiveMode,
+) -> Option<notify::RecommendedWatcher> {
+    let cb = make_watcher_callback(tx.clone(), provider_name.to_owned(), is_direct);
+    match notify::recommended_watcher(cb) {
+        Ok(mut watcher) => {
+            if let Err(e) = watcher.watch(target, mode) {
+                tracing::warn!(
+                    provider = %provider_name,
+                    path = %target.display(),
+                    error = %e,
+                    "session-watcher: failed to arm watch",
+                );
+                None
+            } else {
+                Some(watcher)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider_name,
+                error = %e,
+                "session-watcher: failed to create watcher",
+            );
+            None
+        }
+    }
+}
+
 impl SessionWatcher {
     pub fn new(index: Arc<SessionIndex>, providers: Vec<WatchedProvider>) -> Self {
         Self {
@@ -161,15 +204,14 @@ async fn run_watcher_loop(
 ) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WatchEvent>();
 
-    // Arm one watcher per provider, per watch base.
-    // Keep watchers alive for the loop's lifetime — dropping them unwatches.
-    let mut _watchers: Vec<notify::RecommendedWatcher> = Vec::new();
-    // Track which provider indices have active watchers for each base.
-    let mut armed_bases: Vec<(usize, PathBuf)> = Vec::new();
+    // Active watchers paired with their metadata. Dropping an ArmedWatch
+    // drops the watcher, which unwatches its target.
+    let mut armed: Vec<ArmedWatch> = Vec::new();
     // Providers whose roots didn't exist at startup OR whose watchers
     // failed to arm. Checked periodically so watchers are armed once the
     // provider is installed or the transient error resolves.
     let mut absent: Vec<(usize, PathBuf)> = Vec::new();
+
     for (prov_idx, provider) in providers.iter().enumerate() {
         let watch_bases = provider.layout.watch_bases(&provider.home);
         let is_direct = provider.layout.is_direct_listed();
@@ -206,29 +248,16 @@ async fn run_watcher_loop(
                 candidate
             };
 
-            let cb = make_watcher_callback(event_tx.clone(), name.clone(), is_direct);
-            match notify::recommended_watcher(cb) {
-                Ok(mut watcher) => {
-                    if let Err(e) = watcher.watch(&watch_target, mode) {
-                        tracing::warn!(
-                            provider = %name,
-                            path = %watch_target.display(),
-                            error = %e,
-                            "session-watcher: failed to arm watch",
-                        );
-                        index.mark_provider_dirty(&name);
-                        absent.push((prov_idx, base.clone()));
-                    } else {
-                        _watchers.push(watcher);
-                        armed_bases.push((prov_idx, base.clone()));
-                    }
+            match arm_watcher(&event_tx, &name, is_direct, &watch_target, mode) {
+                Some(watcher) => {
+                    armed.push(ArmedWatch {
+                        _watcher: watcher,
+                        prov_idx,
+                        requested_base: base.clone(),
+                        actual_target: watch_target,
+                    });
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = %name,
-                        error = %e,
-                        "session-watcher: failed to create watcher",
-                    );
+                None => {
                     index.mark_provider_dirty(&name);
                     absent.push((prov_idx, base.clone()));
                 }
@@ -277,7 +306,6 @@ async fn run_watcher_loop(
                 }
             } => {
                 // Debounce timer fired — flush.
-                // Provider-level rescans: only mark the specific providers dirty.
                 for provider_name in pending_rescans.drain() {
                     index.mark_provider_dirty(&provider_name);
                 }
@@ -307,23 +335,38 @@ async fn run_watcher_loop(
                     }
                 }
             }
-            _ = rearm_interval.tick(), if !absent.is_empty() || !armed_bases.is_empty() => {
-                // Detect armed watch bases that disappeared at runtime
-                // (e.g. provider uninstall) and move them to absent.
-                armed_bases.retain(|(prov_idx, base)| {
-                    if base.exists() {
-                        return true; // still present
+            _ = rearm_interval.tick(), if !absent.is_empty() || !armed.is_empty() => {
+                // Detect ancestor watchers whose precise base now exists,
+                // and armed bases that disappeared. Move both to absent
+                // for re-arming — dropping the ArmedWatch drops the old
+                // watcher (unwatching the stale target).
+                let mut indices_to_remove = Vec::new();
+                for (i, aw) in armed.iter().enumerate() {
+                    let name = providers[aw.prov_idx].layout.name();
+                    if aw.actual_target != aw.requested_base && aw.requested_base.exists() {
+                        tracing::info!(
+                            provider = %name,
+                            path = %aw.requested_base.display(),
+                            "session-watcher: precise root appeared, replacing ancestor watcher",
+                        );
+                        absent.push((aw.prov_idx, aw.requested_base.clone()));
+                        index.mark_provider_dirty(name);
+                        indices_to_remove.push(i);
+                    } else if !aw.actual_target.exists() {
+                        tracing::info!(
+                            provider = %name,
+                            path = %aw.actual_target.display(),
+                            "session-watcher: watch target disappeared, tracking for re-arm",
+                        );
+                        absent.push((aw.prov_idx, aw.requested_base.clone()));
+                        index.mark_provider_dirty(name);
+                        indices_to_remove.push(i);
                     }
-                    let name = providers[*prov_idx].layout.name();
-                    tracing::info!(
-                        provider = %name,
-                        path = %base.display(),
-                        "session-watcher: armed watch base disappeared, tracking for re-arm",
-                    );
-                    absent.push((*prov_idx, base.clone()));
-                    index.mark_provider_dirty(name);
-                    false
-                });
+                }
+                // Remove in reverse order to preserve indices.
+                for i in indices_to_remove.into_iter().rev() {
+                    armed.remove(i);
+                }
 
                 // Re-check absent providers: arm watchers for any whose
                 // root has appeared since the last check.
@@ -338,32 +381,24 @@ async fn run_watcher_loop(
                         WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
                     };
                     let name = prov.layout.name().to_owned();
-                    let cb = make_watcher_callback(
-                        rearm_tx.clone(),
-                        name.clone(),
-                        is_direct,
-                    );
-                    let armed = match notify::recommended_watcher(cb) {
-                        Ok(mut watcher) => {
-                            if watcher.watch(base, mode).is_ok() {
-                                _watchers.push(watcher);
-                                armed_bases.push((*prov_idx, base.clone()));
-                                true
-                            } else {
-                                false
-                            }
+                    match arm_watcher(&rearm_tx, &name, is_direct, base, mode) {
+                        Some(watcher) => {
+                            tracing::info!(
+                                provider = %name,
+                                path = %base.display(),
+                                "session-watcher: provider appeared, armed watcher",
+                            );
+                            armed.push(ArmedWatch {
+                                _watcher: watcher,
+                                prov_idx: *prov_idx,
+                                requested_base: base.clone(),
+                                actual_target: base.clone(),
+                            });
+                            index.mark_provider_dirty(&name);
+                            false // remove from absent
                         }
-                        Err(_) => false,
-                    };
-                    if armed {
-                        tracing::info!(
-                            provider = %name,
-                            path = %base.display(),
-                            "session-watcher: provider appeared, armed watcher",
-                        );
-                        index.mark_provider_dirty(&name);
+                        None => true, // keep in absent
                     }
-                    !armed // keep in absent list if arming failed
                 });
             }
         }
@@ -494,25 +529,21 @@ mod tests {
         let project = claude_home.join("projects").join("-p");
         std::fs::create_dir_all(&project).unwrap();
 
-        // Start with one session.
         let sid1 = "550e8400-e29b-41d4-a716-446655440001";
         write_claude_session(&claude_home, sid1, "/p/1");
 
         let source = ClaudeSource::new(claude_home.clone());
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
             vec![Arc::new(source) as Arc<dyn SessionSource>],
-            // Very long TTL — only dirty marking should trigger refreshes.
             Duration::from_secs(3600),
             None,
         ));
 
-        // Warm the index.
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 1);
 
         let mut rx = index.subscribe_changes();
 
-        // Start the watcher.
         let mut watcher = SessionWatcher::new(
             Arc::clone(&index),
             vec![WatchedProvider {
@@ -521,24 +552,18 @@ mod tests {
             }],
         );
         let handle = watcher.start();
-
-        // Give the watcher time to arm.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Write a new session file.
         let sid2 = "550e8400-e29b-41d4-a716-446655440002";
         write_claude_session(&claude_home, sid2, "/p/2");
 
-        // Wait for the change notification.
         let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
         assert!(
             changed.is_ok(),
             "watcher should detect the new file and trigger a snapshot change"
         );
 
-        // The index should now contain both sessions.
         let snap2 = index.snapshot().await;
-        // Poll briefly if stale-while-revalidate hasn't settled.
         let mut final_len = snap2.len();
         for _ in 0..20 {
             if final_len >= 2 {
@@ -558,9 +583,6 @@ mod tests {
     async fn watcher_handles_late_root_appearance() {
         let base = unique_temp_dir("late-root");
         let claude_home = base.join(".claude");
-        // Create the provider home but NOT the session root (projects/).
-        // The watcher can watch claude_home and detect when projects/
-        // appears inside it via recursive inotify.
         std::fs::create_dir_all(&claude_home).unwrap();
 
         let source = ClaudeSource::new(claude_home.clone());
@@ -570,12 +592,10 @@ mod tests {
             None,
         ));
 
-        // Warm — empty, since projects/ doesn't exist.
         let snap = index.snapshot().await;
         assert_eq!(snap.len(), 0);
 
         let mut rx = index.subscribe_changes();
-        // Mark the initial generation seen.
         let _ = *rx.borrow_and_update();
 
         let mut watcher = SessionWatcher::new(
@@ -588,18 +608,15 @@ mod tests {
         let handle = watcher.start();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Now create the session root AND a session file.
         let sid = "550e8400-e29b-41d4-a716-446655440003";
         write_claude_session(&claude_home, sid, "/p/late");
 
-        // The watcher should detect the new file and trigger a refresh.
         let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
         assert!(
             changed.is_ok(),
             "watcher must detect a late-appearing session (DEV-0002 liveness)"
         );
 
-        // Verify the session actually appears in the index.
         let mut found = false;
         for _ in 0..20 {
             let snap = index.snapshot().await;
@@ -618,11 +635,8 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_rearms_when_absent_provider_appears() {
-        // Create a base dir but NOT the provider home (simulates a
-        // provider that isn't installed at startup).
         let base = unique_temp_dir("rearm");
         let claude_home = base.join(".claude");
-        // Don't create claude_home — the watcher should track it as absent.
 
         let source = ClaudeSource::new(claude_home.clone());
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
@@ -644,25 +658,18 @@ mod tests {
                 home: claude_home.clone(),
             }],
         )
-        .with_rearm_interval(1); // 1 second for fast test
+        .with_rearm_interval(1);
         let handle = watcher.start();
-
-        // Give the watcher time to start and register the absent provider.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // "Install" the provider — create its root directory.
         let project = claude_home.join("projects").join("-p");
         std::fs::create_dir_all(&project).unwrap();
 
-        // Wait for the re-arm timer to fire and arm the new watcher.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // NOW write a session file. If the watcher re-armed, it should
-        // detect this file via inotify (not via TTL reconciliation).
         let sid = "550e8400-e29b-41d4-a716-446655440004";
         write_claude_session(&claude_home, sid, "/p/rearm");
 
-        // Wait for the watcher to detect the new file.
         let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
         assert!(
             changed.is_ok(),
