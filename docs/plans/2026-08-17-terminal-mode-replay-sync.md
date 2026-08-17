@@ -1,70 +1,94 @@
-# Terminal mode replay sync — plan (v2, load-bearing validated)
+# Terminal mode replay sync — plan (v3, two load-bearing rounds closed)
 
 ## Context
 
-After any browser page load (hard refresh, new window, re-attach), a pane's xterm instance is recreated and rehydrated from the server's retained replay buffer. Applications like opencode (1.18.18), vim, and tmux enable DEC private modes — mouse tracking (`?1000/?1002/?1003h`, SGR mouse format `?1006h`), alternate screen (`?1049h`), cursor visibility (`?25l`), bracketed paste (`?2004h`), focus reporting (`?1004h`), and XTMODIFYKEYS (`CSI >4;1m`) — **exactly once, at process startup**. Those startup bytes scroll out of the retained replay window, so a recreated xterm boots with default modes: no mouse tracking, normal buffer, no bracketed paste. Proven live 2026-08-16: this pane's replay (1.7 MB tail) contained zero mouse sequences; the result is mouse wheel input never forwarded (xterm `mouseTrackingMode === 'none'`), PgUp/PgDn unaffected (plain key input). Distinct from the geometry-stomp root cause fixed in PR #649.
+After any browser page load, a pane's xterm is recreated and rehydrated from the server's retained replay buffer. Apps enable DEC private modes (mouse `?1000/?1002/?1003h`, SGR mouse `?1006h`, alt screen `?1049h`, cursor `?25l`, bracketed paste `?2004h`, focus `?1004h`) and XTMODIFYKEYS (`CSI >4;1m`) **once at startup**; those bytes scroll out of the retained window, so the recreated xterm reverts to defaults and wheel input is never forwarded (`mouseTrackingMode === 'none'`). Proven live 2026-08-16 (1.7 MB replay tail contained zero mouse sequences; fresh opencode emits the full set in its first burst; resize does not re-emit). Distinct from the geometry-stomp fix (PR #649).
 
-## Load-bearing validation (all rows closed)
+## Load-bearing disposition (rounds 1+2)
 
-- G1a client gates: prepend-into-first-replay-frame is the ONLY valid zero-envelope-change encoding; batch self-consistency fields must be recomputed; seq is frame-ordinal. Dead ends proven for seq-less frames and same-window duplicates. Constraint: preamble byte members must avoid codex startup-probe step bytes (`?2004h`, `?1004h`, `?6n`…) or probe parsing disarms — mitigated structurally by emitting the preamble before probe-containing regions only when the tracker knows those modes SET (then the app's own probe chain ran at spawn, long since out of the tail).
-- G1b choke points (both servers confirm): Node = `TerminalStreamBroker.appendOutputFrames` (broker.ts:804) / `ReplayRing.append` (replay-ring.ts:62, already hosts `barrierScanner`); Rust = `registry.rs ingest` (registry.rs:2595, already hosts `s.scanner`). Preamble per-socket, reconstruct-on-copy (Node `replaySince` frames are shared ring references); never appended to the shared ring.
-- G2 xterm-6.0.0 slot semantics: protocol family {9,1000,1002,1003} shares ONE `_activeProtocol` slot, last-write-wins on set, unconditional family-clear on reset of ANY member; encoding {1006,1016} identical shape. → tracker models FAMILY SLOTS, not per-param booleans. RIS resets everything except cursor-hidden 25; DECSTR resets a broad set but NOT mouse; C1 wire form is UTF-8 `C2 9B`; DECRQM queries never mutate (h/l finals only).
-- G3 real app traffic (byte-faithful PTY captures with corrupted-C1 fix): zero RIS/DECSTR/C1 from opencode 1.18.18, vim 9.1, tmux 3.4 startup+teardown. Real non-h/l emission that IS lost on replay: XTMODIFYKEYS `CSI >4;1m` (opencode, vim), DECSCUSR shapes. tmux emits mode 7727 (inline-images). DECRQM only from opencode (6 queries).
-- G4 gating: wire-only predicate falsified both directions (pane refresh / load-more-history / quarantine-repair / multi-client all send sinceSeq=0 onto preserved xterm surfaces; RIS/user-reset case can attach sinceSeq>0 onto a fresh surface). xterm hazard table: `?1004h` fires fake focus-report keypress into the app (unconditional); `?1048h/?1049h` unconditionally save/restore cursor. → client-side `surfaceReset` marker on attach is required; server emits preamble exactly when the marker is true.
-- G5 test infra: shared JSON fixture dual-consumed by Rust + Node unit suites; CI gap budgeted (`cargo test -p freshell-terminal` absent from port-contract.yml); e2e accessor shape endorsed by xterm public typings (`ITerminal.modes`, `IBufferNamespace.active.type`); wheel→SGR channel via `recordSentWsMessage` feasible (xterm wheel path cited).
+- **R-1 wire encoding**: seq-frame surgery dead; v3 message type survives (see Validator C ordering proof, Validator D write-path proof).
+- **R-2 contract**: additive optional `surfaceReset` + new `terminal.modes.sync` server→client type; WS protocol version stays 7; all four old/new quadrants valid (Zod non-strict strips, serde accept-and-strip with zero real `deny_unknown_fields`, client dispatch has no default-reject). Gated files enumerated incl. `crates/freshell-protocol/tests/inventory.rs` hard counts (57→58 / 87→88) and gateway: `port-contract.yml` (test:port + regen-idempotency + `cargo test -p freshell-protocol`).
+- **R-3 delivery machinery**: `terminal.modes.sync` sent by immediate `safeSend`(Node: broker.ts between :520-522) / `sink`(Rust: registry.rs:1262) inside the attach critical section; strictly ready < sync < replay < live (Node: sync section contains zero awaits, replay flushes on later macrotask; Rust: reader blocked on the per-terminal lock, comment registry.rs:1230-1232). Bypasses every loss channel (queue overflow, supersede/detach discards — all operate on queued output; sync never enters the queue). Empty-replay problem deleted by construction (sync is seq-less).
+- **R-4 probe interplay**: sync bytes never traverse `handleTerminalOutput`/extractors (sole funnel proven); near-spawn probe disarm removal; DECRQM/OSC/title side effects suppressed because sync writes use `mode: 'replay'` write-scope.
+- **R-new (sync tagging)**: sync carries `attachRequestId` AND `streamId` (isCurrentAttachStreamMessage guard, TerminalView:2557-2701); untagged → fail closed (`missing_attach_request_id` reject); handler additionally rejects when `currentAttachRef.current === null`.
+- **R-new (Rust channel pin)**: `TerminalModesSync` must route the direct channel (output_frame_meta wildcard → None today); pin with a unit test so a future queue-delegation edit can't break ready<sync<replay.
+- **xterm facts (G2/E)**: family-slot semantics verified ({9,1000,1002,1003} one protocol slot, {1006,1016} one encoding slot, W-L-W unconditional clears); RIS resets everything except cursor-hidden(25); DECSTR broad but NOT mouse; `?1049h/l` idempotent (active-buffer last-wins law); 47/1047/1049 fold into one alt state (hazard if not); 1048 never synthesized standalone; emit-as-tracked policy for ?1049 chosen with bounded artifact budget.
+- **App traffic (G3)**: no RIS/DECSTR/C1 in opencode/vim/tmux startup+teardown (byte-faithful capture, C1-corruption-safe harness); scanner handles them anyway (cheap); kitty `>7u/<u` keyboard stack = deferred residual (own cycle).
+- **Scanner domain (F)**: both servers scan decoded strings (node-pty default UTF-8; Rust Utf8StreamDecoder lossy port); openers = `ESC[` + U+009B; 64-CODE-POINT carry (existing constant on both scanners: output-barrier-scanner.ts:44 / barrier_scanner.rs:105); U+FFFD = ground content, resync; Node tracker scans the PRE-normalize data at replay-ring.ts:63; fixtures authored in decoded-string domain.
+- **Client marker (A + F)**: new `surfaceFreshRef` (positive polarity). SET at exactly two sites: init-effect construction (TerminalView.tsx:2048, covers mount-fresh + renderer-recreate — one construction site) and user reset (term.reset() at :2215). NOT on term.clear() (:2796) nor cleanup. CLEAR at first applied write of a non-stale generation — anchor terminal-write-queue.ts:134 after the :133 stale guard (wire via new optional onWriteApplied; parity direct-write mirror :1680-1704). Read synchronously at buildTerminalAttachMessage send (~:2859-2869). Required addition (A-5.1): when `surfaceFreshRef.current` is true, the attach MUST force `intent='viewport_hydrate'`, `sinceSeq=0` (else a checkpoint-blessed delta would continue content onto a fresh blank surface — data hole). The hidden-attach wire swap (:2765-2766) applies after this resolution.
+- **Hazard-closure e2e (F)**: harness dispatch `{type:'panes/requestPaneRefresh', payload:{tabId,paneId}}` (slice panesSlice.ts:985/1593), PRECONDITION pane content already terminalId-folded; no `.focus()` on the refresh chain; assertion after settle: no terminal.input containing `\x1b[I`/`\x1b[O`.
+- **1049 ordering (E-A5)**: synthesize `?1049h` before any cursor-effect bytes (only 1048 matters; trivially satisfied by param sort).
 
 ## Design (final)
 
-**Rule:** the server is the architecture-of-record for emulator mode state; a per-terminal tracker consumes every output byte at the replay-append choke; on attach, when (and only when) the client asserts a fresh surface, the server prepends a synthesized mode preamble into the first replay bytes delivered to that socket. Content bytes, ring, and other sockets are untouched.
+**Server tracks a per-terminal emulator-state projection from the output stream; the client marks attach frames with `surfaceReset` only when its xterm surface is fresh; on such attaches (only), the server emits one `terminal.modes.sync` message (attachRequestId + streamId + data) immediately after `terminal.attach.ready` and before replay; the client writes it through the generation-gated write queue with replay-side-effect suppression. Everything else (seq accounting, replay content, ring contents, other sockets) is untouched.**
 
-### Components
+### 1. Mode tracker (both servers, one spec)
 
-1. **Client minimal change (new; closes G4).** `buildTerminalAttachMessage` gains `surfaceReset: boolean` (`ws-protocol.ts` TerminalAttachSchema + `crates/freshell-protocol` mirror; regenerate port contracts). TerminalView computes it at attach: true exactly when the terminal's xterm surface is freshly created/reset for this attach (post-page-load mount attach, and any attach after local RIS user-reset or renderer-recreate within the page session — both tracked via the existing surface-generation refs; everything else (reconnect, reveal, refresh, load-more, quarantine repair) = false).
-   - Server semantics: emit preamble iff `surfaceReset === true`. The replay content itself re-establishes everything else; `sinceSeq` content accounting is unchanged (preamble rides in the first replay frame's data, seq window shared with real content).
-   - Hazard closure proof sketch: emission ⇒ surface fresh (by marker contract) ⇒ client surface is at defaults ⇒ every asserted mode set/reset, including 1004/1048/1049, lands on a default surface (1014…1004's focus keypress fires only if a focus-report handler is armed on a *live* pane's term: on a freshly mounted surface the app's true state IS 1004-on, so any spurious ESC[I the app receives is the report it asked for at startup per its own intent — and pane focus at attach round-trips to the app's true focus state. Monitor as accepted residual; if observed, drop 1004 from the synthesized set).
+- Placement: Node — inside `ReplayRing.append` next to `barrierScanner` (replay-ring.ts:62-63), scanning the pre-normalize `data`; serve-lived at `getOrCreateTerminalState` (ring birth). Rust — inside `registry.rs ingest` beside `s.scanner` (:2614), per-terminal existing scanner slot.
+- String-domain state machine: CSI openers `ESC[` + U+009B; finals `h/l` for `?Pn` (DEC private), final `m` for `>Pm` (XTMODIFYKEYS resource sets, incl. `>4;m`/`>4;0m` clears); plain `ESC c` (RIS → clear protocol slot + encoding slot + all tracked DEC privates except 25 which xterm leaves); `CSI ! p` (DECSTR → apply the verified DECSTR table: clears ?1,?6,?45,?66,?1004,?2004,?2026, cursor visibility(25), margins, saved cursor; NOT mouse families); `$p`/`$y` finals never mutate (DECRQM guard).
+- State: protocol slot ({9,1000,1002,1003}), encoding slot ({1006,1016}), flat map of other tracked ?Pn, XTMODIFYKEYS resource map, alt-folded {47,1047,1049}. 64-code-point carry, U+FFFD resync, 128-entry overflow eviction (log).
+- Lifecycle (L5 spec): keyed to (terminalId, streamId); Node birth at getOrCreateTerminalState, extra death at replaceStreamIdentity; dropped at exit (Node broker exit) / kill (Rust row removal).
 
-2. **Mode tracker (per terminal).** Choke co-located with existing barrier scanner (both servers). Byte-level state machine over the output stream:
-   - Recognize `ESC [` and UTF-8 `C2 9B` CSI openers; parse to final byte; act ONLY on finals `h`/`l` for `? Pn` params (DEC private) and final `m` for `> Pm` (XTMODIFYKEYS resource sets). Split-sequence safety via 64-byte carry across chunks.
-   - Family model: protocol slot ← last W-L-W semantics per {9,1000,1002,1003}; encoding slot per {1006,1016}; **independent** tracked modes for all other emitted `?Pn` (25, 47, 1000 handled via slot, 1004, 1047/1048/1049 buffer semantics collapsed per below, 2004, 2026…), plus XTMODIFYKEYS resource map.
-   - Reset events: RIS (`ESC c`) → clear protocol slot to NONE, encoding slot to DEFAULT, clear tracked DEC privates (per G2's RIS table; cursor-hidden 25 survives RIS in xterm 6.0.0 — mirror that), XTMODIFYKEYS `>4;m`/`>4;0m` semantics appended to the tracker; DECSTR (`CSI ! p`) → apply G2's DECSTR mutation table.
-   - 1047/1048/1049 special-case: track `?1049` state (alt buffer). On synthesis, fresh surface gets `?1049h` iff tracked set. 1048 tracked but NOT synthesized when standalone (save-cursor with no buffer switch has no fresh-surface meaning: emit only when 1049 set AND 1048 also set, mirroring the app's original combination).
-   - Lifecycle keyed to (terminalId, streamId): Rust birth at registry create; Node birth at `getOrCreateTerminalState` (ring birth) — NEVER at earlier PTY spawn (Node brokers see no bytes there); Node extra death at `replaceStreamIdentity` (fresh tracker for new stream); drop at Node exit / Rust kill. Parity: `port` unit fixture, not wire identity.
+### 2. Preamble synthesis + sync emission
 
-3. **Preamble synthesis + injection (both servers).**
-   - Byte shape: `CSI ? Pm h` / `CSI ? Pm l` per family slot / tracked mode, then `CSI > Pm m` XTMODIFYKEYS. Deterministic order (for parity fixture): modes sorted by param within (slot protocol, slot encoding, others h, others l, xtmodifykeys).
-   - Injection point: Node — at per-socket batch/payload build (`buildTerminalOutputBatchPayload`/`buildTerminalOutputPayload` path from `flushReplayCursor`), reconstruct-on-copy: prepend preamble into segment[0].data; recompute `endOffset`s, `serializedBytes`, optional `segment.data` echoes; keep seq fields untouched. No-preamble fallback when replay slice is empty: emit a standalone terminal.output frame with seqStart=seqEnd=seq of first live frame… — G1a L10 proves duplicate windows drop; instead, for empty-replay fresh-surface attach, the server holds the preamble and prepends it into the FIRST LIVE frame the socket receives during/after attach (frames marked `source: 'live'`); if no live output ever arrives, the modes sync on first output (documented acceptable residual: xterm stays default until any output — the motivating case emits output constantly).
-   - Rust equivalent: inside `registry.attach` before streaming the cloned replay vec (`deliver_batches` path), identical sibling live-prepend hold for empty replay.
-   - Startup-probe interplay (G1a A-new-1): the preamble bytes `?2004h`/`?1004h` overlap codex probe steps and would disarm/advance that parser. Guard: when the client side detects fresh-surface attach it already resets the probe parser (TerminalView resets at attach, line 2790) — the preamble lands before genuine probe bytes; if probes were mid-flight in the replay tail (spawned < replay-window ago), the preamble disarms the probe suppressor and xterm auto-replies (ESC[?1;2c etc.): accepted residual, provably restricted to near-spawn attaches, benign for opencode (it already got its DECRPM answers via the bypass pre-refresh).
+- Byte shape from tracker state: deterministic param-sorted sequence of `CSI ? Pm h/l` (protocol slot leader h or family-clear l; encoding likewise; then flat modes; then XTMODIFYKEYS `>Pm m`), `?1049h` placed before any other cursor-affecting bytes (only 1048 interplay; none emitted standalone).
+- Emission condition: `attach.surfaceReset === true` only. Node insertion broker.ts:520-522 (after ready guard, pre-gap); Rust insertion registry.rs:1262 (after `sink(ready)`) — including the dead-terminal Exited path (sync of frozen state is correct for retained-tail rendering; client must tolerate sync-immediately-followed-by-exit edge).
+- Payload: `{ type:'terminal.modes.sync', terminalId, attachRequestId, streamId, data }`. No seq fields (control-plane).
+- Direct-channel pin (Rust): test that output_frame_meta returns None for TerminalModesSync.
 
-4. **Node↔Rust byte parity via shared fixture** (`port/oracle/baselines/mode-preamble/*.json`, input: tracked-state serialization, output: expected preamble bytes): consumed by Rust unit tests + Node vitest unit tests; CI wiring: add `cargo test -p freshell-terminal` (or the specific fixture test) to `port-contract.yml` — new step, budgeted.
+### 3. Client changes (minimal, two files)
 
-5. **Scanner tests** (Rust + Node parity from the same fixture family): split-sequence carry; combined param lists; family slot W-L-W (opencode's 1003h→1002h→1003l → slot NONE); RIS/DECSTR tables; C1 UTF-8 form; DECRQM `$p` ignored; XTMODIFYKEYS `>4;1m` capture + `>4;m` reset semantics; 64-byte carry sufficiency (overflow → conservative resync: drop carry, log).
+- `shared/ws-protocol.ts`: `TerminalAttachSchema` +`surfaceReset: z.boolean().optional()`; new `TerminalModesSyncMessage` TS type (previousSessionId modeling precedent: TS-type-only, server→client, not client-validated) in `ServerMessage` union. `crates/freshell-protocol`: TerminalAttach +`surface_reset: Option<bool>` (skip_serializing_if); server_messages.rs new variant + `SERVER_MESSAGE_TYPES` 57→58; tests/inventory.rs counts 57→58 / 87→88; fix the stale "52 discriminants"/"27 discriminants" header comments (pre-existing drift).
+- `TerminalView.tsx`: `surfaceFreshRef` (SET :2048 & :2215; CLEAR via write-queue :134 stale-guarded first-applied callback; wired through createTerminalWriteQueue new optional onWriteApplied); `attachTerminal` downgrade rule (`surfaceFresh ⇒ intent='viewport_hydrate', sinceSeq=0, clearViewportFirst:false`); pass marker into buildTerminalAttachMessage; new handler case at :3486 chain:
+  ```ts
+  if (msg.type === 'terminal.modes.sync' && msg.terminalId === tid) {
+    if (!currentAttachRef.current) return
+    if (!isCurrentAttachStreamMessage(msg)) return
+    if (typeof msg.data !== 'string' || msg.data.length === 0) return
+    writeQueueRef.current?.enqueue(msg.data, undefined, { mode: 'replay', generation: msg.attachRequestId })
+  }
+  ```
+- Port-contract regen committed in the PR; CI already gates regen idempotency.
+
+### 4. Parity fixture
+
+One shared JSON family `port/oracle/baselines/mode-preamble/*.json` (input: tracker state serialization + attach flag; expected: sync data bytes). Consumed by Rust unit tests and Node vitest unit tests (mirrors the baselines/batch golden pattern). Budgeted CI step: add `cargo test -p freshell-terminal` (at least the fixture test) to port-contract.yml — currently missing (G5-A1).
+
+### 5. E2E (multi-client.spec.ts, both matrix legs)
+
+- Happy path: emitter pane sets `?1003h ?1006h ?1049h >4;1m` once, heartbeats; reload page; via new harness accessor `getTerminalModes(terminalId)` (additive, per G5 sketch — returns IModes + bufferType) assert `mouseTrackingMode==='any'` + `'alternate'`; `page.mouse.wheel` over pane → `terminal.input` with `\x1b[<64;` on wire.
+- Hazard closure: tracked-`?1004h` pane, harness dispatch `panes/requestPaneRefresh` (after content-terminalId fold), settle 400ms, assert zero `terminal.input` containing `\x1b[I`/`\x1b[O`.
+- Marker-forcing rule coverage: renderer-recreate (settings change) → next attach has surfaceReset=true AND sinceSeq=0 (no delta-on-blank-surface).
+
+### 6. Live verification (same shape as PR#649 Task 3)
+
+Scratch dev instance (setsid, pinned ports, owned process-group teardown), long-lived real opencode pane, hard refresh, immediate wheel scroll works; pane refresh produces no junk input; user-reset + reconnect reproducibility sweep.
 
 ## Tasks
 
-### Task 1 — Rust: tracker + preamble + gating
-Sub-list: mode_tracker module with slot model + reset tables; wire into `ingest`; attach integration honoring `surfaceReset`; batch rebuild with offset recompute; live-prepend-hold for empty replay; unit tests + shared fixture consumption.
-
-### Task 2 — Node parity
-Same through broker/ring/payload path; same unit fixture; lifecycle hooks (`getOrCreateTerminalState`, `replaceStreamIdentity`, exit drop).
-
-### Task 3 — Client marker + protocol schema
-`surfaceReset` on TerminalAttachSchema both languages; compute in TerminalView; port-contract regen; unit coverage.
-
-### Task 4 — e2e (multi-client.spec.ts, both matrix legs)
-Tiny emitter pane (prints `?1003h ?1006h ?1049h >4;1m` once, then heartbeat); reload page in place; via new `__FRESHELL_TEST_HARNESS__.getTerminalModes` accessor (additive, per G5 sketch) assert `mouseTrackingMode === 'any'` + buffer type 'alternate'; synthesize page.mouse.wheel; assert `terminal.input` with `\x1b[<64;…M` on the wire. Additionally assert the hazard closure case: pane refresh (user action) on a tracked-`?1004h` pane must NOT produce an `ESC[I` terminal.input (marker=false ⇒ no preamble).
-
-### Task 5 — live verification (same shape as PR#649 Task 3)
-Scratch dev instance, real long-lived opencode session, hard refresh, wheel-scroll works immediately; then pane refresh ∀ no junk input; teardown by owned process group; gate + whole-branch review.
+1. **Rust**: mode scanner (string-domain; verified tables), tracker at ingest, sync emission at registry attach, direct-channel pin test, fixture consumption. TDD.
+2. **Node parity**: same in ReplayRing/broker (getOrCreateTerminalState birth, replaceStreamIdentity death, pre-normalize scan ordering), broker.ts:520 insertion, fixture consumption.
+3. **Client + protocol**: schema/type additions, surfaceFreshRef lifecycle, attach downgrade rule, sync handler, port-contract regen, inventory counts fix, unit coverage (lifecycle file).
+4. **E2E** per §5 (accessor additive surface included).
+5. **Live verification** per §6 + gate (`npm run check` + cargo workspace green modulo ledgered flakes jgpc/ep0f/xqfc) + whole-branch review.
 
 ## Acceptance
-- Task-4 e2e green on both servers; hazard-closure assertion green.
-- Live hard-refresh mouse-scroll regression no longer reproducible.
-- Gate: `npm run check` + cargo workspace green modulo ledgered flakes (jgpc / ep0f / xqfc).
 
-## Accepted residuals
-- Post-refresh panes with empty replay and no live app output keep default modes until first output byte.
-- Near-spawn attaches (probes still in window) may lose probe suppression that attach (xterm auto-replies; harmless for opencode; watch for regression reports).
-- 1004-on fresh-surface assertion may feed one synthetic focus report into apps at attach when a tracker says 1004 is on; mirrors startup intent; drop 1004 from the synthesized set if it proves noisy in practice.
-- DECSCUSR cursor-shape sync not tracked (presentation nicety only).
-- Wire marker lies are accepted as client bugs (not a security boundary).
+- E2E green on both servers, incl. hazard-closure and marker/downgrade assertions.
+- Live hard-refresh mouse-scroll regression not reproducible; pane refresh produces no junk input.
+- Gate green modulo ledgered pre-existing flakes.
+
+## Accepted residuals (all deliberately surfaced and chosen)
+
+- Kitty keyboard `>7u/<u` stack not tracked (needs own cycle; kodas: to file).
+- `?1004h` on a fresh surface may cause one synthetic focus report to reach apps that armed 1004 — mirrors what the app requested at startup; drop from synthesized set if noisy in practice.
+- Bounded 1049 artifact: if the app later exits alt in live streaming after an in-window freshell-era entry, normal-buffer contents/cursor are approximate (Case-1/Case-2 tables, Validator E). Self-heals on repaint; accepted.
+- User-reset asymmetry (A-5.2): if a ws attach happens before any output after a user Reset, history replays from 0 (reset ephemeral) rather than staying wiped; after any applied output the wipe persists via delta continuity. Chosen: server history is authority; Reset wipes the VIEW only.
+- Sync-immediately-followed-by-exit (Rust dead-terminal attach) is legal on the wire; client tolerates (sync applies, then synthesized exit).
+- Same-attachRequestId literal duplicate: Node suppresses (broker.ts:344-347), Rust re-emits idempotently. Idempotent re-assert on a fresh surface is safe by the fresh-surface premise (A3 premise owned by marker design).
+
+## Katas to file on landing
+
+- Kitty keyboard stack replay loss (deferred this branch).
+- `cargo test -p freshell-terminal` missing from port-contract.yml (add in this branch; kata only if descoped).
