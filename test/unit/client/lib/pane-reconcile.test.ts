@@ -188,6 +188,35 @@ describe('buildReconcileRequest', () => {
     expect(req.panes).toHaveLength(200)
     expect(errorSpy).toHaveBeenCalled()
   })
+
+  it('promotes a legacy-only terminal pane resumeSessionId into a canonical sessionRef on the reconcile claim', () => {
+    let state = emptyPanesState()
+    state = addTerminalPane(state, 'tab_1', 'pane_1', {
+      mode: 'claude', createRequestId: 'req-1',
+      resumeSessionId: 'legacy-claude-session-id',
+    } as Partial<TerminalPaneContent>)
+
+    const req = buildReconcileRequest(asRootState(state))
+    expect(req).not.toBeNull()
+    const pane = req!.panes[0]
+    expect(pane.sessionRef).toEqual({ provider: 'claude', sessionId: 'legacy-claude-session-id' })
+    expect(pane.resumeSessionId).toBeUndefined()
+  })
+
+  it('never promotes a shell-mode legacy resumeSessionId (a stateless shell has no durable identity)', () => {
+    let state = emptyPanesState()
+    state = addTerminalPane(state, 'tab_1', 'pane_1', {
+      mode: 'shell', createRequestId: 'req-sh-1',
+      resumeSessionId: 'legacy-shell-id',
+    } as Partial<TerminalPaneContent>)
+
+    const req = buildReconcileRequest(asRootState(state))
+    expect(req).not.toBeNull()
+    const pane = req!.panes.find((p) => p.createRequestId === 'req-sh-1')
+    expect(pane).toBeDefined()
+    expect(pane!.sessionRef).toBeUndefined()
+    expect(pane!.resumeSessionId).toBeUndefined()
+  })
 })
 
 describe('buildReconcileRequestForPanes', () => {

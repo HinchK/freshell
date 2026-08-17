@@ -830,6 +830,9 @@
             "restore": {
               "type": "boolean"
             },
+            "resumeSessionId": {
+              "type": "string"
+            },
             "sessionRef": {
               "additionalProperties": false,
               "properties": {
@@ -1406,6 +1409,24 @@
                 "danger-full-access"
               ],
               "type": "string"
+            },
+            "sessionRef": {
+              "additionalProperties": false,
+              "properties": {
+                "provider": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "sessionId": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
             },
             "type": {
               "const": "codingcli.create",
@@ -2287,6 +2308,24 @@
           ],
           "type": "string"
         },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
         "type": {
           "const": "codingcli.create",
           "type": "string"
@@ -2464,7 +2503,8 @@
         "UNAUTHORIZED",
         "PROTOCOL_MISMATCH",
         "SESSION_RESERVED",
-        "FRESH_AGENT_LOST_SESSION"
+        "FRESH_AGENT_LOST_SESSION",
+        "FRESH_AGENT_CREATE_FAILED"
       ],
       "type": "string"
     },
@@ -4610,6 +4650,9 @@
         },
         "restore": {
           "type": "boolean"
+        },
+        "resumeSessionId": {
+          "type": "string"
         },
         "sessionRef": {
           "additionalProperties": false,

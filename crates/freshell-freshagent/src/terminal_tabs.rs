@@ -48,7 +48,7 @@ use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
     RealFileProbe, ShellType, SpawnSpec,
 };
-use freshell_protocol::{ServerMessage, SessionLocator, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
+use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
@@ -73,7 +73,8 @@ fn mode_is_known(state: &FreshAgentState, mode: &str) -> bool {
 /// `acceptedSessionRefForMode` (`router.ts:230-236`): a `sessionRef` is only
 /// honored when its `provider` matches the terminal's own `mode` -- a
 /// `sessionRef` minted for a different provider is silently NOT accepted
-/// (falls through to the raw `resumeSessionId` path instead).
+/// (post-ejh6: the legacy raw `resumeSessionId` fallback it used to fall
+/// through to is rejected at the REST door before this is ever consulted).
 fn accepted_session_ref_for_mode<'a>(
     session_ref: Option<&'a SessionLocator>,
     mode: &str,
@@ -81,24 +82,20 @@ fn accepted_session_ref_for_mode<'a>(
     session_ref.filter(|r| r.provider == mode)
 }
 
-/// `requestedResumeSessionIdForMode` (`router.ts:214-228`): resolve the ONE
-/// resume-session-id a create should launch with -- the accepted
-/// `sessionRef` first, else (every mode EXCEPT `codex`) the legacy raw
-/// `resumeSessionId` field. `codex` is special-cased (`router.ts:221-226`,
-/// throwing `AgentRouteInputError(INVALID_RAW_CODEX_RESUME_MESSAGE)`): a raw
-/// `resumeSessionId` with no matching `sessionRef` is REJECTED outright
-/// (400), not silently accepted -- a bare codex thread id alone is not
-/// sufficient restore identity per the durable-thread contract
-/// (`restore-decision.ts`).
+/// `requestedResumeSessionIdForMode` (`router.ts:214-228`), post-ejh6:
+/// resolve the ONE resume-session-id a create should launch with — the
+/// provider-matched `sessionRef` only.
 ///
-/// NOTE: the Rust port's WS `terminal.create` handler
-/// (`crates/freshell-ws/src/terminal.rs:763-766`) does NOT yet enforce this
-/// rejection -- it accepts a raw codex `resumeSessionId` unconditionally, a
-/// known, separately-tracked deviation (DEV-0006: the codex app-server
-/// launch planner is not wired into `terminal.create` yet). This REST path
-/// mirrors the ROUTER (the frozen legacy contract) for this specific
-/// decision, per this slice's explicit scope, rather than the WS Rust port's
-/// current interim state.
+/// kata ejh6: the codex-specific legacy throw this function used to carry
+/// moved UP to the door-top presence check in each axum handler (`lib.rs`
+/// `create_tab`, `pane_ops.rs` `split_pane`/`respawn_pane`), which rejects
+/// ANY body carrying `resumeSessionId` (every mode, every JSON value, even
+/// alongside a matching `sessionRef`) with the frozen
+/// `LEGACY_RESUME_IDENTITY_REFUSAL` text. The `_legacy_resume_session_id`
+/// param is retained in the signature for caller compatibility
+/// (`derive_resume_identity` still passes it through) but is now
+/// INTENTIONALLY UNUSED — by the time control reaches here, no body can
+/// still carry the field, so there is nothing left to resolve or reject.
 ///
 /// `Response` is a large `Err` payload (`clippy::result_large_err`), but this
 /// mirrors every other handler in this module (`fail_json` returns `Response`
@@ -109,22 +106,9 @@ fn accepted_session_ref_for_mode<'a>(
 fn requested_resume_session_id_for_mode(
     session_ref: Option<&SessionLocator>,
     mode: &str,
-    legacy_resume_session_id: Option<&str>,
+    _legacy_resume_session_id: Option<&str>,
 ) -> Result<Option<String>, Response> {
-    if let Some(accepted) = accepted_session_ref_for_mode(session_ref, mode) {
-        return Ok(Some(accepted.session_id.clone()));
-    }
-    let legacy = legacy_resume_session_id.filter(|s| !s.is_empty());
-    if mode == "codex" {
-        if legacy.is_some() {
-            return Err(fail_json(
-                StatusCode::BAD_REQUEST,
-                LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
-            ));
-        }
-        return Ok(None);
-    }
-    Ok(legacy.map(str::to_string))
+    Ok(accepted_session_ref_for_mode(session_ref, mode).map(|s| s.session_id.clone()))
 }
 
 /// The terminal modes whose sessions live in a provider-durable store the
@@ -132,9 +116,10 @@ fn requested_resume_session_id_for_mode(
 /// `kimi`) -- the providers for which a bare `resumeSessionId` IS sufficient
 /// canonical identity to mint `sessionRef {provider: mode, sessionId}`.
 /// Deliberately NOT `codex`: a raw codex thread id alone is not restore
-/// identity (`INVALID_RAW_CODEX_RESUME_MESSAGE` / `restore-decision.ts`), and
-/// [`requested_resume_session_id_for_mode`] rejects it before this list is
-/// ever consulted.
+/// identity (`INVALID_RAW_CODEX_RESUME_MESSAGE` / `restore-decision.ts`).
+/// (kata ejh6: wire-level legacy `resumeSessionId` is rejected at the REST
+/// door-top before any of this runs — the plausibility/promotion machinery
+/// below now only sees resume ids derived from an accepted `sessionRef`.)
 fn is_session_provider_mode(mode: &str) -> bool {
     matches!(
         mode,
@@ -4426,6 +4411,150 @@ mod tests {
         let _ = std::fs::remove_file(&argv_file);
     }
 
+    /// kata ejh6: the legacy `resumeSessionId` wire field is REFUSED at the
+    /// `POST /api/tabs` door on EVERY registered mode (uniform any-carry
+    /// ruling) — 400 with the frozen text, before any mode branch. The cli
+    /// specs are registered so a pre-guard build would ACCEPT the create
+    /// (200), proving the door check is what flips the behavior.
+    #[tokio::test]
+    async fn legacy_reject_rest_create_all_modes() {
+        let modes = ["claude", "opencode", "amplifier"];
+        let argv_files: Vec<std::path::PathBuf> = modes
+            .iter()
+            .map(|m| unique_argv_file(&format!("legacy-reject-{m}")))
+            .collect();
+        let specs: Vec<freshell_platform::CliCommandSpec> = modes
+            .iter()
+            .zip(&argv_files)
+            .map(|(m, f)| recording_cli_spec(m, f))
+            .collect();
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(specs));
+        let router = app(state);
+        let tmp = std::env::temp_dir();
+        for (mode, argv_file) in modes.iter().zip(&argv_files) {
+            let (status, body) = post(
+                router.clone(),
+                "/api/tabs",
+                json!({
+                    "mode": mode,
+                    "cwd": tmp.to_string_lossy(),
+                    "resumeSessionId": format!("legacy-{mode}-id")
+                }),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {body}");
+            assert_eq!(
+                body["message"],
+                json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+                "{mode}: {body}"
+            );
+            let _ = std::fs::remove_file(argv_file);
+        }
+    }
+
+    /// kata ejh6 (uniform any-carry ruling): a body carrying BOTH a matching
+    /// `sessionRef` AND the legacy field still rejects — legacy presence is
+    /// checked BEFORE the sessionRef early-return.
+    #[tokio::test]
+    async fn legacy_reject_rest_create_dual_carrier() {
+        let argv_file = unique_argv_file("legacy-reject-dual");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "claude", &argv_file,
+            )]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "legacy",
+                "sessionRef": { "provider": "claude", "sessionId": "canonical" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "dual-carrier must reject: {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{body}"
+        );
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// ejh6 presence-based (finding 2): the contract is "any create that
+    /// CARRIES the field". REST reads raw Value, so null/number/empty-string
+    /// values ARE rejected.
+    #[tokio::test]
+    async fn legacy_reject_rest_create_presence_edge_cases() {
+        let argv_file = unique_argv_file("legacy-reject-edge");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "claude", &argv_file,
+            )]));
+        let router = app(state);
+        let tmp = std::env::temp_dir();
+        for (label, val) in [
+            ("empty-string", json!("")),
+            ("null", json!(null)),
+            ("number", json!(42)),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                "/api/tabs",
+                json!({
+                    "mode": "claude",
+                    "cwd": tmp.to_string_lossy(),
+                    "resumeSessionId": val
+                }),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+            assert_eq!(
+                body["message"],
+                json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+                "{label}: {body}"
+            );
+        }
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// ejh6 finding 3: browser/editor branches also 400 when carrying the
+    /// field — the door-top check fires BEFORE the agent/browser/editor/
+    /// terminal delegation, so no branch can bypass it.
+    #[tokio::test]
+    async fn legacy_reject_rest_browser_editor_branches() {
+        let state = state_with_registry();
+        let router = app(state);
+        for (label, mut body) in [
+            ("browser", json!({"browser": "https://example.com"})),
+            ("editor", json!({"editor": "/tmp/file.ts"})),
+        ] {
+            body.as_object_mut()
+                .unwrap()
+                .insert("resumeSessionId".into(), json!("legacy"));
+            let (status, resp) = post(router.clone(), "/api/tabs", body, true).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label} branch must reject: {resp}"
+            );
+            assert_eq!(
+                resp["message"],
+                json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+                "{label}: {resp}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_codex_tab_accepts_session_ref_and_derives_resume_args() {
         // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
@@ -5926,6 +6055,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_claude_tab_with_non_canonical_resume_id_does_not_synthesize() {
+        // ejh6: wire-level legacy resumeSessionId is REFUSED at the door — the
+        // implausible-id "no-synthesize/keep" EDEV-07 branch is now wire-
+        // unreachable; the branch stays in production code (content concern,
+        // out of scope for ejh6). This test pins the refusal: 400 + frozen
+        // text, and NO ui.command frame is broadcast (no spawn).
         let argv_file = unique_argv_file("claude-implausible");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -5944,30 +6078,29 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-
-        // Implausible id shape (claude ids must be canonical UUIDs,
-        // `freshell_sessions::text::is_canonical_claude_session_id`) -> NO
-        // synthesis; legacy resumeSessionId-only shape is preserved.
-        let frame = rx.recv().await.expect("ui.command frame broadcast");
-        let msg: Value = serde_json::from_str(&frame).unwrap();
-        assert!(
-            msg["payload"]["paneContent"].get("sessionRef").is_none(),
-            "{msg}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(
-            msg["payload"]["paneContent"]["resumeSessionId"],
-            json!("not-a-canonical-uuid"),
-            "{msg}"
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.")
         );
-
-        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        // No spawn -> no ui.command broadcast. subscribe-before-post means any
+        // frame would land in rx; a short timeout proves none arrived.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "no broadcast frame may arrive for a rejected create"
+        );
         let _ = std::fs::remove_file(&argv_file);
     }
 
     #[tokio::test]
     async fn create_amplifier_tab_with_whitespace_resume_id_does_not_synthesize() {
+        // ejh6: wire-level legacy resumeSessionId is REFUSED at the door — the
+        // implausible-id "no-synthesize/keep" EDEV-07 branch is now wire-
+        // unreachable; the branch stays in production code (content concern,
+        // out of scope for ejh6). This test pins the refusal: 400 + frozen
+        // text, and NO ui.command frame is broadcast (no spawn).
         let argv_file = unique_argv_file("amplifier-implausible");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -5987,27 +6120,29 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-
-        let frame = rx.recv().await.expect("ui.command frame broadcast");
-        let msg: Value = serde_json::from_str(&frame).unwrap();
-        assert!(
-            msg["payload"]["paneContent"].get("sessionRef").is_none(),
-            "{msg}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(
-            msg["payload"]["paneContent"]["resumeSessionId"],
-            json!("not a plausible id"),
-            "{msg}"
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.")
         );
-
-        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "no broadcast frame may arrive for a rejected create"
+        );
         let _ = std::fs::remove_file(&argv_file);
     }
 
     #[tokio::test]
     async fn create_opencode_tab_with_non_ses_resume_id_does_not_synthesize() {
+        // ejh6: wire-level legacy resumeSessionId is REFUSED at the door — the
+        // implausible-id "no-synthesize/keep" EDEV-07 branch is now wire-
+        // unreachable (opencode ids are `ses_*` rows,
+        // `shared/session-flavor.ts:65` `isDurableProviderSessionId`); the
+        // branch stays in production code (content concern, out of scope for
+        // ejh6). This test pins the refusal: 400 + frozen text, and NO
+        // ui.command frame is broadcast (no spawn).
         let argv_file = unique_argv_file("opencode-implausible");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -6026,25 +6161,17 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-
-        // Implausible id shape (opencode ids are `ses_*` rows,
-        // `shared/session-flavor.ts:65` `isDurableProviderSessionId`) -> NO
-        // synthesis; legacy resumeSessionId-only shape is preserved.
-        let frame = rx.recv().await.expect("ui.command frame broadcast");
-        let msg: Value = serde_json::from_str(&frame).unwrap();
-        assert!(
-            msg["payload"]["paneContent"].get("sessionRef").is_none(),
-            "{msg}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(
-            msg["payload"]["paneContent"]["resumeSessionId"],
-            json!("foo"),
-            "{msg}"
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.")
         );
-
-        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "no broadcast frame may arrive for a rejected create"
+        );
         let _ = std::fs::remove_file(&argv_file);
     }
 
@@ -6323,7 +6450,7 @@ mod tests {
             json!({
                 "mode": "amplifier",
                 "cwd": tmp.to_string_lossy(),
-                "resumeSessionId": "sess-no-warn-1"
+                "sessionRef": { "provider": "amplifier", "sessionId": "sess-no-warn-1" }
             }),
             true,
         )

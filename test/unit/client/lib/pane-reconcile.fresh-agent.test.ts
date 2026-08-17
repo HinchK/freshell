@@ -209,6 +209,35 @@ describe('buildReconcileRequest with fresh-agent panes', () => {
     const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })
     expect(req).toBeNull()
   })
+
+  it('promotes a legacy-only fresh-agent pane resumeSessionId into a canonical sessionRef on the reconcile claim', () => {
+    // Built by hand (same precedent as the createRequestId-less pane above):
+    // initLayout → normalizePaneContent runs the store's own legacy migration,
+    // which consumes a claude resumeSessionId into either a sessionRef or a
+    // restoreError — so the route-through-the-reducer helper can never produce
+    // the legacy-ONLY content this promotion guards (old persisted pane
+    // content carrying resumeSessionId without a sessionRef, kata ejh6 §2).
+    const panes = emptyPanesState()
+    panes.layouts['tab_1'] = {
+      type: 'leaf',
+      id: 'pane_1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-fa-1',
+        status: 'connected',
+        resumeSessionId: 'legacy-fa-session-id',
+      } as FreshAgentPaneContent,
+    }
+
+    const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })
+    expect(req).not.toBeNull()
+    const pane = req!.panes.find((p) => p.kind === 'fresh-agent')
+    expect(pane).toBeDefined()
+    expect(pane!.sessionRef).toEqual({ provider: 'claude', sessionId: 'legacy-fa-session-id' })
+    expect(pane!.resumeSessionId).toBeUndefined()
+  })
 })
 
 describe('buildReconcileRequestForPanes is kind-agnostic', () => {

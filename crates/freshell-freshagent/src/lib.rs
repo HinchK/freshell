@@ -135,7 +135,7 @@ use freshell_opencode::{
 };
 use freshell_protocol::{
     FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
-    UiCommand,
+    UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
@@ -1624,6 +1624,17 @@ async fn create_tab(
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+    // ejh6 (finding 3): door-top presence check. Reject whenever the body
+    // CONTAINS the key resumeSessionId with ANY JSON value (string, empty,
+    // null, number, object) — BEFORE any agent/browser/editor/terminal
+    // branch, including the `terminal_tabs::create_terminal_or_content_tab`
+    // delegation (this is the only REST entry to that function).
+    if body.get("resumeSessionId").is_some() {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+        );
     }
     let agent = body.get("agent").and_then(Value::as_str).unwrap_or("");
     // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a72.1): `agent`

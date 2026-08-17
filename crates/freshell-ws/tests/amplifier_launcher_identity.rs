@@ -286,14 +286,14 @@ async fn amplifier_create_rejects_synthetic_terminal_placeholder_refs() {
 /// be rejected, never a second live PTY interleaving writes into one
 /// session dir.
 ///
-/// The second create rides the legacy `resumeSessionId` carrier. Since the
-/// legacy-rung D7 promotion (the 2026-08-16 duplicate-tab fix), the
-/// cross-mode D7 liveness guard intercepts this carrier too — BEFORE the
-/// amplifier-specific friendly guard — so the loud reject is now the uniform
-/// D7 frame (`RESTORE_UNAVAILABLE`, "Session ... is still running on the
-/// server"), identical to the wire-`sessionRef` carrier's answer. The
-/// amplifier friendly guard remains downstream as defense-in-depth (it also
-/// covers the registry-level duplicate race D7 cannot see).
+/// The second create rides the legacy `resumeSessionId` carrier. Pre-ejh6
+/// the cross-mode D7 liveness guard answered it (`RESTORE_UNAVAILABLE`,
+/// "Session ... is still running on the server"); post-ejh6 the raw
+/// pre-parse guard rejects the legacy carrier at the door — BEFORE dedupe,
+/// BEFORE D7's liveness ladder — with `INVALID_MESSAGE` + the frozen
+/// refusal text. The amplifier friendly guard remains downstream as
+/// defense-in-depth for the carriers that remain legal (it also covers the
+/// registry-level duplicate race D7 cannot see).
 #[tokio::test]
 async fn amplifier_create_rejects_second_live_resume_of_same_session() {
     let _amp_home = isolate_amplifier_home();
@@ -346,12 +346,17 @@ async fn amplifier_create_rejects_second_live_resume_of_same_session() {
     .expect("send terminal.create");
 
     let err = next_frame_of_type(&mut ws, "error").await;
-    assert_eq!(err["code"], "RESTORE_UNAVAILABLE", "loud reject: {err}");
+    assert_eq!(
+        err["code"], "INVALID_MESSAGE",
+        "post-ejh6 the legacy carrier is rejected at the door, not via D7: {err}"
+    );
     assert_eq!(err["requestId"], "req-amp-launcher-identity-6");
     assert_eq!(
         err["message"],
-        serde_json::json!(format!("Session {sid} is still running on the server.")),
-        "the uniform D7 frame — same answer as the sessionRef carrier: {err}"
+        serde_json::json!(
+            "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."
+        ),
+        "the frozen door-rejection frame: {err}"
     );
 
     // No duplicate spawn: exactly the original terminal owns sid.

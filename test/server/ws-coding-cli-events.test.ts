@@ -305,6 +305,133 @@ describe('WebSocket Coding CLI Events', () => {
     ws.close()
   })
 
+  // ejh6 Task 11 (finding 9: presence on this door too): it.each over string + empty-string.
+  // Finding 10a + review round 3 finding 5: no spawn on reject, with createMock
+  // DECLARED here and the same mid-test wsHandler swap the promote test uses
+  // (never instantiate a real coding-cli manager/provider, V4).
+  it.each([['string', 'legacy-cli-id'], ['empty-string', '']])(
+    'rejects codingcli.create resumeSessionId (%s) with INVALID_MESSAGE + frozen text and no spawn', async (_label, legacy) => {
+      const createMock = vi.fn()
+      class FakeSession extends EventEmitter {
+        id = 'cli-session-reject'
+        provider = { name: 'claude' }
+      }
+      const fakeManager = {
+        create: (...args: any[]) => { createMock(...args); return new FakeSession() },
+        hasProvider: (name: string) => name === 'claude',
+        get: vi.fn(),
+        remove: vi.fn(),
+      } as unknown as CodingCliSessionManager
+      wsHandler.close()
+      wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
+
+      const ws = await createAuthenticatedWs()
+      const requestId = `cli-legacy-reject-${_label}`
+      const errorPromise = new Promise<any>((resolve) => {
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type === 'error' && msg.requestId === requestId) resolve(msg)
+        })
+      })
+      ws.send(JSON.stringify({
+        type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
+        resumeSessionId: legacy,
+      }))
+      const error = await errorPromise
+      expect(error).toMatchObject({
+        type: 'error', code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        requestId,
+      })
+      expect(createMock).not.toHaveBeenCalled() // no spawn on reject
+      ws.close()
+    },
+  )
+
+  it('promotes a provider-matched sessionRef into the spawn-time resume id for codingcli.create', async () => {
+    // V4: NEVER instantiate a real CodingCliSessionManager + real claudeProvider —
+    // use the file's established fake-manager pattern (:247-258). The promoted id
+    // is observable at the manager boundary as `options.resumeSessionId`
+    // (session-manager forwards options verbatim into new CodingCliSession).
+    const createMock = vi.fn()
+    class FakeSession extends EventEmitter {
+      id = 'cli-session-1'
+      provider = { name: 'claude' }
+    }
+    const fakeManager = {
+      create: (...args: any[]) => { createMock(...args); return new FakeSession() },
+      hasProvider: (name: string) => name === 'claude',
+      get: vi.fn(),
+      remove: vi.fn(),
+    } as unknown as CodingCliSessionManager
+
+    // Mid-test WsHandler swap is VALID (V4 leg i): wsHandler.close() removes the
+    // upgrade listener from the shared http.Server, so the new WsHandler is the
+    // ONLY upgrade handler — no double-processing. Established pattern (:257-258).
+    wsHandler.close()
+    wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+    } as any)
+
+    const ws = await createAuthenticatedWs()
+    const requestId = 'cli-sref-promote-1'
+    const createdPromise = new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'codingcli.created') resolve()
+      })
+    })
+    ws.send(JSON.stringify({
+      type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
+      sessionRef: { provider: 'claude', sessionId: 'canonical-cli-session' },
+    }))
+    await createdPromise
+    // V4: the assertion is the fake-manager create spy — the promoted id is
+    // options.resumeSessionId at the manager boundary. Mirrors :295-303.
+    expect(createMock).toHaveBeenCalledWith('claude', expect.objectContaining({
+      resumeSessionId: 'canonical-cli-session',
+    }))
+    ws.close()
+  })
+
+  it('does NOT promote a provider-mismatched sessionRef into the spawn-time resume id', async () => {
+    // Review round 2 finding 10b: a sessionRef whose provider ≠ m.provider is
+    // NOT promoted — the spawn proceeds without a resume id. Same fake-manager
+    // wsHandler swap as the promote test above.
+    const createMock = vi.fn()
+    class FakeSession extends EventEmitter {
+      id = 'cli-session-2'
+      provider = { name: 'claude' }
+    }
+    const fakeManager = {
+      create: (...args: any[]) => { createMock(...args); return new FakeSession() },
+      hasProvider: (name: string) => name === 'claude',
+      get: vi.fn(),
+      remove: vi.fn(),
+    } as unknown as CodingCliSessionManager
+    wsHandler.close()
+    wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
+
+    const ws = await createAuthenticatedWs()
+    const requestId = 'cli-sref-mismatch-1'
+    const createdPromise = new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'codingcli.created') resolve()
+      })
+    })
+    ws.send(JSON.stringify({
+      type: 'codingcli.create', requestId, provider: 'claude', prompt: 'hi',
+      sessionRef: { provider: 'codex', sessionId: 'wrong-provider-session' },
+    }))
+    await createdPromise
+    expect(createMock).toHaveBeenCalledTimes(1)
+    const spawnOptions = createMock.mock.calls[0][1]
+    expect(spawnOptions.resumeSessionId).toBeUndefined()
+    ws.close()
+  })
+
   it('detaches coding cli listeners on socket close', async () => {
     const fakeSession = Object.assign(new EventEmitter(), {
       id: 'fake-session-1',

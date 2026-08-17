@@ -206,8 +206,6 @@ async fn spawn_server_with_probe(
 
 // ── seam 5a pieces (DEV-0006 S5) — copied from codex_managed_launch_e2e.rs ──
 
-const RECV_TIMEOUT: Duration = Duration::from_secs(20);
-
 /// Real codex CliCommandSpec (env_var seam) — copied from
 /// codex_managed_launch_e2e.rs so the resolver takes the REAL codex branch
 /// and managed-launch planning engages.
@@ -262,19 +260,16 @@ fn write_codex_dispatcher() -> std::path::PathBuf {
     dispatcher
 }
 
-/// Poll the capture file the dispatcher writes until it appears, then parse
-/// the argv — verbatim from codex_managed_launch_e2e.rs (a SYNC helper).
-fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
-    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
-    loop {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if !raw.is_empty() {
-                return serde_json::from_str(&raw).expect("captured argv is a JSON array");
-            }
-        }
+/// Bounded NEGATIVE argv-capture check: the dispatcher writes the capture
+/// file SYNCHRONOUSLY at child spawn, so its absence after a short window
+/// proves no codex child ever launched — the door rejection has zero side
+/// effects (no spawn, no planning slot burned).
+fn assert_never_captured(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
         assert!(
-            std::time::Instant::now() < deadline,
-            "spawned codex child never wrote its argv capture at {}",
+            !path.exists(),
+            "a create rejected at the door must never spawn a codex child: {}",
             path.display()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -690,15 +685,15 @@ async fn restore_true_live_legacy_resume_id_is_refused_invalid_message() {
 }
 
 /// Case 6 — the ASYNC sidecar arm of the cross-kind liveness join: liveness
-/// held ONLY by the fresh-agent sidecar (no registry/identity owner). Codex
-/// is exempt from the case-5 legacy-restore refusal (Node's refusal excludes
-/// codex too), so this carrier reaches D7 — whose legacy-rung promotion +
-/// Task 13b sidecar arm now refuse it loudly, protecting live zero-turn
-/// sessions with no rollout on disk yet
-/// (`freshell-server/src/existence.rs:224-227`) from a second writer. The
-/// live session is never gated stale — its Bound row survives.
+/// held ONLY by the fresh-agent sidecar (no registry/identity owner).
+/// Pre-ejh6 codex was exempt from the case-5 legacy-restore refusal, so
+/// this carrier reached D7's loud liveness reject; post-ejh6 the uniform
+/// any-carry door guard (raw pre-parse, `handle_client_text`) rejects the
+/// legacy carrier FIRST — `INVALID_MESSAGE` + frozen text — before any
+/// sidecar liveness consult. The live session is never touched: its Bound
+/// row survives.
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_true_sidecar_live_legacy_resume_id_is_refused_by_d7() {
+async fn restore_true_sidecar_live_legacy_resume_id_is_refused_at_the_door() {
     // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
     // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
@@ -756,12 +751,14 @@ async fn restore_true_sidecar_live_legacy_resume_id_is_refused_by_d7() {
         frame["type"], "error",
         "a sidecar-live legacy carrier must be refused (one writer per thread): {frame}"
     );
-    assert_eq!(frame["code"], "RESTORE_UNAVAILABLE", "{frame}");
-    assert!(
-        frame["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("still running")),
-        "D7's own rejection message must answer: {frame}"
+    assert_eq!(
+        frame["code"], "INVALID_MESSAGE",
+        "codex is no longer exempt from the legacy-field reject: {frame}"
+    );
+    assert_eq!(
+        frame["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen text: {frame}"
     );
     assert_eq!(
         ledger
@@ -777,14 +774,14 @@ async fn restore_true_sidecar_live_legacy_resume_id_is_refused_by_d7() {
     std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
 }
 
-/// Case 7 — gate-before-plan ordering pin (managed-launch default ON): a
-/// definitively-absent codex resume id at the WS door is gated (fresh spawn
-/// + notice) BEFORE managed-launch planning — the stale id never reaches the
-/// plan, so it can never burn a sidecar planning slot. The fresh spawn still
-/// goes managed (`--remote` argv) with NO resume tokens.
+/// Case 7 (post-ejh6) — the definitively-absent codex LEGACY carrier is
+/// rejected at the raw pre-parse guard (managed-launch default ON) with
+/// `INVALID_MESSAGE` + frozen text. Stronger than the old gate-before-plan
+/// pin: the carrier never reaches the gate OR managed-launch planning — no
+/// codex child ever spawns (the dispatcher's argv capture never appears).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
-async fn managed_default_stale_codex_id_is_gated_before_planning() {
+async fn managed_default_legacy_codex_carrier_is_rejected_before_any_planning() {
     // Managed leg: the flag stays UNSET (default ON). remove_var, not "1",
     // mirroring codex_managed_launch_e2e.rs's managed phases.
     std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
@@ -817,47 +814,37 @@ async fn managed_default_stale_codex_id_is_gated_before_planning() {
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
     // terminal.create with restore:true carrying the stale codex resume id —
     // the legacy resume-id carrier shape (case 6), minus its live-sidecar
-    // arrangement: here NOTHING is live, so the gate must fire.
+    // arrangement: post-ejh6 the raw guard rejects it at the door.
     send_json(
         &mut ws,
         &restore_create_with_legacy_resume_id("req-gate-7", "codex", stale_id),
     )
     .await;
 
-    // 1. Gate fired: terminal.created carries the operator notice naming the stale id.
-    let created = next_created_or_error(&mut ws, "req-gate-7").await;
+    // 1. Rejected at the door: INVALID_MESSAGE + frozen text.
+    let frame = next_created_or_error(&mut ws, "req-gate-7").await;
     assert_eq!(
-        created["type"], "terminal.created",
-        "the gate-fired create must SUCCEED as a fresh spawn, got {created}"
+        frame["type"], "error",
+        "the legacy carrier must be refused, never spawn: {frame}"
     );
-    let notice = notice_of(&created).expect("gate must set the stale-resume notice");
-    assert!(
-        notice.contains(stale_id),
-        "notice names the stale id: {notice}"
-    );
-
-    // 2. The FRESH spawn still went managed (default ON): the captured TUI
-    //    argv is the --remote form...
-    let argv = wait_for_captured_argv(&capture_path);
     assert_eq!(
-        argv[0], "--remote",
-        "fresh spawn must still plan managed launch"
+        frame["code"], "INVALID_MESSAGE",
+        "codex is no longer exempt from the legacy-field reject: {frame}"
+    );
+    assert_eq!(
+        frame["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen text: {frame}"
     );
 
-    // 3. ...and the stale resume NEVER reached managed planning: on a managed
-    //    RESUME the `resume <id>` pair rides last in argv (e2e Phase 3 pins
-    //    that). Absence of both tokens proves the plan was Start-intent for a
-    //    fresh session — the stale id never consumed a sidecar planning slot.
-    assert!(
-        !argv.iter().any(|a| a == "resume") && !argv.iter().any(|a| a.contains(stale_id)),
-        "stale id must not appear in managed argv: {argv:?}"
-    );
-
-    // Cleanup (mirror e2e): kill the terminal via the harness, then env.
     registry.kill_all();
     std::env::remove_var("CODEX_CMD");
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
     std::env::remove_var("CODEX_HOME");
+
+    // 2. Zero side effects: no codex child ever launched (the dispatcher
+    //    writes the capture synchronously at spawn).
+    assert_never_captured(&capture_path);
     let _ = std::fs::remove_file(&capture_path);
 }
 
@@ -925,17 +912,15 @@ async fn server_allocated_fresh_amplifier_id_is_never_gated() {
 
 // ── gate-vs-plan ORDER probe (case 7b) ──────────────────────────────────────
 
-/// [`StubProbe`] + a gate-before-plan ORDER latch: on the FIRST `exists`
-/// consult for the watched `(provider, session_id)`, records whether
+/// [`StubProbe`] + a gate-consult latch (post-ejh6 polarity): on the FIRST
+/// `exists` consult for the watched `(provider, session_id)`, records whether
 /// managed-launch planning had ALREADY spawned the codex app-server sidecar
 /// (the fixture's `FAKE_CODEX_APP_SERVER_ARG_LOG` file exists on disk).
 ///
-/// Determinism: the fixture writes the arg-log SYNCHRONOUSLY at process
-/// startup, before it ever listens, and `plan_codex_managed_launch` awaits
-/// the sidecar listening — so by the time any plan completes the marker
-/// exists. Both orderings under test are sequential awaits on the same task
-/// (plan-then-gate pre-fix, gate-then-plan post-fix), so the latch value is
-/// not load-sensitive.
+/// Post-ejh6 the legacy carrier is rejected at the raw pre-parse guard, so
+/// the assertion is the latch's ABSENCE: `None` after the exchange proves
+/// the disk-existence gate was never consulted for the legacy carrier at
+/// all — stronger than the old gate-before-plan ordering pin.
 struct GateOrderProbe {
     provider: String,
     session_id: String,
@@ -960,17 +945,16 @@ impl SessionExistenceProbe for GateOrderProbe {
     }
 }
 
-/// Case 7b — the ORDER behind case 7's pin, made directly observable: the
-/// disk-existence gate must consult the probe for a stale WIRE codex resume
-/// id BEFORE managed-launch planning spawns any app-server sidecar
-/// (gate-before-plan). Post-#589, restore-class codex planning runs
-/// OFF-permit in `prepare_launch`; without an off-permit gate the stale id
-/// undergoes sidecar planning FIRST and the gate only fires afterwards.
-/// Case 7 is blind to that ordering (the stale-planned sidecar is silently
-/// adopted and the TUI argv derives from post-gate state) — this pin is not.
+/// Case 7b — the ZERO-consult invariant behind case 7, made directly
+/// observable: a stale codex legacy carrier must be rejected at the door
+/// with the probe NEVER consulted (`latch == None`) and NO app-server
+/// sidecar ever planned (the fixture's arg-log file never appears).
+/// Post-ejh6 the raw pre-parse guard supersedes the gate-before-plan
+/// ordering this test used to pin: the legacy carrier cannot reach either
+/// stage.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
-async fn managed_default_stale_codex_id_probe_consulted_before_any_planning() {
+async fn managed_default_legacy_codex_carrier_never_consults_gate_or_plans() {
     // Managed leg: the flag stays UNSET (default ON), mirroring case 7.
     std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
@@ -1016,34 +1000,26 @@ async fn managed_default_stale_codex_id_probe_consulted_before_any_planning() {
     )
     .await;
 
-    // Preconditions (case 7's own pins): the gate fired as a fresh spawn with
-    // the operator notice…
-    let created = next_created_or_error(&mut ws, "req-gate-7b").await;
+    // Rejected at the door: INVALID_MESSAGE + frozen text.
+    let frame = next_created_or_error(&mut ws, "req-gate-7b").await;
     assert_eq!(
-        created["type"], "terminal.created",
-        "the gate-fired create must SUCCEED as a fresh spawn, got {created}"
+        frame["type"], "error",
+        "the legacy carrier must be refused, never spawn: {frame}"
     );
-    let notice = notice_of(&created).expect("gate must set the stale-resume notice");
-    assert!(
-        notice.contains(stale_id),
-        "notice names the stale id: {notice}"
-    );
-
-    // …and the fresh spawn still went managed — planning DID run (this guards
-    // the ordering latch against a vacuous pass where nothing was planned).
-    let argv = wait_for_captured_argv(&capture_path);
     assert_eq!(
-        argv[0], "--remote",
-        "fresh spawn must still plan managed launch"
+        frame["code"], "INVALID_MESSAGE",
+        "codex is no longer exempt from the legacy-field reject: {frame}"
     );
-    assert!(
-        planning_marker.exists(),
-        "the codex app-server sidecar must have spawned (planning happened)"
+    assert_eq!(
+        frame["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen text: {frame}"
     );
 
-    let planning_before_gate = *probe.planning_started_before_gate.lock().unwrap();
+    let gate_consulted = probe.planning_started_before_gate.lock().unwrap().is_some();
 
-    // Cleanup BEFORE the ordering assertion so a RED run still tears down.
+    // Cleanup BEFORE the zero-side-effect assertions so a RED run still
+    // tears down.
     registry.kill_all();
     std::env::remove_var("CODEX_CMD");
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
@@ -1052,18 +1028,14 @@ async fn managed_default_stale_codex_id_probe_consulted_before_any_planning() {
     let _ = std::fs::remove_file(&capture_path);
     let _ = std::fs::remove_file(&planning_marker);
 
-    // THE pin: gate-before-plan. `Some(true)` means the app-server sidecar
-    // was already up when the gate first consulted the probe for the stale
-    // id — i.e. the stale WIRE resume id underwent off-permit
-    // `plan_codex_managed_launch` BEFORE the disk-existence gate could drop
-    // it, and the create then silently inherited the stale-planned sidecar.
-    let planning_before_gate = planning_before_gate
-        .expect("the disk-existence gate must consult the probe for the stale codex id");
+    // THE pins: the gate NEVER consulted the probe for the legacy carrier,
+    // and neither the managed-planning sidecar (arg-log marker) nor a TUI
+    // child (argv capture) ever spawned.
     assert!(
-        !planning_before_gate,
-        "GATE-BEFORE-PLAN VIOLATED: managed-launch planning spawned a codex app-server \
-         sidecar BEFORE the disk-existence gate consulted the probe for stale id \
-         {stale_id} — the stale wire resume id underwent off-permit \
-         plan_codex_managed_launch ahead of the gate"
+        !gate_consulted,
+        "the disk-existence gate must NEVER consult the probe for a legacy carrier \
+         (the raw guard rejects it first) — probe latch was set for stale id {stale_id}"
     );
+    assert_never_captured(&planning_marker);
+    assert_never_captured(&capture_path);
 }

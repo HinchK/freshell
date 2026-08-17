@@ -782,6 +782,7 @@ export class WsHandler {
       }),
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
+      /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
       resumeSessionId: z.string().optional(),
       sessionRef: SessionLocatorSchema.optional(),
       codexDurability: CodexDurabilityRefSchema.optional(),
@@ -806,7 +807,10 @@ export class WsHandler {
       provider: dynamicProviderSchema,
       prompt: z.string().min(1),
       cwd: z.string().optional(),
+      /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
       resumeSessionId: z.string().optional(),
+      /** Canonical identity carrier (kata ejh6). */
+      sessionRef: SessionLocatorSchema.optional(),
       model: z.string().optional(),
       maxTurns: z.number().int().positive().optional(),
       permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
@@ -1911,6 +1915,62 @@ export class WsHandler {
         return
       }
 
+      // ejh6 (R3) raw pre-parse presence guard: ANY create-class message
+      // carrying a top-level resumeSessionId — string, empty, null, number,
+      // object — is rejected HERE, before zod parse, so the frozen text and
+      // per-family envelope survive every value type (zod would reject
+      // non-strings generically; a typed field reads strings only). The
+      // wire schemas keep the field declared (retention, comments in this
+      // task) — the guard, not the schema, owns the contract.
+      if (typeof msg === 'object' && msg !== null && 'resumeSessionId' in msg) {
+        const rawMsg = msg as Record<string, unknown>
+        switch (rawMsg.type) {
+          case 'terminal.create': {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : undefined,
+            })
+            return
+          }
+          // Task 10: freshAgent families. Create rides the provider's
+          // create-failed envelope (requestId from the raw frame); attach has
+          // NO requestId — its rejection rides the attach error frame shape
+          // (sendError) with the FRESH_AGENT_CREATE_FAILED family code (kata
+          // §1c names the code family; binding correction D/ruling A
+          // documents the socket-loud/UI-invisible asymmetry).
+          case 'freshAgent.create': {
+            this.send(ws, {
+              type: 'freshAgent.create.failed',
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : '',
+              code: 'FRESH_AGENT_CREATE_FAILED',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              retryable: false,
+            })
+            return
+          }
+          case 'freshAgent.attach': {
+            this.sendError(ws, {
+              code: 'FRESH_AGENT_CREATE_FAILED',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+            })
+            return
+          }
+          // Task 11: codingcli.create → INVALID_MESSAGE + frozen text. The
+          // reject is config-independent (coordinator ruling J) — it fires here
+          // at the raw layer, before the manager-missing INTERNAL_ERROR branch
+          // exists, so {no manager} + {resumeSessionId} answers INVALID_MESSAGE.
+          case 'codingcli.create': {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : undefined,
+            })
+            return
+          }
+        }
+      }
+
       const parsed = this.clientMessageSchema.safeParse(msg)
       if (!parsed.success) {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: parsed.error.message, requestId: msg?.requestId })
@@ -2131,6 +2191,8 @@ export class WsHandler {
         if (codexRestorePlan?.kind === 'durable_session_ref_resume') {
           effectiveResumeSessionId = codexRestorePlan.sessionId
         } else if (m.mode !== 'codex') {
+          // ejh6: the `m.resumeSessionId` fallback is dead for wire input —
+          // the raw pre-parse guard rejects any carry before this point.
           effectiveResumeSessionId = requestedSessionRef && requestedSessionRef.provider === m.mode
             ? requestedSessionRef.sessionId
             : m.resumeSessionId
@@ -2158,33 +2220,10 @@ export class WsHandler {
         } else if (effectiveResumeSessionId && m.mode === 'claude') {
           sessionBindingReason = 'resume'
         }
-        if (codexRestorePlan?.kind === 'reject_invalid_raw_codex_resume_request') {
-          error = true
-          this.sendError(ws, {
-            code: codexRestorePlan.code,
-            message: codexRestorePlan.message,
-            requestId: m.requestId,
-          })
-          endCreateTimer({ error, rateLimited })
-          return
-        }
-        if (
-          m.restore === true
-          && modeSupportsResume(m.mode as TerminalMode)
-          && !hasReusableRequestedLiveTerminal
-          && m.mode !== 'codex'
-          && m.resumeSessionId
-          && !requestedSessionRef
-        ) {
-          error = true
-          this.sendError(ws, {
-            code: 'INVALID_MESSAGE',
-            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-            requestId: m.requestId,
-          })
-          endCreateTimer({ error, rateLimited })
-          return
-        }
+        // ejh6: the scoped legacy-resumeSessionId gates formerly here
+        // (codex-planner reject + restore-scoped non-codex reject) are
+        // subsumed by the raw pre-parse presence guard in onMessage, which
+        // rejects ANY terminal.create carrying resumeSessionId before parse.
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
@@ -3293,6 +3332,13 @@ export class WsHandler {
           { connectionId: ws.connectionId, provider: m.provider },
           { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
         )
+        // ejh6: promote a provider-matched sessionRef into the spawn-time resume
+        // id (provider must equal m.provider, mirroring terminal.create's
+        // sessionRef match). The raw pre-parse guard above rejects any
+        // resumeSessionId carry, so sessionRef is the only wired carrier here.
+        const codingResumeSessionId = m.sessionRef && m.sessionRef.provider === m.provider
+          ? m.sessionRef.sessionId
+          : undefined
         let sessionId: string | undefined
         let error = false
         try {
@@ -3319,7 +3365,7 @@ export class WsHandler {
           const session = this.codingCliManager.create(m.provider, {
             prompt: m.prompt,
             cwd: m.cwd,
-            resumeSessionId: m.resumeSessionId,
+            resumeSessionId: codingResumeSessionId,
             model: m.model ?? providerDefaults.model,
             maxTurns: m.maxTurns ?? providerDefaults.maxTurns,
             permissionMode: m.permissionMode ?? providerDefaults.permissionMode,

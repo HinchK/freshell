@@ -245,6 +245,51 @@ async fn split_browser_pane_registers_cheap_content_no_terminal() {
     assert_eq!(body["message"], json!("pane split (non-terminal)"));
 }
 
+/// kata ejh6: `POST /api/panes/:id/split` REFUSES a body carrying the legacy
+/// `resumeSessionId` field at the door-top — 400 with the frozen text,
+/// presence-based for EVERY JSON value type, and (finding 3) the layout must
+/// NOT mutate on the rejected split.
+#[tokio::test]
+async fn legacy_reject_split() {
+    let state = state_with_registry();
+    let router = app(state);
+    let (_tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+    for (label, val) in [
+        ("string", json!("legacy-split")),
+        ("empty-string", json!("")),
+        ("null", json!(null)),
+        ("number", json!(42)),
+    ] {
+        let (s1, before) = get(router.clone(), "/api/tabs", true).await;
+        assert_eq!(s1, StatusCode::OK);
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/split"),
+            json!({"direction": "horizontal", "mode": "claude", "resumeSessionId": val}),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} split legacy reject: {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: {body}"
+        );
+        let (s2, after) = get(router.clone(), "/api/tabs", true).await;
+        assert_eq!(s2, StatusCode::OK);
+        // Finding 3: layout MUST be unchanged — the door-top check fires
+        // BEFORE layout.split_pane.
+        assert_eq!(
+            before["data"]["tabs"], after["data"]["tabs"],
+            "{label}: layout must not mutate on a rejected split"
+        );
+    }
+}
+
 // ── close ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -653,6 +698,40 @@ async fn respawn_pane_replaces_terminal_in_place_and_broadcasts_pane_attach() {
 
     registry.kill(&old_terminal_id);
     registry.kill(&new_terminal_id);
+}
+
+/// kata ejh6: `POST /api/panes/:id/respawn` REFUSES a body carrying the
+/// legacy `resumeSessionId` field at the door-top — 400 with the frozen
+/// text, presence-based for EVERY JSON value type, BEFORE any spawn.
+#[tokio::test]
+async fn legacy_reject_respawn() {
+    let state = state_with_registry();
+    let router = app(state);
+    let (_tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+    for (label, val) in [
+        ("string", json!("legacy-respawn")),
+        ("empty-string", json!("")),
+        ("null", json!(null)),
+        ("number", json!(42)),
+    ] {
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({"mode": "claude", "resumeSessionId": val}),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} respawn legacy reject: {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: {body}"
+        );
+    }
 }
 
 // ── attach (honest deferral) ─────────────────────────────────────────

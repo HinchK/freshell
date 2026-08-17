@@ -231,6 +231,7 @@ pub struct TerminalCreate {
     /// The spawn-time resume session id (`ws-handler.ts:656-658` — distinct from
     /// `sessionRef`; spec `cli-argv-fidelity.md` §3.3/U7: only the spawn-time id
     /// is modeled here, the binding/repair pipeline stays with coding-cli.md).
+    /// Retained solely so the handler can detect-and-reject; see kata ejh6.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,7 +407,13 @@ pub struct ReconcilePane {
     /// Optional identity claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
-    /// Optional legacy single-key claim.
+    /// Optional legacy single-key claim. PERMANENT compat door (kata ejh6):
+    /// `pane.reconcile` is the SOLE ingress where a legacy
+    /// `resumeSessionId` remains honored — old persisted pane content can
+    /// carry a legacy-only claim indefinitely, so the server-side promotion
+    /// in `crates/freshell-ws/src/reconcile.rs` (`promoted_legacy_claim`)
+    /// stays forever with NO later-removal plan. Every create-class door
+    /// rejects this field outright; this one alone promotes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
     /// Informational only — never trusted.
@@ -441,8 +448,17 @@ pub struct CodingCliCreate {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// Retained solely so the handler can detect-and-reject; see kata ejh6.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    /// Canonical identity carrier (kata ejh6). Parity with the TS
+    /// `CodingCliCreateSchema.sessionRef`. The spec
+    /// (`port/machine/specs/cli-argv-fidelity.md` section 3.3/U7) governs
+    /// `TerminalCreate.resume_session_id` (the spawn-time id) and is silent
+    /// on `CodingCliCreate`; adding the canonical carrier here preserves the
+    /// shared-contract invariant without violating the spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
 }
@@ -507,6 +523,7 @@ pub struct FreshAgentCreate {
     pub plugins: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<AgentProvider>,
+    /// Retained solely so the handler can detect-and-reject; see kata ejh6.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -523,6 +540,7 @@ pub struct FreshAgentAttach {
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Retained solely so the handler can detect-and-reject; see kata ejh6.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

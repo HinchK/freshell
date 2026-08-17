@@ -129,7 +129,11 @@ it('kills the created Codex terminal when split adoption fails after registry.cr
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('rejects raw Codex resume ids before splitting a pane', async () => {
+// ejh6: uniform any-carry, presence-based rejection on all modes (incl. "", null, 42).
+it.each(
+  ['claude', 'codex', 'opencode', 'amplifier'].flatMap((mode) =>
+    (['legacy-x', '', null, 42] as const).map((value) => [mode, value] as const)),
+)('rejects legacy resumeSessionId presence (mode %s, value %j) before splitting a pane', async (mode, resumeSessionId) => {
   const app = express()
   app.use(express.json())
   const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
@@ -144,10 +148,11 @@ it('rejects raw Codex resume ids before splitting a pane', async () => {
 
   const res = await request(app).post('/api/panes/pane_1/split').send({
     direction: 'horizontal',
-    mode: 'codex',
-    resumeSessionId: 'thread-raw-split',
+    mode,
+    resumeSessionId,
   })
 
+  // Layout unchanged: rejection happens at the door-top, before any split.
   expect(res.status).toBe(400)
   expect(res.body).toEqual({
     status: 'error',
@@ -309,7 +314,12 @@ it('kills the created Codex terminal when respawn adoption fails after registry.
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('rejects raw Codex resume ids before respawning a pane', async () => {
+// ejh6: uniform any-carry, presence-based rejection on all modes (incl. "", null, 42).
+// Finding 7: the door-top guard returns BEFORE target resolution.
+it.each(
+  ['claude', 'codex', 'opencode', 'amplifier'].flatMap((mode) =>
+    (['legacy-x', '', null, 42] as const).map((value) => [mode, value] as const)),
+)('rejects legacy resumeSessionId presence (mode %s, value %j) before respawning a pane', async (mode, resumeSessionId) => {
   const app = express()
   app.use(express.json())
   const attachPaneContent = vi.fn()
@@ -326,8 +336,8 @@ it('rejects raw Codex resume ids before respawning a pane', async () => {
   }))
 
   const res = await request(app).post('/api/panes/pane_1/respawn').send({
-    mode: 'codex',
-    resumeSessionId: 'thread-raw-respawn',
+    mode,
+    resumeSessionId,
   })
 
   expect(res.status).toBe(400)
@@ -336,7 +346,8 @@ it('rejects raw Codex resume ids before respawning a pane', async () => {
     message: INVALID_RAW_CODEX_RESUME_MESSAGE,
   })
   expect(codexLaunchPlanner.planCreateCalls).toEqual([])
-  expect(resolveTarget).toHaveBeenCalledWith('pane_1')
+  // Finding 7: door-top rejection returns BEFORE target resolution.
+  expect(resolveTarget).not.toHaveBeenCalled()
   expect(registryCreate).not.toHaveBeenCalled()
   expect(attachPaneContent).not.toHaveBeenCalled()
 })

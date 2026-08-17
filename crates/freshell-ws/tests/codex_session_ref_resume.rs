@@ -21,8 +21,9 @@
 //!      `resume <id>` (FAILED before the fix -- the incident).
 //!   2. `sessionRef` with a NON-matching provider -> NO resume (the
 //!      provider==mode gate is preserved).
-//!   3. Raw `resumeSessionId` (no sessionRef) -> still resumes (the legacy
-//!      WS-path fallback is preserved).
+//!   3. Raw `resumeSessionId` (no sessionRef) -> REJECTED at the door with
+//!      `INVALID_MESSAGE` + the frozen refusal text (kata ejh6 removed the
+//!      codex exemption — `sessionRef` is the only restore carrier).
 //!
 //! The fake codex is a plain `sh` script (no node dependency), so this runs in
 //! the normal suite. Loopback ephemeral ports only -- never 3001/3002.
@@ -243,6 +244,64 @@ async fn create_codex_terminal(
     }
 }
 
+/// Send a `terminal.create` (extra fields merged in) and return the `error`
+/// frame correlated to `request_id` (panicking on a `terminal.created` — a
+/// spawn IS the failure this helper's callers forbid).
+async fn expect_create_error(
+    ws: &mut TestWs,
+    request_id: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut msg = json!({
+        "type": "terminal.create",
+        "requestId": request_id,
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    if let (Some(base), Some(extra)) = (msg.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    ws.send(WsMessage::Text(msg.to_string()))
+        .await
+        .expect("send terminal.create");
+    for _ in 0..20u8 {
+        let frame = tokio::time::timeout(RECV_TIMEOUT, ws.next())
+            .await
+            .expect("error within timeout")
+            .expect("stream open")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = frame {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            match value["type"].as_str() {
+                Some("terminal.created") if value["requestId"] == json!(request_id) => {
+                    panic!("create must be refused at the door, got {value}")
+                }
+                Some("error") if value["requestId"] == json!(request_id) => return value,
+                _ => {}
+            }
+        }
+    }
+    panic!("no error frame for {request_id} within 20 messages");
+}
+
+/// Bounded NEGATIVE argv-capture check: the fake codex writes the capture
+/// file synchronously at child spawn, so its absence after a short window
+/// proves no child ever launched (a door rejection has zero side effects).
+fn assert_never_captured(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        assert!(
+            !path.exists(),
+            "a create rejected at the door must never spawn a child: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Poll the capture file the fake writes until it appears, then return the argv
 /// tokens (one per line).
 fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
@@ -360,32 +419,31 @@ async fn codex_create_derives_resume_from_session_ref() {
     );
     registry.kill(&terminal_id);
 
-    // ── Phase 3: the raw `resumeSessionId` fallback still works (legacy
-    // ── accepts it on the WS path).
+    // ── Phase 3 (ejh6): the raw `resumeSessionId` fallback is REJECTED at
+    // ── the door (the codex exemption is removed; uniform any-carry reject)
+    // ── and nothing spawns.
     let raw_id = "raw-resume-codex-1";
     let capture = capture_for("raw-resume");
     let _ = std::fs::remove_file(&capture);
     std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
 
-    let created = create_codex_terminal(
+    let err = expect_create_error(
         &mut ws,
         "req-raw-resume",
         json!({ "resumeSessionId": raw_id }),
     )
     .await;
-    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
 
     assert_eq!(
-        registry_resume_id(&registry, &terminal_id).as_deref(),
-        Some(raw_id),
-        "the raw resumeSessionId fallback must be preserved"
+        err["code"], "INVALID_MESSAGE",
+        "codex raw-legacy is no longer accepted: {err}"
     );
-    let argv = wait_for_captured_argv(&capture);
-    assert!(
-        resume_pair_position(&argv, raw_id).is_some(),
-        "spawned codex argv must contain `resume {raw_id}`: {argv:?}"
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen text: {err}"
     );
-    registry.kill(&terminal_id);
+    assert_never_captured(&capture);
 
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
     std::env::remove_var("CODEX_CMD");

@@ -1806,15 +1806,19 @@ fn request_id_string(request_id: &freshell_protocol::StringOrNumber) -> String {
 /// `codex.rs`/`opencode_ws.rs` (both document the duplication) -- but unlike those two this
 /// one cannot hardcode the session type: provider `claude` covers BOTH `freshclaude` and
 /// `kilroy`, so the envelope's sessionType comes from the attach message.
-/// The durable claude id an attach carries: `resumeSessionId` first, then
-/// `sessionRef.sessionId` -- both written by the FROZEN client
-/// (`FreshAgentView.tsx:303-313`). Only canonical UUIDs qualify
-/// (`shared/session-contract.ts:34`) -- a nanoid here would just miss the store.
+/// The durable claude id an attach carries: `sessionRef.sessionId` first,
+/// then the legacy `resumeSessionId` fallback — flipped from legacy-first
+/// (kata ejh6 section 4b hygiene). After the wire-level reject on
+/// `freshAgent.attach`, the legacy field is dead for external input; the
+/// fallback remains only for internal/test constructions. Only canonical
+/// UUIDs qualify (`shared/session-contract.ts:34`) — a nanoid here would
+/// just miss the store.
 fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
     let candidate = msg
-        .resume_session_id
-        .clone()
-        .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))?;
+        .session_ref
+        .as_ref()
+        .map(|r| r.session_id.clone())
+        .or_else(|| msg.resume_session_id.clone())?;
     is_canonical_claude_uuid(&candidate).then_some(candidate)
 }
 

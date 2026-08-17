@@ -34,6 +34,7 @@ export const ErrorCode = z.enum([
   'PROTOCOL_MISMATCH',
   'SESSION_RESERVED',
   'FRESH_AGENT_LOST_SESSION',
+  'FRESH_AGENT_CREATE_FAILED',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -322,6 +323,8 @@ export const TerminalCreateSchema = z.object({
   mode: z.string().default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
+  /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
+  resumeSessionId: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
   codexDurability: CodexDurabilityRefSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
@@ -450,7 +453,10 @@ export const CodingCliCreateSchema = z.object({
   provider: CodingCliProviderSchema,
   prompt: z.string().min(1),
   cwd: z.string().optional(),
+  /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
   resumeSessionId: z.string().optional(),
+  /** Canonical identity carrier (kata ejh6). */
+  sessionRef: SessionLocatorSchema.optional(),
   model: z.string().optional(),
   maxTurns: z.number().int().positive().optional(),
   permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
@@ -479,6 +485,7 @@ export const FreshAgentCreateSchema = z.object({
     createdAt: z.number().finite().optional(),
     updatedAt: z.number().finite().optional(),
   }).optional(),
+  /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),
@@ -494,6 +501,7 @@ export const FreshAgentAttachSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
@@ -608,7 +616,8 @@ export const ReconcilePaneSchema = z.object({
   serverInstanceId: z.string().min(1).optional(),
   /** Optional identity claim. */
   sessionRef: ReconcileSessionRefSchema.optional(),
-  /** Optional legacy single-key claim. */
+  /** PERMANENT legacy-compat door: the server promotes this into a sessionRef
+   *  forever (kata ejh6 section 2). Do NOT plan a later removal. */
   resumeSessionId: z.string().optional(),
   /** Informational only — never trusted. */
   status: z.string().optional(),

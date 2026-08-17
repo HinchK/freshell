@@ -367,8 +367,11 @@ async fn await_frame(
 // ── the red tests ────────────────────────────────────────────────────────────────────
 
 /// Direction 1 (V7 scenario B): a live terminal PTY owns `(claude, S)`; a
-/// `freshAgent.create { resumeSessionId: S }` must be refused with
-/// `SESSION_RESERVED { retryable: true }` and spawn ZERO sidecars.
+/// `freshAgent.create { resumeSessionId: S }` must be refused and spawn ZERO
+/// sidecars. Post-ejh6 (Task 7) the refusal fires at the raw-Value ejh6 guard
+/// (the create carries the legacy field) BEFORE the typed dispatch reaches the
+/// SESSION_RESERVED cross-kind guard, so the code is
+/// `FRESH_AGENT_CREATE_FAILED` + frozen text.
 #[tokio::test]
 async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
@@ -422,10 +425,14 @@ async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
         failed["type"], "freshAgent.create.failed",
         "a live terminal PTY owns {session_id}: the fresh-agent resume must be refused, got {failed}"
     );
-    assert_eq!(failed["code"], "SESSION_RESERVED");
+    // ejh6: the legacy field is rejected at the door BEFORE the SESSION_RESERVED
+    // cross-kind guard fires (the raw-Value ejh6 guard's freshAgent.create arm
+    // runs first). The code is FRESH_AGENT_CREATE_FAILED + frozen text, not
+    // SESSION_RESERVED.
+    assert_eq!(failed["code"], "FRESH_AGENT_CREATE_FAILED");
     assert_eq!(
-        failed["retryable"], true,
-        "retryable -- the terminal may be closing"
+        failed["message"],
+        "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."
     );
 
     // 3. ZERO sidecar spawns.
@@ -449,6 +456,8 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
     let mut ws = connect(&url).await;
 
     // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
+    //    (ejh6 Task 7: sessionRef-only -- a legacy `resumeSessionId` carry is now
+    //    rejected at the raw-Value guard, which would break this setup create.)
     send_json(
         &mut ws,
         &json!({
@@ -457,7 +466,6 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
             "sessionType": "freshclaude",
             "provider": "claude",
             "cwd": "/tmp",
-            "resumeSessionId": durable,
             "sessionRef": { "provider": "claude", "sessionId": durable },
         }),
     )

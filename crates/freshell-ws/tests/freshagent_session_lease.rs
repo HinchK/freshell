@@ -992,3 +992,55 @@ async fn opencode_attach_resume_is_serialized_without_touching_the_shared_sideca
         "the loser must never issue a second in-flight resume"
     );
 }
+
+/// ejh6: a `freshAgent.create` carrying `resumeSessionId` is rejected with
+/// `freshAgent.create.failed{code:"FRESH_AGENT_CREATE_FAILED"}` + frozen text.
+/// No sidecar spawn. Create has a requestId, so the rejection uses the
+/// create-failed envelope.
+#[tokio::test]
+async fn legacy_reject_freshagent_create() {
+    let _guard = LEASE_ENV_LOCK.lock().await;
+    let env = FakeLeaseSidecarEnv::install();
+    let url = spawn_server().await;
+    let mut ws = connect(&url, true).await;
+
+    // ejh6 presence (finding 9): rejection fires for any string, including "".
+    for (label, legacy, req_id) in [
+        ("string", "legacy-durable-id", "req-fa-legacy-create"),
+        ("empty-string", "", "req-fa-legacy-create-empty"),
+    ] {
+        send_json(
+            &mut ws,
+            &serde_json::json!({
+                "type": "freshAgent.create",
+                "requestId": req_id,
+                "sessionType": "freshclaude",
+                "provider": "claude",
+                "cwd": "/tmp",
+                "resumeSessionId": legacy,
+            }),
+        )
+        .await;
+
+        let failed = await_frame(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "freshAgent.create.failed" && v["requestId"].as_str() == Some(req_id)
+        })
+        .await;
+        assert_eq!(
+            failed["code"],
+            serde_json::json!("FRESH_AGENT_CREATE_FAILED"),
+            "{label}: create-failed family code: {failed}"
+        );
+        assert_eq!(
+            failed["message"],
+            serde_json::json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: frozen text: {failed}"
+        );
+        assert_eq!(failed["retryable"], serde_json::json!(false));
+    }
+    assert!(
+        env.create_rows().is_empty(),
+        "no sidecar may spawn for a rejected legacy create: {:?}",
+        env.create_rows()
+    );
+}

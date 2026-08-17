@@ -1441,4 +1441,82 @@ describe('WsHandler fresh-agent routing', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('rejects freshAgent.create carrying resumeSessionId with freshAgent.create.failed', async () => {
+    const runtimeManager = {
+      create: vi.fn(),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      for (const [index, legacy] of ['legacy-durable-id', ''].entries()) {
+        const requestId = `req-fa-legacy-create-${index}`
+        ws.send(JSON.stringify({
+          type: 'freshAgent.create', requestId,
+          sessionType: 'freshclaude', provider: 'claude', cwd: '/tmp',
+          resumeSessionId: legacy,
+        }))
+        await vi.waitFor(() => {
+          expect(seenMessages.some((m) => m.type === 'freshAgent.create.failed' && m.requestId === requestId)).toBe(true)
+        }, { timeout: 5000 })
+        const failed = seenMessages.find((m) => m.type === 'freshAgent.create.failed' && m.requestId === requestId)
+        expect(failed).toMatchObject({
+          type: 'freshAgent.create.failed', requestId,
+          code: 'FRESH_AGENT_CREATE_FAILED',
+          message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+          retryable: false,
+        })
+      }
+      expect(runtimeManager.create).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('rejects freshAgent.attach carrying resumeSessionId with error{FRESH_AGENT_CREATE_FAILED}', async () => {
+    const runtimeManager = {
+      attach: vi.fn(),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      for (const [index, legacy] of ['legacy-durable-id', ''].entries()) {
+        ws.send(JSON.stringify({
+          type: 'freshAgent.attach',
+          sessionId: `cli-session-legacy-attach-${index}`,
+          sessionType: 'freshclaude', provider: 'claude',
+          resumeSessionId: legacy,
+        }))
+      }
+      await vi.waitFor(() => {
+        expect(seenMessages.filter((m) => m.type === 'error' && m.code === 'FRESH_AGENT_CREATE_FAILED')).toHaveLength(2)
+      }, { timeout: 5000 })
+      const errors = seenMessages.filter((m) => m.type === 'error' && m.code === 'FRESH_AGENT_CREATE_FAILED')
+      for (const error of errors) {
+        expect(error).toMatchObject({
+          type: 'error', code: 'FRESH_AGENT_CREATE_FAILED',
+          message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        })
+      }
+      expect(runtimeManager.attach).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

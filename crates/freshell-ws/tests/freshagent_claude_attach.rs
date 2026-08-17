@@ -589,3 +589,57 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
         "post-rebind envelopes must be stamped with the durable id"
     );
 }
+
+/// ejh6: a `freshAgent.attach` carrying `resumeSessionId` is rejected with
+/// `freshAgent.error{code:"FRESH_AGENT_CREATE_FAILED"}` + frozen text. No
+/// sidecar spawn, no manager.attach call. Attach has no requestId, so the
+/// rejection rides the freshAgent.error event channel keyed by sessionId.
+#[tokio::test]
+async fn legacy_reject_freshagent_attach() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeClaudeResumeEnv::install("legacy-durable-id");
+    let url = spawn_server().await;
+    let mut ws = connect_and_complete_handshake(&url).await;
+
+    // ejh6 presence (finding 9): rejection fires for any string, including "".
+    for (label, legacy) in [("string", "legacy-durable-id"), ("empty-string", "")] {
+        send_json(
+            &mut ws,
+            &serde_json::json!({
+                "type": "freshAgent.attach",
+                "sessionId": "cli-session-legacy-attach",
+                "sessionType": "freshclaude",
+                "provider": "claude",
+                "resumeSessionId": legacy,
+            }),
+        )
+        .await;
+
+        let err = await_frame(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.error"
+                && v["sessionId"] == "cli-session-legacy-attach"
+        })
+        .await;
+        assert_eq!(
+            err["event"]["code"],
+            serde_json::json!("FRESH_AGENT_CREATE_FAILED"),
+            "{label}: attach legacy reject must use the create-failed family code: {err}"
+        );
+        assert_eq!(
+            err["event"]["message"],
+            serde_json::json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: frozen text: {err}"
+        );
+    }
+    // V3: this file has NO create_rows(); use request_log_rows() and filter for create rows.
+    let create_count = env
+        .request_log_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["type"] == "create")
+        .count();
+    assert_eq!(
+        create_count, 0,
+        "no sidecar may spawn for a rejected legacy attach"
+    );
+}

@@ -448,6 +448,66 @@ describe('tab endpoints', () => {
     expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
   })
 
+  it.each(['claude', 'opencode', 'amplifier'])('rejects legacy resumeSessionId on mode %s with 400', async (mode) => {
+    const app = express()
+    app.use(express.json())
+    const registry = { create: vi.fn(), killAndWait: vi.fn(async () => true) }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}), renameTab: () => ({}), closeTab: () => ({}), hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }), selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+    const res = await request(app).post('/api/tabs').send({ mode, name: `legacy ${mode}`, resumeSessionId: `legacy-${mode}-id` })
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ status: 'error', message: INVALID_RAW_CODEX_RESUME_MESSAGE })
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(layoutStore.createTab).not.toHaveBeenCalled()
+  })
+
+  it('rejects legacy resumeSessionId even with a companion sessionRef', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = { create: vi.fn(), killAndWait: vi.fn(async () => true) }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = { createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })), attachPaneContent: vi.fn(), selectTab: () => ({}), renameTab: () => ({}), closeTab: () => ({}), hasTab: () => true, selectNextTab: () => ({ tabId: 'tab_1' }), selectPrevTab: () => ({ tabId: 'tab_1' }) }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+    const res = await request(app).post('/api/tabs').send({ mode: 'claude', resumeSessionId: 'legacy', sessionRef: { provider: 'claude', sessionId: 'canonical' } })
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ status: 'error', message: INVALID_RAW_CODEX_RESUME_MESSAGE })
+  })
+
+  // ejh6 finding 2: presence-based — "", null, 42 are all rejected.
+  it.each([
+    ['empty-string', ''],
+    ['null', null],
+    ['number', 42],
+  ])('rejects resumeSessionId presence (%s)', async (_label, val) => {
+    const app = express()
+    app.use(express.json())
+    const layoutStore = { createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })), attachPaneContent: vi.fn(), selectTab: () => ({}), renameTab: () => ({}), closeTab: () => ({}), hasTab: () => true, selectNextTab: () => ({ tabId: 'tab_1' }), selectPrevTab: () => ({ tabId: 'tab_1' }) }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry: { create: vi.fn() }, codexLaunchPlanner: new FakeCodexLaunchPlanner() }))
+    const res = await request(app).post('/api/tabs').send({ mode: 'claude', resumeSessionId: val })
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ status: 'error', message: INVALID_RAW_CODEX_RESUME_MESSAGE })
+  })
+
+  // ejh6 finding 3: browser/editor branches also 400.
+  it.each([
+    ['browser', { browser: 'https://example.com' }],
+    ['editor', { editor: '/tmp/file.ts' }],
+  ])('rejects resumeSessionId on %s branch', async (_label, extra) => {
+    const app = express()
+    app.use(express.json())
+    const layoutStore = { createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })), attachPaneContent: vi.fn(), selectTab: () => ({}), renameTab: () => ({}), closeTab: () => ({}), hasTab: () => true, selectNextTab: () => ({ tabId: 'tab_1' }), selectPrevTab: () => ({ tabId: 'tab_1' }) }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry: { create: vi.fn() }, codexLaunchPlanner: new FakeCodexLaunchPlanner() }))
+    const res = await request(app).post('/api/tabs').send({ resumeSessionId: 'legacy', ...extra })
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ status: 'error', message: INVALID_RAW_CODEX_RESUME_MESSAGE })
+  })
+
   it('uses canonical Codex sessionRef as the durable resume path', async () => {
     const app = express()
     app.use(express.json())

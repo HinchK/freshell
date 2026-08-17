@@ -659,6 +659,99 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
+  it.each([
+    ['claude', true], ['claude', false], ['claude', undefined],
+    ['opencode', true], ['opencode', false], ['amplifier', true],
+  ] as const)('rejects legacy resumeSessionId on mode %s restore=%s', async (mode, restore) => {
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+    try {
+      await waitForOpen(ws)
+      await waitForReady(ws)
+      const requestId = `legacy-reject-${mode}-${restore}`
+      const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create', requestId, mode,
+        ...(restore === undefined ? {} : { restore }),
+        resumeSessionId: `legacy-${mode}-id`,
+      }))
+      const error = await errorPromise
+      expect(error).toMatchObject({
+        type: 'error', code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        requestId,
+      })
+      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  // ejh6 finding 2: presence-based — "" is rejected.
+  it('rejects resumeSessionId empty string on terminal.create', async () => {
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+    try {
+      await waitForOpen(ws)
+      await waitForReady(ws)
+      const requestId = 'legacy-reject-empty'
+      const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'claude', shell: 'system', resumeSessionId: '' }))
+      const error = await errorPromise
+      expect(error).toMatchObject({ type: 'error', code: 'INVALID_MESSAGE', requestId })
+      expect(error.message).toContain('sessionRef')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  // ejh6 finding 5: a message carrying BOTH recoveryIntent and resumeSessionId
+  // gets INVALID_MESSAGE with frozen text (the mandatory error wins over
+  // INVALID_CREATE_REQUEST's "Fresh recovery requests cannot include restore identity").
+  it('rejects resumeSessionId even when recoveryIntent is also present', async () => {
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+    try {
+      await waitForOpen(ws)
+      await waitForReady(ws)
+      const requestId = 'legacy-reject-dual-intent'
+      const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create', requestId, mode: 'claude', shell: 'system',
+        recoveryIntent: 'fresh_after_restore_unavailable', resumeSessionId: 'legacy',
+      }))
+      const error = await errorPromise
+      expect(error).toMatchObject({ type: 'error', code: 'INVALID_MESSAGE', requestId })
+      expect(error.message).toBe('Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  // ejh6 review round 3 finding 1: the raw pre-parse guard intercepts ANY
+  // JSON value with key-presence BEFORE zod ever runs — non-string carries
+  // get the SAME INVALID_MESSAGE + frozen-text envelope as strings on Node
+  // (no generic-text residual). Every value pinned with frozen text.
+  it.each([['null', null], ['number', 42], ['object', { nested: true }]])(
+    'rejects non-string resumeSessionId (%s) with INVALID_MESSAGE + frozen text (raw guard)', async (_label, val) => {
+      const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+      try {
+        await waitForOpen(ws)
+        await waitForReady(ws)
+        const requestId = `legacy-reject-nonstr-${_label}`
+        const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+        ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'claude', shell: 'system', resumeSessionId: val }))
+        const error = await errorPromise
+        expect(error).toMatchObject({
+          type: 'error', code: 'INVALID_MESSAGE',
+          message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+          requestId,
+        })
+        expect(registry.createCalls).toHaveLength(0)
+      } finally {
+        await closeWebSocket(ws)
+      }
+    },
+  )
+
   it('existingId branch returns created only and requires explicit attach', async () => {
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {

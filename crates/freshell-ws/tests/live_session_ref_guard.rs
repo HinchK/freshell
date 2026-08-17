@@ -14,7 +14,10 @@
 
 mod common;
 
-use common::{connect_and_capture_inventory, next_frame_of_type, session_ref_of, spawn_server};
+use common::{
+    connect_and_capture_inventory, next_frame_of_type, session_ref_of, sleeper_cli_spec,
+    spawn_server, spawn_server_with_specs,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -130,12 +133,15 @@ async fn live_session_ref_create_is_refused_loudly() {
 
 /// The legacy rung of the same doctrine (2026-08-16 duplicate-tab incident):
 /// a `terminal.create` carrying ONLY the legacy `resumeSessionId` (no
-/// `sessionRef`) must arm D7 exactly like the sessionRef rung — a legacy
+/// `sessionRef`) used to arm D7 exactly like the sessionRef rung — a legacy
 /// `mode` + `resumeSessionId` pair IS a sessionRef claim (`reconcile.rs`
-/// §5.2 uniform promotion, `create_session_locator`). Before the fix this
-/// carrier bypassed D7 in every ordering (the wire-resume gate's liveness
-/// precondition SKIPS live candidates rather than refusing them) and spawned
-/// a second `<cli> --resume S` writer.
+/// §5.2 uniform promotion, `create_session_locator`).
+///
+/// Post-ejh6 the carrier never reaches D7: the raw pre-parse guard
+/// (`handle_client_text`) rejects ANY `resumeSessionId` carry with
+/// `INVALID_MESSAGE` + the frozen refusal text, before dedupe and before any
+/// liveness planning. The live owner is never touched either way: exactly
+/// one terminal still owns S.
 #[tokio::test]
 async fn legacy_resume_session_id_create_is_refused_loudly() {
     let (url, registry) = spawn_server().await; // sleeper claude: stays Running
@@ -180,13 +186,13 @@ async fn legacy_resume_session_id_create_is_refused_loudly() {
     let err = expect_refusal_for(&mut ws, "req-legacy-recreate-7c1d").await;
     assert_eq!(
         err["code"],
-        json!("RESTORE_UNAVAILABLE"),
-        "exact wire code: {err}"
+        json!("INVALID_MESSAGE"),
+        "post-ejh6 the legacy carrier is rejected at the door, not via D7: {err}"
     );
-    let message = err["message"].as_str().expect("error message");
-    assert!(
-        message.contains(&session_id),
-        "message must name the live session {session_id}: {err}"
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+        "frozen text: {err}"
     );
 
     let rows = registry.identity_probe_rows();
@@ -240,5 +246,211 @@ async fn legacy_only_restore_is_refused_invalid_message() {
     assert!(
         registry.identity_probe_rows().is_empty(),
         "no terminal may spawn for a refused legacy-only restore"
+    );
+}
+
+/// ejh6: a `terminal.create` carrying `resumeSessionId` is rejected with
+/// `INVALID_MESSAGE` + frozen text on ANY mode, ANY restore state, and even
+/// when a companion `sessionRef` is present. No spawn, no registry row.
+/// Presence-based: `resumeSessionId: ""` is also rejected — and so are the
+/// JSON value shapes the typed layer cannot even see: `null` (serde absorbs
+/// it into `None`) and non-strings (they fail the typed parse into the
+/// accept-and-strip arm — total silent drop).
+#[tokio::test]
+async fn legacy_reject_ws_terminal_create() {
+    // A codex sleeper spec is registered too, so a SILENTLY ACCEPTED codex
+    // carry really would spawn (the failure this test exists to forbid).
+    let (url, registry) = spawn_server_with_specs(vec![
+        sleeper_cli_spec("amplifier"),
+        sleeper_cli_spec("claude"),
+        sleeper_cli_spec("codex"),
+    ])
+    .await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+        (
+            "claude-restore-true",
+            "req-blanket-1",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-1",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "restore": true, "resumeSessionId": "9d1f6f5a-2b6e-4d0f-8a3c-5e7b2c9d4f10",
+            }),
+        ),
+        (
+            "codex-no-restore",
+            "req-blanket-2",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-2",
+                "mode": "codex", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": "thread-raw-codex",
+            }),
+        ),
+        (
+            "claude-with-companion-sessionref",
+            "req-blanket-3",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-3",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": "legacy-should-still-reject",
+                "sessionRef": {"provider": "claude", "sessionId": "canonical-session-id"},
+            }),
+        ),
+        (
+            "empty-string-presence",
+            "req-blanket-4",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-4",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": "",
+            }),
+        ),
+        (
+            "null-presence",
+            "req-blanket-5",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-5",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": null,
+            }),
+        ),
+        (
+            "number-presence",
+            "req-blanket-6",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-6",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": 42,
+            }),
+        ),
+        (
+            "object-presence",
+            "req-blanket-7",
+            json!({
+                "type": "terminal.create", "requestId": "req-blanket-7",
+                "mode": "claude", "shell": "system",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "resumeSessionId": {"nested": true},
+            }),
+        ),
+    ];
+    for (label, req_id, body) in cases {
+        send_create(&mut ws, body).await;
+        let err = expect_refusal_for(&mut ws, req_id).await;
+        assert_eq!(err["code"], json!("INVALID_MESSAGE"), "{label}: {err}");
+        assert_eq!(
+            err["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "{label}: frozen text must be byte-exact: {err}"
+        );
+    }
+    assert!(
+        registry.identity_probe_rows().is_empty(),
+        "no terminal may spawn"
+    );
+}
+
+/// ejh6: a duplicate-requestId replay carrying the legacy field gets
+/// `INVALID_MESSAGE`, not the cached `terminal.created` — the raw guard fires
+/// BEFORE `create_dedupe.begin`.
+#[tokio::test]
+async fn legacy_reject_ws_duplicate_request_id_with_legacy() {
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+    // First: a successful shell create to seed the dedupe cache.
+    send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create", "requestId": "req-dup-seed",
+            "mode": "shell", "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let _created = next_frame_of_type(&mut ws, "terminal.created").await;
+    // Replay: same requestId but carrying legacy — must get INVALID_MESSAGE,
+    // not the cached terminal.created.
+    send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create", "requestId": "req-dup-seed",
+            "mode": "claude", "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "resumeSessionId": "legacy-dup",
+        }),
+    )
+    .await;
+    let err = expect_refusal_for(&mut ws, "req-dup-seed").await;
+    assert_eq!(
+        err["code"],
+        json!("INVALID_MESSAGE"),
+        "duplicate replay with legacy must reject: {err}"
+    );
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+    );
+    registry.kill_all();
+}
+
+/// ejh6: restore:true + codex + legacy is rejected BEFORE
+/// `spawn_gated_restore_create` / `prepare_launch` — no disk-gate planning,
+/// no sidecar planning slot burned.
+#[tokio::test]
+async fn legacy_reject_ws_restore_codex_legacy() {
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+    send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create", "requestId": "req-restore-codex-legacy",
+            "mode": "codex", "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true, "resumeSessionId": "thread-raw-restore-codex",
+        }),
+    )
+    .await;
+    let err = expect_refusal_for(&mut ws, "req-restore-codex-legacy").await;
+    assert_eq!(
+        err["code"],
+        json!("INVALID_MESSAGE"),
+        "restore+codex+legacy must reject before disk gate: {err}"
+    );
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+    );
+    assert!(
+        registry.identity_probe_rows().is_empty(),
+        "no terminal may spawn"
+    );
+}
+
+/// ejh6: a `codingcli.create` carrying the legacy field hits the raw-Value
+/// guard with `INVALID_MESSAGE` + frozen text. Rust has no codingcli handler
+/// (the `_ => true` arm of the dispatch) — without the guard this silently
+/// no-ops; the guard is the loud rejector.
+#[tokio::test]
+async fn legacy_reject_ws_codingcli_create() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+    send_create(
+        &mut ws,
+        json!({
+            "type": "codingcli.create", "requestId": "req-codingcli-legacy",
+            "prompt": "hi", "provider": "claude",
+            "resumeSessionId": "legacy-codingcli",
+        }),
+    )
+    .await;
+    let err = expect_refusal_for(&mut ws, "req-codingcli-legacy").await;
+    assert_eq!(err["code"], json!("INVALID_MESSAGE"), "{err}");
+    assert_eq!(
+        err["message"],
+        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
     );
 }
