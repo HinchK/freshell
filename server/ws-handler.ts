@@ -108,6 +108,7 @@ import {
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import {
+  INVALID_RAW_CODEX_RESUME_MESSAGE,
   planCodexCreateRestoreDecision,
   resolveCodexCreateRestoreDecision,
 } from './coding-cli/codex-app-server/restore-decision.js'
@@ -2178,7 +2179,7 @@ export class WsHandler {
           error = true
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
-            message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+            message: INVALID_RAW_CODEX_RESUME_MESSAGE,
             requestId: m.requestId,
           })
           endCreateTimer({ error, rateLimited })

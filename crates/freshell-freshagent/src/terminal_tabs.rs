@@ -48,21 +48,13 @@ use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
     RealFileProbe, ShellType, SpawnSpec,
 };
-use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
+use freshell_protocol::{LEGACY_RESUME_IDENTITY_REFUSAL, ServerMessage, SessionLocator, UiCommand};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
     authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
     TerminalPaneEntry,
 };
-
-/// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
-/// on a `mode:"codex"` create -- mirrors
-/// `server/coding-cli/codex-app-server/restore-decision.ts:27-28`'s
-/// `INVALID_RAW_CODEX_RESUME_MESSAGE` verbatim (a frozen TS string literal,
-/// not importable from Rust) so a REST client sees byte-identical text to the
-/// legacy Node server for this specific rejection.
-const INVALID_RAW_CODEX_RESUME_MESSAGE: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
 
 // -- mode / resume-id / sessionRef derivation (router.ts:695-793 semantics) --
 
@@ -127,7 +119,7 @@ fn requested_resume_session_id_for_mode(
         if legacy.is_some() {
             return Err(fail_json(
                 StatusCode::BAD_REQUEST,
-                INVALID_RAW_CODEX_RESUME_MESSAGE.to_string(),
+                LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
             ));
         }
         return Ok(None);

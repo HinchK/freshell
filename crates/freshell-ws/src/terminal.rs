@@ -60,10 +60,10 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent, Pong, ServerMessage,
-    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
-    TerminalKill, TerminalResize,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent,
+    LEGACY_RESUME_IDENTITY_REFUSAL, Pong, ServerMessage, SessionLocator, SessionType, Shell,
+    TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
+    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -1506,19 +1506,6 @@ impl Drop for KeyedCreateGuard {
     }
 }
 
-/// The sessionRef a create claims at spawn time (council rule 7, D8), when
-/// resolvable from the create BODY alone: a non-shell mode whose session id
-/// comes from `sessionRef` (provider must match the mode — the same filter
-/// as the resume derivation in `handle_create`) or the legacy
-/// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
-/// the P0.4 restore ladder) are freshly minted or single-source and carry no
-/// concurrent-duplicate shape, so they claim nothing.
-/// Node's legacy-restore refusal text (`server/ws-handler.ts:2181`; the SAME
-/// frozen string the REST door's codex rejection reuses,
-/// `freshell-freshagent/terminal_tabs.rs` `INVALID_RAW_CODEX_RESUME_MESSAGE`)
-/// -- byte-identical so clients see one contract across doors and servers.
-const LEGACY_RESTORE_IDENTITY_REFUSAL: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
-
 /// Node parity (`server/terminal-registry.ts:186-189` `modeSupportsResume`):
 /// a non-shell mode whose CLI spec declares `resumeArgs`. Mirrors Node's
 /// truthiness check on the array (`!!resumeArgs` -- present counts, even
@@ -1531,6 +1518,13 @@ fn mode_supports_resume(state: &WsState, mode: &str) -> bool {
             .any(|s| s.name == mode && s.resume_args.is_some())
 }
 
+/// The sessionRef a create claims at spawn time (council rule 7, D8), when
+/// resolvable from the create BODY alone: a non-shell mode whose session id
+/// comes from `sessionRef` (provider must match the mode — the same filter
+/// as the resume derivation in `handle_create`) or the legacy
+/// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
+/// the P0.4 restore ladder) are freshly minted or single-source and carry no
+/// concurrent-duplicate shape, so they claim nothing.
 fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
     if create.mode == "shell" {
         return None;
@@ -2450,7 +2444,7 @@ pub(crate) async fn handle_create(
         return send_create_error(
             out,
             ErrorCode::InvalidMessage,
-            LEGACY_RESTORE_IDENTITY_REFUSAL.to_string(),
+            LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
             &create.request_id,
         )
         .await;
