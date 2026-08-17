@@ -2794,16 +2794,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     let effectiveIntent = intent
     let clearViewportFirst = opts?.clearViewportFirst === true
     let fullHydrateFallbackReason: string | null = null
-    if (surfaceFreshRef.current && effectiveIntent !== 'viewport_hydrate') {
+    if (surfaceFreshRef.current) {
       // A fresh surface has NO usable delta window: any checkpointed sinceSeq
-      // would continue content onto a blank xterm (data hole). Force a wiped
-      // full hydrate; the wipe also self-heals a wedged stale marker.
-      effectiveIntent = 'viewport_hydrate'
-      clearViewportFirst = true
-      fullHydrateFallbackReason = 'surface_fresh'
-    } else if (surfaceFreshRef.current) {
-      // Already a viewport hydrate: still wipe (same self-healing rule).
-      clearViewportFirst = true
+      // would continue content onto a blank xterm (data hole). Force the full
+      // hydrate. Wipe ONLY when a marker exists — a marker means an EARLIER
+      // claim was abandoned mid-hydration (trap-door), so this surface may
+      // hold partial replay content; a genuinely fresh surface (marker null,
+      // flag just set at construction/user-reset) is blank by construction
+      // and must not pay a spurious term.clear().
+      if (effectiveIntent !== 'viewport_hydrate') {
+        effectiveIntent = 'viewport_hydrate'
+        fullHydrateFallbackReason = 'surface_fresh'
+      }
+      if (surfaceFreshMarkerRef.current !== null) {
+        clearViewportFirst = true
+      }
     }
     if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
       effectiveIntent = 'viewport_hydrate'

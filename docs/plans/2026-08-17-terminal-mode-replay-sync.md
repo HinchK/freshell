@@ -38,6 +38,14 @@ After any browser page load, a pane's xterm is recreated and rehydrated from the
 
 ### Round 5 / implementation-era resolution (hazard closure)
 
+- **Downgrade wipe refinement landed (marker-gated):** the forced
+  `clearViewportFirst` wipe applies only when a marker exists (i.e., an
+  earlier claim was abandoned mid-hydration — the trap-door case the wipe
+  exists to heal). Genuinely fresh first attaches (flag set at
+  construction/user-reset, marker null) skip the wipe; this also removes a
+  spurious `term.clear()` that broke the stale-actions lifecycle invariant
+  (TerminalView.keyboard.test.tsx).
+
 - **xterm 6.0.0 fires an immediate focus report on EVERY `?1004` arm**
   (InputHandler DECSET-1004 → `_onRequestSendFocus` → `_reportFocus` emits
   `ESC[I`/`ESC[O` gated only on the surface's current focus class, not on a

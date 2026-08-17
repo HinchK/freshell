@@ -613,6 +613,16 @@ test.describe('Multi-Client', () => {
     const context = await newClientContext(browser)
     const page = await context.newPage()
     await page.setViewportSize({ width: 1400, height: 900 })
+    const syncFrames: Array<{ data: string }> = []
+    page.on('websocket', (ws) => {
+      ws.on('framereceived', (ev) => {
+        const payload = typeof ev.payload === 'string' ? ev.payload : ev.payload.toString('utf8')
+        try {
+          const msg = JSON.parse(payload)
+          if (msg?.type === 'terminal.modes.sync' && typeof msg?.data === 'string') syncFrames.push(msg)
+        } catch { /* ignore */ }
+      })
+    })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(page)
     await ensureTerminalReady(page)
@@ -667,11 +677,19 @@ test.describe('Multi-Client', () => {
     expect(claimed.every((m) => m.sinceSeq === 0),
       `every fresh claim must force a full hydrate (sinceSeq 0); got: ${JSON.stringify(reloadAttaches)}`).toBe(true)
 
-    // The sync preamble must have re-armed the modes on the fresh surface.
+    // The sync preamble must have RE-ARMED the modes on the fresh surface —
+    // and the mechanism is asserted at the wire level, not only by outcome:
+    // exactly the claimed attaches received compound preambles containing
+    // the armed modes' bytes.
     await page.waitForFunction((id) => {
       const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
       return modes?.mouseTrackingMode === 'any' && modes?.bufferType === 'alternate'
     }, terminalId, { timeout: 45_000 })
+    expect(
+      syncFrames.length,
+      'a fresh-reload attach must receive at least one terminal.modes.sync frame',
+    ).toBeGreaterThanOrEqual(1)
+    expect(syncFrames.every((f) => f.data.includes('\u001b[?1003h') && f.data.includes('\u001b[?1049h'))).toBe(true)
 
     // Consumption: once hydration of the marker attach completed, a later
     // transport-level reconnect must NOT re-claim (stuck markers would force
