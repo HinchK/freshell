@@ -46,11 +46,33 @@ GCP_REGION="${FRESHELL_GCP_REGION:-us-west1}"
 GCP_REPO="${FRESHELL_GCP_REPO:-freshell-e2e}"
 GCP_JOB="${FRESHELL_GCP_VITEST_JOB:-freshell-vitest}"
 
-IMAGE_LOCAL="freshell-e2e:latest"
-IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+IMAGE_NAME="freshell-e2e"
+IMAGE_LOCAL="${IMAGE_NAME}:latest"
+IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:latest"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Commit-addressed image tag — mirrors scripts/e2e-cloud.sh (wrap-review r3):
+# a cloud run must execute the code at the CURRENT HEAD — with only a mutable
+# :latest tag, `run` would happily execute whatever source was last pushed and
+# the "cloud vitest gate" could pass against STALE code. This was observed in
+# practice: the freshell-vitest job kept an image predating TEST_MODE=vitest
+# support and ran Playwright instead of vitest. `:latest` is still
+# built/pushed (human convenience pointer + layer-cache anchor) but the run
+# path never uses it. A dirty tree gets a non-addressable `-dirty` SENTINEL
+# tag so a build of uncommitted code can never masquerade as the clean commit
+# (untracked files count as dirty — the image bakes the working tree);
+# `-dirty` tags are never reused: the run path ALWAYS rebuilds on a dirty tree
+# (mirrors wrap-review r4).
+image_tag_for_head() {
+  local sha
+  sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    sha="${sha}-dirty"
+  fi
+  echo "$sha"
+}
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
 # Docker when pushing to Artifact Registry).
@@ -140,23 +162,28 @@ cmd_build() {
     esac
   done
 
-  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+  # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
+  local tag remote_base
+  tag="$(image_tag_for_head)"
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
 
   if $local_build; then
-    echo "[vitest-cloud] Building Docker image locally..."
-    docker build -f "$ROOT/docker/cloud-run/Dockerfile" -t "$IMAGE_LOCAL" "$ROOT"
-    echo "[vitest-cloud] Image built: $IMAGE_LOCAL"
+    echo "[vitest-cloud] Building Docker image locally (tag: $tag)..."
+    docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+      -t "$IMAGE_LOCAL" \
+      -t "${IMAGE_NAME}:${tag}" \
+      "$ROOT"
+    echo "[vitest-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
     cmd_push
   else
-    echo "[vitest-cloud] Building Docker image via Cloud Build..."
+    echo "[vitest-cloud] Building Docker image via Cloud Build (tag: $tag)..."
     gcloud builds submit \
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
       --account="$GCP_ACCOUNT" \
       --project="$GCP_PROJECT" \
-      --substitutions=_IMAGE="$IMAGE_REMOTE" \
+      --substitutions=_IMAGE="${remote_base}:${tag}" \
       "$ROOT"
-    echo "[vitest-cloud] Cloud Build complete: $IMAGE_REMOTE"
+    echo "[vitest-cloud] Cloud Build complete: ${remote_base}:${tag}"
   fi
 }
 
@@ -178,9 +205,19 @@ cmd_push() {
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
-  docker tag "$IMAGE_LOCAL" "$IMAGE_REMOTE"
-  docker push "$IMAGE_REMOTE"
-  echo "[vitest-cloud] Pushed: $IMAGE_REMOTE"
+  # Push BOTH refs explicitly (mirrors scripts/e2e-cloud.sh): the
+  # commit-addressed tag (what `run` resolves) and :latest (human convenience
+  # pointer + cache anchor; `run` never consumes it). Never read the mutable
+  # $IMAGE_REMOTE global here — the standalone `push` subcommand path still
+  # has it at :latest while the run path has repointed it at the HEAD tag.
+  local tag remote_base
+  tag="$(image_tag_for_head)"
+  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:latest"
+  docker tag "$IMAGE_LOCAL" "${remote_base}:${tag}"
+  docker push "${remote_base}:${tag}"
+  docker push "${remote_base}:latest"
+  echo "[vitest-cloud] Pushed: ${remote_base}:${tag} (+ ${remote_base}:latest)"
 }
 
 # ---------------------------------------------------------------------------
@@ -285,11 +322,27 @@ cmd_run() {
     exit "$exit_code"
   fi
 
-  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+  # Recompute the remote ref with potentially overridden GCP settings —
+  # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head; mirrors
+  # scripts/e2e-cloud.sh): the job must run THIS HEAD's code or fail loudly,
+  # never pass on a stale image.
+  local image_tag
+  image_tag="$(image_tag_for_head)"
+  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
 
   # Cloud mode
   if $force_build; then
+    if $local_build_flag; then
+      cmd_build --local-build
+    else
+      cmd_build
+    fi
+  elif [[ "$image_tag" == *-dirty ]]; then
+    # A dirty tree has NO addressable content: a stored `<sha>-dirty` tag can
+    # only ever name whatever the FIRST dirty build contained, so reusing it
+    # would silently run stale source. Always rebuild+push; docker's layer
+    # cache keeps an unchanged tree cheap.
+    echo "[vitest-cloud] Dirty worktree — rebuilding the image (uncommitted tree has no addressable tag)..."
     if $local_build_flag; then
       cmd_build --local-build
     else
