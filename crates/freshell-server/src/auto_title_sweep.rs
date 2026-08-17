@@ -522,7 +522,7 @@ pub fn spawn_auto_title_sweep(
         // Minimum interval between auto-title passes — no need to run
         // faster than this even if the index is changing rapidly.
         let min_interval = std::time::Duration::from_secs(30);
-        let mut last_run = tokio::time::Instant::now();
+        let mut last_run = tokio::time::Instant::now() - min_interval;
 
         loop {
             // Wait for either a change notification or the minimum interval.

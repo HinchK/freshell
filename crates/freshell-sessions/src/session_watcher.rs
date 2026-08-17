@@ -8,7 +8,8 @@
 //!   collapses ~35 events/s (measured 24h observer) to ~0.09 net changes/s
 //! - Debounced flush (200ms) delivers dirty paths to `SessionIndex::mark_dirty`
 //! - Late-root handling: watches nearest existing ancestor when the provider
-//!   root doesn't exist yet; reconfigures on appearance
+//!   root doesn't exist yet; the 15-minute TTL reconciliation covers providers
+//!   whose root never appears during the watcher's lifetime
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,53 +94,65 @@ async fn run_watcher_loop(
 ) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PathBuf, bool)>();
 
-    // Arm one watcher per provider.
+    // Arm one watcher per provider, per watch base.
     // Keep watchers alive for the loop's lifetime — dropping them unwatches.
     let mut _watchers: Vec<notify::RecommendedWatcher> = Vec::new();
     for provider in &providers {
-        let root = provider.layout.session_root(&provider.home);
-        let watch_target = if root.exists() {
-            root.clone()
-        } else {
-            // Late-root: watch the nearest existing ancestor within the
-            // watch base. When the root appears, a Create event will
-            // trigger reconfiguration via mark_provider_dirty.
-            nearest_existing_ancestor(&root, &provider.home)
-        };
-
-        let tx = event_tx.clone();
+        let watch_bases = provider.layout.watch_bases(&provider.home);
         let is_direct = provider.layout.is_direct_listed();
         let mode = match provider.layout.watch_mode() {
             WatchMode::Recursive => notify::RecursiveMode::Recursive,
             WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
         };
+        let name = provider.layout.name().to_owned();
 
-        match notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            if let Ok(event) = res {
-                if is_relevant(&event) {
-                    let rescan = is_direct || event.need_rescan();
-                    for path in event.paths {
-                        let _ = tx.send((path, rescan));
+        for base in &watch_bases {
+            let watch_target = if base.exists() {
+                base.clone()
+            } else {
+                // Late-root: watch the nearest existing ancestor. The
+                // 15-minute TTL reconciliation covers providers whose
+                // root never appears during the watcher's lifetime.
+                nearest_existing_ancestor(base, &provider.home)
+            };
+
+            let tx = event_tx.clone();
+            let cb_name = name.clone();
+            match notify::recommended_watcher(move |res: Result<notify::Event, _>| {
+                match res {
+                    Ok(event) => {
+                        if !is_relevant(&event) {
+                            return;
+                        }
+                        let rescan = is_direct || event.need_rescan();
+                        if event.paths.is_empty() && rescan {
+                            let _ = tx.send((PathBuf::new(), true));
+                        } else {
+                            for path in event.paths {
+                                let _ = tx.send((path, rescan));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("session-watcher: watcher error for {cb_name}: {e}");
                     }
                 }
-            }
-        }) {
-            Ok(mut watcher) => {
-                if let Err(e) = watcher.watch(&watch_target, mode) {
-                    eprintln!(
-                        "session-watcher: failed to watch {} for {}: {e}",
-                        watch_target.display(),
-                        provider.layout.name()
-                    );
-                } else {
-                    _watchers.push(watcher);
+            }) {
+                Ok(mut watcher) => {
+                    if let Err(e) = watcher.watch(&watch_target, mode) {
+                        eprintln!(
+                            "session-watcher: failed to watch {} for {name}: {e}",
+                            watch_target.display(),
+                        );
+                    } else {
+                        _watchers.push(watcher);
+                    }
                 }
-            }
-            Err(e) => {
-                eprintln!(
-                    "session-watcher: failed to create watcher for {}: {e}",
-                    provider.layout.name()
-                );
+                Err(e) => {
+                    eprintln!(
+                        "session-watcher: failed to create watcher for {name}: {e}",
+                    );
+                }
             }
         }
     }

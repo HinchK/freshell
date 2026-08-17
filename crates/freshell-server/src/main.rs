@@ -697,8 +697,10 @@ async fn main() -> ExitCode {
     // 1s-TTL polling with event-driven inotify watching. The TTL (now 15
     // minutes) serves as a reconciliation sweep for the ~1.8% of events
     // the watcher misses.
-    if let Some(ref index) = session_index {
-        if let Some(home) = session_directory::provider_home() {
+    // Session-directory watcher — must live for the process lifetime (dropping
+    // the SessionWatcher sends the stop signal, killing the watcher loop).
+    let _session_watcher = if let Some(ref index) = session_index {
+        session_directory::provider_home().map(|home| {
             let providers = vec![
                 freshell_sessions::session_watcher::WatchedProvider {
                     layout: Box::new(freshell_sessions::provider_layout::ClaudeLayout),
@@ -722,9 +724,11 @@ async fn main() -> ExitCode {
                 providers,
             );
             watcher.start();
-            // Watcher runs for the process lifetime — no explicit stop needed.
-        }
-    }
+            watcher
+        })
+    } else {
+        None
+    };
 
     // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
     // registry tap (installed right below), broadcasts *.activity.updated /

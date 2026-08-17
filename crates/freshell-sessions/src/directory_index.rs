@@ -1211,17 +1211,14 @@ impl SessionIndex {
             let direct_cache = Arc::clone(&direct_cache);
             let snapshot = Arc::clone(&snapshot);
             move || {
-                // Drain dirty sets at the start of the sweep. Any new
-                // dirty paths arriving after this drain will trigger
-                // another refresh cycle.
-                let _drained_dirty: HashSet<PathBuf> = {
-                    let mut dirty = dirty_paths.lock().unwrap();
-                    std::mem::take(&mut *dirty)
-                };
-                let _drained_providers: HashSet<String> = {
-                    let mut dirty = dirty_providers.lock().unwrap();
-                    std::mem::take(&mut *dirty)
-                };
+                // Drain dirty sets so the `is_dirty()` gate in
+                // `cached_pair()` resets. Any new dirty paths arriving
+                // after this drain trigger another refresh cycle.
+                // Currently the refresh is a full scan regardless of
+                // which paths changed — incremental path-scoped refresh
+                // is a future optimisation.
+                dirty_paths.lock().unwrap().clear();
+                dirty_providers.lock().unwrap().clear();
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
                 // Seed the failure set from the last PUBLISHED generation in
