@@ -194,6 +194,30 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
     expect(getFreshAgentModelCapabilitiesSpy).not.toHaveBeenCalled()
   })
 
+  it('focuses the search box once the catalog probe resolves (it is disabled while probing)', async () => {
+    // Regression: the open-time focus timer fires while capabilities are still
+    // undefined for freshopencode, and focus() on a DISABLED input is a no-op —
+    // focus used to stay on whatever opened the dialog (e.g. the popover's
+    // Change… button) forever.
+    const store = createStore()
+    seedFreshopencodePane(store)
+
+    let resolveProbe: ((value: typeof catalogResponse) => void) | undefined
+    getFreshAgentModelCapabilitiesSpy.mockReturnValueOnce(
+      new Promise((resolve) => { resolveProbe = resolve }),
+    )
+
+    renderDialog(store, { open: true })
+
+    const search = await screen.findByRole('searchbox', { name: 'Filter models' })
+    expect(search).toBeDisabled()
+
+    resolveProbe!(catalogResponse)
+
+    await waitFor(() => expect(search).toBeEnabled())
+    await waitFor(() => expect(search).toHaveFocus())
+  })
+
   it('fetches the cwd-scoped catalog on open and lists provider groups with the current model marked', async () => {
     const store = createStore()
     seedFreshopencodePane(store)
@@ -202,7 +226,7 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
 
     const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshopencode', expect.objectContaining({ cwd: '/repo/project-a' }))
-    expect(screen.getByRole('searchbox', { name: 'Filter models' })).toHaveFocus()
+    await waitFor(() => expect(screen.getByRole('searchbox', { name: 'Filter models' })).toHaveFocus())
 
     const modelsList = screen.getByRole('listbox', { name: 'Models' })
     expect(modelsList).toHaveTextContent('OpenCode Go')

@@ -206,8 +206,8 @@ export function FreshAgentModelDialog({
     setRecentModels(recent)
   }, [open, capabilities, mruProvider, paneId, cwdKey, effectiveModelId])
 
-  // Focus management: autofocus the search box on open, restore on close;
-  // Escape cancels (capture phase, ahead of parent popovers/views).
+  // Focus management: Escape cancels (capture phase, ahead of parent
+  // popovers/views); previous focus is restored on close.
   useEffect(() => {
     if (!open) return
     previousFocusRef.current = document.activeElement as HTMLElement | null
@@ -218,15 +218,23 @@ export function FreshAgentModelDialog({
       }
     }
     document.addEventListener('keydown', handleKeyDown, { capture: true })
-    const focusTimer = window.setTimeout(() => {
-      searchRef.current?.focus()
-    }, 0)
     return () => {
       document.removeEventListener('keydown', handleKeyDown, { capture: true })
-      window.clearTimeout(focusTimer)
       previousFocusRef.current?.focus()
     }
   }, [open, onClose])
+
+  // Autofocus the search box once the catalog is PRESENT: the input is
+  // `disabled` while the freshopencode probe is in flight, and focus() on a
+  // disabled element is a silent no-op — a mount-time-only timer would lose
+  // the race and leave focus on whatever opened the dialog.
+  useEffect(() => {
+    if (!open || !capabilities) return
+    const focusTimer = window.setTimeout(() => {
+      searchRef.current?.focus()
+    }, 0)
+    return () => window.clearTimeout(focusTimer)
+  }, [open, capabilities])
 
   const { groups, hiddenCount } = useMemo(() => {
     if (!capabilities) return { groups: [] as FreshAgentModelSourceGroup[], hiddenCount: 0 }
