@@ -205,7 +205,11 @@ describe('cli e2e flow', () => {
     } finally {
       ws.close()
       handler.close?.()
-      process.env.AUTH_TOKEN = previousAuthToken
+      if (previousAuthToken === undefined) {
+        delete process.env.AUTH_TOKEN
+      } else {
+        process.env.AUTH_TOKEN = previousAuthToken
+      }
       await new Promise<void>((done) => server.close(() => done()))
     }
   })
