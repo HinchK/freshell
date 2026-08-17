@@ -2238,6 +2238,36 @@ pub(crate) mod tests {
         msg
     }
 
+    /// Delta review round-2 pin (kata ejh6 section 4b): `attach_durable_id` reads
+    /// sessionRef-first after the Task-7 flip. A legacy-first ordering (pre-flip)
+    /// returns the legacy id in the dual-carrier case — this test fails there.
+    #[test]
+    fn attach_durable_id_prefers_session_ref_over_legacy() {
+        const REF_ID: &str = "11111111-2222-4333-8444-555555555555";
+        const LEGACY_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+        // (i) both carriers set with different canonical UUIDs → sessionRef wins
+        let mut both = attach_msg("s");
+        both.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: REF_ID.to_string(),
+        });
+        both.resume_session_id = Some(LEGACY_ID.to_string());
+        assert_eq!(attach_durable_id(&both), Some(REF_ID.to_string()));
+
+        // (ii) sessionRef only → its id
+        let ref_only = attach_msg_with_resume("s", REF_ID);
+        assert_eq!(attach_durable_id(&ref_only), Some(REF_ID.to_string()));
+
+        // (iii) legacy only → its id (internal/test-compat lane)
+        let mut legacy_only = attach_msg("s");
+        legacy_only.resume_session_id = Some(LEGACY_ID.to_string());
+        assert_eq!(attach_durable_id(&legacy_only), Some(LEGACY_ID.to_string()));
+
+        // (iv) neither → None
+        assert_eq!(attach_durable_id(&attach_msg("s")), None);
+    }
+
     fn write_fake_transcript(home: &std::path::Path, durable: &str) {
         let dir = home.join("projects").join("-t");
         std::fs::create_dir_all(&dir).unwrap();
