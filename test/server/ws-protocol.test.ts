@@ -1744,6 +1744,36 @@ describe('ws protocol', () => {
     expect(result.code).toBe(4001)
   })
 
+  // ejh6 delta-review minor (Fix A): the raw pre-parse resumeSessionId guard is
+  // gated on authentication — a pre-hello create-class frame carrying the legacy
+  // field must fall through to the NOT_AUTHENTICATED gate (error + close 4001),
+  // never the legacy-field reject envelopes (INVALID_MESSAGE /
+  // freshAgent.create.failed).
+  it.each([
+    ['terminal.create', { type: 'terminal.create', requestId: 'pre-hello-legacy-term', mode: 'shell', resumeSessionId: 'legacy-thread' }],
+    ['freshAgent.create', { type: 'freshAgent.create', requestId: 'pre-hello-legacy-fa', sessionType: 'freshcodex', provider: 'codex', cwd: '/tmp', resumeSessionId: 'legacy-thread' }],
+  ])('pre-hello %s carrying resumeSessionId gets NOT_AUTHENTICATED + close 4001, not the legacy-field reject', async (_label, frame) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+    const firstResponsePromise = new Promise<any>((resolve) => {
+      ws.on('message', (data) => resolve(JSON.parse(data.toString())))
+    })
+    ws.send(JSON.stringify(frame))
+
+    const firstResponse = await firstResponsePromise
+    expect(firstResponse).toMatchObject({
+      type: 'error',
+      code: 'NOT_AUTHENTICATED',
+      message: 'Send hello first',
+    })
+
+    const closeCode = await new Promise<number>((resolve) => {
+      ws.on('close', (code) => resolve(code))
+    })
+    expect(closeCode).toBe(4001)
+  })
+
   it('connection timeout on no hello', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))

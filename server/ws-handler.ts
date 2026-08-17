@@ -1922,7 +1922,13 @@ export class WsHandler {
       // non-strings generically; a typed field reads strings only). The
       // wire schemas keep the field declared (retention, comments in this
       // task) — the guard, not the schema, owns the contract.
-      if (typeof msg === 'object' && msg !== null && 'resumeSessionId' in msg) {
+      //
+      // The guard is gated on authentication (delta-review minor): pre-hello
+      // frames must fall through to the `!state.authenticated` gate below so
+      // they receive NOT_AUTHENTICATED + close(4001) — the required pre-auth
+      // envelope — not the legacy-field reject (which would also leak door
+      // behavior to unauthenticated senders).
+      if (state.authenticated && typeof msg === 'object' && msg !== null && 'resumeSessionId' in msg) {
         const rawMsg = msg as Record<string, unknown>
         switch (rawMsg.type) {
           case 'terminal.create': {

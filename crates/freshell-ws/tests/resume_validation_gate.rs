@@ -276,6 +276,31 @@ fn assert_never_captured(path: &std::path::Path) {
     }
 }
 
+/// Scope guard owning a test's teardown (registry kill, env-var removal,
+/// evidence-file deletion) so the zero-side-effect pins can run BEFORE the
+/// files are deleted while cleanup is still guaranteed: on a RED pin the
+/// assertion panic unwinds through this guard's Drop and the teardown runs
+/// anyway. Delta-review Fix B (ejh6) — previously the files were deleted
+/// before `assert_never_captured`, so the assertions passed even when a
+/// sidecar or CLI child had written them.
+struct AssertBeforeCleanupGuard<'a> {
+    registry: &'a freshell_terminal::TerminalRegistry,
+    evidence_files: Vec<std::path::PathBuf>,
+}
+
+impl Drop for AssertBeforeCleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.kill_all();
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
+        std::env::remove_var("CODEX_HOME");
+        for path in &self.evidence_files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Managed-codex harness: modeled line-for-line on `spawn_server_with_probe`
 /// with exactly one difference — the CLI specs are the REAL codex spec only
 /// (no sleeper specs), so the resolver takes the env_var codex branch and
@@ -1018,15 +1043,15 @@ async fn managed_default_legacy_codex_carrier_never_consults_gate_or_plans() {
 
     let gate_consulted = probe.planning_started_before_gate.lock().unwrap().is_some();
 
-    // Cleanup BEFORE the zero-side-effect assertions so a RED run still
-    // tears down.
-    registry.kill_all();
-    std::env::remove_var("CODEX_CMD");
-    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
-    std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
-    std::env::remove_var("CODEX_HOME");
-    let _ = std::fs::remove_file(&capture_path);
-    let _ = std::fs::remove_file(&planning_marker);
+    // THE pins run BEFORE the evidence files are deleted, with the teardown
+    // owned by a scope guard so a RED run still cleans up on unwind (see
+    // AssertBeforeCleanupGuard). Asserting before deletion is the load-bearing
+    // ordering: the never-captured pins must observe the filesystem while a
+    // violation is still visible.
+    let _teardown = AssertBeforeCleanupGuard {
+        registry: &registry,
+        evidence_files: vec![capture_path.clone(), planning_marker.clone()],
+    };
 
     // THE pins: the gate NEVER consulted the probe for the legacy carrier,
     // and neither the managed-planning sidecar (arg-log marker) nor a TUI
