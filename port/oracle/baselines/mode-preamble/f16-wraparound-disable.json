@@ -1,0 +1,10 @@
+{
+  "name": "f16-wraparound-disable",
+  "chunks": [
+    "\u001b[?7l",
+    "\u001b[?1000h"
+  ],
+  "surfaceReset": true,
+  "expectedSyncData": "\u001b[?1000h\u001b[?7l",
+  "note": "?7 (DECAWM wrap) defaults ON; an app-disabled wrap restores via trailing explicit ?7l."
+}

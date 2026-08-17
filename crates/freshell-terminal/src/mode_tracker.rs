@@ -68,6 +68,9 @@ const SYNCHRONIZED_OUTPUT: u32 = 2026;
 /// on the surface's focus class — arming from the preamble on a fresh focused
 /// surface deterministically injects junk into the app's stdin.
 const SEND_FOCUS: u32 = 1004;
+/// DECAWM wrap defaults ON in xterm; a tracked-false entry must restore the
+/// original surface's disabled wrap with an explicit trailing `?7l`.
+const WRAPAROUND: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
@@ -100,7 +103,7 @@ pub struct ModeTracker {
     /// XTMODIFYKEYS resource map (`CSI > Pm ; Pv m`; absent/0 Pv clears to 0).
     /// Tracked for fidelity (+ future use), NEVER synthesized (xterm 6.0.0
     /// implements no modifyOtherKeys handling).
-    xt_modify_keys: HashMap<u32, u32>,
+    xt_modify_keys: IndexMap<u32, u32>,
 }
 
 impl Default for ModeTracker {
@@ -118,7 +121,7 @@ impl ModeTracker {
             sgr_encoding: None,
             alt_buffer: None,
             flat: IndexMap::new(),
-            xt_modify_keys: HashMap::new(),
+            xt_modify_keys: IndexMap::new(),
         }
     }
 
@@ -231,6 +234,12 @@ impl ModeTracker {
                     .filter(|s| !s.is_empty())
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
+                if self.xt_modify_keys.len() >= 128 && !self.xt_modify_keys.contains_key(&pm) {
+                    let evicted = self.xt_modify_keys.keys().next().copied();
+                    if let Some(pm0) = evicted {
+                        self.xt_modify_keys.shift_remove(&pm0);
+                    }
+                }
                 self.xt_modify_keys.insert(pm, pv);
             }
             'p' if payload == "!" => self.apply_decstr(),
@@ -302,6 +311,7 @@ impl ModeTracker {
         if let Some(pm) = self.alt_buffer {
             enables.push(pm);
         }
+        let wrap_disabled = matches!(self.flat.get(&WRAPAROUND), Some(false));
         let cursor_hidden = matches!(self.flat.get(&CURSOR_VISIBILITY), Some(false));
         for (&pm, &on) in &self.flat {
             if on && pm != SYNCHRONIZED_OUTPUT && pm != SEND_FOCUS {
@@ -314,6 +324,9 @@ impl ModeTracker {
             out.push_str("\u{1b}[?");
             out.push_str(&pm.to_string());
             out.push('h');
+        }
+        if wrap_disabled {
+            out.push_str("\u{1b}[?7l");
         }
         if cursor_hidden {
             out.push_str("\u{1b}[?25l");
@@ -482,6 +495,24 @@ mod tests {
         );
         // DECSTR via the C1 CSI opener.
         assert_eq!(synth_after(&["\u{1b}[?1004h", "\u{9b}!p"]), "");
+    }
+
+    #[test]
+    fn wraparound_disable_restores_with_trailing_reset() {
+        assert_eq!(synth_after(&["\u{1b}[?7l", "\u{1b}[?1000h"]), "\u{1b}[?1000h\u{1b}[?7l");
+        assert_eq!(synth_after(&["\u{1b}[?7l", "\u{1b}[?7h"]), "\u{1b}[?7h");
+    }
+
+    #[test]
+    fn xtm_map_is_capped() {
+        let mut t = ModeTracker::new();
+        let mut blob = String::from("\u{1b}[>9;1m");
+        for i in 0..200u32 {
+            blob.push_str(&format!("\u{1b}[>{};{}m", 1000 + i, i));
+        }
+        t.scan(&blob);
+        assert!(t.xt_modify_keys.len() <= 128);
+        assert_eq!(t.synthesize(), "");
     }
 
     #[test]

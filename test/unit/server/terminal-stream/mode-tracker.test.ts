@@ -328,3 +328,17 @@ describe('u32 range parity (Rust rejects out-of-range params)', () => {
     expect(tracker.synthesize()).toBe(`${SET}2004h`)
   })
 })
+
+describe('default-true disable restoration (?7 wrap)', () => {
+  it('emits a trailing ?7l when DECAWM wrap was disabled', () => {
+    const tracker = createTerminalModeTracker()
+    tracker.scan(`${SET}7l${SET}1000h`)
+    expect(tracker.synthesize()).toBe(`${SET}1000h${SET}7l`)
+  })
+
+  it('?7h after ?7l re-enables (ordinary enable in the sorted set)', () => {
+    const tracker = createTerminalModeTracker()
+    tracker.scan(`${SET}7l${SET}7h`)
+    expect(tracker.synthesize()).toBe(`${SET}7h`)
+  })
+})

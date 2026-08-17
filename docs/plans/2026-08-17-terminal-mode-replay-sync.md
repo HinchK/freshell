@@ -36,6 +36,19 @@ After any browser page load, a pane's xterm is recreated and rehydrated from the
 - **C: survives with two strengthened pins (tests):** `output_frame_meta(&modes_sync).is_none()` at crates/freshell-terminal/src/output_queue.rs (location correction from round 3: freshell-terminal, not freshell-ws) PLUS `ConnectionOutputQueue::route(modes_sync).is_some()` (covers the TerminalExit carve-out refactor path at backpressure.rs).
 - **D small additions:** plan tasks now include threading `surfaceReset` through both servers' attach ingress (ws-handler.ts:2786-2838 structural type + call sites; broker attach signatures; terminal.rs ingress; registry.attach params). Server skips emission when sync data is empty (with completion-clear this is provably safe). Emission keys on `surfaceReset` REGARDLESS of wire intent — hidden fresh surfaces attach as keepalive_delta sinceSeq=0 and must receive sync (background hydration is exactly where recreated hidden panes get modes before reveal).
 
+### Round 5+ / fresheyes loop (5 iterations, never a clean PASS; dispositions)
+
+Fresh-eyes rounds landed real fixes (stale-actions wipe regression →
+marker-gated wipe; wire-observed sync assertions; stale XTMODIFYKEYS doc
+claims; e2e arm-command `[>4;1m` typo; user-reset reconnect duplication
+→ surfaceWritesSinceFresh wipe gate + unit regression; Node/Rust u32 param
+parity; XTM map now capped at 128 with eviction both sides; `?7l` DECAWM
+disable restores via trailing disable — fixture f16, f17 new), plus a volume
+of fabricated round-2 findings refuted by greps and recorded below. Round 5's
+alt-buffer early-arm deliberation stays an accepted round-1 residual
+(bounded artifacts; app self-repaints; sync-first required for the common
+in-alt case). Final gate: full suites green locally; e2e 6/6.
+
 ### Round 5 / implementation-era resolution (hazard closure)
 
 - **Downgrade wipe refinement landed (marker-gated):** the forced

@@ -53,12 +53,22 @@ const REPLACEMENT_CHARACTER = 0xfffd
 // identically.)
 const CSI_PENDING_CODE_POINT_LIMIT = 64
 const FLAT_MODE_LIMIT = 128
+// Same discipline for the XTMODIFYKEYS resource map: xterm 6.0.0 never
+// emits it, but an app can stream unique resources and grow per-terminal
+// server memory without bound otherwise (fresheyes round 5).
+const XTM_RESOURCE_LIMIT = 128
 
 const MOUSE_PROTOCOL_FAMILY = new Set([9, 1000, 1002, 1003])
 const SGR_ENCODING_FAMILY = new Set([1006, 1016])
 const ALT_BUFFER_FAMILY = new Set([47, 1047, 1049])
 const DECSTR_DELETED_MODES = new Set([1, 6, 45, 66, 1004, 2004, 2026, 25])
 const CURSOR_VISIBILITY_MODE = 25
+// DECAWM wrap (?7) also defaults to ON in xterm: an app that disabled it can
+// only be restored onto a fresh surface with an explicit `?7l`.
+const WRAPAROUND_MODE = 7
+// Default-true modes whose tracked-false state restores via trailing `?Pn l`
+// bytes (ascending). Everything else in the flat map defaults OFF.
+const DEFAULT_TRUE_DISABLE_EMITTED = [WRAPAROUND_MODE, CURSOR_VISIBILITY_MODE] as const
 // ?2026 (synchronized output) is a per-frame rendering hint: re-arming it on a
 // wedged mid-frame state could stall paints, and its absence is never a
 // user-visible regression, so it is tracked but never synthesized.
@@ -160,6 +170,10 @@ export function createTerminalModeTracker(): TerminalModeTracker {
       if (!Number.isFinite(resource) || resource > 0xffffffff) return
       const value = valueText === undefined || valueText === '' ? 0 : Number.parseInt(valueText, 10)
       if (!Number.isFinite(value) || value > 0xffffffff) return
+      if (xtModifyKeys.size >= XTM_RESOURCE_LIMIT) {
+        const evicted = xtModifyKeys.keys().next().value
+        if (evicted !== undefined) xtModifyKeys.delete(evicted)
+      }
       xtModifyKeys.set(resource, value)
       return
     }
@@ -270,10 +284,11 @@ export function createTerminalModeTracker(): TerminalModeTracker {
       for (const param of enables) {
         data += `\u001b[?${param}h`
       }
-      // A default surface is cursor-visible, so an explicitly tracked ?25l
-      // trails the enables; a tracked ?25h is an ordinary enable above.
-      if (flatModes.get(CURSOR_VISIBILITY_MODE) === false) {
-        data += '\u001b[?25l'
+      // Default-true modes restore their disabled state via trailing `l`
+      // bytes (ascending): a fresh surface boots with ?7/?25 ON, so only an
+      // explicit disable brings the original session's state across.
+      for (const param of DEFAULT_TRUE_DISABLE_EMITTED) {
+        if (flatModes.get(param) === false) data += `\u001b[?${param}l`
       }
       return data
     },

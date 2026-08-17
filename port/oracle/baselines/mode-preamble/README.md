@@ -48,9 +48,15 @@ state (it is text, not structure).
    every flat param with value true.
 2. Emit ascending numeric order as `ESC [ ? Pm h`, EXCLUDING `?2026` and
    `?1004` (see above).
-3. If `?25` is explicitly tracked as FALSE, append `ESC [ ? 2 5 l` after all
-   enables (default surface is cursor-visible; an explicit `?25h` is emitted
-   like any other enable when tracked as true).
+3. Default-TRUE modes tracked as FALSE restore their default-true state with
+   an explicit disable: `?25` (cursor visibility) and `?7` (DECAWM wrap)
+   append `ESC [ ? 2 5 l` / `ESC [ ? 7 l` as trailing disables after all
+   enables, ascending (default surface has both ON; an `l` restore is the
+   only way to bring a disabled-default-true mode to a fresh surface).
+   (Only these two have defaults that matter; other flat modes default OFF.)
+4. Both the flat map and the XTMODIFYKEYS map are capped at 128 entries with
+   insertion-order eviction (old entries dropped, logged); a capable app
+   flooding unique params cannot grow per-terminal server state unboundedly.
 4. `?1049h` ahead of cursor-affecting bytes is trivially satisfied: `?1048`
    is never synthesized standalone and `?25` disable is trailing.
 

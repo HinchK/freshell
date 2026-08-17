@@ -66,6 +66,8 @@ describe('mode-preamble oracle fixtures', () => {
       'f13-cursor-visibility-restore.json',
       'f14-surface-reset-false.json',
       'f15-empty-tracker.json',
+      'f16-wraparound-disable.json',
+      'f17-xtm-cap.json',
     ])
   })
 
