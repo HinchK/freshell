@@ -72,22 +72,6 @@ describe('mode-preamble oracle fixtures', () => {
   for (const file of fixtureFiles) {
     const fixture = loadFixture(file)
 
-    if (fixture.name === 'f10-c1-opener') {
-      // Authored-fixture bug: f10's input bytes are "\u001b?1003h\u001b?2004h"
-      // (ESC followed by '?'), but — per the README's Input Domain — the C1
-      // CSI opener is U+009B ("\u009b"), and ESC '?' is a complete (unknown)
-      // two-byte ESC sequence to any ECMA-48 parser, so "?1003h" can never be
-      // tracked from those bytes. The fixture's own name, and its expected
-      // output, confirm the intent was a U+009B input. port/ ownership is
-      // outside this change's scope, so this case is pinned as expected-to-fail
-      // until the fixture bytes are corrected to "\u009b?1003h\u009b?2004h" —
-      // at which point vitest fails this run and the `it.fails` must be removed.
-      it.fails(`${fixture.name} (xfail: fixture encodes C1 CSI as ESC '?'; awaiting port/ byte fix)`, () => {
-        expect(emittedSyncData(fixture)).toBe(fixture.expectedSyncData)
-      })
-      continue
-    }
-
     it(fixture.name, () => {
       expect(emittedSyncData(fixture)).toBe(fixture.expectedSyncData)
     })

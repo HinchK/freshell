@@ -608,21 +608,6 @@ mod tests {
     fn mode_preamble_baseline_fixtures_match_expected_synthesis() {
         use std::path::PathBuf;
 
-        // KNOWN FIXTURE DEFECTS (flagged to the plan owner; the fixture files
-        // live outside this change's scope, in port/). A listed fixture is
-        // skip-verified: if it ever STARTS passing while still listed, this
-        // test fails loudly — delete it from the list instead of re-skipping.
-        //
-        // f10-c1-opener: `chunks` contain the literal bytes ESC `?1003h` /
-        // ESC `?2004h` (0x1B followed by 0x3F — an Fs escape, NOT a CSI
-        // opener). The contract README names exactly two openers — `ESC [`
-        // and C1 `U+009B` — and `expectedSyncData` only makes sense if the
-        // author meant `\u009b?1003h` (U+009B) but wrote `\u001b`. Under the
-        // README (and under xterm 6.0.0), `ESC ?` cannot open a CSI, so no
-        // README-conformant tracker can produce the expected bytes — and the
-        // Node port must face the same defect identically. Fix upstream:
-        // change the two chunk prefixes to `\u009b`.
-        const DEFECTIVE_FIXTURES: &[&str] = &["f10-c1-opener"];
 
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../port/oracle/baselines/mode-preamble");
@@ -659,15 +644,7 @@ mod tests {
             }
             let synthesized = tracker.synthesize();
 
-            if DEFECTIVE_FIXTURES.contains(&name.as_str()) {
-                assert!(
-                    synthesized != expected,
-                    "{name} now passes while still on DEFECTIVE_FIXTURES — \
-                     the upstream fixture was fixed; remove it from the list"
-                );
-                continue;
-            }
-            if !surface_reset {
+if !surface_reset {
                 // Server-gating fixture (f14): emission suppression lives in
                 // the registry's attach path, not the tracker. Skip here.
                 continue;
