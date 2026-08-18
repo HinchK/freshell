@@ -154,7 +154,8 @@ pub struct FileStat {
 /// Split into `discover` (cheap: stat every visible file) + `parse` (expensive:
 /// read + parse ONE file) so [`SessionIndex`]'s incremental cache can re-parse
 /// only what actually changed, instead of re-parsing everything on every
-/// refresh.
+/// refresh. A third stat path, [`Self::stat_scoped`], serves watcher-scoped
+/// dirty marks and MUST key the cache identically to `discover`'s stats.
 pub trait SessionSource: Send + Sync {
     /// Enumerate every file this provider can currently see — stat only
     /// (path/mtime/size), no parsing. Corruption-tolerant (an unreadable
@@ -221,6 +222,19 @@ pub trait SessionSource: Send + Sync {
     /// Default wraps the infallible `discover()` for test sources.
     fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
         Ok(self.discover())
+    }
+
+    /// Fold-aware stat for a watcher-scoped dirty path. The incremental
+    /// cache key written for `path` comes from whatever this returns, so a
+    /// source whose discover stats fold sibling state into the cache key
+    /// (amplifier's sidecar mtimes) MUST fold identically here — otherwise
+    /// the discover and scoped paths write different cache keys for the same
+    /// file (raw-vs-folded thrash + frozen recency, design lines 77-83).
+    /// `None` means the file is gone/unreadable and prunes the entry — a
+    /// source override must therefore return None when ITS canonical file is
+    /// missing regardless of surviving sidecars (never resurrect a ghost).
+    fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+        stat_file(path)
     }
 }
 
@@ -1643,13 +1657,22 @@ fn refresh_snapshot(
     // Scoped-path handling: stat + conditionally re-parse individual
     // dirty paths that weren't already covered by a provider-level
     // discover above. These paths came from the watcher (already
-    // qualified), so we only need to re-stat and re-parse on change.
+    // qualified), so we only need to re-stat and re-parse on change. The
+    // re-stat goes through the hinted source's `stat_scoped` so the cache
+    // key written here matches the discover path's key exactly (amplifier
+    // folds sidecar mtimes on both; a no-hint path keeps the raw stat).
     if !is_full {
         for (path, watcher_provider) in &scoped_paths {
             if discovered.contains(path) {
                 continue;
             }
-            match stat_file(path) {
+            let hinted = sources
+                .iter()
+                .find(|s| s.provider_name() == Some(watcher_provider.as_str()));
+            match hinted
+                .map(|s| s.stat_scoped(path))
+                .unwrap_or_else(|| stat_file(path))
+            {
                 Some(stat) => {
                     discovered.insert(path.clone());
                     let unchanged = cache
@@ -2006,24 +2029,28 @@ pub(crate) mod tests {
     /// guard -- an unchanged (or cached-excluded) file must never increment
     /// it again after its first sweep; `direct_list_calls` is the
     /// change-token-gating guard for direct-listed sources (opencode) -- an
-    /// unchanged token must never increment it again after the first sweep.
+    /// unchanged token must never increment it again after the first sweep;
+    /// `stat_scoped_calls` is the watcher-scoped sweep's observable-work pin
+    /// -- a dropped event must produce NO scoped stat either.
     pub(crate) struct CountingWrapper<S: SessionSource> {
         inner: S,
         discover_calls: Arc<AtomicUsize>,
         parse_calls: Arc<AtomicUsize>,
         direct_list_calls: Arc<AtomicUsize>,
+        stat_scoped_calls: Arc<AtomicUsize>,
     }
 
     impl<S: SessionSource> CountingWrapper<S> {
         /// Construct with fresh (zeroed) counters -- the common case, so call
         /// sites that only care about one counter don't need to spell out
-        /// all three fields.
+        /// all four fields.
         pub(crate) fn new(inner: S) -> Self {
             Self {
                 inner,
                 discover_calls: Arc::new(AtomicUsize::new(0)),
                 parse_calls: Arc::new(AtomicUsize::new(0)),
                 direct_list_calls: Arc::new(AtomicUsize::new(0)),
+                stat_scoped_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -2033,15 +2060,20 @@ pub(crate) mod tests {
     /// is OBSERVABLE WORK that always increments its counter, unlike the
     /// `subscribe_changes()` generation which stays silent when a sweep
     /// publishes unchanged content. Returns `(discover_calls, parse_calls,
-    /// direct_list_calls)` clones. (Task 5 adds the counted `stat_scoped`
-    /// passthrough and a 4th counter here.)
+    /// direct_list_calls, stat_scoped_calls)` clones.
     pub(crate) fn wrapper_counters<S: SessionSource>(
         w: &CountingWrapper<S>,
-    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         (
             Arc::clone(&w.discover_calls),
             Arc::clone(&w.parse_calls),
             Arc::clone(&w.direct_list_calls),
+            Arc::clone(&w.stat_scoped_calls),
         )
     }
 
@@ -2075,6 +2107,11 @@ pub(crate) mod tests {
         fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
             self.discover_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.discover_checked()
+        }
+
+        fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+            self.stat_scoped_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.stat_scoped(path)
         }
     }
 
@@ -5087,5 +5124,181 @@ pub(crate) mod tests {
         assert_eq!(snap2.len(), 1, "deleted file must be removed from snapshot");
 
         std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    // Regression 1 (scoped path): a sidecar-only change on an active amplifier
+    // session refreshes recency WITHOUT a full discover and without parse thrash
+    // — TWICE in sequence: the second sidecar-only change is the raw-key trap
+    // (a raw-stat cache key would be raw-equal and skip the third parse).
+    #[tokio::test]
+    async fn scoped_mark_with_sidecar_only_activity_refreshes_amplifier_recency_without_discover() {
+        let home = unique_temp_dir("scoped-fold");
+        let session_dir = {
+            let dir = home
+                .join("projects")
+                .join("slug")
+                .join("sessions")
+                .join("012584be-9478-4801-a62d-4e5da428b3a0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("metadata.json"),
+                r#"{"session_id":"s1","working_dir":"/p/w","created":"2026-03-01T00:00:00.000Z","name":"t","description":"d","turn_count":1}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+            dir
+        };
+        let metadata = session_dir.join("metadata.json");
+
+        let amplifier = crate::amplifier::AmplifierSource::new(home.clone());
+        let wrapped = CountingWrapper::new(amplifier);
+        let (discover_calls, parse_calls, _, _) = wrapper_counters(&wrapped);
+        let index = test_index_with_ttl(
+            vec![Arc::new(wrapped) as Arc<dyn SessionSource>],
+            Duration::from_secs(3600),
+        );
+
+        let snap = index.snapshot().await;
+        let row = snap.iter().find(|s| s.provider == "amplifier").unwrap();
+        let before = row.last_activity_at;
+        assert_eq!(discover_calls.load(Ordering::SeqCst), 1);
+
+        // Sidecar-only activity: transcript grows, metadata.json untouched.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+
+        let snap2 = index.snapshot().await;
+        let row2 = snap2.iter().find(|s| s.provider == "amplifier").unwrap();
+        assert!(
+            row2.last_activity_at > before,
+            "recency ADVANCES on a sidecar-only change (equality would mean the sidecar never fed the key)"
+        );
+        // Scoped path: NO second discover; exactly one re-parse (folded key changed).
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "no full/provider discover"
+        );
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            2,
+            "one initial + one scoped re-parse"
+        );
+
+        // A steady second scoped mark (no file movement) re-parses nothing,
+        // proving the folded-vs-folded cache keys match (no raw-fold thrash).
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            2,
+            "folded keys agree on both paths"
+        );
+
+        // The raw-key trap: a SECOND sidecar-only change must force a THIRD
+        // parse. A raw-stat implementation cached the raw metadata key above
+        // (unchanged again here), so it skips this re-parse and freezes
+        // activity ordering at row2 — the exact bug this regression guards.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n{\"type\":\"user\"}\n",
+        )
+        .unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+
+        let snap3 = index.snapshot().await;
+        let row3 = snap3.iter().find(|s| s.provider == "amplifier").unwrap();
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            3,
+            "the second sidecar-only change re-parses via the folded key (a raw key is raw-equal and is skipped)"
+        );
+        assert!(
+            row3.last_activity_at > row2.last_activity_at,
+            "activity ordering advances STRICTLY on every sidecar-only change ({} > {})",
+            row3.last_activity_at,
+            row2.last_activity_at
+        );
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "still no full/provider discover"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // Regression 8: metadata.json deleted, sidecars survive — scoped mark prunes.
+    #[tokio::test]
+    async fn metadata_json_deleted_but_sidecars_survive_still_prunes_never_resurrects() {
+        let home = unique_temp_dir("scoped-prune");
+        let session_dir = {
+            let dir = home
+                .join("projects")
+                .join("slug")
+                .join("sessions")
+                .join("012584be-9478-4801-a62d-4e5da428b3a0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("metadata.json"),
+                r#"{"session_id":"s1","working_dir":"/p/w","created":"2026-03-01T00:00:00.000Z"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+            std::fs::write(dir.join("events.jsonl"), "{}\n").unwrap();
+            dir
+        };
+        let metadata = session_dir.join("metadata.json");
+        let index = test_index_with_ttl(
+            vec![
+                Arc::new(crate::amplifier::AmplifierSource::new(home.clone()))
+                    as Arc<dyn SessionSource>,
+            ],
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            1
+        );
+
+        std::fs::remove_file(&metadata).unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            0,
+            "metadata.json deletion prunes even with surviving sidecars"
+        );
+        // A repeat mark must not resurrect the row.
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            0
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

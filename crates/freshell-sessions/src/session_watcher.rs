@@ -22,11 +22,13 @@
 //!   (idempotently — a rename's untracked duplicate `Name(From)` is a clean
 //!   no-op), a paired `Name(Both)` splits into its remove + create
 //!   endpoints, and depth-3 subagent mkdirs escalate only on declared
-//!   interest; all other events take the legacy pending-map flow. Two
-//!   resource alarms guard the accepted unbounded root-session watch
-//!   growth: an edge-triggered WARN at >25% of the kernel inotify watch
-//!   limit (checked after every arm batch) and a daily-bucketed WARN on
-//!   unknown-format arm drift.
+//!   interest. Depth-4 file events fold onto scoped `metadata.json` marks
+//!   (a depth-4 folder create is dropped), and anything not routed is
+//!   dropped by default — amplifier events never take the legacy
+//!   pending-map escalation path. Two resource alarms guard the accepted
+//!   unbounded root-session watch growth: an edge-triggered WARN at >25%
+//!   of the kernel inotify watch limit (checked after every arm batch) and
+//!   a daily-bucketed WARN on unknown-format arm drift.
 //! - Debounced flush (200ms) delivers dirty paths to `SessionIndex::mark_dirty`
 //! - Late-root handling: legacy providers watch the nearest existing ancestor
 //!   when the provider root doesn't exist yet; the amplifier projects root
@@ -64,9 +66,9 @@ const REARM_INTERVAL_SECS: u64 = 60;
 /// A coarse, provider-agnostic classification of one notify event. The
 /// amplifier managed engine consumes it; the legacy providers' flush
 /// ignores it. `CreateFolder` deliberately preserves the
-/// `CreateKind::Folder` distinction: depth-4+ routing (Task 5) drops a
+/// `CreateKind::Folder` distinction: depth-4 routing drops a
 /// folder creation (`context-intelligence/` mkdir) while scoped-marking
-/// a file creation, and structural depths (Tasks 3-4) treat
+/// a file creation, and structural depths treat
 /// `CreateFolder` as create-ish because a mkdir IS a `Create(Folder)`
 /// under inotify. `Remove` deliberately does NOT carry the notify
 /// dir-vs-file tag: a directly-armed directory's self-delete surfaces as
@@ -1046,15 +1048,19 @@ fn amplifier_depth(projects_root: &Path, path: &Path) -> Option<usize> {
         .map(|r| r.components().count())
 }
 
-/// One amplifier FileChanged path, routed by depth: structural create-ish
-/// kinds (`Create | CreateFolder | NameTo | NameBoth` — a mkdir surfaces
-/// as `CreateFolder`) at depths 1-3 run the managed arm path with
+/// One amplifier FileChanged path, routed by DEPTH below the projects root
+/// (never by parent basename): structural create-ish kinds
+/// (`Create | CreateFolder | NameTo | NameBoth` — a mkdir surfaces as
+/// `CreateFolder`) at depths 1-3 run the managed arm path with
 /// `emit_marks: true` (runtime events scan what they arm; only startup
 /// skips marks); structural remove-ish kinds (`Remove | NameFrom`) at
 /// depths 0-3 run [`write_remove_dispatch`] (renames: a `Name(To)` at
 /// depths 1/3 IS a create — a `mv`'d root session dir re-arms first-line).
-/// Everything else falls through to the legacy pending map (Task 5 owns
-/// depth-4 scoped routing).
+/// File-level (depth 4) events inside an armed root session dir fold onto
+/// a scoped `metadata.json` mark batched through `pending` — EXCEPT a
+/// folder creation, which is dropped outright. Everything else is dropped
+/// by default: amplifier events NEVER reach the legacy pending map's
+/// provider-escalation branch.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_amplifier_path(
     book: &mut ManagedBook,
@@ -1084,7 +1090,8 @@ fn dispatch_amplifier_path(
         (Some(1), true) => cascade_new_project(book, watcher, outcome, path, true),
         // Depth 2: `sessions/` appearing under an armed stand-in — swap to
         // the real sessions arm (which cascades). Other stand-in children
-        // fall through to the legacy flow.
+        // (e.g. a `{project}/recipe-sessions/` tree) are dropped by default
+        // (regression 14b).
         (Some(2), true) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
             if let Some(project) = path.parent() {
                 arm_sessions_or_standin(book, watcher, outcome, project, true);
@@ -1110,23 +1117,47 @@ fn dispatch_amplifier_path(
                 pending_rescans.insert("amplifier".to_owned());
             }
         }
-        _ => {
-            pending.insert((path.to_path_buf(), "amplifier".to_owned()), Instant::now());
+        // Depth 4: file-level events inside an armed root session dir. A
+        // FOLDER creation (the `context-intelligence/` mkdir) is DROPPED —
+        // sub-session trees are never watched and never marked (regression
+        // 6). Every other kind (sidecar writes, tmp+rename metadata
+        // replacements, backups, plus remove/rename-away variants) folds
+        // onto ONE scoped mark on the sibling metadata.json — NO filename
+        // whitelist (temp/backup files fold onto the canonical mark) —
+        // batched into `pending` (deduped per flush) so the index re-stats
+        // fold-aware and re-parses only that one session (regression 5).
+        // The rewritten mark still passes the flush's
+        // `AmplifierLayout::qualifies` safety check, so amplifier events
+        // never reach the `dirty_provider_names` escalation branch.
+        (Some(4), _) if kind != WatchKind::CreateFolder => {
+            if let Some(session_dir) = path.parent() {
+                pending.insert(
+                    (session_dir.join("metadata.json"), "amplifier".to_owned()),
+                    Instant::now(),
+                );
+            }
         }
+        // Dropped by default: the depth-4 folder create, depths ≥5
+        // (unreachable under NonRecursive arms — defensive), non-`sessions/`
+        // stand-in children, and non-createish strays at structural depths.
+        _ => {}
     }
 }
 
-/// Drain an [`ArmOutcome`] into the index — the async-loop side of the
-/// hand-back: scoped `metadata.json` marks per file-state arm, then a
-/// provider-level dirty flag.
-fn drain_arm_outcome(index: &SessionIndex, provider: &str, outcome: ArmOutcome) {
-    if !outcome.marks.is_empty() {
-        let marks: Vec<(PathBuf, String)> = outcome
-            .marks
-            .into_iter()
-            .map(|path| (path, provider.to_owned()))
-            .collect();
-        index.mark_dirty(&marks);
+/// Drain an [`ArmOutcome`] into the loop's coalescing maps — the
+/// async-loop side of the hand-back: scoped `metadata.json` marks per
+/// file-state arm land in the SAME `pending` map the depth-4 rewrites use
+/// (event-time arm marks coalesce with them; the flush batches everything
+/// through one `index.mark_dirty`), then a provider-level dirty flag marks
+/// the provider directly.
+fn drain_arm_outcome(
+    index: &SessionIndex,
+    pending: &mut HashMap<(PathBuf, String), Instant>,
+    provider: &str,
+    outcome: ArmOutcome,
+) {
+    for mark in outcome.marks {
+        pending.insert((mark, provider.to_owned()), Instant::now());
     }
     if outcome.provider_dirty {
         index.mark_provider_dirty(provider);
@@ -1261,6 +1292,14 @@ async fn run_watcher_loop(
     // provider is installed or the transient error resolves.
     let mut absent: Vec<(usize, PathBuf)> = Vec::new();
 
+    // File-level events keyed by (path, provider) → last-seen instant.
+    // Declared before the arming loop: the amplifier startup apply's
+    // ArmOutcome drain lands its scoped marks here too (the flush batches
+    // arm marks and depth-4 rewrites through one `mark_dirty`).
+    let mut pending: HashMap<(PathBuf, String), Instant> = HashMap::new();
+    // Providers that need a full rescan (direct-listed change, rescan flag, or error).
+    let mut pending_rescans: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for (prov_idx, provider) in providers.iter().enumerate() {
         let name = provider.layout.name().to_owned();
 
@@ -1337,7 +1376,7 @@ async fn run_watcher_loop(
                             targets: Vec::new(),
                         },
                     );
-                    drain_arm_outcome(&index, &name, outcome);
+                    drain_arm_outcome(&index, &mut pending, &name, outcome);
                 }
                 Err(e) => {
                     // The helpers never panic, so this is unreachable in
@@ -1430,10 +1469,6 @@ async fn run_watcher_loop(
 
     // Coalescing event loop.
     let debounce = Duration::from_millis(DEBOUNCE_MS);
-    // File-level events keyed by (path, provider) → last-seen instant.
-    let mut pending: HashMap<(PathBuf, String), Instant> = HashMap::new();
-    // Providers that need a full rescan (direct-listed change, rescan flag, or error).
-    let mut pending_rescans: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rearm_interval = tokio::time::interval(Duration::from_secs(rearm_interval_secs));
     rearm_interval.tick().await; // consume the immediate first tick
 
@@ -1536,7 +1571,7 @@ async fn run_watcher_loop(
                                         pending.insert((path, provider.clone()), Instant::now());
                                     }
                                 }
-                                drain_arm_outcome(&index, "amplifier", outcome);
+                                drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
                             }
                             None => {
                                 for path in paths {
@@ -1774,7 +1809,7 @@ async fn run_watcher_loop(
                                     // sites (the retry-drain batch and the
                                     // absent-root-return cascade).
                                     check_watch_budget(&mut amp.book.lock().unwrap());
-                                    drain_arm_outcome(&index, "amplifier", outcome);
+                                    drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
                                 }
                                 Err(e) => {
                                     tracing::warn!(

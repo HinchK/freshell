@@ -408,19 +408,19 @@ fn amplifier_watcher(index: &Arc<SessionIndex>, home: &Path) -> SessionWatcher {
 /// scoped stat ALWAYS increments its counter) — never only on
 /// `subscribe_changes()`, whose generation bumps only when the published
 /// CONTENT changes, so an index-equivalent erroneous sweep would leave
-/// the receiver silent while the prohibited CPU work ran anyway. (Task 5
-/// grows the struct with `stat_scoped_calls` when the counted passthrough
-/// lands; only fields a test actually reads live here, or the clippy
-/// `-D warnings` gate would flag a dead one.)
+/// the receiver silent while the prohibited CPU work ran anyway. (Only
+/// fields a test actually reads live here, or the clippy `-D warnings`
+/// gate would flag a dead one.)
 struct CountedAmplifierIndex {
     index: Arc<SessionIndex>,
     discover_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stat_scoped_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn counted_amplifier_index(home: &Path) -> CountedAmplifierIndex {
     let amplifier = crate::amplifier::AmplifierSource::new(home.to_path_buf());
     let wrapped = crate::directory_index::tests::CountingWrapper::new(amplifier);
-    let (discover_calls, _parse_calls, _direct_list_calls) =
+    let (discover_calls, _parse_calls, _direct_list_calls, stat_scoped_calls) =
         crate::directory_index::tests::wrapper_counters(&wrapped);
     let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
         vec![Arc::new(wrapped) as Arc<dyn crate::directory_index::SessionSource>],
@@ -430,6 +430,7 @@ fn counted_amplifier_index(home: &Path) -> CountedAmplifierIndex {
     CountedAmplifierIndex {
         index,
         discover_calls,
+        stat_scoped_calls,
     }
 }
 
@@ -1374,4 +1375,181 @@ fn watch_budget_warn_fires_once_per_crossing_and_rearms_below() {
     // ...and the next crossing warns again.
     let (_, emit) = watch_budget_edge(warned, 27, max);
     assert!(emit, "re-armed edge warns on the next crossing");
+}
+
+// ---------- file-depth routing ----------
+
+/// Regression 5: sidecar/tmp/backup churn inside a watched root session dir
+/// produces scoped metadata.json marks — never provider-dirty; steady
+/// activity triggers no repeated full discovers.
+#[tokio::test]
+async fn amplify_file_depth_events_route_to_scoped_metadata_marks_and_never_escalate() {
+    use std::sync::atomic::Ordering;
+    let home = unique_temp_dir("amp-filedepth");
+    let session = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let amplifier = crate::amplifier::AmplifierSource::new(home.clone());
+    let wrapped = crate::directory_index::tests::CountingWrapper::new(amplifier);
+    let (discover_calls, _, _, _) = crate::directory_index::tests::wrapper_counters(&wrapped);
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![Arc::new(wrapped) as Arc<dyn crate::directory_index::SessionSource>],
+        Duration::from_secs(3600),
+        None,
+    ));
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(book.lock().unwrap().armed.contains(&session));
+    let baseline_discovers = discover_calls.load(Ordering::SeqCst);
+
+    // Steady heavy activity: sidecar append + tmp+rename metadata (VALID
+    // content, so the row stays) + backup + the other sidecar.
+    std::fs::write(session.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+    std::fs::write(
+        session.join("metadata.json.tmp"),
+        r#"{"session_id":"s1","working_dir":"/p/p","created":"2026-03-01T00:00:00.000Z","name":"t2"}"#,
+    )
+    .unwrap();
+    std::fs::rename(
+        session.join("metadata.json.tmp"),
+        session.join("metadata.json"),
+    )
+    .unwrap();
+    std::fs::write(session.join("metadata.json.backup"), b"{}").unwrap();
+    std::fs::write(session.join("events.jsonl"), "{}\n").unwrap();
+
+    let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(changed.is_ok(), "scoped marks refresh the index");
+    let mut settles = 0;
+    for _ in 0..20 {
+        if !index.has_dirty() {
+            settles += 1;
+            if settles >= 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        discover_calls.load(Ordering::SeqCst) == baseline_discovers,
+        "no repeated full discovers: baseline {baseline_discovers}, now {}",
+        discover_calls.load(Ordering::SeqCst)
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression 6: a `context-intelligence/` mkdir inside a session dir
+/// results in NO index activity at all (dropped at depth 4). The pins are
+/// OBSERVABLE WORK, not just the generation wait: a directory created at
+/// depth 4 must produce NO scoped mark (`stat_scoped_calls` never moves —
+/// had the mkdir been rewritten to a metadata.json mark, the background
+/// refresh would have stat'ed it) AND no provider-scan work
+/// (`discover_calls` never moves — an erroneous escalation's discover over
+/// identical content would not bump the generation, so the receiver timeout
+/// alone would be vacuous). The `WatchKind::CreateFolder` distinction
+/// (Task 2) is what lets this routing exist.
+#[tokio::test]
+async fn mkdir_inside_watched_session_dir_is_dropped_no_discover() {
+    use std::sync::atomic::Ordering;
+    let home = unique_temp_dir("amp-mkdir-drop");
+    let session = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let counted = counted_amplifier_index(&home);
+    let index = counted.index.clone();
+    let mut watcher = amplifier_watcher(&index, &home);
+    let _book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let baseline_discovers = counted.discover_calls.load(Ordering::SeqCst);
+    let baseline_scoped_stats = counted.stat_scoped_calls.load(Ordering::SeqCst);
+
+    std::fs::create_dir_all(session.join("context-intelligence")).unwrap();
+    std::fs::write(
+        session.join("context-intelligence").join("index.json"),
+        b"{}",
+    )
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), rx.changed())
+            .await
+            .is_err(),
+        "folder mkdir + its contents never reach the index"
+    );
+    // Past the 200ms debounce flush and the fire-and-forget refresh: the
+    // mkdir produced no mark and no sweep.
+    assert_eq!(
+        counted.discover_calls.load(Ordering::SeqCst),
+        baseline_discovers,
+        "no discover ran for the depth-4 mkdir"
+    );
+    assert_eq!(
+        counted.stat_scoped_calls.load(Ordering::SeqCst),
+        baseline_scoped_stats,
+        "no scoped stat ran — the mkdir created NO mark either"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression 14b: events under a stand-in watch that aren't `sessions/`
+/// (the real `{project}/recipe-sessions/` tree) are dropped by default.
+/// Same observable-work pins as the other negative tests: neither a
+/// discover nor a scoped stat may run for the dropped tree.
+#[tokio::test]
+async fn standin_project_children_other_than_sessions_are_dropped() {
+    use std::sync::atomic::Ordering;
+    let home = unique_temp_dir("amp-standin-drop");
+    let proj = home.join("projects").join("{project}");
+    std::fs::create_dir_all(&proj).unwrap(); // stand-in target
+    let counted = counted_amplifier_index(&home);
+    let index = counted.index.clone();
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(book.lock().unwrap().armed.contains(&proj));
+    let baseline_discovers = counted.discover_calls.load(Ordering::SeqCst);
+    let baseline_scoped_stats = counted.stat_scoped_calls.load(Ordering::SeqCst);
+
+    let odd = proj.join("recipe-sessions").join("nested");
+    std::fs::create_dir_all(&odd).unwrap();
+    std::fs::write(odd.join("data.json"), b"{}").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), rx.changed())
+            .await
+            .is_err(),
+        "recipes tree is dropped"
+    );
+    assert_eq!(
+        counted.discover_calls.load(Ordering::SeqCst),
+        baseline_discovers,
+        "no discover ran for dropped stand-in children"
+    );
+    assert_eq!(
+        counted.stat_scoped_calls.load(Ordering::SeqCst),
+        baseline_scoped_stats,
+        "no scoped mark was created for dropped stand-in children"
+    );
+    // And nothing under it got armed.
+    {
+        let b = book.lock().unwrap();
+        assert!(!b
+            .armed
+            .iter()
+            .any(|p| p.to_string_lossy().contains("recipe-sessions")));
+    } // guard released before the async stop-and-join
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
 }
