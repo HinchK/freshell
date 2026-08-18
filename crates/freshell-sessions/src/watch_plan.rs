@@ -229,9 +229,8 @@ pub(crate) fn classify_arm_error(err: &notify::Error) -> ArmErr {
         },
         // `ErrorKind::MaxFilesWatch` → Transient via this default arm:
         // watch-limit exhaustion clears and evicted paths re-arm after the
-        // pressure releases. `MaxFilesWatch` has no pub constructor in
-        // notify 6.1.1 (verified against the vendored error.rs), so it is
-        // exercised only through this default coverage, not a unit test.
+        // pressure releases. Pinned in the classifier test via
+        // `notify::Error::new(notify::ErrorKind::MaxFilesWatch)`.
         _ => ArmErr::Transient,
     }
 }
@@ -450,9 +449,8 @@ mod tests {
     fn classify_arm_error_splits_deterministic_io_from_transient() {
         use std::io::ErrorKind;
         // notify 6.1.1 API (verified against the vendored error.rs):
-        // `Error::io` and `Error::path_not_found` are pub constructors;
-        // `ErrorKind::MaxFilesWatch` exists but has no pub constructor, so
-        // its Transient arm is default-covered (not test-constructible).
+        // `Error::new`, `Error::io`, and `Error::path_not_found` are pub
+        // constructors, so every variant below is constructed directly.
         assert!(matches!(
             classify_arm_error(&notify::Error::path_not_found()),
             ArmErr::Deterministic
@@ -477,6 +475,12 @@ mod tests {
         ));
         assert!(matches!(
             classify_arm_error(&notify::Error::io(std::io::Error::from(ErrorKind::Other))),
+            ArmErr::Transient
+        ));
+        // Watch-limit exhaustion is transient: pressure clears and evicted
+        // paths re-arm on retry.
+        assert!(matches!(
+            classify_arm_error(&notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
             ArmErr::Transient
         ));
     }
