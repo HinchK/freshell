@@ -729,8 +729,10 @@ test.describe('Multi-Client', () => {
     // _reportFocus immediately emits ESC[I/ESC[O on a focused surface — so a
     // sync preamble replaying ?1004h would deterministically inject junk
     // into the app's stdin. The preamble therefore tracks but NEVER emits
-    // ?1004. (Replaying the ORIGINAL arming byte while it is still inside
-    // the retained window is a pre-existing leak, out of scope here.)
+    // ?1004. (Replaying the ORIGINAL arming byte from the retained window no
+    // longer leaks either: kata 9gy8 silences the phantom report at onData;
+    // pinned by "mode replay-sync: replay no longer injects phantom xterm
+    // focus reports (kata 9gy8)" later in this spec.)
     //
     // This pins the wire behavior DIRECTLY: arm both a representative mode
     // (?2004, included) and ?1004, reload (fresh surface → surfaceReset
@@ -816,6 +818,96 @@ test.describe('Multi-Client', () => {
       const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
       return modes?.bracketedPasteMode === true
     }, terminalId, { timeout: 20_000 })
+
+    await context.close()
+  })
+
+  test('mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)', async ({ browser, serverInfo }) => {
+    // Kata 9gy8 wire proof. xterm 6.0.0 re-fires the app's ?1004 focus-report
+    // switch on EVERY ?1004h parse — including when the arming byte is inside
+    // a replayed history chunk (page reload here) — and _reportFocus
+    // immediately emits ESC[I (focused surface) / ESC[O (unfocused) as
+    // synthetic input. The client gate (TerminalView onData +
+    // isReplayPhantomFocusReport) must swallow that invented keypress while
+    // the replay write scope is open, so the shell/app never sees an
+    // un-requested focus keystroke. The arm itself must survive: the replayed
+    // arm byte still sets sendFocusMode on the fresh surface (asserted via
+    // the harness modes accessor) — the mode is re-armed, the report is not.
+    test.setTimeout(120_000)
+    const context = await newClientContext(browser)
+    const page = await context.newPage()
+    await page.setViewportSize({ width: 1400, height: 900 })
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await waitForReady(page)
+    await ensureTerminalReady(page)
+
+    const terminalId = await getActiveTerminalId(page)
+    expect(terminalId).toBeTruthy()
+    await flushPersistedLayout(page, terminalId!)
+
+    // Arm focus reporting exactly like a terminal app would (keyboard-typed
+    // printf, matching the sibling mode-sync specs). The arm byte is now
+    // inside the retained replay window, so the reload below re-feeds it to
+    // a fresh xterm surface.
+    await executeCommand(page, `printf '\\x1b[?1004h'; echo __FOCUS_ARMED__`)
+    await waitForTerminalText(page, '__FOCUS_ARMED__', terminalId!)
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.sendFocusMode === true
+    }, terminalId, { timeout: 15_000 })
+
+    // Reload: fresh xterm surface, rehydrated via surfaceReset attach + sync
+    // preamble + retained-window replay. The reload installs a fresh harness,
+    // so getSentWsMessages is a clean, window-scoped record of every
+    // client→server message since boot — that IS the assertion window: it
+    // starts at reload-ready by construction and ends just after the arm is
+    // re-observed; a genuine live focus report cannot flake it here because
+    // no focus change occurs post-arm in this flow.
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await waitForReady(page)
+
+    // The fresh surface must claim a full wipe+hydrate and re-present the
+    // marker — proof the retained window (containing the ?1004h byte) replayed.
+    await page.waitForFunction((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((m: any) =>
+        m?.type === 'terminal.attach'
+        && m?.terminalId === id
+        && m?.surfaceReset === true
+        && m?.sinceSeq === 0)
+    }, terminalId, { timeout: 45_000 })
+    await waitForTerminalText(page, '__FOCUS_ARMED__', terminalId!, 45_000)
+
+    // Arm restored by the replay: xterm parsed ?1004h out of the replayed
+    // chunk. This is the meaning-proving half — without it, "no phantom
+    // input" would pass vacuously on a surface that never saw the arm byte.
+    // xterm sets decPrivateModes.sendFocus and fires _reportFocus in the SAME
+    // parse step, so by the time this wait resolves the phantom (pre-fix)
+    // has already been emitted and recorded.
+    await page.waitForFunction((id) => {
+      const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
+      return modes?.sendFocusMode === true
+    }, terminalId, { timeout: 45_000 })
+
+    // Short settle for any same-tick send-path drift, then close the window:
+    // no terminal.input this client sent since reload may contain ESC[I or
+    // ESC[O (checked against both directions — the fresh surface has no
+    // 'focus' class headlessly — which variant the phantom takes depends on
+    // xterm's focus class at arm-parse time; the gate is byte-exact either
+    // way, so assert against both).
+    await page.waitForTimeout(500)
+    const phantomInputs: any[] = await page.evaluate((id) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.filter((m: any) =>
+        m?.type === 'terminal.input'
+        && m?.terminalId === id
+        && typeof m?.data === 'string'
+        && (m.data.includes('\u001b[I') || m.data.includes('\u001b[O')))
+    }, terminalId)
+    expect(
+      phantomInputs,
+      `replay of the ?1004h arm byte must not inject a focus report into the app; got: ${JSON.stringify(phantomInputs)}`,
+    ).toHaveLength(0)
 
     await context.close()
   })

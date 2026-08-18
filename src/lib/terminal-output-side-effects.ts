@@ -93,3 +93,24 @@ export function shouldAllowTerminalOutputSideEffect(
 
   return false
 }
+
+const XTERM_FOCUS_IN = '\u001b[I'
+const XTERM_FOCUS_OUT = '\u001b[O'
+
+/**
+ * xterm fires ESC[I / ESC[O synchronously from its parser every time it
+ * parses a ?1004h arm byte — including when that byte arrives via history
+ * replay (kata 9gy8). Such a replay-triggered report is a phantom: nothing
+ * about user focus changed, and the app receives an invented keypress.
+ * The replay write scope (“suppressExternalSideEffects”) is held open until
+ * xterm's write callback, which covers both synchronous and deferred parses,
+ * so it is the correct discriminator; the exact-bytes check keeps all other
+ * input untouched.
+ */
+export function isReplayPhantomFocusReport(
+  data: string,
+  terminalInstanceId: string | undefined,
+): boolean {
+  if (data !== XTERM_FOCUS_IN && data !== XTERM_FOCUS_OUT) return false
+  return getTerminalOutputWriteScope(terminalInstanceId)?.suppressExternalSideEffects === true
+}

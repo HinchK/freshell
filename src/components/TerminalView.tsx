@@ -131,6 +131,7 @@ import {
   shouldAllowTerminalOutputSideEffect,
   type TerminalOutputSource,
 } from '@/lib/terminal-output-write-scope'
+import { isReplayPhantomFocusReport } from '@/lib/terminal-output-side-effects'
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
@@ -2292,6 +2293,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     requestTerminalLayout({ fit: true, focus: true })
 
     term.onData((data) => {
+      if (isReplayPhantomFocusReport(data, terminalInstanceId)) {
+        // Kata 9gy8: xterm re-fired a focus report because a replay chunk
+        // contained the app's ?1004h arm byte. Nothing about user focus
+        // changed; this is invented input. Swallow silently (no send, no
+        // activity) — the tracked mode state is untouched. The gate sits
+        // before EVERYTHING below (sendInput, engagement/activity recording)
+        // and before any "bind later" input buffering.
+        log.debug('replay phantom focus report silenced (kata 9gy8)', {
+          paneId,
+          tabId,
+          // data is known-exact here (the gate only matches the two focus
+          // report strings), so endsWith safely reads the direction.
+          direction: data.endsWith('[I') ? 'in' : 'out',
+        })
+        return
+      }
       sendInput(data)
       // Decision 1: a real keystroke (printable / Enter) dismisses this tab's green
       // in BOTH attentionDismiss modes. Bare arrows / synthetic sequences do not.

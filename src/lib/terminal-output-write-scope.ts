@@ -22,25 +22,36 @@ export type TerminalOutputWriteContext = {
   suppressExternalSideEffects: boolean
 }
 
-const activeScopes = new Map<string, TerminalOutputWriteContext>()
+const activeScopes = new Map<string, TerminalOutputWriteContext[]>()
 
 export function getTerminalOutputWriteScope(
   terminalInstanceId: string | undefined,
 ): TerminalOutputWriteContext | null {
   if (!terminalInstanceId) return null
-  return activeScopes.get(terminalInstanceId) ?? null
+  const stack = activeScopes.get(terminalInstanceId)
+  if (!stack || stack.length === 0) return null
+  return stack[stack.length - 1]
 }
 
 export function beginTerminalOutputWriteScope(
   context: TerminalOutputWriteContext,
 ): { complete: () => void } {
-  activeScopes.set(context.terminalInstanceId, context)
+  let stack = activeScopes.get(context.terminalInstanceId)
+  if (!stack) {
+    stack = []
+    activeScopes.set(context.terminalInstanceId, stack)
+  }
+  stack.push(context)
   let completed = false
   return {
     complete: () => {
       if (completed) return
       completed = true
-      if (activeScopes.get(context.terminalInstanceId) === context) {
+      const index = stack.indexOf(context)
+      if (index !== -1) {
+        stack.splice(index, 1)
+      }
+      if (stack.length === 0) {
         activeScopes.delete(context.terminalInstanceId)
       }
     },

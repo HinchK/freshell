@@ -122,7 +122,10 @@ One shared JSON family `port/oracle/baselines/mode-preamble/*.json` (input: trac
   report on ANY arm — including the REPLAY of the original arming byte while
   it is still inside the retained window — a pre-existing leak (kata 9gy8)
   that would make any junk-free window assertion conflate two distinct
-  mechanisms. The sync-exclusion wire pin is the property this branch owns.
+  mechanisms. **RESOLVED (follow-up branch the-usual/kata-9gy8-focus-silence)**:
+  replay-sourced focus reports are silenced at the client onData gate;
+  see docs/plans/2026-08-17-kata-9gy8-replay-focus-silence.md. The
+  sync-exclusion wire pin is the property this branch owns.
 - Marker-forcing rule coverage: renderer-recreate (settings change) → next attach has surfaceReset=true AND sinceSeq=0 (no delta-on-blank-surface).
 
 ### 6. Live verification (same shape as PR#649 Task 3)

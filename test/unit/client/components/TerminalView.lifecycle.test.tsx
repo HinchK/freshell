@@ -6,6 +6,8 @@ import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { removeLayout, requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
+import sessionActivityReducer from '@/store/sessionActivitySlice'
+import tabRecencyReducer from '@/store/tabRecencySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
@@ -9961,4 +9963,315 @@ describe('terminal.modes.sync (surface-reset mode preamble)', () => {
     return terminalWriteStrings(term)
   }
   function storeSentCount(): number { return wsMocks.send.mock.calls.length }
+})
+
+describe('replay phantom focus report silencing (kata 9gy8)', () => {
+  let messageHandler: ((msg: any) => void) | null = null
+  let reconnectHandler: (() => void) | null = null
+
+  const TERMINAL_ID = 'term-9gy8-focus'
+  const TAB_ID = 'tab-9gy8-focus'
+  const PANE_ID = 'pane-9gy8-focus'
+
+  const FOCUS_IN = '\u001b[I'
+  const FOCUS_OUT = '\u001b[O'
+  const ARM_FOCUS_REPORTING = '\u001b[?1004h'
+
+  function setupPane() {
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-9gy8-focus',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId: TERMINAL_ID,
+    }
+    const root: PaneNode = { type: 'leaf', id: PANE_ID, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        tabRecency: tabRecencyReducer,
+        sessionActivity: sessionActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: TAB_ID,
+            mode: 'shell',
+            status: 'running',
+            title: 'Shell',
+            titleSetByUser: false,
+            terminalId: TERMINAL_ID,
+            createRequestId: 'req-9gy8-focus',
+          }],
+          activeTabId: TAB_ID,
+        },
+        panes: {
+          layouts: { [TAB_ID]: root },
+          activePane: { [TAB_ID]: PANE_ID },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-9gy8' },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
+        tabRecency: { version: 1, paneLastInputAt: {} },
+        sessionActivity: { sessions: {} },
+      },
+    })
+    return { store, paneContent }
+  }
+
+  function sentAttaches() {
+    return wsMocks.send.mock.calls
+      .map(([m]) => m)
+      .filter((m) => m?.type === 'terminal.attach' && m.terminalId === TERMINAL_ID)
+  }
+
+  function sentInputs() {
+    return wsMocks.send.mock.calls
+      .map(([m]) => m)
+      .filter((m) => m?.type === 'terminal.input' && m.terminalId === TERMINAL_ID)
+  }
+
+  function sentFocusReports() {
+    return sentInputs().filter((m) => m?.data === FOCUS_IN || m?.data === FOCUS_OUT)
+  }
+
+  function inputActivityActionTypes(dispatchSpy: ReturnType<typeof vi.fn>): string[] {
+    return dispatchSpy.mock.calls
+      .map((call) => (call[0] as { type?: unknown } | undefined)?.type)
+      .filter((type): type is string => typeof type === 'string')
+      .filter((type) => type === 'tabRecency/recordPaneTabActivity' || type === 'sessionActivity/updateSessionActivity')
+  }
+
+  function getTerm() {
+    const term = terminalInstances[terminalInstances.length - 1]
+    expect(term, 'a mock xterm instance must exist').toBeTruthy()
+    return term
+  }
+
+  function getOnDataHandler(): (data: string) => void {
+    const handler = getTerm().onData.mock.calls.at(-1)?.[0]
+    expect(handler, 'xterm onData handler must be registered').toBeTruthy()
+    return handler
+  }
+
+  async function renderPane() {
+    const { store, paneContent } = setupPane()
+    // Activity-observation pattern (same as TerminalView.lastInputAt.test.tsx):
+    // a pass-through dispatch spy, installed BEFORE render so useAppDispatch
+    // captures it.
+    const originalDispatch = store.dispatch
+    const dispatchSpy = vi.fn((action) => originalDispatch(action))
+    store.dispatch = dispatchSpy as typeof store.dispatch
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB_ID} paneId={PANE_ID} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+      expect(messageHandler).not.toBeNull()
+      expect(reconnectHandler).not.toBeNull()
+    })
+    return { store, dispatchSpy }
+  }
+
+  async function beginAttachWithReplayWindow(replayToSeq: number) {
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        headSeq: replayToSeq,
+        replayFromSeq: 1,
+        replayToSeq,
+      })
+    })
+  }
+
+  // Drive a replay chunk whose write fires the registered xterm onData handler
+  // with `fireDuringWrite` WHILE the chunk's replay write scope is still open —
+  // the exact timing a real xterm produces when a replayed chunk contains the
+  // app's ?1004h arm byte (xterm's parser re-fires the report mid-parse, before
+  // the write callback runs and completes the scope). Firing onData after the
+  // write resolves would be post-scope and would NOT exercise the gate.
+  function writeReplayChunk(input: { seqStart: number; seqEnd: number; data: string; fireDuringWrite?: string }) {
+    const term = getTerm()
+    if (input.fireDuringWrite !== undefined) {
+      const onData = getOnDataHandler()
+      const payload = input.fireDuringWrite
+      term.write.mockImplementationOnce((_chunk: string, onWritten?: () => void) => {
+        onData(payload)
+        onWritten?.()
+      })
+    }
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: input.seqStart,
+        seqEnd: input.seqEnd,
+        data: input.data,
+      })
+    })
+  }
+
+  beforeEach(() => {
+    vi.useRealTimers()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    __resetLastSentViewportCacheForTests()
+    resetHydrationQueueForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPersistFlushListenersForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    wsMocks.isReady = true
+    wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg.terminalId === 'string'
+        && typeof msg.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
+    wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
+      messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
+      return () => { messageHandler = null }
+    })
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        if (reconnectHandler === callback) reconnectHandler = null
+      }
+    })
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+      return 1
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    terminalInstances.length = 0
+    runtimeMocks.instances.length = 0
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+    installPerfAuditBridge(null)
+    restoreMocks.consumeTerminalRestoreRequestId.mockReset()
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    terminalThemeMocks.getTerminalTheme.mockReset()
+    terminalThemeMocks.getTerminalTheme.mockReturnValue({})
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    resetHydrationQueueForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    messageHandler = null
+    reconnectHandler = null
+    installPerfAuditBridge(null)
+  })
+
+  it('swallows a phantom focus-in report fired while the replay write scope is open (no ws input, no input activity)', async () => {
+    const { store, dispatchSpy } = await renderPane()
+    await beginAttachWithReplayWindow(1)
+
+    dispatchSpy.mockClear()
+    writeReplayChunk({
+      seqStart: 1,
+      seqEnd: 1,
+      data: `${ARM_FOCUS_REPORTING}armed prompt$ `,
+      fireDuringWrite: FOCUS_IN,
+    })
+
+    // The replay chunk itself renders — the arm byte's text companions are written.
+    expect(terminalWriteStrings(getTerm()).join('')).toContain('armed prompt$ ')
+    // But the phantom report the parse invented reaches neither the wire nor the
+    // input-activity ledgers.
+    expect(sentFocusReports()).toEqual([])
+    expect(inputActivityActionTypes(dispatchSpy)).toEqual([])
+    expect(store.getState().tabRecency.paneLastInputAt[PANE_ID]).toBeUndefined()
+  })
+
+  it('swallows the blur variant (focus-out report) during replay', async () => {
+    const { store, dispatchSpy } = await renderPane()
+    await beginAttachWithReplayWindow(1)
+
+    dispatchSpy.mockClear()
+    writeReplayChunk({
+      seqStart: 1,
+      seqEnd: 1,
+      data: `${ARM_FOCUS_REPORTING}armed prompt$ `,
+      fireDuringWrite: FOCUS_OUT,
+    })
+
+    expect(terminalWriteStrings(getTerm()).join('')).toContain('armed prompt$ ')
+    expect(sentFocusReports()).toEqual([])
+    expect(inputActivityActionTypes(dispatchSpy)).toEqual([])
+    expect(store.getState().tabRecency.paneLastInputAt[PANE_ID]).toBeUndefined()
+  })
+
+  it('leaves non-focus input untouched during the same replay scope window (bytes-level gate, not batch-level)', async () => {
+    const { dispatchSpy } = await renderPane()
+    await beginAttachWithReplayWindow(1)
+
+    dispatchSpy.mockClear()
+    writeReplayChunk({
+      seqStart: 1,
+      seqEnd: 1,
+      data: `${ARM_FOCUS_REPORTING}armed prompt$ `,
+      fireDuringWrite: 'x',
+    })
+
+    // A genuine keystroke landing mid-replay-write still goes to the wire…
+    expect(sentInputs().filter((m) => m?.data === 'x')).toHaveLength(1)
+    // …and the replay chunk itself is ingested normally.
+    expect(terminalWriteStrings(getTerm()).join('')).toContain('armed prompt$ ')
+  })
+
+  it('still forwards a live focus report when no replay scope is open', async () => {
+    await renderPane()
+    await waitFor(() => expect(sentAttaches().length).toBe(1))
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+    })
+
+    fireData(getTerm(), FOCUS_IN)
+
+    expect(sentFocusReports()).toHaveLength(1)
+  })
+
+  it('swallows the phantom on every replay of the same pane (no first-time-only state)', async () => {
+    const { store, dispatchSpy } = await renderPane()
+    await beginAttachWithReplayWindow(2)
+
+    dispatchSpy.mockClear()
+    for (const seq of [1, 2]) {
+      writeReplayChunk({
+        seqStart: seq,
+        seqEnd: seq,
+        data: `${ARM_FOCUS_REPORTING}replay line ${seq}\r\n`,
+        fireDuringWrite: FOCUS_IN,
+      })
+    }
+
+    expect(terminalWriteStrings(getTerm()).join('')).toContain('replay line 2')
+    expect(sentFocusReports()).toEqual([])
+    expect(inputActivityActionTypes(dispatchSpy)).toEqual([])
+    expect(store.getState().tabRecency.paneLastInputAt[PANE_ID]).toBeUndefined()
+  })
 })

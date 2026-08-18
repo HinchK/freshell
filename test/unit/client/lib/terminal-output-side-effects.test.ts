@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { registerTerminalRequestModeBypass } from '@/components/terminal/request-mode-bypass'
+import { isReplayPhantomFocusReport } from '@/lib/terminal-output-side-effects'
 import {
   beginTerminalOutputWriteScope,
   shouldAllowTerminalOutputSideEffect,
@@ -158,5 +159,89 @@ describe('terminal output side-effect policy', () => {
     expect(privateHandler([2004])).toBe(true)
     expect(sendInput).toHaveBeenCalledWith('\u001b[?2004;1$y')
     liveScope.complete()
+  })
+})
+
+describe('isReplayPhantomFocusReport', () => {
+  it('swallows ESC[I and ESC[O while a suppressing replay write scope is open', () => {
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 't1',
+      source: 'replay',
+      attachRequestId: undefined,
+      generation: 'g',
+      suppressExternalSideEffects: true,
+    })
+    try {
+      expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(true)
+      expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(true)
+    } finally {
+      scope.complete()
+    }
+  })
+
+  it('passes focus reports through inside a live (non-suppressing) scope', () => {
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 't1',
+      source: 'live',
+      attachRequestId: undefined,
+      generation: 'g',
+      suppressExternalSideEffects: false,
+    })
+    try {
+      expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(false)
+    } finally {
+      scope.complete()
+    }
+  })
+
+  it('passes focus reports through when no write scope is open', () => {
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[I', undefined)).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(false)
+  })
+
+  it('leaves non-report bytes untouched even under a suppressing replay scope', () => {
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 't1',
+      source: 'replay',
+      attachRequestId: undefined,
+      generation: 'g',
+      suppressExternalSideEffects: true,
+    })
+    try {
+      expect(isReplayPhantomFocusReport('a', 't1')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[?1004h', 't1')).toBe(false)
+    } finally {
+      scope.complete()
+    }
+  })
+
+  it('does not swallow reports for a different terminal instance', () => {
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 't1',
+      source: 'replay',
+      attachRequestId: undefined,
+      generation: 'g',
+      suppressExternalSideEffects: true,
+    })
+    try {
+      expect(isReplayPhantomFocusReport('\u001b[I', 't2')).toBe(false)
+    } finally {
+      scope.complete()
+    }
+  })
+
+  it('releases the swallow once the scope completes', () => {
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 't1',
+      source: 'replay',
+      attachRequestId: undefined,
+      generation: 'g',
+      suppressExternalSideEffects: true,
+    })
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(true)
+    scope.complete()
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
   })
 })
