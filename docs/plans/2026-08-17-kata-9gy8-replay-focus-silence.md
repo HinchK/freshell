@@ -27,9 +27,9 @@ Fix pre-existing kata `9gy8`: when saved terminal history is replayed to rebuild
 - Server protocol and code: NO changes (`shared/ws-protocol.ts`, `server/`, `crates/` untouched).
 - Do not weaken, skip, or silence assertions in existing tests to make this pass. No code change may avoid the e2e style already established in `test/e2e-browser/specs/multi-client.spec.ts` (ws frame tracer, keyboard-typed arm command, `page.waitForFunction` on harness accessors).
 - The gate must cover BOTH `ESC[I` (focused) and `ESC[O` (blurred) — background/hidden pane replays emit the blur variant.
-- The swallwed report must not reach ANY of: ws input, `recordPaneTabActivity`, `updateSessionActivity`, or the un-anchored input buffer. The gate must sit before all of them.
+- The swallowed report must not reach ANY of: ws input, `recordPaneTabActivity`, `updateSessionActivity`, or the un-anchored input buffer. The gate must sit before all of them.
 - Keep tracked mode state intact: `getTerminalModes().sendFocusMode === true` after replay (arm preserved, report silenced).
-- Commit `feat:`, `test:`, `docs:` conventional messages; verify CI will see clippy/contract/typecheck-client green (no Rust/TS/contract changes expected, but prove it).
+- Commit conventional messages (`feat:`, `fix:`, `test:`, `docs:`); verify CI will see clippy/contract/typecheck-client green (no Rust/TS/contract changes expected, but prove it).
 - Bypass-the-scope buffering: reports generated while an attach anchor is pending are buffered upstream; the gate must therefore reject the phantom BEFORE the un-anchored fast-path can buffer it (onData entry is that point).
 
 ---
@@ -41,7 +41,7 @@ Fix pre-existing kata `9gy8`: when saved terminal history is replayed to rebuild
 - Test: `test/unit/client/lib/terminal-output-side-effects.test.ts`
 
 **Interfaces:**
-- Consumes: `getTerminalOutputWriteScope(terminalInstanceId)` from `./terminal-output-write-scope.js` (returns `{ suppressExternalSideEffects: boolean, ... } | null`), breadth-first on the existing page-lifecycle mocks used in this suite (e.g. expose or simulate via `beginTerminalOutputWriteScope(...)`).
+- Consumes: `getTerminalOutputWriteScope(terminalInstanceId)` from `./terminal-output-write-scope.js` (returns `{ suppressExternalSideEffects: boolean, ... } | null`) — tests simulate scopes directly via `beginTerminalOutputWriteScope(...)`, as the existing suite does.
 - Produces: `export function isReplayPhantomFocusReport(data: string, terminalInstanceId: string | undefined): boolean` — true exactly when `data === '\u001b[I'` or `data === '\u001b[O'` AND `getTerminalOutputWriteScope(terminalInstanceId)?.suppressExternalSideEffects === true`. No logging inside the helper (caller logs).
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -127,7 +127,7 @@ git commit -m "feat(terminal): pure predicate for replay-phantom xterm focus rep
 - Modify: `src/lib/terminal-output-write-scope.ts`
 - Test: `test/unit/client/lib/terminal-output-write-scope.test.ts`
 
-**Rationale (load-bearing A3):** `activeScopes` is one slot per `terminalInstanceId`; a live direct-path write for the same instance can overwrite a mid-parse replay scope, letting that replay's phantom slip the gate. Upgrade the map to an identity-checked stack: `Map<string, TerminalOutputWriteContext[]>`; `beginTerminalOutputWriteScope` pushes; `complete()` removes exactly that context; `getTerminalOutputWriteScope` returns the TOP (last) entry.
+**Rationale (load-bearing A3):** `activeScopes` is one slot per `terminalInstanceId`; a scope completing out of order can clear the wrong entry (e.g. the synchronous-throw early-complete paths in terminal-write-queue.ts:153-159), letting a later phantom slip the gate. Upgrade the map to an identity-checked stack: `Map<string, TerminalOutputWriteContext[]>`; `beginTerminalOutputWriteScope` pushes; `complete()` removes exactly that context; `getTerminalOutputWriteScope` returns the TOP (last) entry. Known residual (accepted, not widened): if a live scope and a replay scope for the same instance are both open and the replay bytes parse LATE, the gate reads the live top and that one phantom slips — the serializing write queue prevents this on every replay-driven rebuild path; the residual is confined to the queue-null fallback edge.
 
 - [ ] Steps (TDD): RED test — begin replay-suppress scope, then begin a non-suppress scope for the same id, complete the inner, assert the outer suppress scope is again active (leak closed); also assert existing behavior (single begin/complete) green. Implement the stack; the existing write-scope test file gets the two new cases plus full-suite stays green.
 - [ ] Commit: `feat(terminal): per-instance write-scope stack (closes replay-scope overlap leak, kata 9gy8)`
@@ -159,7 +159,7 @@ Concrete code: implementer reuses the file's existing replay-write-driving helpe
 
 Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx --reporter=basic`
 
-Expected: FAIL — tests 1, 4-6 observe `\u001b[I`/`\u001b[O` in the outgoing send stream (no gate exists yet).
+Expected: FAIL — tests 1, 2, 5, 6 observe `\u001b[I`/`\u001b[O` reaching the outgoing send stream / activity path (no gate exists yet); test 4 (live pass-through) passes pre-fix, and test 3 (non-report bytes) is a pass-through pin that stays green both ways.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -172,11 +172,9 @@ In `src/components/TerminalView.tsx`, inside the `term.onData((data) => { ... })
         // contained the app's ?1004h arm byte. Nothing about user focus
         // changed; this is invented input. Swallow silently (no send, no
         // activity) — the mode state is untouched.
-        logClient({
-          event: 'replay_phantom_focus_report_silenced',
+        log.debug('replay phantom focus report silenced (kata 9gy8)', {
           paneId,
           tabId,
-          level: 'debug',
           direction: data === '[I' ? 'in' : 'out',
         })
         return
@@ -229,7 +227,7 @@ Add (either as a `test` in the spec's "mode replay-sync" area or a sibling spec;
 
 1. Create a shell tab.
 2. Type `printf '\u001b[?1004h\n'` + Enter (arm focus reporting).
-3. `page.waitForFunction(() => window.__FRESHELL_TEST_HARNESS__.getTerminalModes('<pane-id>')?.sendFocusMode === true)` — arm visible.
+3. `page.waitForFunction(() => window.__FRESHELL_TEST_HARNESS__.getTerminalModes('<terminal-id>')?.sendFocusMode === true)` — arm visible.
 4. Reload the page.
 5. After reload ready, re-arm verification: `waitForFunction(sendFocusMode === true)` again (replay restored the arm).
 6. Assert: no sent ws message observed post-reload whose payload contains `\u001b[I` or `\u001b[O` (use the existing tracer collection pattern / harness sent-messages accessor). Scope the assertion window tightly: start at reload-ready, end at the arm-visible wait plus a short settle (load-bearing A4 — a GENUINE live focus report after the window would be legitimate and must not flake the test; headless runs generate no physical focus events, so the window is deterministic).
