@@ -121,6 +121,17 @@ git commit -m "feat(terminal): pure predicate for replay-phantom xterm focus rep
 
 ---
 
+### Task 1.5: per-instance write-scope stack (closes same-instance overlap leak)
+
+**Files:**
+- Modify: `src/lib/terminal-output-write-scope.ts`
+- Test: `test/unit/client/lib/terminal-output-write-scope.test.ts`
+
+**Rationale (load-bearing A3):** `activeScopes` is one slot per `terminalInstanceId`; a live direct-path write for the same instance can overwrite a mid-parse replay scope, letting that replay's phantom slip the gate. Upgrade the map to an identity-checked stack: `Map<string, TerminalOutputWriteContext[]>`; `beginTerminalOutputWriteScope` pushes; `complete()` removes exactly that context; `getTerminalOutputWriteScope` returns the TOP (last) entry.
+
+- [ ] Steps (TDD): RED test — begin replay-suppress scope, then begin a non-suppress scope for the same id, complete the inner, assert the outer suppress scope is again active (leak closed); also assert existing behavior (single begin/complete) green. Implement the stack; the existing write-scope test file gets the two new cases plus full-suite stays green.
+- [ ] Commit: `feat(terminal): per-instance write-scope stack (closes replay-scope overlap leak, kata 9gy8)`
+
 ### Task 2: onData gate in TerminalView + lifecycle integration tests
 
 **Files:**
@@ -135,7 +146,7 @@ git commit -m "feat(terminal): pure predicate for replay-phantom xterm focus rep
 
 Add a new describe block in the lifecycle suite following the file's existing pattern for replay writes (the `submitAcceptedOutput`-style path used by the modes-sync describe at ~:9659). Tests:
 
-1. **Phantom swallowed on replay, byte-exact.** Mount a pane, arm nothing, drive a replay-mode write through the harness/mock containing the literal byte `\u001b[?1004h` followed by normal text; have the mock xterm invoke its registered onData with `'\u001b[I'` while the write scope is still open (the mock lifecycle component pattern already supports this — reuse how existing tests drive onData; e.g. `term.onData.mock.calls[0][0]('\u001b[I')`). Assert: no `send` call whose payload contains `\u001b[I`, and the mock harness `getSentWsMessages/...` input area is empty of focus bytes.
+1. **Phantom swallowed on replay, byte-exact.** Mount a pane, arm nothing, drive a replay-mode write through the harness/mock containing the literal byte `\u001b[?1004h` followed by normal text; fire the registered onData handler WHILE the write scope is open: use `term.write.mockImplementationOnce` (or the suite's existing queue-driving spy) so the mock calls the captured `term.onData.mock.calls[0][0]('\u001b[I')` from inside the `write()` implementation — i.e. before the scope's callback completes it (calling onData after write resolves is post-scope and would not exercise the gate). Assert: no `send` call whose payload contains `\u001b[I`, and the mock harness `getSentWsMessages/...` input area is empty of focus bytes.
 2. **Activity not disturbed.** Same setup: `recordPaneTabActivity`/session-activity side of the handler did NOT receive the phantom input (assert via the file's existing activity-observation pattern; if none exists, assert the dismissal path not fired for bare `\u001b[I` — it already is a non-engagement byte, the sub-assertion is a no-op regression net).
 3. **Ingestion not disturbed for non-report bytes:** same replay chunk carries `\u001b[?1004h` + plain bytes; assert non-focus input from onData during the same scope window is untouched (i.e. gate applied only at the bytes level, not at the write-batch level).
 4. **Live pass-through regression.** With NO open replay scope (simulate: normal live write), fire onData `'\u001b[I'` and assert it reaches `send` (input) with exactly `'\u001b[I'`. This pins "live focus reports keep flowing".
@@ -174,7 +185,7 @@ In `src/components/TerminalView.tsx`, inside the `term.onData((data) => { ... })
       // ...existing engagement/activity logic unchanged
 ```
 
-Add the import: `import { isReplayPhantomFocusReport } from '@/lib/terminal-output-side-effects'` (check the module's export — the helper lives in terminal-output-side-effects.ts, which is also re-exported from terminal-output-write-scope.js; import from the canonical source file to avoid a cycle).
+Add the import from the canonical source file: `import { isReplayPhantomFocusReport } from '@/lib/terminal-output-side-effects'` (write-scope.js does NOT re-export it today) and use the file's existing logger symbol (`log`, created via `createLogger` at ~:175) — `logClient` does not exist.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -221,7 +232,7 @@ Add (either as a `test` in the spec's "mode replay-sync" area or a sibling spec;
 3. `page.waitForFunction(() => window.__FRESHELL_TEST_HARNESS__.getTerminalModes('<pane-id>')?.sendFocusMode === true)` — arm visible.
 4. Reload the page.
 5. After reload ready, re-arm verification: `waitForFunction(sendFocusMode === true)` again (replay restored the arm).
-6. Assert: no sent ws message observed post-reload whose payload contains `\u001b[I` or `\u001b[O` (use the existing tracer collection pattern / harness sent-messages accessor).
+6. Assert: no sent ws message observed post-reload whose payload contains `\u001b[I` or `\u001b[O` (use the existing tracer collection pattern / harness sent-messages accessor). Scope the assertion window tightly: start at reload-ready, end at the arm-visible wait plus a short settle (load-bearing A4 — a GENUINE live focus report after the window would be legitimate and must not flake the test; headless runs generate no physical focus events, so the window is deterministic).
 
 Title: `mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)`.
 
@@ -268,7 +279,7 @@ At multi-client.spec.ts:731-733 (the comment that says the sync preamble never f
 
 - [ ] **Step 3: Kata comment**
 
-`kata comment 9gy8 "Fix implemented in worktree kata-9gy8-focus-silence / branch the-usual/kata-9gy8-focus-silence + PR review; tests pin no phantom input at unit + e2e levels. Close after merge."`
+`kata comment 9gy8 -m "Fix implemented in worktree kata-9gy8-focus-silence / branch the-usual/kata-9gy8-focus-silence + PR review; tests pin no phantom input at unit + e2e levels. Close after merge."`
 
 - [ ] **Step 4: Commit**
 
@@ -286,4 +297,4 @@ git commit -m "docs: kata 9gy8 silenced; update spec residual comment"
 3. **File/interface consistency:** exact paths specified; new predicate consumed from one place; existing helper (`getTerminalOutputWriteScope`, `beginTerminalOutputWriteScope`) signatures reused untouched.
 4. **Executable tests:** every test has an exact command and expected outcome; reds proven for unit (export missing → ImportError) and lifecycle (assert sees phantom before gate); e2e red is leg-dependent (unit tests are the deterministic red).
 5. **Placeholder scan:** none — no TBD/TODO; assertions are concrete strings and byte comparisons.
-6. **Operational completeness:** debug log at debug level (off by default, per AGENTS.md); no user-facing UI, so no docs/index.html change; no AGENTS.md contract change; CI gates (clippy for Rust — no Rust touched; typecheck-client must pass; contract inventory untouched — no new ws message types added; prisma-style lint: chan previously passing getContext-gated `logClient` import and relative-vs-alias imports follow the file's existing imports).
+6. **Operational completeness:** debug log at debug level (off by default, per AGENTS.md); no user-facing UI, so no docs/index.html change; no AGENTS.md contract change; CI gates (clippy for Rust — no Rust touched; typecheck-client must pass; contract inventory untouched — no new ws message types added; lint: the file's existing `log` (createLogger) import pattern is reused; relative-vs-alias imports follow the file's existing imports).
