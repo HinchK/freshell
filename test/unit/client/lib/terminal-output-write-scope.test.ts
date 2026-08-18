@@ -50,6 +50,36 @@ describe('terminal output write scope', () => {
     expect(getTerminalOutputWriteScope('surface-1')).toBeNull()
   })
 
+  it('restores the outer replay-suppress scope when an overlapping inner scope completes out of order', () => {
+    const replayScope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 'surface-1',
+      source: 'replay',
+      attachRequestId: 'attach-1',
+      generation: 'attach-1',
+      suppressExternalSideEffects: true,
+    })
+    const liveScope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 'surface-1',
+      source: 'live',
+      attachRequestId: 'attach-2',
+      generation: 'attach-2',
+      suppressExternalSideEffects: false,
+    })
+
+    // The inner live scope completes first; the outer replay scope must still
+    // be the active scope for the instance (a single-slot map would have lost
+    // it when the inner scope began).
+    liveScope.complete()
+    expect(getTerminalOutputWriteScope('surface-1')).toMatchObject({
+      source: 'replay',
+      attachRequestId: 'attach-1',
+      suppressExternalSideEffects: true,
+    })
+
+    replayScope.complete()
+    expect(getTerminalOutputWriteScope('surface-1')).toBeNull()
+  })
+
   it('suppresses external side effects during replay writes', () => {
     expect(shouldAllowTerminalOutputSideEffect({
       terminalInstanceId: 'surface-1',
