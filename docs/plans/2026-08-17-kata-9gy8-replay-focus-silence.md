@@ -267,19 +267,19 @@ git commit -m "test(e2e): wire proof that replay no longer injects phantom focus
 - Modify: `docs/plans/2026-08-17-terminal-mode-replay-sync.md` (status box only, noting 9gy8 as SILENCED/residual)
 - Modify: `test/e2e-browser/specs/multi-client.spec.ts` line ~731 comment (residual now fixed)
 
-- [ ] **Step 1: Update the plan-status box**
+- [x] **Step 1: Update the plan-status box**
 
 In the mode-replay-sync plan, add to its Stage-6/update area: `kata 9gy8 = SILENCED` with a link to this plan's branch commit SHA.
 
-- [ ] **Step 2: Update the spec comment**
+- [x] **Step 2: Update the spec comment**
 
 At multi-client.spec.ts:731-733 (the comment that says the sync preamble never fires and the replay path retains the focus-report bug), update the residual note: sync still never emits `?1004`, and replay no longer injects phantom reports via kata 9gy8. Reference the new test title.
 
-- [ ] **Step 3: Kata comment**
+- [x] **Step 3: Kata comment**
 
 `kata comment 9gy8 -m "Fix implemented in worktree kata-9gy8-focus-silence / branch the-usual/kata-9gy8-focus-silence + PR review; tests pin no phantom input at unit + e2e levels. Close after merge."`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/plans/2026-08-17-terminal-mode-replay-sync.md test/e2e-browser/specs/multi-client.spec.ts
