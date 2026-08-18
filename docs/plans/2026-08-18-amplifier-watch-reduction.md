@@ -62,7 +62,7 @@ FRESHELL_VITEST_BACKEND=local npm test
 
 Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --no-fail-fast` (protocol crate touched in Task 8) and `npm run contract:generate && git diff --exit-code -- port/contract/` (regeneration is a committed no-op after Task 8).
 
-## Regression coverage map (design "Regression tests" lines 169-205)
+## Regression coverage map (design "Regression tests" lines 169-205; rows 18-19 pin the design's watch-then-scan invariant (design lines 44-51) and absence/retry lifecycle (design lines 84-102) — added in fresh-eyes remediation)
 
 | # | Design requirement | Task | Test(s) |
 |---|---|---|---|
@@ -83,6 +83,8 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 | 15 | Cadence stays live through arbitrarily long quiet periods while a subscribed client is connected; stops at last disconnect | 8, 9 | quiet-period phase of the Task 9 cadence test (no fetch traffic at all between ticks) + Task 8 disconnect-clear integration |
 | 16 | Structural MovedFrom/Remove of a project cleans armed/absent/retry bookkeeping; no leaked inode-following watches after mv | 4 | `project_move_or_remove_cleans_all_bookkeeping` + `moved_away_session_dir_is_explicitly_unwatched` |
 | 17 | Stray file at project depth → no arm attempt; deterministic arm error (ENOENT/ENOTDIR) leaves the retry set immediately | 1, 3 | `planner_ignores_stray_files_at_project_depth` + `deterministic_arm_failure_never_enters_retry_set` |
+| 18 | Watch-then-scan at startup: a root session dir created between the initial plan scan and the structural arms is armed via the post-arm rescan union (zero-latency hard requirement) | 3 | `startup_arms_session_dirs_created_in_the_scan_arm_window` |
+| 19 | Transient arm failure retries on the rearm-tick drain until it arms; failures re-enter with doubled, capped backoff; replan/self-correction never bypass backoff | 3 | `transient_arm_failure_is_retried_by_the_rearm_drain_and_eventually_arms` + pure `retry_backoff_doubles_to_a_sixty_second_cap` |
 
 ---
 
@@ -93,7 +95,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 - Modify: crates/freshell-sessions/src/lib.rs:28-32 (module list; add `pub mod watch_plan;` between `provider_layout` and `resume_input`)
 
 **Interfaces:**
-- Consumes: `crate::directory_index::open_root_dir` (pub(crate), `directory_index.rs:242-255` — NotFound/NotADirectory → `Ok(None)`, other errors propagate); the strict-root/tolerant-nested traversal convention of `discover_amplifier_metadata` (`amplifier.rs:120-183`).
+- Consumes: `crate::directory_index::open_root_dir` (pub(crate), `directory_index.rs:242-255` — NotFound/NotADirectory → `Ok(None)`, other errors propagate). The planner is deliberately STRICT-EVERYWHERE and does NOT mirror the strict-root/tolerant-nested traversal convention of `discover_amplifier_metadata` (`amplifier.rs:120-183`): the plan feeds Task 6's replan unwatch diff, so a partial plan built over a nested read error would mass-unwatch healthy root sessions.
 - Produces (all `pub(crate)`):
   - `enum BasenameClass { Subagent, UuidRoot, Unknown }`
   - `fn classify_basename(name: &str) -> BasenameClass` (static `regex::Regex` via `std::sync::LazyLock`, mirroring `resume_input.rs:84-87`; the crate already depends on `regex = "1"`)
@@ -105,7 +107,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   - `enum ArmErr { Deterministic, Transient }`; `fn classify_arm_error(err: &notify::Error) -> ArmErr` — match `&err.kind`: `notify::ErrorKind::PathNotFound` → Deterministic; `ErrorKind::Io(io)` → Deterministic iff `io.kind()` is `std::io::ErrorKind::NotFound | NotADirectory`, else Transient; `ErrorKind::MaxFilesWatch` → Transient (watch-limit exhaustion clears; evicted paths re-arm after pressure releases); everything else → Transient
 
 - [ ] **Step 1: Write the failing behavioral test**
-  New file `crates/freshell-sessions/src/watch_plan.rs` containing ONLY the test module first (compile-and-fail red; the module declares no items yet):
+  New file `crates/freshell-sessions/src/watch_plan.rs` containing ONLY the test module first (compile-and-fail red; the module declares no items yet), AND register `pub mod watch_plan;` in `crates/freshell-sessions/src/lib.rs` (alphabetical, after `pub mod provider_layout;`) IN THE SAME EDIT — module registration is part of the test edit, so the failing tests compile into the tree and fail for the missing-behavior reason:
 
   ```rust
   //! (Task 1 adds the module doc + implementation above these tests.)
@@ -207,6 +209,34 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           assert!(plan.sessions_dirs.is_empty() && plan.root_session_dirs.is_empty() && plan.standins.is_empty());
       }
 
+      /// A nested read error ANYWHERE (here: one project's `sessions/` dir is
+      /// unreadable while the projects root and the project dir list fine)
+      /// fails the WHOLE plan — never a partial plan. Task 6's replan aborts
+      /// on `Err`, so a transient nested EACCES/EIO tears nothing down.
+      #[cfg(unix)]
+      #[test]
+      fn planner_nested_scan_error_fails_the_whole_plan() {
+          use std::os::unix::fs::PermissionsExt;
+          let root = unique_temp_dir("planner-nested-err");
+          let projects = root.join("projects");
+          mkdir(&projects.join("good").join("sessions").join("012584be-9478-4801-a62d-4e5da428b3a0"));
+          let bad_sessions = projects.join("bad").join("sessions");
+          mkdir(&bad_sessions.join("aa2584be-9478-4801-a62d-4e5da428b3a0"));
+          std::fs::set_permissions(&bad_sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+          if std::fs::read_dir(&bad_sessions).is_ok() {
+              eprintln!("skipping: euid can list a 0o000 dir");
+              std::fs::set_permissions(&bad_sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+              std::fs::remove_dir_all(&root).ok();
+              return;
+          }
+          assert!(
+              plan_amplifier_targets(&projects).is_err(),
+              "a nested readdir error fails the whole plan (no partial plans)"
+          );
+          std::fs::set_permissions(&bad_sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+          std::fs::remove_dir_all(&root).ok();
+      }
+
       #[test]
       fn diff_armed_partitions_missing_and_extra() {
           let desired: std::collections::HashSet<PathBuf> =
@@ -236,10 +266,10 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib watch_plan`
-  Expected: FAIL because `freshell-sessions` does not compile: `watch_plan::tests` references `classify_basename`, `plan_amplifier_targets`, `diff_armed`, `classify_arm_error`, none of which exist yet. (E0432/E0425-family compile errors, not syntax accidents.)
+  Expected: FAIL because `freshell-sessions` does not compile: `watch_plan::tests` (registered in `lib.rs` by the Step-1 edit, so the module DOES compile into the tree) references `classify_basename`, `plan_amplifier_targets`, `diff_armed`, `classify_arm_error`, none of which exist yet. (E0432/E0425-family compile errors, not syntax accidents.)
 
 - [ ] **Step 3: Add the minimal production implementation**
-  Prepend to `crates/freshell-sessions/src/watch_plan.rs` (before `mod tests`) + register `pub mod watch_plan;` in `crates/freshell-sessions/src/lib.rs` (alphabetical, after `pub mod provider_layout;`):
+  Prepend to `crates/freshell-sessions/src/watch_plan.rs` (before `mod tests`; `pub mod watch_plan;` in `lib.rs` already landed with the Step-1 test edit):
 
   ```rust
   //! Pure watch-set planning for the amplifier provider's managed inotify
@@ -324,7 +354,16 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   /// Root-open semantics match the discover contract (`open_root_dir`): a
   /// missing projects root is `Ok(plan with root_exists:false)`, other root
   /// errors PROPAGATE (a transient EACCES/EIO must not look like "nothing to
-  /// arm"). Nested reads are tolerant like `discover_project_session_metadata`.
+  /// arm"). Nested reads are STRICT, not tolerant like
+  /// `discover_project_session_metadata`: ANY readdir/stat error at ANY depth
+  /// (projects-root entry, a `sessions/` stat or readdir, a session entry,
+  /// an entry's `file_type`) fails the WHOLE plan with `Err` — never a
+  /// partial plan. The plan is authoritative for Task 6's replan unwatch
+  /// diff; a partial plan over a transient nested error would tear every
+  /// healthy root watch it failed to see. A plain MISSING `sessions/` dir
+  /// (NotFound) is NOT an error — it yields the stand-in — and a non-dir
+  /// `sessions` FILE is not an error either (classification by entry
+  /// file_type stays; only ERRORS fail the plan).
   pub(crate) fn plan_amplifier_targets(projects_root: &Path) -> Result<PlanTargets, std::io::Error> {
       let mut plan = PlanTargets::default();
       let Some(entries) = crate::directory_index::open_root_dir(projects_root)? else {
@@ -343,31 +382,43 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       projects.sort(); // determinism (readdir order is filesystem-dependent)
       for project in projects {
           let sessions = project.join("sessions");
-          if !sessions.is_dir() {
-              plan.standins.push(project);
-              continue;
-          }
-          plan.sessions_dirs.push(sessions.clone());
-          let Ok(children) = std::fs::read_dir(&sessions) else {
-              continue; // tolerant: watch the sessions dir itself, arm no children
-          };
-          let mut dirs: Vec<PathBuf> = children
-              .filter_map(|e| e.ok())
-              .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-              .map(|e| e.path())
-              .collect();
-          dirs.sort();
-          for session_dir in dirs {
-              let name = session_dir
-                  .file_name()
-                  .and_then(|n| n.to_str())
-                  .unwrap_or("");
-              match classify_basename(name) {
-                  BasenameClass::Subagent => {} // never watched
-                  BasenameClass::UuidRoot => plan.root_session_dirs.push(session_dir),
-                  BasenameClass::Unknown => {
-                      plan.root_session_dirs.push(session_dir);
-                      plan.unknown_format_arms += 1;
+          match std::fs::metadata(&sessions) {
+              // Plain missing `sessions/` ⇒ stand-in. NOT an error.
+              Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                  plan.standins.push(project);
+              }
+              // Strict: any stat error fails the whole plan.
+              Err(e) => return Err(e),
+              // `sessions` exists but is a FILE — treat like the stand-in
+              // (classification by file_type stays; never a doomed arm).
+              Ok(meta) if !meta.is_dir() => {
+                  plan.standins.push(project);
+              }
+              Ok(_) => {
+                  plan.sessions_dirs.push(sessions.clone());
+                  // Strict: the readdir AND every entry/file_type error
+                  // propagate — no partial plans.
+                  let mut dirs: Vec<PathBuf> = Vec::new();
+                  for entry in std::fs::read_dir(&sessions)? {
+                      let entry = entry?;
+                      if entry.file_type()?.is_dir() {
+                          dirs.push(entry.path());
+                      }
+                  }
+                  dirs.sort();
+                  for session_dir in dirs {
+                      let name = session_dir
+                          .file_name()
+                          .and_then(|n| n.to_str())
+                          .unwrap_or("");
+                      match classify_basename(name) {
+                          BasenameClass::Subagent => {} // never watched
+                          BasenameClass::UuidRoot => plan.root_session_dirs.push(session_dir),
+                          BasenameClass::Unknown => {
+                              plan.root_session_dirs.push(session_dir);
+                              plan.unknown_format_arms += 1;
+                          }
+                      }
                   }
               }
           }
@@ -426,15 +477,15 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 4: Run the focused test**
   Run: `cargo test -p freshell-sessions --lib watch_plan`
-  Expected: PASS (7 tests).
+  Expected: PASS (8 tests).
 
 - [ ] **Step 5: Refactor while green**
-  No refactor needed: the module is new and minimal; the traversal mirrors the established strict-root/tolerant-nested idiom without altering it; the two regexes follow the crate's `LazyLock<Regex>` precedent. `cargo fmt --all -- --check` must be clean.
+  No refactor needed: the module is new and minimal; the traversal is deliberately strict-everywhere (the discover path's tolerant-nested idiom is intentionally NOT mirrored — the plan feeds Task 6's unwatch diff, so a partial plan is a mass-unwatch hazard); the two regexes follow the crate's `LazyLock<Regex>` precedent. `cargo fmt --all -- --check` must be clean.
 
 - [ ] **Step 6: Run impacted-test verification**
   Impacted set: the whole `freshell-sessions` crate (a new public(crate) module + one `lib.rs` line; no existing code paths change, but the suite is cheap and this is the crate's safety net). Behavior untouched elsewhere.
   Run: `cargo test -p freshell-sessions`
-  Expected: PASS (all existing tests green plus the 7 new ones).
+  Expected: PASS (all existing tests green plus the 8 new ones).
 
 - [ ] **Step 7: Commit the task**
   ```bash
@@ -464,9 +515,35 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   Append to `#[cfg(test)] mod tests` at the bottom of `crates/freshell-sessions/src/session_watcher.rs` (before the closing brace):
 
   ```rust
+      /// Drain FileChanged paths into a set until `done` holds or the window
+      /// closes (ProviderRescan carries no paths and is skipped; a closed
+      /// channel or the expired deadline ends the drain). Module scope: Task
+      /// 3's amplifier tests reuse this collector after the test-file move.
+      async fn collect_file_paths(
+          rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
+          window: Duration,
+          done: impl Fn(&std::collections::HashSet<PathBuf>) -> bool,
+      ) -> std::collections::HashSet<PathBuf> {
+          let mut seen = std::collections::HashSet::new();
+          let until = tokio::time::Instant::now() + window;
+          while !done(&seen) {
+              match tokio::time::timeout_at(until, rx.recv()).await {
+                  Ok(Some(WatchEvent::FileChanged { paths, .. })) => seen.extend(paths),
+                  Ok(Some(WatchEvent::ProviderRescan { .. })) => {}
+                  Ok(None) | Err(_) => break,
+              }
+          }
+          seen
+      }
+
       /// The one-fd-per-provider restructure's behavioral contract: one shared
       /// `RecommendedWatcher` can arm SEVERAL paths; unwatching one path must
       /// not disturb the others; unwatch of a never-armed path is tolerated.
+      ///
+      /// Events are COLLECTED into a set under a deadline with set-membership
+      /// assertions — never per-`recv` identity: one `std::fs::write` emits
+      /// several notifications (commonly Create + Modify), so the recv after
+      /// a second write can deliver the FIRST write's queued companion.
       #[tokio::test]
       async fn one_watcher_supports_many_targets_and_tolerated_unwatch() {
           let a = unique_temp_dir("onefd-a");
@@ -480,45 +557,35 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           watch_path(&mut watcher, "claude", &a, notify::RecursiveMode::NonRecursive).unwrap();
           watch_path(&mut watcher, "claude", &b, notify::RecursiveMode::NonRecursive).unwrap();
 
-          async fn next_file_event(
-              rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
-          ) -> Vec<PathBuf> {
-              match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-                  Ok(Some(WatchEvent::FileChanged { paths, .. })) => paths,
-                  other => panic!("expected file events, got {:?}", other.is_ok()),
-              }
-          }
-
-          // Both armed paths deliver events through the ONE watcher.
+          // Both armed paths deliver events through the ONE watcher (early
+          // exit once BOTH prefixes observed; companion events interleave with
+          // the second write's, which is exactly why membership — not recv
+          // order — is the assertion).
           std::fs::write(a.join("one.txt"), b"x").unwrap();
-          let saw_a = next_file_event(&mut rx).await;
-          assert!(saw_a.iter().any(|p| p.starts_with(&a)), "events for a: {saw_a:?}");
           std::fs::write(b.join("one.txt"), b"x").unwrap();
-          let saw_b = next_file_event(&mut rx).await;
-          assert!(saw_b.iter().any(|p| p.starts_with(&b)));
-          // Drain any co-delivered/modify companions still buffered from the
-          // first two writes so the negative window below is honest.
-          while rx.try_recv().is_ok() {}
+          let saw = collect_file_paths(&mut rx, Duration::from_secs(2), |s| {
+              s.iter().any(|p| p.starts_with(&a)) && s.iter().any(|p| p.starts_with(&b))
+          })
+          .await;
+          assert!(saw.iter().any(|p| p.starts_with(&a)), "events for a: {saw:?}");
+          assert!(saw.iter().any(|p| p.starts_with(&b)), "events for b: {saw:?}");
 
           // Unwatch a (twice: the second proves the tolerated path), then
           // verify a's further writes produce nothing while b still delivers.
+          // One fixed 700ms window collects every straggler, so the negative
+          // assertion runs over the COMPLETE set.
           unwatch_tolerated(&mut watcher, "claude", &a);
           unwatch_tolerated(&mut watcher, "claude", &a); // tolerated no-op, no panic
           std::fs::write(a.join("two.txt"), b"x").unwrap();
           std::fs::write(b.join("two.txt"), b"x").unwrap();
-          let still_b = next_file_event(&mut rx).await;
-          assert!(still_b.iter().any(|p| p.starts_with(&b)));
+          let after = collect_file_paths(&mut rx, Duration::from_millis(700), |_| false).await;
           assert!(
-              tokio::time::timeout(Duration::from_millis(400), rx.recv())
-                  .await
-                  .map(|ev| match ev {
-                      Some(WatchEvent::FileChanged { paths, .. }) => {
-                          !paths.iter().any(|p| p.starts_with(&a))
-                      }
-                      _ => true,
-                  })
-                  .unwrap_or(true),
-              "no events from the unwatched path may arrive"
+              after.iter().any(|p| p.starts_with(&b)),
+              "b still delivers: {after:?}"
+          );
+          assert!(
+              !after.iter().any(|p| p.starts_with(&a)),
+              "no events from the unwatched path may arrive: {after:?}"
           );
           drop(watcher);
           std::fs::remove_dir_all(&a).ok();
@@ -528,7 +595,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL because `create_provider_watcher`, `watch_path`, and `unwatch_tolerated` do not exist on the current one-watcher-per-target `ArmedWatch` model (compile error, unresolved names).
+  Expected: FAIL because `create_provider_watcher`, `watch_path`, and `unwatch_tolerated` do not exist on the current one-watcher-per-target `ArmedWatch` model (compile error, unresolved names — the new test's set-under-deadline assertions only add the helper; the red reason is unchanged).
 
 - [ ] **Step 3: Add the minimal production implementation**
   Precise patch to `crates/freshell-sessions/src/session_watcher.rs`:
@@ -722,6 +789,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
     /// Bookkeeping for the amplifier managed watch set (design "Watch set" +
     /// "Absence/retry"). Owned by the watcher task; an Arc clone is held by
     /// SessionWatcher so tests can observe armed state without racing the loop.
+    #[derive(Default)]
     struct ManagedBook {
         /// Every armed path (projects root, sessions dirs, stand-ins, root
         /// session dirs).
@@ -731,7 +799,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
         /// never absence-tracked (design).
         absent: std::collections::HashSet<PathBuf>,
         /// Transient arm failures under bounded exponential backoff
-        /// (RETRY_BASE_SECS doubling up to RETRY_MAX_SECS, RETRY_CAP entries).
+        /// (retry_backoff doubling to its 60s cap, RETRY_CAP entries).
         retry: std::collections::HashMap<PathBuf, RetryEntry>,
         /// Count of replans performed (observability for the Task 6 test).
         replans: usize,
@@ -739,15 +807,24 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
     struct RetryEntry { failures: u32, next_attempt: std::time::Instant }
     ```
   - `const RETRY_CAP: usize = 256;` `retry_backoff(failures: u32) -> Duration` (base 1s, doubling, cap 60s — computation expressed via a pure fn so tests assert the schedule without sleeping)
-  - `fn arm_managed_dir(book, watcher, index, provider, path, arm_kind_context, emit_marks: bool)` — the ONE arming site: `watch_path` + book insert on success (+watch-then-scan mark when `emit_marks`); on failure classifies: Deterministic → book insert nowhere + debug; Transient → retry entry (respecting RETRY_CAP eviction-with-debug-log)
-  - `fn cascade_session_children(book, watcher, index, sessions_dir)` — readdir a sessions dir, classify each child dir by basename, `arm_managed_dir` each watch target with a scoped `metadata.json` mark (the watch-then-scan invariant: `<sess>/metadata.json` marked with provider `"amplifier"`, safe no-op if missing)
-  - `fn arm_sessions_or_standin(book, watcher, index, project_dir)` — design's stand-in rule incl. the post-arm re-check: if `<proj>/sessions` didn't exist before the arm but exists immediately after, unwatch the stand-in and arm the real sessions dir (+ cascade its children)
-  - `fn cascade_new_project(book, watcher, index, project_dir)` — `Create(<proj>)` on the root watch: `arm_sessions_or_standin` (+ stray-file guard: skip non-dirs)
+  - `enum ArmKind { ProjectsRoot, SessionsDir, Standin, SessionDir }` — arm context for debug logging and Task 4's drift counter (a `SessionDir` arm classifies the basename inside `arm_managed_dir`).
+  - The arm helpers are FREE FUNCTIONS, not `SessionWatcher` methods: the recv loop calls them with ITS watcher + locked book; tests drive the identical helpers DIRECTLY on a locally-constructed watcher (Task 2's `create_provider_watcher`) and a fresh `ManagedBook::default()` — no spawned loop needed for bookkeeping assertions. `ManagedBook` holds neither the `RecommendedWatcher` nor the provider context (both live inside the spawned loop), which is exactly why probes on `SessionWatcher` cannot drive a real arm.
+  - `fn arm_managed_dir(book: &mut ManagedBook, watcher: &mut RecommendedWatcher, index: &Arc<SessionIndex>, provider: &str, path: &Path, arm_kind: ArmKind, emit_marks: bool)` — the ONE arming site: `watch_path` + `book.armed` insert on success (`book.retry.remove(path)` too — a successful arm clears any stale retry entry) + watch-then-scan scoped `metadata.json` mark when `emit_marks`; on failure classifies: Deterministic → book insert nowhere + debug; Transient → `retry.insert(path, RetryEntry { failures: 1, next_attempt: now + retry_backoff(1) })` (RETRY_CAP eviction logs a warn and drops)
+  - `fn cascade_session_children(book: &mut ManagedBook, watcher: &mut RecommendedWatcher, index: &Arc<SessionIndex>, sessions_dir: &Path, emit_marks: bool)` — readdir a sessions dir, classify each child dir by basename, `arm_managed_dir` each watch target (the watch-then-scan invariant: `<sess>/metadata.json` marked with provider `"amplifier"` when `emit_marks`, safe no-op if missing)
+  - `fn arm_sessions_or_standin(book: &mut ManagedBook, watcher: &mut RecommendedWatcher, index: &Arc<SessionIndex>, project_dir: &Path, emit_marks: bool)` — design's stand-in rule incl. the post-arm re-check: if `<proj>/sessions` didn't exist before the arm but exists immediately after, unwatch the stand-in and arm the real sessions dir (+ cascade its children)
+  - `fn cascade_new_project(book: &mut ManagedBook, watcher: &mut RecommendedWatcher, index: &Arc<SessionIndex>, project_dir: &Path, emit_marks: bool)` — `Create(<proj>)` on the root watch: `arm_sessions_or_standin` (+ stray-file guard: skip non-dirs)
+  - `fn apply_amplifier_startup_plan(book: &mut ManagedBook, watcher: &mut RecommendedWatcher, index: &Arc<SessionIndex>, projects_root: &Path, plan: PlanTargets)` — the startup half of the watch-then-scan invariant; the exact ordered pipeline is specified in Step 3. Always `emit_marks: false` (the boot warm sweep covers file state)
   - `SessionWatcher::amplifier_book_handle() -> Option<Arc<Mutex<ManagedBook>>>` — `#[cfg(test)]` accessor so tests assert armed/absent/retry without racing the loop
   - SessionWatcher-internal amplifier dispatch in `run_watcher_loop`'s recv arm: `provider == "amplifier"` routes FileChanged by depth computed as `path.strip_prefix(&projects_root).map(|r| r.components().count())` (depth 1 = a project child of the root watch; depth 3 = a sessions-dir child; everything else falls through to the legacy pending map for now — Task 5 takes the rest).
 
 - [ ] **Step 1: Write the failing behavioral test**
-  Move `session_watcher.rs`'s `#[cfg(test)] mod tests { ... }` (:421-687) verbatim into the new `crates/freshell-sessions/src/session_watcher_tests.rs`, keep the same content, and add these amplifier tests at the end:
+  Move `session_watcher.rs`'s `#[cfg(test)] mod tests { ... }` (:421-687) verbatim into the new `crates/freshell-sessions/src/session_watcher_tests.rs`, AND in the SAME EDIT replace the inline mod in `session_watcher.rs` with the `#[path]` declaration —
+  ```rust
+  #[cfg(test)]
+  #[path = "session_watcher_tests.rs"]
+  mod tests;
+  ```
+  (registration is part of the test edit, precedent `codex_locator.rs:725`, so the RED run compiles the moved/new tests into the tree) — then add these amplifier tests at the end:
 
   ```rust
   // ---------- amplifier managed watch set ----------
@@ -852,24 +929,28 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let home = unique_temp_dir("amp-armerr");
       std::fs::create_dir_all(home.join("projects")).unwrap();
       let index = amplifier_index(&home);
-      let mut watcher = amplifier_watcher(&index, &home);
-      let book = watcher.amplifier_book_handle().unwrap();
-      let handle = watcher.start();
-      let _ = index.snapshot().await;
-      tokio::time::sleep(Duration::from_millis(300)).await;
 
-      // Drive the arming helper directly against a path that exists in NO
-      // way (ENOENT): deterministic, so it is dropped, not retried.
-      watcher.test_arm_for_probe(&home.join("projects").join("ghost"));
-      tokio::time::sleep(Duration::from_millis(200)).await;
+      // The arm helpers are free functions; drive them on a locally-
+      // constructed shared watcher + a fresh book — the same helpers the
+      // spawned loop calls with ITS watcher/book, but with no loop and no
+      // inotify timing at all.
+      let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+      let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+      let mut book = ManagedBook::default();
+      let ghost = home.join("projects").join("ghost");
+      arm_managed_dir(
+          &mut book,
+          &mut watcher,
+          &index,
+          "amplifier",
+          &ghost,
+          ArmKind::SessionDir,
+          false,
+      );
 
-      {
-          let b = book.lock().unwrap();
-          assert!(b.retry.is_empty(), "deterministic failures never retry");
-          assert!(!b.armed.contains(&home.join("projects").join("ghost")));
-      }
-      watcher.stop();
-      let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+      assert!(book.retry.is_empty(), "deterministic failures never retry");
+      assert!(!book.armed.contains(&ghost));
+      drop(watcher);
       std::fs::remove_dir_all(&home).ok();
   }
 
@@ -881,30 +962,83 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let proj = home.join("projects").join("proj");
       std::fs::create_dir_all(&proj).unwrap(); // no sessions/ yet
       let index = amplifier_index(&home);
-      let mut watcher = amplifier_watcher(&index, &home);
-      let book = watcher.amplifier_book_handle().unwrap();
-      let handle = watcher.start();
-      let _ = index.snapshot().await;
-      tokio::time::sleep(Duration::from_millis(300)).await;
+      let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+      let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+      let mut book = ManagedBook::default();
 
       // Phase 1: drive the project arm with NO sessions/ — a stand-in arms.
-      watcher.test_arm_project_for_probe(&proj);
-      tokio::time::sleep(Duration::from_millis(150)).await;
-      assert!(book.lock().unwrap().armed.contains(&proj));
-      assert!(!book.lock().unwrap().armed.contains(&proj.join("sessions")));
+      arm_sessions_or_standin(&mut book, &mut watcher, &index, &proj, false);
+      assert!(book.armed.contains(&proj));
+      assert!(!book.armed.contains(&proj.join("sessions")));
 
       // Phase 2: sessions/ appears; the armed stand-in must swap to the real
       // sessions dir (the swap path `arm_sessions_or_standin` re-checks after
-      // arming AND serves as the recheck on repeat arms).
-      write_amplifier_session(&home, "proj", "012584be-9478-4801-a62d-4e5da428b3a0");
-      watcher.test_arm_project_for_probe(&proj);
-      tokio::time::sleep(Duration::from_millis(150)).await;
+      // arming AND serves as the recheck on repeat arms), cascading the
+      // session child.
+      let session = write_amplifier_session(&home, "proj", "012584be-9478-4801-a62d-4e5da428b3a0");
+      arm_sessions_or_standin(&mut book, &mut watcher, &index, &proj, false);
+      assert!(book.armed.contains(&proj.join("sessions")), "sessions/ armed");
+      assert!(!book.armed.contains(&proj), "stale stand-in removed: {:?}", book.armed);
+      assert!(
+          book.armed.contains(&session),
+          "the post-arm recheck cascades session children"
+      );
+      drop(watcher);
+      std::fs::remove_dir_all(&home).ok();
+  }
 
-      let b = book.lock().unwrap();
-      assert!(b.armed.contains(&proj.join("sessions")), "sessions/ armed");
-      assert!(!b.armed.contains(&proj), "stale stand-in removed: {:?}", b.armed);
-      watcher.stop();
-      let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+  /// Startup race regression (watch-then-scan applied AT STARTUP): a root
+  /// session dir created AFTER the initial plan scan but BEFORE the
+  /// structural arms is nevertheless armed — the post-arm readdir union, not
+  /// the stale scan, decides session-dir arms. Driven deterministically by
+  /// splitting startup into the same ordered steps the production loop runs
+  /// and creating the dir at the window; no sleeps, no spawned loop.
+  #[tokio::test]
+  async fn startup_arms_session_dirs_created_in_the_scan_arm_window() {
+      let home = unique_temp_dir("amp-startup-race");
+      let pre = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+      let _ = pre; // one pre-existing session (present in the initial scan)
+      let index = amplifier_index(&home);
+      let projects_root = home.join("projects");
+
+      // Step A of production startup: the initial plan scan.
+      let plan = crate::watch_plan::plan_amplifier_targets(&projects_root).unwrap();
+      // THE WINDOW: the dir appears after the scan, before the arms (in
+      // production the loop calls apply_amplifier_startup_plan immediately
+      // after the plan, in the same order, just wrapped in spawn_blocking).
+      let windowed = write_amplifier_session(&home, "p", "bb2584be-9478-4801-a62d-4e5da428b3a0");
+      // Step B: the structural arms + post-arm rescans.
+      let (tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+      let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+      let mut book = ManagedBook::default();
+      apply_amplifier_startup_plan(&mut book, &mut watcher, &index, &projects_root, plan);
+
+      assert!(
+          book.armed.contains(&windowed),
+          "created between scan and arm ⇒ caught by the post-arm rescan: {:?}",
+          book.armed
+      );
+
+      // The arm is LIVE: a sidecar write surfaces through the armed watch.
+      std::fs::write(windowed.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+      let seen = collect_file_paths(&mut rx, Duration::from_secs(2), |s| {
+          s.iter().any(|p| p.starts_with(&windowed))
+      })
+      .await;
+      assert!(
+          seen.iter().any(|p| p.starts_with(&windowed)),
+          "events flow through the window-armed watch: {seen:?}"
+      );
+
+      // …and visible in the index once the boot discover runs (startup arms
+      // skip file marks by design; the discover covers initial state).
+      let snap = index.snapshot().await;
+      assert!(
+          snap.iter().any(|s| s.provider == "amplifier"
+              && s.session_id == "bb2584be-9478-4801-a62d-4e5da428b3a0"),
+          "window-created session is visible at the first snapshot"
+      );
+      drop(watcher);
       std::fs::remove_dir_all(&home).ok();
   }
 
@@ -1036,27 +1170,122 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
       std::fs::remove_dir_all(&home).ok();
   }
+
+  /// Retry lifecycle (design "Absence/retry"): a transient arm failure lands
+  /// in `retry`; the rearm tick's drain re-attempts it once `next_attempt`
+  /// arrives — a STILL-failing attempt re-enters with doubled backoff, and
+  /// once the dir's access is restored the drain arms it. One transient
+  /// failure must never suppress the watch indefinitely. Uses the crate's
+  /// established `with_rearm_interval` short-interval seam so the REAL loop's
+  /// tick drives the drain.
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn transient_arm_failure_is_retried_by_the_rearm_drain_and_eventually_arms() {
+      use std::os::unix::fs::PermissionsExt;
+      let home = unique_temp_dir("amp-retry");
+      let victim = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+      let index = amplifier_index(&home);
+
+      // Make the session dir unwatchable: inotify_add_watch needs read
+      // permission, so watch() fails EACCES (Transient ⇒ retry, never absent).
+      std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+      if std::fs::read_dir(&victim).is_ok() {
+          eprintln!("skipping retry-drain assertions: euid can list a 0o000 dir");
+          std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+          std::fs::remove_dir_all(&home).ok();
+          return;
+      }
+
+      let mut watcher = amplifier_watcher(&index, &home).with_rearm_interval(1); // 1s tick
+      let book = watcher.amplifier_book_handle().unwrap();
+      let handle = watcher.start();
+
+      // Phase 1: the startup arm fails transiently and the entry sits in
+      // `retry` (startup arms run inside the loop; no tick wait needed).
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              if book.lock().unwrap().retry.contains_key(&victim) {
+                  break;
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+      })
+      .await
+      .expect("transient arm failure lands in retry");
+      let failures_at_insert = book.lock().unwrap().retry[&victim].failures;
+
+      // Phase 2: a re-attempt while access is STILL denied re-enters with an
+      // incremented failure count (backoff doubled). Force due immediacy via
+      // the book handle so the 1s tick processes it at once.
+      book.lock().unwrap().retry.get_mut(&victim).unwrap().next_attempt =
+          std::time::Instant::now() - Duration::from_secs(1);
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              let grown = {
+                  let b = book.lock().unwrap();
+                  !b.armed.contains(&victim)
+                      && b.retry.get(&victim).is_some_and(|e| e.failures > failures_at_insert)
+              };
+              if grown {
+                  break;
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+      })
+      .await
+      .expect("failed re-attempt re-enters retry with doubled backoff");
+
+      // Phase 3: restore access and force due again — the drain re-arms the
+      // dir and clears the retry entry, with no new filesystem event.
+      std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+      book.lock().unwrap().retry.get_mut(&victim).unwrap().next_attempt =
+          std::time::Instant::now() - Duration::from_secs(1);
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              {
+                  let b = book.lock().unwrap();
+                  if b.armed.contains(&victim) && !b.retry.contains_key(&victim) {
+                      break;
+                  }
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+      })
+      .await
+      .expect("retry drain eventually arms the restored dir");
+
+      watcher.stop();
+      let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+      std::fs::remove_dir_all(&home).ok();
+  }
+
+  /// The retry schedule is bounded exponential: 1, 2, 4, … 60s cap, no
+  /// overflow — asserted against the pure fn without sleeping.
+  #[test]
+  fn retry_backoff_doubles_to_a_sixty_second_cap() {
+      assert_eq!(retry_backoff(0), Duration::from_secs(1));
+      assert_eq!(retry_backoff(1), Duration::from_secs(2));
+      assert_eq!(retry_backoff(2), Duration::from_secs(4));
+      assert_eq!(retry_backoff(4), Duration::from_secs(16));
+      assert_eq!(retry_backoff(6), Duration::from_secs(60), "hits the cap");
+      assert_eq!(retry_backoff(7), Duration::from_secs(60), "capped");
+      assert_eq!(retry_backoff(100), Duration::from_secs(60), "no overflow");
+  }
   ```
 
-  Import note for the moved test file: the `#[path]` directive makes this file the `session_watcher::tests` module, so its header is exactly:
+  Import note for the moved test file: the `#[path]` directive makes this file the `session_watcher::tests` module, so its header is exactly the current test module's two imports, verbatim:
   ```rust
   use super::*;
   use crate::directory_index::{ClaudeSource, SessionIndex, SessionSource};
   ```
-  (the two existing imports of the current tests — keep them verbatim), plus `use crate::amplifier;` and `use std::sync::Arc;` where the new amplifier tests need them.
+  plus `use std::sync::Arc;` (the new amplifier helpers use `Arc::new`/`Arc::clone` unqualified; the current tests don't import it). NO `use crate::amplifier;` — every amplifier reference in the tests stays fully qualified (`crate::amplifier::AmplifierSource`), so that import would be dead weight and the `cargo clippy --workspace --all-targets -- -D warnings` gate would reject it.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL because `ManagedBook`, `amplifier_book_handle`, `with_subagent_interest`, `test_arm_for_probe`, and `test_arm_project_for_probe` do not exist (unresolved names / missing methods), not because of a syntax or fixture accident.
+  Expected: FAIL because `ManagedBook` (`#[derive(Default)]`), `ArmKind`, `amplifier_book_handle`, `with_subagent_interest`, the arm helpers (`arm_managed_dir`, `arm_sessions_or_standin`, `cascade_session_children`, `cascade_new_project`), `apply_amplifier_startup_plan`, and `retry_backoff` do not exist (unresolved names in the compiled test module — the `#[path]` registration landed with the test file in Step 1, so the red compile failure is inside the tree, not a zero-tests-matched pass), and not because of a syntax or fixture accident.
 
 - [ ] **Step 3: Add the minimal production implementation**
-  1. In `session_watcher.rs`, replace the inline `#[cfg(test)] mod tests {…}` with:
-     ```rust
-     #[cfg(test)]
-     #[path = "session_watcher_tests.rs"]
-     mod tests;
-     ```
-     (Precedent: `codex_locator.rs:725`. Keeps `session_watcher.rs` under the ~1K-line guidance.)
+  1. The test split already landed in Step 1: the inline `#[cfg(test)] mod tests {…}` in `session_watcher.rs` was replaced by the `#[path = "session_watcher_tests.rs"] mod tests;` declaration as part of the test edit (precedent: `codex_locator.rs:725`; keeps `session_watcher.rs` under the ~1K-line guidance). Nothing further here.
   2. Add the amplifier engine to `session_watcher.rs`:
 
      ```rust
@@ -1067,31 +1296,77 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
          Duration::from_secs(step.min(60))
      }
      ```
-     Plus `ManagedBook`, `arm_managed_dir`, `cascade_session_children`,
-     `arm_sessions_or_standin`, `cascade_new_project` per the Interfaces
-     section. Key semantics, verbatim:
-     - **Startup arm (Task-2 `watches` map):** for the provider with
+     Plus `ManagedBook`, `ArmKind`, the free arm helpers (`arm_managed_dir`,
+     `cascade_session_children`, `arm_sessions_or_standin`,
+     `cascade_new_project`), and `apply_amplifier_startup_plan` per the
+     Interfaces section. Key semantics, verbatim:
+     - **Startup arm (Task-2 `watches` map) — the watch-then-scan invariant
+       applied AT STARTUP (design lines 44-51):** for the provider with
        `layout.name() == "amplifier"`, replace the generic watch_bases arming
-       entirely: create the provider watcher, then run
+       entirely: create the provider watcher, run
        `crate::watch_plan::plan_amplifier_targets(&projects_root)` inside
        `tokio::task::spawn_blocking` (the design's startup-sweep rule), then
-       arm: projects root (NonRecursive) → per plan every sessions dir &
-       stand-in (NonRecursive) → each root session dir (NonRecursive) +
-       `index.mark_dirty` on `<sess>/metadata.json` (`"amplifier"`). On a
-       missing root: `book.absent.insert(projects_root)` +
+       call `apply_amplifier_startup_plan`, which runs this exact ordered
+       pipeline:
+       1. Arm the projects root FIRST (NonRecursive, `ArmKind::ProjectsRoot`).
+       2. Arm every plan-listed STRUCTURAL target: each `sessions_dirs` entry
+          (NonRecursive), and each `standins` entry via
+          `arm_sessions_or_standin` (its own post-arm recheck covers a
+          `sessions/` that appeared in the window). NO session-dir arms
+          happen in steps 1-2.
+       3. Post-arm rescan — the union step, the invariant's core: every
+          session-dir arm comes from a readdir taken AFTER its parent watch
+          is live, never from the initial scan's possibly-stale listing:
+          (a) readdir the ARMED projects root and `cascade_new_project` every
+              project dir the plan did not cover (a project created between
+              the initial scan and the root arm) — its cascade arms +
+              post-arm-readdir's its sessions dir;
+          (b) `cascade_session_children` on every ARMED sessions dir —
+              re-finds the initial scan's session dirs AND catches any dir
+              created between the initial scan and that dir's arm.
+          Anything present in EITHER the initial scan OR a post-arm rescan
+          is armed; events observed during arming are queued on the watcher's
+          channel and processed normally by the recv arm (every arm helper
+          is bookkeeping-idempotent, so double-discovery is a no-op).
+       The race this closes: before the root arm, creations are re-found by
+       step 3(a); after it, they are Create events; likewise per sessions
+       dir via 3(b) — the scan-before-watch window (a session dir created
+       between the scan and its parent's arm producing no event and
+       appearing in no scan) cannot lose a root session's freshness, which
+       the hard zero-latency requirement demands. ("Arm order root-first"
+       alone never closed this: the scan itself was stale.)
+       ONLY the file-state stream stays skipped at startup: `emit_marks:
+       false` threads through the whole pass (the boot warm sweep covers
+       initial file state) — the structural stream (arms + rescans) is NOT
+       skipped. No marks for startup arms beyond the case below.
+       On a missing root (`!plan.root_exists`): `book.absent.insert(projects_root)` +
        `index.mark_provider_dirty("amplifier")` (same resilience contract as
-       the generic late-root path). No marks for startup arms beyond the one
-       provider-dirty (the boot warm sweep already covers initial state).
+       the generic late-root path).
        Absence-track via `book.absent`, re-checked at the rearm tick (add an
-       amplifier-specific branch there). Arm order root-first so events are
-       never missed between plan and arm.
+       amplifier-specific branch there — the same branch that drains `retry`,
+       see below).
      - **Absence/retry hygiene (design lines 84-102):** only structural
        targets (root, stand-ins, sessions dirs) use `book.absent`. Deleted
        session dirs are forgotten outright (kernel dropped the watch — see
-       Task 4). Transient arm failures land in `retry` with
-       `retry_backoff(failures)`; RETRY_CAP eviction logs a warn and drops
-       (latency-only degradation; the 15-minute reconcile owns it).
-       Deterministic (`ArmErr::Deterministic`) failures insert nothing.
+       Task 4). Transient arm failures land in `retry` as
+       `RetryEntry { failures: 1, next_attempt: now + retry_backoff(1) }`;
+       RETRY_CAP eviction logs a warn and drops (latency-only degradation;
+       the 15-minute reconcile owns it). Deterministic
+       (`ArmErr::Deterministic`) failures insert nothing.
+       **Retry drain — the retry set is WORKED, not just accumulated:** the
+       amplifier branch of the rearm tick (the same bounded periodic check
+       that re-checks `book.absent`, paced by the established
+       `with_rearm_interval` seam) runs the drain after the absent re-check:
+       collect the retry keys whose `next_attempt <= now` FIRST (no mutation
+       during iteration), then re-run `arm_managed_dir(path, …, emit_marks:
+       true)` on each. Success: the entry clears (a successful arm lands in
+       `armed` with the watch-then-scan mark). A still-Transient re-failure re-enters
+       `retry` with `failures += 1` and `next_attempt = now +
+       retry_backoff(failures)` — doubled backoff, still bounded by the 60s
+       cap and RETRY_CAP eviction. A now-Deterministic failure is dropped
+       like a fresh one. Replan (Task 6) and self-correction (Task 7) keep
+       SKIPPING retry members — the drain is the only path that works them,
+       and only when due (no backoff bypass anywhere).
      - **Dispatch (recv arm, amplifier provider only):** compute depth =
        components below the projects root. `watch_path` events are delivered
        per-event with Task 2's `WatchKind`. Depth 1 `Create|NameTo|NameBoth`
@@ -1101,7 +1376,9 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
        classify basename — watch target → `arm_managed_dir` + scoped mark;
        subagent → `pending_rescans` escalation ONLY when the interest counter
        is non-zero. All other events: legacy pending-map flow (Task 5 takes
-       over). A helper `amplifier_depth(path) -> Option<usize>` using
+       over). Every dispatch call site passes `emit_marks: true` (runtime
+       events must scan what they arm; only startup skips marks). A helper
+       `amplifier_depth(path) -> Option<usize>` using
        `strip_prefix`.
      - **Interest counter:** `SessionWatcher` gains a
        ```rust
@@ -1113,26 +1390,32 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
        (default `Arc::new(AtomicUsize::new(0))` — production wires Task 9;
        a `#[cfg(test)]` variant setter is unnecessary because the builder is
        the injection point).
-     - **Test-only probes:**
+     - **Test-only probe (the seam Task 3 owns):**
        ```rust
        #[cfg(test)]
        pub(crate) fn amplifier_book_handle(&self) -> Option<Arc<std::sync::Mutex<ManagedBook>>>
-       #[cfg(test)]
-       pub(crate) fn test_arm_for_probe(&self, path: &Path)      // drives arm_managed_dir
-       #[cfg(test)]
-       pub(crate) fn test_arm_project_for_probe(&self, project: &Path) // drives arm_sessions_or_standin
        ```
-       These route into the loop's owned state via the shared book:
        `SessionWatcher::new` creates `amplifier_book: Option<Arc<Mutex<ManagedBook>>>`
        (Some iff a provider with `layout.name() == "amplifier"` is configured),
        `start()` clones the Arc into `run_watcher_loop`, and the
-       `#[cfg(test)]` accessor returns a clone. `test_arm_*_for_probe` drive the
-       same `arm` helpers the loop calls, so bookkeeping tests need no inotify timing.
+       `#[cfg(test)]` accessor returns a clone, so started-loop tests assert
+       armed/absent/retry without racing the loop. There are deliberately NO
+       `test_arm_*_for_probe` methods on `SessionWatcher`: `ManagedBook`
+       contains neither the `RecommendedWatcher` nor the provider context
+       (both are owned inside the spawned loop, and `start()` drains the
+       providers), so a probe on `SessionWatcher` cannot drive a real arm.
+       Bookkeeping tests instead call the arm helpers DIRECTLY — they are
+       free functions taking `&mut RecommendedWatcher` + `&mut ManagedBook` +
+       context — on a locally-constructed watcher (Task 2's
+       `create_provider_watcher` + `mpsc::unbounded_channel`) and a fresh
+       `ManagedBook::default()`: the identical code path the loop uses, with
+       no spawned loop and no inotify timing. The loop holds the book behind
+       the Arc<Mutex<>>; its calls lock the guard and pass `&mut *guard`.
   3. `run_watcher_loop` signature gains the amplifier context: `{ Optional projects_root per provider; book Arc; interest counter }` — passed from `SessionWatcher::start`. Claude/codex/opencode take the Task-2 legacy path unchanged.
 
 - [ ] **Step 4: Run the focused test**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: PASS — the moved pre-existing tests, plus the 7 new amplifier tests.
+  Expected: PASS — the moved pre-existing tests, plus the 9 new amplifier tests.
 
 - [ ] **Step 5: Refactor while green**
   Check the module header comment (:1-12): update the architecture bullets to describe the managed watch set for amplifier (one fd per provider; amplifier arms a managed set vs. recursive). Verify `session_watcher.rs` stays under ~1000 lines of production code after the split. No further refactor: the engine is the smallest complete form of the design's watch-set semantics.
@@ -1169,7 +1452,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   - `fn watch_budget_warn_needed(armed: usize, max_user_watches: usize) -> bool` — `armed > max / 4` (pure)
   - Startup log + alarm wiring: after the initial plan application, `tracing::info!(armed_count, …)`; `if let Some(max) = read_max_user_watches() { if watch_budget_warn_needed(total_armed, max) { tracing::warn!(…) } }`
   - `struct DailyCounter { day_stamp: u32, count: u32 }` + `fn note_unknown_arm(&mut self, now: SystemTime) -> Option<String>` — day-bucketed (UTC days since epoch via `now.duration_since(UNIX_EPOCH)/86400`); first arm of unknown format above `DRIFT_DAILY_WARN_THRESHOLD` (= 50/day; real corpus has 21 oddball arms at boot, so 50 is comfortably above steady-state but under a naming-drift flood of ~609/day) returns the WARN message to log; None otherwise
-  - Drift alarm wiring: Task 3's `arm_managed_dir` gains a `BasenameClass::Unknown` arm-kind check → increments the counter via the book's `DailyCounter` → `tracing::warn!` once per threshold-crossing day
+  - Drift alarm wiring: Task 3's `arm_managed_dir` classifies the basename on `ArmKind::SessionDir` arms → a `BasenameClass::Unknown` result increments the counter via the book's `DailyCounter` → `tracing::warn!` once per threshold-crossing day
 
 - [ ] **Step 1: Write the failing behavioral test**
   Append to `crates/freshell-sessions/src/session_watcher_tests.rs`:
@@ -1884,14 +2167,14 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 - Produces:
   - `const MAX_FLUSH_DEFERRAL: Duration = Duration::from_secs(2)` (design value)
   - Debounce rule change: after the FIRST event of a pending burst (`pending_since: Option<tokio::time::Instant>`, latched when pending goes empty→non-empty, cleared on flush), the deadline is `min(now + DEBOUNCE_MS, pending_since + MAX_FLUSH_DEFERRAL)` — sustained sub-200ms streams can no longer starve the flush
-  - `fn replan_amplifier_watch_set(book, watcher, index, projects_root, provider)`: `spawn_blocking(plan_amplifier_targets)` → `diff_armed(desired, armed)` → arm new (with cascade-marks where applicable), `unwatch_tolerated` stale (+ bookkeeping cleanup), provider dirty, `book.replans += 1`. ABORT discipline: when `plan_amplifier_targets` returns `Err`, the replan ABORTS — a warn-level log, the armed set and ALL bookkeeping stay untouched, no unwatch diffs are applied (a transient scan error is NOT an empty listing — the same transient-failure protection philosophy as `discover_checked`); the `mark_provider_dirty("amplifier")` mark STILL fires so the data plane recovers through discover's own root-listing-failure protection, and `book.replans` is NOT incremented (the counter counts APPLIED replans). Honors backoff: a path present in `retry` is NOT re-armed by the diff (Task 7's pure fold-in makes this a shared `roots_needing_arm` predicate — this task uses the simpler "not armed and not in retry" check inline)
+  - `fn replan_amplifier_watch_set(book, watcher, index, projects_root, provider)`: `spawn_blocking(plan_amplifier_targets)` → `diff_armed(desired, armed)` → arm new (with cascade-marks where applicable), `unwatch_tolerated` stale (+ bookkeeping cleanup), provider dirty, `book.replans += 1`. DESIRED SET, precisely: `desired = plan.sessions_dirs ∪ plan.standins ∪ plan.root_session_dirs ∪ { projects_root }` — `PlanTargets` deliberately excludes the permanent projects-root watch (it is the engine's startup context, not a plan product), so the replan UNIONs it in before diffing the COMPLETE armed set; otherwise every successful replan would classify the structural root watch as stale and unwatch it. (sessions dirs and stand-ins already live inside `PlanTargets`, so the root is the only missing permanent.) ABORT discipline: when `plan_amplifier_targets` returns `Err`, the replan ABORTS — a warn-level log, the armed set and ALL bookkeeping stay untouched, no unwatch diffs are applied (a transient scan error is NOT an empty listing — the same transient-failure protection philosophy as `discover_checked`; with Task 1's strict planner this also covers nested read errors); the `mark_provider_dirty("amplifier")` mark STILL fires so the data plane recovers through discover's own root-listing-failure protection, and `book.replans` is NOT incremented (the counter counts APPLIED replans). Honors backoff: a path present in `retry` is NOT re-armed by the diff (Task 7's pure fold-in makes this a shared `roots_needing_arm` predicate — this task uses the simpler "not armed and not in retry" check inline)
   - Flush-arm change (:305-307): `pending_rescans` entries route: `provider == "amplifier"` → `replan_amplifier_watch_set` + `mark_provider_dirty`; everything else → the legacy `mark_provider_dirty` (need_rescan for claude/codex/opencode is unchanged)
-  - `#[cfg(test)] SessionWatcher` gains a test event-injection seam:
+  - The `WatchEvent` channel moves from `start()` to CONSTRUCTION time (today it is created at the top of `run_watcher_loop`): `SessionWatcher::new` creates the channel once, stores the sender in a field (cloned into every provider-watcher callback exactly as today) and the receiver in an `Option` field that `start()` `take()`s and moves into the loop unchanged. On this, the `#[cfg(test)] SessionWatcher` event-injection seam is:
     ```rust
     #[cfg(test)]
     pub(crate) fn test_event_tx(&self) -> Option<mpsc::UnboundedSender<WatchEvent>>
     ```
-    implemented by cloning the channel sender created in `start()` into a `SessionWatcher` field before spawning (no production behavior change: the sender already exists; the test seam publishes the same `WatchEvent` the notify callback would).
+    which simply clones the stored sender — always `Some` BEFORE `start()` (no production behavior change: same channel, same senders, same consumer; the replan tests obtain the sender pre-start by design, so the channel must exist at construction).
 
 - [ ] **Step 1: Write the failing behavioral test**
   Append to `crates/freshell-sessions/src/session_watcher_tests.rs`:
@@ -1901,7 +2184,13 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
   /// Regression 10: a sustained sub-200ms event stream can no longer starve
   /// the flush — it fires within the 2s max-deferral cap even while events
-  /// keep arriving.
+  /// keep arriving. Timing discipline (the crate's real-time idiom, with
+  /// margins so a CORRECT implementation can never flake this): measure from
+  /// the stream's start (the first write lands ~immediately after spawn,
+  /// milliseconds before the first event is processed); the outer timeout is
+  /// 5s — comfortably larger than the 2s cap, so it can only trip on a
+  /// genuinely starved flush, never on a correct cap-limited one; the cap
+  /// assertion itself carries 500ms of notify/scheduling slack.
   #[tokio::test]
   async fn sustained_sub_gap_event_stream_flushes_within_max_deferral() {
       let home = unique_temp_dir("amp-debounce-cap");
@@ -1916,6 +2205,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
       // Producer: 100ms-spaced sidecar writes; spans ~3s of continuous input.
       let transcript = session.join("transcript.jsonl");
+      let stream_started = tokio::time::Instant::now();
       let producer = tokio::spawn(async move {
           for i in 0..28u32 {
               std::fs::write(&transcript, format!("{{\"i\":{i}}}\n")).unwrap();
@@ -1923,10 +2213,21 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           }
       });
 
-      // Without the cap, rx.changed() would not fire until ~3s (producer end)
-      // + quiet-gap; with it, fires ≤ 2s from the first event.
-      let fire_at = tokio::time::timeout(Duration::from_secs(2), rx.changed()).await;
-      assert!(fire_at.is_ok(), "flush deferred at most 2s under a sustained stream");
+      // Without the cap the flush lands at producer-end (~2.8s) + 200ms quiet
+      // gap ≈ 3.0s from stream start; with it, ≈2s after the first event.
+      tokio::time::timeout(Duration::from_secs(5), rx.changed())
+          .await
+          .expect("flush never starves past 5s (outer timeout ≫ 2s cap)")
+          .unwrap();
+      let elapsed = stream_started.elapsed();
+      assert!(
+          elapsed >= Duration::from_millis(150),
+          "the 200ms quiet gap is still respected (asserted with 50ms slack): {elapsed:?}"
+      );
+      assert!(
+          elapsed <= Duration::from_millis(2_500),
+          "flush within cap + 500ms slack of the stream start (first event ≈ start): {elapsed:?}"
+      );
       producer.abort();
       let _ = producer.await;
       watcher.stop();
@@ -1943,6 +2244,8 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let index = amplifier_index(&home);
       let mut watcher = amplifier_watcher(&index, &home);
       let book = watcher.amplifier_book_handle().unwrap();
+      // The event channel is allocated at construction (Interfaces), so the
+      // sender is valid BEFORE start() — this ordering is intentional.
       let tx = watcher.test_event_tx().expect("test event seam");
       let handle = watcher.start();
       let _ = index.snapshot().await;
@@ -1967,18 +2270,27 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       .expect("rescan triggered a replan");
       // Bookkeeping is still consistent afterwards.
       assert!(book.lock().unwrap().armed.contains(&_s1));
+      // The permanent projects-root watch survives the replan — the desired
+      // set is `plan.targets ∪ { projects_root }`, so the diff can never
+      // classify the structural root watch as stale and unwatch it.
+      assert!(
+          book.lock().unwrap().armed.contains(&home.join("projects")),
+          "the structural projects-root watch is never replanned away"
+      );
       watcher.stop();
       let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
       std::fs::remove_dir_all(&home).ok();
   }
 
-  /// Replan abort discipline: when `plan_amplifier_targets` fails transiently
-  /// (a chmod-000 projects root propagates EACCES from `open_root_dir`), the
-  /// replan ABORTS — no arm/unwatch diff is applied, the armed set and all
-  /// bookkeeping stay untouched, `book.replans` (APPLIED replans only) does
-  /// not move — while the provider-dirty mark STILL fires, observable as a
-  /// recorded `amplifier` scan failure via discover's own root-listing
-  /// protection.
+  /// Replan abort discipline, two phases: (1) a chmod-000 projects root
+  /// propagates EACCES from `open_root_dir`; (2) the NESTED partial-scan
+  /// case — root and project listable, `p/sessions` unreadable, which Task
+  /// 1's strict planner turns into a whole-plan `Err` rather than a partial
+  /// plan. In both, the replan ABORTS — no arm/unwatch diff is applied, the
+  /// armed set and all bookkeeping stay untouched, `book.replans` (APPLIED
+  /// replans only) does not move — while the provider-dirty mark STILL
+  /// fires, observable in phase 1 as a recorded `amplifier` scan failure via
+  /// discover's own root-listing protection.
   #[cfg(unix)]
   #[tokio::test]
   async fn replan_aborts_and_keeps_armed_set_on_planner_error() {
@@ -1988,6 +2300,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let index = amplifier_index(&home);
       let mut watcher = amplifier_watcher(&index, &home);
       let book = watcher.amplifier_book_handle().unwrap();
+      // Construction-time channel: the sender is valid before start().
       let tx = watcher.test_event_tx().expect("test event seam");
       let handle = watcher.start();
       let _ = index.snapshot().await;
@@ -2048,7 +2361,35 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           );
       }
 
+      // Phase 2 — the NESTED partial-scan case: the projects root lists fine
+      // and project `p` lists fine, but `p/sessions` is unreadable. Task 1's
+      // strict planner fails the WHOLE plan on this (no partial plan), so the
+      // replan must abort identically — before the strict-everywhere contract
+      // this shape silently produced a partial plan whose unwatch diff would
+      // tear down p's healthy root-session watch.
       std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+      let sessions = projects.join("p").join("sessions");
+      std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+      tx.send(WatchEvent::ProviderRescan {
+          provider: "amplifier".to_string(),
+      })
+      .unwrap();
+      // Bounded settle (the suite's negative-window idiom): long enough for a
+      // buggy diff-applying replan to have run, then assert nothing changed.
+      tokio::time::sleep(Duration::from_millis(700)).await;
+      {
+          let b = book.lock().unwrap();
+          let mut armed_nested: Vec<PathBuf> = b.armed.iter().cloned().collect();
+          armed_nested.sort();
+          assert_eq!(
+              armed_nested, armed_before,
+              "nested scan error also aborts: the armed set is untouched"
+          );
+          assert!(b.absent.is_empty() && b.retry.is_empty());
+          assert_eq!(b.replans, replans_before, "still no applied replan");
+      }
+      std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+
       watcher.stop();
       let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
       std::fs::remove_dir_all(&home).ok();
@@ -2057,7 +2398,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL — `sustained_sub_gap_event_stream_flushes_within_max_deferral` times out at 2s (the deadline resets on every event today); `need_rescan_on_amplifier_replans_the_watch_set` and `replan_aborts_and_keeps_armed_set_on_planner_error` fail to compile (`test_event_tx`) and/or the replan counter never increments.
+  Expected: FAIL — `sustained_sub_gap_event_stream_flushes_within_max_deferral` fails its `elapsed <= 2.5s` cap assertion: today's deadline resets on every event, so the flush lands ≈3.0s from stream start (the 5s outer timeout deliberately does NOT trip — the red signal is the cap assertion, and a correct implementation can never flake the outer timeout); `need_rescan_on_amplifier_replans_the_watch_set` and `replan_aborts_and_keeps_armed_set_on_planner_error` fail to compile (`test_event_tx`, and the construction-time channel field, do not exist) and/or the replan counter never increments.
 
 - [ ] **Step 3: Add the minimal production implementation**
   1. Debounce cap — the flush-deadline computation at :278-283 becomes:
@@ -2072,8 +2413,8 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
      };
      ```
      with `let mut pending_since: Option<tokio::time::Instant> = None;` next to `pending` (:272) and `pending_since = None;` inside the flush arm after draining (:303-332). The coalescing map's per-key `Instant` (:272) remains intentionally unused — a refactor would remove it, but no task needs the stamp: the cap needs only burst-start time (explicitly left as-is per the stale-stamp rule).
-  2. Rescan replan — `replan_amplifier_watch_set` per Interfaces, called from the flush loop's `pending_rescans` branch when `provider == "amplifier"`. The replan plans in `spawn_blocking` (design "bulk operations in `spawn_blocking`"). On planner `Err` the replan ABORTS before any diff application: warn-level log, the armed set and all bookkeeping stay untouched (a transient scan error is not an empty listing — `discover_checked`'s protection philosophy), `mark_provider_dirty("amplifier")` STILL fires (the data plane recovers through discover's own root-listing protection), and `book.replans` is NOT incremented (it counts APPLIED replans). On `Ok`, applies: `arm` diffs → `arm_managed_dir` (cascade marks on session dirs), `unwatch` diffs → `unwatch_tolerated` + bookkeeping cleanup, the provider-dirty mark fires as today, `book.replans += 1`.
-  3. Test seam: `start()` clones the `event_tx` into `self.test_event_tx` (a `#[cfg(test)] Option<UnboundedSender<WatchEvent>>` field) before moving it into the loop.
+  2. Rescan replan — `replan_amplifier_watch_set` per Interfaces, called from the flush loop's `pending_rescans` branch when `provider == "amplifier"`. The replan plans in `spawn_blocking` (design "bulk operations in `spawn_blocking`"). On planner `Err` the replan ABORTS before any diff application: warn-level log, the armed set and all bookkeeping stay untouched (a transient scan error — root OR nested, Task 1's planner is strict-everywhere — is not an empty listing — `discover_checked`'s protection philosophy), `mark_provider_dirty("amplifier")` STILL fires (the data plane recovers through discover's own root-listing protection), and `book.replans` is NOT incremented (it counts APPLIED replans). On `Ok`, computes `desired = plan.sessions_dirs ∪ plan.standins ∪ plan.root_session_dirs ∪ { projects_root }` FIRST — the permanent root watch is not a `PlanTargets` member, so it must be UNIONED in or the diff against the complete armed set would unwatch it — then applies: `arm` diffs → `arm_managed_dir` (cascade marks on session dirs, `emit_marks: true`), `unwatch` diffs → `unwatch_tolerated` + bookkeeping cleanup, the provider-dirty mark fires as today, `book.replans += 1`.
+  3. Test seam / channel placement: the `WatchEvent` channel is allocated in `SessionWatcher::new` (not in `start()`): `new` stores the sender in a field (provider-watcher callbacks clone it as today) and the receiver in an `Option` field that `start()` `take()`s and moves into `run_watcher_loop` unchanged. `test_event_tx()` (a `#[cfg(test)]` accessor) clones the stored sender, so it returns `Some` at construction time and the replan tests' pre-start ordering is correct by construction.
 
 - [ ] **Step 4: Run the focused test**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
@@ -2200,7 +2541,12 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   ```rust
   // Regression 4 (round trip): a subagent-NAMED dir holding root CONTENT
   // (parent_id absent) is name-classified as subagent → never armed at
-  // startup — and is recovered by the refresh→watcher report.
+  // startup — and is recovered by the refresh→watcher report. The
+  // not-armed-then-armed sequence is observed WITHOUT sleeps or races:
+  // phase 1 asserts the startup classification BEFORE any discover/snapshot
+  // has run (so no report can exist yet — the sink only fires from a full
+  // refresh, and startup itself is markless for an existing root); phase 2
+  // triggers the discover and awaits the arm.
   #[tokio::test]
   async fn misnamed_subagent_named_root_is_armed_via_refresh_report() {
       let home = unique_temp_dir("amp-misname");
@@ -2219,13 +2565,31 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let mut watcher = amplifier_watcher(&index, &home);
       let book = watcher.amplifier_book_handle().unwrap();
       let handle = watcher.start();
+
+      // Phase 1 (no report can exist yet — `index.snapshot()` has not been
+      // called): wait for the startup structural arm pass to complete (the
+      // `p/sessions` watch is the deepest structural arm in this fixture),
+      // then assert the misnamed dir is UNARMED — name classification, with
+      // no report in flight to race it.
+      let sessions = home.join("projects").join("p").join("sessions");
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              if book.lock().unwrap().armed.contains(&sessions) {
+                  break;
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+      })
+      .await
+      .expect("startup structural arm pass completes");
+      assert!(
+          !book.lock().unwrap().armed.contains(&dir),
+          "at startup the name says subagent ⇒ unarmed"
+      );
+
+      // Phase 2: NOW the first full discover runs — the root report fires
+      // and the self-correction channel arms the misnamed root.
       let _ = index.snapshot().await;
-
-      // Initially NOT armed (name says subagent).
-      tokio::time::sleep(Duration::from_millis(300)).await;
-      assert!(!book.lock().unwrap().armed.contains(&dir));
-
-      // …then the self-correction channel catches it.
       tokio::time::timeout(Duration::from_secs(5), async {
           loop {
               if book.lock().unwrap().armed.contains(&dir) {
@@ -2674,16 +3038,18 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
     }
     ```
 - [ ] **Step 1: Write the failing behavioral test**
-  Append to `crates/freshell-server/src/subagent_cadence.rs` (created by this task; tests in a `#[cfg(test)] mod tests`):
+  Create `crates/freshell-server/src/subagent_cadence.rs` containing ONLY the `#[cfg(test)] mod tests` below, AND register `mod subagent_cadence;` in `crates/freshell-server/src/main.rs` (alphabetical with the other `mod` decls at the top, ~:46 region) IN THE SAME EDIT — module registration is part of the test edit, so the RED run compiles the failing tests into the tree. The test module is import-self-contained (its own `Duration` and `SubagentInterestRegistry` imports — the file has no production header yet), so its only unresolved names are the production items reaching it through `use super::*`:
 
   ```rust
   #[cfg(test)]
   mod tests {
       use super::*;
+      use std::time::Duration;
+
       use freshell_sessions::directory_index::{
           FileStat, IndexedSession, SessionIndex, SessionSource,
       };
-      use std::collections::HashSet;
+      use freshell_ws::subagent_interest::SubagentInterestRegistry;
       use std::path::{Path, PathBuf};
       use std::sync::atomic::{AtomicUsize, Ordering};
       use std::sync::Arc;
@@ -2808,11 +3174,11 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-server subagent_cadence`
-  Expected: FAIL because `mod subagent_cadence;` is not yet registered in `main.rs` (unresolved module/import — not a syntax accident).
+  Expected: FAIL because the tests — compiled into the tree (the module IS registered; registration was part of the Step-1 test edit) — reference `spawn_subagent_cadence` through `use super::*`, and it does not exist yet (E0425-family unresolved-name compile errors, not a syntax accident).
 
 - [ ] **Step 3: Add the minimal production implementation**
-  1. Create `crates/freshell-server/src/subagent_cadence.rs` with the module doc + `spawn_subagent_cadence` code above (WITHOUT the tests first — TDD: the test is written in Step 1, the module arrives here; order within Step 3 doesn't matter as long as the commit contains both).
-  2. `main.rs`: add `mod subagent_cadence;` (alphabetical with the other `mod` decls at the top, ~:46 region).
+  1. Prepend the module doc + imports + `SUBAGENT_CADENCE_INTERVAL` + `spawn_subagent_cadence` code (the Interfaces block above) to `crates/freshell-server/src/subagent_cadence.rs`, ABOVE the tests written in Step 1. The production header's own `use std::time::Duration;` / `use std::sync::Arc;` / `use freshell_ws::subagent_interest::SubagentInterestRegistry;` imports are used by the const and the fn signature; the test module's same-named explicit imports shadow the `super::*` glob cleanly (no unused-import or ambiguity fallout under the clippy `-D warnings` gate).
+  2. `main.rs`: `mod subagent_cadence;` is already registered (Step 1) — nothing further here.
   3. `main.rs` construction: `let subagent_interest = freshell_ws::subagent_interest::SubagentInterestRegistry::default();` beside `screenshots` (:317-321) if Task 8 didn't already add it; wire the same instance into the `WsState` literal (`subagent_interest: subagent_interest.clone(),` at :991-1045 — Task 8 did the field) and into the session watcher construction (:722-725):
      ```rust
      let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
