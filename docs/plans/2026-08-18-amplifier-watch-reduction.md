@@ -2254,13 +2254,24 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let meta = dir.join("metadata.json");
       let source = AmplifierSource::new(home.clone());
 
+      // Make the sidecar DETERMINISTICALLY newer than metadata.json (the 20ms
+      // mtime-separation idiom used throughout): with a newer sidecar present
+      // the folded key must be STRICTLY greater than the raw metadata mtime —
+      // a raw (unfolded) scoped stat would merely TIE it, which `>=` accepts.
+      std::thread::sleep(std::time::Duration::from_millis(20));
+      std::fs::write(
+          dir.join("transcript.jsonl"),
+          "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+      )
+      .unwrap();
+
       let raw = std::fs::metadata(&meta).unwrap().modified().unwrap();
       let folded = <AmplifierSource as crate::directory_index::SessionSource>::stat_scoped(&source, &meta)
           .expect("scoped stat when metadata exists");
       assert_eq!(folded.path, meta);
       assert!(
-          folded.mtime_ms >= raw.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64,
-          "fold never lowers the mtime"
+          folded.mtime_ms > raw.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64,
+          "a newer sidecar raises the folded key strictly above the raw metadata mtime (a raw-stat key ties and fails)"
       );
 
       // Regression 8's second half: metadata.json gone but transcript.jsonl
@@ -2278,7 +2289,9 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
   ```rust
   // Regression 1 (scoped path): a sidecar-only change on an active amplifier
-  // session refreshes recency WITHOUT a full discover and without parse thrash.
+  // session refreshes recency WITHOUT a full discover and without parse thrash
+  // — TWICE in sequence: the second sidecar-only change is the raw-key trap
+  // (a raw-stat cache key would be raw-equal and skip the third parse).
   #[tokio::test]
   async fn scoped_mark_with_sidecar_only_activity_refreshes_amplifier_recency_without_discover() {
       let home = unique_temp_dir("scoped-fold");
@@ -2321,16 +2334,47 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
       let snap2 = index.snapshot().await;
       let row2 = snap2.iter().find(|s| s.provider == "amplifier").unwrap();
-      assert!(row2.last_activity_at >= before, "recency follows the sidecars");
+      assert!(
+          row2.last_activity_at > before,
+          "recency ADVANCES on a sidecar-only change (equality would mean the sidecar never fed the key)"
+      );
       // Scoped path: NO second discover; exactly one re-parse (folded key changed).
       assert_eq!(discover_calls.load(Ordering::SeqCst), 1, "no full/provider discover");
       assert_eq!(parse_calls.load(Ordering::SeqCst), 2, "one initial + one scoped re-parse");
 
-      // And a steady second scoped mark (no file movement) re-parses nothing,
+      // A steady second scoped mark (no file movement) re-parses nothing,
       // proving the folded-vs-folded cache keys match (no raw-fold thrash).
       index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
       assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
       assert_eq!(parse_calls.load(Ordering::SeqCst), 2, "folded keys agree on both paths");
+
+      // The raw-key trap: a SECOND sidecar-only change must force a THIRD
+      // parse. A raw-stat implementation cached the raw metadata key above
+      // (unchanged again here), so it skips this re-parse and freezes
+      // activity ordering at row2 — the exact bug this regression guards.
+      tokio::time::sleep(Duration::from_millis(20)).await;
+      std::fs::write(
+          session_dir.join("transcript.jsonl"),
+          "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n{\"type\":\"user\"}\n",
+      )
+      .unwrap();
+      index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+      assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+
+      let snap3 = index.snapshot().await;
+      let row3 = snap3.iter().find(|s| s.provider == "amplifier").unwrap();
+      assert_eq!(
+          parse_calls.load(Ordering::SeqCst),
+          3,
+          "the second sidecar-only change re-parses via the folded key (a raw key is raw-equal and is skipped)"
+      );
+      assert!(
+          row3.last_activity_at > row2.last_activity_at,
+          "activity ordering advances STRICTLY on every sidecar-only change ({} > {})",
+          row3.last_activity_at,
+          row2.last_activity_at
+      );
+      assert_eq!(discover_calls.load(Ordering::SeqCst), 1, "still no full/provider discover");
 
       std::fs::remove_dir_all(&home).ok();
   }
@@ -3478,9 +3522,10 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 **Files:**
 - Create: crates/freshell-server/src/subagent_cadence.rs
-- Modify: crates/freshell-server/src/main.rs (mod registration; construction; watcher construction at :702-728 gains `.with_subagent_interest(...)`; new spawn next to `spawn_sessions_sweep` at :1279-1284; the boot warm spawn at :1257-1273 gains the watcher-ready barrier)
-- Modify: crates/freshell-sessions/src/session_watcher.rs (the startup-ready watch channel + signal inside `run_watcher_loop` + the `startup_ready()` accessor)
-- Test: crates/freshell-sessions/src/session_watcher_tests.rs (extends the Task 3 startup-race fixture with the barrier-ordered warm-discover coverage)
+- Modify: crates/freshell-server/src/main.rs (mod registration; construction; watcher construction at :702-728 gains `.with_subagent_interest(...)`; new spawn next to `spawn_sessions_sweep` at :1279-1284; the gate install `index.set_startup_gate(watcher.startup_ready())` inside the :702-731 closure, BETWEEN construction and `watcher.start()` :726)
+- Modify: crates/freshell-sessions/src/session_watcher.rs (the startup-ready watch channel + signal inside `run_watcher_loop` + the receiver-cloning `startup_ready()` accessor)
+- Modify: crates/freshell-sessions/src/directory_index.rs (the cold-start publish gate: `startup_gate` field + `set_startup_gate` + the cold-only consult on the two publish entries)
+- Test: crates/freshell-sessions/src/session_watcher_tests.rs (extends the Task 3 startup-race fixture with the production-order gate coverage)
 
 **Interfaces:**
 - Consumes: `SubagentInterestRegistry` (Task 8); `SessionIndex::mark_provider_dirty` (`directory_index.rs:1016-1022`); the scoped sweep semantics (`:1575-1585` discover gate; `:1699-1711` provider-scoped prune); Task 3's `SessionWatcher::with_subagent_interest`.
@@ -3529,28 +3574,20 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
         })
     }
     ```
-  - Startup watcher-ready barrier (makes the design's "the full discover that FOLLOWS covers it" (lines 48-49, 165-167) deterministic — Task 3's startup arms deliberately skip the file-state stream, so the boot warm discover must be provably ordered AFTER those arms; today `watcher.start()` (main.rs:726) and the warm `tokio::spawn(snapshot())` (:1264) are two unrelated tasks, and a metadata.json written after the warm scan's readdir but before its session dir's structural arm would be armed marklessly and sit stale until the 15-minute reconcile):
-    - `SessionWatcher::startup_ready(&self) -> tokio::sync::watch::Receiver<bool>` — a `tokio::sync::watch` channel (created `watch::channel(false)` in `SessionWatcher::new`; accessor subscribes). `watch`, not a bare `Notify`: the sender may fire BEFORE any awaiter exists, and `Notify::notify_waiters` loses such signals (the task would hang forever); the watch receiver's `wait_for(|done| *done)` returns immediately once the value is set regardless of when it was set. `start()` moves the Sender into `run_watcher_loop`, which sends `true` ONCE after the initial startup arming pass for EVERY configured provider has SETTLED (legacy recursive arms completed; the amplifier `spawn_blocking` plan+apply awaited — success OR planner-`Err` absent-branch alike: a failed plan must never wedge the boot warm sweep), before the select loop begins.
-    - main.rs consumer: the watcher construction block (:702-731) binds `let _session_watcher: Option<SessionWatcher>` (kept alive for the process lifetime); immediately after it, bind `let watcher_startup_ready = _session_watcher.as_ref().map(|w| w.startup_ready());`, capture that `Option<watch::Receiver<bool>>` into the boot warm spawn, and gate the discover on it:
+  - Startup watcher-ready barrier + cold-start publish gate (makes the design's "the full discover that FOLLOWS covers it" (lines 48-49, 165-167) deterministic — Task 3's startup arms deliberately skip the file-state stream, so the FIRST session-index publish of the process must be provably ordered AFTER those arms; a metadata.json written after an early scan's readdir but before its session dir's structural arm would otherwise be armed marklessly and sit stale until the 15-minute reconcile):
+    - EVERY boot-time `snapshot()`/discover entry point (verified against current `main.rs` and its callees): ① the boot warm spawn (`main.rs:1264-1273`, `snapshot()` at :1266), ② `spawn_sessions_sweep`'s initial signature snapshot (`main.rs:2606`, spawned :1279-1284 — UNGATED today: it can populate a fresh 15-minute TTL cache before the watcher finishes arming, after which even a gated warm `snapshot()` would serve that cache without discovering again — the production race this task closes), ③ `spawn_auto_title_sweep`'s first pass (`auto_title_sweep.rs:548` — first wake on a change notification or the 5s tick; spawned `main.rs:1290-1307`), ④ request-serving handlers reachable once the listener binds, pre-readiness: the session-directory listing (`session_directory.rs:421`), the sessions key lookup (`sessions.rs:273`), the diag debug body (`diag.rs:198`), and the WS existence probe's `kick_refresh` (`existence.rs:189`), ⑤ `mark_dirty`/`mark_provider_dirty` → `request_refresh` (`directory_index.rs:990-994` — this task's own cadence included). ALL of these POPULATE the TTL snapshot cache when it is cold or stale — that is how they behave today (cold: run the full discover inline and publish, `run_refresh_inline` directory_index.rs:1076-1077; stale: `spawn_background_refresh`, :1073) — there is no persisted ROW cache a handler could serve instead (the persisted parse cache only accelerates the inline sweep), so the gate goes on the populating path itself, not on any callsite.
+    - The formulation — ONE cold-start gate inside `SessionIndex`, airtight because TTL publishes flow through exactly two entries: `SessionIndex::set_startup_gate(&self, ready: tokio::sync::watch::Receiver<bool>)` installs an optional gate (field default `None`; no watcher ⇒ no gate ⇒ today's exact behavior). `run_refresh_inline` AND the spawned task inside `spawn_background_refresh` open with a cold-only consult: while a gate is installed AND no snapshot has ever been published, await `gate.wait_for(|done| *done)` before sweeping (fail-OPEN on sender drop — a crashed watcher task must never wedge session serving; holding the refresh lock across the wait is deadlock-free because the readiness send happens in the watch loop and every index touch on that path reaches `request_refresh`'s non-blocking `try_lock`). After the first publish the consult is a one-lock `is_some` no-op — steady-state request/sweep paths pay nothing. Cold pre-readiness requests now await readiness inside the index instead of running their own inline pre-arm discover (bounded by the boot window; `/api/health` and every non-session route never touch the index). NO boot callsite — warm spawn, sessions sweep, auto-title sweep, routes — grows a per-site barrier.
+    - The watcher side (receiver-CLONING accessor — production call order construct → consumers subscribe → `start()`; no moved-sender trap): `SessionWatcher::new` creates the `tokio::sync::watch::channel(false)` pair ONCE and stores BOTH ends; `SessionWatcher::startup_ready(&self) -> tokio::sync::watch::Receiver<bool>` returns a CLONE of the retained `Receiver` (`watch::Receiver` is `Clone` — any number of consumers subscribe, before or after `start()`, identically); `start()` moves ONLY the `Sender` into `run_watcher_loop`. `watch`, not a bare `Notify`: the sender may fire BEFORE any awaiter exists, and `Notify::notify_waiters` loses such signals (the task would hang forever); the watch receiver's `wait_for(|done| *done)` returns immediately once the value is set regardless of when it was set. `run_watcher_loop` sends `true` ONCE after the initial startup arming pass for EVERY configured provider has SETTLED (legacy recursive arms completed; the amplifier `spawn_blocking` plan+apply JoinHandle resolved AND its `ArmOutcome` drained into the index — `marks` → `index.mark_dirty`, `provider_dirty` → `index.mark_provider_dirty("amplifier")` — so the first post-gate publish consumes them; success OR planner-`Err` absent-branch alike: a failed plan must never wedge the boot sweeps), before the select loop begins.
+    - main.rs wiring (production call order: construct → subscribe+install → start): inside the watcher construction closure (:702-731), between the `SessionWatcher::new(...)`/`.with_subagent_interest(...)` construction and `watcher.start()` (:726):
       ```rust
-      tokio::spawn(async move {
-          // Watch-reduction ordering barrier: the boot warm DISCOVER runs only
-          // AFTER the watcher's startup arms settled (design: "Skip the
-          // file-state stream during the startup arming pass (the full
-          // discover that follows covers it)"). Without the barrier a
-          // completed metadata write landing between the warm scan and the
-          // structural arm is armed marklessly and could sit stale until the
-          // 15-minute reconcile. `wait_for` returns immediately when the
-          // signal already fired; `None` (no provider home ⇒ no watcher)
-          // leaves the sweep as unbarriered as today.
-          if let Some(mut ready) = watcher_startup_ready {
-              let _ = ready.wait_for(|done| *done).await;
-          }
-          let items = warm_index.snapshot().await;
-          ...
-      });
+      // Watch-reduction cold-start gate: every boot-time session-index
+      // publish (warm spawn :1266, sessions-sweep initial :2606, auto-title
+      // first pass, pre-readiness routes, mark-driven background refreshes)
+      // funnels through the index's two publish entries; installing the
+      // receiver HERE — before start() — orders the FIRST publish after the
+      // watcher reports startup arms settled.
+      index.set_startup_gate(watcher.startup_ready());
       ```
-      Only the warm task waits — request-serving paths are untouched (the barrier narrows the boot race the arm-suppression contract relies on; by the time anything serves traffic the barrier is long settled).
 - [ ] **Step 1: Write the failing behavioral test**
   Create `crates/freshell-server/src/subagent_cadence.rs` containing ONLY the `#[cfg(test)] mod tests` below, AND register `mod subagent_cadence;` in `crates/freshell-server/src/main.rs` (alphabetical with the other `mod` decls at the top, ~:46 region) IN THE SAME EDIT — module registration is part of the test edit, so the RED run compiles the failing tests into the tree. The test module is import-self-contained (its own `Duration` and `SubagentInterestRegistry` imports — the file has no production header yet), so its only unresolved names are the production items reaching it through `use super::*`:
 
@@ -3686,37 +3723,60 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   }
   ```
 
-  (b) the startup-barrier regression — append to `crates/freshell-sessions/src/session_watcher_tests.rs` (extends Task 3's `startup_arms_session_dirs_created_in_the_scan_arm_window` fixture with the raced metadata write):
+  (b) the startup-barrier regression — append to `crates/freshell-sessions/src/session_watcher_tests.rs` (extends Task 3's `startup_arms_session_dirs_created_in_the_scan_arm_window` fixture with the raced metadata write, in PRODUCTION boot order — no `mark_provider_dirty` the production boot sequence does not make):
 
   ```rust
-  /// Startup-barrier race (extends `startup_arms_session_dirs_created_in_the_scan_arm_window`):
-  /// a metadata.json written AFTER an early warm scan but BEFORE its session
-  /// dir's structural arm is picked up by the post-barrier discover — never
-  /// stale until the 15-minute reconcile. The warm discover is ordered AFTER
-  /// the watcher's startup plan application (`startup_ready`), which makes
-  /// the design's "skip the file-state stream at startup; the discover that
-  /// follows covers it" contract true deterministically.
+  /// Startup-barrier race, PRODUCTION ORDER (extends
+  /// `startup_arms_session_dirs_created_in_the_scan_arm_window`): the real
+  /// boot race is the detached sweep tasks issued while the watcher arms —
+  /// the warm spawn (`main.rs:1266`) AND `spawn_sessions_sweep`'s initial
+  /// signature snapshot (`main.rs:2606`). The cold-start publish gate
+  /// (`SessionIndex::set_startup_gate`, fed by `SessionWatcher::startup_ready`)
+  /// must hold the FIRST publish until the startup arms settle, so a metadata
+  /// write landing in the scan↔arm window is visible in that SAME boot
+  /// snapshot — never stale until the 15-minute reconcile.
   #[tokio::test]
-  async fn warm_discover_after_startup_barrier_covers_window_raced_writes() {
+  async fn boot_snapshot_gate_covers_window_raced_writes() {
       let home = unique_temp_dir("amp-barrier");
       let _pre = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
       let index = amplifier_index(&home);
       let mut watcher = amplifier_watcher(&index, &home);
+      // Production order (main.rs): construct → consumers subscribe via
+      // `startup_ready()` → `start()`. The accessor clones the retained
+      // receiver, so the gate install AND this test's awaiter both subscribe
+      // before start — exactly as the main.rs wiring does.
+      index.set_startup_gate(watcher.startup_ready());
       let mut ready = watcher.startup_ready();
       let book = watcher.amplifier_book_handle().unwrap();
 
-      // The unordered world the barrier outlaws: an early warm scan publishes
-      // WITHOUT the racer (this snapshot completes before the write below).
-      let snap0 = index.snapshot().await;
-      assert_eq!(snap0.iter().filter(|s| s.provider == "amplifier").count(), 1);
+      // The sessions sweep's boot snapshot (main.rs:2606): issued
+      // immediately, pre-start — the task that raced ahead ungated in
+      // production.
+      let mut early = tokio::spawn({
+          let index = Arc::clone(&index);
+          async move { index.snapshot().await }
+      });
 
-      // The raced write: session dir + metadata land after the warm scan,
-      // before the watcher arms the tree (startup is markless by design).
+      // The raced write: lands after the sweep's call, before its arm
+      // (startup is markless by design).
       let racer = write_amplifier_session(&home, "p", "cc2584be-9478-4801-a62d-4e5da428b3a0");
+
+      // Deterministic gate proof (no sleep-race): `timeout` DRIVES `early` —
+      // ungated, the snapshot completes right here (a pre-arm publish, the
+      // bug, and the assertion fails); gated, it can only still be pending —
+      // the gate cannot open because `start()` has not been called, so the
+      // 250ms window's length decides nothing.
+      assert!(
+          tokio::time::timeout(Duration::from_millis(250), &mut early)
+              .await
+              .is_err(),
+          "the boot sweep's snapshot is gated: no publish before watcher readiness"
+      );
+
       let handle = watcher.start();
 
-      // The barrier: readiness fires only AFTER the startup arms settle, and
-      // by then the raced dir is provably armed.
+      // Readiness fires only AFTER the startup arms settle; the raced dir is
+      // provably armed by then.
       tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|done| *done))
           .await
           .expect("startup readiness fires")
@@ -3726,22 +3786,18 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           "readiness implies the raced dir is armed"
       );
 
-      // The discover that FOLLOWS the barrier — the boot warm sweep's
-      // production ordering — covers the completed write: the row appears.
-      // (A provider-dirty re-discover models the post-barrier boot sweep
-      // deterministically: the warm TTL would otherwise serve the early
-      // snapshot forever within this test.)
-      index.mark_provider_dirty("amplifier");
-      let mut visible = false;
-      for _ in 0..50 {
-          if index.snapshot().await.iter().any(|s| s.provider == "amplifier"
-              && s.session_id == "cc2584be-9478-4801-a62d-4e5da428b3a0") {
-              visible = true;
-              break;
-          }
-          tokio::time::sleep(Duration::from_millis(100)).await;
-      }
-      assert!(visible, "the post-barrier discover covers the raced write");
+      // The boot sweep's OWN snapshot — the first post-readiness publish —
+      // covers the window-raced write. NO provider-dirty kick: the production
+      // boot sequence makes no such call.
+      let items = tokio::time::timeout(Duration::from_secs(5), early)
+          .await
+          .expect("the gated snapshot completes after readiness")
+          .unwrap();
+      assert!(
+          items.iter().any(|s| s.provider == "amplifier"
+              && s.session_id == "cc2584be-9478-4801-a62d-4e5da428b3a0"),
+          "the first post-readiness publish covers the window-raced write"
+      );
       watcher.stop();
       let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
       std::fs::remove_dir_all(&home).ok();
@@ -3750,7 +3806,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-server subagent_cadence` and `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL because the tests — compiled into the tree (the module IS registered; registration was part of the Step-1 test edit) — reference `spawn_subagent_cadence` through `use super::*`, and it does not exist yet (E0425-family unresolved-name compile errors, not a syntax accident); and because the sessions test references `SessionWatcher::startup_ready`, which does not exist yet (same unresolved-name compile failure in `session_watcher_tests`).
+  Expected: FAIL because the tests — compiled into the tree (the module IS registered; registration was part of the Step-1 test edit) — reference `spawn_subagent_cadence` through `use super::*`, and it does not exist yet (E0425-family unresolved-name compile errors, not a syntax accident); and because the sessions test references `SessionWatcher::startup_ready` AND `SessionIndex::set_startup_gate`, neither of which exists yet (same E0425/E0599-family compile failures in `session_watcher_tests`).
 
 - [ ] **Step 3: Add the minimal production implementation**
   1. Prepend the module doc + imports + `SUBAGENT_CADENCE_INTERVAL` + `spawn_subagent_cadence` code (the Interfaces block above) to `crates/freshell-server/src/subagent_cadence.rs`, ABOVE the tests written in Step 1. The production header's own `use std::time::Duration;` / `use std::sync::Arc;` / `use freshell_ws::subagent_interest::SubagentInterestRegistry;` imports are used by the const and the fn signature; the test module's same-named explicit imports shadow the `super::*` glob cleanly (no unused-import or ambiguity fallout under the clippy `-D warnings` gate).
@@ -3773,23 +3829,26 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
           subagent_cadence::SUBAGENT_CADENCE_INTERVAL,
       );
       ```
-   5. The watcher-ready barrier (per Interfaces): `session_watcher.rs` — `SessionWatcher` gains the `watch::Sender<bool>` field created as `watch::channel(false)` in `new`; `startup_ready()` subscribes a Receiver; `start()` moves the Sender into `run_watcher_loop`, which sends `true` once, after the full initial arming pass for every provider has settled (for amplifier: after the `spawn_blocking` plan+apply JoinHandle resolves — including the planner-`Err` absent branch, which must never wedge the sweep), before the select loop begins. `main.rs` — bind the `Option`'s receiver right after the watcher construction (:702-731) and gate the boot warm spawn's `snapshot()` on `wait_for(|done| *done)` as in the Interfaces code block.
+   5. The watcher-ready channel + cold-start publish gate (per Interfaces):
+      - `session_watcher.rs` — `SessionWatcher::new` creates the `watch::channel(false)` pair ONCE and stores BOTH ends (the `Sender` field AND the retained `Receiver` field). `startup_ready(&self) -> tokio::sync::watch::Receiver<bool>` returns a CLONE of the retained receiver (`watch::Receiver` is `Clone` — consumers subscribe before or after `start()`, identically). `start()` moves ONLY the `Sender` into `run_watcher_loop`, which sends `true` once, after the full initial arming pass for every provider has settled (for amplifier: after the `spawn_blocking` plan+apply JoinHandle has resolved AND the returned `ArmOutcome` has been drained into the index — `marks` → `index.mark_dirty`, `provider_dirty` → `index.mark_provider_dirty("amplifier")` — so the first post-gate publish consumes them; including the planner-`Err` absent branch, which must never wedge the sweeps), before the select loop begins. The round-3 review's moved-sender contradiction cannot arise: the accessor never touches the sender.
+      - `directory_index.rs` — `SessionIndex` gains the `startup_gate` field (`Arc<StdMutex<Option<tokio::sync::watch::Receiver<bool>>>>`, default `None`) and `pub fn set_startup_gate(&self, ready: tokio::sync::watch::Receiver<bool>)` (install-once at boot; `None` watcher ⇒ no gate ⇒ today's exact behavior). `run_refresh_inline` AND the spawned task inside `spawn_background_refresh` open with a cold-only consult: while a gate is installed AND no snapshot has ever been published, `let _ = gate.wait_for(|done| *done).await;` before sweeping (fail-OPEN on sender drop — a crashed watcher task must never wedge session serving). Holding the refresh lock across the wait is deadlock-free: the readiness send is in the watch loop, and every index touch on that path goes through `request_refresh`'s non-blocking `try_lock`. After the first publish the consult is a one-lock `is_some` no-op — steady-state request/sweep paths pay nothing.
+      - `main.rs` — inside the watcher construction closure (:702-731), insert the gate install BETWEEN the `SessionWatcher::new(...)`/`.with_subagent_interest(...)` construction (item 3) and `watcher.start()` (:726): `index.set_startup_gate(watcher.startup_ready());` (exact code block in Interfaces). NO other main.rs site changes: the boot warm spawn (:1257-1273), `spawn_sessions_sweep`'s initial snapshot (:2606), and `spawn_auto_title_sweep` (:1290-1307) all funnel through the gated publish entries and need no per-callsite barrier; the request routes are code-untouched (a cold pre-readiness request now awaits readiness inside the index instead of running its own inline pre-arm discover — bounded by the boot window; `/api/health` and non-session routes never touch the index).
 
 - [ ] **Step 4: Run the focused test**
   Run: `cargo test -p freshell-server subagent_cadence && cargo test -p freshell-sessions --lib session_watcher`
   Expected: PASS (cadence tests + the barrier test + the existing watcher suite).
 
 - [ ] **Step 5: Refactor while green**
-  The module is standalone and small; nothing to refactor. Confirm the spawn is inside the `session_index.is_some()` block (no index ⇒ no cadence, matching the sessions sweep) and that the barrier gates ONLY the boot warm sweep (no request path waits on it).
+  The module is standalone and small; nothing to refactor. Confirm the spawn is inside the `session_index.is_some()` block (no index ⇒ no cadence, matching the sessions sweep), that the gate consult fires only while NO snapshot has ever been published (a post-boot stale-while-revalidate refresh never waits on it), and that no sweep/route callsite grew a per-site barrier.
 
 - [ ] **Step 6: Run impacted-test verification**
-  Impacted set: freshell-server full suite (main.rs construction changed: three interaction points — registry instance, watcher builder call, cadence spawn) + a freshell-sessions freshness check (the watcher builder's default arm must not break session_watcher tests that call plain `new`).
-  Run: `cargo test -p freshell-server --no-fail-fast && cargo test -p freshell-sessions --lib session_watcher`
+  Impacted set: freshell-server full suite (main.rs construction changed: four interaction points — registry instance, watcher builder call, gate install, cadence spawn) + the FULL freshell-sessions lib suite (the gate touches `directory_index.rs`'s two publish entries — the cold-path, stale-while-revalidate, and persisted-cache tests there must stay green alongside session_watcher).
+  Run: `cargo test -p freshell-server --no-fail-fast && cargo test -p freshell-sessions --lib`
   Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
   ```bash
-  git add crates/freshell-server/src/subagent_cadence.rs crates/freshell-server/src/main.rs crates/freshell-sessions/src/session_watcher.rs crates/freshell-sessions/src/session_watcher_tests.rs
+  git add crates/freshell-server/src/subagent_cadence.rs crates/freshell-server/src/main.rs crates/freshell-sessions/src/session_watcher.rs crates/freshell-sessions/src/session_watcher_tests.rs crates/freshell-sessions/src/directory_index.rs
   git commit -m "feat(server): demand-driven 15s amplifier subagent rescan cadence + startup watcher-ready barrier"
   ```
 
