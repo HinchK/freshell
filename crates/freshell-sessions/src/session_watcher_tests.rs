@@ -1554,3 +1554,268 @@ async fn standin_project_children_other_than_sessions_are_dropped() {
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------- debounce cap + rescan replan ----------
+
+/// Regression 10: a sustained sub-200ms event stream can no longer starve
+/// the flush — it fires within the 2s max-deferral cap even while events
+/// keep arriving. Timing discipline (the crate's real-time idiom, with
+/// margins so a CORRECT implementation can never flake this): measure from
+/// the stream's start (the first write lands ~immediately after spawn,
+/// milliseconds before the first event is processed); the outer timeout is
+/// 5s — comfortably larger than the 2s cap, so it can only trip on a
+/// genuinely starved flush, never on a correct cap-limited one; the cap
+/// assertion itself carries 500ms of notify/scheduling slack.
+#[tokio::test]
+async fn sustained_sub_gap_event_stream_flushes_within_max_deferral() {
+    let home = unique_temp_dir("amp-debounce-cap");
+    let session = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Producer: 100ms-spaced sidecar writes; spans ~3s of continuous input.
+    let transcript = session.join("transcript.jsonl");
+    let stream_started = tokio::time::Instant::now();
+    let producer = tokio::spawn(async move {
+        for i in 0..28u32 {
+            std::fs::write(&transcript, format!("{{\"i\":{i}}}\n")).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Without the cap the flush lands at producer-end (~2.8s) + 200ms quiet
+    // gap ≈ 3.0s from stream start; with it, ≈2s after the first event.
+    tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        .await
+        .expect("flush never starves past 5s (outer timeout ≫ 2s cap)")
+        .unwrap();
+    let elapsed = stream_started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "the 200ms quiet gap is still respected (asserted with 50ms slack): {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(2_500),
+        "flush within cap + 500ms slack of the stream start (first event ≈ start): {elapsed:?}"
+    );
+    producer.abort();
+    let _ = producer.await;
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// need_rescan (IN_Q_OVERFLOW) on amplifier = full watch-set replan AND
+/// provider dirty; on claude it stays provider-dirty only.
+#[tokio::test]
+async fn need_rescan_on_amplifier_replans_the_watch_set() {
+    let home = unique_temp_dir("amp-replan");
+    let _s1 = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    // The event channel is allocated at construction (Interfaces), so the
+    // sender is valid BEFORE start() — this ordering is intentional.
+    let tx = watcher.test_event_tx().expect("test event seam");
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let initial_replans = book.lock().unwrap().replans;
+
+    // Inject a synthetic queue-overflow rescan for amplifier.
+    tx.send(WatchEvent::ProviderRescan {
+        provider: "amplifier".to_string(),
+    })
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().replans > initial_replans {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("rescan triggered a replan");
+    // Bookkeeping is still consistent afterwards.
+    assert!(book.lock().unwrap().armed.contains(&_s1));
+    // The permanent projects-root watch survives the replan — the desired
+    // kind-map includes `{ projects_root → ProjectsRoot }` whenever the
+    // root exists, so the diff can never classify the structural root
+    // watch as stale and unwatch it.
+    assert!(
+        book.lock().unwrap().armed.contains(&home.join("projects")),
+        "the structural projects-root watch is never replanned away"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Replan abort discipline, two phases: (1) a chmod-000 projects root
+/// propagates EACCES from `open_root_dir`; (2) the NESTED partial-scan
+/// case — root and project listable, `p/sessions` unreadable, which Task
+/// 1's strict planner turns into a whole-plan `Err` rather than a partial
+/// plan. In both, the replan ABORTS — no arm/unwatch diff is applied, the
+/// armed set and all bookkeeping stay untouched, `book.replans` (APPLIED
+/// replans only) does not move — while the provider-dirty mark STILL
+/// fires, observable in phase 1 as a recorded `amplifier` scan failure via
+/// discover's own root-listing protection.
+#[cfg(unix)]
+#[tokio::test]
+async fn replan_aborts_and_keeps_armed_set_on_planner_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = unique_temp_dir("amp-replan-abort");
+    let s1 = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    // Construction-time channel: the sender is valid before start().
+    let tx = watcher.test_event_tx().expect("test event seam");
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    assert!(index.scan_failures().is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut armed_before: Vec<PathBuf> = book.lock().unwrap().armed.iter().cloned().collect();
+    armed_before.sort();
+    let replans_before = book.lock().unwrap().replans;
+    assert!(armed_before.iter().any(|p| p == &s1));
+
+    // Transient planner failure: the projects root becomes UNLISTABLE.
+    // (stat still succeeds — only read_dir fails — so the rearm tick sees
+    // `exists() == true` and does not churn the armed set.)
+    let projects = home.join("projects");
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&projects).is_ok() {
+        eprintln!("skipping planner-error assertions: euid can list a 0o000 dir");
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        watcher.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        std::fs::remove_dir_all(&home).ok();
+        return;
+    }
+
+    tx.send(WatchEvent::ProviderRescan {
+        provider: "amplifier".to_string(),
+    })
+    .unwrap();
+
+    // The provider-dirty mark STILL fired: discover's root-listing
+    // protection records a scan failure instead of gutting the snapshot
+    // (data plane recovers through discover's own protection).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if index.scan_failures().iter().any(|n| n == "amplifier") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("provider dirty still fired (amplifier scan failure recorded)");
+
+    // The ABORT left every watch-set facet untouched: no arm/unwatch diff
+    // was applied, bookkeeping is unchanged, and the applied-only replan
+    // counter did not increment.
+    {
+        let b = book.lock().unwrap();
+        let mut armed_after: Vec<PathBuf> = b.armed.iter().cloned().collect();
+        armed_after.sort();
+        assert_eq!(armed_after, armed_before, "aborted replan applies no diff");
+        assert!(b.absent.is_empty() && b.retry.is_empty());
+        assert_eq!(
+            b.replans, replans_before,
+            "book.replans counts APPLIED replans only"
+        );
+    }
+
+    // Phase 2 — the NESTED partial-scan case: the projects root lists fine
+    // and project `p` lists fine, but `p/sessions` is unreadable. Task 1's
+    // strict planner fails the WHOLE plan on this (no partial plan), so the
+    // replan must abort identically — before the strict-everywhere contract
+    // this shape silently produced a partial plan whose unwatch diff would
+    // tear down p's healthy root-session watch.
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sessions = projects.join("p").join("sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+    tx.send(WatchEvent::ProviderRescan {
+        provider: "amplifier".to_string(),
+    })
+    .unwrap();
+    // Bounded settle (the suite's negative-window idiom): long enough for a
+    // buggy diff-applying replan to have run, then assert nothing changed.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    {
+        let b = book.lock().unwrap();
+        let mut armed_nested: Vec<PathBuf> = b.armed.iter().cloned().collect();
+        armed_nested.sort();
+        assert_eq!(
+            armed_nested, armed_before,
+            "nested scan error also aborts: the armed set is untouched"
+        );
+        assert!(b.absent.is_empty() && b.retry.is_empty());
+        assert_eq!(b.replans, replans_before, "still no applied replan");
+    }
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The replan applies arm diffs KIND-CORRECTLY (never flattened): a
+/// `sessions/` dir first discovered by the REPLAN (not startup, not an
+/// event cascade — its create events were lost) is armed as
+/// `ArmKind::SessionsDir`, so the arm CASCADES: its root-session children
+/// are armed first-line and their scoped metadata.json marks are emitted.
+/// A flattened bare-path arm would leave those children unwatched —
+/// silent staleness against the hard zero-latency requirement. Driven
+/// through the sync core with the established no-loop idiom.
+#[tokio::test]
+async fn replan_arms_newly_appeared_sessions_dir_kind_correctly_with_cascade() {
+    let home = unique_temp_dir("amp-replan-kind");
+    let session = write_amplifier_session(&home, "late", "550e8400-e29b-41d4-a716-4466554400aa");
+    let metadata = session.join("metadata.json");
+    let projects_root = home.join("projects");
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    // Seed the book as if startup armed ONLY the projects root (the `late`
+    // project appeared later and its events were lost — the replan is the
+    // recovery path, so nothing below the root is armed yet).
+    book.armed.insert(projects_root.clone());
+    let mut outcome = ArmOutcome::default();
+
+    let applied = replan_amplifier_watch_set(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        "amplifier",
+    );
+
+    let sessions_dir = projects_root.join("late").join("sessions");
+    assert!(applied, "a clean plan applies");
+    assert!(book.armed.contains(&sessions_dir), "sessions dir armed");
+    assert!(
+        book.armed.contains(&session),
+        "the kind-correct arm CASCADED: the root-session child is armed"
+    );
+    assert!(
+        outcome.marks.contains(&metadata),
+        "watch-then-scan: the cascaded session's scoped mark was emitted"
+    );
+    assert!(
+        outcome.provider_dirty,
+        "the replan escalates provider dirty"
+    );
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}

@@ -29,7 +29,13 @@
 //!   unbounded root-session watch growth: an edge-triggered WARN at >25%
 //!   of the kernel inotify watch limit (checked after every arm batch) and
 //!   a daily-bucketed WARN on unknown-format arm drift.
-//! - Debounced flush (200ms) delivers dirty paths to `SessionIndex::mark_dirty`
+//! - Debounced flush (200ms quiet gap, capped at 2s from a burst's first
+//!   event so sustained sub-gap streams can't starve it) delivers dirty
+//!   paths to `SessionIndex::mark_dirty`. An amplifier rescan
+//!   (need_rescan / queue overflow) additionally runs a full watch-set
+//!   REPLAN (strict plan → kind-tagged diff → kind-correct arm/unwatch)
+//!   inside one `spawn_blocking` batch; other providers keep the legacy
+//!   provider-dirty path.
 //! - Late-root handling: legacy providers watch the nearest existing ancestor
 //!   when the provider root doesn't exist yet; the amplifier projects root
 //!   absence-tracks in the managed book instead (`absent` + rearm-tick
@@ -48,14 +54,20 @@ use tokio::sync::mpsc;
 use crate::directory_index::SessionIndex;
 use crate::provider_layout::{ProviderLayout, WatchMode};
 use crate::watch_plan::{
-    classify_arm_error, classify_basename, is_watch_target, plan_amplifier_targets, ArmErr,
-    ArmKind, BasenameClass, PlanTargets,
+    classify_arm_error, classify_basename, diff_armed, is_watch_target, plan_amplifier_targets,
+    ArmErr, ArmKind, BasenameClass, PlanTargets,
 };
 
 /// Debounce window: coalesced events are flushed to SessionIndex after
 /// this much quiet time. 200ms matches the observer's findings and is
 /// well under human-perceptible latency.
 const DEBOUNCE_MS: u64 = 200;
+
+/// Max deferral cap (design value): a burst's flush deadline is additionally
+/// bounded at this offset from the FIRST event of the burst, so a sustained
+/// stream of sub-quiet-gap events can never starve the flush (the plain
+/// quiet-gap rule resets the deadline per event, so such a stream would).
+const MAX_FLUSH_DEFERRAL: Duration = Duration::from_secs(2);
 
 /// How often (seconds) to re-check absent providers whose roots didn't
 /// exist at startup (or whose watchers failed to arm). When a provider's
@@ -77,7 +89,7 @@ const REARM_INTERVAL_SECS: u64 = 60;
 /// must dispatch on the `Remove` kind WITHOUT filtering on the
 /// dir-vs-file tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchKind {
+pub(crate) enum WatchKind {
     Create,
     CreateFolder,
     Remove,
@@ -103,8 +115,10 @@ fn kind_of(event: &notify::Event) -> WatchKind {
 }
 
 /// Events from watcher callbacks, carrying provider identity so the
-/// flush logic can scope dirty marks to the correct provider.
-enum WatchEvent {
+/// flush logic can scope dirty marks to the correct provider. Crate-visible
+/// because the `#[cfg(test)]` event-injection seam types it over the
+/// channel halves.
+pub(crate) enum WatchEvent {
     /// One notify event's full path set (one FileChanged message per
     /// notify event). Rename vocabulary as observed by the LB-01
     /// real-notify probe (notify 6.1.1, kernel 6.6.87.2-WSL2, ext4): an
@@ -155,6 +169,12 @@ pub struct SessionWatcher {
     amplifier_book: Option<Arc<std::sync::Mutex<ManagedBook>>>,
     /// Connected subagent interest count (see `with_subagent_interest`).
     subagent_interest: Arc<std::sync::atomic::AtomicUsize>,
+    /// The event channel, allocated at CONSTRUCTION (not in `start`):
+    /// watcher callbacks clone the sender exactly as before; `start`
+    /// `take()`s the receiver into the loop unchanged. Tests can inject
+    /// events BEFORE start via `test_event_tx`.
+    event_tx: mpsc::UnboundedSender<WatchEvent>,
+    event_rx: Option<mpsc::UnboundedReceiver<WatchEvent>>,
 }
 
 /// Event filter: same logic as `activity.rs::fs_event_is_relevant` —
@@ -308,9 +328,9 @@ pub(crate) struct ManagedBook {
     /// Daily-bucketed count of unknown-format session-dir arms — the
     /// naming-drift alarm's input.
     drift: DailyCounter,
-    // The plan's `replans: usize` counter lands in Task 6 together with its
-    // only writer (the replan path) — declared now it would be dead code
-    // under the `-D warnings` gate.
+    /// Count of APPLIED replans (observability): a planner-Err abort is not
+    /// an applied replan, so the abort path leaves this untouched.
+    replans: usize,
 }
 
 /// A transient arm failure awaiting the rearm tick; `kind` is retained so
@@ -366,8 +386,8 @@ fn watch_budget_edge(warned: bool, armed: usize, max_user_watches: usize) -> (bo
 
 /// The watch-budget check shared by every arm-batch application — startup
 /// apply, the structural-create cascade dispatch (once per batch, not per
-/// arm), the retry-drain batch, and the absent-root-return cascade (the
-/// replan apply joins the list when Task 6 lands it). The armed set grows
+/// arm), the retry-drain batch, the absent-root-return cascade, and the
+/// replan apply. The armed set grows
 /// unboundedly at RUNTIME (the accepted ~31K/yr accrual), so a
 /// startup-only check would sleep through a runtime crossing. `None`
 /// off-Linux/parse failure no-ops with the edge state untouched.
@@ -1035,6 +1055,105 @@ fn apply_amplifier_plan(
     }
 }
 
+/// The SYNC core of an amplifier watch-set replan (need_rescan /
+/// IN_Q_OVERFLOW recovery): re-plan the desired watch set, diff it
+/// (kind-tagged) against the armed set, and apply. Returns "applied" — the
+/// async flush wrapper uses it for `book.replans` (the counter counts
+/// APPLIED replans only).
+///
+/// ABORT discipline: when `plan_amplifier_targets` returns `Err` the replan
+/// aborts BEFORE any diff application — a warn-level log, the armed set and
+/// ALL bookkeeping stay untouched (a transient scan error — root OR nested;
+/// the planner is strict-everywhere — is NOT an empty listing; same
+/// transient-failure protection philosophy as `discover_checked`), while
+/// `outcome.provider_dirty` is STILL set (the data plane recovers through
+/// discover's own root-listing-failure protection).
+///
+/// On `Ok`, the desired set is `sessions_dirs → SessionsDir`,
+/// `standins → Standin`, `root_session_dirs → SessionDir` PLUS
+/// `{ projects_root → ProjectsRoot }` — the projects root ONLY when
+/// `plan.root_exists`: the permanent root watch is not a `PlanTargets`
+/// member (it is the engine's startup context, not a plan product), so the
+/// union keeps the diff from classifying the structural root watch as
+/// stale. When the root has VANISHED the desired set excludes it and the
+/// replan itself routes the root to absence tracking (`unwatch_tolerated` +
+/// `armed.remove` + `absent.insert` + provider dirty) — the dead subtree
+/// then unwatches via the diff (all `WatchNotFound`-tolerated), and the
+/// rearm tick's full-cascade re-arm owns the return. Apply is KIND-CORRECT,
+/// never flattened: `SessionsDir` arms cascade their children, `Standin`
+/// arms run the swap, `SessionDir` arms watch-then-scan; a path still in
+/// `retry` is NOT re-armed (backoff is never bypassed). Each unwatch path
+/// gets `unwatch_tolerated` + `structural_remove` bookkeeping cleanup.
+/// Arm-failure routing (deterministic drop / absence / retry insert) stays
+/// with `watch_and_record` inside the arm helpers. Every applied replan —
+/// and the root-vanish/absence route — escalates `provider_dirty`.
+fn replan_amplifier_watch_set(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    provider: &str,
+) -> bool {
+    let plan = match plan_amplifier_targets(projects_root) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider,
+                path = %projects_root.display(),
+                error = %e,
+                "session-watcher: amplifier replan aborted: plan scan failed (armed set untouched)",
+            );
+            outcome.provider_dirty = true;
+            return false;
+        }
+    };
+    // The replan escalates provider dirty on both the applied and the
+    // root-vanish routes: the rescan the event stood for still runs a full
+    // provider discover.
+    outcome.provider_dirty = true;
+    let mut desired: HashMap<PathBuf, ArmKind> = HashMap::new();
+    for sessions_dir in &plan.sessions_dirs {
+        desired.insert(sessions_dir.clone(), ArmKind::SessionsDir);
+    }
+    for standin in &plan.standins {
+        desired.insert(standin.clone(), ArmKind::Standin);
+    }
+    for session_dir in &plan.root_session_dirs {
+        desired.insert(session_dir.clone(), ArmKind::SessionDir);
+    }
+    if plan.root_exists {
+        desired.insert(projects_root.to_path_buf(), ArmKind::ProjectsRoot);
+    } else {
+        // Route the vanished root to absence tracking NOW (the rearm tick's
+        // full-cascade return owns the re-arm) so delete-and-recreate can
+        // never end up with no ancestor able to detect the return.
+        if book.armed.remove(projects_root) {
+            unwatch_tolerated(watcher, provider, projects_root);
+        }
+        book.absent.insert(projects_root.to_path_buf());
+    }
+    let diff = diff_armed(&desired, &book.armed);
+    for target in &diff.arm {
+        if book.retry.contains_key(&target.path) {
+            continue; // arm-failure backoff is never bypassed by a replan
+        }
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            provider,
+            &target.path,
+            target.kind,
+            true,
+        );
+    }
+    for path in &diff.unwatch {
+        unwatch_tolerated(watcher, provider, path);
+        structural_remove(book, path);
+    }
+    true
+}
+
 /// Depth of `path` below the managed projects root (`strip_prefix`
 /// component count): 0 = the projects root's OWN self-event (its removal
 /// wiring is Task 4's), 1 = a project child of the root watch, 3 = a
@@ -1162,12 +1281,106 @@ fn drain_arm_outcome(
     }
 }
 
+/// Rescan routing (need_rescan / IN_Q_OVERFLOW recovery), the async-loop
+/// side. Amplifier additionally REPLANS its managed watch set before its
+/// provider-dirty mark; claude/codex/opencode take the legacy
+/// provider-dirty path unchanged. The replan moves the amplifier
+/// `ProviderWatch` out of `watches` and runs its whole batch (plan scan +
+/// `watch()`/`unwatch()` syscalls + cascade readdirs) in ONE
+/// `spawn_blocking` closure over the locked book guard —
+/// `RecommendedWatcher` is `Send` (the inotify handle), so nothing blocks
+/// the watch-loop worker. Events arriving during the await buffer on the
+/// unbounded channel and dispatch after re-insertion, exactly as the loop
+/// already serializes arms today; only the `ArmOutcome` drain (plus the
+/// applied-only `replans` bump and the post-batch budget check) returns to
+/// the loop.
+async fn flush_pending_rescans(
+    amplifier: Option<&AmplifierLoopCtx>,
+    watches: &mut HashMap<usize, ProviderWatch>,
+    index: &SessionIndex,
+    pending: &mut HashMap<(PathBuf, String), Instant>,
+    pending_rescans: &mut std::collections::HashSet<String>,
+) {
+    let mut amplifier_rescan = false;
+    for provider_name in pending_rescans.drain() {
+        if provider_name == "amplifier" {
+            amplifier_rescan = true;
+        } else {
+            index.mark_provider_dirty(&provider_name);
+        }
+    }
+    if !amplifier_rescan {
+        return;
+    }
+    let Some(amp) = amplifier else {
+        // A rescan naming an unconfigured provider can only be a legacy
+        // path — provider dirty only.
+        index.mark_provider_dirty("amplifier");
+        return;
+    };
+    let Some(pw) = watches.remove(&amp.prov_idx) else {
+        // No watcher (startup creation failed / the root is absent):
+        // nothing to replan with — the data plane still recovers.
+        index.mark_provider_dirty("amplifier");
+        return;
+    };
+    let book = Arc::clone(&amp.book);
+    let projects_root = amp.projects_root.clone();
+    let replan_batch = tokio::task::spawn_blocking(move || {
+        let mut watcher = pw.watcher;
+        let mut outcome = ArmOutcome::default();
+        let applied = {
+            let mut book = book.lock().unwrap();
+            replan_amplifier_watch_set(
+                &mut book,
+                &mut watcher,
+                &mut outcome,
+                &projects_root,
+                "amplifier",
+            )
+        };
+        (watcher, outcome, applied)
+    })
+    .await;
+    match replan_batch {
+        Ok((watcher, outcome, applied)) => {
+            watches.insert(
+                amp.prov_idx,
+                ProviderWatch {
+                    watcher,
+                    targets: Vec::new(),
+                },
+            );
+            if applied {
+                let mut book = amp.book.lock().unwrap();
+                book.replans += 1;
+                // Per-arm-batch budget check: the replan-apply site joins
+                // the listed post-batch checks (a replan can arm thousands
+                // of lost watches).
+                check_watch_budget(&mut book);
+            }
+            drain_arm_outcome(index, pending, "amplifier", outcome);
+        }
+        Err(e) => {
+            // The helpers never panic, so this is unreachable in practice —
+            // degrade to the data plane (the watcher is lost, so re-entry
+            // would go through the no-watcher branch above).
+            tracing::warn!(
+                error = %e,
+                "session-watcher: amplifier replan batch failed; provider marked dirty",
+            );
+            index.mark_provider_dirty("amplifier");
+        }
+    }
+}
+
 impl SessionWatcher {
     pub fn new(index: Arc<SessionIndex>, providers: Vec<WatchedProvider>) -> Self {
         let amplifier_book = providers
             .iter()
             .any(|p| p.layout.name() == "amplifier")
             .then(|| Arc::new(std::sync::Mutex::new(ManagedBook::default())));
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<WatchEvent>();
         Self {
             index,
             providers,
@@ -1175,6 +1388,8 @@ impl SessionWatcher {
             rearm_interval_secs: REARM_INTERVAL_SECS,
             amplifier_book,
             subagent_interest: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            event_tx,
+            event_rx: Some(event_rx),
         }
     }
 
@@ -1208,6 +1423,15 @@ impl SessionWatcher {
         self.amplifier_book.clone()
     }
 
+    /// Test-only event-injection seam: clones the construction-time channel
+    /// sender, so it is always `Some` BEFORE `start()` — tests can queue
+    /// synthetic events ahead of the spawned loop (same channel, same
+    /// consumer; no production behavior change).
+    #[cfg(test)]
+    pub(crate) fn test_event_tx(&self) -> Option<mpsc::UnboundedSender<WatchEvent>> {
+        Some(self.event_tx.clone())
+    }
+
     /// Start the watcher background task. Returns a `JoinHandle` for the
     /// event loop. Call `stop()` to shut it down.
     pub fn start(&mut self) -> tokio::task::JoinHandle<()> {
@@ -1219,6 +1443,11 @@ impl SessionWatcher {
         let rearm_secs = self.rearm_interval_secs;
         let amplifier_book = self.amplifier_book.clone();
         let subagent_interest = Arc::clone(&self.subagent_interest);
+        let event_tx = self.event_tx.clone();
+        let event_rx = self
+            .event_rx
+            .take()
+            .expect("SessionWatcher::start may be called only once");
 
         tokio::spawn(async move {
             run_watcher_loop(
@@ -1228,6 +1457,7 @@ impl SessionWatcher {
                 rearm_secs,
                 amplifier_book,
                 subagent_interest,
+                (event_tx, event_rx),
             )
             .await;
         })
@@ -1261,8 +1491,12 @@ async fn run_watcher_loop(
     rearm_interval_secs: u64,
     amplifier_book: Option<Arc<std::sync::Mutex<ManagedBook>>>,
     subagent_interest: Arc<std::sync::atomic::AtomicUsize>,
+    event: (
+        mpsc::UnboundedSender<WatchEvent>,
+        mpsc::UnboundedReceiver<WatchEvent>,
+    ),
 ) {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let (event_tx, mut event_rx) = event;
 
     // The amplifier managed-watch context: which provider slot it
     // occupies and where its projects root lives (both derivable from
@@ -1467,14 +1701,22 @@ async fn run_watcher_loop(
 
     // Coalescing event loop.
     let debounce = Duration::from_millis(DEBOUNCE_MS);
+    // Burst-start latch for the max-deferral cap: latched when a pending
+    // burst goes empty→non-empty, cleared on flush. The flush deadline is
+    // `min(now + debounce, pending_since + MAX_FLUSH_DEFERRAL)` — a
+    // sustained sub-quiet-gap stream can no longer starve the flush.
+    let mut pending_since: Option<tokio::time::Instant> = None;
     let mut rearm_interval = tokio::time::interval(Duration::from_secs(rearm_interval_secs));
     rearm_interval.tick().await; // consume the immediate first tick
 
     loop {
         let flush_deadline = if pending.is_empty() && pending_rescans.is_empty() {
+            pending_since = None;
             None
         } else {
-            Some(tokio::time::Instant::now() + debounce)
+            let start = pending_since.get_or_insert_with(tokio::time::Instant::now);
+            let capped = *start + MAX_FLUSH_DEFERRAL;
+            Some(capped.min(tokio::time::Instant::now() + debounce))
         };
         // The amplifier managed book has tick work of its own (absent
         // re-check / retry drain) even while the legacy sets are empty.
@@ -1590,10 +1832,18 @@ async fn run_watcher_loop(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                // Debounce timer fired — flush.
-                for provider_name in pending_rescans.drain() {
-                    index.mark_provider_dirty(&provider_name);
-                }
+                // Debounce timer fired — flush. The burst-start latch clears
+                // with the drained maps (a replan/arm outcome that re-adds
+                // marks below relatches fresh on the next iteration).
+                pending_since = None;
+                flush_pending_rescans(
+                    amplifier.as_ref(),
+                    &mut watches,
+                    &index,
+                    &mut pending,
+                    &mut pending_rescans,
+                )
+                .await;
                 if !pending.is_empty() {
                     let events: Vec<((PathBuf, String), Instant)> =
                         pending.drain().collect();
