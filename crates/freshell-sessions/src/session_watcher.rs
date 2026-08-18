@@ -55,8 +55,8 @@ const DEBOUNCE_MS: u64 = 200;
 const REARM_INTERVAL_SECS: u64 = 60;
 
 /// A coarse, provider-agnostic classification of one notify event. The
-/// amplifier managed engine (later tasks) consumes it; the legacy
-/// providers' flush ignores it. `CreateFolder` deliberately preserves the
+/// amplifier managed engine consumes it; the legacy providers' flush
+/// ignores it. `CreateFolder` deliberately preserves the
 /// `CreateKind::Folder` distinction: depth-4+ routing (Task 5) drops a
 /// folder creation (`context-intelligence/` mkdir) while scoped-marking
 /// a file creation, and structural depths (Tasks 3-4) treat
@@ -125,7 +125,7 @@ pub struct WatchedProvider {
 /// `ProviderWatch` drops every remaining watch with the watcher.
 struct ProviderWatch {
     watcher: notify::RecommendedWatcher,
-    /// legacy-model bookkeeping parity with old `ArmedWatch`:
+    /// legacy per-base bookkeeping mirroring the former per-target record:
     targets: Vec<ArmedTarget>,
 }
 
@@ -534,8 +534,9 @@ fn cascade_session_children(
 /// The design's stand-in rule, including the post-arm re-check: arm the
 /// project dir itself when it has no `sessions/` child (so the later
 /// `sessions/` create is observed); if `sessions/` already exists — or
-/// appeared in the check→arm window — drop the stand-in and arm the real
-/// sessions dir (`ArmKind::SessionsDir`, which cascades its children).
+/// appeared in the check→arm window — arm the real sessions dir
+/// (`ArmKind::SessionsDir`, which cascades its children), then drop the
+/// stand-in only once that arm has landed.
 fn arm_sessions_or_standin(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
@@ -565,9 +566,13 @@ fn arm_sessions_or_standin(
     // the watch arm produced NO event the armed watch could see — only
     // this recheck can catch it (the check→arm window).
     if sessions.is_dir() {
-        if book.armed.remove(project_dir) {
-            unwatch_tolerated(watcher, "amplifier", project_dir);
-        }
+        // Swap order: arm the sessions dir FIRST (the kind-correct failure
+        // routing inside — deterministic drop / transient retry — is
+        // unchanged), then unwatch the stand-in only once the sessions arm
+        // has landed. A failed swap keeps the stand-in watching the
+        // project, so a re-created sessions/ is observed as a fresh depth-2
+        // create; the brief double-watch window is harmless (all arms are
+        // idempotent).
         arm_managed_dir(
             book,
             watcher,
@@ -577,6 +582,9 @@ fn arm_sessions_or_standin(
             ArmKind::SessionsDir,
             emit_marks,
         );
+        if book.armed.contains(&sessions) && book.armed.remove(project_dir) {
+            unwatch_tolerated(watcher, "amplifier", project_dir);
+        }
     }
 }
 
