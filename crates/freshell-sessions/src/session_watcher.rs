@@ -821,8 +821,7 @@ fn amplifier_root_vanished(
 /// the bookkeeping removes hit nothing). Runs strictly on the async loop,
 /// so it calls `index.mark_dirty` / `mark_provider_dirty` directly (never
 /// the `ArmOutcome` sink — that exists for the `spawn_blocking` arm
-/// helpers). Returns true when the path was structurally handled (the
-/// caller then skips the legacy pending-map insert).
+/// helpers). True = structurally handled; false → depth-4 mark fold or drop.
 fn write_remove_dispatch(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
@@ -853,8 +852,7 @@ fn write_remove_dispatch(
         // Depth 2: `sessions/` removed under an armed sessions watch →
         // swap back to the stand-in (arm the project, unwatch the
         // sessions-dir entry, drop its children bookkeeping). Already a
-        // stand-in (or never armed): nothing. Other stand-in children are
-        // not structural — they fall through to the legacy pending map.
+        // stand-in (or never armed): nothing; others → the caller's `_ => {}`.
         Some(2) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
             if book.armed.contains(path) {
                 unwatch_tolerated(watcher, "amplifier", path);

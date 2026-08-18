@@ -1461,12 +1461,13 @@ async fn mkdir_inside_watched_session_dir_is_dropped_no_discover() {
     let counted = counted_amplifier_index(&home);
     let index = counted.index.clone();
     let mut watcher = amplifier_watcher(&index, &home);
-    let _book = watcher.amplifier_book_handle().unwrap();
+    let book = watcher.amplifier_book_handle().unwrap();
     let mut rx = index.subscribe_changes();
     let handle = watcher.start();
     let _ = index.snapshot().await;
     let _ = rx.borrow_and_update();
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(book.lock().unwrap().armed.contains(&session));
     let baseline_discovers = counted.discover_calls.load(Ordering::SeqCst);
     let baseline_scoped_stats = counted.stat_scoped_calls.load(Ordering::SeqCst);
 
