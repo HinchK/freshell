@@ -32,6 +32,7 @@ pub mod search;
 pub mod session_watcher;
 pub mod text;
 pub mod time;
+pub mod watch_plan;
 
 /// Serializes tests (crate-wide) that mutate the process-global
 /// `HOME`/`USERPROFILE`/`FRESHELL_HOME` env vars: cargo runs tests in
