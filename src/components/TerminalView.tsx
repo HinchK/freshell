@@ -2293,7 +2293,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     requestTerminalLayout({ fit: true, focus: true })
 
     term.onData((data) => {
-      if (isReplayPhantomFocusReport(data, terminalInstanceIdRef.current)) {
+      if (isReplayPhantomFocusReport(data, terminalInstanceId)) {
         // Kata 9gy8: xterm re-fired a focus report because a replay chunk
         // contained the app's ?1004h arm byte. Nothing about user focus
         // changed; this is invented input. Swallow silently (no send, no
