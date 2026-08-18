@@ -307,6 +307,7 @@ mod tests {
             shutdown: StdArc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
             terminals_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: StdArc::new(Vec::new()),

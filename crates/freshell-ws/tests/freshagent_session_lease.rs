@@ -305,6 +305,7 @@ async fn spawn_server() -> String {
         registry: freshell_terminal::TerminalRegistry::new(),
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),

@@ -320,6 +320,12 @@ async fn main() -> ExitCode {
     // (capability tracking + result routing) and the screenshots REST state.
     let screenshots = freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx));
 
+    // Per-connection `includeSubagents` interest registry (amplifier watch
+    // reduction): `sessions.prefs` frames flip the sending connection's entry;
+    // teardown clears it. Task 9's demand-driven amplifier subagent rescan
+    // cadence reads the SAME instance.
+    let subagent_interest = freshell_ws::subagent_interest::SubagentInterestRegistry::default();
+
     // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
     // capture socket). Seeded with the settings tree so `PATCH /api/settings` returns/merges it.
@@ -1026,6 +1032,7 @@ async fn main() -> ExitCode {
         // The SAME store `fresh_agent_state.layout` holds (AUTO-01 spine).
         layout: layout_store.clone(),
         screenshots: screenshots.clone(),
+        subagent_interest: subagent_interest.clone(),
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),

@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 30,
+    "count": 31,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -22,6 +22,7 @@
       "opencode.activity.list",
       "pane.reconcile.request",
       "ping",
+      "sessions.prefs",
       "terminal.attach",
       "terminal.autoResumeCancel",
       "terminal.codex.candidate.persisted",

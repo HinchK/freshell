@@ -306,6 +306,18 @@ export const PingSchema = z.object({
   type: z.literal('ping'),
 })
 
+/**
+ * The client's includeSubagents listing preference (amplifier watch
+ * reduction). Per-connection, pushed mid-session and on (re)connect; old
+ * servers answer it with INVALID_MESSAGE without closing (accept-and-strip),
+ * so no client-side capability gate is needed.
+ */
+export const SessionsPrefsSchema = z.object({
+  type: z.literal('sessions.prefs'),
+  includeSubagents: z.boolean(),
+})
+export type SessionsPrefs = z.infer<typeof SessionsPrefsSchema>
+
 export const ClientDiagnosticSchema = z.object({
   type: z.literal('client.diagnostic'),
   event: z.literal('restore_unavailable'),
@@ -689,6 +701,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   PaneReconcileRequestSchema,
   HelloSchema,
   PingSchema,
+  SessionsPrefsSchema,
   ClientDiagnosticSchema,
   TerminalCreateSchema,
   TerminalCodexCandidatePersistedSchema,
