@@ -952,3 +952,426 @@ fn retry_backoff_doubles_to_a_sixty_second_cap() {
     assert_eq!(retry_backoff(7), Duration::from_secs(60), "capped");
     assert_eq!(retry_backoff(100), Duration::from_secs(60), "no overflow");
 }
+
+// ---------- removes / renames / resource alarms ----------
+
+/// Regression 13: `mv` of a root session dir within the same sessions/ dir
+/// shows up as Name(Both) (or From+To); the new basename is re-armed
+/// first-line and its files keep producing events.
+#[tokio::test]
+async fn renamed_root_session_dir_is_rearmed_immediately() {
+    let home = unique_temp_dir("amp-rename");
+    let old = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(book.lock().unwrap().armed.contains(&old));
+
+    let new = old
+        .parent()
+        .unwrap()
+        .join("aa2584be-9478-4801-a62d-4e5da428b3a0");
+    std::fs::rename(&old, &new).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let b = book.lock().unwrap();
+                if b.armed.contains(&new) && !b.armed.contains(&old) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("renamed session dir re-armed first-line, old entry forgotten");
+
+    // Keep proving the new watch is live: a transcript append refreshes
+    // the index without a provider discover.
+    std::fs::write(
+        new.join("transcript.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(changed.is_ok(), "events flow through the re-armed watch");
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// LB-01 probe (notify 6.1.1): renaming an ARMED session dir emits the
+/// tracked From/To/Both trio AND a 4th, UNTRACKED duplicate `Name(From)`
+/// on the old path (notify's mapping of the child watch's IN_MOVE_SELF),
+/// arriving after the trio. Structural-remove handling must be idempotent:
+/// the duplicate re-processes a path already removed from every
+/// bookkeeping set.
+#[tokio::test]
+async fn armed_child_rename_duplicate_name_from_is_idempotent() {
+    let home = unique_temp_dir("amp-rename-idem");
+    let old = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(book.lock().unwrap().armed.contains(&old));
+
+    let new = old
+        .parent()
+        .unwrap()
+        .join("aa2584be-9478-4801-a62d-4e5da428b3a0");
+    std::fs::rename(&old, &new).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let b = book.lock().unwrap();
+                if b.armed.contains(&new) && !b.armed.contains(&old) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("renamed dir re-armed under the new path, old forgotten");
+    // Settle past the 4th, untracked duplicate Name(From) (it arrives
+    // after the trio), then re-assert the settled bookkeeping.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let b = book.lock().unwrap();
+        assert_eq!(
+            b.armed.iter().filter(|p| **p == new).count(),
+            1,
+            "exactly one armed entry for the new path"
+        );
+        assert!(
+            !b.armed.contains(&old),
+            "duplicate From re-removal is a no-op"
+        );
+        assert!(!b.absent.contains(&old) && !b.retry.contains_key(&old));
+        // No double-WARN is structural on this path: re-processing the
+        // duplicate From hits only the book-miss no-op and
+        // `unwatch_tolerated`'s debug-tier tolerated arm (the managed-set
+        // auto-drop makes unwatch of the moved path return WatchNotFound)
+        // — no warn site is reachable, so there is no log to count.
+    }
+
+    // Events from the renamed dir keep flowing (the duplicate From did not
+    // tear down the fresh arm).
+    let _ = rx.borrow_and_update();
+    std::fs::write(
+        new.join("transcript.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(changed.is_ok(), "events flow through the re-armed watch");
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression 8 (first half): removing a watched session dir prunes its row
+/// promptly (scoped metadata.json mark → stat None → prune) and forgets all
+/// bookkeeping.
+#[tokio::test]
+async fn session_dir_removal_prunes_rows_and_forgets_bookkeeping() {
+    let home = unique_temp_dir("amp-sessrm");
+    let victim = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+    let snap0 = index.snapshot().await;
+    assert_eq!(
+        snap0.iter().filter(|s| s.provider == "amplifier").count(),
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    std::fs::remove_dir_all(&victim).unwrap();
+
+    let mut pruned = false;
+    for _ in 0..50 {
+        if index
+            .snapshot()
+            .await
+            .iter()
+            .filter(|s| s.provider == "amplifier")
+            .count()
+            == 0
+            && !book.lock().unwrap().armed.contains(&victim)
+        {
+            pruned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(pruned, "row pruned AND watch bookkeeping forgotten");
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression 16: structural removal of a whole project cleans armed/absent/
+/// retry bookkeeping (no forever-retrying entries after project deletion).
+#[tokio::test]
+async fn project_move_or_remove_cleans_all_bookkeeping() {
+    let home = unique_temp_dir("amp-projrm");
+    let proj = home.join("projects").join("doomed");
+    let sess = write_amplifier_session(&home, "doomed", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Seed a retry entry under the project to prove cleanup reaches it.
+    book.lock().unwrap().retry.insert(
+        proj.join("should_never_exist"),
+        RetryEntry {
+            failures: 1,
+            next_attempt: std::time::Instant::now(),
+            kind: crate::watch_plan::ArmKind::SessionDir,
+        },
+    );
+    assert!(book.lock().unwrap().armed.contains(&sess));
+
+    std::fs::remove_dir_all(&proj).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let b = book.lock().unwrap();
+                let proj_prefix = proj.to_path_buf();
+                let clean = !b.armed.iter().any(|p| p.starts_with(&proj_prefix))
+                    && !b.absent.iter().any(|p| p.starts_with(&proj_prefix))
+                    && !b.retry.keys().any(|p| p.starts_with(&proj_prefix));
+                if clean {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("project subtree dropped from armed/absent/retry");
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression 16 second clause: a session dir `mv`'d OUT of the watched
+/// tree is explicitly unwatched (inotify watches follow inodes — without
+/// this, events keep arriving under the stale old path forever).
+/// Caveat (LB-01 sub-claim 3 nuance): in the managed-set shape the parent
+/// arm's MOVED_FROM auto-drops the old-path watch, so the negative window
+/// below cannot catch a MISSING explicit-unwatch regression (post-move
+/// writes would be silent either way); the explicit unwatch stays as
+/// belt-and-braces for the unowned-parent (inode-follow) shape.
+#[tokio::test]
+async fn moved_away_session_dir_is_explicitly_unwatched() {
+    let home = unique_temp_dir("amp-mvout");
+    let sess = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let outside = home.join("outside-escaped-session");
+    std::fs::rename(&sess, &outside).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !book
+                .lock()
+                .unwrap()
+                .armed
+                .iter()
+                .any(|p| p.ends_with("012584be-9478-4801-a62d-4e5da428b3a0"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("moved-away dir forgotten");
+
+    // Writing where the dir moved to must produce NO further index traffic
+    // (the watch would still fire under the stale path if it leaked).
+    let _ = rx.borrow_and_update(); // clear any pending
+    std::fs::write(outside.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(700), rx.changed())
+            .await
+            .is_err(),
+        "no events from an unwatched inode"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 25% watch-budget WARN: pure verdict + real procfs probe.
+#[test]
+fn watch_budget_warn_needed_trips_only_above_a_quarter_of_the_limit() {
+    assert!(!watch_budget_warn_needed(524_288 / 4, 524_288));
+    assert!(watch_budget_warn_needed(524_288 / 4 + 1, 524_288));
+    assert!(!watch_budget_warn_needed(2, 524_288));
+    // Real machine (Linux/WSL always has procfs here): parser sanity.
+    if std::path::Path::new("/proc/sys/fs/inotify/max_user_watches").exists() {
+        let max = read_max_user_watches().expect("parse the kernel limit");
+        assert!(max > 1_000);
+    }
+}
+
+/// Drift alarm: daily-bucketed, warns once per day on crossing.
+#[test]
+fn unknown_format_drift_alarm_is_daily_bucketed() {
+    let mut counter = DailyCounter::default();
+    let day0 = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000u64);
+    // Below the threshold: quiet.
+    for _ in 0..DRIFT_DAILY_WARN_THRESHOLD - 1 {
+        assert!(counter.note_unknown_arm(day0).is_none());
+    }
+    // Crossing: exactly one WARN.
+    assert!(counter.note_unknown_arm(day0).is_some());
+    assert!(
+        counter.note_unknown_arm(day0).is_none(),
+        "warn once per day"
+    );
+    // Next day: fresh budget.
+    let day1 = day0 + Duration::from_secs(86_400);
+    assert!(counter.note_unknown_arm(day1).is_none());
+}
+
+/// Projects-root absence lifecycle (design: "Only the provider root itself
+/// re-enters absence tracking when it disappears"): deleting the ARMED
+/// projects root routes it from `armed` to `absent` via the DEPTH-0
+/// self-removal (the kernel surfaces it tagless — LB-01 `Remove(File)`),
+/// with the subtree's bookkeeping wiped; re-creating the root re-arms it
+/// at the rearm tick and the FULL structural cascade (plan + apply,
+/// `emit_marks: true`) arms sessions created while the root was absent —
+/// first-line, without waiting for the 15-minute reconcile.
+#[tokio::test]
+async fn deleted_projects_root_enters_absence_and_rearms_with_full_cascade_on_return() {
+    let home = unique_temp_dir("amp-rootabsent");
+    let session = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let _ = session;
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home).with_rearm_interval(1);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+    let projects = home.join("projects");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.contains(&projects) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("projects root armed at startup");
+
+    // Delete the whole root: the depth-0 self-removal routes it to absent
+    // and wipes the subtree bookkeeping.
+    std::fs::remove_dir_all(&projects).unwrap();
+    // The teardown's provider-dirty publish lands first (generation bump);
+    // consume it so the later `changed()` await is the RETURN's publish.
+    let _ = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let gone = {
+                let b = book.lock().unwrap();
+                b.absent.contains(&projects)
+                    && !b.armed.iter().any(|p| p.starts_with(&projects))
+                    && !b.retry.keys().any(|p| p.starts_with(&projects))
+            };
+            if gone {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("deleted root enters absent; whole subtree forgotten");
+
+    // Re-create the root WITH a session while it is tracked absent — this
+    // session was created while NO watch covered it, so only the
+    // absent → re-arm full cascade can pick it up first-line.
+    let _ = rx.borrow_and_update();
+    let returned = write_amplifier_session(&home, "p", "bb2584be-9478-4801-a62d-4e5da428b3a0");
+    tokio::time::timeout(Duration::from_secs(8), rx.changed())
+        .await
+        .expect("the return cascade's marks refresh the index promptly (1s rearm tick)")
+        .unwrap();
+    {
+        let b = book.lock().unwrap();
+        assert!(b.armed.contains(&projects), "returned root re-armed");
+        assert!(b.armed.contains(&projects.join("p").join("sessions")));
+        assert!(
+            b.armed.contains(&returned),
+            "session created during the absence armed by the cascade"
+        );
+        assert!(!b.absent.contains(&projects));
+    }
+    let snap = index.snapshot().await;
+    assert!(
+        snap.iter()
+            .any(|s| s.provider == "amplifier"
+                && s.session_id == "bb2584be-9478-4801-a62d-4e5da428b3a0"),
+        "the returned session is visible without waiting for the reconcile"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The 25% watch-budget WARN is edge-triggered and re-evaluated after
+/// EVERY arm batch (startup apply, cascade, retry drain, replan,
+/// absent-return), not only at startup: crossing ≤25% → >25% warns exactly
+/// once, staying above stays quiet, and falling back below re-arms the
+/// edge so the NEXT crossing warns again. The kernel limit is injected —
+/// no procfs dependency and no real 4.4K-arm corpus needed.
+#[test]
+fn watch_budget_warn_fires_once_per_crossing_and_rearms_below() {
+    let max = 100usize; // injected max_user_watches (test-only injection)
+    let mut warned = false;
+    // Exactly 1/4 (25 of 100): NOT above the quarter — no warn.
+    let (w, emit) = watch_budget_edge(warned, 25, max);
+    assert!(!emit, "at exactly the quarter: silent");
+    warned = w;
+    // Cross above: the edge fires exactly once.
+    let (w, emit) = watch_budget_edge(warned, 26, max);
+    assert!(emit, "crossing above 25% warns");
+    warned = w;
+    // More arms while already warned: no per-arm spam.
+    let (w, emit) = watch_budget_edge(warned, 40, max);
+    assert!(!emit, "already warned: silent");
+    warned = w;
+    // Falling back below re-arms the edge silently...
+    let (w, emit) = watch_budget_edge(warned, 20, max);
+    assert!(!emit, "falling back below: silent");
+    warned = w;
+    // ...and the next crossing warns again.
+    let (_, emit) = watch_budget_edge(warned, 27, max);
+    assert!(emit, "re-armed edge warns on the next crossing");
+}

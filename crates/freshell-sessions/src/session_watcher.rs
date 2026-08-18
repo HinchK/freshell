@@ -16,10 +16,17 @@
 //!   [`ArmOutcome`] so every bulk batch is `spawn_blocking`-safe.
 //! - Raw events flow through a coalescing `HashMap<PathBuf, Instant>` that
 //!   collapses ~35 events/s (measured 24h observer) to ~0.09 net changes/s.
-//!   Amplifier events are routed by DEPTH below the projects root
-//!   (structural create-ish kinds at depths 1–3 arm/cascade/swap; depth-3
-//!   subagent mkdirs escalate only on declared interest); all other events
-//!   take the legacy pending-map flow.
+//!   Amplifier events are routed by DEPTH below the projects root:
+//!   structural create-ish kinds at depths 1–3 arm/cascade/swap, structural
+//!   remove-ish kinds at depths 0–3 tear the target's bookkeeping down
+//!   (idempotently — a rename's untracked duplicate `Name(From)` is a clean
+//!   no-op), a paired `Name(Both)` splits into its remove + create
+//!   endpoints, and depth-3 subagent mkdirs escalate only on declared
+//!   interest; all other events take the legacy pending-map flow. Two
+//!   resource alarms guard the accepted unbounded root-session watch
+//!   growth: an edge-triggered WARN at >25% of the kernel inotify watch
+//!   limit (checked after every arm batch) and a daily-bucketed WARN on
+//!   unknown-format arm drift.
 //! - Debounced flush (200ms) delivers dirty paths to `SessionIndex::mark_dirty`
 //! - Late-root handling: legacy providers watch the nearest existing ancestor
 //!   when the provider root doesn't exist yet; the amplifier projects root
@@ -31,7 +38,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use notify::Watcher;
 use tokio::sync::mpsc;
@@ -40,7 +47,7 @@ use crate::directory_index::SessionIndex;
 use crate::provider_layout::{ProviderLayout, WatchMode};
 use crate::watch_plan::{
     classify_arm_error, classify_basename, is_watch_target, plan_amplifier_targets, ArmErr,
-    ArmKind, PlanTargets,
+    ArmKind, BasenameClass, PlanTargets,
 };
 
 /// Debounce window: coalesced events are flushed to SessionIndex after
@@ -292,6 +299,13 @@ pub(crate) struct ManagedBook {
     /// Transient arm failures under bounded exponential backoff
     /// (retry_backoff doubling to its 60s cap, RETRY_CAP entries).
     retry: HashMap<PathBuf, RetryEntry>,
+    /// Edge state of the 25%-of-kernel-limit watch-budget WARN: true while
+    /// the armed set sits above the quarter. Re-evaluated after every arm
+    /// batch via `check_watch_budget`.
+    budget_warned: bool,
+    /// Daily-bucketed count of unknown-format session-dir arms — the
+    /// naming-drift alarm's input.
+    drift: DailyCounter,
     // The plan's `replans: usize` counter lands in Task 6 together with its
     // only writer (the replan path) — declared now it would be dead code
     // under the `-D warnings` gate.
@@ -317,6 +331,92 @@ const RETRY_CAP: usize = 256;
 fn retry_backoff(failures: u32) -> Duration {
     let step = 2u64.checked_pow(failures.min(6)).unwrap_or(64);
     Duration::from_secs(step.min(60))
+}
+
+/// Read the kernel inotify watch limit (Linux). `None` elsewhere — the
+/// 25% WARN simply stays off (design line 160 budgets against it).
+fn read_max_user_watches() -> Option<usize> {
+    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// WARN when total armed watches exceed 25% of the kernel limit.
+fn watch_budget_warn_needed(armed: usize, max_user_watches: usize) -> bool {
+    armed > max_user_watches / 4
+}
+
+/// Edge-triggered budget state transition: (new warned state, emit WARN
+/// now). The edge fires on the ≤25% → >25% CROSSING only — already-warned
+/// growth stays silent (no per-arm spam), and falling back below the
+/// threshold silently re-arms the edge so the NEXT crossing warns again.
+/// `max_user_watches` is a parameter so tests inject the limit.
+fn watch_budget_edge(warned: bool, armed: usize, max_user_watches: usize) -> (bool, bool) {
+    let over = watch_budget_warn_needed(armed, max_user_watches);
+    match (warned, over) {
+        (false, true) => (true, true),   // crossing: warn once
+        (true, false) => (false, false), // recovered: re-arm the edge
+        (w, _) => (w, false),
+    }
+}
+
+/// The watch-budget check shared by every arm-batch application — startup
+/// apply, the structural-create cascade dispatch (once per batch, not per
+/// arm), the retry-drain batch, and the absent-root-return cascade (the
+/// replan apply joins the list when Task 6 lands it). The armed set grows
+/// unboundedly at RUNTIME (the accepted ~31K/yr accrual), so a
+/// startup-only check would sleep through a runtime crossing. `None`
+/// off-Linux/parse failure no-ops with the edge state untouched.
+fn check_watch_budget(book: &mut ManagedBook) {
+    let Some(max) = read_max_user_watches() else {
+        return;
+    };
+    let (warned, emit) = watch_budget_edge(book.budget_warned, book.armed.len(), max);
+    book.budget_warned = warned;
+    if emit {
+        tracing::warn!(
+            armed = book.armed.len(),
+            max_user_watches = max,
+            "session-watcher: armed inotify watches exceed 25% of the kernel watch limit",
+        );
+    }
+}
+
+/// Daily-bucketed counter for unknown-format (non-UUID, non-subagent)
+/// arms — surfaces amplifier naming drift in days instead of silently
+/// minting ~609 permanent watches/day (design lines 160-164).
+#[derive(Debug, Default)]
+struct DailyCounter {
+    day_stamp: u64,
+    count: u32,
+}
+
+/// Unknown-format arms per UTC day that trip a single WARN (the real
+/// corpus has 21 oddball arms at boot — 50 sits comfortably above
+/// steady-state and far under a naming-drift flood of ~609/day).
+const DRIFT_DAILY_WARN_THRESHOLD: u32 = 50;
+
+impl DailyCounter {
+    /// Note one unknown-format arm; returns the WARN message to log on the
+    /// day-bucketed threshold crossing, `None` otherwise.
+    fn note_unknown_arm(&mut self, now: SystemTime) -> Option<String> {
+        let day = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        if day != self.day_stamp {
+            self.day_stamp = day;
+            self.count = 0;
+        }
+        self.count += 1;
+        (self.count == DRIFT_DAILY_WARN_THRESHOLD).then(|| {
+            format!(
+                "session-watcher: {DRIFT_DAILY_WARN_THRESHOLD} unknown-format amplifier session dirs armed today — possible naming drift (each costs a permanent inotify watch)"
+            )
+        })
+    }
 }
 
 /// The ONLY output channel of the arm helpers: watch-then-scan scoped
@@ -454,6 +554,14 @@ fn arm_managed_dir(
             }
             if book.armed.contains(path) {
                 return;
+            }
+            if class == BasenameClass::Unknown {
+                // Drift alarm: each unknown-format arm mints a permanent
+                // inotify watch; the day-bucketed counter WARNs once per
+                // threshold-crossing day.
+                if let Some(msg) = book.drift.note_unknown_arm(SystemTime::now()) {
+                    tracing::warn!("{msg}");
+                }
             }
             tracing::debug!(
                 provider = %provider,
@@ -604,6 +712,164 @@ fn cascade_new_project(
         return;
     }
     arm_sessions_or_standin(book, watcher, outcome, project_dir, emit_marks);
+}
+
+/// The shared bookkeeping cleanup for one structurally-removed path (and
+/// anything below it, by `starts_with` prefix): dropped from `armed`,
+/// `absent`, and `retry` (a removed disposable workspace must not
+/// forever-retry). IDEMPOTENT — the LB-01 untracked duplicate `Name(From)`
+/// re-processes an already-forgotten path as a clean no-op. Unwatching is
+/// the callers' job (they hold the watcher).
+fn structural_remove(book: &mut ManagedBook, path: &Path) {
+    book.armed.retain(|p| !p.starts_with(path));
+    book.absent.retain(|p| !p.starts_with(path));
+    book.retry.retain(|p, _| !p.starts_with(path));
+}
+
+/// Forget ONE removed session dir: the explicit unwatch is belt-and-braces
+/// (LB-01 sub-claim 3 nuance: in the managed-set shape the armed parent's
+/// MOVED_FROM auto-drops the old-path watch, so this unwatch commonly
+/// returns the tolerated `WatchNotFound`; it stays for the unowned-parent
+/// inode-follow shape, whose watch would otherwise keep reporting under
+/// the stale path forever) — then prefix bookkeeping cleanup, then a
+/// scoped metadata.json mark so the row prunes promptly (stat None →
+/// cache remove).
+fn amplifier_remove_session(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    index: &SessionIndex,
+    session_dir: &Path,
+) {
+    unwatch_tolerated(watcher, "amplifier", session_dir);
+    structural_remove(book, session_dir);
+    index.mark_dirty(&[(session_dir.join("metadata.json"), "amplifier".to_owned())]);
+}
+
+/// Structural removal of a whole project (design line 88: "Structural
+/// removes clean up the whole subtree's bookkeeping"): unwatch EVERY armed
+/// path under the project (inotify watches follow inodes — an `mv`'d
+/// project would leak watchers reporting under stale paths), drop the
+/// subtree from armed/absent/retry, and scoped-mark each removed session
+/// dir's metadata.json so its row prunes promptly (the dispatch's
+/// provider-dirty escalation then reconciles independently).
+fn amplifier_teardown_project(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    index: &SessionIndex,
+    project_dir: &Path,
+) {
+    let doomed: Vec<PathBuf> = book
+        .armed
+        .iter()
+        .filter(|p| p.starts_with(project_dir))
+        .cloned()
+        .collect();
+    for path in &doomed {
+        unwatch_tolerated(watcher, "amplifier", path);
+    }
+    structural_remove(book, project_dir);
+    let marks: Vec<(PathBuf, String)> = doomed
+        .iter()
+        .filter(|p| {
+            // Session dirs sit exactly two levels below the project
+            // (`<proj>/sessions/<id>`) — depth-relative, never basename-
+            // routed (a project literally named `sessions` must not
+            // misroute).
+            p.strip_prefix(project_dir)
+                .map(|r| r.components().count() == 2)
+                .unwrap_or(false)
+        })
+        .map(|p| (p.join("metadata.json"), "amplifier".to_owned()))
+        .collect();
+    index.mark_dirty(&marks);
+}
+
+/// The DEPTH-0 self-removal of the ARMED projects root (LB-01: it surfaces
+/// tagless as `Remove(File)` / untracked `Name(From)`; nothing watches the
+/// root's parent, so depth-0 self-events are the ONLY way the watcher
+/// learns the root is gone). The kernel already dropped the watch via
+/// IN_IGNORED, so the explicit unwatch is tolerated belt-and-braces; the
+/// whole managed set lives under the root, so every bookkeeping entry
+/// prefixed by it is dropped; and the root ALONE re-enters absence
+/// tracking (design: "only the provider root itself re-enters absence
+/// tracking when it disappears") — Task 3's rearm-tick absent re-check
+/// then re-arms a returned root with the full structural cascade, so
+/// delete-and-recreate leaves a live watcher. Pure bookkeeping; the
+/// dispatch issues the provider-dirty escalation right after (mirroring
+/// depth 1).
+fn amplifier_root_vanished(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    projects_root: &Path,
+) {
+    unwatch_tolerated(watcher, "amplifier", projects_root);
+    structural_remove(book, projects_root);
+    book.absent.insert(projects_root.to_path_buf());
+}
+
+/// The structural Remove / rename-From routing (design "Structural removes
+/// clean up the whole subtree's bookkeeping"), dispatched on the `Remove`
+/// kind WITHOUT the notify dir-vs-file tag — an armed dir's self-delete
+/// surfaces as `Remove(File)`, never `Remove(Folder)` (the kernel does not
+/// set ISDIR on IN_DELETE_SELF — LB-01; a Folder-only gate would silently
+/// miss it, so no refactor may add one). Every path is IDEMPOTENT: an
+/// ARMED child's rename emits a 4th, UNTRACKED duplicate `Name(From)`
+/// after the paired trio, and re-processing it is a clean no-op
+/// (`unwatch_tolerated` absorbs the already-auto-dropped watch at debug;
+/// the bookkeeping removes hit nothing). Runs strictly on the async loop,
+/// so it calls `index.mark_dirty` / `mark_provider_dirty` directly (never
+/// the `ArmOutcome` sink — that exists for the `spawn_blocking` arm
+/// helpers). Returns true when the path was structurally handled (the
+/// caller then skips the legacy pending-map insert).
+fn write_remove_dispatch(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    index: &SessionIndex,
+    projects_root: &Path,
+    path: &Path,
+) -> bool {
+    match amplifier_depth(projects_root, path) {
+        // Depth 0: the ARMED projects root's own tagless self-removal —
+        // the only way the watcher learns the root is gone (there is no
+        // depth-0 Create to route; the root's RETURN is owned by the
+        // rearm-tick absent re-check's full cascade). Provider dirty: a
+        // provider discover reconciles the now-empty tree.
+        Some(0) => {
+            amplifier_root_vanished(book, watcher, projects_root);
+            index.mark_provider_dirty("amplifier");
+            true
+        }
+        // Depth 1: a whole project vanished (or was renamed away) — full
+        // subtree teardown; provider dirty: the survivors' children are
+        // gone, so a provider discover reconciles rows.
+        Some(1) => {
+            amplifier_teardown_project(book, watcher, index, path);
+            index.mark_provider_dirty("amplifier");
+            true
+        }
+        // Depth 2: `sessions/` removed under an armed sessions watch →
+        // swap back to the stand-in (arm the project, unwatch the
+        // sessions-dir entry, drop its children bookkeeping). Already a
+        // stand-in (or never armed): nothing. Other stand-in children are
+        // not structural — they fall through to the legacy pending map.
+        Some(2) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
+            if book.armed.contains(path) {
+                unwatch_tolerated(watcher, "amplifier", path);
+                structural_remove(book, path);
+                if let Some(project) = path.parent() {
+                    arm_sessions_or_standin(book, watcher, outcome, project, true);
+                }
+            }
+            true
+        }
+        // Depth 3: one session dir vanished — forget it and prune its row.
+        Some(3) => {
+            amplifier_remove_session(book, watcher, index, path);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The startup half of the watch-then-scan invariant
@@ -784,9 +1050,11 @@ fn amplifier_depth(projects_root: &Path, path: &Path) -> Option<usize> {
 /// kinds (`Create | CreateFolder | NameTo | NameBoth` — a mkdir surfaces
 /// as `CreateFolder`) at depths 1-3 run the managed arm path with
 /// `emit_marks: true` (runtime events scan what they arm; only startup
-/// skips marks). EVERYTHING else falls through to the legacy pending map
-/// for now (Task 4 owns depth-0 root self-events and remove/rename
-/// dispatch; Task 5 owns depth-4 scoped routing).
+/// skips marks); structural remove-ish kinds (`Remove | NameFrom`) at
+/// depths 0-3 run [`write_remove_dispatch`] (renames: a `Name(To)` at
+/// depths 1/3 IS a create — a `mv`'d root session dir re-arms first-line).
+/// Everything else falls through to the legacy pending map (Task 5 owns
+/// depth-4 scoped routing).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_amplifier_path(
     book: &mut ManagedBook,
@@ -798,11 +1066,17 @@ fn dispatch_amplifier_path(
     kind: WatchKind,
     pending: &mut HashMap<(PathBuf, String), Instant>,
     pending_rescans: &mut std::collections::HashSet<String>,
+    index: &SessionIndex,
 ) {
     let createish = matches!(
         kind,
         WatchKind::Create | WatchKind::CreateFolder | WatchKind::NameTo | WatchKind::NameBoth
     );
+    if matches!(kind, WatchKind::Remove | WatchKind::NameFrom)
+        && write_remove_dispatch(book, watcher, outcome, index, projects_root, path)
+    {
+        return;
+    }
     match (amplifier_depth(projects_root, path), createish) {
         // Depth 1: a project appeared under the root watch (create_dir_all
         // surfaces only `Create(<proj>)` at the root) — cascade arms its
@@ -1044,11 +1318,18 @@ async fn run_watcher_loop(
             .await;
             match applied {
                 Ok((watcher, outcome)) => {
-                    tracing::info!(
-                        provider = %name,
-                        armed = amp.book.lock().unwrap().armed.len(),
-                        "session-watcher: amplifier managed watch set armed",
-                    );
+                    {
+                        let mut book = amp.book.lock().unwrap();
+                        tracing::info!(
+                            provider = %name,
+                            armed = book.armed.len(),
+                            "session-watcher: amplifier managed watch set armed",
+                        );
+                        // First of the per-arm-batch budget checks: the
+                        // ~4.4K-watch boot set can itself cross 25% of a
+                        // small kernel limit.
+                        check_watch_budget(&mut book);
+                    }
                     watches.insert(
                         prov_idx,
                         ProviderWatch {
@@ -1192,18 +1473,61 @@ async fn run_watcher_loop(
                                 let mut outcome = ArmOutcome::default();
                                 if let Some(pw) = watches.get_mut(&amp.prov_idx) {
                                     let mut book = amp.book.lock().unwrap();
-                                    for path in &paths {
+                                    let armed_before = book.armed.len();
+                                    if kind == WatchKind::NameBoth && paths.len() == 2 {
+                                        // LB-01 paired shape: `Name(Both)`
+                                        // carries [from, to] — the From
+                                        // endpoint is remove-handled, the
+                                        // To endpoint create-handled.
                                         dispatch_amplifier_path(
                                             &mut book,
                                             &mut pw.watcher,
                                             &mut outcome,
                                             &amp.projects_root,
                                             &amp.interest,
-                                            path,
-                                            kind,
+                                            &paths[0],
+                                            WatchKind::NameFrom,
                                             &mut pending,
                                             &mut pending_rescans,
+                                            &index,
                                         );
+                                        dispatch_amplifier_path(
+                                            &mut book,
+                                            &mut pw.watcher,
+                                            &mut outcome,
+                                            &amp.projects_root,
+                                            &amp.interest,
+                                            &paths[1],
+                                            WatchKind::NameTo,
+                                            &mut pending,
+                                            &mut pending_rescans,
+                                            &index,
+                                        );
+                                    } else {
+                                        for path in &paths {
+                                            dispatch_amplifier_path(
+                                                &mut book,
+                                                &mut pw.watcher,
+                                                &mut outcome,
+                                                &amp.projects_root,
+                                                &amp.interest,
+                                                path,
+                                                kind,
+                                                &mut pending,
+                                                &mut pending_rescans,
+                                                &index,
+                                            );
+                                        }
+                                    }
+                                    // The 25% watch-budget WARN is
+                                    // re-evaluated after every arm batch —
+                                    // the structural-create cascade dispatch
+                                    // is one of its call sites, checked once
+                                    // per drained batch (not per arm), and
+                                    // only when the batch actually changed
+                                    // the armed set.
+                                    if book.armed.len() != armed_before {
+                                        check_watch_budget(&mut book);
                                     }
                                 } else {
                                     // No watcher (startup creation failed):
@@ -1445,6 +1769,11 @@ async fn run_watcher_loop(
                                             targets: Vec::new(),
                                         },
                                     );
+                                    // Per-arm-batch budget check: this
+                                    // batch covers BOTH listed rearm-tick
+                                    // sites (the retry-drain batch and the
+                                    // absent-root-return cascade).
+                                    check_watch_budget(&mut amp.book.lock().unwrap());
                                     drain_arm_outcome(&index, "amplifier", outcome);
                                 }
                                 Err(e) => {
