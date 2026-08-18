@@ -197,6 +197,7 @@ describe('isReplayPhantomFocusReport', () => {
 
   it('passes focus reports through when no write scope is open', () => {
     expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[I', undefined)).toBe(false)
     expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(false)
   })
 
