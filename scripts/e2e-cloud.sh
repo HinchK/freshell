@@ -435,12 +435,16 @@ cmd_run() {
   execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait 2>&1) || true
   echo "$execute_output"
 
-  # Extract the execution ID from the execute output (format: "Execution NAME")
-  local execution_id
-  # (`|| true`: grep no-match must not kill set -eo pipefail before the
-  # fall-back latest-execution lookup; real gcloud prints "Execution NAME ...",
-  # stubs/minimal CLIs may print nothing.)
-  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1 || true)
+  # Extract the execution ID from the execute output. gcloud prints
+  # `Execution [NAME] has successfully completed.` — brackets are literal and,
+  # on color-capable captures, the name is wrapped in ANSI SGR codes — so strip
+  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captured the
+  # bracket+escapes; downstream describe/logs then addressed a nonexistent
+  # execution and the `|| echo 0` masking below reported succeeded=0 forever.)
+  execution_id=$(echo "$execute_output" \
+    | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
+    | head -1 || true)
   if [ -z "$execution_id" ]; then
     # Fallback: query the latest execution (may race with concurrent agents)
     echo "[e2e-cloud] WARNING: could not capture execution ID, falling back to latest"

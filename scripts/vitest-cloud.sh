@@ -402,9 +402,17 @@ cmd_run() {
     --wait 2>&1) || execute_exit=$?
   echo "$execute_output"
 
-  # Extract the execution ID from the execute output (format: "Execution NAME")
+  # Extract the execution ID from the execute output. gcloud prints
+  # `Execution [NAME] has successfully completed.` — brackets are literal and,
+  # on color-capable captures, the name is wrapped in ANSI SGR codes — so strip
+  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captures the
+  # bracket+escapes; every downstream describe/logs then addresses a nonexistent
+  # execution — observed live 2026-08-18 on executions -xzrwg and -ftrdv.)
   local execution_id
-  execution_id=$(echo "$execute_output" | grep -oP 'Execution \K[^ ]+' | head -1)
+  execution_id=$(echo "$execute_output" \
+    | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
+    | head -1 || true)
   if [ -z "$execution_id" ]; then
     echo "[vitest-cloud] WARNING: could not capture execution ID, falling back to latest"
     execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
