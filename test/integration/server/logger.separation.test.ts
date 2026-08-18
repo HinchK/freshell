@@ -18,7 +18,11 @@ const REPO_ROOT = path.resolve(__dirname, '../../..')
 const require = createRequire(import.meta.url)
 let TSX_CLI: string | undefined
 const DEFAULT_TEST_TIMEOUT_MS = 120_000
-const FILE_CONTENT_TIMEOUT_MS = process.platform === 'win32' ? 30_000 : 5_000
+// The wait only bounds file-content APPEARANCE (the assertions care about
+// which filename was chosen, never about how fast). A cold `tsx` start under
+// full-suite shard contention on a shared Cloud Run vCPU exceeded the old 5s
+// gate (observed 2026-08-18, execution freshell-vitest-l68jz); unify at 30s.
+const FILE_CONTENT_TIMEOUT_MS = 30_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
   '(async () => {',
