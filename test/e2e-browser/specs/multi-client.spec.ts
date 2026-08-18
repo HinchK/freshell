@@ -731,7 +731,8 @@ test.describe('Multi-Client', () => {
     // into the app's stdin. The preamble therefore tracks but NEVER emits
     // ?1004. (Replaying the ORIGINAL arming byte from the retained window no
     // longer leaks either: kata 9gy8 silences the phantom report at onData;
-    // see the SILENCING test later in this spec.)
+    // pinned by "mode replay-sync: replay no longer injects phantom xterm
+    // focus reports (kata 9gy8)" later in this spec.)
     //
     // This pins the wire behavior DIRECTLY: arm both a representative mode
     // (?2004, included) and ?1004, reload (fresh surface → surfaceReset
@@ -860,8 +861,8 @@ test.describe('Multi-Client', () => {
     // so getSentWsMessages is a clean, window-scoped record of every
     // client→server message since boot — that IS the assertion window: it
     // starts at reload-ready by construction and ends just after the arm is
-    // re-observed, so a genuine live focus report (impossible in headless
-    // anyway) can never flake it.
+    // re-observed; a genuine live focus report cannot flake it here because
+    // no focus change occurs post-arm in this flow.
     await page.reload({ waitUntil: 'domcontentloaded' })
     await waitForReady(page)
 

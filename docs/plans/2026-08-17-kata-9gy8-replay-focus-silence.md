@@ -70,8 +70,8 @@ import {
   type TerminalOutputSource,
 } from './terminal-output-write-scope.js'
 
-const XTERM_FOCUS_IN = '[I'
-const XTERM_FOCUS_OUT = '[O'
+const XTERM_FOCUS_IN = '\u001b[I'
+const XTERM_FOCUS_OUT = '\u001b[O'
 
 /**
  * xterm fires ESC[I / ESC[O synchronously from its parser every time it
@@ -175,7 +175,7 @@ In `src/components/TerminalView.tsx`, inside the `term.onData((data) => { ... })
         log.debug('replay phantom focus report silenced (kata 9gy8)', {
           paneId,
           tabId,
-          direction: data === '[I' ? 'in' : 'out',
+          direction: data === '\u001b[I' ? 'in' : 'out',
         })
         return
       }
