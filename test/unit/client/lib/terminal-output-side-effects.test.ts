@@ -157,7 +157,7 @@ describe('terminal output side-effect policy', () => {
       suppressExternalSideEffects: false,
     })
     expect(privateHandler([2004])).toBe(true)
-    expect(sendInput).toHaveBeenCalledWith('[?2004;1$y')
+    expect(sendInput).toHaveBeenCalledWith('\u001b[?2004;1$y')
     liveScope.complete()
   })
 })
@@ -172,8 +172,8 @@ describe('isReplayPhantomFocusReport', () => {
       suppressExternalSideEffects: true,
     })
     try {
-      expect(isReplayPhantomFocusReport('[I', 't1')).toBe(true)
-      expect(isReplayPhantomFocusReport('[O', 't1')).toBe(true)
+      expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(true)
+      expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(true)
     } finally {
       scope.complete()
     }
@@ -188,16 +188,16 @@ describe('isReplayPhantomFocusReport', () => {
       suppressExternalSideEffects: false,
     })
     try {
-      expect(isReplayPhantomFocusReport('[I', 't1')).toBe(false)
-      expect(isReplayPhantomFocusReport('[O', 't1')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(false)
     } finally {
       scope.complete()
     }
   })
 
   it('passes focus reports through when no write scope is open', () => {
-    expect(isReplayPhantomFocusReport('[I', 't1')).toBe(false)
-    expect(isReplayPhantomFocusReport('[O', 't1')).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[O', 't1')).toBe(false)
   })
 
   it('leaves non-report bytes untouched even under a suppressing replay scope', () => {
@@ -210,7 +210,7 @@ describe('isReplayPhantomFocusReport', () => {
     })
     try {
       expect(isReplayPhantomFocusReport('a', 't1')).toBe(false)
-      expect(isReplayPhantomFocusReport('[?1004h', 't1')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[?1004h', 't1')).toBe(false)
     } finally {
       scope.complete()
     }
@@ -225,7 +225,7 @@ describe('isReplayPhantomFocusReport', () => {
       suppressExternalSideEffects: true,
     })
     try {
-      expect(isReplayPhantomFocusReport('[I', 't2')).toBe(false)
+      expect(isReplayPhantomFocusReport('\u001b[I', 't2')).toBe(false)
     } finally {
       scope.complete()
     }
@@ -239,8 +239,8 @@ describe('isReplayPhantomFocusReport', () => {
       generation: 'g',
       suppressExternalSideEffects: true,
     })
-    expect(isReplayPhantomFocusReport('[I', 't1')).toBe(true)
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(true)
     scope.complete()
-    expect(isReplayPhantomFocusReport('[I', 't1')).toBe(false)
+    expect(isReplayPhantomFocusReport('\u001b[I', 't1')).toBe(false)
   })
 })

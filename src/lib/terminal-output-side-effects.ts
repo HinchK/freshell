@@ -94,8 +94,8 @@ export function shouldAllowTerminalOutputSideEffect(
   return false
 }
 
-const XTERM_FOCUS_IN = '[I'
-const XTERM_FOCUS_OUT = '[O'
+const XTERM_FOCUS_IN = '\u001b[I'
+const XTERM_FOCUS_OUT = '\u001b[O'
 
 /**
  * xterm fires ESC[I / ESC[O synchronously from its parser every time it
