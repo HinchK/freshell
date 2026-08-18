@@ -1819,3 +1819,151 @@ async fn replan_arms_newly_appeared_sessions_dir_kind_correctly_with_cascade() {
     drop(watcher);
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------- refresh→watcher self-correction channel (misnamed-root recovery) ----------
+
+// Regression 4 (round trip): a subagent-NAMED dir holding root CONTENT
+// (parent_id absent) is name-classified as subagent → never armed at
+// startup — and is recovered by the refresh→watcher report. The
+// not-armed-then-armed sequence is observed WITHOUT sleeps or races:
+// phase 1 asserts the startup classification BEFORE any discover/snapshot
+// has run (so no report can exist yet — the sink only fires from a full
+// refresh, and startup itself is markless for an existing root); phase 2
+// triggers the discover and awaits the arm.
+#[tokio::test]
+async fn misnamed_subagent_named_root_is_armed_via_refresh_report() {
+    let home = unique_temp_dir("amp-misname");
+    let dir = home
+        .join("projects")
+        .join("p")
+        .join("sessions")
+        .join("0000000000000000-014b6af1c2ac4ab5_actually_a_root");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        r#"{"session_id":"mis","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+
+    // Phase 1 (no report can exist yet — `index.snapshot()` has not been
+    // called): wait for the startup structural arm pass to complete (the
+    // `p/sessions` watch is the deepest structural arm in this fixture),
+    // then assert the misnamed dir is UNARMED — name classification, with
+    // no report in flight to race it.
+    let sessions = home.join("projects").join("p").join("sessions");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.contains(&sessions) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("startup structural arm pass completes");
+    assert!(
+        !book.lock().unwrap().armed.contains(&dir),
+        "at startup the name says subagent ⇒ unarmed"
+    );
+
+    // Phase 2: NOW the first full discover runs — the root report fires
+    // and the self-correction channel arms the misnamed root.
+    let _ = index.snapshot().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.contains(&dir) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("misnamed root armed via the refresh report");
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// Regression 9: the diff never bypasses arm-failure backoff.
+#[test]
+fn roots_needing_arm_respects_retry_backoff() {
+    let ghost = PathBuf::from("/tmp/amplifier-retry-ghost");
+    let reported = vec![ghost.clone(), PathBuf::from("/tmp/fresh")];
+    let mut armed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut retry: std::collections::HashMap<PathBuf, RetryEntry> =
+        std::collections::HashMap::new();
+    retry.insert(
+        ghost.clone(),
+        RetryEntry {
+            failures: 2,
+            next_attempt: std::time::Instant::now() + Duration::from_secs(60),
+            kind: crate::watch_plan::ArmKind::SessionDir,
+        },
+    );
+    let to_arm = roots_needing_arm(&reported, &armed, &retry);
+    assert_eq!(to_arm, vec![PathBuf::from("/tmp/fresh")]);
+
+    // Rust: a dir that's already armed is also skipped.
+    let report2 = vec![ghost.clone()];
+    armed.insert(ghost.clone());
+    assert!(roots_needing_arm(&report2, &armed, &retry).is_empty());
+}
+
+/// Companion corner the channel itself creates: a transient arm failure of
+/// a channel-reported misnamed root lands in `retry` (kind `SessionDir`),
+/// where first-line re-arming through `arm_managed_dir` would refuse the
+/// subagent-pattern basename FOREVER (the name gate exists precisely so
+/// first-line paths never arm subagent dirs). The retry drain must route
+/// such entries through the channel's content-verified arm — only the
+/// channel can insert a subagent-named `SessionDir` entry, so this
+/// classification-free re-arm can never leak onto a real subagent dir.
+#[tokio::test]
+async fn retry_drain_recovers_reported_misnamed_root() {
+    let home = unique_temp_dir("amp-retry-misname");
+    let dir = home
+        .join("projects")
+        .join("p")
+        .join("sessions")
+        .join("0000000000000000-014b6af1c2ac4ab5_misnamed_root");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    book.retry.insert(
+        dir.clone(),
+        RetryEntry {
+            failures: 1,
+            next_attempt: Instant::now(), // due now
+            kind: crate::watch_plan::ArmKind::SessionDir,
+        },
+    );
+
+    let mut outcome = ArmOutcome::default();
+    arm_retry_entry(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        "amplifier",
+        &dir,
+        crate::watch_plan::ArmKind::SessionDir,
+    );
+
+    assert!(
+        book.armed.contains(&dir),
+        "the channel-reported misnamed root is re-armed: {:?}",
+        book.armed
+    );
+    assert!(
+        book.retry.is_empty(),
+        "a successful re-arm clears the retry entry"
+    );
+    // The kind-correct file-state watch-then-scan mark was emitted.
+    assert!(outcome.marks.contains(&dir.join("metadata.json")));
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}

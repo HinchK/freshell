@@ -884,6 +884,14 @@ pub struct SessionIndex {
     /// Subscribers (via `subscribe_changes`) wake on changes.
     change_tx: tokio::sync::watch::Sender<u64>,
     change_rx: tokio::sync::watch::Receiver<u64>,
+    /// One-way refresh→watcher report (amplifier watch-reduction design,
+    /// "Self-correction channel"). After a sweep that fully discovered
+    /// amplifier, the watcher receives every amplifier session dir whose
+    /// parsed metadata has `parent_id` absent (true roots). Amplifier
+    /// IndexedSession rows publish `source_file: None` (amplifier.rs:415-419),
+    /// so dirs are derived from the private `file_cache` KEYS (canonical
+    /// metadata.json paths), never from published rows.
+    amplifier_root_report: Arc<StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>>,
 }
 
 /// One published sweep GENERATION: the snapshot items AND the scan-failure
@@ -969,6 +977,7 @@ impl SessionIndex {
             last_full_at: Arc::new(StdMutex::new(None)),
             change_tx,
             change_rx,
+            amplifier_root_report: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1033,6 +1042,20 @@ impl SessionIndex {
             dirty.insert(provider.to_string());
         }
         self.request_refresh();
+    }
+
+    /// Register the self-correction report sink (amplifier watch-reduction
+    /// design, "Self-correction channel"). After every sweep that fully
+    /// discovers amplifier, the index sends the content-verified root
+    /// session dirs (parsed metadata with `parent_id` absent) on this
+    /// channel so the session watcher can arm any the name classifier
+    /// missed. Best-effort: a dropped receiver just means no watcher is
+    /// listening; the sends never block or fail the sweep.
+    pub fn set_amplifier_root_report_sink(
+        &self,
+        sink: tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>,
+    ) {
+        *self.amplifier_root_report.lock().unwrap() = Some(sink);
     }
 
     /// Subscribe to snapshot-change notifications. The receiver's value
@@ -1183,6 +1206,7 @@ impl SessionIndex {
             Arc::clone(&self.last_full_at),
             self.ttl,
             self.change_tx.clone(),
+            Arc::clone(&self.amplifier_root_report),
         )
         .await;
         drop(guard);
@@ -1206,6 +1230,7 @@ impl SessionIndex {
         let last_full_at = Arc::clone(&self.last_full_at);
         let ttl = self.ttl;
         let change_tx = self.change_tx.clone();
+        let amplifier_root_report = Arc::clone(&self.amplifier_root_report);
         tokio::spawn(async move {
             let _ = Self::perform_refresh(
                 sources,
@@ -1219,6 +1244,7 @@ impl SessionIndex {
                 last_full_at,
                 ttl,
                 change_tx,
+                amplifier_root_report,
             )
             .await;
             drop(guard);
@@ -1244,6 +1270,9 @@ impl SessionIndex {
         last_full_at: Arc<StdMutex<Option<Instant>>>,
         ttl: Duration,
         change_tx: tokio::sync::watch::Sender<u64>,
+        amplifier_root_report: Arc<
+            StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+        >,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
         // Force a full reconciliation when:
         // - no snapshot has been published yet (cold start), or
@@ -1288,7 +1317,7 @@ impl SessionIndex {
                     .as_ref()
                     .map(|c| c.scan_failures.clone())
                     .unwrap_or_default();
-                let (items, changed) = refresh_snapshot(
+                let (items, changed, amplifier_root_dirs) = refresh_snapshot(
                     &sources,
                     &mut cache,
                     &mut direct,
@@ -1296,11 +1325,11 @@ impl SessionIndex {
                     scoped_paths,
                     scoped_providers,
                 );
-                (items, changed, failures)
+                (items, changed, failures, amplifier_root_dirs)
             }
         })
         .await;
-        let (items, changed, failures) = match sweep_result {
+        let (items, changed, failures, amplifier_root_dirs) = match sweep_result {
             Ok(result) => result,
             Err(join_err) => {
                 // `discover`/`parse` are documented never-panic (every
@@ -1340,6 +1369,16 @@ impl SessionIndex {
                 scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
+          // Self-correction report (amplifier watch-reduction design
+          // "Self-correction channel"): sent only on sweeps that fully
+          // discovered amplifier (`refresh_snapshot` computes `None`
+          // otherwise), immediately after the snapshot publish. One-way,
+          // best-effort: a dropped receiver means no watcher is listening.
+        if let Some(dirs) = amplifier_root_dirs {
+            if let Some(sink) = amplifier_root_report.lock().unwrap().as_ref() {
+                let _ = sink.send(dirs);
+            }
+        }
         if force_full {
             *last_full_at.lock().unwrap() = Some(Instant::now());
         }
@@ -1503,7 +1542,7 @@ fn refresh_snapshot(
     scan_failures: &mut HashSet<String>,
     scoped_paths: HashMap<PathBuf, String>,
     scoped_providers: HashSet<String>,
-) -> (Vec<IndexedSession>, usize) {
+) -> (Vec<IndexedSession>, usize, Option<Vec<PathBuf>>) {
     let is_full = scoped_paths.is_empty() && scoped_providers.is_empty();
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut fully_discovered_providers = HashSet::<String>::new();
@@ -1702,6 +1741,27 @@ fn refresh_snapshot(
         }
     }
 
+    // Self-correction report (refresh → watcher, one-way; amplifier
+    // watch-reduction design "Self-correction channel"): a sweep that
+    // fully discovered amplifier reports every amplifier session dir
+    // whose PARSED metadata proves a root (`parent_id` absent ⇔
+    // `!is_subagent`). The dirs come from the file-cache KEYS (canonical
+    // metadata.json paths → parent dir) — amplifier rows publish
+    // `source_file: None`, so published rows could never carry them.
+    // Cached exclusions (`item: None`) contribute nothing: they are
+    // already name-classified fail-safe by the watcher's planner. Scoped
+    // sweeps (which did not fully discover amplifier) produce no report.
+    let amplifier_root_dirs = fully_discovered_providers.contains("amplifier").then(|| {
+        let mut dirs: Vec<PathBuf> = cache
+            .iter()
+            .filter(|(_, entry)| entry.source_name.as_deref() == Some("amplifier"))
+            .filter(|(_, entry)| entry.item.as_ref().is_some_and(|i| !i.is_subagent))
+            .filter_map(|(path, _)| path.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs
+    });
+
     // Prune: a real cache mutation that must contribute to persistence
     // accounting. During a full reconciliation, prune everything not
     // discovered (existing behavior). During a scoped refresh, only
@@ -1746,7 +1806,7 @@ fn refresh_snapshot(
             .cmp(&a.last_activity_at)
             .then_with(|| b.key().cmp(&a.key()))
     });
-    (items, changed)
+    (items, changed, amplifier_root_dirs)
 }
 
 // -- Persistent parse cache (self-hosting-readiness bake-in, "kill the cold
@@ -2795,6 +2855,7 @@ pub(crate) mod tests {
             Arc::new(StdMutex::new(Some(Instant::now()))),
             Duration::from_secs(3600),
             change_tx,
+            Arc::new(StdMutex::new(None)),
         )
         .await;
 
@@ -5298,6 +5359,74 @@ pub(crate) mod tests {
                 .filter(|s| s.provider == "amplifier")
                 .count(),
             0
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ---------- refresh→watcher self-correction report ----------
+
+    #[tokio::test]
+    async fn amplifier_report_carries_only_parsed_root_session_dirs() {
+        let home = unique_temp_dir("amp-report");
+        let mk = |slug: &str, id: &str, metadata: &str| {
+            let dir = home.join("projects").join(slug).join("sessions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), metadata).unwrap();
+            dir
+        };
+        // True root (parent_id absent).
+        let root = mk(
+            "p",
+            "012584be-9478-4801-a62d-4e5da428b3a0",
+            r#"{"session_id":"r","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // Misnamed root: subagent-PATTERN name, but parent_id absent.
+        let misnamed = mk(
+            "p",
+            "0000000000000000-014b6af1c2ac4ab5_agent",
+            r#"{"session_id":"m","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // True subagent: parent_id present.
+        let _sub = mk(
+            "p",
+            "1111111111111111-2222222222222222_sub",
+            r#"{"session_id":"s","working_dir":"/p/x","parent_id":"r","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // Excluded (cwd-less) root-named dir: contributes nothing (unparseable rows are already fail-safe-watched).
+        let _excluded = mk(
+            "p",
+            "222584be-9478-4801-a62d-4e5da428b3a0",
+            r#"{"session_id":"e","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+
+        let index = test_index_with_ttl(
+            vec![
+                Arc::new(crate::amplifier::AmplifierSource::new(home.clone()))
+                    as Arc<dyn SessionSource>,
+            ],
+            Duration::from_secs(3600),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        index.set_amplifier_root_report_sink(tx);
+        let _ = index.snapshot().await;
+        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("report fires after a full discover")
+            .expect("channel open");
+        assert_eq!(report, {
+            let mut v = vec![misnamed.clone(), root.clone()];
+            v.sort();
+            v
+        });
+
+        // A scoped-only refresh must NOT re-report (amplifier was not fully discovered).
+        index.mark_dirty(&[(home.join("nonexistent.json"), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "scoped-only sweeps produce no report"
         );
         std::fs::remove_dir_all(&home).ok();
     }

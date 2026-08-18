@@ -28,7 +28,12 @@
 //!   pending-map escalation path. Two resource alarms guard the accepted
 //!   unbounded root-session watch growth: an edge-triggered WARN at >25%
 //!   of the kernel inotify watch limit (checked after every arm batch) and
-//!   a daily-bucketed WARN on unknown-format arm drift.
+//!   a daily-bucketed WARN on unknown-format arm drift. A one-way
+//!   refresh→watcher self-correction channel closes the loop the name
+//!   classifier cannot: each full amplifier discover reports its
+//!   content-verified root session dirs (parsed `parent_id` absent), and
+//!   the loop arms any the basename classifier missed — never bypassing
+//!   arm-failure retry backoff.
 //! - Debounced flush (200ms quiet gap, capped at 2s from a burst's first
 //!   event so sustained sub-gap streams can't starve it) delivers dirty
 //!   paths to `SessionIndex::mark_dirty`. An amplifier rescan
@@ -531,11 +536,13 @@ fn watch_and_record(
     }
 }
 
-/// The ONE arming site, KIND-AWARE so first-line, retry-drain, replan, and
-/// self-correction arms behave identically for the same target.
-/// Bookkeeping-idempotent: arming an already-armed path is a no-op, so
-/// double discovery (initial scan ∪ post-arm rescans ∪ live events) is
-/// safe.
+/// The FIRST-LINE arming site, KIND-AWARE so first-line, retry-drain, and
+/// replan arms behave identically for the same target. (The refresh→watcher
+/// self-correction channel deliberately does NOT flow through the
+/// `ArmKind::SessionDir` name gate — its content-verified roots arm via
+/// [`arm_reported_root_dir`].) Bookkeeping-idempotent: arming an
+/// already-armed path is a no-op, so double discovery (initial scan ∪
+/// post-arm rescans ∪ live events) is safe.
 fn arm_managed_dir(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
@@ -559,11 +566,16 @@ fn arm_managed_dir(
             }
         }
         ArmKind::SessionDir => {
-            // Classification by BASENAME only, inside the one arming site
-            // (defense in depth — planner, cascades, and dispatch all
-            // pre-filter): subagent dirs are NEVER armed; unknown formats
-            // fail safe toward watching (Task 4's drift counter hooks this
-            // classification).
+            // Classification by BASENAME only, inside the FIRST-LINE
+            // arming site (defense in depth — planner, cascades, and
+            // dispatch all pre-filter): subagent dirs are NEVER armed;
+            // unknown formats fail safe toward watching (Task 4's drift
+            // counter hooks this classification). The refresh→watcher
+            // self-correction channel arms its content-verified roots via
+            // [`arm_reported_root_dir`] instead — it alone bypasses the
+            // name gate by design (its whole purpose is recovering dirs
+            // whose name says subagent but whose parsed content says
+            // root).
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let class = classify_basename(name);
             if !is_watch_target(class) {
@@ -605,6 +617,71 @@ fn arm_managed_dir(
             watch_and_record(book, watcher, outcome, provider, path, arm_kind);
         }
     }
+}
+
+/// Self-correction channel arm (design "Self-correction channel"): the
+/// index reported this dir as a CONTENT-verified root (a sweep that fully
+/// discovered amplifier parsed its metadata with `parent_id` absent), so
+/// the basename classifier — the FIRST-LINE authority — is intentionally
+/// not consulted: the misnamed-root case this channel exists to recover
+/// is precisely name-says-subagent / content-says-root, and
+/// `arm_managed_dir(.., ArmKind::SessionDir, ..)` would refuse the
+/// subagent-pattern basename. Everything else is IDENTICAL to an
+/// `ArmKind::SessionDir` arm: the shared `watch_and_record` clause (armed
+/// bookkeeping, deterministic drop, transient retry — recorded under
+/// `ArmKind::SessionDir` so the retry drain's kind routing in
+/// [`arm_retry_entry`] recognizes it), the file-state watch-then-scan
+/// mark when `emit_marks`, and the already-armed no-op. NO drift
+/// accounting: drift counts unknown-FORMAT (non-UUID, non-subagent-
+/// pattern) arms, and a reported dir that reaches here unarmed carries a
+/// KNOWN-format subagent-pattern name by construction (UUID/unknown names
+/// are armed first-line or sit in retry — both filtered before the
+/// channel's arm loop runs).
+fn arm_reported_root_dir(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    provider: &str,
+    path: &Path,
+    emit_marks: bool,
+) {
+    if book.armed.contains(path) {
+        return;
+    }
+    tracing::debug!(
+        provider = %provider,
+        path = %path.display(),
+        "session-watcher: arming content-verified root session dir reported by refresh",
+    );
+    if watch_and_record(book, watcher, outcome, provider, path, ArmKind::SessionDir) && emit_marks {
+        outcome.marks.push(path.join("metadata.json"));
+    }
+}
+
+/// Retry-drain routing: a `SessionDir`-kind retry entry whose basename
+/// classifies Subagent can ONLY have been inserted by the content-verified
+/// self-correction channel (first-line `ArmKind::SessionDir` arming refuses
+/// subagent names before `watch_and_record` runs, so a genuinely subagent
+/// dir never enters retry), so it re-arms through the channel's
+/// classification-free helper rather than the first-line name gate — which
+/// would refuse it forever. Every other entry re-arms kind-correctly
+/// through the one arming site.
+fn arm_retry_entry(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    provider: &str,
+    path: &Path,
+    kind: ArmKind,
+) {
+    if kind == ArmKind::SessionDir {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !is_watch_target(classify_basename(name)) {
+            arm_reported_root_dir(book, watcher, outcome, provider, path, true);
+            return;
+        }
+    }
+    arm_managed_dir(book, watcher, outcome, provider, path, kind, true);
 }
 
 /// Readdir a sessions dir and arm every root-classified child session dir
@@ -1154,6 +1231,26 @@ fn replan_amplifier_watch_set(
     true
 }
 
+/// The self-correction diff (design "Self-correction channel"): of the
+/// content-verified root session dirs a full amplifier discover reported,
+/// which still need an arm? PURE — diffs against (armed ∪ retry-pending),
+/// so a dir under arm-failure backoff is suppressed outright (retry's
+/// rearm-tick drain is the only path that works it, and only when due:
+/// the channel NEVER bypasses backoff), and a dir already armed via the
+/// race is a no-op.
+fn roots_needing_arm(
+    reported: &[PathBuf],
+    armed: &std::collections::HashSet<PathBuf>,
+    retry: &std::collections::HashMap<PathBuf, RetryEntry>,
+) -> Vec<PathBuf> {
+    reported
+        .iter()
+        .filter(|d| !armed.contains(*d))
+        .filter(|d| !retry.contains_key(*d))
+        .cloned()
+        .collect()
+}
+
 /// Depth of `path` below the managed projects root (`strip_prefix`
 /// component count): 0 = the projects root's OWN self-event (its removal
 /// wiring is Task 4's), 1 = a project child of the root watch, 3 = a
@@ -1449,6 +1546,16 @@ impl SessionWatcher {
             .take()
             .expect("SessionWatcher::start may be called only once");
 
+        // The self-correction channel (refresh → watcher, one-way) exists
+        // iff the amplifier managed book does: the index reports its
+        // content-verified amplifier root session dirs on it after every
+        // full amplifier discover.
+        let root_report_rx = self.amplifier_book.is_some().then(|| {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
+            self.index.set_amplifier_root_report_sink(tx);
+            rx
+        });
+
         tokio::spawn(async move {
             run_watcher_loop(
                 index,
@@ -1458,6 +1565,7 @@ impl SessionWatcher {
                 amplifier_book,
                 subagent_interest,
                 (event_tx, event_rx),
+                root_report_rx,
             )
             .await;
         })
@@ -1484,6 +1592,7 @@ struct AmplifierLoopCtx {
 }
 
 /// Arm watchers and run the coalescing event loop.
+#[allow(clippy::too_many_arguments)]
 async fn run_watcher_loop(
     index: Arc<SessionIndex>,
     providers: Vec<WatchedProvider>,
@@ -1495,8 +1604,10 @@ async fn run_watcher_loop(
         mpsc::UnboundedSender<WatchEvent>,
         mpsc::UnboundedReceiver<WatchEvent>,
     ),
+    root_report_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>,
 ) {
     let (event_tx, mut event_rx) = event;
+    let mut root_report_rx = root_report_rx;
 
     // The amplifier managed-watch context: which provider slot it
     // occupies and where its projects root lives (both derivable from
@@ -1826,6 +1937,63 @@ async fn run_watcher_loop(
                     None => break,
                 }
             }
+            // Self-correction channel (refresh → watcher, one-way): each
+            // full amplifier discover reports its content-verified root
+            // session dirs. Diff against (armed ∪ retry-pending) —
+            // arm-failure backoff is NEVER bypassed — and arm the misses
+            // with the file-state watch-then-scan arm; a fresh ArmOutcome
+            // drains to the index afterwards. Reports carry handfuls of
+            // dirs, never bulk batches, so this arm stays on the async
+            // loop (the spawn_blocking rule covers the batch phases).
+            report = async {
+                match root_report_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    // No amplifier provider (or a closed channel): park the
+                    // arm forever. A bare `Some(dirs) = ...` pattern would
+                    // busy-spin on a closed channel instead.
+                    None => std::future::pending::<Option<Vec<PathBuf>>>().await,
+                }
+            } => {
+                match report {
+                    Some(dirs) => {
+                        if let Some(amp) = amplifier.as_ref() {
+                            // No watcher (startup creation failed): nothing
+                            // to arm with — the replan/rearm paths own
+                            // recovery; the next full discover re-reports.
+                            if let Some(pw) = watches.get_mut(&amp.prov_idx) {
+                                let mut outcome = ArmOutcome::default();
+                                {
+                                    let mut book = amp.book.lock().unwrap();
+                                    let armed_before = book.armed.len();
+                                    for dir in
+                                        roots_needing_arm(&dirs, &book.armed, &book.retry)
+                                    {
+                                        arm_reported_root_dir(
+                                            &mut book,
+                                            &mut pw.watcher,
+                                            &mut outcome,
+                                            "amplifier",
+                                            &dir,
+                                            true,
+                                        );
+                                    }
+                                    // Per-arm-batch budget check: every
+                                    // arm-batch application re-evaluates
+                                    // the 25%-of-kernel-limit WARN.
+                                    if book.armed.len() != armed_before {
+                                        check_watch_budget(&mut book);
+                                    }
+                                }
+                                drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
+                            }
+                        }
+                    }
+                    // The sink drops only with the index (which the loop
+                    // itself holds), so a close is unreachable; disable the
+                    // arm rather than spin.
+                    None => root_report_rx = None,
+                }
+            }
             _ = async {
                 match flush_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2027,16 +2195,18 @@ async fn run_watcher_loop(
                                         }
                                     }
                                     // Retry drain: kind-retained re-arms
-                                    // with the file-state watch-then-scan.
+                                    // with the file-state watch-then-scan
+                                    // (arm_retry_entry additionally routes
+                                    // the channel-inserted subagent-named
+                                    // SessionDir corner — see its doc).
                                     for (path, kind) in retry_due {
-                                        arm_managed_dir(
+                                        arm_retry_entry(
                                             &mut book,
                                             &mut watcher,
                                             &mut outcome,
                                             "amplifier",
                                             &path,
                                             kind,
-                                            true,
                                         );
                                     }
                                 }
