@@ -1888,7 +1888,7 @@ fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2007,7 +2007,7 @@ mod tests {
     /// it again after its first sweep; `direct_list_calls` is the
     /// change-token-gating guard for direct-listed sources (opencode) -- an
     /// unchanged token must never increment it again after the first sweep.
-    struct CountingWrapper<S: SessionSource> {
+    pub(crate) struct CountingWrapper<S: SessionSource> {
         inner: S,
         discover_calls: Arc<AtomicUsize>,
         parse_calls: Arc<AtomicUsize>,
@@ -2018,7 +2018,7 @@ mod tests {
         /// Construct with fresh (zeroed) counters -- the common case, so call
         /// sites that only care about one counter don't need to spell out
         /// all three fields.
-        fn new(inner: S) -> Self {
+        pub(crate) fn new(inner: S) -> Self {
             Self {
                 inner,
                 discover_calls: Arc::new(AtomicUsize::new(0)),
@@ -2026,6 +2026,23 @@ mod tests {
                 direct_list_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
+    }
+
+    /// Counter access for OTHER modules' negative no-scan pins (the
+    /// session_watcher amplifier tests): an erroneous discover/parse sweep
+    /// is OBSERVABLE WORK that always increments its counter, unlike the
+    /// `subscribe_changes()` generation which stays silent when a sweep
+    /// publishes unchanged content. Returns `(discover_calls, parse_calls,
+    /// direct_list_calls)` clones. (Task 5 adds the counted `stat_scoped`
+    /// passthrough and a 4th counter here.)
+    pub(crate) fn wrapper_counters<S: SessionSource>(
+        w: &CountingWrapper<S>,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        (
+            Arc::clone(&w.discover_calls),
+            Arc::clone(&w.parse_calls),
+            Arc::clone(&w.direct_list_calls),
+        )
     }
 
     impl<S: SessionSource> SessionSource for CountingWrapper<S> {

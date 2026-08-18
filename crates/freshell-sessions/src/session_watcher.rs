@@ -3,15 +3,29 @@
 //! polling that burned 50-90% of a CPU core.
 //!
 //! Architecture:
-//! - Literally one `notify::RecommendedWatcher` (one inotify fd) per provider,
-//!   armed on many paths via [`ProviderLayout`] watch bases; watch lifetimes
-//!   are explicit (`watch_path` to arm, `unwatch_tolerated` to drop)
+//! - Literally one `notify::RecommendedWatcher` (one inotify fd) per provider;
+//!   watch lifetimes are explicit (`watch_path` to arm, `unwatch_tolerated`
+//!   to drop). Claude/codex/opencode arm their [`ProviderLayout`] watch bases
+//!   (recursive tree / single db dir); the AMPLIFIER provider instead arms a
+//!   MANAGED watch set (kata v0h9 follow-up): the pure planner
+//!   [`crate::watch_plan`] enumerates the desired set (projects root,
+//!   per-project sessions dirs or stand-ins, root-classified session dirs),
+//!   and the free arm helpers below apply it kind-aware with
+//!   watch-then-scan, stand-in swap, absence tracking, and bounded backoff
+//!   retry — all bookkeeping in [`ManagedBook`], all marks routed through
+//!   [`ArmOutcome`] so every bulk batch is `spawn_blocking`-safe.
 //! - Raw events flow through a coalescing `HashMap<PathBuf, Instant>` that
-//!   collapses ~35 events/s (measured 24h observer) to ~0.09 net changes/s
+//!   collapses ~35 events/s (measured 24h observer) to ~0.09 net changes/s.
+//!   Amplifier events are routed by DEPTH below the projects root
+//!   (structural create-ish kinds at depths 1–3 arm/cascade/swap; depth-3
+//!   subagent mkdirs escalate only on declared interest); all other events
+//!   take the legacy pending-map flow.
 //! - Debounced flush (200ms) delivers dirty paths to `SessionIndex::mark_dirty`
-//! - Late-root handling: watches nearest existing ancestor when the provider
-//!   root doesn't exist yet; the 15-minute TTL reconciliation covers providers
-//!   whose root never appears during the watcher's lifetime
+//! - Late-root handling: legacy providers watch the nearest existing ancestor
+//!   when the provider root doesn't exist yet; the amplifier projects root
+//!   absence-tracks in the managed book instead (`absent` + rearm-tick
+//!   return cascade). The 15-minute TTL reconciliation covers providers
+//!   whose root never appears during the watcher's lifetime.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -24,6 +38,10 @@ use tokio::sync::mpsc;
 
 use crate::directory_index::SessionIndex;
 use crate::provider_layout::{ProviderLayout, WatchMode};
+use crate::watch_plan::{
+    classify_arm_error, classify_basename, is_watch_target, plan_amplifier_targets, ArmErr,
+    ArmKind, PlanTargets,
+};
 
 /// Debounce window: coalesced events are flushed to SessionIndex after
 /// this much quiet time. 200ms matches the observer's findings and is
@@ -122,6 +140,12 @@ pub struct SessionWatcher {
     providers: Vec<WatchedProvider>,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     rearm_interval_secs: u64,
+    /// Some iff a provider with `layout.name() == "amplifier"` is
+    /// configured: the managed watch-set bookkeeping, shared with the
+    /// watcher loop which clones the Arc at `start`.
+    amplifier_book: Option<Arc<std::sync::Mutex<ManagedBook>>>,
+    /// Connected subagent interest count (see `with_subagent_interest`).
+    subagent_interest: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Event filter: same logic as `activity.rs::fs_event_is_relevant` —
@@ -243,13 +267,603 @@ fn unwatch_tolerated(watcher: &mut notify::RecommendedWatcher, provider_name: &s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Amplifier managed watch set (kata v0h9 follow-up; design
+// docs/superpowers/plans/2026-08-17-amplifier-watch-reduction.md). The
+// planner (`crate::watch_plan`) owns "what SHOULD be armed"; this engine
+// owns arming. The arm helpers are FREE FUNCTIONS (not SessionWatcher
+// methods): the recv loop calls them with ITS watcher + locked book + a
+// fresh ArmOutcome, and tests drive the identical helpers directly on a
+// locally-constructed watcher + a fresh book, with no spawned loop.
+// ---------------------------------------------------------------------------
+
+/// Bookkeeping for the amplifier managed watch set (design "Watch set" +
+/// "Absence/retry"). Owned by the watcher task; an Arc clone is held by
+/// SessionWatcher so tests can observe armed state without racing the loop.
+#[derive(Debug, Default)]
+pub(crate) struct ManagedBook {
+    /// Every armed path (projects root, sessions dirs, stand-ins, root
+    /// session dirs).
+    armed: std::collections::HashSet<PathBuf>,
+    /// Structural targets (the projects root chiefly) whose path is
+    /// currently absent — re-checked by the rearm tick. Session dirs are
+    /// never absence-tracked (design).
+    absent: std::collections::HashSet<PathBuf>,
+    /// Transient arm failures under bounded exponential backoff
+    /// (retry_backoff doubling to its 60s cap, RETRY_CAP entries).
+    retry: HashMap<PathBuf, RetryEntry>,
+    // The plan's `replans: usize` counter lands in Task 6 together with its
+    // only writer (the replan path) — declared now it would be dead code
+    // under the `-D warnings` gate.
+}
+
+/// A transient arm failure awaiting the rearm tick; `kind` is retained so
+/// the retry drain re-arms with the SAME behavior as first-line arming
+/// (a `SessionsDir` re-arm cascades its children, a `Standin` re-arm
+/// performs the swap, never a flattened bare path).
+#[derive(Debug)]
+struct RetryEntry {
+    failures: u32,
+    next_attempt: Instant,
+    kind: ArmKind,
+}
+
+/// Bound on the retry set; eviction logs a warn and drops (latency-only
+/// degradation — the 15-minute reconcile owns evicted targets).
+const RETRY_CAP: usize = 256;
+
+/// Exponential backoff schedule for transient arm failures: 1,2,4,…,60s,
+/// expressed as a pure fn so tests pin the schedule without sleeping.
+fn retry_backoff(failures: u32) -> Duration {
+    let step = 2u64.checked_pow(failures.min(6)).unwrap_or(64);
+    Duration::from_secs(step.min(60))
+}
+
+/// The ONLY output channel of the arm helpers: watch-then-scan scoped
+/// `metadata.json` marks plus a provider-level dirty flag. Drained by the
+/// async caller into the index — the helpers NEVER take `&Arc<SessionIndex>`
+/// and never touch the index, which is exactly what keeps them
+/// `spawn_blocking`-safe: every bulk phase (startup apply, replan apply,
+/// retry-drain batch, absent-root-return cascade) runs off the async
+/// worker and hands marks/routing back. Index mutation ALWAYS happens on
+/// the async loop.
+#[derive(Default)]
+struct ArmOutcome {
+    marks: Vec<PathBuf>,
+    provider_dirty: bool,
+}
+
+/// Shared arming clause for every managed target: one NonRecursive
+/// `watch_path`, then the bookkeeping the design pins. Success: the path
+/// lands in `armed` and any stale retry entry clears. Deterministic
+/// failure (ENOENT/ENOTDIR): dropped immediately for the non-root kinds
+/// (a reappearance is a fresh structural create anyway) — the PROJECTS
+/// ROOT routes to `absent` + provider dirty instead (the scan→arm ENOENT
+/// race is never silently dropped). Transient failure: enters `retry` at
+/// doubled, capped backoff with the kind retained (a re-failure bumps the
+/// count in place). Returns true when the path is armed.
+fn watch_and_record(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    provider: &str,
+    path: &Path,
+    kind: ArmKind,
+) -> bool {
+    match watch_path(watcher, provider, path, notify::RecursiveMode::NonRecursive) {
+        Ok(()) => {
+            book.armed.insert(path.to_path_buf());
+            book.retry.remove(path);
+            true
+        }
+        Err(e) => {
+            match classify_arm_error(&e) {
+                ArmErr::Deterministic => {
+                    book.retry.remove(path);
+                    if kind == ArmKind::ProjectsRoot {
+                        tracing::debug!(
+                            provider = %provider,
+                            path = %path.display(),
+                            "session-watcher: projects root vanished between scan and arm; absence-tracking",
+                        );
+                        book.absent.insert(path.to_path_buf());
+                        outcome.provider_dirty = true;
+                    } else {
+                        tracing::debug!(
+                            provider = %provider,
+                            path = %path.display(),
+                            kind = ?kind,
+                            "session-watcher: deterministic arm failure; dropped (reappearance is a fresh structural create)",
+                        );
+                    }
+                }
+                ArmErr::Transient => {
+                    if !book.retry.contains_key(path) && book.retry.len() >= RETRY_CAP {
+                        tracing::warn!(
+                            provider = %provider,
+                            path = %path.display(),
+                            "session-watcher: retry set full ({RETRY_CAP}); dropping transient arm failure",
+                        );
+                        return false;
+                    }
+                    let failures = book.retry.get(path).map(|e| e.failures + 1).unwrap_or(1);
+                    book.retry.insert(
+                        path.to_path_buf(),
+                        RetryEntry {
+                            failures,
+                            next_attempt: Instant::now() + retry_backoff(failures),
+                            kind,
+                        },
+                    );
+                    tracing::debug!(
+                        provider = %provider,
+                        path = %path.display(),
+                        kind = ?kind,
+                        failures,
+                        "session-watcher: transient arm failure; retry scheduled",
+                    );
+                }
+            }
+            false
+        }
+    }
+}
+
+/// The ONE arming site, KIND-AWARE so first-line, retry-drain, replan, and
+/// self-correction arms behave identically for the same target.
+/// Bookkeeping-idempotent: arming an already-armed path is a no-op, so
+/// double discovery (initial scan ∪ post-arm rescans ∪ live events) is
+/// safe.
+fn arm_managed_dir(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    provider: &str,
+    path: &Path,
+    arm_kind: ArmKind,
+    emit_marks: bool,
+) {
+    match arm_kind {
+        ArmKind::Standin => arm_sessions_or_standin(book, watcher, outcome, path, emit_marks),
+        ArmKind::SessionsDir => {
+            if book.armed.contains(path) {
+                return;
+            }
+            if watch_and_record(book, watcher, outcome, provider, path, arm_kind) {
+                // Watch-then-scan: the structural cascade runs only off a
+                // LIVE watch, so a create landing between the readdir and
+                // the arm can never be lost.
+                cascade_session_children(book, watcher, outcome, path, emit_marks);
+            }
+        }
+        ArmKind::SessionDir => {
+            // Classification by BASENAME only, inside the one arming site
+            // (defense in depth — planner, cascades, and dispatch all
+            // pre-filter): subagent dirs are NEVER armed; unknown formats
+            // fail safe toward watching (Task 4's drift counter hooks this
+            // classification).
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let class = classify_basename(name);
+            if !is_watch_target(class) {
+                tracing::debug!(
+                    provider = %provider,
+                    path = %path.display(),
+                    "session-watcher: subagent-class session dir is never armed",
+                );
+                return;
+            }
+            if book.armed.contains(path) {
+                return;
+            }
+            tracing::debug!(
+                provider = %provider,
+                path = %path.display(),
+                class = ?class,
+                "session-watcher: arming session dir",
+            );
+            if watch_and_record(book, watcher, outcome, provider, path, arm_kind) && emit_marks {
+                // File-state watch-then-scan: a scoped mark on a
+                // (possibly missing) metadata.json is a safe no-op /
+                // correct prune downstream.
+                outcome.marks.push(path.join("metadata.json"));
+            }
+        }
+        ArmKind::ProjectsRoot => {
+            if book.armed.contains(path) {
+                return;
+            }
+            watch_and_record(book, watcher, outcome, provider, path, arm_kind);
+        }
+    }
+}
+
+/// Readdir a sessions dir and arm every root-classified child session dir
+/// (each arm does its own file-state watch-then-scan: the scoped
+/// `metadata.json` mark lands in `outcome.marks` when `emit_marks`).
+/// Tolerant per entry — a failed entry skips, never aborts the cascade
+/// (the live parent watch reports later structural changes; STRICT scans
+/// are the planner's job).
+fn cascade_session_children(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    sessions_dir: &Path,
+    emit_marks: bool,
+) {
+    let entries = match std::fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!(
+                path = %sessions_dir.display(),
+                error = %e,
+                "session-watcher: sessions-dir rescan failed; live watch keeps reporting",
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::debug!(
+                    path = %sessions_dir.display(),
+                    error = %e,
+                    "session-watcher: sessions-dir rescan entry failed; skipped",
+                );
+                continue;
+            }
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            &entry.path(),
+            ArmKind::SessionDir,
+            emit_marks,
+        );
+    }
+}
+
+/// The design's stand-in rule, including the post-arm re-check: arm the
+/// project dir itself when it has no `sessions/` child (so the later
+/// `sessions/` create is observed); if `sessions/` already exists — or
+/// appeared in the check→arm window — drop the stand-in and arm the real
+/// sessions dir (`ArmKind::SessionsDir`, which cascades its children).
+fn arm_sessions_or_standin(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    project_dir: &Path,
+    emit_marks: bool,
+) {
+    let sessions = project_dir.join("sessions");
+    if !sessions.is_dir() {
+        // Stand-in arm (skip when already armed: the live watch then owns
+        // the sessions/ create, and the recheck below would be stale).
+        if book.armed.contains(project_dir) {
+            return;
+        }
+        if !watch_and_record(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            project_dir,
+            ArmKind::Standin,
+        ) {
+            return; // absence/retry bookkeeping done inside
+        }
+    }
+    // Post-arm recheck: a sessions/ created between the first is_dir and
+    // the watch arm produced NO event the armed watch could see — only
+    // this recheck can catch it (the check→arm window).
+    if sessions.is_dir() {
+        if book.armed.remove(project_dir) {
+            unwatch_tolerated(watcher, "amplifier", project_dir);
+        }
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            &sessions,
+            ArmKind::SessionsDir,
+            emit_marks,
+        );
+    }
+}
+
+/// `Create(<proj>)`/`CreateFolder(<proj>)` on the root watch (or the
+/// startup root rescan): arm the new project's sessions dir / stand-in,
+/// cascading existing children. The stray-file guard skips non-dirs — a
+/// stray file at project depth (e.g. `repl_history`) never generates a
+/// doomed `<file>/sessions` arm attempt.
+fn cascade_new_project(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    project_dir: &Path,
+    emit_marks: bool,
+) {
+    if !project_dir.is_dir() {
+        return;
+    }
+    arm_sessions_or_standin(book, watcher, outcome, project_dir, emit_marks);
+}
+
+/// The startup half of the watch-then-scan invariant
+/// (`apply_amplifier_plan` with `emit_marks: false`): the boot warm sweep
+/// covers initial file state, so only the file-state stream is skipped —
+/// the structural stream (arms + post-arm rescans) is NEVER skipped.
+fn apply_amplifier_startup_plan(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    plan: PlanTargets,
+) {
+    apply_amplifier_plan(book, watcher, outcome, projects_root, &plan, false);
+}
+
+/// `apply_amplifier_plan` with `emit_marks: true`, used by the rearm tick
+/// when an ABSENT projects root returns — the watch-then-scan rescan
+/// equivalent (readdir → arm/swap every child), so sessions created while
+/// the root was gone are armed AND scoped-marked first-line, never
+/// deferred to the 15-minute reconcile.
+fn apply_amplifier_return_plan(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    plan: &PlanTargets,
+) {
+    apply_amplifier_plan(book, watcher, outcome, projects_root, plan, true);
+}
+
+/// The ordered managed-set apply:
+/// 1. Arm the projects root FIRST (NonRecursive, `ArmKind::ProjectsRoot`;
+///    a deterministic failure routes to `absent` inside the shared
+///    clause — the scan→arm ENOENT race is never silently dropped).
+/// 2. Arm every plan-listed STRUCTURAL target kind-correctly
+///    (`sessions_dirs` via `ArmKind::SessionsDir`, `standins` via
+///    `ArmKind::Standin` — each arm does its own cascade/swap inline).
+/// 3. Post-arm rescan — the union step: (a) readdir the ARMED projects
+///    root and `cascade_new_project` every project dir the plan did not
+///    cover (a project created between the initial scan and the root arm);
+///    (b) `cascade_session_children` on every ARMED sessions dir, the
+///    explicit idempotent union re-pass. Every session-dir arm therefore
+///    comes from a readdir taken AFTER its parent watch is live, never
+///    from the initial scan's possibly-stale listing — the scan→arm
+///    window cannot lose a root session's freshness (the hard zero-latency
+///    requirement). Arms landing while the batch runs queue events on the
+///    watcher's channel and are processed normally by the recv arm.
+fn apply_amplifier_plan(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    plan: &PlanTargets,
+    emit_marks: bool,
+) {
+    if !plan.root_exists {
+        // Missing root: absence-track (the rearm tick re-checks). Provider
+        // dirty only on the RUNTIME paths (emit_marks ⇔ the absent-return
+        // cascade): a hot index may hold stale rows for the vanished root
+        // and must prune them. At initial startup (emit_marks == false) the
+        // mark is deliberately NOT set — the boot discover covers initial
+        // state, nothing published can be stale yet, and a boot-time
+        // detached refresh is unsynchronized with startup-settle
+        // observability (it could publish content that only the not-yet-
+        // armed watch set should have surfaced — the pre-managed engine
+        // likewise armed the home ancestor then without a provider-dirty
+        // mark). The planner-Err and arm-race paths keep provider dirty
+        // unconditionally (both are runtime-informative).
+        book.absent.insert(projects_root.to_path_buf());
+        if emit_marks {
+            outcome.provider_dirty = true;
+        }
+        return;
+    }
+    // 1. Root first.
+    arm_managed_dir(
+        book,
+        watcher,
+        outcome,
+        "amplifier",
+        projects_root,
+        ArmKind::ProjectsRoot,
+        emit_marks,
+    );
+    // 2. Plan-listed structural targets, kind-correct. Track every ARMED
+    //    sessions dir for the 3(b) union re-pass, and every plan-covered
+    //    project dir for 3(a)'s skip set.
+    let mut armed_sessions_dirs: Vec<PathBuf> = Vec::new();
+    let mut covered_projects: std::collections::HashSet<PathBuf> =
+        plan.standins.iter().cloned().collect();
+    for sessions_dir in &plan.sessions_dirs {
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            sessions_dir,
+            ArmKind::SessionsDir,
+            emit_marks,
+        );
+        if book.armed.contains(sessions_dir) {
+            armed_sessions_dirs.push(sessions_dir.clone());
+        }
+        if let Some(project) = sessions_dir.parent() {
+            covered_projects.insert(project.to_path_buf());
+        }
+    }
+    for standin in &plan.standins {
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            standin,
+            ArmKind::Standin,
+            emit_marks,
+        );
+        // A stand-in whose sessions/ appeared mid-apply swaps inline.
+        let sessions = standin.join("sessions");
+        if book.armed.contains(&sessions) {
+            armed_sessions_dirs.push(sessions);
+        }
+    }
+    // 3(a). Root rescan: projects created between the initial plan scan
+    // and the root arm produced no event the root watch could see.
+    if book.armed.contains(projects_root) {
+        match std::fs::read_dir(projects_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else { continue };
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let project = entry.path();
+                    if !covered_projects.contains(&project) {
+                        cascade_new_project(book, watcher, outcome, &project, emit_marks);
+                        let sessions = project.join("sessions");
+                        if book.armed.contains(&sessions) {
+                            armed_sessions_dirs.push(sessions);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %projects_root.display(),
+                    error = %e,
+                    "session-watcher: post-arm root rescan failed; live root watch owns later creates",
+                );
+            }
+        }
+    }
+    // 3(b). Explicit union re-pass over every ARMED sessions dir (the
+    // step-2 kind-aware arms already cascaded; re-running the same
+    // idempotent helper keeps the invariant statement unconditional:
+    // double discovery is a bookkeeping no-op).
+    for sessions_dir in armed_sessions_dirs {
+        cascade_session_children(book, watcher, outcome, &sessions_dir, emit_marks);
+    }
+}
+
+/// Depth of `path` below the managed projects root (`strip_prefix`
+/// component count): 0 = the projects root's OWN self-event (its removal
+/// wiring is Task 4's), 1 = a project child of the root watch, 3 = a
+/// sessions-dir child, ... Routing is DEPTH-relative, never parent-basename
+/// (a project literally named `sessions` must not misroute).
+fn amplifier_depth(projects_root: &Path, path: &Path) -> Option<usize> {
+    path.strip_prefix(projects_root)
+        .ok()
+        .map(|r| r.components().count())
+}
+
+/// One amplifier FileChanged path, routed by depth: structural create-ish
+/// kinds (`Create | CreateFolder | NameTo | NameBoth` — a mkdir surfaces
+/// as `CreateFolder`) at depths 1-3 run the managed arm path with
+/// `emit_marks: true` (runtime events scan what they arm; only startup
+/// skips marks). EVERYTHING else falls through to the legacy pending map
+/// for now (Task 4 owns depth-0 root self-events and remove/rename
+/// dispatch; Task 5 owns depth-4 scoped routing).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_amplifier_path(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    interest: &std::sync::atomic::AtomicUsize,
+    path: &Path,
+    kind: WatchKind,
+    pending: &mut HashMap<(PathBuf, String), Instant>,
+    pending_rescans: &mut std::collections::HashSet<String>,
+) {
+    let createish = matches!(
+        kind,
+        WatchKind::Create | WatchKind::CreateFolder | WatchKind::NameTo | WatchKind::NameBoth
+    );
+    match (amplifier_depth(projects_root, path), createish) {
+        // Depth 1: a project appeared under the root watch (create_dir_all
+        // surfaces only `Create(<proj>)` at the root) — cascade arms its
+        // sessions dir / stand-in and scans its existing children.
+        (Some(1), true) => cascade_new_project(book, watcher, outcome, path, true),
+        // Depth 2: `sessions/` appearing under an armed stand-in — swap to
+        // the real sessions arm (which cascades). Other stand-in children
+        // fall through to the legacy flow.
+        (Some(2), true) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
+            if let Some(project) = path.parent() {
+                arm_sessions_or_standin(book, watcher, outcome, project, true);
+            }
+        }
+        // Depth 3: a sessions-dir child. Root-classified dirs arm with the
+        // watch-then-scan scoped mark; subagent dirs escalate ONLY while a
+        // connected client has declared subagent interest — otherwise the
+        // mkdir is dropped silently (the 15-minute reconcile owns it).
+        (Some(3), true) if path.is_dir() => {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if is_watch_target(classify_basename(name)) {
+                arm_managed_dir(
+                    book,
+                    watcher,
+                    outcome,
+                    "amplifier",
+                    path,
+                    ArmKind::SessionDir,
+                    true,
+                );
+            } else if interest.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                pending_rescans.insert("amplifier".to_owned());
+            }
+        }
+        _ => {
+            pending.insert((path.to_path_buf(), "amplifier".to_owned()), Instant::now());
+        }
+    }
+}
+
+/// Drain an [`ArmOutcome`] into the index — the async-loop side of the
+/// hand-back: scoped `metadata.json` marks per file-state arm, then a
+/// provider-level dirty flag.
+fn drain_arm_outcome(index: &SessionIndex, provider: &str, outcome: ArmOutcome) {
+    if !outcome.marks.is_empty() {
+        let marks: Vec<(PathBuf, String)> = outcome
+            .marks
+            .into_iter()
+            .map(|path| (path, provider.to_owned()))
+            .collect();
+        index.mark_dirty(&marks);
+    }
+    if outcome.provider_dirty {
+        index.mark_provider_dirty(provider);
+    }
+}
+
 impl SessionWatcher {
     pub fn new(index: Arc<SessionIndex>, providers: Vec<WatchedProvider>) -> Self {
+        let amplifier_book = providers
+            .iter()
+            .any(|p| p.layout.name() == "amplifier")
+            .then(|| Arc::new(std::sync::Mutex::new(ManagedBook::default())));
         Self {
             index,
             providers,
             stop_tx: None,
             rearm_interval_secs: REARM_INTERVAL_SECS,
+            amplifier_book,
+            subagent_interest: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -257,6 +871,30 @@ impl SessionWatcher {
     pub fn with_rearm_interval(mut self, secs: u64) -> Self {
         self.rearm_interval_secs = secs;
         self
+    }
+
+    /// Connected subagent interest (WS clients with the toggle on). The
+    /// count handle is shared from freshell-ws' SubagentInterestRegistry;
+    /// the subagent-mkdir escalation consults it (>0 = escalate).
+    pub fn with_subagent_interest(
+        mut self,
+        interested: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.subagent_interest = interested;
+        self
+    }
+
+    /// Test-only probe: observe the amplifier managed book (armed / absent
+    /// / retry) without racing the watcher loop, which clones the same Arc
+    /// at `start`. There are deliberately NO `test_arm_*` probe methods on
+    /// `SessionWatcher` — the book holds neither the `RecommendedWatcher`
+    /// nor the provider context (both live inside the spawned loop), so a
+    /// probe here cannot drive a real arm; bookkeeping tests call the free
+    /// arm helpers directly instead (the identical code path the loop
+    /// uses, with no spawned loop and no inotify timing).
+    #[cfg(test)]
+    pub(crate) fn amplifier_book_handle(&self) -> Option<Arc<std::sync::Mutex<ManagedBook>>> {
+        self.amplifier_book.clone()
     }
 
     /// Start the watcher background task. Returns a `JoinHandle` for the
@@ -268,9 +906,19 @@ impl SessionWatcher {
         let index = Arc::clone(&self.index);
         let providers: Vec<_> = self.providers.drain(..).collect();
         let rearm_secs = self.rearm_interval_secs;
+        let amplifier_book = self.amplifier_book.clone();
+        let subagent_interest = Arc::clone(&self.subagent_interest);
 
         tokio::spawn(async move {
-            run_watcher_loop(index, providers, stop_rx, rearm_secs).await;
+            run_watcher_loop(
+                index,
+                providers,
+                stop_rx,
+                rearm_secs,
+                amplifier_book,
+                subagent_interest,
+            )
+            .await;
         })
     }
 
@@ -282,14 +930,45 @@ impl SessionWatcher {
     }
 }
 
+/// The amplifier provider's managed-watch context inside the watcher loop:
+/// its provider slot in `providers`/`watches`, its projects root, and the
+/// shared bookkeeping + subagent-interest handles. `None` when no
+/// amplifier provider is configured — claude/codex/opencode then take the
+/// legacy watch_bases path unchanged.
+struct AmplifierLoopCtx {
+    prov_idx: usize,
+    projects_root: PathBuf,
+    book: Arc<std::sync::Mutex<ManagedBook>>,
+    interest: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Arm watchers and run the coalescing event loop.
 async fn run_watcher_loop(
     index: Arc<SessionIndex>,
     providers: Vec<WatchedProvider>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     rearm_interval_secs: u64,
+    amplifier_book: Option<Arc<std::sync::Mutex<ManagedBook>>>,
+    subagent_interest: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WatchEvent>();
+
+    // The amplifier managed-watch context: which provider slot it
+    // occupies and where its projects root lives (both derivable from
+    // `providers`), plus the shared handles passed in from `start`.
+    let amplifier = providers
+        .iter()
+        .position(|p| p.layout.name() == "amplifier")
+        .and_then(|prov_idx| {
+            amplifier_book.map(|book| AmplifierLoopCtx {
+                prov_idx,
+                projects_root: providers[prov_idx]
+                    .layout
+                    .session_root(&providers[prov_idx].home),
+                book,
+                interest: Arc::clone(&subagent_interest),
+            })
+        });
 
     // One watcher per provider, keyed by provider index. Watch lifetimes
     // are explicit (`watch_path`/`unwatch_tolerated`); dropping a
@@ -301,13 +980,102 @@ async fn run_watcher_loop(
     let mut absent: Vec<(usize, PathBuf)> = Vec::new();
 
     for (prov_idx, provider) in providers.iter().enumerate() {
+        let name = provider.layout.name().to_owned();
+
+        // The amplifier provider replaces the generic watch_bases arming
+        // entirely: ONE spawn_blocking batch (the plan scan AND every
+        // arm's watch()/unwatch() syscall and readdir) holding the book
+        // lock, so the thousands of blocking syscalls never stall the
+        // async worker. The watcher moves in and back out; the ArmOutcome
+        // hands marks/routing back to the async side for the index drain.
+        if let Some(amp) = amplifier.as_ref().filter(|a| a.prov_idx == prov_idx) {
+            let Some(watcher) = create_provider_watcher(&event_tx, &name, false) else {
+                index.mark_provider_dirty(&name);
+                amp.book
+                    .lock()
+                    .unwrap()
+                    .absent
+                    .insert(amp.projects_root.clone());
+                continue;
+            };
+            let book = Arc::clone(&amp.book);
+            let projects_root = amp.projects_root.clone();
+            let batch_name = name.clone();
+            let applied = tokio::task::spawn_blocking(move || {
+                let mut watcher = watcher;
+                let mut outcome = ArmOutcome::default();
+                {
+                    let mut book = book.lock().unwrap();
+                    match plan_amplifier_targets(&projects_root) {
+                        Ok(plan) => apply_amplifier_startup_plan(
+                            &mut book,
+                            &mut watcher,
+                            &mut outcome,
+                            &projects_root,
+                            plan,
+                        ),
+                        Err(e) => {
+                            // Transient read failure at ANY scan depth (the
+                            // planner is strict-everywhere): same branch as
+                            // a missing root — absence-track + provider
+                            // dirty; the rearm tick retries, and the Task 9
+                            // readiness signal is never blocked by it.
+                            tracing::warn!(
+                                provider = %batch_name,
+                                path = %projects_root.display(),
+                                error = %e,
+                                "session-watcher: amplifier plan scan failed; absence-tracking the projects root",
+                            );
+                            book.absent.insert(projects_root.clone());
+                            outcome.provider_dirty = true;
+                        }
+                    }
+                }
+                (watcher, outcome)
+            })
+            .await;
+            match applied {
+                Ok((watcher, outcome)) => {
+                    tracing::info!(
+                        provider = %name,
+                        armed = amp.book.lock().unwrap().armed.len(),
+                        "session-watcher: amplifier managed watch set armed",
+                    );
+                    watches.insert(
+                        prov_idx,
+                        ProviderWatch {
+                            watcher,
+                            targets: Vec::new(),
+                        },
+                    );
+                    drain_arm_outcome(&index, &name, outcome);
+                }
+                Err(e) => {
+                    // The helpers never panic, so this is unreachable in
+                    // practice — but a lost batch must degrade (absence +
+                    // provider dirty), never hang the startup.
+                    tracing::warn!(
+                        provider = %name,
+                        error = %e,
+                        "session-watcher: amplifier startup arm batch failed; absence-tracking the projects root",
+                    );
+                    index.mark_provider_dirty(&name);
+                    amp.book
+                        .lock()
+                        .unwrap()
+                        .absent
+                        .insert(amp.projects_root.clone());
+                }
+            }
+            continue;
+        }
+
         let watch_bases = provider.layout.watch_bases(&provider.home);
         let is_direct = provider.layout.is_direct_listed();
         let mode = match provider.layout.watch_mode() {
             WatchMode::Recursive => notify::RecursiveMode::Recursive,
             WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
         };
-        let name = provider.layout.name().to_owned();
 
         for base in &watch_bases {
             let watch_target = if base.exists() {
@@ -386,6 +1154,12 @@ async fn run_watcher_loop(
         } else {
             Some(tokio::time::Instant::now() + debounce)
         };
+        // The amplifier managed book has tick work of its own (absent
+        // re-check / retry drain) even while the legacy sets are empty.
+        let amplifier_book_pending = amplifier.as_ref().is_some_and(|amp| {
+            let book = amp.book.lock().unwrap();
+            !book.absent.is_empty() || !book.retry.is_empty()
+        });
 
         tokio::select! {
             _ = &mut stop_rx => break,
@@ -394,9 +1168,49 @@ async fn run_watcher_loop(
                     // One message per notify event; fan the paths back out
                     // so the coalescing keys (path, provider) are identical
                     // to the old per-path messages.
-                    Some(WatchEvent::FileChanged { paths, provider, .. }) => {
-                        for path in paths {
-                            pending.insert((path, provider.clone()), Instant::now());
+                    Some(WatchEvent::FileChanged { paths, provider, kind }) => {
+                        let amp = if provider == "amplifier" {
+                            amplifier.as_ref()
+                        } else {
+                            None
+                        };
+                        match amp {
+                            // Amplifier managed dispatch, per-event on the
+                            // async loop (single events are not bulk work —
+                            // the spawn_blocking rule covers the batch
+                            // phases only): structural arms feed a fresh
+                            // ArmOutcome, drained immediately afterwards.
+                            Some(amp) => {
+                                let mut outcome = ArmOutcome::default();
+                                if let Some(pw) = watches.get_mut(&amp.prov_idx) {
+                                    let mut book = amp.book.lock().unwrap();
+                                    for path in &paths {
+                                        dispatch_amplifier_path(
+                                            &mut book,
+                                            &mut pw.watcher,
+                                            &mut outcome,
+                                            &amp.projects_root,
+                                            &amp.interest,
+                                            path,
+                                            kind,
+                                            &mut pending,
+                                            &mut pending_rescans,
+                                        );
+                                    }
+                                } else {
+                                    // No watcher (startup creation failed):
+                                    // nothing to arm with — legacy flow.
+                                    for path in paths {
+                                        pending.insert((path, provider.clone()), Instant::now());
+                                    }
+                                }
+                                drain_arm_outcome(&index, "amplifier", outcome);
+                            }
+                            None => {
+                                for path in paths {
+                                    pending.insert((path, provider.clone()), Instant::now());
+                                }
+                            }
                         }
                     }
                     Some(WatchEvent::ProviderRescan { provider }) => {
@@ -441,7 +1255,7 @@ async fn run_watcher_loop(
                     }
                 }
             }
-            _ = rearm_interval.tick(), if !absent.is_empty() || !watches.is_empty() => {
+            _ = rearm_interval.tick(), if !absent.is_empty() || !watches.is_empty() || amplifier_book_pending => {
                 // Detect ancestor watches whose precise base now exists,
                 // and armed targets that disappeared. Unwatch the stale
                 // target explicitly (inotify watches follow inodes, so an
@@ -523,6 +1337,119 @@ async fn run_watcher_loop(
                         Err(_) => true, // keep in absent
                     }
                 });
+
+                // Amplifier managed bookkeeping: the absent re-check FIRST
+                // (the projects root is the ONLY absence-tracked target),
+                // then the retry drain — the retry set is WORKED, not just
+                // accumulated, and only when due (collecting due keys +
+                // kinds up front so no mutation happens during iteration).
+                // Replan and self-correction never bypass this drain.
+                if let Some(amp) = &amplifier {
+                    let now = Instant::now();
+                    let (root_returned, retry_due) = {
+                        let book = amp.book.lock().unwrap();
+                        (
+                            book.absent.contains(&amp.projects_root) && amp.projects_root.exists(),
+                            book.retry
+                                .iter()
+                                .filter(|(_, entry)| entry.next_attempt <= now)
+                                .map(|(path, entry)| (path.clone(), entry.kind))
+                                .collect::<Vec<(PathBuf, ArmKind)>>(),
+                        )
+                    };
+                    if root_returned || !retry_due.is_empty() {
+                        // Every batched watch() syscall + cascade readdir
+                        // runs off the async worker (same hand-back shape
+                        // as startup); the outcome drains to the index
+                        // afterwards.
+                        if let Entry::Vacant(slot) = watches.entry(amp.prov_idx) {
+                            if let Some(watcher) = create_provider_watcher(&rearm_tx, "amplifier", false) {
+                                slot.insert(ProviderWatch {
+                                    watcher,
+                                    targets: Vec::new(),
+                                });
+                            }
+                        }
+                        if let Some(pw) = watches.remove(&amp.prov_idx) {
+                            let book = Arc::clone(&amp.book);
+                            let projects_root = amp.projects_root.clone();
+                            let rearm_batch = tokio::task::spawn_blocking(move || {
+                                let mut watcher = pw.watcher;
+                                let mut outcome = ArmOutcome::default();
+                                {
+                                    let mut book = book.lock().unwrap();
+                                    if root_returned {
+                                        // The design's return semantics, in
+                                        // full: plan + apply with marks ON,
+                                        // so sessions created while the
+                                        // root was gone are armed AND
+                                        // scoped-marked first-line. The
+                                        // root leaves absent only on a
+                                        // successful re-arm.
+                                        match plan_amplifier_targets(&projects_root) {
+                                            Ok(plan) => apply_amplifier_return_plan(
+                                                &mut book,
+                                                &mut watcher,
+                                                &mut outcome,
+                                                &projects_root,
+                                                &plan,
+                                            ),
+                                            Err(e) => {
+                                                // Transient scan failure:
+                                                // stay absent, surface the
+                                                // data plane via discover's
+                                                // own protections.
+                                                tracing::warn!(
+                                                    path = %projects_root.display(),
+                                                    error = %e,
+                                                    "session-watcher: amplifier return plan scan failed; keeping the root absent",
+                                                );
+                                                outcome.provider_dirty = true;
+                                            }
+                                        }
+                                        if book.armed.contains(&projects_root) {
+                                            book.absent.remove(&projects_root);
+                                        }
+                                    }
+                                    // Retry drain: kind-retained re-arms
+                                    // with the file-state watch-then-scan.
+                                    for (path, kind) in retry_due {
+                                        arm_managed_dir(
+                                            &mut book,
+                                            &mut watcher,
+                                            &mut outcome,
+                                            "amplifier",
+                                            &path,
+                                            kind,
+                                            true,
+                                        );
+                                    }
+                                }
+                                (watcher, outcome)
+                            })
+                            .await;
+                            match rearm_batch {
+                                Ok((watcher, outcome)) => {
+                                    watches.insert(
+                                        amp.prov_idx,
+                                        ProviderWatch {
+                                            watcher,
+                                            targets: Vec::new(),
+                                        },
+                                    );
+                                    drain_arm_outcome(&index, "amplifier", outcome);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "session-watcher: amplifier rearm batch failed; provider marked dirty",
+                                    );
+                                    index.mark_provider_dirty("amplifier");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
