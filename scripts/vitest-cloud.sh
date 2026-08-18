@@ -423,10 +423,15 @@ cmd_run() {
     exit 1
   fi
 
-  # Fetch logs
+  # Fetch logs (one short retry: right after --wait completes, log reads can
+  # transiently return empty; observed live 2026-08-18).
   echo "[vitest-cloud] Fetching logs..."
   local log_output
   log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
+  if [ -z "$log_output" ]; then
+    sleep 3
+    log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
+  fi
 
   # Print full log output from ALL shards.
   echo "$log_output"
@@ -437,22 +442,32 @@ cmd_run() {
   echo "$log_output" | grep -E '(\[vitest-entrypoint\]|Test Files|Tests )' || true
 
   # Check execution status — propagate query errors instead of normalizing to 0.
+  # Transient describe failures right after `execute --wait` returns are a real
+  # flake class (observed live 2026-08-18: execution succeeded on all 4 shards
+  # while a single describe errored, failing the wrapper); retry briefly before
+  # declaring the run failed.
+  query_count() {
+    local field="$1" val attempt
+    for attempt in 1 2 3 4 5; do
+      if val=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+        --format="value($field)" 2>/dev/null); then
+        echo "${val:-0}"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
   local succeeded
   local failed
-  if ! succeeded=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.succeededCount)" 2>/dev/null); then
+  if ! succeeded=$(query_count status.succeededCount); then
     echo "[vitest-cloud] ERROR: failed to query execution status"
     exit 1
   fi
-  if ! failed=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.failedCount)" 2>/dev/null); then
+  if ! failed=$(query_count status.failedCount); then
     echo "[vitest-cloud] ERROR: failed to query execution status"
     exit 1
   fi
-
-  # Normalize empty/null to 0
-  succeeded="${succeeded:-0}"
-  failed="${failed:-0}"
 
   echo ""
   echo "[vitest-cloud] Succeeded tasks: $succeeded"
