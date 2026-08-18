@@ -606,7 +606,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
      ) {
          match watcher.unwatch(target) {
              Ok(()) => {}
-             Err(e) if e.kind() == notify::ErrorKind::WatchNotFound => {
+             Err(e) if matches!(&e.kind, notify::ErrorKind::WatchNotFound) => {
                  tracing::debug!(
                      provider = %provider_name,
                      path = %target.display(),
