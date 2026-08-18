@@ -139,6 +139,39 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
+# Check 10: transient execution-status query failures are retried.
+# Regression: a single flaky `gcloud run jobs executions describe` right after
+# `execute --wait` completed must not fail an otherwise-green run (observed
+# live 2026-08-18: execution succeeded on all shards, wrapper exited 1 because
+# the status query errored once).
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE2'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"succeededCount"* ]]; then
+    CC=$(cat "${FAKE_GCLOUD_LOG}.desccount" 2>/dev/null || echo 0); CC=$((CC+1)); echo "$CC" > "${FAKE_GCLOUD_LOG}.desccount"
+    if [ "$CC" -le 2 ]; then exit 1; fi
+    echo "1"   # one succeeded shard
+  else
+    echo "0"   # zero failed shards
+  fi
+  exit 0
+fi
+if [[ "$*" == *"executions list"* ]]; then echo "test-execution-1"; exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution test-execution-1"; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE2
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+rm -f "${FAKE_GCLOUD_LOG}.desccount"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+check "transient describe failures retried (2 failures, then success)" bash -c "bash '$SCRIPT' run --cloud --config=default >/dev/null 2>&1"
+check "describe was retried (>=3 describe calls logged)" bash -c "[ \$(grep -c 'executions describe' '$FAKE_GCLOUD_LOG') -ge 3 ]"
+
 # Cleanup
 rm -rf "$FAKE_GCLOUD_DIR"
 
