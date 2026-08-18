@@ -102,7 +102,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   - `fn plan_amplifier_targets(projects_root: &Path) -> Result<PlanTargets, std::io::Error>`
   - `struct PlanDiff { pub arm: Vec<PathBuf>, pub unwatch: Vec<PathBuf> }`
   - `fn diff_armed(desired: &HashSet<PathBuf>, armed: &HashSet<PathBuf>) -> PlanDiff`
-  - `enum ArmErr { Deterministic, Transient }`; `fn classify_arm_error(err: &std::io::Error) -> ArmErr` (NotFound/NotADirectory → Deterministic; else Transient)
+  - `enum ArmErr { Deterministic, Transient }`; `fn classify_arm_error(err: &notify::Error) -> ArmErr` — match `&err.kind`: `notify::ErrorKind::PathNotFound` → Deterministic; `ErrorKind::Io(io)` → Deterministic iff `io.kind()` is `std::io::ErrorKind::NotFound | NotADirectory`, else Transient; `ErrorKind::MaxFilesWatch` → Transient (watch-limit exhaustion clears; evicted paths re-arm after pressure releases); everything else → Transient
 
 - [ ] **Step 1: Write the failing behavioral test**
   New file `crates/freshell-sessions/src/watch_plan.rs` containing ONLY the test module first (compile-and-fail red; the module declares no items yet):
@@ -220,11 +220,16 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
       #[test]
       fn classify_arm_error_splits_deterministic_io_from_transient() {
-          use std::io::{Error, ErrorKind};
-          assert!(matches!(classify_arm_error(&Error::from(ErrorKind::NotFound)), ArmErr::Deterministic));
-          assert!(matches!(classify_arm_error(&Error::from(ErrorKind::NotADirectory)), ArmErr::Deterministic));
-          assert!(matches!(classify_arm_error(&Error::from(ErrorKind::PermissionDenied)), ArmErr::Transient));
-          assert!(matches!(classify_arm_error(&Error::from(ErrorKind::Other)), ArmErr::Transient));
+          use std::io::ErrorKind;
+          // notify 6.1.1 API (verified against the vendored error.rs):
+          // `Error::io` and `Error::path_not_found` are pub constructors;
+          // `ErrorKind::MaxFilesWatch` exists but has no pub constructor, so
+          // its Transient arm is default-covered (not test-constructible).
+          assert!(matches!(classify_arm_error(&notify::Error::path_not_found()), ArmErr::Deterministic));
+          assert!(matches!(classify_arm_error(&notify::Error::io(std::io::Error::from(ErrorKind::NotFound))), ArmErr::Deterministic));
+          assert!(matches!(classify_arm_error(&notify::Error::io(std::io::Error::from(ErrorKind::NotADirectory))), ArmErr::Deterministic));
+          assert!(matches!(classify_arm_error(&notify::Error::io(std::io::Error::from(ErrorKind::PermissionDenied))), ArmErr::Transient));
+          assert!(matches!(classify_arm_error(&notify::Error::io(std::io::Error::from(ErrorKind::Other))), ArmErr::Transient));
       }
   }
   ```
@@ -389,15 +394,29 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   /// Arm-failure classification (design: ENOENT/ENOTDIR entries are dropped
   /// immediately — a dir's reappearance arrives as a fresh structural create;
   /// everything else is a transient error that gets bounded backoff retry).
+  /// Arms fail with `notify::Error` (`watch()` returns
+  /// `Result<(), notify::Error>`), so the classifier consumes that type and
+  /// matches its pub `kind` field, never a bare `std::io::Error`.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub(crate) enum ArmErr {
       Deterministic,
       Transient,
   }
 
-  pub(crate) fn classify_arm_error(err: &std::io::Error) -> ArmErr {
-      match err.kind() {
-          std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => ArmErr::Deterministic,
+  pub(crate) fn classify_arm_error(err: &notify::Error) -> ArmErr {
+      match &err.kind {
+          notify::ErrorKind::PathNotFound => ArmErr::Deterministic,
+          notify::ErrorKind::Io(io) => match io.kind() {
+              std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                  ArmErr::Deterministic
+              }
+              _ => ArmErr::Transient,
+          },
+          // `ErrorKind::MaxFilesWatch` → Transient via this default arm:
+          // watch-limit exhaustion clears and evicted paths re-arm after the
+          // pressure releases. `MaxFilesWatch` has no pub constructor in
+          // notify 6.1.1 (verified against the vendored error.rs), so it is
+          // exercised only through this default coverage, not a unit test.
           _ => ArmErr::Transient,
       }
   }
@@ -437,7 +456,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   - `fn create_provider_watcher(tx: &mpsc::UnboundedSender<WatchEvent>, provider_name: &str, is_direct: bool) -> Option<notify::RecommendedWatcher>`
   - `fn watch_path(watcher: &mut notify::RecommendedWatcher, provider_name: &str, target: &Path, mode: notify::RecursiveMode) -> Result<(), notify::Error>` (warns + propagates on failure; no swallowing)
   - `fn unwatch_tolerated(watcher: &mut notify::RecommendedWatcher, provider_name: &str, target: &Path)` — ignore `notify::ErrorKind::WatchNotFound` at debug (kernel already dropped the watch), warn on anything else
-  - `enum WatchKind { Create, Remove, NameFrom, NameTo, NameBoth, Modify, Other }` + `fn kind_of(event: &notify::Event) -> WatchKind` (pure; `need_rescan()` events never carry it — they short-circuit to `ProviderRescan` in the callback)
+  - `enum WatchKind { Create, Remove, NameFrom, NameTo, NameBoth, Modify, Other }` + `fn kind_of(event: &notify::Event) -> WatchKind` (pure; `need_rescan()` events never carry it — they short-circuit to `ProviderRescan` in the callback; `Remove` carries NO dir-vs-file tag: an armed dir's self-delete surfaces as `Remove(File)` because the kernel doesn't tag IN_DELETE_SELF with ISDIR (LB-01 probe), so structural-remove consumers never filter on the tag)
   - `WatchEvent::FileChanged` gains `paths: Vec<PathBuf>` + `kind: WatchKind` (one message per event, preserving rename pairing; legacy flush iterates paths and ignores kind)
   - `watches: HashMap<usize, ProviderWatch>` keyed by provider index replaces `armed: Vec<ArmedWatch>`; unwatching a base = `unwatch_tolerated` on the OLD `actual_target` + `targets.retain(...)` — never by drop.
 
@@ -613,7 +632,12 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
      ```rust
      /// A coarse, provider-agnostic classification of one notify event. The
      /// amplifier managed engine (later tasks) consumes it; the legacy
-     /// providers' flush ignores it.
+     /// providers' flush ignores it. `Remove` deliberately does NOT carry
+     /// the notify dir-vs-file tag: a directly-armed directory's self-delete
+     /// surfaces as `Remove(File)`, NOT `Remove(Folder)` (the kernel does
+     /// not set ISDIR on IN_DELETE_SELF — LB-01 probe), so remove routing by
+     /// path depth must dispatch on the `Remove` kind WITHOUT filtering on
+     /// the dir-vs-file tag.
      #[derive(Debug, Clone, Copy, PartialEq, Eq)]
      enum WatchKind {
          Create,
@@ -639,8 +663,14 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
      }
 
      enum WatchEvent {
-         /// One notify event's full path set. Rename pairing is preserved:
-         /// `Name(Both)` carries [from, to] in ONE message.
+         /// One notify event's full path set (one FileChanged message per
+         /// notify event). Rename vocabulary as observed by the LB-01
+         /// real-notify probe (notify 6.1.1, kernel 6.6.87.2-WSL2, ext4): an
+         /// intra-`sessions/` rename emits THREE events sharing one tracker
+         /// cookie — `Name(From)` with paths [from], `Name(To)` with paths
+         /// [to], and `Name(Both)` carrying paths [from, to] — so a rename
+         /// surfaces as three FileChanged messages and the dispatch handles
+         /// both the From/To pair shape and the paired Both shape.
          FileChanged {
              paths: Vec<PathBuf>,
              kind: WatchKind,
@@ -1130,11 +1160,11 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 - Consumes: Task 3's `ManagedBook`, amplifier dispatch, `unwatch_tolerated`, `cascade_new_project`; the depth-routing helper.
 - Produces:
   - `fn amplifier_teardown_project(book, watcher, index, project_dir)` — drops the whole subtree from `armed`/`absent`/`retry` (design lines 88: "Structural removes clean up the whole subtree's bookkeeping": on Remove/MovedFrom of `<proj>`, unwatch every armed path under it, drop absent/retry entries under it; disposable evaluation workspaces must not forever-retry) and enqueues a scoped prune mark per removed session dir
-  - `fn amplifier_remove_session(book, watcher, index, session_dir)` — forget one session dir: explicit `unwatch_tolerated` (kernel dropped the watch; inode-follow leak prevention for the MovedFrom case) + bookkeeping cleanup + scoped metadata.json mark so the row prunes
+  - `fn amplifier_remove_session(book, watcher, index, session_dir)` — forget one session dir: explicit `unwatch_tolerated` (LB-01 sub-claim 3 nuance: in the managed-set shape — the same watcher owns the armed parent — notify auto-drops the old-path watch on MOVED_FROM, so unwatch of the moved path returns `WatchNotFound`, already tolerated; the explicit unwatch stays as belt-and-braces for the inode-follow case, which the probe's isolated-arm tier confirmed keeps reporting under the stale path) + bookkeeping cleanup + scoped metadata.json mark so the row prunes
   - `fn structural_remove(book, path)` — the shared absent/retry/armed cleanup for one removed path (and anything below it, by `starts_with` prefix)
-  - MovedFrom / `Name(From)` handling at depths 1, 2, 3: unwatch + forget (depth 1 = full project teardown; depth 3 = per-session-dir removal)
+  - MovedFrom / `Name(From)` handling at depths 1, 2, 3: unwatch + forget (depth 1 = full project teardown; depth 3 = per-session-dir removal). IDEMPOTENT: renaming an ARMED child emits a 4th, UNTRACKED duplicate `Name(From)` after the paired trio (LB-01 probe on notify 6.1.1 — notify's mapping of the child watch's IN_MOVE_SELF), so re-processing a From for a path already removed from armed/absent/retry must be a clean no-op — `unwatch_tolerated` absorbs the already-auto-dropped watch (`WatchNotFound` at debug) and the bookkeeping remove hits nothing
   - MovedTo / `Name(To)` / `Name(Both)` at depths 1, 3: treated as creates routed into Task 3's cascade/arm helpers (a `mv`'d root session dir is re-armed first-line — regression 13)
-  - `fn write_remove_dispatch(...)`: depth-1 Remove/MovedFrom → `amplifier_teardown_project` + `mark_provider_dirty("amplifier")` (survivors' children are gone; a provider discover reconciles rows). depth-2 `Remove(sessions)` under an armed sessions-dir-less stand-in → nothing (already stand-in); under a real sessions watch → swap to stand-in. depth-3 Remove/MovedFrom of a session dir → `amplifier_remove_session`.
+  - `fn write_remove_dispatch(...)`: depth-1 Remove/MovedFrom → `amplifier_teardown_project` + `mark_provider_dirty("amplifier")` (survivors' children are gone; a provider discover reconciles rows). depth-2 `Remove(sessions)` under an armed sessions-dir-less stand-in → nothing (already stand-in); under a real sessions watch → swap to stand-in. depth-3 Remove/MovedFrom of a session dir → `amplifier_remove_session` — dispatched on the `Remove` kind WITHOUT filtering on the notify dir-vs-file tag: a directly-armed session dir's self-delete surfaces as `Remove(File)`, not `Remove(Folder)` (the kernel does not set ISDIR on IN_DELETE_SELF — LB-01 probe), so no refactor may add a Folder-only gate.
   - `fn read_max_user_watches() -> Option<usize>` — parse `/proc/sys/fs/inotify/max_user_watches`; None on non-Linux/parse failure (WARN sites no-op)
   - `fn watch_budget_warn_needed(armed: usize, max_user_watches: usize) -> bool` — `armed > max / 4` (pure)
   - Startup log + alarm wiring: after the initial plan application, `tracing::info!(armed_count, …)`; `if let Some(max) = read_max_user_watches() { if watch_budget_warn_needed(total_armed, max) { tracing::warn!(…) } }`
@@ -1183,6 +1213,76 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
       // Keep proving the new watch is live: a transcript append refreshes
       // the index without a provider discover.
+      std::fs::write(
+          new.join("transcript.jsonl"),
+          "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+      )
+      .unwrap();
+      let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+      assert!(changed.is_ok(), "events flow through the re-armed watch");
+      watcher.stop();
+      let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+      std::fs::remove_dir_all(&home).ok();
+  }
+
+  /// LB-01 probe (notify 6.1.1): renaming an ARMED session dir emits the
+  /// tracked From/To/Both trio AND a 4th, UNTRACKED duplicate `Name(From)`
+  /// on the old path (notify's mapping of the child watch's IN_MOVE_SELF),
+  /// arriving after the trio. Structural-remove handling must be idempotent:
+  /// the duplicate re-processes a path already removed from every
+  /// bookkeeping set.
+  #[tokio::test]
+  async fn armed_child_rename_duplicate_name_from_is_idempotent() {
+      let home = unique_temp_dir("amp-rename-idem");
+      let old = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+      let index = amplifier_index(&home);
+      let mut watcher = amplifier_watcher(&index, &home);
+      let book = watcher.amplifier_book_handle().unwrap();
+      let mut rx = index.subscribe_changes();
+      let handle = watcher.start();
+      let _ = index.snapshot().await;
+      let _ = rx.borrow_and_update();
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      assert!(book.lock().unwrap().armed.contains(&old));
+
+      let new = old.parent().unwrap().join("aa2584be-9478-4801-a62d-4e5da428b3a0");
+      std::fs::rename(&old, &new).unwrap();
+
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              {
+                  let b = book.lock().unwrap();
+                  if b.armed.contains(&new) && !b.armed.contains(&old) {
+                      break;
+                  }
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+      })
+      .await
+      .expect("renamed dir re-armed under the new path, old forgotten");
+      // Settle past the 4th, untracked duplicate Name(From) (it arrives
+      // after the trio), then re-assert the settled bookkeeping.
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      {
+          let b = book.lock().unwrap();
+          assert_eq!(
+              b.armed.iter().filter(|p| **p == new).count(),
+              1,
+              "exactly one armed entry for the new path"
+          );
+          assert!(!b.armed.contains(&old), "duplicate From re-removal is a no-op");
+          assert!(!b.absent.contains(&old) && !b.retry.contains_key(&old));
+          // No double-WARN is structural on this path: re-processing the
+          // duplicate From hits only the book-miss no-op and
+          // `unwatch_tolerated`'s debug-tier tolerated arm (the managed-set
+          // auto-drop makes unwatch of the moved path return WatchNotFound)
+          // — no warn site is reachable, so there is no log to count.
+      }
+
+      // Events from the renamed dir keep flowing (the duplicate From did not
+      // tear down the fresh arm).
+      let _ = rx.borrow_and_update();
       std::fs::write(
           new.join("transcript.jsonl"),
           "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
@@ -1275,6 +1375,11 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
   /// Regression 16 second clause: a session dir `mv`'d OUT of the watched
   /// tree is explicitly unwatched (inotify watches follow inodes — without
   /// this, events keep arriving under the stale old path forever).
+  /// Caveat (LB-01 sub-claim 3 nuance): in the managed-set shape the parent
+  /// arm's MOVED_FROM auto-drops the old-path watch, so the negative window
+  /// below cannot catch a MISSING explicit-unwatch regression (post-move
+  /// writes would be silent either way); the explicit unwatch stays as
+  /// belt-and-braces for the unowned-parent (inode-follow) shape.
   #[tokio::test]
   async fn moved_away_session_dir_is_explicitly_unwatched() {
       let home = unique_temp_dir("amp-mvout");
@@ -1346,11 +1451,11 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL because `amplifier_teardown_project`, `amplifier_remove_session`, `watch_budget_warn_needed`, `read_max_user_watches`, `DailyCounter`, and the MovedFrom/MovedTo dispatch do not exist (the rename/remove tests hang past their timeouts or fail to compile).
+  Expected: FAIL because `amplifier_teardown_project`, `amplifier_remove_session`, `watch_budget_warn_needed`, `read_max_user_watches`, `DailyCounter`, and the MovedFrom/MovedTo dispatch do not exist (all seven rename/remove tests — including `armed_child_rename_duplicate_name_from_is_idempotent`, which hangs at its 5s re-arm timeout awaiting dispatch that does not exist yet — hang past their timeouts or fail to compile).
 
 - [ ] **Step 3: Add the minimal production implementation**
   In `session_watcher.rs`:
-  1. Implement the four lifecycle functions per Interfaces (`amplifier_teardown_project`, `amplifier_remove_session`, `structural_remove`, and the MovedFrom/MovedTo dispatch). Dispatch stays inside the amplifier recv branch added in Task 3, extended: at depth 1 `WatchKind::Remove | WatchKind::NameFrom` → `amplifier_teardown_project` then `index.mark_provider_dirty("amplifier")`; at depth 2 the ONLY sessions-child removal under a real sessions dir → swap to stand-in (arm project, unwatch sessions-dir entry, `cascade` drop its children bookkeeping via `structural_remove`); at depth 3 `Remove | NameFrom` → `amplifier_remove_session`; depth 3 `Create | NameTo | NameBoth` routes to Task 3's classifier arm path (already exists — this is what makes regression 13 immediate); depth ≤3 `Name(Both)` handles both endpoints (From → remove-handling on `paths[0]`, To → create-handling on `paths[1]`).
+  1. Implement the four lifecycle functions per Interfaces (`amplifier_teardown_project`, `amplifier_remove_session`, `structural_remove`, and the MovedFrom/MovedTo dispatch). Dispatch stays inside the amplifier recv branch added in Task 3, extended: at depth 1 `WatchKind::Remove | WatchKind::NameFrom` → `amplifier_teardown_project` then `index.mark_provider_dirty("amplifier")`; at depth 2 the ONLY sessions-child removal under a real sessions dir → swap to stand-in (arm project, unwatch sessions-dir entry, `cascade` drop its children bookkeeping via `structural_remove`); at depth 3 `Remove | NameFrom` → `amplifier_remove_session`, dispatched on the `Remove` kind WITHOUT any dir-vs-file tag filter (the kernel does not set ISDIR on IN_DELETE_SELF — a directly-armed session dir's self-delete surfaces as `Remove(File)`, never `Remove(Folder)`; LB-01 — so a Folder-only gate would silently miss it; no refactor may add one); depth 3 `Create | NameTo | NameBoth` routes to Task 3's classifier arm path (already exists — this is what makes regression 13 immediate); depth ≤3 `Name(Both)` handles both endpoints (From → remove-handling on `paths[0]`, To → create-handling on `paths[1]`). Structural-remove handling is IDEMPOTENT: an ARMED child's rename emits a 4th, untracked duplicate `Name(From)` after the trio (LB-01), and re-processing it must be a clean no-op — the path is already absent from armed/absent/retry and `unwatch_tolerated` absorbs the already-auto-dropped watch (`WatchNotFound` at debug, no second WARN).
   2. Add the alarms:
      ```rust
      /// Read the kernel inotify watch limit (Linux). `None` elsewhere — the
@@ -1403,10 +1508,10 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
 - [ ] **Step 4: Run the focused test**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: PASS (all prior tests + the 6 new ones).
+  Expected: PASS (all prior tests + the 7 new ones).
 
 - [ ] **Step 5: Refactor while green**
-  The depth-3 Remove/MovedFrom handling and `amplifier_remove_session` share enough with the stand-in swap that the discoverable names should stay as stated; confirm no double-log for rename-vs-delete (MoveFrom must not log 'watch target disappeared' at info — it is debug now). No further dedup justified.
+  The depth-3 Remove/MovedFrom handling and `amplifier_remove_session` share enough with the stand-in swap that the discoverable names should stay as stated; confirm no double-log for rename-vs-delete (MoveFrom must not log 'watch target disappeared' at info — it is debug now) and no double-WARN from the armed-child duplicate `Name(From)` (its re-processing is the book-miss no-op plus a tolerated `WatchNotFound` unwatch). No further dedup justified.
 
 - [ ] **Step 6: Run impacted-test verification**
   Run: `cargo test -p freshell-sessions`
@@ -1779,7 +1884,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 - Produces:
   - `const MAX_FLUSH_DEFERRAL: Duration = Duration::from_secs(2)` (design value)
   - Debounce rule change: after the FIRST event of a pending burst (`pending_since: Option<tokio::time::Instant>`, latched when pending goes empty→non-empty, cleared on flush), the deadline is `min(now + DEBOUNCE_MS, pending_since + MAX_FLUSH_DEFERRAL)` — sustained sub-200ms streams can no longer starve the flush
-  - `fn replan_amplifier_watch_set(book, watcher, index, projects_root, provider)`: `spawn_blocking(plan_amplifier_targets)` → `diff_armed(desired, armed)` → arm new (with cascade-marks where applicable), `unwatch_tolerated` stale (+ bookkeeping cleanup), provider dirty, `book.replans += 1`. Honors backoff: a path present in `retry` is NOT re-armed by the diff (Task 7's pure fold-in makes this a shared `roots_needing_arm` predicate — this task uses the simpler "not armed and not in retry" check inline)
+  - `fn replan_amplifier_watch_set(book, watcher, index, projects_root, provider)`: `spawn_blocking(plan_amplifier_targets)` → `diff_armed(desired, armed)` → arm new (with cascade-marks where applicable), `unwatch_tolerated` stale (+ bookkeeping cleanup), provider dirty, `book.replans += 1`. ABORT discipline: when `plan_amplifier_targets` returns `Err`, the replan ABORTS — a warn-level log, the armed set and ALL bookkeeping stay untouched, no unwatch diffs are applied (a transient scan error is NOT an empty listing — the same transient-failure protection philosophy as `discover_checked`); the `mark_provider_dirty("amplifier")` mark STILL fires so the data plane recovers through discover's own root-listing-failure protection, and `book.replans` is NOT incremented (the counter counts APPLIED replans). Honors backoff: a path present in `retry` is NOT re-armed by the diff (Task 7's pure fold-in makes this a shared `roots_needing_arm` predicate — this task uses the simpler "not armed and not in retry" check inline)
   - Flush-arm change (:305-307): `pending_rescans` entries route: `provider == "amplifier"` → `replan_amplifier_watch_set` + `mark_provider_dirty`; everything else → the legacy `mark_provider_dirty` (need_rescan for claude/codex/opencode is unchanged)
   - `#[cfg(test)] SessionWatcher` gains a test event-injection seam:
     ```rust
@@ -1866,11 +1971,93 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
       let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
       std::fs::remove_dir_all(&home).ok();
   }
+
+  /// Replan abort discipline: when `plan_amplifier_targets` fails transiently
+  /// (a chmod-000 projects root propagates EACCES from `open_root_dir`), the
+  /// replan ABORTS — no arm/unwatch diff is applied, the armed set and all
+  /// bookkeeping stay untouched, `book.replans` (APPLIED replans only) does
+  /// not move — while the provider-dirty mark STILL fires, observable as a
+  /// recorded `amplifier` scan failure via discover's own root-listing
+  /// protection.
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn replan_aborts_and_keeps_armed_set_on_planner_error() {
+      use std::os::unix::fs::PermissionsExt;
+      let home = unique_temp_dir("amp-replan-abort");
+      let s1 = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+      let index = amplifier_index(&home);
+      let mut watcher = amplifier_watcher(&index, &home);
+      let book = watcher.amplifier_book_handle().unwrap();
+      let tx = watcher.test_event_tx().expect("test event seam");
+      let handle = watcher.start();
+      let _ = index.snapshot().await;
+      assert!(index.scan_failures().is_empty());
+      tokio::time::sleep(Duration::from_millis(300)).await;
+
+      let mut armed_before: Vec<PathBuf> =
+          book.lock().unwrap().armed.iter().cloned().collect();
+      armed_before.sort();
+      let replans_before = book.lock().unwrap().replans;
+      assert!(armed_before.iter().any(|p| p == &s1));
+
+      // Transient planner failure: the projects root becomes UNLISTABLE.
+      // (stat still succeeds — only read_dir fails — so the rearm tick sees
+      // `exists() == true` and does not churn the armed set.)
+      let projects = home.join("projects");
+      std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+      if std::fs::read_dir(&projects).is_ok() {
+          eprintln!("skipping planner-error assertions: euid can list a 0o000 dir");
+          std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+          watcher.stop();
+          let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+          std::fs::remove_dir_all(&home).ok();
+          return;
+      }
+
+      tx.send(WatchEvent::ProviderRescan {
+          provider: "amplifier".to_string(),
+      })
+      .unwrap();
+
+      // The provider-dirty mark STILL fired: discover's root-listing
+      // protection records a scan failure instead of gutting the snapshot
+      // (data plane recovers through discover's own protection).
+      tokio::time::timeout(Duration::from_secs(5), async {
+          loop {
+              if index.scan_failures().iter().any(|n| n == "amplifier") {
+                  break;
+              }
+              tokio::time::sleep(Duration::from_millis(100)).await;
+          }
+      })
+      .await
+      .expect("provider dirty still fired (amplifier scan failure recorded)");
+
+      // The ABORT left every watch-set facet untouched: no arm/unwatch diff
+      // was applied, bookkeeping is unchanged, and the applied-only replan
+      // counter did not increment.
+      {
+          let b = book.lock().unwrap();
+          let mut armed_after: Vec<PathBuf> = b.armed.iter().cloned().collect();
+          armed_after.sort();
+          assert_eq!(armed_after, armed_before, "aborted replan applies no diff");
+          assert!(b.absent.is_empty() && b.retry.is_empty());
+          assert_eq!(
+              b.replans, replans_before,
+              "book.replans counts APPLIED replans only"
+          );
+      }
+
+      std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+      watcher.stop();
+      let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+      std::fs::remove_dir_all(&home).ok();
+  }
   ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
   Run: `cargo test -p freshell-sessions --lib session_watcher`
-  Expected: FAIL — `sustained_sub_gap_event_stream_flushes_within_max_deferral` times out at 2s (the deadline resets on every event today); `need_rescan_on_amplifier_replans_the_watch_set` fails to compile (`test_event_tx`) and/or the replan counter never increments.
+  Expected: FAIL — `sustained_sub_gap_event_stream_flushes_within_max_deferral` times out at 2s (the deadline resets on every event today); `need_rescan_on_amplifier_replans_the_watch_set` and `replan_aborts_and_keeps_armed_set_on_planner_error` fail to compile (`test_event_tx`) and/or the replan counter never increments.
 
 - [ ] **Step 3: Add the minimal production implementation**
   1. Debounce cap — the flush-deadline computation at :278-283 becomes:
@@ -1885,7 +2072,7 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
      };
      ```
      with `let mut pending_since: Option<tokio::time::Instant> = None;` next to `pending` (:272) and `pending_since = None;` inside the flush arm after draining (:303-332). The coalescing map's per-key `Instant` (:272) remains intentionally unused — a refactor would remove it, but no task needs the stamp: the cap needs only burst-start time (explicitly left as-is per the stale-stamp rule).
-  2. Rescan replan — `replan_amplifier_watch_set` per Interfaces, called from the flush loop's `pending_rescans` branch when `provider == "amplifier"`. The replan plans in `spawn_blocking` (design "bulk operations in `spawn_blocking`"), then applies: `arm` diffs → `arm_managed_dir` (cascade marks on session dirs), `unwatch` diffs → `unwatch_tolerated` + bookkeeping cleanup. `mark_provider_dirty("amplifier")` as today.
+  2. Rescan replan — `replan_amplifier_watch_set` per Interfaces, called from the flush loop's `pending_rescans` branch when `provider == "amplifier"`. The replan plans in `spawn_blocking` (design "bulk operations in `spawn_blocking`"). On planner `Err` the replan ABORTS before any diff application: warn-level log, the armed set and all bookkeeping stay untouched (a transient scan error is not an empty listing — `discover_checked`'s protection philosophy), `mark_provider_dirty("amplifier")` STILL fires (the data plane recovers through discover's own root-listing protection), and `book.replans` is NOT incremented (it counts APPLIED replans). On `Ok`, applies: `arm` diffs → `arm_managed_dir` (cascade marks on session dirs), `unwatch` diffs → `unwatch_tolerated` + bookkeeping cleanup, the provider-dirty mark fires as today, `book.replans += 1`.
   3. Test seam: `start()` clones the `event_tx` into `self.test_event_tx` (a `#[cfg(test)] Option<UnboundedSender<WatchEvent>>` field) before moving it into the loop.
 
 - [ ] **Step 4: Run the focused test**
@@ -2463,8 +2650,10 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
     use freshell_sessions::directory_index::SessionIndex;
     use freshell_ws::subagent_interest::SubagentInterestRegistry;
 
-    /// Design cadence: 15s. Warm amplifier discover ≈ 0.3s on the real corpus
-    /// (~2% of a core while any interested client is connected; zero while none).
+    /// Design cadence: 15s. Warm amplifier discover ≈ 0.65s warm (measured
+    /// 2026-08-18 on the 22,300-dir real corpus; supersedes the design's
+    /// ~0.3s estimate) — ~4.2% of a core while any interested client is
+    /// connected; zero while none.
     pub const SUBAGENT_CADENCE_INTERVAL: Duration = Duration::from_secs(15);
 
     pub fn spawn_subagent_cadence(
@@ -2789,9 +2978,11 @@ Plus two addenda forced by the diff surface: `cargo test -p freshell-protocol --
 
   ```rust
   /// Manual probe: warm full-discover duration on the REAL amplifier home.
-  /// The 15s cadence's cost estimate (~0.3s inclusive of stat/fold across the
-  /// 22K-dir corpus) pins the "≤2% of a core while interested" design claim;
-  /// the number here re-measures it on demand rather than gating CI.
+  /// The 15s cadence's cost was the design's ~0.3s/~2% estimate; measured
+  /// 2026-08-18 on the real corpus (22,300 session dirs and growing): ~0.65s
+  /// warm mean → ~4.2% of a core at the 15s cadence, with ~1.9× headroom to
+  /// the 1.0s falsification threshold (LB-02). The probe here re-measures it
+  /// on demand rather than gating CI.
   ///
   ///   cargo test -p freshell-sessions --lib measure_real_home_discover -- --ignored --nocapture
   #[test]
