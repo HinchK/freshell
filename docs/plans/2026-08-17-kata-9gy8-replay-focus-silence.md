@@ -44,7 +44,7 @@ Fix pre-existing kata `9gy8`: when saved terminal history is replayed to rebuild
 - Consumes: `getTerminalOutputWriteScope(terminalInstanceId)` from `./terminal-output-write-scope.js` (returns `{ suppressExternalSideEffects: boolean, ... } | null`) — tests simulate scopes directly via `beginTerminalOutputWriteScope(...)`, as the existing suite does.
 - Produces: `export function isReplayPhantomFocusReport(data: string, terminalInstanceId: string | undefined): boolean` — true exactly when `data === '\u001b[I'` or `data === '\u001b[O'` AND `getTerminalOutputWriteScope(terminalInstanceId)?.suppressExternalSideEffects === true`. No logging inside the helper (caller logs).
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add a `describe('isReplayPhantomFocusReport')` block with these tests (exact assertions):
 
@@ -55,13 +55,13 @@ Add a `describe('isReplayPhantomFocusReport')` block with these tests (exact ass
 5. Cross-instance isolation: open a suppressing scope for 't1', assert `isReplayPhantomFocusReport('\u001b[I', 't2') === false`.
 6. Scope completion releases: after `scope.complete()`, the predicate returns `false` for the same input on the same instance id.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/lib/terminal-output-side-effects.test.ts --reporter=basic`
 
 Expected: FAIL — `isReplayPhantomFocusReport` is not exported (`ImportError`/`TypeError`), proving the tests exercise the new predicate rather than a stub.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 ```ts
 import {
@@ -94,17 +94,17 @@ export function isReplayPhantomFocusReport(
 
 (Names of the two constants are the literals shown in red-box form above: `'\u001b[I'` and `'\u001b[O'`.)
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/lib/terminal-output-side-effects.test.ts --reporter=basic`
 
 Expected: PASS (all new tests green, existing suite green).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None expected; helper is a pure predicate with two constants. If the existing suite has a naming pattern for ESC literals, follow it instead of introducing local constants.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 The scope lib is self-contained; only the predicate consumer changes in Task 2. Run the two scope-related suites together to prove an unchanged baseline:
 
@@ -112,7 +112,7 @@ Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/lib/terminal-output-side-effects.ts test/unit/client/lib/terminal-output-side-effects.test.ts
@@ -129,8 +129,8 @@ git commit -m "feat(terminal): pure predicate for replay-phantom xterm focus rep
 
 **Rationale (load-bearing A3):** `activeScopes` is one slot per `terminalInstanceId`; a scope completing out of order can clear the wrong entry (e.g. the synchronous-throw early-complete paths in terminal-write-queue.ts:153-159), letting a later phantom slip the gate. Upgrade the map to an identity-checked stack: `Map<string, TerminalOutputWriteContext[]>`; `beginTerminalOutputWriteScope` pushes; `complete()` removes exactly that context; `getTerminalOutputWriteScope` returns the TOP (last) entry. Known residual (accepted, not widened): if a live scope and a replay scope for the same instance are both open and the replay bytes parse LATE, the gate reads the live top and that one phantom slips — the serializing write queue prevents this on every replay-driven rebuild path; the residual is confined to the queue-null fallback edge.
 
-- [ ] Steps (TDD): RED test — begin replay-suppress scope, then begin a non-suppress scope for the same id, complete the inner, assert the outer suppress scope is again active (leak closed); also assert existing behavior (single begin/complete) green. Implement the stack; the existing write-scope test file gets the two new cases plus full-suite stays green.
-- [ ] Commit: `feat(terminal): per-instance write-scope stack (closes replay-scope overlap leak, kata 9gy8)`
+- [x] Steps (TDD): RED test — begin replay-suppress scope, then begin a non-suppress scope for the same id, complete the inner, assert the outer suppress scope is again active (leak closed); also assert existing behavior (single begin/complete) green. Implement the stack; the existing write-scope test file gets the two new cases plus full-suite stays green.
+- [x] Commit: `feat(terminal): per-instance write-scope stack (closes replay-scope overlap leak, kata 9gy8)`
 
 ### Task 2: onData gate in TerminalView + lifecycle integration tests
 
@@ -142,7 +142,7 @@ git commit -m "feat(terminal): pure predicate for replay-phantom xterm focus rep
 - Consumes: `isReplayPhantomFocusReport` from Task 1; existing `terminalInstanceIdRef.current`, `sendInput`, `dispatch(dismissTabGreen)`, `recordPaneTabActivity`, `updateSessionActivity`, `bufferPendingInput` — all already in scope at the onData handler.
 - Produces: gate behavior only; no new public API.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add a new describe block in the lifecycle suite following the file's existing pattern for replay writes (the `submitAcceptedOutput`-style path used by the modes-sync describe at ~:9659). Tests:
 
@@ -155,13 +155,13 @@ Add a new describe block in the lifecycle suite following the file's existing pa
 
 Concrete code: implementer reuses the file's existing replay-write-driving helper (the same one used to push a `terminal.modes.sync` frame in the existing modes-sync describe); the ONLY new bytes are the acceptance chunk and the onData invocation.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx --reporter=basic`
 
 Expected: FAIL — tests 1, 2, 5, 6 observe `\u001b[I`/`\u001b[O` reaching the outgoing send stream / activity path (no gate exists yet); test 4 (live pass-through) passes pre-fix, and test 3 (non-report bytes) is a pass-through pin that stays green both ways.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `src/components/TerminalView.tsx`, inside the `term.onData((data) => { ... })` handler, make the FIRST statement:
 
@@ -185,17 +185,17 @@ In `src/components/TerminalView.tsx`, inside the `term.onData((data) => { ... })
 
 Add the import from the canonical source file: `import { isReplayPhantomFocusReport } from '@/lib/terminal-output-side-effects'` (write-scope.js does NOT re-export it today) and use the file's existing logger symbol (`log`, created via `createLogger` at ~:175) — `logClient` does not exist.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx --reporter=basic`
 
 Expected: PASS (all describe-block tests green; full file stays green).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep the gate body minimal; the helper already isolates the predicate. No further refactor.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Everything touching onData/sendInput/write queue path:
 
@@ -203,7 +203,7 @@ Run: `FRESHELL_VITEST_BACKEND=local npm run test:vitest -- run test/unit/client/
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
@@ -221,7 +221,7 @@ git commit -m "fix(terminal): swallow replay-triggered phantom xterm focus repor
 - Consumes: existing ws frame tracer (page.on('websocket')), the keyboard-typed arm pattern (`printf` bytes), `page.waitForFunction` on `window.__FRESHELL_TEST_HARNESS__` accessors (`getSentWsMessages`, `getTerminalModes`), the ws-terminal-modes-sync server's harness-provided FakeRegistry (no server change).
 - Produces: one new spec entry proving phantom-free reload.
 
-- [ ] **Step 1: Write the failing e2e test**
+- [x] **Step 1: Write the failing e2e test**
 
 Add (either as a `test` in the spec's "mode replay-sync" area or a sibling spec; the existing tests at multi-client.spec.ts:605-821 are the template):
 
@@ -236,23 +236,23 @@ Title: `mode replay-sync: replay no longer injects phantom xterm focus reports (
 
 Red-state proof BEFORE the fix: this test's step 6 currently FAILS on any leg where the arm byte lands in the retained window with the pane focused (the failing assertion is a ghost input frame; if a leg happens to be green due to a pane-focus race, the unit tests in Task 2 are the deterministic red).
 
-- [ ] **Step 2: Run the e2e and verify behavior**
+- [x] **Step 2: Run the e2e and verify behavior**
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/multi-client.spec.ts -g "9gy8"`
 
 Expected: test runs on all three legs; pre-fix (or via assertion shape) shows phantom input; post-fix no phantom on any leg.
 
-- [ ] **Step 3: Refactor while green**
+- [x] **Step 3: Refactor while green**
 
 Share the tracer-verify helper with the existing mode-sync tests if one exists; otherwise duplicate minimally.
 
-- [ ] **Step 4: Run stable-e2e verification**
+- [x] **Step 4: Run stable-e2e verification**
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/multi-client.spec.ts -g "mode replay-sync"`
 
 Expected: PASS all 6 prior tests plus the new one.
 
-- [ ] **Step 5: Commit the task**
+- [x] **Step 5: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/multi-client.spec.ts

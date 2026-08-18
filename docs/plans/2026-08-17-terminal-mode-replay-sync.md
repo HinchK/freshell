@@ -121,6 +121,9 @@ One shared JSON family `port/oracle/baselines/mode-preamble/*.json` (input: trac
   zero focus junk" shape was abandoned because xterm 6.0.0 re-fires a focus
   report on ANY arm — including the REPLAY of the original arming byte while
   it is still inside the retained window — a pre-existing leak (kata 9gy8)
+  — **RESOLVED (post-merge)**: replay-sourced focus reports are silenced at
+  the onData gate; branch the-usual/kata-9gy8-focus-silence,
+  docs/plans/2026-08-17-kata-9gy8-replay-focus-silence.md.
   that would make any junk-free window assertion conflate two distinct
   mechanisms. The sync-exclusion wire pin is the property this branch owns.
 - Marker-forcing rule coverage: renderer-recreate (settings change) → next attach has surfaceReset=true AND sinceSeq=0 (no delta-on-blank-surface).

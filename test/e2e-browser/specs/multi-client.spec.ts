@@ -729,8 +729,9 @@ test.describe('Multi-Client', () => {
     // _reportFocus immediately emits ESC[I/ESC[O on a focused surface — so a
     // sync preamble replaying ?1004h would deterministically inject junk
     // into the app's stdin. The preamble therefore tracks but NEVER emits
-    // ?1004. (Replaying the ORIGINAL arming byte while it is still inside
-    // the retained window is a pre-existing leak, out of scope here.)
+    // ?1004. (Replaying the ORIGINAL arming byte from the retained window no
+    // longer leaks either: kata 9gy8 silences the phantom report at onData;
+    // see the SILENCING test later in this spec.)
     //
     // This pins the wire behavior DIRECTLY: arm both a representative mode
     // (?2004, included) and ?1004, reload (fresh surface → surfaceReset
@@ -890,8 +891,9 @@ test.describe('Multi-Client', () => {
     // Short settle for any same-tick send-path drift, then close the window:
     // no terminal.input this client sent since reload may contain ESC[I or
     // ESC[O (checked against both directions — the fresh surface has no
-    // 'focus' class headlessly, so the phantom variant is the blur report,
-    // but the gate is byte-exact either way).
+    // 'focus' class headlessly — which variant the phantom takes depends on
+    // xterm's focus class at arm-parse time; the gate is byte-exact either
+    // way, so assert against both).
     await page.waitForTimeout(500)
     const phantomInputs: any[] = await page.evaluate((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
@@ -899,7 +901,7 @@ test.describe('Multi-Client', () => {
         m?.type === 'terminal.input'
         && m?.terminalId === id
         && typeof m?.data === 'string'
-        && (m.data.includes('[I') || m.data.includes('[O')))
+        && (m.data.includes('\u001b[I') || m.data.includes('\u001b[O')))
     }, terminalId)
     expect(
       phantomInputs,
