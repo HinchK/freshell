@@ -46,6 +46,7 @@ pub mod reconcile_freshagent;
 pub mod resume_validation;
 pub mod screenshot;
 pub mod spawn_gate;
+pub mod subagent_interest;
 pub mod tabs;
 pub mod tabs_persist;
 pub mod tabs_store;
@@ -226,6 +227,12 @@ pub struct WsState {
     /// `POST /api/screenshots` knows a capable UI exists, and its inbound
     /// `ui.screenshot.result` is routed back to the waiting REST handler.
     pub screenshots: crate::screenshot::ScreenshotBroker,
+    /// Per-connection `includeSubagents` listing interest (amplifier watch
+    /// reduction): `sessions.prefs` client frames overwrite the sending
+    /// connection's entry; the connection-teardown block clears it. The
+    /// amplifier subagent rescan cadence (`freshell-server`, Task 9) runs while
+    /// `any()` is true. See [`crate::subagent_interest`].
+    pub subagent_interest: crate::subagent_interest::SubagentInterestRegistry,
     /// The handler-scoped monotonic `terminals.changed` revision counter
     /// (`ws-handler.ts:566` `terminalsRevision`). SHARED with the REST
     /// `/api/terminals` PATCH/DELETE broadcasts (`terminals::TerminalsState`),
@@ -886,6 +893,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

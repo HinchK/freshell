@@ -561,6 +561,25 @@ fn terminal_created_notice_is_optional_and_additive() {
 }
 
 #[test]
+fn client_sessions_prefs_roundtrips_and_conforms() {
+    let msg: ClientMessage =
+        serde_json::from_str(r#"{"type":"sessions.prefs","includeSubagents":true}"#)
+            .expect("parse");
+    assert!(matches!(msg, ClientMessage::SessionsPrefs(ref p) if p.include_subagents),);
+    let back = serde_json::to_value(&msg).expect("serialize");
+    assert_eq!(
+        back,
+        serde_json::json!({"type": "sessions.prefs", "includeSubagents": true})
+    );
+    // Validate against the ClientMessageSchema UNION (the same target the
+    // existing `client_roundtrip` helper uses) — never the top-level
+    // contract document, which constrains nothing about a message instance.
+    let schema = inbound_schema()["schemas"]["ClientMessageSchema"].clone();
+    assert!(!schema.is_null(), "frozen client-message schema must exist");
+    assert_conforms(&validator(&schema), &back, "sessions.prefs");
+}
+
+#[test]
 fn terminal_created_roundtrips_with_and_without_notice() {
     // Base shape: notice omitted — byte-identical to today's frame on the wire.
     let base = r#"{"type":"terminal.created","createdAt":1700000000000,"requestId":"req-1","terminalId":"t1"}"#;

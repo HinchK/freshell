@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 30 discriminants).
+//! Client → server messages (`ClientMessage`, 31 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -20,6 +20,8 @@ pub enum ClientMessage {
     Hello(Hello),
     #[serde(rename = "ping")]
     Ping,
+    #[serde(rename = "sessions.prefs")]
+    SessionsPrefs(SessionsPrefs),
     #[serde(rename = "client.diagnostic")]
     ClientDiagnostic(ClientDiagnostic),
     #[serde(rename = "terminal.create")]
@@ -83,7 +85,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 30] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -104,6 +106,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 30] = [
     "opencode.activity.list",
     "pane.reconcile.request",
     "ping",
+    "sessions.prefs",
     "terminal.attach",
     "terminal.autoResumeCancel",
     "terminal.codex.candidate.persisted",
@@ -186,6 +189,18 @@ pub struct ClientDiagnostic {
     pub reason: String,
     pub tab_id: String,
     pub terminal_id: String,
+}
+
+// --- sessions.prefs ---------------------------------------------------------
+
+/// The client's includeSubagents listing preference (amplifier watch
+/// reduction). Per-connection, pushed mid-session and on (re)connect;
+/// old servers never receive it (frozen client) and new servers ignore
+/// it on connections that never send one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsPrefs {
+    pub include_subagents: bool,
 }
 
 // --- terminal.* -------------------------------------------------------------

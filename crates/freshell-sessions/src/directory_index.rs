@@ -35,6 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -154,7 +155,8 @@ pub struct FileStat {
 /// Split into `discover` (cheap: stat every visible file) + `parse` (expensive:
 /// read + parse ONE file) so [`SessionIndex`]'s incremental cache can re-parse
 /// only what actually changed, instead of re-parsing everything on every
-/// refresh.
+/// refresh. A third stat path, [`Self::stat_scoped`], serves watcher-scoped
+/// dirty marks and MUST key the cache identically to `discover`'s stats.
 pub trait SessionSource: Send + Sync {
     /// Enumerate every file this provider can currently see — stat only
     /// (path/mtime/size), no parsing. Corruption-tolerant (an unreadable
@@ -221,6 +223,19 @@ pub trait SessionSource: Send + Sync {
     /// Default wraps the infallible `discover()` for test sources.
     fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
         Ok(self.discover())
+    }
+
+    /// Fold-aware stat for a watcher-scoped dirty path. The incremental
+    /// cache key written for `path` comes from whatever this returns, so a
+    /// source whose discover stats fold sibling state into the cache key
+    /// (amplifier's sidecar mtimes) MUST fold identically here — otherwise
+    /// the discover and scoped paths write different cache keys for the same
+    /// file (raw-vs-folded thrash + frozen recency, design lines 77-83).
+    /// `None` means the file is gone/unreadable and prunes the entry — a
+    /// source override must therefore return None when ITS canonical file is
+    /// missing regardless of surviving sidecars (never resurrect a ghost).
+    fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+        stat_file(path)
     }
 }
 
@@ -861,6 +876,17 @@ pub struct SessionIndex {
     /// Providers marked fully dirty (e.g. its root directory appeared/disappeared).
     /// Triggers a full discover() for that provider on next refresh.
     dirty_providers: Arc<StdMutex<HashSet<String>>>,
+    /// Wake-up handoff for the check-to-unlock window (delta D5-1).
+    /// `mark_dirty`/`mark_provider_dirty` store `true` AFTER enqueuing and
+    /// BEFORE attempting `refresh_lock.try_lock()`, so a mark whose
+    /// try-lock fails (a sweep — or a cold-cache awaiter — still holds the
+    /// guard) is causally ordered before that holder's end-of-work consult.
+    /// Every sweep iteration absorbs the flag at its start (a plain
+    /// `store(false)`, paired with that iteration's later drain: every mark
+    /// whose store preceded the absorb has its enqueue ordered before the
+    /// drain, so the drain provably covers it) and every guard release is
+    /// followed by a consult of the flag. See [`Self::perform_refresh`].
+    wake_pending: Arc<AtomicBool>,
     /// When the last full reconciliation completed (all providers discovered).
     /// `None` means no full reconciliation has ever run. Used to ensure the
     /// TTL-based full sweep fires even when scoped refreshes keep the
@@ -870,6 +896,25 @@ pub struct SessionIndex {
     /// Subscribers (via `subscribe_changes`) wake on changes.
     change_tx: tokio::sync::watch::Sender<u64>,
     change_rx: tokio::sync::watch::Receiver<u64>,
+    /// One-way refresh→watcher report (amplifier watch-reduction design,
+    /// "Self-correction channel"). After a sweep that fully discovered
+    /// amplifier, the watcher receives every amplifier session dir whose
+    /// parsed metadata has `parent_id` absent (true roots). Amplifier
+    /// IndexedSession rows publish `source_file: None` (amplifier.rs:415-419),
+    /// so dirs are derived from the private `file_cache` KEYS (canonical
+    /// metadata.json paths), never from published rows.
+    amplifier_root_report: Arc<StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>>,
+    /// The startup watcher-ready barrier (amplifier watch-reduction Task
+    /// 9): an OPTIONAL gate, fed by `SessionWatcher::startup_ready` (never
+    /// installed when no session watcher runs — today's exact behavior).
+    /// Consulted COLD-ONLY: while installed AND no snapshot has ever been
+    /// published, the two publish entries (`run_refresh_inline` and the
+    /// spawned task inside `spawn_background_refresh`) await readiness
+    /// before sweeping, so the FIRST publish of the process is provably
+    /// ordered after the watcher's startup arm pass settles. `Arc`-wrapped
+    /// for the same reason `snapshot` is: the detached background refresh
+    /// consults its own clone.
+    startup_gate: Arc<StdMutex<Option<tokio::sync::watch::Receiver<bool>>>>,
 }
 
 /// One published sweep GENERATION: the snapshot items AND the scan-failure
@@ -952,9 +997,12 @@ impl SessionIndex {
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
             dirty_paths: Arc::new(StdMutex::new(HashMap::new())),
             dirty_providers: Arc::new(StdMutex::new(HashSet::new())),
+            wake_pending: Arc::new(AtomicBool::new(false)),
             last_full_at: Arc::new(StdMutex::new(None)),
             change_tx,
             change_rx,
+            amplifier_root_report: Arc::new(StdMutex::new(None)),
+            startup_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -993,6 +1041,28 @@ impl SessionIndex {
         }
     }
 
+    /// Test-only arming for the D5-1 tail seam ([`PERFORM_REFRESH_TAIL_HOOK`]):
+    /// installs the one-shot pause keyed to THIS index's `wake_pending`
+    /// allocation (the only key `perform_refresh`'s tail will match), and
+    /// returns the receiver the sweep signals once parked plus the sender
+    /// that releases it.
+    #[cfg(test)]
+    fn install_refresh_tail_hook_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *PERFORM_REFRESH_TAIL_HOOK.lock().unwrap() = Some((
+            Arc::as_ptr(&self.wake_pending) as usize,
+            parked_tx,
+            resume_rx,
+        ));
+        (parked_rx, resume_tx)
+    }
+
     /// Mark specific file paths as dirty. The next `snapshot()` call will
     /// re-stat these paths (and re-parse any that actually changed) even
     /// if the TTL hasn't expired. Paths not tracked by any source are
@@ -1007,6 +1077,11 @@ impl SessionIndex {
                 dirty.insert(path.clone(), provider.clone());
             }
         }
+        // D5-1: raise the wake flag after enqueuing and strictly BEFORE the
+        // try-lock inside `request_refresh` (unconditionally — a store
+        // ordered only after a FAILED try-lock is not causally fenced
+        // against the sweeper's end-of-work consult; see `perform_refresh`).
+        self.wake_pending.store(true, Ordering::SeqCst);
         self.request_refresh();
     }
 
@@ -1018,7 +1093,64 @@ impl SessionIndex {
             let mut dirty = self.dirty_providers.lock().unwrap();
             dirty.insert(provider.to_string());
         }
+        // Same wake-flag ordering as `mark_dirty` (see it and
+        // `perform_refresh`): flag strictly before the try-lock attempt.
+        self.wake_pending.store(true, Ordering::SeqCst);
         self.request_refresh();
+    }
+
+    /// Register the self-correction report sink (amplifier watch-reduction
+    /// design, "Self-correction channel"). After every sweep that fully
+    /// discovers amplifier, the index sends the content-verified root
+    /// session dirs (parsed metadata with `parent_id` absent) on this
+    /// channel so the session watcher can arm any the name classifier
+    /// missed. Best-effort: a dropped receiver just means no watcher is
+    /// listening; the sends never block or fail the sweep.
+    pub fn set_amplifier_root_report_sink(
+        &self,
+        sink: tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>,
+    ) {
+        *self.amplifier_root_report.lock().unwrap() = Some(sink);
+    }
+
+    /// Install the cold-start publish gate (amplifier watch-reduction Task
+    /// 9's startup watcher-ready barrier). Boot-time, install-once, fed by
+    /// `SessionWatcher::startup_ready()`: while a gate is installed AND no
+    /// snapshot has ever been published, the two publish entries
+    /// (`run_refresh_inline` and the spawned task inside
+    /// `spawn_background_refresh`) await readiness BEFORE sweeping, so every
+    /// boot-time snapshot caller (the warm spawn, the sessions sweep's
+    /// initial signature snapshot, the auto-title first pass, pre-readiness
+    /// request routes, mark-driven background refreshes — all of which
+    /// funnel through exactly those two entries) publishes its FIRST
+    /// generation provably after the watcher's startup arm pass settled.
+    /// No watcher ⇒ no gate installed ⇒ today's exact behavior.
+    pub fn set_startup_gate(&self, ready: tokio::sync::watch::Receiver<bool>) {
+        *self.startup_gate.lock().unwrap() = Some(ready);
+    }
+
+    /// The cold-only startup-gate consult shared by both publish entries:
+    /// while a gate is installed AND no snapshot has ever been published,
+    /// await watcher readiness before sweeping — fail-OPEN on sender drop
+    /// (`wait_for` errors when every sender is gone; a crashed watcher task
+    /// must never wedge session serving). After the first publish the
+    /// consult degenerates to a one-lock `is_some` no-op, so steady-state
+    /// request/sweep paths pay nothing. Holding the refresh lock across the
+    /// wait is deadlock-free: the readiness send happens in the watch loop,
+    /// whose only index touches reach `request_refresh`'s non-blocking
+    /// `try_lock`.
+    async fn await_startup_gate(
+        startup_gate: &StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+        snapshot: &StdMutex<Option<CachedSnapshot>>,
+    ) {
+        let gate = startup_gate.lock().unwrap().clone();
+        let Some(mut gate) = gate else {
+            return;
+        };
+        if snapshot.lock().unwrap().is_some() {
+            return; // already published: steady-state no-op
+        }
+        let _ = gate.wait_for(|done| *done).await;
     }
 
     /// Subscribe to snapshot-change notifications. The receiver's value
@@ -1031,8 +1163,7 @@ impl SessionIndex {
 
     /// Whether any dirty paths or providers are pending.
     pub fn has_dirty(&self) -> bool {
-        !self.dirty_paths.lock().unwrap().is_empty()
-            || !self.dirty_providers.lock().unwrap().is_empty()
+        has_dirty_parts(&self.dirty_paths, &self.dirty_providers)
     }
 
     /// Return a snapshot, pre-sorted `lastActivityAt` DESC then `key()` DESC
@@ -1085,10 +1216,42 @@ impl SessionIndex {
                 // THEIR sweep instead of starting a second one (preserves
                 // B-T5's "N concurrent misses -> 1 sweep" guarantee for the
                 // cold-cache case).
-                let _guard = self.refresh_lock.lock().await;
-                self.cached_pair(true)
+                let guard = self.refresh_lock.lock().await;
+                let pair = self
+                    .cached_pair(true)
                     .or_else(|| self.cached_pair(false))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                drop(guard);
+                // D5-1: this caller held `refresh_lock` (however briefly),
+                // so any mark whose try-lock failed during that window
+                // stored the wake flag beforehand and relies on a holder's
+                // exit consult — the same consult every other guard release
+                // performs (see `perform_refresh`'s tail). If the consult's
+                // own try-lock fails, the then-current holder's exit consult
+                // sees the same still-set flag.
+                if self.wake_pending.load(Ordering::SeqCst) {
+                    if let Ok(next) = Arc::clone(&self.refresh_lock).try_lock_owned() {
+                        let _ = Self::perform_refresh(
+                            next,
+                            Arc::clone(&self.refresh_lock),
+                            Arc::clone(&self.wake_pending),
+                            self.sources.clone(),
+                            Arc::clone(&self.file_cache),
+                            Arc::clone(&self.direct_cache),
+                            Arc::clone(&self.snapshot),
+                            self.persist_path.clone(),
+                            Arc::clone(&self.persist_state),
+                            Arc::clone(&self.dirty_paths),
+                            Arc::clone(&self.dirty_providers),
+                            Arc::clone(&self.last_full_at),
+                            self.ttl,
+                            self.change_tx.clone(),
+                            Arc::clone(&self.amplifier_root_report),
+                        )
+                        .await;
+                    }
+                }
+                pair
             }
         }
     }
@@ -1152,12 +1315,21 @@ impl SessionIndex {
     /// Cold-start path: run the sweep and wait for it (there is nothing else
     /// to serve). `guard` is held for the sweep's full duration -- exactly
     /// the pre-fix behavior, but now reachable ONLY when no snapshot has
-    /// ever been published, never for a routine stale-cache refresh.
+    /// ever been published, never for a routine stale-cache refresh. The
+    /// guard moves INTO `perform_refresh`, which owns the end-of-work
+    /// quiescence handoff (release + wake-flag consult, delta D5-1).
     async fn run_refresh_inline(
         &self,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
-        let pair = Self::perform_refresh(
+        // Task 9 cold-start publish gate: reachable ONLY cold (a published
+        // snapshot short-circuits `snapshot_with_failures` before this
+        // path), so the consult's own cold re-check is belt-and-braces.
+        Self::await_startup_gate(&self.startup_gate, &self.snapshot).await;
+        Self::perform_refresh(
+            guard,
+            Arc::clone(&self.refresh_lock),
+            Arc::clone(&self.wake_pending),
             self.sources.clone(),
             Arc::clone(&self.file_cache),
             Arc::clone(&self.direct_cache),
@@ -1169,18 +1341,21 @@ impl SessionIndex {
             Arc::clone(&self.last_full_at),
             self.ttl,
             self.change_tx.clone(),
+            Arc::clone(&self.amplifier_root_report),
         )
-        .await;
-        drop(guard);
-        pair
+        .await
     }
 
     /// Warm-cache path: run the sweep DETACHED, so the caller that triggered
     /// it (and every other concurrent caller) can go on serving the stale
-    /// snapshot immediately. `guard` moves into the spawned task and is
-    /// dropped only once that sweep fully completes, so `try_lock_owned`
-    /// correctly rejects any other concurrent sweeper until then.
+    /// snapshot immediately. `guard` moves into the spawned task and —
+    /// inside `perform_refresh`, which owns the end-of-work quiescence
+    /// handoff (delta D5-1) — is released only once that sweep fully
+    /// completes, so `try_lock_owned` correctly rejects any other concurrent
+    /// sweeper until then.
     fn spawn_background_refresh(&self, guard: tokio::sync::OwnedMutexGuard<()>) {
+        let refresh_lock = Arc::clone(&self.refresh_lock);
+        let wake_pending = Arc::clone(&self.wake_pending);
         let sources = self.sources.clone();
         let file_cache = Arc::clone(&self.file_cache);
         let direct_cache = Arc::clone(&self.direct_cache);
@@ -1192,8 +1367,19 @@ impl SessionIndex {
         let last_full_at = Arc::clone(&self.last_full_at);
         let ttl = self.ttl;
         let change_tx = self.change_tx.clone();
+        let amplifier_root_report = Arc::clone(&self.amplifier_root_report);
+        let startup_gate = Arc::clone(&self.startup_gate);
         tokio::spawn(async move {
+            // Task 9 cold-start publish gate: `request_refresh` (mark_dirty /
+            // mark_provider_dirty — incl. the subagent cadence itself) reaches
+            // this entry possibly-cold, so the consult MUST live here too —
+            // and it is a one-lock no-op once anything has published, so the
+            // steady-state stale-while-revalidate path never waits on it.
+            Self::await_startup_gate(&startup_gate, &snapshot).await;
             let _ = Self::perform_refresh(
+                guard,
+                refresh_lock,
+                wake_pending,
                 sources,
                 file_cache,
                 direct_cache,
@@ -1205,9 +1391,9 @@ impl SessionIndex {
                 last_full_at,
                 ttl,
                 change_tx,
+                amplifier_root_report,
             )
             .await;
-            drop(guard);
         });
     }
 
@@ -1217,8 +1403,59 @@ impl SessionIndex {
     /// any `&SessionIndex` borrow -- every input is an owned `Arc`/value --
     /// so it runs identically whether awaited inline (cold start) or inside
     /// a detached `tokio::spawn` (warm, stale-while-revalidate refresh).
+    ///
+    /// Delta D4-2 (the lost-wakeup race, mid-sweep form): `mark_dirty` /
+    /// `mark_provider_dirty` attempt `request_refresh` ONCE; a refresh
+    /// already in flight holds `refresh_lock`, so that attempt is DROPPED —
+    /// and a sweep drains the dirty maps at its START, so a mark landing
+    /// MID-sweep would otherwise sit until some unrelated caller happened
+    /// to refresh again (the pre-watch-reduction handling serviced such
+    /// marks sub-second). After each sweep, re-check the dirty state: if
+    /// any mark arrived while it ran, run ONE follow-up sweep, looping
+    /// until the re-check comes back empty ("quiescent").
+    ///
+    /// Delta D5-1 (the lost-wakeup race, check-to-unlock form): the D4-2
+    /// re-check alone leaves a terminal window — a mark landing AFTER the
+    /// final re-check yet BEFORE the guard release failed its one try-lock
+    /// (the guard was still held) and was never serviced. The close-out is
+    /// a wake-flag handshake with `wake_pending`, with the orderings that
+    /// exclude every interleaving — NO MARK IS EVER LOST:
+    ///
+    /// * Markers ALWAYS store `wake_pending = true` after enqueueing and
+    ///   BEFORE attempting the try-lock (unconditionally: a store ordered
+    ///   only behind a FAILED try-lock would not be causally fenced against
+    ///   the sweeper's end-of-work consult — preemption between the failed
+    ///   try-lock and the store would re-open the hole).
+    /// * Every sweep iteration begins by ABSORBING the flag (store
+    ///   `false`). The iteration's drain runs later in program order, so
+    ///   every mark whose store preceded the absorb has its enqueue ordered
+    ///   before that drain and is covered by it — an absorb can therefore
+    ///   never orphan a mark.
+    /// * The sweeper's end-of-work consult happens strictly AFTER the guard
+    ///   release. A mark whose try-lock failed against THIS guard stored
+    ///   the flag beforehand, and the failed try-lock precedes the release
+    ///   (a try-lock fails only while the guard is held), so the
+    ///   post-release consult provably runs after the store: it reads the
+    ///   flag set, re-acquires the guard, and loops — the next iteration's
+    ///   absorb + drain services the mark. If the consult's try-lock fails,
+    ///   another holder exists, and every guard release performs the same
+    ///   consult on the still-set flag — unless some sweep iteration's
+    ///   absorb already consumed it, in which case that iteration's paired
+    ///   drain covered the mark.
+    ///
+    /// The refresh_lock guard moves INTO this call (from `run_refresh_inline`,
+    /// `spawn_background_refresh`, or the cold-cache awaiter): the release
+    /// and the wake-flag consult are the end-of-work path of the sweep
+    /// itself. The loop is bounded exactly as in D4-2 — it continues only
+    /// on a non-empty dirty re-check or a set wake flag, both driven by
+    /// real marks (already debounce-bounded by the watcher's 200ms flush);
+    /// a set flag over quiesced dirty maps costs exactly one empty pass and
+    /// leaves the flag clear.
     #[allow(clippy::too_many_arguments)]
     async fn perform_refresh(
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        refresh_lock: Arc<AsyncMutex<()>>,
+        wake_pending: Arc<AtomicBool>,
         sources: Vec<Arc<dyn SessionSource>>,
         file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
         direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
@@ -1230,6 +1467,94 @@ impl SessionIndex {
         last_full_at: Arc<StdMutex<Option<Instant>>>,
         ttl: Duration,
         change_tx: tokio::sync::watch::Sender<u64>,
+        amplifier_root_report: Arc<
+            StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+        >,
+    ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        let mut guard = guard;
+        loop {
+            // Absorb the wake flag at iteration start; this iteration's
+            // drain (inside `perform_refresh_once`) is ordered after the
+            // absorb, and every mark whose store preceded the absorb has
+            // its enqueue ordered before that drain.
+            wake_pending.store(false, Ordering::SeqCst);
+            let pair = Self::perform_refresh_once(
+                sources.clone(),
+                Arc::clone(&file_cache),
+                Arc::clone(&direct_cache),
+                Arc::clone(&snapshot),
+                persist_path.clone(),
+                Arc::clone(&persist_state),
+                Arc::clone(&dirty_paths),
+                Arc::clone(&dirty_providers),
+                Arc::clone(&last_full_at),
+                ttl,
+                change_tx.clone(),
+                Arc::clone(&amplifier_root_report),
+            )
+            .await;
+            // D4-2: a mark that landed MID-sweep is picked up by exactly one
+            // follow-up iteration; loop until the re-check comes back empty.
+            if has_dirty_parts(&dirty_paths, &dirty_providers) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let hook = {
+                    let key = Arc::as_ptr(&wake_pending) as usize;
+                    let mut slot = PERFORM_REFRESH_TAIL_HOOK.lock().unwrap();
+                    match slot.as_ref() {
+                        Some((armed_for, _, _)) if *armed_for == key => slot.take(),
+                        _ => None,
+                    }
+                };
+                if let Some((_, parked, resume)) = hook {
+                    let _ = parked.send(());
+                    let _ = resume.await;
+                }
+            }
+            drop(guard);
+            // D5-1: the final dirty re-check ran BEFORE the guard release
+            // above, so a mark landing in the check-to-unlock window failed
+            // its try-lock against this guard — and stored the wake flag
+            // before that try-lock, hence provably before this consult. A
+            // set flag means: re-acquire and run one more iteration (its
+            // absorb + drain services the mark); a clean flag means real
+            // quiescence.
+            if !wake_pending.load(Ordering::SeqCst) {
+                return pair;
+            }
+            guard = match Arc::clone(&refresh_lock).try_lock_owned() {
+                Ok(next) => next,
+                // Another holder sweep exists; its own end-of-work consult
+                // reads the same still-set flag (or an iteration absorb
+                // consumed it, pairing the flag with that iteration's
+                // drain — either way the mark is covered).
+                Err(_) => return pair,
+            };
+        }
+    }
+
+    /// One full sweep of [`Self::perform_refresh`]'s refresh cycle (drain
+    /// the dirty maps, discover/parse, publish, persist). Split out so the
+    /// quiescence loop above can re-run it for mid-sweep marks; callers
+    /// never invoke it directly.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform_refresh_once(
+        sources: Vec<Arc<dyn SessionSource>>,
+        file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
+        direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
+        snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
+        persist_path: Option<PathBuf>,
+        persist_state: Arc<StdMutex<PersistState>>,
+        dirty_paths: Arc<StdMutex<HashMap<PathBuf, String>>>,
+        dirty_providers: Arc<StdMutex<HashSet<String>>>,
+        last_full_at: Arc<StdMutex<Option<Instant>>>,
+        ttl: Duration,
+        change_tx: tokio::sync::watch::Sender<u64>,
+        amplifier_root_report: Arc<
+            StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+        >,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
         // Force a full reconciliation when:
         // - no snapshot has been published yet (cold start), or
@@ -1274,7 +1599,7 @@ impl SessionIndex {
                     .as_ref()
                     .map(|c| c.scan_failures.clone())
                     .unwrap_or_default();
-                let (items, changed) = refresh_snapshot(
+                let (items, changed, amplifier_root_dirs) = refresh_snapshot(
                     &sources,
                     &mut cache,
                     &mut direct,
@@ -1282,11 +1607,11 @@ impl SessionIndex {
                     scoped_paths,
                     scoped_providers,
                 );
-                (items, changed, failures)
+                (items, changed, failures, amplifier_root_dirs)
             }
         })
         .await;
-        let (items, changed, failures) = match sweep_result {
+        let (items, changed, failures, amplifier_root_dirs) = match sweep_result {
             Ok(result) => result,
             Err(join_err) => {
                 // `discover`/`parse` are documented never-panic (every
@@ -1326,6 +1651,16 @@ impl SessionIndex {
                 scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
+          // Self-correction report (amplifier watch-reduction design
+          // "Self-correction channel"): sent only on sweeps that fully
+          // discovered amplifier (`refresh_snapshot` computes `None`
+          // otherwise), immediately after the snapshot publish. One-way,
+          // best-effort: a dropped receiver means no watcher is listening.
+        if let Some(dirs) = amplifier_root_dirs {
+            if let Some(sink) = amplifier_root_report.lock().unwrap().as_ref() {
+                let _ = sink.send(dirs);
+            }
+        }
         if force_full {
             *last_full_at.lock().unwrap() = Some(Instant::now());
         }
@@ -1420,6 +1755,49 @@ fn sorted_names(failures: &HashSet<String>) -> Vec<String> {
     names
 }
 
+/// Test-only seam for the D5-1 regression test (see `mod tests`): a
+/// one-shot pause INSIDE [`SessionIndex::perform_refresh`]'s tail — after
+/// the final quiescence re-check has reported clean and BEFORE the sweep's
+/// `refresh_lock` guard is released — so a test can land a dirty mark
+/// strictly inside the check-to-unlock window, deterministically. Never
+/// armed in production (`cfg(test)`-only, and only ever constructed by the
+/// one test that installs it). The hook is keyed by the identity of the
+/// arming index's `wake_pending` allocation, so a CONCURRENT test's sweep
+/// (which reaches the same tail code under the shared test binary) can
+/// never consume it: only a sweep of the arming test's own index matches
+/// and takes. `take()` makes it fire exactly once, and a panicking test
+/// can never leak an armed hook that a later test would match (a new index
+/// is a new allocation).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static PERFORM_REFRESH_TAIL_HOOK: StdMutex<
+    Option<(
+        usize,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = StdMutex::new(None);
+
+/// The dirty-state re-check shape shared by [`SessionIndex::has_dirty`]
+/// (the public probe) and [`SessionIndex::perform_refresh`]'s sweep-end
+/// re-check (delta D4-2): true iff any scoped path or whole provider is
+/// marked pending. ONE locked section consulting BOTH maps (paths before
+/// providers — the only nested acquisition of these two locks anywhere;
+/// markers lock exactly one map each and the sweep's drain takes them one
+/// at a time, so no lock cycle is possible), never held across an await
+/// point. The atomicity matters (delta D5-1): a quiescence decision must
+/// observe both maps at a single point — a scoped-path mark and a
+/// whole-provider mark landing on opposite sides of two independent reads
+/// could otherwise straddle the sweeper's final check.
+fn has_dirty_parts(
+    dirty_paths: &StdMutex<HashMap<PathBuf, String>>,
+    dirty_providers: &StdMutex<HashSet<String>>,
+) -> bool {
+    let paths = dirty_paths.lock().unwrap();
+    let providers = dirty_providers.lock().unwrap();
+    !paths.is_empty() || !providers.is_empty()
+}
+
 /// One cached direct-listed source's last successful listing, keyed by
 /// source index in [`SessionIndex::direct_cache`]. Mirrors [`FileEntry`]'s
 /// role for file-based sources, but keyed by change-token instead of
@@ -1489,7 +1867,7 @@ fn refresh_snapshot(
     scan_failures: &mut HashSet<String>,
     scoped_paths: HashMap<PathBuf, String>,
     scoped_providers: HashSet<String>,
-) -> (Vec<IndexedSession>, usize) {
+) -> (Vec<IndexedSession>, usize, Option<Vec<PathBuf>>) {
     let is_full = scoped_paths.is_empty() && scoped_providers.is_empty();
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut fully_discovered_providers = HashSet::<String>::new();
@@ -1643,13 +2021,22 @@ fn refresh_snapshot(
     // Scoped-path handling: stat + conditionally re-parse individual
     // dirty paths that weren't already covered by a provider-level
     // discover above. These paths came from the watcher (already
-    // qualified), so we only need to re-stat and re-parse on change.
+    // qualified), so we only need to re-stat and re-parse on change. The
+    // re-stat goes through the hinted source's `stat_scoped` so the cache
+    // key written here matches the discover path's key exactly (amplifier
+    // folds sidecar mtimes on both; a no-hint path keeps the raw stat).
     if !is_full {
         for (path, watcher_provider) in &scoped_paths {
             if discovered.contains(path) {
                 continue;
             }
-            match stat_file(path) {
+            let hinted = sources
+                .iter()
+                .find(|s| s.provider_name() == Some(watcher_provider.as_str()));
+            match hinted
+                .map(|s| s.stat_scoped(path))
+                .unwrap_or_else(|| stat_file(path))
+            {
                 Some(stat) => {
                     discovered.insert(path.clone());
                     let unchanged = cache
@@ -1678,6 +2065,27 @@ fn refresh_snapshot(
             }
         }
     }
+
+    // Self-correction report (refresh → watcher, one-way; amplifier
+    // watch-reduction design "Self-correction channel"): a sweep that
+    // fully discovered amplifier reports every amplifier session dir
+    // whose PARSED metadata proves a root (`parent_id` absent ⇔
+    // `!is_subagent`). The dirs come from the file-cache KEYS (canonical
+    // metadata.json paths → parent dir) — amplifier rows publish
+    // `source_file: None`, so published rows could never carry them.
+    // Cached exclusions (`item: None`) contribute nothing: they are
+    // already name-classified fail-safe by the watcher's planner. Scoped
+    // sweeps (which did not fully discover amplifier) produce no report.
+    let amplifier_root_dirs = fully_discovered_providers.contains("amplifier").then(|| {
+        let mut dirs: Vec<PathBuf> = cache
+            .iter()
+            .filter(|(_, entry)| entry.source_name.as_deref() == Some("amplifier"))
+            .filter(|(_, entry)| entry.item.as_ref().is_some_and(|i| !i.is_subagent))
+            .filter_map(|(path, _)| path.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs
+    });
 
     // Prune: a real cache mutation that must contribute to persistence
     // accounting. During a full reconciliation, prune everything not
@@ -1723,7 +2131,7 @@ fn refresh_snapshot(
             .cmp(&a.last_activity_at)
             .then_with(|| b.key().cmp(&a.key()))
     });
-    (items, changed)
+    (items, changed, amplifier_root_dirs)
 }
 
 // -- Persistent parse cache (self-hosting-readiness bake-in, "kill the cold
@@ -1888,7 +2296,7 @@ fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2006,26 +2414,52 @@ mod tests {
     /// guard -- an unchanged (or cached-excluded) file must never increment
     /// it again after its first sweep; `direct_list_calls` is the
     /// change-token-gating guard for direct-listed sources (opencode) -- an
-    /// unchanged token must never increment it again after the first sweep.
-    struct CountingWrapper<S: SessionSource> {
+    /// unchanged token must never increment it again after the first sweep;
+    /// `stat_scoped_calls` is the watcher-scoped sweep's observable-work pin
+    /// -- a dropped event must produce NO scoped stat either.
+    pub(crate) struct CountingWrapper<S: SessionSource> {
         inner: S,
         discover_calls: Arc<AtomicUsize>,
         parse_calls: Arc<AtomicUsize>,
         direct_list_calls: Arc<AtomicUsize>,
+        stat_scoped_calls: Arc<AtomicUsize>,
     }
 
     impl<S: SessionSource> CountingWrapper<S> {
         /// Construct with fresh (zeroed) counters -- the common case, so call
         /// sites that only care about one counter don't need to spell out
-        /// all three fields.
-        fn new(inner: S) -> Self {
+        /// all four fields.
+        pub(crate) fn new(inner: S) -> Self {
             Self {
                 inner,
                 discover_calls: Arc::new(AtomicUsize::new(0)),
                 parse_calls: Arc::new(AtomicUsize::new(0)),
                 direct_list_calls: Arc::new(AtomicUsize::new(0)),
+                stat_scoped_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
+    }
+
+    /// Counter access for OTHER modules' negative no-scan pins (the
+    /// session_watcher amplifier tests): an erroneous discover/parse sweep
+    /// is OBSERVABLE WORK that always increments its counter, unlike the
+    /// `subscribe_changes()` generation which stays silent when a sweep
+    /// publishes unchanged content. Returns `(discover_calls, parse_calls,
+    /// direct_list_calls, stat_scoped_calls)` clones.
+    pub(crate) fn wrapper_counters<S: SessionSource>(
+        w: &CountingWrapper<S>,
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        (
+            Arc::clone(&w.discover_calls),
+            Arc::clone(&w.parse_calls),
+            Arc::clone(&w.direct_list_calls),
+            Arc::clone(&w.stat_scoped_calls),
+        )
     }
 
     impl<S: SessionSource> SessionSource for CountingWrapper<S> {
@@ -2058,6 +2492,11 @@ mod tests {
         fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
             self.discover_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.discover_checked()
+        }
+
+        fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+            self.stat_scoped_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.stat_scoped(path)
         }
     }
 
@@ -2729,7 +3168,14 @@ mod tests {
         let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
 
         let (change_tx, _change_rx) = tokio::sync::watch::channel(0u64);
+        let refresh_lock = Arc::new(AsyncMutex::new(()));
+        let guard = Arc::clone(&refresh_lock)
+            .try_lock_owned()
+            .expect("a fresh lock is uncontended");
         let (result, result_failures) = SessionIndex::perform_refresh(
+            guard,
+            refresh_lock,
+            Arc::new(AtomicBool::new(false)),
             vec![panicking_source],
             Arc::clone(&file_cache),
             Arc::clone(&direct_cache),
@@ -2741,6 +3187,7 @@ mod tests {
             Arc::new(StdMutex::new(Some(Instant::now()))),
             Duration::from_secs(3600),
             change_tx,
+            Arc::new(StdMutex::new(None)),
         )
         .await;
 
@@ -4711,6 +5158,216 @@ mod tests {
         );
     }
 
+    /// Delta-review D4-2 (the lost-wakeup race): `mark_dirty` /
+    /// `mark_provider_dirty` attempt `request_refresh` ONCE, and an in-flight
+    /// refresh holds `refresh_lock`, so that attempt is dropped — while
+    /// `perform_refresh` drains the dirty maps at sweep START. A mark landing
+    /// MID-refresh therefore sat un-serviced until some unrelated caller
+    /// happened to refresh again (pre-change handling was sub-second). The
+    /// fix: after a refresh completes, re-check the dirty state and run one
+    /// follow-up sweep per arrived wave, looping until quiescent.
+    ///
+    /// Ordering is made DETERMINISTIC with the `BlockingSource` idiom above:
+    /// the warm-up publishes before the gate is armed, so sweep 2 blocks
+    /// inside `discover_checked` with the lock held; the provider mark then
+    /// provably lands MID-sweep (its `request_refresh` attempt is the one
+    /// being dropped); releasing the gate must be followed PROMPTLY by a
+    /// follow-up sweep that drains the mark — observed by `has_dirty()`
+    /// clearing and the discover counter advancing by EXACTLY one extra
+    /// sweep (the follow-up exists, and there is no refresh storm).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mark_landing_during_in_flight_refresh_is_serviced_by_a_follow_up_sweep() {
+        struct GateOnceSource {
+            discovers: Arc<AtomicUsize>,
+            gate_armed: Arc<AtomicBool>,
+            entered: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl SessionSource for GateOnceSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                self.discovers.fetch_add(1, Ordering::SeqCst);
+                // Block on the FIRST entry while the gate is armed (and
+                // disarm, so no later discover can block): this is the
+                // in-flight refresh the mark must land inside.
+                if self.gate_armed.swap(false, Ordering::SeqCst) {
+                    self.entered.store(true, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+                Ok(Vec::new())
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let discovers = Arc::new(AtomicUsize::new(0));
+        let gate_armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let index = std::sync::Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(GateOnceSource {
+                discovers: Arc::clone(&discovers),
+                gate_armed: Arc::clone(&gate_armed),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }) as _],
+            std::time::Duration::from_secs(3600), // TTL holds out every non-mark trigger
+            None,
+        ));
+
+        // Warm publish (ungated): exactly one sweep has run.
+        let _ = index.snapshot().await;
+        assert_eq!(discovers.load(Ordering::SeqCst), 1);
+
+        // Arm the gate, then kick a bare refresh: sweep 2 blocks inside
+        // discover_checked with refresh_lock held.
+        gate_armed.store(true, Ordering::SeqCst);
+        index.request_refresh();
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || entered
+                .load(Ordering::SeqCst))
+            .await,
+            "the gated sweep must be in flight (lock held) before the mark lands"
+        );
+        assert_eq!(discovers.load(Ordering::SeqCst), 2);
+
+        // The mark lands MID-refresh: its request_refresh attempt drops on
+        // the held lock, and the sweep's start-of-sweep drain already ran.
+        index.mark_provider_dirty("claude");
+        assert!(index.has_dirty(), "the mid-sweep mark is pending");
+
+        // Release the gated sweep...
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        // ...and the mark MUST be serviced by a prompt follow-up sweep, not
+        // by waiting on some later unrelated caller: there is no periodic
+        // trigger in scope here at all (TTL is an hour and no snapshot()
+        // poller exists in this test), so only a post-completion re-check +
+        // follow-up can service it.
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || !index.has_dirty()).await,
+            "a mark landing during an in-flight refresh must be drained by a follow-up sweep"
+        );
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || discovers
+                .load(Ordering::SeqCst)
+                == 3)
+            .await,
+            "exactly one follow-up sweep ran: {}",
+            discovers.load(Ordering::SeqCst)
+        );
+        // No refresh storm: quiescence holds after the follow-up.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            discovers.load(Ordering::SeqCst),
+            3,
+            "the follow-up loop must stop once the dirty state is quiescent"
+        );
+    }
+
+    /// Delta-review D5-1: the D4-2 follow-up re-check closes the MID-sweep
+    /// window but leaves a terminal one. A mark landing AFTER the sweeper's
+    /// final `has_dirty_parts` re-check yet BEFORE its caller releases the
+    /// `refresh_lock` guard fails its one and only `request_refresh`
+    /// try-lock attempt (the guard is still held) and receives no later
+    /// wake-up — it sits until some unrelated refresh trigger happens along.
+    ///
+    /// Ordering is made DETERMINISTIC with the `PERFORM_REFRESH_TAIL_HOOK`
+    /// seam: sweep 2 parks inside `perform_refresh`'s tail, which provably
+    /// places the subsequent mark inside the window — the final re-check
+    /// has already run (it reported clean, which is why the tail is
+    /// reached) and the guard is still held. With every periodic trigger
+    /// held out of scope (TTL is an hour and no snapshot() poller exists
+    /// here), only the sweeper's own end-of-work wake-up path can service
+    /// the mark — observed as exactly one extra discover pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mark_landing_between_final_dirty_check_and_guard_release_is_serviced() {
+        struct CountingSource {
+            discovers: Arc<AtomicUsize>,
+        }
+        impl SessionSource for CountingSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                self.discovers.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let discovers = Arc::new(AtomicUsize::new(0));
+        let index = std::sync::Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(CountingSource {
+                discovers: Arc::clone(&discovers),
+            }) as _],
+            std::time::Duration::from_secs(3600), // TTL holds out every non-mark trigger
+            None,
+        ));
+
+        // Warm publish: exactly one sweep has run.
+        let _ = index.snapshot().await;
+        assert_eq!(discovers.load(Ordering::SeqCst), 1);
+
+        // Arm the one-shot tail pause (keyed to THIS index — a concurrent
+        // test's sweep can never consume it), then kick the refresh that
+        // parks in it (sweep 2, with refresh_lock held start to finish).
+        let (parked_rx, resume_tx) = index.install_refresh_tail_hook_for_test();
+        index.request_refresh();
+        tokio::time::timeout(std::time::Duration::from_secs(2), parked_rx)
+            .await
+            .expect("sweep 2 must reach the perform_refresh tail")
+            .expect("the tail-pause signal must be delivered");
+        assert_eq!(discovers.load(Ordering::SeqCst), 2);
+
+        // The mark lands STRICTLY inside the window: the sweeper's final
+        // dirty re-check has already run (it reported clean — that is why
+        // the tail was reached), and `refresh_lock` is still held, so this
+        // mark's one `request_refresh` try-lock attempt provably fails.
+        index.mark_provider_dirty("claude");
+        assert!(index.has_dirty(), "the in-window mark is pending");
+
+        // Let the sweeper return and release the guard, then the mark MUST
+        // be serviced promptly by the sweeper's own end-of-work follow-up.
+        let _ = resume_tx.send(());
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || discovers
+                .load(Ordering::SeqCst)
+                == 3)
+            .await,
+            "a mark landing between the final dirty check and guard release must be \
+             serviced by a follow-up refresh: {}",
+            discovers.load(Ordering::SeqCst)
+        );
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || !index.has_dirty()).await,
+            "the follow-up refresh must drain the pending mark"
+        );
+        // No refresh storm: the wake path must quiesce after servicing.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            discovers.load(Ordering::SeqCst),
+            3,
+            "the wake-flag follow-up must stop once the mark is serviced"
+        );
+    }
+
     /// Finding-3 pin: the snapshot and its scan failures are ONE atomic
     /// generation. A source that strictly alternates between a failing sweep
     /// (last-known-good session + failure recorded) and a healthy sweep (one
@@ -5070,5 +5727,249 @@ mod tests {
         assert_eq!(snap2.len(), 1, "deleted file must be removed from snapshot");
 
         std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    // Regression 1 (scoped path): a sidecar-only change on an active amplifier
+    // session refreshes recency WITHOUT a full discover and without parse thrash
+    // — TWICE in sequence: the second sidecar-only change is the raw-key trap
+    // (a raw-stat cache key would be raw-equal and skip the third parse).
+    #[tokio::test]
+    async fn scoped_mark_with_sidecar_only_activity_refreshes_amplifier_recency_without_discover() {
+        let home = unique_temp_dir("scoped-fold");
+        let session_dir = {
+            let dir = home
+                .join("projects")
+                .join("slug")
+                .join("sessions")
+                .join("012584be-9478-4801-a62d-4e5da428b3a0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("metadata.json"),
+                r#"{"session_id":"s1","working_dir":"/p/w","created":"2026-03-01T00:00:00.000Z","name":"t","description":"d","turn_count":1}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+            dir
+        };
+        let metadata = session_dir.join("metadata.json");
+
+        let amplifier = crate::amplifier::AmplifierSource::new(home.clone());
+        let wrapped = CountingWrapper::new(amplifier);
+        let (discover_calls, parse_calls, _, _) = wrapper_counters(&wrapped);
+        let index = test_index_with_ttl(
+            vec![Arc::new(wrapped) as Arc<dyn SessionSource>],
+            Duration::from_secs(3600),
+        );
+
+        let snap = index.snapshot().await;
+        let row = snap.iter().find(|s| s.provider == "amplifier").unwrap();
+        let before = row.last_activity_at;
+        assert_eq!(discover_calls.load(Ordering::SeqCst), 1);
+
+        // Sidecar-only activity: transcript grows, metadata.json untouched.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+
+        let snap2 = index.snapshot().await;
+        let row2 = snap2.iter().find(|s| s.provider == "amplifier").unwrap();
+        assert!(
+            row2.last_activity_at > before,
+            "recency ADVANCES on a sidecar-only change (equality would mean the sidecar never fed the key)"
+        );
+        // Scoped path: NO second discover; exactly one re-parse (folded key changed).
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "no full/provider discover"
+        );
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            2,
+            "one initial + one scoped re-parse"
+        );
+
+        // A steady second scoped mark (no file movement) re-parses nothing,
+        // proving the folded-vs-folded cache keys match (no raw-fold thrash).
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            2,
+            "folded keys agree on both paths"
+        );
+
+        // The raw-key trap: a SECOND sidecar-only change must force a THIRD
+        // parse. A raw-stat implementation cached the raw metadata key above
+        // (unchanged again here), so it skips this re-parse and freezes
+        // activity ordering at row2 — the exact bug this regression guards.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n{\"type\":\"user\"}\n",
+        )
+        .unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+
+        let snap3 = index.snapshot().await;
+        let row3 = snap3.iter().find(|s| s.provider == "amplifier").unwrap();
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            3,
+            "the second sidecar-only change re-parses via the folded key (a raw key is raw-equal and is skipped)"
+        );
+        assert!(
+            row3.last_activity_at > row2.last_activity_at,
+            "activity ordering advances STRICTLY on every sidecar-only change ({} > {})",
+            row3.last_activity_at,
+            row2.last_activity_at
+        );
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            1,
+            "still no full/provider discover"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // Regression 8: metadata.json deleted, sidecars survive — scoped mark prunes.
+    #[tokio::test]
+    async fn metadata_json_deleted_but_sidecars_survive_still_prunes_never_resurrects() {
+        let home = unique_temp_dir("scoped-prune");
+        let session_dir = {
+            let dir = home
+                .join("projects")
+                .join("slug")
+                .join("sessions")
+                .join("012584be-9478-4801-a62d-4e5da428b3a0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("metadata.json"),
+                r#"{"session_id":"s1","working_dir":"/p/w","created":"2026-03-01T00:00:00.000Z"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("transcript.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+            std::fs::write(dir.join("events.jsonl"), "{}\n").unwrap();
+            dir
+        };
+        let metadata = session_dir.join("metadata.json");
+        let index = test_index_with_ttl(
+            vec![
+                Arc::new(crate::amplifier::AmplifierSource::new(home.clone()))
+                    as Arc<dyn SessionSource>,
+            ],
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            1
+        );
+
+        std::fs::remove_file(&metadata).unwrap();
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            0,
+            "metadata.json deletion prunes even with surviving sidecars"
+        );
+        // A repeat mark must not resurrect the row.
+        index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert_eq!(
+            index
+                .snapshot()
+                .await
+                .iter()
+                .filter(|s| s.provider == "amplifier")
+                .count(),
+            0
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ---------- refresh→watcher self-correction report ----------
+
+    #[tokio::test]
+    async fn amplifier_report_carries_only_parsed_root_session_dirs() {
+        let home = unique_temp_dir("amp-report");
+        let mk = |slug: &str, id: &str, metadata: &str| {
+            let dir = home.join("projects").join(slug).join("sessions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), metadata).unwrap();
+            dir
+        };
+        // True root (parent_id absent).
+        let root = mk(
+            "p",
+            "012584be-9478-4801-a62d-4e5da428b3a0",
+            r#"{"session_id":"r","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // Misnamed root: subagent-PATTERN name, but parent_id absent.
+        let misnamed = mk(
+            "p",
+            "0000000000000000-014b6af1c2ac4ab5_agent",
+            r#"{"session_id":"m","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // True subagent: parent_id present.
+        let _sub = mk(
+            "p",
+            "1111111111111111-2222222222222222_sub",
+            r#"{"session_id":"s","working_dir":"/p/x","parent_id":"r","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+        // Excluded (cwd-less) root-named dir: contributes nothing (unparseable rows are already fail-safe-watched).
+        let _excluded = mk(
+            "p",
+            "222584be-9478-4801-a62d-4e5da428b3a0",
+            r#"{"session_id":"e","created":"2026-03-01T00:00:00.000Z"}"#,
+        );
+
+        let index = test_index_with_ttl(
+            vec![
+                Arc::new(crate::amplifier::AmplifierSource::new(home.clone()))
+                    as Arc<dyn SessionSource>,
+            ],
+            Duration::from_secs(3600),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        index.set_amplifier_root_report_sink(tx);
+        let _ = index.snapshot().await;
+        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("report fires after a full discover")
+            .expect("channel open");
+        assert_eq!(report, {
+            let mut v = vec![misnamed.clone(), root.clone()];
+            v.sort();
+            v
+        });
+
+        // A scoped-only refresh must NOT re-report (amplifier was not fully discovered).
+        index.mark_dirty(&[(home.join("nonexistent.json"), "amplifier".to_string())]);
+        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "scoped-only sweeps produce no report"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

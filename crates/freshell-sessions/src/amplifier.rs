@@ -107,6 +107,14 @@ impl SessionSource for AmplifierSource {
     fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
         discover_amplifier_metadata(&self.amplifier_home)
     }
+
+    /// Fold-aware scoped stat: same cache key as the discover path
+    /// (`fold_activity_mtime`). `None` whenever metadata.json itself is
+    /// missing so the scoped deletion prune still fires — surviving sidecars
+    /// never resurrect a ghost entry (design lines 80-83).
+    fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+        stat_metadata_file(path).map(fold_activity_mtime)
+    }
 }
 
 /// Stat every qualifying `metadata.json` under `<amplifier_home>/projects`.
@@ -930,5 +938,99 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key(), "amplifier:override-me");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---------- stat_scoped (fold-aware scoped stat) ----------
+
+    #[test]
+    fn stat_scoped_folds_sidecar_mtime_and_none_when_metadata_missing() {
+        let home = unique_temp_dir("stat-scoped-fold");
+        let dir = write_session(
+            &home,
+            "slug",
+            "sess-1",
+            &sample_metadata("sess-1", "/p/x", "t"),
+            Some("{\"type\":\"user\"}\n"),
+        );
+        let meta = dir.join("metadata.json");
+        let source = AmplifierSource::new(home.clone());
+
+        // Make the sidecar DETERMINISTICALLY newer than metadata.json (the
+        // 20ms mtime-separation idiom used throughout): with a newer sidecar
+        // present the folded key must be STRICTLY greater than the raw
+        // metadata mtime — a raw (unfolded) scoped stat would merely TIE it,
+        // which `>=` accepts.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            dir.join("transcript.jsonl"),
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+
+        let raw = std::fs::metadata(&meta).unwrap().modified().unwrap();
+        let folded =
+            <AmplifierSource as crate::directory_index::SessionSource>::stat_scoped(&source, &meta)
+                .expect("scoped stat when metadata exists");
+        assert_eq!(folded.path, meta);
+        assert!(
+            folded.mtime_ms
+                > raw
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            "a newer sidecar raises the folded key strictly above the raw metadata mtime \
+             (a raw-stat key ties and fails)"
+        );
+
+        // Regression 8's second half: metadata.json gone but transcript.jsonl
+        // survives → None (never resurrect a ghost from surviving sidecars).
+        std::fs::remove_file(&meta).unwrap();
+        assert!(
+            <AmplifierSource as crate::directory_index::SessionSource>::stat_scoped(&source, &meta)
+                .is_none(),
+            "missing metadata.json ⇒ None even with surviving sidecars"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Manual probe: warm full-discover duration on the REAL amplifier home.
+    /// The 15s cadence's cost was the design's ~0.3s/~2% estimate; measured
+    /// 2026-08-18 by LB-02 at ~0.65s warm mean on 22,300 session dirs, and
+    /// re-measured 2026-08-18 by THIS probe run on 21,494 metadata files at
+    /// 560/612/568ms (~0.58s warm mean) → ~3.9% of a core at the 15s cadence,
+    /// with ~1.7× headroom to the 1.0s falsification threshold (LB-02). The
+    /// probe re-measures on demand rather than gating CI. Content-free by
+    /// construction: it calls `discover()` only — read_dir + stat, never a
+    /// content read (LB-02's content-free discover is the production path).
+    ///
+    ///   cargo test -p freshell-sessions --lib measure_real_home_discover -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual real-corpus probe"]
+    fn measure_real_home_discover() {
+        let home = std::env::var("FRESHELL_AMPLIFIER_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| std::path::PathBuf::from(h).join(".amplifier"))
+            })
+            .filter(|h| h.join("projects").is_dir());
+        let Some(home) = home else {
+            eprintln!("no real amplifier home present; skipping");
+            return;
+        };
+        let source = AmplifierSource::new(home);
+        // Cold-ish pass, then two warm passes.
+        let _ = source.discover();
+        for pass in 0..3 {
+            let start = std::time::Instant::now();
+            let stats = source.discover();
+            println!(
+                "real-home warm discover pass {pass}: {} files in {:?}",
+                stats.len(),
+                start.elapsed()
+            );
+        }
     }
 }

@@ -583,6 +583,10 @@ async fn run_loop(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+    // This connection's `sessions.prefs` includeSubagents interest is gone with
+    // it (amplifier watch reduction): the demand-driven subagent rescan cadence
+    // stops when the last interested connection leaves.
+    state.subagent_interest.remove(conn_id);
     // Multi-client layout store: this connection's mirrored layout snapshot is
     // gone with it (its pane/tab ids are client-local and unreachable now);
     // the primary falls back to the most recently synced remaining client.
@@ -1207,6 +1211,15 @@ async fn handle_client_text(
         // out of this task's scope.
         ClientMessage::UiLayoutSync(sync) => {
             state.layout.update_from_ui(&sync, &conn_id.to_string());
+            true
+        }
+        // `sessions.prefs` — the client's includeSubagents listing preference.
+        // Per-connection (design: "track the flag per WS client; clear on
+        // disconnect"); no reply frame (parity with ui.layout.sync).
+        ClientMessage::SessionsPrefs(prefs) => {
+            state
+                .subagent_interest
+                .set(conn_id, prefs.include_subagents);
             true
         }
         // Application-level liveness ping (legacy parity: `ws-handler.ts:1832-1835`
@@ -5965,6 +5978,7 @@ mod terminals_changed_tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -6202,6 +6216,7 @@ mod terminal_meta_created_tests {
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),

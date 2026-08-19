@@ -51,6 +51,7 @@ mod sessions;
 mod settings;
 mod settings_store;
 mod shutdown_forensics;
+mod subagent_cadence;
 mod tabs_snapshots;
 mod terminals;
 #[cfg(test)]
@@ -319,6 +320,12 @@ async fn main() -> ExitCode {
     // the capable client's `ui.screenshot.result` back. Shared by value into WsState
     // (capability tracking + result routing) and the screenshots REST state.
     let screenshots = freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx));
+
+    // Per-connection `includeSubagents` interest registry (amplifier watch
+    // reduction): `sessions.prefs` frames flip the sending connection's entry;
+    // teardown clears it. Task 9's demand-driven amplifier subagent rescan
+    // cadence reads the SAME instance.
+    let subagent_interest = freshell_ws::subagent_interest::SubagentInterestRegistry::default();
 
     // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
@@ -700,6 +707,9 @@ async fn main() -> ExitCode {
     // Session-directory watcher — must live for the process lifetime (dropping
     // the SessionWatcher sends the stop signal, killing the watcher loop).
     let _session_watcher = if let Some(ref index) = session_index {
+        // The subagent-mkdir escalation gate (Task 3) reads the SAME
+        // registry the cadence (spawned below) reads.
+        let subagent_count = subagent_interest.count_handle();
         session_directory::provider_home().map(|home| {
             let providers = vec![
                 freshell_sessions::session_watcher::WatchedProvider {
@@ -722,7 +732,17 @@ async fn main() -> ExitCode {
             let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
                 Arc::clone(index),
                 providers,
-            );
+            )
+            .with_subagent_interest(subagent_count);
+            // Watch-reduction cold-start gate (Task 9): every boot-time
+            // session-index publish (the warm spawn, the sessions sweep's
+            // initial signature snapshot, the auto-title first pass,
+            // pre-readiness request routes, mark-driven background
+            // refreshes) funnels through the index's two publish entries;
+            // installing the receiver HERE — BETWEEN construction and
+            // start() — orders the FIRST publish provably after the watcher
+            // reports its startup arms settled.
+            index.set_startup_gate(watcher.startup_ready());
             watcher.start();
             watcher
         })
@@ -1026,6 +1046,7 @@ async fn main() -> ExitCode {
         // The SAME store `fresh_agent_state.layout` holds (AUTO-01 spine).
         layout: layout_store.clone(),
         screenshots: screenshots.clone(),
+        subagent_interest: subagent_interest.clone(),
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
@@ -1281,6 +1302,16 @@ async fn main() -> ExitCode {
             ws_state.clone(),
             terminal_identity.clone(),
             SESSIONS_SWEEP_INTERVAL,
+        );
+        // Amplifier watch-reduction kata (Task 9): demand-driven subagent
+        // rescan cadence — 15s while any connected WS client lists
+        // subagents (the SAME registry instance wired into WsState and the
+        // watcher); zero otherwise. `mark_provider_dirty("amplifier")` only
+        // — never the index-global TTL, never a fetch-recency window.
+        subagent_cadence::spawn_subagent_cadence(
+            Arc::clone(index),
+            subagent_interest.clone(),
+            subagent_cadence::SUBAGENT_CADENCE_INTERVAL,
         );
         // Task 5: the background auto-name pass (dir -> first-message ->
         // Gemini AI) -- `server/index.ts:868-950`. Same cadence + index
@@ -2474,6 +2505,12 @@ const IDENTITY_INVARIANT_SWEEP_INTERVAL: std::time::Duration = std::time::Durati
 /// `IndexedSession`s the sweep's `snapshot()` call already produced, no
 /// extra I/O.
 ///
+/// ROLE (post-D1-3): this triple gates ONLY the 2s identity ticker. The
+/// change-generation wake arm broadcasts unconditionally — a generation
+/// advance already means "a refresh republished changed content", which
+/// this triple provably under-detects (title/summary edits beneath a
+/// static global max).
+///
 /// BOTH halves matter; max-`lastActivityAt` ALONE is not sufficient. A real
 /// session-directory corpus routinely has some provider already sitting at
 /// a later `lastActivityAt` than a session that just landed (e.g. a
@@ -2509,14 +2546,14 @@ const IDENTITY_INVARIANT_SWEEP_INTERVAL: std::time::Duration = std::time::Durati
 ///    in `sessions.rs`.
 ///
 /// 2. **Delete+add in the SAME tick, count-neutral AND max-neutral --
-///    ACCEPTED, exotic.** If one session is deleted and a different one
-///    added within the same ~2s sweep window, and the composition happens
-///    to leave both `len()` and the max `lastActivityAt` unchanged, this
-///    signature cannot distinguish the pre/post corpus. This requires a
-///    coincidental timestamp match across two unrelated sessions landing in
-///    the same tick -- accepted as out of scope. Note: the SessionWatcher
-///    still triggers the same signature-based broadcast; it does not close
-///    this gap on its own.
+///    CLOSED on the generation-advance wake.** If one session is deleted
+///    and a different one added within the same sweep window, leaving both
+///    `len()` and the max `lastActivityAt` unchanged, this signature cannot
+///    distinguish the pre/post corpus — but the index's change generation
+///    DOES advance on any republished content, and the `changed()` wake arm
+///    broadcasts on the generation advance itself (delta review D1-3), so
+///    watcher-driven changes never depend on this triple. The triple still
+///    gates the 2s identity ticker (which fires unconditionally).
 ///
 /// 3. **External-process override edits (bake-in with the legacy Node
 ///    server writing the SAME `config.json`) -- ACCEPTED for bake-in.** The
@@ -2617,14 +2654,28 @@ fn spawn_sessions_sweep(
                         break; // sender dropped
                     }
                     let items = session_index.snapshot().await;
-                    let signature = sessions_sweep_signature(&items, &identity.list());
-                    if signature != last_signature {
-                        last_signature = signature;
-                        freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
-                    }
+                    // D1-3 (amplifier watch-reduction delta review): a
+                    // `changed()` wake means the index's change generation
+                    // ADVANCED, which happens only when a refresh actually
+                    // republished changed content. Broadcast unconditionally
+                    // here: the (count, max, digest) triple is an
+                    // UNDER-approximation of "sidebar-visible change" — a
+                    // title/summary edit with the global max timestamp held
+                    // static (e.g. the 15s subagent cadence's discover
+                    // picking up one subagent row edit while another row
+                    // holds the max) leaves the triple untouched, and
+                    // suppressing here would break the cadence's 15s
+                    // freshness promise indefinitely. The triple's
+                    // suppression stays ONLY on the identity ticker below,
+                    // which fires unconditionally every 2s and therefore
+                    // NEEDS a change gate.
+                    last_signature = sessions_sweep_signature(&items, &identity.list());
+                    freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
                 }
                 _ = identity_ticker.tick() => {
                     // Check if identity changes alone moved the signature.
+                    // (File-driven changes never reach this arm first —
+                    // they broadcast at the generation advance above.)
                     let items = session_index.snapshot().await;
                     let signature = sessions_sweep_signature(&items, &identity.list());
                     if signature != last_signature {
@@ -2899,6 +2950,206 @@ mod sessions_sweep_tests {
         assert_eq!(first, second, "an unchanged home must yield a stable token");
 
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    /// Delta-review D1-3 (the demand-driven 15s amplifier subagent cadence's
+    /// promise vs the sweep's suppression predicate): when the sweep's wake
+    /// is an index change-GENERATION advance — a refresh that republished
+    /// content — `sessions.changed` must reach clients even when the
+    /// (count, max `lastActivityAt`, identity digest) triple did not move.
+    /// This test reproduces the finding directly: a title-only update to an
+    /// existing amplifier row (e.g. a subagent's title/summary edit) with
+    /// the corpus count static AND the global max timestamp held static by
+    /// an unrelated anchor row. Pre-fix the wake folded into
+    /// `signature == last_signature` and the broadcast was swallowed
+    /// indefinitely; post-fix the generation advance itself broadcasts.
+    /// Integration-level: drives the REAL `spawn_sessions_sweep` task
+    /// against a REAL `SessionIndex` (watcher marks → refresh → publish)
+    /// and observes the actual broadcast channel of a REAL `WsState`.
+    #[tokio::test]
+    async fn title_only_row_update_with_static_max_still_broadcasts_sessions_changed() {
+        use freshell_sessions::directory_index::FileStat;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// In-memory corpus double: full control over (count, max, title)
+        /// with NO filesystem timing. `discover` reports the current
+        /// (mtime, size); `parse` materializes the row. A title flip bumps
+        /// the entry's mtime+size so the index's stat-driven change
+        /// detection re-parses it — mirroring a metadata rewrite on disk.
+        /// The corpus lives in its own Arc so the test can mutate it after
+        /// the source moves into the index.
+        struct FlipSource {
+            corpus: Arc<Mutex<HashMap<PathBuf, (i64, IndexedSession)>>>,
+        }
+        impl SessionSource for FlipSource {
+            fn discover(&self) -> Vec<FileStat> {
+                self.corpus
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(path, (mtime_ms, item))| FileStat {
+                        path: path.clone(),
+                        mtime_ms: *mtime_ms,
+                        // Size participates in the unchanged check; derive
+                        // it from content so a title flip always moves it.
+                        size: item.title.as_deref().unwrap_or("").len() as u64,
+                    })
+                    .collect()
+            }
+            fn parse(&self, path: &Path) -> Option<IndexedSession> {
+                Some(self.corpus.lock().unwrap().get(path)?.1.clone())
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("amplifier")
+            }
+        }
+
+        let anchor_path = PathBuf::from("/flip/anchor");
+        let flipped_path = PathBuf::from("/flip/flipped");
+        let mut anchor = mk_indexed(9_000_000); // the global max holder — static forever
+        anchor.session_id = "anchor".to_string();
+        anchor.provider = "amplifier".to_string();
+        anchor.title = Some("anchor".to_string());
+        let mut flipped = mk_indexed(1_000); // strictly below the max, always
+        flipped.session_id = "flipped".to_string();
+        flipped.provider = "amplifier".to_string();
+        flipped.is_subagent = true; // the finding's subagent-row shape
+        flipped.title = Some("before".to_string());
+
+        let corpus = Arc::new(Mutex::new(HashMap::from([
+            (anchor_path, (100, anchor)),
+            (flipped_path.clone(), (100, flipped)),
+        ])));
+        let source = Arc::new(FlipSource {
+            corpus: Arc::clone(&corpus),
+        });
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![source as Arc<dyn SessionSource>],
+            std::time::Duration::from_secs(3600),
+            None,
+        ));
+
+        // A REAL WsState (the sessions_prefs.rs harness literal, rerooted
+        // in-process): the sweep broadcasts through its shared channel.
+        let auth_token = Arc::new("tok".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+        let settings_json = serde_json::json!({
+            "ai": {},
+            "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+            "editor": { "externalEditor": "auto" },
+            "extensions": { "disabled": [] },
+            "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+            "logging": { "debug": false },
+            "network": { "configured": true, "host": "127.0.0.1" },
+            "panes": { "defaultNewPane": "ask" },
+            "safety": { "autoKillIdleMinutes": 15 },
+            "sidebar": {
+                "autoGenerateTitles": true,
+                "excludeFirstChatMustStart": false,
+                "excludeFirstChatSubstrings": []
+            },
+            "terminal": { "scrollback": 10000 }
+        });
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let ws_state = WsState {
+            pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: identity.clone(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-test".to_string()),
+            boot_id: Arc::new("boot-test".to_string()),
+            settings: Arc::new(serde_json::from_value(settings_json.clone()).unwrap()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(
+                serde_json::from_value(settings_json).unwrap(),
+            )),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: freshell_ws::tabs::TabsRegistry::new(),
+            screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+            subagent_interest: Default::default(),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: freshell_ws::backpressure::Term09Config::default(),
+            create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms:
+                freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+        };
+
+        let mut gen_rx = index.subscribe_changes();
+        spawn_sessions_sweep(
+            Arc::clone(&index),
+            ws_state,
+            identity,
+            std::time::Duration::from_secs(2),
+        );
+
+        // Settle the startup publish (the sweep's own cold snapshot), then
+        // drain any startup frame so the ONLY frame the assertion below can
+        // observe is the post-flip one.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), gen_rx.changed()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while broadcast_rx.try_recv().is_ok() {}
+
+        // THE flip: title-only, mtime+size moved, count static, max held
+        // by the static anchor. Exactly the finding's swallowed-broadcast
+        // shape.
+        {
+            let mut corpus = corpus.lock().unwrap();
+            let entry = corpus.get_mut(&flipped_path).unwrap();
+            entry.0 += 1;
+            entry.1.title = Some("after".to_string());
+        }
+        // The cadence's mark, in miniature: watcher-equivalent provider
+        // dirty → refresh → publish.
+        index.mark_provider_dirty("amplifier");
+
+        // Both pre- and post-fix the generation MUST advance (the refresh
+        // republished); if it does not, the test is vacuous, not red.
+        tokio::time::timeout(std::time::Duration::from_secs(3), gen_rx.changed())
+            .await
+            .expect("the title-flip refresh must advance the change generation")
+            .unwrap();
+
+        // PRE-FIX: suppressed — (count=2, max=9_000_000, digest) identical,
+        // so the wake folded to a no-broadcast and this recv timed out.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), broadcast_rx.recv())
+            .await
+            .expect(
+                "a generation advance must broadcast sessions.changed even \
+                     when (count, max, digest) is unchanged",
+            )
+            .expect("broadcast channel open");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], serde_json::json!("sessions.changed"));
     }
 }
 
