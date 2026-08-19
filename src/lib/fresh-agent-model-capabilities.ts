@@ -296,10 +296,11 @@ export interface ClaudeSelectorOptions {
  * Merge a probed claude model catalog into the static selector menu so
  * alias-only catalog rows (e.g. `opus[1m]`, `sonnet`) surface alongside the
  * baked-in option. Probed rows keep the server's own displayName verbatim —
- * never re-derive labels client-side. Dedupe key is the row `id`: a probed
- * row whose id equals a static value is dropped entirely (static label wins).
- * Null/empty catalogs leave the statics untouched. Pure: no fetches, no
- * globals.
+ * never re-derive labels client-side — and carry the catalog's effort levels
+ * as `thinkingEfforts` (never a `defaultEffort`; provider default logic
+ * handles that). Dedupe key is the row `id`: a probed row whose id equals a
+ * static value is dropped entirely (static label wins). Null/empty catalogs
+ * leave the statics untouched. Pure: no fetches, no globals.
  */
 export function mergeClaudeSelectorOptions(
   catalog: FreshAgentModelCapabilities | null | undefined,
@@ -313,7 +314,11 @@ export function mergeClaudeSelectorOptions(
   for (const model of catalog?.models ?? []) {
     if (seen.has(model.id)) continue
     seen.add(model.id)
-    modelOptions.push({ value: model.id, label: model.displayName })
+    modelOptions.push({
+      value: model.id,
+      label: model.displayName,
+      thinkingEfforts: model.supportsEffort ? (model.supportedEffortLevels ?? []) : [],
+    })
   }
   return { modelOptions }
 }

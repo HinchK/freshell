@@ -7,7 +7,6 @@ import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getEffectiveFreshAgentEffort,
-  getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
   resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
@@ -101,8 +100,15 @@ export function FreshAgentSettingsButton({
     : staticModelOptions
   const opensModelDialog = paneContent.sessionType === 'freshopencode' || paneContent.sessionType === 'freshcodex'
 
+  // Simple-list path: thinking levels come from the merged selector rows, so
+  // probed-only models use their own catalog levels instead of the static
+  // table's default-model fallback. Static rows resolve identically to the
+  // old getFreshAgentThinkingOptions call — for claude providers,
+  // normalizeFreshAgentModel is the identity. Models in neither list
+  // legitimately show no Thinking select.
   const thinkingOptions = keepsSimpleModelList
-    ? getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
+    ? (modelOptions.find((option) => option.value === activeModel)?.thinkingEfforts ?? [])
+        .map((value) => ({ value, label: value }))
     : []
   const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)

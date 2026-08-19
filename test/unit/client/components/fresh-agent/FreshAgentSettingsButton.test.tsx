@@ -152,14 +152,16 @@ describe('FreshAgentSettingsButton', () => {
     seedPane(store, {
       sessionType: 'freshclaude',
       provider: 'claude',
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'high',
     })
 
     renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
 
-    expect(screen.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
+    // a static model shows its static thinking levels (models in neither the
+    // statics nor the probed catalog legitimately show no Thinking select)
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toBeInTheDocument()
     // the shared dialog path is not offered to freshclaude
     expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
@@ -315,5 +317,77 @@ describe('FreshAgentSettingsButton', () => {
 
     expect(await screen.findByText('Model catalog unavailable — try again')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
+  })
+
+  it('hides the Thinking select when the active model is a probed-only claude row without effort support', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'haiku',
+      effort: 'high',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    // the probed row lands in the merged radio list as the active selection
+    expect(await screen.findByRole('radio', { name: 'Haiku' })).toBeChecked()
+    // haiku declares no effort levels — the static opus[1m] five-level menu
+    // must NOT stand in for it
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
+  })
+
+  it('sources the Thinking select from the active probed claude row’s own levels', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet',
+          provider: 'claude' as const,
+          supportsEffort: true,
+          supportedEffortLevels: ['alpha', 'beta'],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'alpha',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    expect(await screen.findByRole('radio', { name: 'Sonnet' })).toBeChecked()
+    const thinking = await screen.findByRole('combobox', { name: 'Thinking level' })
+    const levels = Array.from(thinking.querySelectorAll('option')).map((option) => option.value)
+    // exactly the probed row's levels — not the static opus[1m] fallback's five
+    expect(levels).toEqual(['alpha', 'beta'])
   })
 })
