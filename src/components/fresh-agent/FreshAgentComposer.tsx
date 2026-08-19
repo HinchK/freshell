@@ -646,7 +646,9 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           </div>
           <div className="fresh-agent-composer-menu-help flex gap-3 border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
             <span>Arrow keys navigate</span>
-            <span>Enter {menuMode === 'files' ? 'inserts' : 'runs'}</span>
+            {/* Enter on a session row INSERTS `/name ` text (it never dispatches),
+                so the hint tracks the highlighted row's kind. */}
+            <span>Enter {menuMode === 'files' || visibleRows[highlightedIndex]?.kind === 'session' ? 'inserts' : 'runs'}</span>
             {menuMode === 'chat' ? <span>Tab completes</span> : null}
             {menuMode === 'files' ? <span>Tab inserts</span> : null}
           </div>

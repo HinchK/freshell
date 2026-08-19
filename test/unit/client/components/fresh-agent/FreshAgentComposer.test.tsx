@@ -369,6 +369,33 @@ describe('FreshAgentComposer', () => {
       expect(onCommand).not.toHaveBeenCalled()
     })
 
+    it('describes Enter accurately for the highlighted row kind: runs for pane actions, inserts for session rows', () => {
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: SESSION_ROWS }}
+          onCommand={vi.fn()}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/' } })
+      const menu = screen.getByRole('menu', { name: 'Slash commands' })
+      // The highlight opens on the first pane action row: Enter RUNS that action.
+      expect(within(menu).getByText('Enter runs')).toBeInTheDocument()
+
+      // Walk the highlight onto the first session row: Enter INSERTS that row's
+      // /name text — the hint must not claim it runs anything.
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      expect(within(menu).getByText('Enter inserts')).toBeInTheDocument()
+      expect(within(menu).queryByText('Enter runs')).toBeNull()
+
+      // Back onto a pane action row, the original hint returns unchanged.
+      fireEvent.keyDown(getInput(), { key: 'ArrowUp' })
+      expect(within(menu).getByText('Enter runs')).toBeInTheDocument()
+      expect(within(menu).queryByText('Enter inserts')).toBeNull()
+    })
+
     it('renders the flat single-list menu structure when no session rows exist', () => {
       render(
         <FreshAgentComposer
