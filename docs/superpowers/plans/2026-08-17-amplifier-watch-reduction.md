@@ -215,6 +215,10 @@ MAJOR findings of adversarial round 3 were bugs in that machinery; it is gone.
     deferred re-probe; a true subagent (`parent_id` present) is never armed
     and never provider-dirties with the toggle off; the deferred set
     cap/TTL drains and overflows per its stated bounds.
+19. Lost-wakeup (as-built correction, round 4, finding D4-2): a dirty mark
+    landing DURING an in-flight refresh is serviced by a follow-up sweep
+    (post-completion dirty re-check, loop until quiescent), never by waiting
+    for some later unrelated trigger.
 
 ### As-built corrections (final fresh-eyes round 4)
 
@@ -231,6 +235,14 @@ MAJOR findings of adversarial round 3 were bugs in that machinery; it is gone.
   self-correction channel / cadence / reconcile per the accepted residuals.
   The interest-gated provider-dirty escalation is unchanged and still fires
   for everything the probe did not arm; subagent dirs remain never-watched.
+- **Refresh lost-wakeup fix (D4-2).** `mark_dirty`/`mark_provider_dirty`
+  attempt `request_refresh` once; an in-flight refresh (holding
+  `refresh_lock`) dropped that attempt, and a sweep drains the dirty maps only
+  at its start — so a mark landing mid-refresh could wait for an unrelated
+  trigger. After every refresh completes, the dirty state is re-checked and
+  one follow-up sweep runs per arrived wave, looping until the re-check comes
+  back empty; the `refresh_lock` guard outlives the loop, preserving the
+  one-sweeper invariant.
 
 ### Measured facts the design rests on (2026-08-17, this machine)
 

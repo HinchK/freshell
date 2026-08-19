@@ -1120,8 +1120,7 @@ impl SessionIndex {
 
     /// Whether any dirty paths or providers are pending.
     pub fn has_dirty(&self) -> bool {
-        !self.dirty_paths.lock().unwrap().is_empty()
-            || !self.dirty_providers.lock().unwrap().is_empty()
+        has_dirty_parts(&self.dirty_paths, &self.dirty_providers)
     }
 
     /// Return a snapshot, pre-sorted `lastActivityAt` DESC then `key()` DESC
@@ -1320,8 +1319,70 @@ impl SessionIndex {
     /// any `&SessionIndex` borrow -- every input is an owned `Arc`/value --
     /// so it runs identically whether awaited inline (cold start) or inside
     /// a detached `tokio::spawn` (warm, stale-while-revalidate refresh).
+    ///
+    /// Delta D4-2 (the lost-wakeup race): `mark_dirty` / `mark_provider_dirty`
+    /// attempt `request_refresh` ONCE; a refresh already in flight holds
+    /// `refresh_lock`, so that attempt is DROPPED — and a sweep drains the
+    /// dirty maps at its START, so a mark landing MID-sweep would otherwise
+    /// sit until some unrelated caller happened to refresh again (the
+    /// pre-watch-reduction handling serviced such marks sub-second). After
+    /// each sweep, re-check the dirty state: if any mark arrived while it
+    /// ran, run ONE follow-up sweep, looping until the re-check comes back
+    /// empty ("quiescent"). The loop is bounded in practice by the marks
+    /// themselves — it re-sweeps only on a NON-EMPTY re-check, and real
+    /// mark floods are already debounce-bounded by the watcher's 200ms
+    /// flush. The caller's `refresh_lock` guard outlives the whole call, so
+    /// no second sweeper can start mid-loop and the one-sweeper invariant
+    /// holds across every pass.
     #[allow(clippy::too_many_arguments)]
     async fn perform_refresh(
+        sources: Vec<Arc<dyn SessionSource>>,
+        file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
+        direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
+        snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
+        persist_path: Option<PathBuf>,
+        persist_state: Arc<StdMutex<PersistState>>,
+        dirty_paths: Arc<StdMutex<HashMap<PathBuf, String>>>,
+        dirty_providers: Arc<StdMutex<HashSet<String>>>,
+        last_full_at: Arc<StdMutex<Option<Instant>>>,
+        ttl: Duration,
+        change_tx: tokio::sync::watch::Sender<u64>,
+        amplifier_root_report: Arc<
+            StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+        >,
+    ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        loop {
+            let pair = Self::perform_refresh_once(
+                sources.clone(),
+                Arc::clone(&file_cache),
+                Arc::clone(&direct_cache),
+                Arc::clone(&snapshot),
+                persist_path.clone(),
+                Arc::clone(&persist_state),
+                Arc::clone(&dirty_paths),
+                Arc::clone(&dirty_providers),
+                Arc::clone(&last_full_at),
+                ttl,
+                change_tx.clone(),
+                Arc::clone(&amplifier_root_report),
+            )
+            .await;
+            // Post-completion dirty drain: a mark that landed mid-sweep is
+            // picked up by exactly one follow-up; marks landing BETWEEN the
+            // re-check and the caller's guard release are serviced by their
+            // own successful `try_lock` once the guard drops.
+            if !has_dirty_parts(&dirty_paths, &dirty_providers) {
+                return pair;
+            }
+        }
+    }
+
+    /// One full sweep of [`Self::perform_refresh`]'s refresh cycle (drain
+    /// the dirty maps, discover/parse, publish, persist). Split out so the
+    /// quiescence loop above can re-run it for mid-sweep marks; callers
+    /// never invoke it directly.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform_refresh_once(
         sources: Vec<Arc<dyn SessionSource>>,
         file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
         direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
@@ -1534,6 +1595,18 @@ fn sorted_names(failures: &HashSet<String>) -> Vec<String> {
     let mut names: Vec<String> = failures.iter().cloned().collect();
     names.sort();
     names
+}
+
+/// The dirty-state re-check shape shared by [`SessionIndex::has_dirty`]
+/// (the public probe) and [`SessionIndex::perform_refresh`]'s
+/// post-completion re-check (delta D4-2): true iff any scoped path or whole
+/// provider is marked pending. Two short lock acquisitions, never held
+/// across an await point.
+fn has_dirty_parts(
+    dirty_paths: &StdMutex<HashMap<PathBuf, String>>,
+    dirty_providers: &StdMutex<HashSet<String>>,
+) -> bool {
+    !dirty_paths.lock().unwrap().is_empty() || !dirty_providers.lock().unwrap().is_empty()
 }
 
 /// One cached direct-listed source's last successful listing, keyed by
@@ -4886,6 +4959,125 @@ pub(crate) mod tests {
         assert!(
             failures.is_empty(),
             "no failure recorded yet — the sweep hasn't published anything"
+        );
+    }
+
+    /// Delta-review D4-2 (the lost-wakeup race): `mark_dirty` /
+    /// `mark_provider_dirty` attempt `request_refresh` ONCE, and an in-flight
+    /// refresh holds `refresh_lock`, so that attempt is dropped — while
+    /// `perform_refresh` drains the dirty maps at sweep START. A mark landing
+    /// MID-refresh therefore sat un-serviced until some unrelated caller
+    /// happened to refresh again (pre-change handling was sub-second). The
+    /// fix: after a refresh completes, re-check the dirty state and run one
+    /// follow-up sweep per arrived wave, looping until quiescent.
+    ///
+    /// Ordering is made DETERMINISTIC with the `BlockingSource` idiom above:
+    /// the warm-up publishes before the gate is armed, so sweep 2 blocks
+    /// inside `discover_checked` with the lock held; the provider mark then
+    /// provably lands MID-sweep (its `request_refresh` attempt is the one
+    /// being dropped); releasing the gate must be followed PROMPTLY by a
+    /// follow-up sweep that drains the mark — observed by `has_dirty()`
+    /// clearing and the discover counter advancing by EXACTLY one extra
+    /// sweep (the follow-up exists, and there is no refresh storm).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mark_landing_during_in_flight_refresh_is_serviced_by_a_follow_up_sweep() {
+        struct GateOnceSource {
+            discovers: Arc<AtomicUsize>,
+            gate_armed: Arc<AtomicBool>,
+            entered: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl SessionSource for GateOnceSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                self.discovers.fetch_add(1, Ordering::SeqCst);
+                // Block on the FIRST entry while the gate is armed (and
+                // disarm, so no later discover can block): this is the
+                // in-flight refresh the mark must land inside.
+                if self.gate_armed.swap(false, Ordering::SeqCst) {
+                    self.entered.store(true, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+                Ok(Vec::new())
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let discovers = Arc::new(AtomicUsize::new(0));
+        let gate_armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let index = std::sync::Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(GateOnceSource {
+                discovers: Arc::clone(&discovers),
+                gate_armed: Arc::clone(&gate_armed),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }) as _],
+            std::time::Duration::from_secs(3600), // TTL holds out every non-mark trigger
+            None,
+        ));
+
+        // Warm publish (ungated): exactly one sweep has run.
+        let _ = index.snapshot().await;
+        assert_eq!(discovers.load(Ordering::SeqCst), 1);
+
+        // Arm the gate, then kick a bare refresh: sweep 2 blocks inside
+        // discover_checked with refresh_lock held.
+        gate_armed.store(true, Ordering::SeqCst);
+        index.request_refresh();
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || entered
+                .load(Ordering::SeqCst))
+            .await,
+            "the gated sweep must be in flight (lock held) before the mark lands"
+        );
+        assert_eq!(discovers.load(Ordering::SeqCst), 2);
+
+        // The mark lands MID-refresh: its request_refresh attempt drops on
+        // the held lock, and the sweep's start-of-sweep drain already ran.
+        index.mark_provider_dirty("claude");
+        assert!(index.has_dirty(), "the mid-sweep mark is pending");
+
+        // Release the gated sweep...
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        // ...and the mark MUST be serviced by a prompt follow-up sweep, not
+        // by waiting on some later unrelated caller: there is no periodic
+        // trigger in scope here at all (TTL is an hour and no snapshot()
+        // poller exists in this test), so only a post-completion re-check +
+        // follow-up can service it.
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || !index.has_dirty()).await,
+            "a mark landing during an in-flight refresh must be drained by a follow-up sweep"
+        );
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || discovers
+                .load(Ordering::SeqCst)
+                == 3)
+            .await,
+            "exactly one follow-up sweep ran: {}",
+            discovers.load(Ordering::SeqCst)
+        );
+        // No refresh storm: quiescence holds after the follow-up.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            discovers.load(Ordering::SeqCst),
+            3,
+            "the follow-up loop must stop once the dirty state is quiescent"
         );
     }
 
