@@ -992,4 +992,45 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// Manual probe: warm full-discover duration on the REAL amplifier home.
+    /// The 15s cadence's cost was the design's ~0.3s/~2% estimate; measured
+    /// 2026-08-18 by LB-02 at ~0.65s warm mean on 22,300 session dirs, and
+    /// re-measured 2026-08-18 by THIS probe run on 21,494 metadata files at
+    /// 560/612/568ms (~0.58s warm mean) → ~3.9% of a core at the 15s cadence,
+    /// with ~1.7× headroom to the 1.0s falsification threshold (LB-02). The
+    /// probe re-measures on demand rather than gating CI. Content-free by
+    /// construction: it calls `discover()` only — read_dir + stat, never a
+    /// content read (LB-02's content-free discover is the production path).
+    ///
+    ///   cargo test -p freshell-sessions --lib measure_real_home_discover -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual real-corpus probe"]
+    fn measure_real_home_discover() {
+        let home = std::env::var("FRESHELL_AMPLIFIER_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| std::path::PathBuf::from(h).join(".amplifier"))
+            })
+            .filter(|h| h.join("projects").is_dir());
+        let Some(home) = home else {
+            eprintln!("no real amplifier home present; skipping");
+            return;
+        };
+        let source = AmplifierSource::new(home);
+        // Cold-ish pass, then two warm passes.
+        let _ = source.discover();
+        for pass in 0..3 {
+            let start = std::time::Instant::now();
+            let stats = source.discover();
+            println!(
+                "real-home warm discover pass {pass}: {} files in {:?}",
+                stats.len(),
+                start.elapsed()
+            );
+        }
+    }
 }

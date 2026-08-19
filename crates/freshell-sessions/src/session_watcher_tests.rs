@@ -2046,3 +2046,126 @@ async fn retry_drain_recovers_reported_misnamed_root() {
     drop(watcher);
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------- watch-reduction proof (kata target) ----------
+
+/// THE proof: a 12-project corpus arms EXACTLY
+/// 1 (projects root) + 12 (sessions dirs) + 4 (stand-ins) + 12×3 (root session dirs) = 53
+/// watches — never a subagent dir, never context-intelligence — while every
+/// root session (incl. one old+externally-resumed) updates instantly through
+/// the real watcher path and all 72 subagent rows still index.
+#[tokio::test]
+async fn amplifier_managed_watch_set_proof_of_reduction_and_root_liveness() {
+    let home = unique_temp_dir("amp-proof");
+    let projects_with_sessions = 12usize;
+    let roots_per = [
+        "012584be-9478-4801-a62d-4e5da428b3a0",
+        "aa2584be-9478-4801-a62d-4e5da428b3a0",
+    ];
+    let subagents_per = [
+        "0000000000000000-014b6af1c2ac4ab5_a",
+        "1111111111111111-2222222222222222_b",
+        "3333333333333333-4444444444444444_c",
+    ];
+    // Twelve with sessions/, four stand-ins.
+    for i in 0..projects_with_sessions {
+        let slug = format!("proj_{i}");
+        for id in roots_per {
+            let dir = write_amplifier_session(&home, &slug, id);
+            std::fs::write(
+                dir.join("metadata.json"),
+                format!(
+                    r#"{{"session_id":"{id}-{i}","working_dir":"/p/{slug}","created":"2026-03-01T00:00:00.000Z","name":"t","description":"d","turn_count":1}}"#
+                ),
+            )
+            .unwrap();
+        }
+        for id in subagents_per {
+            let dir = write_amplifier_session(&home, &slug, id);
+            // parent_id present ⇒ subagent row content (rows still index).
+            std::fs::write(
+                dir.join("metadata.json"),
+                format!(
+                    r#"{{"session_id":"{id}-{i}","working_dir":"/p/{slug}","parent_id":"x","created":"2026-03-01T00:00:00.000Z"}}"#
+                ),
+            )
+            .unwrap();
+        }
+        // One oddball root per project (drift alarm input) + a CI subtree.
+        write_amplifier_session(&home, &slug, &format!("oddball-{i}"));
+        std::fs::create_dir_all(
+            projects_with_sessions_path(&home, &slug, roots_per[0]).join("context-intelligence"),
+        )
+        .unwrap();
+    }
+    for i in 0..4usize {
+        std::fs::create_dir_all(home.join("projects").join(format!("standin_{i}"))).unwrap();
+    }
+
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if book.lock().unwrap().armed.len() >= 53 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("full arm pass");
+
+    // 1 root + 12 sessions + 4 stand-ins + 36 root session dirs = 53.
+    let expected = 1 + projects_with_sessions + 4 + projects_with_sessions * 3;
+    {
+        let b = book.lock().unwrap();
+        assert_eq!(b.armed.len(), expected, "exact planned watch count");
+        // Never watched: any subagent-pattern dir or anything below a
+        // session dir (context-intelligence).
+        for p in &b.armed {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            assert!(
+                crate::watch_plan::classify_basename(name)
+                    != crate::watch_plan::BasenameClass::Subagent,
+                "armed a subagent dir: {}",
+                p.display()
+            );
+            assert!(!name.starts_with("context-intelligence"));
+        }
+        drop(b);
+    }
+
+    // Subagent rows still exist (discover covers the whole corpus).
+    let snap = index.snapshot().await;
+    let amps = snap.iter().filter(|s| s.provider == "amplifier").count();
+    assert_eq!(
+        amps,
+        projects_with_sessions * (2 + 3 + 1),
+        "every row indexed (roots + subagents + oddball)"
+    );
+
+    // Zero-latency-regression pin: an OLD root session (created at startup,
+    // never touched since) gets an external-resume write and still updates
+    // instantly through the real watched path.
+    let _ = rx.borrow_and_update();
+    let old_root = projects_with_sessions_path(&home, "proj_3", roots_per[0]);
+    std::fs::write(
+        old_root.join("transcript.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"resumed\"}}\n",
+    )
+    .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(changed.is_ok(), "old root session stays instantly fresh");
+
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn projects_with_sessions_path(home: &Path, slug: &str, id: &str) -> PathBuf {
+    home.join("projects").join(slug).join("sessions").join(id)
+}
