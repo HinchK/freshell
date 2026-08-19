@@ -8,6 +8,7 @@ import {
   type SDKResultMessage,
   type SDKPartialAssistantMessage,
   type SDKStatusMessage,
+  type SDKCommandsChangedMessage,
   type Query as SdkQuery,
   type Options as SdkOptions,
   type CanUseTool,
@@ -15,6 +16,7 @@ import {
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
+import { FreshAgentSessionCommandSchema, type FreshAgentSessionCommand } from '../shared/fresh-agent-contract.js'
 import { logger } from './logger.js'
 import { synthesizeClaudeFreshAgentLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
 import { nextMonotonicTurnCompleteAt } from './fresh-agent/turn-complete-clock.js'
@@ -104,6 +106,34 @@ export function createClaudeSdkOptions(input: ClaudeSdkOptionsInput): SdkOptions
   return options
 }
 
+/**
+ * Normalize raw SDK slash-command rows (create-time probe result or a
+ * commands_changed push) through the shared contract schema at the state
+ * boundary. Push-level tolerance: if ANY row is invalid, the whole payload is
+ * rejected (returns null) so a malformed push cannot partially clobber the
+ * prior catalog. Field coercion before validation: description absent/non-string
+ * becomes ''; aliases is dropped unless it is an array (the SDK has been observed
+ * emitting explicit null); name passes through so schema min(1) can reject it.
+ */
+function normalizeSlashCommandRows(rows: unknown): FreshAgentSessionCommand[] | null {
+  if (!Array.isArray(rows)) return null
+  const normalized: FreshAgentSessionCommand[] = []
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null
+    const raw = row as { name?: unknown; description?: unknown; argumentHint?: unknown; aliases?: unknown }
+    const candidate: Record<string, unknown> = {
+      name: raw.name,
+      description: typeof raw.description === 'string' ? raw.description : '',
+    }
+    if (typeof raw.argumentHint === 'string') candidate.argumentHint = raw.argumentHint
+    if (Array.isArray(raw.aliases)) candidate.aliases = raw.aliases
+    const parsed = FreshAgentSessionCommandSchema.safeParse(candidate)
+    if (!parsed.success) return null
+    normalized.push(parsed.data)
+  }
+  return normalized
+}
+
 export class SdkBridge extends EventEmitter {
   private sessions = new Map<string, SdkSessionState>()
   private processes = new Map<string, SessionProcess>()
@@ -123,6 +153,10 @@ export class SdkBridge extends EventEmitter {
       })),
       pendingPermissions: new Map(state.pendingPermissions),
       pendingQuestions: new Map(state.pendingQuestions),
+      slashCommandNames: state.slashCommandNames ? [...state.slashCommandNames] : undefined,
+      terminalCommandNames: state.terminalCommandNames ? [...state.terminalCommandNames] : undefined,
+      commandCatalog: state.commandCatalog ? [...state.commandCatalog] : undefined,
+      commands: state.commands ? [...state.commands] : undefined,
     }
   }
 
@@ -229,6 +263,27 @@ export class SdkBridge extends EventEmitter {
     // Start consuming the message stream in the background
     this.consumeStream(sessionId, sdkQuery).catch((err) => {
       log.error({ sessionId, err }, 'SDK stream error')
+    })
+
+    // Fire-and-forget slash-command catalog probe (VAL-B: resolves in ~1.2–1.5s over
+    // the control channel, independent of the lazy streamed init frame). NEVER awaited —
+    // an await here would hold the create path on a low-single-digit-second round-trip.
+    // Rejection or an invalid payload = catalog absent; the session is unaffected.
+    void sdkQuery.supportedCommands().then((rows) => {
+      const current = this.sessions.get(sessionId)
+      if (!current) return
+      // Stale-probe rule: a commands_changed push incorporated since the probe was
+      // fired carries the fresher catalog; the late probe result must not clobber it.
+      if (current.commandsChangedSeen) return
+      const normalized = normalizeSlashCommandRows(rows)
+      if (normalized === null) {
+        log.debug({ sessionId }, 'Ignoring invalid supportedCommands probe payload')
+        return
+      }
+      current.commandCatalog = normalized
+      this.maybePublishSessionCommands(sessionId, current)
+    }).catch((err) => {
+      log.debug({ sessionId, err: err instanceof Error ? err.message : String(err) }, 'supportedCommands probe failed; command catalog absent')
     })
 
     return Object.assign(state, {
@@ -374,6 +429,12 @@ export class SdkBridge extends EventEmitter {
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
           state.status = 'connected'
+          // Capture the init frame's slash-command name-lists (both optional per
+          // sdk.d.ts:4766-4770). The terminal list drives the publish subtract;
+          // absent = empty subtract list (data-driven, no name denylist).
+          state.slashCommandNames = Array.isArray(init.slash_commands) ? [...init.slash_commands] : undefined
+          state.terminalCommandNames = Array.isArray(init.terminal_slash_commands) ? [...init.terminal_slash_commands] : undefined
+          state.commandsInitSeen = true
           this.syncRestoreLedger(state)
           this.broadcastToSession(sessionId, {
             type: 'sdk.session.init',
@@ -383,6 +444,19 @@ export class SdkBridge extends EventEmitter {
             cwd: state.cwd,
             tools: state.tools,
           })
+          this.maybePublishSessionCommands(sessionId, state)
+        } else if (msg.subtype === 'commands_changed') {
+          // Fire-and-forget REPLACE push of the full slash-command list (SDK 0.3).
+          // On invalid payload: ignore and keep the prior catalog.
+          const changed = msg as SDKCommandsChangedMessage
+          const rows = normalizeSlashCommandRows(changed.commands)
+          if (rows === null) {
+            log.debug({ sessionId }, 'Ignoring invalid commands_changed payload; prior catalog kept')
+            break
+          }
+          state.commandCatalog = rows
+          state.commandsChangedSeen = true
+          this.maybePublishSessionCommands(sessionId, state)
         } else if (msg.subtype === 'status') {
           const statusMsg = msg as SDKStatusMessage
           if (statusMsg.status === 'compacting') {
@@ -516,6 +590,27 @@ export class SdkBridge extends EventEmitter {
     const at = nextMonotonicTurnCompleteAt(state.lastWaitingAt, Date.now())
     state.lastWaitingAt = at
     this.broadcastToSession(sessionId, { type: 'sdk.turn.waiting', sessionId, at })
+  }
+
+  /**
+   * Publish the slash-command catalog at the JOIN of (init frame landed, a
+   * catalog source present). The streamed system/init frame is lazy (VAL-B: it
+   * arrives with the first turn), while supportedCommands() resolves over the
+   * control channel pre-first-turn — so whichever of init/probe/push arrives
+   * second completes the join here. Publish subtracts rows whose name is in the
+   * session's LATEST terminal list (init re-emits per turn and may re-tag), then
+   * emits the existing snapshot-invalidation edge (sdk.session.changed →
+   * freshAgent.session.changed → the client refetches the snapshot).
+   */
+  private maybePublishSessionCommands(sessionId: string, state: SdkSessionState): void {
+    if (!state.commandsInitSeen || state.commandCatalog === undefined) return
+    const terminal = new Set(state.terminalCommandNames ?? [])
+    state.commands = state.commandCatalog.filter((row) => !terminal.has(row.name))
+    this.broadcastToSession(sessionId, {
+      type: 'sdk.session.changed',
+      sessionId,
+      reason: 'session-commands',
+    })
   }
 
   private async handlePermissionRequest(

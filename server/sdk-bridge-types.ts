@@ -39,6 +39,7 @@ export type {
 
 import type { PermissionUpdate, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import type { ContentBlock, Usage } from '../shared/ws-protocol.js'
+import type { FreshAgentSessionCommand } from '../shared/fresh-agent-contract.js'
 
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 export type SdkRestoreFailureCode =
@@ -68,6 +69,7 @@ export type SdkServerMessage =
     streamingText?: string
   }
   | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.session.changed'; sessionId: string; reason?: string }
   | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
   | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
@@ -131,6 +133,18 @@ export interface SdkSessionState {
   lastTurnCompleteAt?: number
   /** Last emitted turn-waiting `at`, kept per session so the waiting edge stays strictly monotonic, independent of the completion edge. */
   lastWaitingAt?: number
+  /** Latest system/init `slash_commands` name-list, refreshed on each init frame. Diagnostic only; the publish subtract uses terminalCommandNames. */
+  slashCommandNames?: string[]
+  /** Latest system/init `terminal_slash_commands` name-list. The SDK marks it optional: absent = empty subtract list (data-driven; no name denylist). */
+  terminalCommandNames?: string[]
+  /** True once the first system/init frame has landed — the join gate for publishing the command catalog. */
+  commandsInitSeen?: boolean
+  /** Latest validated catalog rows from a catalog source (create-time probe or commands_changed push), before the terminal subtract. REPLACE-assigned, never mutated. */
+  commandCatalog?: FreshAgentSessionCommand[]
+  /** True once a commands_changed push has been incorporated; a late-resolving create-probe is dropped as stale. */
+  commandsChangedSeen?: boolean
+  /** Published catalog = commandCatalog minus rows whose name is in the latest terminal list. Undefined until the init-frame + catalog-source join has fired. */
+  commands?: FreshAgentSessionCommand[]
 }
 
 export interface SdkReplayState {

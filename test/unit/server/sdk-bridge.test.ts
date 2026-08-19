@@ -23,6 +23,35 @@ let mockSupportedModels: any[] = [
 /** When set, supportedModels() rejects with this error */
 let mockSupportedModelsError: Error | null = null
 let mockSupportedModelsCallCount = 0
+/** Mock supportedCommands return value (the create-time slash-command catalog probe) */
+let mockSupportedCommandsRows: any[] = []
+/** When set, supportedCommands() rejects with this error. Defaults to rejected so sessions
+ *  whose tests opt out of the probe behave like a bridge with nothing to advertise. */
+let mockSupportedCommandsError: Error | null = new Error('supportedCommands unavailable')
+/** When set, supportedCommands() returns this promise so the test controls probe timing */
+let mockSupportedCommandsDeferred: {
+  promise: Promise<any[]>
+  resolve: (rows: any[]) => void
+  reject: (err: Error) => void
+} | null = null
+let mockSupportedCommandsCallCount = 0
+/** Live-phase message channel: pushLiveSdkMessage(msg) yields mid-test while the mock
+ *  stream is held open (mockKeepStreamOpen), so tests can stream frames AFTER create. */
+let mockLivePushes: any[] = []
+let mockLivePushWaiters: Array<() => void> = []
+
+function makeSupportedCommandsDeferred() {
+  let resolve!: (rows: any[]) => void
+  let reject!: (err: Error) => void
+  const promise = new Promise<any[]>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+function pushLiveSdkMessage(msg: any) {
+  mockLivePushes.push(msg)
+  const waiters = mockLivePushWaiters.splice(0, mockLivePushWaiters.length)
+  for (const waiter of waiters) waiter()
+}
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ options }: any) => {
@@ -38,7 +67,23 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
         throw mockStreamError
       }
       if (mockKeepStreamOpen) {
-        await new Promise<void>(resolve => { mockStreamEndResolve = resolve })
+        // Held-open live phase: yields any pushed live messages until released.
+        // When nothing is pushed this is byte-equivalent to awaiting mockStreamEndResolve.
+        let released = false
+        while (!released) {
+          if (mockLivePushes.length > 0) {
+            yield mockLivePushes.shift()
+            continue
+          }
+          await new Promise<void>((resolve) => {
+            mockStreamEndResolve = () => { released = true; resolve() }
+            if (mockLivePushes.length > 0) {
+              resolve()
+              return
+            }
+            mockLivePushWaiters.push(resolve)
+          })
+        }
       }
     })()
     // Add Query methods
@@ -53,6 +98,16 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
         throw mockSupportedModelsError
       }
       return mockSupportedModels
+    })
+    ;(gen as any).supportedCommands = vi.fn(() => {
+      mockSupportedCommandsCallCount += 1
+      if (mockSupportedCommandsDeferred) {
+        return mockSupportedCommandsDeferred.promise
+      }
+      if (mockSupportedCommandsError) {
+        return Promise.reject(mockSupportedCommandsError)
+      }
+      return Promise.resolve(mockSupportedCommandsRows)
     })
     return gen
   }),
@@ -77,6 +132,12 @@ describe('SdkBridge', () => {
       { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
     ]
     mockSupportedModelsError = null
+    mockSupportedCommandsRows = []
+    mockSupportedCommandsError = new Error('supportedCommands unavailable')
+    mockSupportedCommandsDeferred = null
+    mockSupportedCommandsCallCount = 0
+    mockLivePushes = []
+    mockLivePushWaiters = []
     bridge = new SdkBridge()
   })
 
@@ -1681,6 +1742,298 @@ describe('SdkBridge', () => {
       expect(assistantBroadcasts).toHaveLength(1)
       expect(assistantBroadcasts[0].content).toEqual([{ type: 'text', text: 'post-benign liveness: model_refusal_no_fallback' }])
       expect(received.find((m) => m.type === 'sdk.result')).toBeUndefined()
+    })
+  })
+
+  describe('slash-command catalogs', () => {
+    const initFrame = (overrides: Record<string, unknown> = {}) => ({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'cli-123',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp',
+      tools: ['Bash'],
+      slash_commands: ['compact', 'review', 'doctor', 'color'],
+      terminal_slash_commands: ['doctor', 'color'],
+      uuid: 'test-uuid',
+      ...overrides,
+    })
+
+    it('fires one fire-and-forget supportedCommands probe at create and publishes the terminal-subtracted catalog at the init+probe join', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // The probe is fire-and-forget: createSession never awaited it (the deferred is
+      // still pending), the init frame has landed, and nothing is published pre-join.
+      expect(mockSupportedCommandsCallCount).toBe(1)
+      expect(bridge.getSession(session.sessionId)?.status).toBe('connected')
+      expect(bridge.getSession(session.sessionId)?.commands).toBeUndefined()
+      expect(received.find((m) => m.type === 'sdk.session.changed')).toBeUndefined()
+
+      deferred.resolve([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '', aliases: ['compress-messages'] },
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+        { name: 'doctor', description: 'Health-check the setup', argumentHint: '', aliases: ['checkup'] },
+        { name: 'color', description: 'Set the prompt bar color', argumentHint: '[red|blue]' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // Terminal-tagged rows (doctor, color) are subtracted; surviving rows keep every
+      // probed field verbatim (description, argumentHint, aliases).
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '', aliases: ['compress-messages'] },
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+    })
+
+    it('publishes at the init frame when the probe resolved first (pre-first-turn grace: absent until then, no crash)', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      deferred.resolve([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // Grace window: the catalog is captured but the init frame has not landed, so the
+      // published slot stays absent and no invalidation edge has fired.
+      expect(bridge.getSession(session.sessionId)?.commands).toBeUndefined()
+      expect(received.find((m) => m.type === 'sdk.session.changed')).toBeUndefined()
+
+      // terminal_slash_commands absent -> empty subtract list
+      const lateInit = initFrame({ slash_commands: ['review'] })
+      delete (lateInit as Record<string, unknown>).terminal_slash_commands
+      pushLiveSdkMessage(lateInit)
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+    })
+
+    it('re-applies the terminal subtract when a refreshed init frame changes the terminal list', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      deferred.resolve([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+        { name: 'doctor', description: 'Health-check the setup', argumentHint: '' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+
+      // The CLI re-emits init per turn (VAL-B); a later frame tags review terminal-bound
+      // and the published catalog re-subtracts against the latest list.
+      pushLiveSdkMessage(initFrame({ terminal_slash_commands: ['doctor', 'review'] }))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(2)
+    })
+
+    it('commands_changed REPLACEs the catalog, re-applies the latest terminal subtract, re-invalidates, and the stream stays live', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      deferred.resolve([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+
+      // REPLACE: the probe rows are gone; the push becomes the whole catalog, and the
+      // session's latest terminal list re-applies (doctor stays hidden).
+      pushLiveSdkMessage({
+        type: 'system',
+        subtype: 'commands_changed',
+        commands: [
+          { name: 'review', description: 'Review the current changes', argumentHint: '[file]', aliases: ['rev'] },
+          { name: 'doctor', description: 'Health-check the setup', argumentHint: '' },
+        ],
+        uuid: 'test-uuid-2',
+        session_id: 'cli-123',
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]', aliases: ['rev'] },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(2)
+
+      // Liveness: a subsequent assistant frame still broadcasts, proving the new arm
+      // consumed the push without wedging the stream (benign-shape idiom).
+      pushLiveSdkMessage({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'post-commands_changed liveness' }] },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid-3',
+        session_id: 'cli-123',
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const assistantBroadcasts = received.filter((m) => m.type === 'sdk.assistant')
+      expect(assistantBroadcasts).toHaveLength(1)
+      expect(assistantBroadcasts[0].content).toEqual([{ type: 'text', text: 'post-commands_changed liveness' }])
+    })
+
+    it('drops a stale create-probe that resolves after a commands_changed was incorporated', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+      mockMessages.push({
+        type: 'system',
+        subtype: 'commands_changed',
+        commands: [
+          { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+          { name: 'doctor', description: 'Health-check the setup', argumentHint: '' },
+        ],
+        uuid: 'test-uuid-2',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // init + commands_changed joined first: the push published, subtracted.
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+
+      // The create-time probe lands late and must be dropped, not REPLACE the push.
+      deferred.resolve([
+        { name: 'stale', description: 'Late probe row that must be dropped', argumentHint: '' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+    })
+
+    it('tolerates a rejected supportedCommands probe (session unaffected, commands absent)', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = new Error('probe blew up')
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(mockSupportedCommandsCallCount).toBe(1)
+      expect(bridge.getSession(session.sessionId)?.status).toBe('connected')
+      expect(bridge.getSession(session.sessionId)?.commands).toBeUndefined()
+      expect(received.find((m) => m.type === 'sdk.session.init')).toBeDefined()
+      expect(received.find((m) => m.type === 'sdk.session.changed')).toBeUndefined()
+    })
+
+    it('ignores an invalid commands_changed payload and keeps the prior catalog', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      deferred.resolve([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+
+      // A push with a schema-invalid row (empty name) is ignored whole.
+      pushLiveSdkMessage({
+        type: 'system',
+        subtype: 'commands_changed',
+        commands: [
+          { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+          { name: '', description: 'invalid: no name', argumentHint: '' },
+        ],
+        uuid: 'test-uuid-2',
+        session_id: 'cli-123',
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+
+      // A push whose commands field is not an array is likewise ignored.
+      pushLiveSdkMessage({
+        type: 'system',
+        subtype: 'commands_changed',
+        commands: 'not-an-array',
+        uuid: 'test-uuid-3',
+        session_id: 'cli-123',
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+
+      // Liveness after the ignored pushes.
+      pushLiveSdkMessage({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'post-invalid-push liveness' }] },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid-4',
+        session_id: 'cli-123',
+      })
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(received.filter((m) => m.type === 'sdk.assistant')).toHaveLength(1)
     })
   })
 })
