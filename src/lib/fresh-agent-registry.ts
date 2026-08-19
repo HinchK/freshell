@@ -64,7 +64,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'claude',
     label: 'Freshclaude',
     icon: FreshclaudeIcon,
-    defaultModel: 'claude-opus-4-6',
+    defaultModel: 'opus[1m]',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {
@@ -101,7 +101,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'claude',
     label: 'Kilroy',
     icon: KilroyIcon,
-    defaultModel: 'claude-opus-4-6',
+    defaultModel: 'opus[1m]',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {

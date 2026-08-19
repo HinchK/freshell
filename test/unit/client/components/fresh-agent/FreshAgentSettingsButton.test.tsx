@@ -159,7 +159,7 @@ describe('FreshAgentSettingsButton', () => {
     renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
 
-    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toBeInTheDocument()
     // the shared dialog path is not offered to freshclaude
     expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
@@ -171,7 +171,7 @@ describe('FreshAgentSettingsButton', () => {
     seedPane(store, {
       sessionType: 'freshclaude',
       provider: 'claude',
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'high',
       initialCwd: '/repo/project-b',
     })
@@ -185,14 +185,15 @@ describe('FreshAgentSettingsButton', () => {
     expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshclaude', expect.objectContaining({ cwd: '/repo/project-b' }))
 
     // statics render instantly and stay first; probed rows swap in when the fetch resolves
-    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeInTheDocument()
-    expect(await screen.findByRole('radio', { name: 'Opus (1M context)' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeInTheDocument()
     expect(screen.getByRole('radio', { name: 'Sonnet' })).toBeInTheDocument()
 
-    // one row per unique id: 1 static + 2 probed
-    expect(screen.getAllByRole('radio')).toHaveLength(3)
+    // one row per unique id: the probed opus[1m] row dedupes into the static
+    // row (static label wins), so 1 static + 1 remaining probed row
+    expect(screen.getAllByRole('radio', { name: /Opus/ })).toHaveLength(1)
+    expect(screen.getAllByRole('radio')).toHaveLength(2)
     // the checked radio is the persisted static model
-    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
   })
 
   it('fires exactly one capabilities fetch for a kilroy popover via its claude provider', async () => {
@@ -215,7 +216,9 @@ describe('FreshAgentSettingsButton', () => {
       expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
     })
     expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('kilroy', expect.anything())
-    expect(await screen.findByRole('radio', { name: 'Opus (1M context)' })).toBeInTheDocument()
+    // probed rows surface; the probed opus[1m] row folds into the static row,
+    // leaving the probed sonnet row as the appended entry
+    expect(await screen.findByRole('radio', { name: 'Sonnet' })).toBeInTheDocument()
   })
 
   it('shows a compact Model row for freshcodex and retires the radio list and Thinking dropdown', () => {

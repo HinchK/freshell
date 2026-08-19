@@ -21,9 +21,9 @@ export const FRESHOPENCODE_DEFAULT_EFFORT = 'max'
 export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
   freshclaude: [
     {
-      value: 'claude-opus-4-6',
-      label: 'Claude Opus 4.6',
-      thinkingEfforts: ['low', 'medium', 'high'],
+      value: 'opus[1m]',
+      label: 'Claude Opus 5 (1M context)',
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],
@@ -49,9 +49,9 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
   ],
   kilroy: [
     {
-      value: 'claude-opus-4-6',
-      label: 'Claude Opus 4.6',
-      thinkingEfforts: ['low', 'medium', 'high'],
+      value: 'opus[1m]',
+      label: 'Claude Opus 5 (1M context)',
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],

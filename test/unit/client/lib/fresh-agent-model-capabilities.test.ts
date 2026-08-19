@@ -399,9 +399,9 @@ describe('fresh-agent-model-capabilities opencode catalog helpers', () => {
 describe('mergeClaudeSelectorOptions', () => {
   const staticOptions = [
     {
-      value: 'claude-opus-4-6',
-      label: 'Claude Opus 4.6',
-      thinkingEfforts: ['low', 'medium', 'high'],
+      value: 'opus[1m]',
+      label: 'Claude Opus 5 (1M context)',
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       defaultEffort: 'high',
     },
   ] as const
@@ -415,11 +415,11 @@ describe('mergeClaudeSelectorOptions', () => {
       models: [
         {
           id: 'opus[1m]',
-          displayName: 'Opus (1M context)',
+          displayName: 'Probed duplicate that must not replace the static',
           provider: 'claude',
-          supportsEffort: true,
-          supportedEffortLevels: ['low', 'high'],
-          supportsAdaptiveThinking: true,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
         },
         {
           id: 'claude-opus-4-7',
@@ -430,30 +430,30 @@ describe('mergeClaudeSelectorOptions', () => {
           supportsAdaptiveThinking: false,
         },
         {
-          id: 'claude-opus-4-6',
-          displayName: 'Probed duplicate that must not replace the static',
+          id: 'sonnet',
+          displayName: 'Sonnet',
           provider: 'claude',
-          supportsEffort: false,
-          supportedEffortLevels: [],
-          supportsAdaptiveThinking: false,
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'medium', 'high'],
+          supportsAdaptiveThinking: true,
         },
       ],
     }, staticOptions)
 
     expect(merged.modelOptions).toEqual([
       {
-        value: 'claude-opus-4-6',
-        label: 'Claude Opus 4.6',
-        thinkingEfforts: ['low', 'medium', 'high'],
+        value: 'opus[1m]',
+        label: 'Claude Opus 5 (1M context)',
+        thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
         defaultEffort: 'high',
       },
-      { value: 'opus[1m]', label: 'Opus (1M context)' },
       { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
+      { value: 'sonnet', label: 'Sonnet' },
     ])
     expect(merged.labelById).toEqual({
-      'claude-opus-4-6': 'Claude Opus 4.6',
-      'opus[1m]': 'Opus (1M context)',
+      'opus[1m]': 'Claude Opus 5 (1M context)',
       'claude-opus-4-7': 'Claude Opus 4.7',
+      'sonnet': 'Sonnet',
     })
   })
 
@@ -461,7 +461,7 @@ describe('mergeClaudeSelectorOptions', () => {
     const merged = mergeClaudeSelectorOptions(null, staticOptions)
 
     expect(merged.modelOptions).toEqual(staticOptions)
-    expect(merged.labelById).toEqual({ 'claude-opus-4-6': 'Claude Opus 4.6' })
+    expect(merged.labelById).toEqual({ 'opus[1m]': 'Claude Opus 5 (1M context)' })
   })
 
   it('returns statics and static labels unchanged for an empty catalog', () => {
@@ -474,7 +474,7 @@ describe('mergeClaudeSelectorOptions', () => {
     }, staticOptions)
 
     expect(merged.modelOptions).toEqual(staticOptions)
-    expect(merged.labelById).toEqual({ 'claude-opus-4-6': 'Claude Opus 4.6' })
+    expect(merged.labelById).toEqual({ 'opus[1m]': 'Claude Opus 5 (1M context)' })
   })
 })
 
