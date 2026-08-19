@@ -925,22 +925,36 @@ fn amplifier_teardown_project(
 /// The DEPTH-0 self-removal of the ARMED projects root (LB-01: it surfaces
 /// tagless as `Remove(File)` / untracked `Name(From)`; nothing watches the
 /// root's parent, so depth-0 self-events are the ONLY way the watcher
-/// learns the root is gone). The kernel already dropped the watch via
-/// IN_IGNORED, so the explicit unwatch is tolerated belt-and-braces; the
-/// whole managed set lives under the root, so every bookkeeping entry
-/// prefixed by it is dropped; and the root ALONE re-enters absence
+/// learns the root is gone). Unwatch EVERY armed descendant, not just the
+/// root: inotify watches follow inodes, and notify maps `MOVE_SELF` onto
+/// the watched object only — a MOVED (not deleted) root leaves every
+/// descendant non-recursive watch live, reporting under its stale path,
+/// invisible to the ledger and the budget WARN, and un-tearable when a
+/// replacement root is armed (delta review D1-1; the same sweep
+/// [`amplifier_teardown_project`] performs at depth 1). For the delete
+/// shape these descendant unwatches are the tolerated `WatchNotFound`
+/// no-ops (the kernel already IN_IGNORED them). Then the whole managed
+/// set's bookkeeping is dropped, and the root ALONE re-enters absence
 /// tracking (design: "only the provider root itself re-enters absence
 /// tracking when it disappears") — Task 3's rearm-tick absent re-check
 /// then re-arms a returned root with the full structural cascade, so
-/// delete-and-recreate leaves a live watcher. Pure bookkeeping; the
-/// dispatch issues the provider-dirty escalation right after (mirroring
-/// depth 1).
+/// delete-and-recreate (and move-away-and-recreate) leaves a live watcher.
+/// The dispatch issues the provider-dirty escalation right after
+/// (mirroring depth 1).
 fn amplifier_root_vanished(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
     projects_root: &Path,
 ) {
-    unwatch_tolerated(watcher, "amplifier", projects_root);
+    let doomed: Vec<PathBuf> = book
+        .armed
+        .iter()
+        .filter(|p| p.starts_with(projects_root))
+        .cloned()
+        .collect();
+    for path in &doomed {
+        unwatch_tolerated(watcher, "amplifier", path);
+    }
     structural_remove(book, projects_root);
     book.absent.insert(projects_root.to_path_buf());
 }
@@ -985,14 +999,40 @@ fn write_remove_dispatch(
             index.mark_provider_dirty("amplifier");
             true
         }
-        // Depth 2: `sessions/` removed under an armed sessions watch →
-        // swap back to the stand-in (arm the project, unwatch the
-        // sessions-dir entry, drop its children bookkeeping). Already a
-        // stand-in (or never armed): nothing; others → the caller's `_ => {}`.
+        // Depth 2: `sessions/` removed (or renamed away) under an armed
+        // sessions watch → (a) unwatch EVERY armed subtree member — same
+        // inode-follow hazard as depth 1/depth 0: a MOVED sessions/ tree
+        // leaves its session-dir watches live under stale paths —
+        // (b) scoped-prune-mark each removed session dir's metadata.json
+        // (same semantics as `amplifier_remove_session`) so cached rows
+        // prune promptly, then (c) swap back to the stand-in (arm the
+        // project) so a re-created sessions/ is observed. Already a
+        // stand-in (or never armed): nothing; others → the caller's
+        // `_ => {}`.
         Some(2) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
             if book.armed.contains(path) {
-                unwatch_tolerated(watcher, "amplifier", path);
+                let doomed: Vec<PathBuf> = book
+                    .armed
+                    .iter()
+                    .filter(|p| p.starts_with(path))
+                    .cloned()
+                    .collect();
+                for doomed_path in &doomed {
+                    unwatch_tolerated(watcher, "amplifier", doomed_path);
+                }
                 structural_remove(book, path);
+                // Session dirs sit exactly ONE level below the sessions dir
+                // (depth-relative, never basename-routed).
+                let marks: Vec<(PathBuf, String)> = doomed
+                    .iter()
+                    .filter(|p| {
+                        p.strip_prefix(path)
+                            .map(|r| r.components().count() == 1)
+                            .unwrap_or(false)
+                    })
+                    .map(|p| (p.join("metadata.json"), "amplifier".to_owned()))
+                    .collect();
+                index.mark_dirty(&marks);
                 if let Some(project) = path.parent() {
                     arm_sessions_or_standin(book, watcher, outcome, project, true);
                 }

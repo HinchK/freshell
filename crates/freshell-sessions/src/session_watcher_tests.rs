@@ -495,6 +495,308 @@ fn book_has_path_named(b: &ManagedBook, name: &str) -> bool {
     b.armed.iter().any(|p| p.ends_with(name))
 }
 
+/// Delta-review D1-1/D1-2 probe (the Task-10 `/proc/self/fdinfo` idiom,
+/// refined): the inode numbers this process CURRENTLY holds inotify
+/// watches on, parsed from the `inotify wd:… ino:<hex>` fdinfo lines.
+/// Negative event windows can never distinguish "explicitly released" from
+/// "kernel auto-dropped" (LB-01's kernel-auto-drop ambiguity), so the
+/// watch-release assertions below read the KERNEL state directly. The
+/// lookup is keyed by THIS fixture's inodes, so concurrent tests' watcher
+/// activity in the same test process can never pollute the assertion.
+/// Linux-only by construction (inotify); callers gate on the returned set
+/// being non-empty so a stripped /proc degrades to a skip rather than a
+/// false pass.
+#[cfg(target_os = "linux")]
+fn watched_inotify_inos() -> std::collections::HashSet<u64> {
+    let mut inos = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") else {
+        return inos;
+    };
+    for entry in entries.flatten() {
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in content.lines() {
+            // "inotify wd:5 ino:1a24001 sdev:800001 mask:fce …"
+            let Some(rest) = line.strip_prefix("inotify wd:") else {
+                continue;
+            };
+            let Some(ino_field) = rest.split_whitespace().nth(1) else {
+                continue;
+            };
+            let Some(hex) = ino_field.strip_prefix("ino:") else {
+                continue;
+            };
+            if let Ok(ino) = u64::from_str_radix(hex, 16) {
+                inos.insert(ino);
+            }
+        }
+    }
+    inos
+}
+
+#[cfg(target_os = "linux")]
+fn ino_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// Delta-review D1-1 (inode-follow on the projects ROOT): `mv` of the root
+/// is NOT the `remove_dir_all` shape — the kernel auto-drops nothing, so
+/// without explicit descendant unwatches every armed sessions/session dir
+/// watch follows its moved inode: still reporting under the stale path,
+/// untracked by the ledger, invisible to the budget WARN, and un-tearable
+/// when a replacement root is armed. The depth-0 vanish path must unwatch
+/// EVERY armed descendant before clearing the bookkeeping — proven here by
+/// direct kernel observation (the fixture's inode numbers must leave this
+/// process's inotify fdinfo), and a re-created root at the original path
+/// must re-arm with the FULL cascade.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn moved_projects_root_releases_every_descendant_watch_and_rearms_on_return() {
+    let home = unique_temp_dir("amp-rootmv");
+    let s_a = write_amplifier_session(&home, "p1", "aa2584be-9478-4801-a62d-4e5da428b3a0");
+    let s_b = write_amplifier_session(&home, "p1", "bb2584be-9478-4801-a62d-4e5da428b3a0");
+    let s_c = write_amplifier_session(&home, "p2", "cc2584be-9478-4801-a62d-4e5da428b3a0");
+    let projects = home.join("projects");
+
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home).with_rearm_interval(1);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    let _ = rx.borrow_and_update();
+
+    // Full expected set: root + 2 sessions dirs + 3 session dirs.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.len() == 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("startup arming completes");
+
+    // Record the inode of every armed path. Re-key by the fixture paths
+    // rather than the live book (renames do not change inodes, so these
+    // remain the identifiers of the moved directories).
+    let fixture_dirs = [
+        projects.clone(),
+        projects.join("p1").join("sessions"),
+        s_a.clone(),
+        s_b.clone(),
+        projects.join("p2").join("sessions"),
+        s_c.clone(),
+    ];
+    let fixture_inos: Vec<u64> = fixture_dirs.iter().map(|p| ino_of(p)).collect();
+    let watched_before = watched_inotify_inos();
+    if watched_before.is_empty() {
+        eprintln!("skipping fdinfo assertions: /proc/self/fdinfo unreadable");
+    } else {
+        for ino in &fixture_inos {
+            assert!(
+                watched_before.contains(ino),
+                "sanity: armed fixture dir must be kernel-watched (ino {ino})"
+            );
+        }
+    }
+
+    // MOVE the root away (same fs, rename): the depth-0 vanish path must
+    // release every descendant's watch — not just the root's own.
+    let moved_to = home.join("projects-moved");
+    std::fs::rename(&projects, &moved_to).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cleared = {
+                let b = book.lock().unwrap();
+                b.absent.contains(&projects) && !b.armed.iter().any(|p| p.starts_with(&projects))
+            };
+            if cleared {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("moved root enters absent; whole subtree forgotten");
+
+    if !watched_before.is_empty() {
+        let watched_after = watched_inotify_inos();
+        for ino in &fixture_inos {
+            assert!(
+                !watched_after.contains(ino),
+                "moved descendant watch must be explicitly released, not left \
+                 following its inode (ino {ino} still kernel-watched)"
+            );
+        }
+    }
+
+    // Re-create the root at the ORIGINAL path with a session while the root
+    // is tracked absent: only the rearm tick's full return cascade can pick
+    // this up first-line.
+    let _ = rx.borrow_and_update();
+    let returned = write_amplifier_session(&home, "p3", "dd2584be-9478-4801-a62d-4e5da428b3a0");
+    tokio::time::timeout(Duration::from_secs(8), rx.changed())
+        .await
+        .expect("the return cascade's marks refresh the index promptly (1s rearm tick)")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let done = {
+                let b = book.lock().unwrap();
+                b.armed.contains(&projects)
+                    && b.armed.contains(&projects.join("p3").join("sessions"))
+                    && b.armed.contains(&returned)
+                    && !b.absent.contains(&projects)
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("re-created root re-arms with the full cascade");
+
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Delta-review D1-2 (inode-follow on a whole sessions/ subtree): `mv` of
+/// `<proj>/sessions` must (a) explicitly unwatch EVERY armed session dir
+/// under it — they follow their inodes otherwise, (b) scoped-prune-mark
+/// each removed session dir so cached rows disappear promptly (never
+/// waiting for the reconcile), and (c) keep the stand-in swap for the
+/// now-sessions-less project, so a re-created sessions/ is picked up
+/// first-line.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn moved_sessions_dir_unwatches_children_prunes_rows_and_reswaps_standin() {
+    let home = unique_temp_dir("amp-sessmv");
+    let s_a = write_amplifier_session(&home, "p", "aa2584be-9478-4801-a62d-4e5da428b3a0");
+    let s_b = write_amplifier_session(&home, "p", "bb2584be-9478-4801-a62d-4e5da428b3a0");
+    let project = home.join("projects").join("p");
+    let sessions = project.join("sessions");
+
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+    let snap0 = index.snapshot().await;
+    assert_eq!(
+        snap0.iter().filter(|s| s.provider == "amplifier").count(),
+        2
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.len() == 4 {
+                break; // root + sessions + 2 session dirs
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("startup arming completes");
+
+    let fixture_inos: Vec<u64> = [sessions.clone(), s_a.clone(), s_b.clone()]
+        .iter()
+        .map(|p| ino_of(p))
+        .collect();
+    let fdinfo_live = !watched_inotify_inos().is_empty();
+
+    // MOVE the whole sessions/ tree out of the project (out of the corpus).
+    let moved_to = home.join("sessions-moved");
+    std::fs::rename(&sessions, &moved_to).unwrap();
+
+    // (c) the stand-in swap still fires for the now-sessions-less project,
+    // (a)'s bookkeeping half clears the whole subtree.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let swapped = {
+                let b = book.lock().unwrap();
+                b.armed.contains(&project) && !b.armed.iter().any(|p| p.starts_with(&sessions))
+            };
+            if swapped {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("stand-in armed for the project; sessions subtree forgotten");
+
+    // (b) rows prune PROMPTLY via the scoped marks (the 15-minute reconcile
+    // can never fire inside a test — a timeout here is the regression).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if index
+                .snapshot()
+                .await
+                .iter()
+                .all(|s| s.provider != "amplifier")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("moved sessions' rows prune promptly on scoped marks");
+
+    // (a) kernel-side: every descendant watch actually released (not
+    // following the moved inodes).
+    if fdinfo_live {
+        let watched_after = watched_inotify_inos();
+        for ino in &fixture_inos {
+            assert!(
+                !watched_after.contains(ino),
+                "moved sessions-tree watch must be explicitly released (ino {ino})"
+            );
+        }
+    }
+
+    // A re-created sessions/ is picked up first-line through the stand-in.
+    let returned = write_amplifier_session(&home, "p", "cc2584be-9478-4801-a62d-4e5da428b3a0");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let done = {
+                let b = book.lock().unwrap();
+                b.armed.contains(&sessions)
+                    && b.armed.contains(&returned)
+                    && !b.armed.contains(&project)
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("re-created sessions/ re-arms (swap) with its new session dir");
+    // The swap arm's scoped metadata.json mark flows through the debounced
+    // flush — poll instead of asserting on the immediate snapshot.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if index.snapshot().await.iter().any(|s| {
+                s.provider == "amplifier" && s.session_id == "cc2584be-9478-4801-a62d-4e5da428b3a0"
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the re-created session row is visible first-line");
+
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Regression 17b: a deterministic arm failure (path missing by the time
 /// the arm runs) leaves the retry set immediately — a reappearance is a
 /// fresh structural create anyway.
