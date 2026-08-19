@@ -512,6 +512,70 @@ describe('panesSlice', () => {
         ? initialized.content.style
         : 'unexpected').toBeUndefined()
     })
+
+    it('keeps a fresh-agent pane’s stamped modelEffortLevels through init and merge normalization', () => {
+      const state = panesReducer(undefined, initLayout({
+        tabId: 'tab-stamp',
+        paneId: 'pane-stamp',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-stamp',
+          status: 'idle',
+          model: 'sonnet',
+          effort: 'alpha',
+          modelEffortLevels: ['alpha', 'beta'],
+        },
+      }))
+
+      const initialized = state.layouts['tab-stamp']
+      expect(initialized.type === 'leaf' && initialized.content.kind === 'fresh-agent'
+        ? initialized.content.modelEffortLevels
+        : null).toEqual(['alpha', 'beta'])
+
+      const updated = panesReducer(state, mergePaneContent({
+        tabId: 'tab-stamp',
+        paneId: 'pane-stamp',
+        updates: { effort: 'beta' },
+      }))
+      const updatedNode = updated.layouts['tab-stamp']
+      expect(updatedNode.type === 'leaf' && updatedNode.content.kind === 'fresh-agent'
+        ? updatedNode.content.modelEffortLevels
+        : null).toEqual(['alpha', 'beta'])
+    })
+
+    it('drops malformed modelEffortLevels values during fresh-agent content normalization', () => {
+      const junkState = panesReducer(undefined, initLayout({
+        tabId: 'tab-junk',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          status: 'idle',
+          modelEffortLevels: 'bogus',
+        } as any,
+      }))
+      const junkLeaf = junkState.layouts['tab-junk']
+      expect(junkLeaf.type === 'leaf' && junkLeaf.content.kind === 'fresh-agent'
+        ? junkLeaf.content.modelEffortLevels
+        : 'unexpected').toBeUndefined()
+
+      const mixedState = panesReducer(undefined, initLayout({
+        tabId: 'tab-mixed',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          status: 'idle',
+          modelEffortLevels: ['low', 42, 'high'],
+        } as any,
+      }))
+      const mixedLeaf = mixedState.layouts['tab-mixed']
+      expect(mixedLeaf.type === 'leaf' && mixedLeaf.content.kind === 'fresh-agent'
+        ? mixedLeaf.content.modelEffortLevels
+        : null).toEqual(['low', 'high'])
+    })
   })
 
   describe('restartFreshAgentCreate', () => {

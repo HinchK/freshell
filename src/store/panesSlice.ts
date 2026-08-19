@@ -2,6 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import {
   normalizeFreshAgentEffortOverride,
+  normalizeFreshAgentModelEffortLevels,
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
   type DeadSessionEntry,
@@ -126,6 +127,7 @@ function normalizePaneContent(
     const existingRestoreError = sanitizeRestoreError(rawFreshAgent.restoreError)
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
+    const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const status = input.status || (pendingLocalEcho ? 'running' : 'creating')
     if (existingRestoreError) {
       return {
@@ -152,6 +154,7 @@ function normalizePaneContent(
         permissionMode: input.permissionMode,
         sandbox: input.sandbox,
         effort: normalizeFreshAgentEffortOverride(input.effort),
+        ...(modelEffortLevels ? { modelEffortLevels } : {}),
         plugins: input.plugins,
         ...(style ? { style } : {}),
         settingsDismissed: input.settingsDismissed,
@@ -201,6 +204,7 @@ function normalizePaneContent(
       permissionMode: input.permissionMode,
       sandbox: input.sandbox,
       effort: normalizeFreshAgentEffortOverride(input.effort),
+      ...(modelEffortLevels ? { modelEffortLevels } : {}),
       plugins: input.plugins,
       ...(style ? { style } : {}),
       settingsDismissed: input.settingsDismissed,

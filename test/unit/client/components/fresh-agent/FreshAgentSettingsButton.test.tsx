@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { useAppSelector } from '@/store/hooks'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -423,6 +423,10 @@ describe('FreshAgentSettingsButton', () => {
     // row: the clamp lands on the row’s first declared level, not the static
     // table’s fallback
     expect(content.effort).toBe('alpha')
+    // the switched-to row's levels are stamped onto the pane so later effort
+    // normalization (select value, send/create payloads) clamps against them
+    // without re-deriving from the static table
+    expect(content.modelEffortLevels).toEqual(['alpha', 'beta'])
   })
 
   it('clears the pane effort when switching to a probed claude row that declares no effort levels', async () => {
@@ -461,6 +465,9 @@ describe('FreshAgentSettingsButton', () => {
     // the probed row declares NO levels — never fabricate a clamp from the
     // static default’s table (pre-fix kept 'max' because opus[1m] allows it)
     expect(content.effort).toBeUndefined()
+    // the empty-levels stamp survives so normalization stays on the
+    // "no levels" branch instead of falling back to the static table
+    expect(content.modelEffortLevels).toEqual([])
   })
 
   it('keeps the existing static-table normalization when switching to the static opus[1m] row', async () => {
@@ -500,9 +507,35 @@ describe('FreshAgentSettingsButton', () => {
     // row’s declared defaultEffort ('high') stands in — exactly the pre-fix
     // normalizeFreshAgentEffort result
     expect(content.effort).toBe('high')
+    // static rows stamp their static levels too (value identical to today’s
+    // static table) so stamped semantics stay uniform for every switched model
+    expect(content.modelEffortLevels).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
 
-  it('sources the Thinking select from the active probed claude row’s own levels', async () => {
+  it('clears the stamped levels when a merge targets a model absent from the selector rows', () => {
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'alpha',
+      modelEffortLevels: ['alpha', 'beta'],
+    })
+
+    // the stamp survives pane-content normalization (pre-fix it is dropped)
+    expect(readPaneContent(store).modelEffortLevels).toEqual(['alpha', 'beta'])
+
+    // the switch fallback branch (absent row) clears the stamp so the pane
+    // returns to static-table normalization
+    store.dispatch(mergePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      updates: { model: 'claude-ghost', effort: 'high', modelEffortLevels: undefined },
+    }))
+    expect(readPaneContent(store).modelEffortLevels).toBeUndefined()
+  })
+
+  it('sources the Thinking select (options AND selected value) from the active probed claude row’s own levels', async () => {
     getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
       ok: true as const,
       sessionType: 'freshclaude' as const,
@@ -515,7 +548,11 @@ describe('FreshAgentSettingsButton', () => {
           displayName: 'Sonnet',
           provider: 'claude' as const,
           supportsEffort: true,
-          supportedEffortLevels: ['alpha', 'beta'],
+          // 'high' deliberately included: the pre-fix static fallback resolves
+          // the staged 'beta' to 'high', and 'high' IS an option here — so the
+          // select observably lands on the WRONG value instead of jsdom's
+          // first-option fallback masking an unmatched value
+          supportedEffortLevels: ['high', 'beta'],
           supportsAdaptiveThinking: true,
         },
       ],
@@ -525,7 +562,10 @@ describe('FreshAgentSettingsButton', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       model: 'sonnet',
-      effort: 'alpha',
+      effort: 'beta',
+      // a pane that went through the selector carries the switched-to row's
+      // levels as a stamp so normalization can clamp against them
+      modelEffortLevels: ['high', 'beta'],
     })
 
     renderButton(store)
@@ -535,6 +575,9 @@ describe('FreshAgentSettingsButton', () => {
     const thinking = await screen.findByRole('combobox', { name: 'Thinking level' })
     const levels = Array.from(thinking.querySelectorAll('option')).map((option) => option.value)
     // exactly the probed row's levels — not the static opus[1m] fallback's five
-    expect(levels).toEqual(['alpha', 'beta'])
+    expect(levels).toEqual(['high', 'beta'])
+    // and the rendered SELECTED value is the staged 'beta' — never the static
+    // table's re-clamped 'high'
+    expect(thinking).toHaveValue('beta')
   })
 })

@@ -424,6 +424,62 @@ describe('Panes Persistence Integration', () => {
     expect(restored.resumeSessionId).toBeUndefined() // always stripped; re-derived from sessionRef at create time
   })
 
+  it('round-trips a freshclaude pane’s stamped modelEffortLevels (probed-model effort survives reload)', () => {
+    // A pane that selected a probed-only model via the settings popover
+    // carries the row's effort levels as a stamp; the persist denylist keeps
+    // it, and hydrate must replay it through pane-content normalization.
+    const store1 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store1.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store1.getState().tabs.tabs[0].id
+    store1.dispatch(initLayout({
+      tabId,
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        createRequestId: 'req-stamp',
+        status: 'connected',
+        model: 'sonnet',
+        effort: 'alpha',
+        modelEffortLevels: ['alpha', 'beta'],
+      } as any,
+    }))
+
+    vi.runAllTimers()
+    const persistedTabs = loadPersistedTabs()
+    const persistedPanes = loadPersistedPanes()
+
+    const store2 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    if (persistedTabs?.tabs) {
+      store2.dispatch(hydrateTabs(persistedTabs.tabs))
+    }
+    if (persistedPanes) {
+      store2.dispatch(hydratePanes(persistedPanes))
+    }
+
+    const restoredLayout = store2.getState().panes.layouts[tabId]
+    expect(restoredLayout).toBeDefined()
+    expect(restoredLayout.type).toBe('leaf')
+    const restored = (restoredLayout as any).content
+    expect(restored.kind).toBe('fresh-agent')
+    expect(restored.modelSelection).toEqual({ kind: 'exact', modelId: 'sonnet' })
+    expect(restored.effort).toBe('alpha')
+    expect(restored.modelEffortLevels).toEqual(['alpha', 'beta'])
+  })
+
   it('crashTrace persists across a panes round-trip (denylist keeps new fields)', () => {
     // znhn item 1: the crash trace lives on pane content BECAUSE the
     // pane-content persistence strip is a denylist — a new field persists by

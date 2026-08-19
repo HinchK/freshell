@@ -309,7 +309,19 @@ export function FreshAgentSettingsButton({
                           dispatch(mergePaneContent({
                             tabId,
                             paneId,
-                            updates: { model: nextModel, effort: nextEffort },
+                            updates: {
+                              model: nextModel,
+                              effort: nextEffort,
+                              // Stamp the switched-to row's known levels
+                              // (static or probed) so effort normalization
+                              // clamps against THEM — never re-derived from
+                              // the static table's default-model fallback for
+                              // probed-only models. Absent row → field clears
+                              // back to static-table normalization.
+                              modelEffortLevels: nextRow?.thinkingEfforts
+                                ? [...nextRow.thinkingEfforts]
+                                : undefined,
+                            },
                           }))
                           persistProviderDefaults({
                             modelSelection: { kind: 'exact', modelId: nextModel },
