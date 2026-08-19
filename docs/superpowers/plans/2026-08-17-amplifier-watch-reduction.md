@@ -207,6 +207,30 @@ MAJOR findings of adversarial round 3 were bugs in that machinery; it is gone.
     inode-following watches after `mv`).
 17. A stray file created at project depth causes no arm attempt; a
     deterministic arm error (ENOENT/ENOTDIR) leaves the retry set immediately.
+18. Drift rescue at runtime (as-built correction, final fresh-eyes round 4,
+    finding D4-1): a subagent-NAMED dir created post-startup whose
+    `metadata.json` parses with `parent_id` ABSENT is armed promptly (name
+    gate bypassed via the self-correction channel's own helper) without a
+    provider discover; the metadata-late variant arms via the bounded
+    deferred re-probe; a true subagent (`parent_id` present) is never armed
+    and never provider-dirties with the toggle off; the deferred set
+    cap/TTL drains and overflows per its stated bounds.
+
+### As-built corrections (final fresh-eyes round 4)
+
+- **Drift-rescue prompt probe (D4-1).** A depth-3 mkdir of a subagent-NAMED
+  session dir now answers the name gate's refusal with a prompt, single-target
+  content probe — stat+parse the one `metadata.json`, never a watch. Positive
+  root content (`parent_id` absent) arms the dir via `arm_reported_root_dir`
+  (the self-correction channel's helper, bypassing the name gate exactly as
+  the channel does) with the file-state watch-then-scan mark. If
+  `metadata.json` is absent (creation precedes the write), the candidate is
+  parked in a BOUNDED deferred set (64 entries, new candidates dropped with a
+  WARN on overflow) re-probed on every flush for up to ~5s; a declined
+  (true-subagent or unparseable) or expired candidate drops to the
+  self-correction channel / cadence / reconcile per the accepted residuals.
+  The interest-gated provider-dirty escalation is unchanged and still fires
+  for everything the probe did not arm; subagent dirs remain never-watched.
 
 ### Measured facts the design rests on (2026-08-17, this machine)
 

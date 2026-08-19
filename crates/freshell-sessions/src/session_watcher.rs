@@ -21,8 +21,12 @@
 //!   remove-ish kinds at depths 0–3 tear the target's bookkeeping down
 //!   (idempotently — a rename's untracked duplicate `Name(From)` is a clean
 //!   no-op), a paired `Name(Both)` splits into its remove + create
-//!   endpoints, and depth-3 subagent mkdirs escalate to an immediate
-//!   provider-dirty mark only on declared interest. Event-time work is
+//!   endpoints, and depth-3 subagent-pattern mkdirs first take the D4-1
+//!   drift-rescue content probe (stat+parse the one metadata.json — never
+//!   a watch; positive root content arms via the self-correction channel's
+//!   own helper, metadata-absent parks a bounded per-flush re-probe) and
+//!   only otherwise escalate to an immediate provider-dirty mark on
+//!   declared interest. Event-time work is
 //!   SPLIT by class: single-target arms/marks run inline on the loop, while
 //!   cascade-class routes (a project move-in / `sessions/` appearance — a
 //!   readdir plus a batch of arms) run as ONE `spawn_blocking` batch per
@@ -373,7 +377,29 @@ pub(crate) struct ManagedBook {
     /// the ancestor is a PREFIX of every managed path — booking it there
     /// would let a diff-unwatch cascade wipe the whole set.
     ancestor: Option<PathBuf>,
+    /// Delta D4-1 deferred drift-rescue probes: subagent-NAMED session dirs
+    /// whose mkdir-time content probe found NO `metadata.json` yet
+    /// (amplifier creates the dir before writing it — the design's known
+    /// emit order). Re-probed on every flush while any entry lives (the
+    /// flush scheduler folds this set into its deadline), each entry
+    /// expiring after [`DEFERRED_ROOT_PROBE_TTL`]; the set is capped at
+    /// [`DEFERRED_ROOT_PROBE_CAP`]. An evicted (overflow/expiry) or
+    /// declined candidate drops to the self-correction channel / cadence /
+    /// reconcile per the accepted residuals — a deferred dir is never
+    /// WATCHED, only stat+parse-probed, and never armed without positive
+    /// root content.
+    deferred: HashMap<PathBuf, Instant>,
 }
+
+/// D4-1: bound on the deferred drift-rescue probe set (one stat+small-read
+/// per entry per flush, so the bound caps the per-flush probe cost of a
+/// subagent mkdir storm). Overflow drops the NEW candidate with a WARN to
+/// the self-correction channel — the accepted-residual backstop.
+const DEFERRED_ROOT_PROBE_CAP: usize = 64;
+/// D4-1: how long a metadata-absent drift candidate is re-probed before
+/// dropping to the channel/cadence/reconcile — sized so the real
+/// create-then-write gap (~ms) wins the prompt arm with a wide margin.
+const DEFERRED_ROOT_PROBE_TTL: Duration = Duration::from_secs(5);
 
 /// A transient arm failure awaiting the rearm tick; `kind` is retained so
 /// the retry drain re-arms with the SAME behavior as first-line arming
@@ -1484,6 +1510,102 @@ fn roots_needing_arm(
         .collect()
 }
 
+/// Delta D4-1: the verdict of the PROMPT content probe applied to a
+/// subagent-NAMED session-dir mkdir (the drift-rescue for a true root that
+/// carries a subagent-pattern name). The probe is one stat+small read of
+/// the dir's `metadata.json` — the same cost class as the `is_dir` stat
+/// the depth-3 route already performs inline — and NEVER watches the dir:
+/// subagent dirs stay watch-free; only positive root content arms.
+enum RootProbe {
+    /// No readable `metadata.json` yet — amplifier creates the dir before
+    /// writing it (the design's known emit order), so the candidate is
+    /// deferred for a bounded per-flush re-probe.
+    Absent,
+    /// The file parsed with `parent_id` PRESENT and non-null (Node parity:
+    /// a true subagent), OR failed to parse — the content does not prove a
+    /// root, and the probe defers to the channel/cadence/reconcile.
+    Declined,
+    /// The file parsed with `parent_id` ABSENT — the same content-verified
+    /// root definition the self-correction channel's reports use.
+    Root,
+}
+
+/// Stat+parse-probe `<dir>/metadata.json` for the drift-rescue verdict.
+/// `parse_amplifier_metadata`'s `is_subagent` field is the exact Node
+/// parity predicate (`Some(true)` ⇔ `parent_id` present-and-non-null);
+/// malformed JSON yields `None` and declines (no arm, no recheck — the
+/// channel owns the recoverable cases).
+fn probe_subagent_named_dir(dir: &Path) -> RootProbe {
+    let Ok(content) = std::fs::read_to_string(dir.join("metadata.json")) else {
+        return RootProbe::Absent;
+    };
+    match crate::amplifier::parse_amplifier_metadata(&content).is_subagent {
+        Some(false) => RootProbe::Root,
+        Some(true) | None => RootProbe::Declined,
+    }
+}
+
+/// Park a metadata-absent drift candidate for the per-flush re-probe,
+/// under the set's bound: overflow drops the NEW candidate with a WARN to
+/// the self-correction channel (the accepted-residual backstop), keeping
+/// the per-flush probe cost of a subagent mkdir storm bounded.
+fn defer_root_probe(book: &mut ManagedBook, dir: &Path) {
+    if book.deferred.contains_key(dir) {
+        return;
+    }
+    if book.deferred.len() >= DEFERRED_ROOT_PROBE_CAP {
+        tracing::warn!(
+            path = %dir.display(),
+            "session-watcher: deferred root-probe set full ({DEFERRED_ROOT_PROBE_CAP}); \
+             dropping drift probe (self-correction channel owns it)",
+        );
+        return;
+    }
+    book.deferred.insert(dir.to_path_buf(), Instant::now());
+}
+
+/// The per-flush re-probe of deferred drift candidates (delta D4-1),
+/// driven from the flush arm so a `metadata.json` landing within a couple
+/// of seconds of its mkdir still wins the prompt arm: positive root content
+/// arms through the channel's content-verified helper (watch-then-scan —
+/// [`ArmKind::SessionDir`] bookkeeping, so a transient arm failure lands
+/// in retry and the drain's classification-free re-arm keeps it); a
+/// declined (true-subagent or unparseable) candidate and a TTL-expired
+/// absent candidate both drop out — the self-correction channel / cadence
+/// / reconcile own them per the accepted residuals.
+fn recheck_deferred_root_probes(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+) {
+    let now = Instant::now();
+    let candidates: Vec<(PathBuf, Instant)> =
+        book.deferred.iter().map(|(p, t)| (p.clone(), *t)).collect();
+    for (dir, since) in candidates {
+        if now.duration_since(since) >= DEFERRED_ROOT_PROBE_TTL {
+            tracing::debug!(
+                path = %dir.display(),
+                "session-watcher: deferred root probe expired ({DEFERRED_ROOT_PROBE_TTL:?}); \
+                 self-correction channel owns the dir",
+            );
+            book.deferred.remove(&dir);
+            continue;
+        }
+        match probe_subagent_named_dir(&dir) {
+            RootProbe::Root => {
+                arm_reported_root_dir(book, watcher, outcome, "amplifier", &dir, true);
+                // Attempted: the arm owns success, retry owns a transient
+                // failure — the probe's job is done either way.
+                book.deferred.remove(&dir);
+            }
+            RootProbe::Absent => {} // still awaiting its metadata.json
+            RootProbe::Declined => {
+                book.deferred.remove(&dir);
+            }
+        }
+    }
+}
+
 /// Depth of `path` below the managed projects root (`strip_prefix`
 /// component count): 0 = the projects root's OWN self-event (its removal
 /// wiring is Task 4's), 1 = a project child of the root watch, 3 = a
@@ -1581,13 +1703,25 @@ fn dispatch_amplifier_path(
             }
         }
         // Depth 3: a sessions-dir child. Root-classified dirs arm with the
-        // watch-then-scan scoped mark; subagent dirs escalate via a DIRECT
-        // provider-dirty mark (the design lever — a full amplifier
-        // discover) ONLY while a connected client has declared subagent
-        // interest — otherwise the mkdir is dropped silently (the
-        // 15-minute reconcile owns it). The escalation never takes the
-        // pending-rescan channel: its amplifier branch runs the strict
-        // whole-tree replan reserved for true need_rescan events.
+        // watch-then-scan scoped mark. A subagent-NAMED dir gets the delta
+        // D4-1 drift rescue FIRST: the pre-change recursive watcher observed
+        // a drift-case true root's metadata.json landing instantly, so the
+        // name gate's refusal is answered with a PROMPT, single-target
+        // content probe (stat+read the one metadata.json — the dir itself
+        // is NEVER watched). Positive root content arms via the
+        // self-correction channel's own helper (the name gate bypassed
+        // exactly as the channel bypasses it); metadata-absent parks the
+        // candidate in the BOUNDED deferred set re-probed each flush
+        // (creation precedes the write — a metadata.json landing within a
+        // couple of seconds still wins the prompt arm); a declined
+        // (true-subagent or unparseable) probe does nothing further — the
+        // channel/cadence/reconcile own it per the accepted residuals.
+        // Anything the probe did NOT arm keeps the design's escalation:
+        // a DIRECT provider-dirty mark ONLY while a connected client has
+        // declared subagent interest — otherwise the mkdir is dropped
+        // silently (the 15-minute reconcile owns it). The escalation never
+        // takes the pending-rescan channel: its amplifier branch runs the
+        // strict whole-tree replan reserved for true need_rescan events.
         (Some(3), true) if path.is_dir() => {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if is_watch_target(classify_basename(name)) {
@@ -1600,8 +1734,19 @@ fn dispatch_amplifier_path(
                     ArmKind::SessionDir,
                     true,
                 );
-            } else if interest.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                index.mark_provider_dirty("amplifier");
+            } else {
+                match probe_subagent_named_dir(path) {
+                    RootProbe::Root => {
+                        arm_reported_root_dir(book, watcher, outcome, "amplifier", path, true)
+                    }
+                    RootProbe::Absent => defer_root_probe(book, path),
+                    RootProbe::Declined => {}
+                }
+                if !book.armed.contains(path)
+                    && interest.load(std::sync::atomic::Ordering::SeqCst) > 0
+                {
+                    index.mark_provider_dirty("amplifier");
+                }
             }
         }
         // Depth 4: file-level events inside an armed root session dir. A
@@ -2153,20 +2298,30 @@ async fn run_watcher_loop(
     rearm_interval.tick().await; // consume the immediate first tick
 
     loop {
-        let flush_deadline = if pending.is_empty() && pending_rescans.is_empty() {
-            pending_since = None;
-            None
-        } else {
-            let start = pending_since.get_or_insert_with(tokio::time::Instant::now);
-            let capped = *start + MAX_FLUSH_DEFERRAL;
-            Some(capped.min(tokio::time::Instant::now() + debounce))
-        };
         // The amplifier managed book has tick work of its own (absent
-        // re-check / retry drain) even while the legacy sets are empty.
-        let amplifier_book_pending = amplifier.as_ref().is_some_and(|amp| {
-            let book = amp.book.lock().unwrap();
-            !book.absent.is_empty() || !book.retry.is_empty()
-        });
+        // re-check / retry drain) even while the legacy sets are empty —
+        // and D4-1 deferred drift candidates schedule their per-flush
+        // re-probe by keeping the flush deadline alive until the set
+        // drains (one lock reads both facts).
+        let (amplifier_book_pending, amplifier_deferred_pending) = amplifier
+            .as_ref()
+            .map(|amp| {
+                let book = amp.book.lock().unwrap();
+                (
+                    !book.absent.is_empty() || !book.retry.is_empty(),
+                    !book.deferred.is_empty(),
+                )
+            })
+            .unwrap_or((false, false));
+        let flush_deadline =
+            if pending.is_empty() && pending_rescans.is_empty() && !amplifier_deferred_pending {
+                pending_since = None;
+                None
+            } else {
+                let start = pending_since.get_or_insert_with(tokio::time::Instant::now);
+                let capped = *start + MAX_FLUSH_DEFERRAL;
+                Some(capped.min(tokio::time::Instant::now() + debounce))
+            };
 
         tokio::select! {
             _ = &mut stop_rx => break,
@@ -2479,6 +2634,36 @@ async fn run_watcher_loop(
                     &mut pending_rescans,
                 )
                 .await;
+                // Delta D4-1: each flush re-probes the deferred drift
+                // candidates (a metadata.json landing within a couple of
+                // seconds of its subagent-NAMED mkdir still wins the prompt
+                // arm via the channel's own helper). Runs BEFORE the
+                // pending drain below so a fresh arm's scoped mark flushes
+                // in this same cycle. Single-target work (≤
+                // DEFERRED_ROOT_PROBE_CAP small reads), so it stays on the
+                // async loop like every other single-dir arm.
+                if let Some(amp) = amplifier.as_ref() {
+                    if !amp.book.lock().unwrap().deferred.is_empty() {
+                        if let Some(pw) = watches.get_mut(&amp.prov_idx) {
+                            let mut outcome = ArmOutcome::default();
+                            {
+                                let mut book = amp.book.lock().unwrap();
+                                let armed_before = book.armed.len();
+                                recheck_deferred_root_probes(
+                                    &mut book,
+                                    &mut pw.watcher,
+                                    &mut outcome,
+                                );
+                                // Per-arm-batch budget check: deferred-probe
+                                // arms join every other arm-batch site.
+                                if book.armed.len() != armed_before {
+                                    check_watch_budget(&mut book);
+                                }
+                            }
+                            drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
+                        }
+                    }
+                }
                 if !pending.is_empty() {
                     let events: Vec<((PathBuf, String), Instant)> =
                         pending.drain().collect();

@@ -3064,6 +3064,305 @@ async fn retry_drain_recovers_reported_misnamed_root() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ---------- delta D4-1: prompt content probe for subagent-NAMED mkdirs (drift rescue) ----------
+
+/// D4-1 corner 1 (RED at reviewed HEAD): a subagent-NAMED session dir whose
+/// metadata.json is ALREADY on disk and parses with `parent_id` ABSENT is a
+/// drift-case true root. Its depth-3 mkdir event must answer the name gate's
+/// refusal with a prompt, single-target content probe: stat+read the one
+/// metadata.json and, on positive root content, arm the dir via the
+/// self-correction channel's own content-verified helper (name gate bypassed
+/// exactly as the channel does) with the file-state watch-then-scan mark.
+/// Drives `dispatch_amplifier_path` directly so the mkdir event's dispatch is
+/// deterministic — no event-loop race can let the probe (or its absence)
+/// hide behind a channel report.
+#[test]
+fn subagent_named_mkdir_with_root_content_arms_via_prompt_probe() {
+    let home = unique_temp_dir("amp-drift-prompt");
+    let projects_root = home.join("projects");
+    let dir = projects_root
+        .join("p")
+        .join("sessions")
+        .join("0000000000000000-014b6af1c2ac4ab5_drift_root");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        r#"{"session_id":"drift-root","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+    let interest = std::sync::atomic::AtomicUsize::new(0);
+    let index = SessionIndex::with_ttl_and_cache_path(Vec::new(), Duration::from_secs(3600), None);
+    let mut pending = HashMap::new();
+    let mut cascades = Vec::new();
+    let mut root_return = false;
+
+    dispatch_amplifier_path(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        &interest,
+        &dir,
+        WatchKind::CreateFolder,
+        &mut pending,
+        &index,
+        &mut cascades,
+        &mut root_return,
+    );
+
+    assert!(
+        book.armed.contains(&dir),
+        "name says subagent but content says root: the prompt content probe must arm it"
+    );
+    assert!(
+        outcome.marks.contains(&dir.join("metadata.json")),
+        "the arm carries the file-state watch-then-scan scoped mark"
+    );
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// D4-1 corner 2 (RED at reviewed HEAD, metadata-LATE variant): amplifier
+/// creates the session dir BEFORE writing metadata.json (the design's known
+/// emit order). A drift-case root created this way must still win the prompt
+/// arm: the mkdir-time probe finds no metadata and parks the dir in the
+/// BOUNDED deferred set, re-probed on each flush, and the recheck that
+/// observes the landed metadata.json arms it — seconds, not the 15-minute
+/// reconcile. The pinned side condition is the D4-1 budget line: NO full
+/// amplifier discover is paid for the mkdir (the arm's scoped
+/// metadata.json mark is the only index work).
+#[tokio::test]
+async fn metadata_late_subagent_named_mkdir_arms_via_deferred_recheck_without_a_discover() {
+    use std::sync::atomic::Ordering;
+    let home = unique_temp_dir("amp-drift-late");
+    // A pre-existing root session guarantees the sessions dir is armed at
+    // startup, so the drift mkdir's depth-3 event is observed at all.
+    let _root = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let counted = counted_amplifier_index(&home);
+    let index = counted.index.clone();
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+    let sessions = home.join("projects").join("p").join("sessions");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.contains(&sessions) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("startup structural arm pass completes");
+
+    // Warm the index BEFORE the drift mkdir: the self-correction report
+    // (fired only by a full discover) reflects this pre-mkdir world, so it
+    // can never arm the dir under test — only the mkdir's own event path
+    // can. The warm also means the pinned "no discover" side condition is
+    // observable against a real baseline.
+    let _ = index.snapshot().await;
+    let baseline_discovers = counted.discover_calls.load(Ordering::SeqCst);
+
+    let dir = sessions.join("0000000000000000-014b6af1c2ac4ab5_late_drift_root");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The metadata lands ~350ms after the mkdir (creation precedes the
+    // write), modeled on a plain thread so no session stays half-written.
+    let writer = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(350));
+            std::fs::write(
+                dir.join("metadata.json"),
+                r#"{"session_id":"late-drift-root","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+            )
+            .unwrap();
+        })
+    };
+
+    // Well under the deferred set's TTL: the arm must land within a couple
+    // of seconds of the metadata write, not at the 15-minute reconcile.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.contains(&dir) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the deferred probe recheck arms the drift root within seconds of its metadata");
+    writer.join().unwrap();
+    assert_eq!(
+        counted.discover_calls.load(Ordering::SeqCst),
+        baseline_discovers,
+        "the mkdir must never pay a full provider discover (scoped marks only)"
+    );
+    // And the row is promptly visible — the watch-then-scan scoped mark
+    // drove a scoped re-parse, end to end.
+    let snap = index.snapshot().await;
+    assert!(
+        snap.iter()
+            .any(|s| s.provider == "amplifier" && s.session_id == "late-drift-root"),
+        "the drift root's scoped mark made the row visible without a discover"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// D4-1 corner 3 (preservation pin — the probe must never WATCH a true
+/// subagent): a subagent-named mkdir whose metadata.json parses with
+/// `parent_id` PRESENT is declined by the content probe and, with subagent
+/// interest off, produces NO arm, NO mark, NO provider-dirty — per the
+/// accepted residuals the cadence/reconcile own it.
+#[test]
+fn subagent_named_mkdir_with_subagent_content_is_never_armed_never_marked() {
+    let home = unique_temp_dir("amp-drift-true-sub");
+    let projects_root = home.join("projects");
+    let dir = projects_root
+        .join("p")
+        .join("sessions")
+        .join("0000000000000000-014b6af1c2ac4ab5_true_subagent");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        r#"{"session_id":"true-sub","working_dir":"/p/x","parent_id":"par","created":"2026-03-01T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+    let interest = std::sync::atomic::AtomicUsize::new(0);
+    let index = SessionIndex::with_ttl_and_cache_path(Vec::new(), Duration::from_secs(3600), None);
+    let mut pending = HashMap::new();
+    let mut cascades = Vec::new();
+    let mut root_return = false;
+
+    dispatch_amplifier_path(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        &interest,
+        &dir,
+        WatchKind::CreateFolder,
+        &mut pending,
+        &index,
+        &mut cascades,
+        &mut root_return,
+    );
+
+    assert!(
+        !book.armed.contains(&dir),
+        "a TRUE subagent dir must never be armed — even by the drift-rescue probe"
+    );
+    assert!(!index.has_dirty(), "no provider dirty, no scoped marks");
+    assert!(outcome.marks.is_empty() && !outcome.provider_dirty);
+    assert!(pending.is_empty() && cascades.is_empty() && !root_return);
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// D4-1 corner 4a (the bound): the deferred probe set is CAPPED — a
+/// subagent mkdir storm past `DEFERRED_ROOT_PROBE_CAP` drops the overflow
+/// candidates rather than growing the per-flush re-probe cost unboundedly
+/// (dropped-to-channel per the accepted residuals).
+#[test]
+fn deferred_root_probe_set_overflow_is_dropped() {
+    let mut book = ManagedBook::default();
+    for i in 0..DEFERRED_ROOT_PROBE_CAP {
+        defer_root_probe(&mut book, &PathBuf::from(format!("/tmp/d4-cap/{i}")));
+    }
+    assert_eq!(book.deferred.len(), DEFERRED_ROOT_PROBE_CAP);
+    defer_root_probe(&mut book, &PathBuf::from("/tmp/d4-cap/overflow"));
+    assert_eq!(
+        book.deferred.len(),
+        DEFERRED_ROOT_PROBE_CAP,
+        "an overflow candidate must NOT grow the bounded set"
+    );
+    assert!(!book
+        .deferred
+        .contains_key(Path::new("/tmp/d4-cap/overflow")));
+}
+
+/// D4-1 corner 4b (drain semantics per the bound): the per-flush recheck
+/// (i) arms a candidate whose metadata.json has landed with `parent_id`
+/// absent — the verdict switch covers an entry deferred as Absent while
+/// content arrived as Root — and evicts it; (ii) evicts a candidate
+/// declined as a true subagent; (iii) keeps a still-absent candidate
+/// inside its TTL; (iv) evicts a TTL-EXPIRED absent candidate to the
+/// channel WITHOUT ever arming it.
+#[test]
+fn deferred_root_probe_recheck_drains_per_its_bounds() {
+    let home = unique_temp_dir("amp-drift-drain");
+    let armed_at_recheck = home.join("armed_at_recheck");
+    let true_sub = home.join("true_sub");
+    let still_late = home.join("still_late");
+    let expired_late = home.join("expired_late");
+    for d in [&armed_at_recheck, &true_sub, &still_late, &expired_late] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // metadata landed, parent_id absent ⇒ Root verdict at the recheck.
+    std::fs::write(
+        armed_at_recheck.join("metadata.json"),
+        r#"{"session_id":"a","working_dir":"/p/x","created":"2026-03-01T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+    // parent_id present ⇒ Declined.
+    std::fs::write(
+        true_sub.join("metadata.json"),
+        r#"{"session_id":"s","working_dir":"/p/x","parent_id":"par","created":"2026-03-01T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+    // still_late + expired_late: no metadata.json at all ⇒ Absent.
+
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    for d in [&armed_at_recheck, &true_sub, &still_late] {
+        defer_root_probe(&mut book, d);
+    }
+    // Backdate one candidate past the TTL (const-declared ~5s).
+    book.deferred.insert(
+        expired_late.clone(),
+        Instant::now() - (DEFERRED_ROOT_PROBE_TTL + Duration::from_secs(1)),
+    );
+    assert_eq!(book.deferred.len(), 4);
+
+    let mut outcome = ArmOutcome::default();
+    recheck_deferred_root_probes(&mut book, &mut watcher, &mut outcome);
+
+    assert!(
+        book.armed.contains(&armed_at_recheck),
+        "landed root content arms at the recheck (channel helper, watch-then-scan)"
+    );
+    assert!(
+        outcome
+            .marks
+            .contains(&armed_at_recheck.join("metadata.json")),
+        "the recheck arm carries the scoped watch-then-scan mark"
+    );
+    assert!(
+        !book.armed.contains(&true_sub) && !book.armed.contains(&expired_late),
+        "declined/expired candidates are never armed"
+    );
+    assert_eq!(
+        book.deferred.len(),
+        1,
+        "armed, declined, and expired candidates all drain — only the still-late one remains"
+    );
+    assert!(book.deferred.contains_key(&still_late));
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ---------- watch-reduction proof (kata target) ----------
 
 /// THE proof: a 12-project corpus arms EXACTLY
