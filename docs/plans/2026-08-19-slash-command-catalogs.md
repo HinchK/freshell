@@ -1,117 +1,128 @@
-# Dynamic provider-advertised slash-command catalogs in fresh-agent panes
+# Dynamic provider-advertised slash commands in fresh-agent panes — Implementation Plan
 
 > **For agentic workers:** REQUIRED: Use the usual-subagents (subagent-driven-development / executing-plans) and the-usual TDD (test-driven-development) subskills to implement this plan task-by-task and subtask-by-subtask. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **User Request:**
 
-> Port the fork's dynamic slash-command advertising to main's fresh-agent panes, with the general-then-provider layering the user directed:
-> 1. **Generic fresh-agent layer:** the composer merges the existing static action commands (`new`/`compact`/`fork`/`model` — UI-level orchestration actions, byte-identical behavior) with provider-advertised **session commands** (chosen → composed as `/name ` text, sent verbatim as user text); a generic per-session server-fed slot that is absent/empty for providers with nothing to advertise.
-> 2. **freshclaude/kilroy specifics:** probe the installed Claude Agent SDK 0.3.235's advertised commands (init payload + `supportedCommands()`), keep current via the SDK's `commands_changed` push.
-> 3. **freshopencode:** wire a second provider IFF the serve API's command surface proves out (E4: `GET /command` exists with `{name, description?, source, template, hints}`; invocation semantics gated in Stage 2).
-> 4. **freshcodex:** no-op (empty slot).
-> 5. Static action-command behavior, menu ARIA conventions (menu/combobox semantics only while open), and the typed-Enter fall-through (`/unknown` sent verbatim) all preserved.
-> The user approved running "the slash command thing ... generally in fresh agent and then the specifics in fresh cl[au]de" through the-usual.
+> Context: the fork inventory found a slash-command menu advertising SDK commands in the fork's (now-deleted) legacy agent-chat composer; main's fresh-agent composer has only a static action list.
+>
+> "Can we implement the slash command thing generally in fresh agent and then the specifics in fresh clod [claude] so that other agents can benefit from the pattern? Or does that not make sense because it is primarily only cloud code that can support it?" — answered: the layering makes sense; run it.
+>
+> "Yes." (run it through the-usual)
+
+Derived scope (user-ratified in that exchange): (1) generic fresh-agent dynamic slash-command catalog merging static action commands with provider-advertised session commands; generic server-fed slot absent/empty for providers with nothing to advertise; (2) freshclaude/kilroy: probe the installed SDK 0.3.235's advertised commands at session create, keep current as the session evolves; (3) freshopencode: discovery said the surface EXISTS — wire it as the second provider; (4) freshcodex: no-op; (5) provider-advertised commands insert verbatim text (`/name arg text`) when chosen — never auto-send; static action-command behavior byte-identical; composer ARIA combobox-only-while-open convention preserved.
 
 ## 1. Context lineage
 
-- Prior completed work: the fork inventory (5 features triaged; slash commands = fork changes.md item 15, built on the deleted legacy agent-chat composer — intent re-derived here, code not ported); PR #664 (SDK 0.3.235) landed and is this run's enabler (`supportedCommands()` + init `commands` + `commands_changed` all present).
-- Workspace stage: worktree `.worktrees/slash-command-catalogs`, branch `the-usual/slash-command-catalogs`, base_ref `9a6b8fc39` (origin/main = PR #664 merge), `npm ci` exit 0; base gate ADOPTED (final-gate exit 0 at bf8322897; diff to base = 2 docs lines).
-- Stage 1 exploration (all reports in logs dir `reports/`): **E1-client** (composer/View seams, verified anchors), **E2-server** (slot verdict: snapshot field wins decisively; hook points; Rust-port caveat), **E3-sdk** (SlashCommand 4 fields verbatim from installed sdk.d.ts; commands_changed REPLACE semantics; init-vs-probe recommendation), **E4-opencode** (`GET /command` EXISTS, 44 live entries incl. user custom commands; invocation semantics UNPROVEN → Stage-2 gate).
+- Explorer reports (Stage 1, all verified-anchored): `reports/explore-e1-client.md`, `explore-e2-server.md`, `explore-e3-sdk.md`, `explore-e4-opencode.md` in the run logs dir.
+- Prior the-usual run (sdk-0-3-upgrade, PR #664 merged at base 9a6b8fc39) landed the 0.3.235 SDK this feature probes — `query().supportedCommands()` and init `commands` exist and are receipt-verified.
+- Fork witness (design-only, never cherry-picked): `/tmp/opencode/fork-analysis/freshell`, changes.md item 15; its approach: server probes supportedCommands post-create, REPLACE-broadcasts on `commands_changed`, replays to late subscribers, client inserts `/name ` without auto-sending.
 
 ## 2. Goal
 
-A fresh-agent pane's `/` menu shows two groups — **Pane actions** (today's statics, identical behavior) and **Agent session** (provider-advertised commands) — where the session group is populated from the provider's live catalog, stays current as the session evolves, works for freshclaude+kilroy from one implementation, extends to freshopencode if its serve surface proves out, and costs freshcodex nothing. Selecting a session command composes `/name ` text (never auto-sends); submitting typed `/cmd args` sends it verbatim.
+Freshclaude/kilroy/freshopencode panes' composer `/` menu shows the provider's live-advertised commands (Claude skills/plugins/builtins, opencode custom/skill/MCP commands) merged with the existing static action commands, inserting verbatim `/name ` text on select (never auto-send), staying current as sessions evolve — with freshcodex and any provider lacking the surface unaffected, and the production Rust server unaffected (graceful absence).
 
-## 3. Architecture
+## 3. Architecture (decisive answers from exploration)
 
-**Data flow (slot = snapshot field — E2's verdict):** adapters normalize a per-session command catalog into the thread snapshot (`FreshAgentSnapshotSchema`, strict at `shared/fresh-agent-contract.ts:230-246`; new OPTIONAL `commands` field → graceful absence incl. the Rust port which keeps vendored SDK 0.2.x). Clients fetch snapshots on `freshAgent.session.changed` (existing invalidation edge, `FreshAgentView.tsx:78-89`), so refresh = mark + broadcast; no new WS message types, no new redux state, no REST TTL machine (pull-per-open with per-session keys was rejected by E2 as misfit).
-
-**Kind split (the one discrimination the layer must model):** `FreshAgentSlashCommand` gains an explicit `kind`: statics are `kind:'action'` (name/description/aliases/requiresCapability/action, unchanged dispatch), catalog rows are `kind:'session'` (+`argumentHint`). Name collisions across kinds are allowed (e.g. SDK `/compact` vs static `compact`): typed-Enter dispatch consults **actions only** (statics-first semantics preserved); menu shows both groups.
-
-**Claude specifics:** `sdk-bridge.createSession` retains the query handle (L189-225); after create, fire-and-forget `supportedCommands()` (cached after init — zero extra round-trips, E3) → store normalized full-objects in per-session bridge state. Also capture the init message's `slash_commands` name-list in the `system/init` arm (L369-385) as the placeholder until the probe lands. `system/commands_changed` gets its own arm (currently falls through to the benign default arm at L503-504): REPLACE the stored list + broadcast `freshAgent.session.changed` → clients refetch → next snapshot carries the new list. `normalizeClaudeThreadSnapshot` (`server/fresh-agent/adapters/claude/normalize.ts:206-256`) maps state.commands → snapshot.commands. Kilroy shares the adapter instance (registered twice, `server/index.ts:383-392`) — one implementation covers both. Detached/durable snapshots have no live session → no commands (acceptable).
-
-**Opencode specifics (gated):** E4 verified `GET /command?directory=<cwd>` on serve 1.18.18 (44 rows; nulls present in optional fields — schema must tolerate user-JSON nulls; refresh caveat: project commands scanned at sidecar start). Stage-2 must prove invocation semantics: whether sending `/cmd args` as prompt text expands commands server-side, or whether the client must expand `template` with `$ARGUMENTS`. Wire-in point: `model-catalog.ts:166-194` `fetchWithTimeout` pattern, refreshed at session create/attach. If the probe fails → empty slot, decision recorded, kata filed (not a run failure).
-
-**Client composition:** `FreshAgentView` merges `getFreshAgentSlashCommands(sessionType)` with `snapshot.commands` via a new pure shared helper and passes one grouped list into the composer. Composer renders two labelled groups inside the existing single `role="menu"` (group headers non-interactive; existing test query conventions preserved). Selection: `kind:'action'` → existing `executeCommand` path; `kind:'session'` → `setText('/name ')` + focus, never send. `executeSlashText` (L337-346) matches only `kind:'action'` entries so typed `/clear args` falls through to the existing verbatim send (L403-404).
-
-**A11y:** keep main's existing menu pattern (conditionally-rendered menu only while open); group headers as plain labelled, non-focusable dividers; composer textarea gains no permanent combobox attrs.
+- **Slot = the fresh-agent session snapshot.** `FreshAgentSnapshotSchema` (`shared/fresh-agent-contract.ts:230-246`) already feeds composer gating (`capabilities.fork` precedent at `FreshAgentView.tsx:674-680`). Add OPTIONAL field `commands?: readonly FreshAgentSessionCommand[]` — strict-non-optional fails parse; optional = graceful absence for Rust port, codex, offline. `mergeSnapshotForDisplay` next-wins so updates merge cleanly. E2 rejected dedicated WS push (needs redux state + Rust porting + re-push-on-attach) and REST-route pull (wrong granularity for per-session entity, misses mid-session changes).
+- **Refresh:** claude: SDK's `commands_changed` system push (REPLACE semantics — sdk.d.ts:3134, union member) → new bridge arm replaces `state.commands` and rebroadcasts the existing `freshAgent.session.changed` edge (already in `SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS`, `FreshAgentView.tsx:78-89`) → the client refetches the snapshot. No polling. Opencode: populated once at create (sidecar scans project-layer commands at startup only — documented E4 caveat; config-global/user skills layers are stable at runtime).
+- **Claude probe:** `supportedCommands()` on the query handle right after `SdkBridge.createSession` stores it (`server/sdk-bridge.ts:189-225`); cached-promise, zero extra roundtrips, callable pre-iteration (E3 fact 2). Snapshot composition in `normalizeClaudeThreadSnapshot` (`server/fresh-agent/adapters/claude/normalize.ts:206-256`). Kilroy rides free (same adapter registered twice, `server/_index.ts:383-392`). Detached/durable snapshots have no liveSession → commands absent (correct semantics: can't send to a dead session).
+- **Opencode fetch:** sidecar `GET /command?directory=<cwd>` (1.18.18, envelope at both `/command` and `/api/command`; E4 captured shape `{name, description?, agent?, model?, source: 'command'|'mcp'|'skill', template, subtask?, hints: string[]}` with explicit nulls — schemas MUST tolerate explicit nulls and missing optionals). Wire-in beside the existing catalog fetcher pattern (`server/fresh-agent/adapters/opencode/model-catalog.ts:166-194` precedent: `fetchWithTimeout` against `${baseUrl}`), flat per-cwd fetch at session create.
+- **Data model (shared):** `FreshAgentSessionCommand = { name: string; description: string; argumentHint?: string; aliases?: string[] }` — mirrors the SDK's SlashCommand exactly (the minimal useful intersect with opencode's shape: description nullable → coerce to `''`; hints/template/hints/agent/model dropped).
+- **Menu merge (client):** new merge in `shared/fresh-agent-slash-commands.ts`: static action rows first, then session rows; **static-wins dedupe by name (case-insensitive)** — a session command colliding with a static action name (`new`/`compact`/`fork`/`model` + their aliases) is dropped so `/compact` always means the freshell action (sends the dedicated `freshAgent.compact` frame, not queue-racing user text). Session rows carry `kind: 'session'` discriminator info via a wrapper union so the composer can dispatch differently.
+- **Select behavior:** static rows: unchanged dispatch (`executeCommand` → `runSlashCommand` at `FreshAgentView.tsx:1096-1124`). Session rows: **insert** verbatim `/name ` (canonical name, never the alias) into the composer input — NO auto-send, NO dispatch; user adds args (guided by `argumentHint`) and hits Enter. Existing fallthrough for unmatched `/text` (`FreshAgentComposer.tsx:403-404`) stays as-is (unknown commands still send as text — harmless).
+- **ARIA:** menu remains inline conditionally-rendered `role="menu"`/`menuitem` only while open (current pattern at `FreshAgentComposer.tsx:500-561`); no combobox-role changes; DirectoryPicker conditional-combobox precedent NOT taken (menu, not combobox).
+- **Rust port (production :3001 sidecar):** untouched (vendored SDK ^0.2.40, no commands surface) — optional field means absence, never an error. Follow-up recorded in recap, chained near kata fpxj.
+- **freshcodex:** untouched; statics only.
 
 ## 4. Tech stack
 
-Existing only: React 18 + Redux Toolkit + Vitest (client/server configs) + Playwright; claude SDK 0.3.235 (installed); opencode serve 1.18.18 (discovery arm only). No new dependencies.
+Existing only: Zod contracts, Express + ws, Redux Toolkit + React, Vitest, Playwright e2e. No new dependencies.
 
 ## 5. Global constraints
 
-- **Worktree only**; `main` and production untouched; no PR without explicit user approval; scratch servers on recorded ports only (opencode probes used 4199 rules from E4).
-- **TDD** with RED-witness pastes; mechanical steps record why no RED. Tests = behavior contracts; mocks through real schema boundaries (snapshot schema is Zod-strict; publisher fixtures must parse).
-- **Contract traceability:** any new shared schema/type names for the fresh-agent contract must be registered in `test/fixtures/fresh-agent/contract-traceability.js` (E2-verified requirement) — traceability tests otherwise fail.
-- **Byte-identical elsewhere:** static action behavior, freshcodex paths, opencode paths outside the gated arm, and the composer action dispatch must not move.
-- **Server test commands always carry explicit `--config config/vitest/vitest.server.config.ts`** (coordinator bare-`run` filter bug, known). Client/default-config suites use plain `run`.
-- **Fork = design witness only** (`/tmp/opencode/fork-analysis/freshell`, changes.md item 15): its composer/menu/ARIA choices inform semantics (insert-never-send; combobox-only-while-open); all diffs re-derived against this tree.
+- Worktree-only at `/home/dan/code/freshell/.worktrees/slash-command-catalogs` (branch `the-usual/slash-command-catalogs`); never touch main checkout/3001/PRs-without-approval. TDD with real RED witnesses pasted in reports. Tests via repo wrappers with EXPLICIT `--config config/vitest/vitest.server.config.ts` for all server paths (bare `run` passthrough misfires — verified last run); client/shared tests plain `run` fine (default config). Mocks put valid data through real schema boundaries.
+- **Contract traceability:** new/renamed schema types must be registered in `test/fixtures/fresh-agent/contract-traceability.js` (convention per E2).
+- **freshcodex + opencode transcript paths untouched**; static action dispatch unchanged; no Rust changes.
+- **Scratch sidecars on recorded ports with PID files only, always torn down** (never touch 3001/3002 or the user's live opencode sidecar).
+- **Dedupe policy locked:** static-wins on name collision (both canonical names and static aliases count as collisions); session-command sends use canonical `name` never an alias.
+- **Null tolerance locked:** any parse of opencode rows must treat description/agent/model/subtask as possibly-null (E4 observed explicit nulls live).
+- Composer menu must not regress: fresh-agent-control e2e + composer unit tests stay green byte-compatible for static lists (a11y lint included).
 
 ## 6. File responsibility map
 
 | File | Change |
 |---|---|
-| `shared/fresh-agent-slash-commands.ts` | `kind:'action'` on statics; `FreshAgentSessionCommand`-typed catalog merge helper `buildFreshAgentSlashCommandMenu(statics, catalog)` → `{ action: [...], session: [...] }` (dedupe within kinds by name; cross-kind collisions allowed) |
-| `shared/fresh-agent-contract.ts` | `FreshAgentSessionCommandSchema` (name/description/argumentHint?/aliases?) + optional `commands` on `FreshAgentSnapshotSchema` |
-| `test/fixtures/fresh-agent/contract-traceability.js` | register new schema/type names |
-| `src/store` (view selectors) | pass `snapshot.commands` through to the view (read-only; verify existing slice exposure first) |
-| `src/components/fresh-agent/FreshAgentView.tsx` | compute grouped list via helper; pass to composer |
-| `src/components/fresh-agent/FreshAgentComposer.tsx` | grouped rendering; session-kind select → insert `/name `; executeSlashText action-only |
-| `server/sdk-bridge.ts` | per-session `commands` state; init-arm name capture; post-create `supportedCommands()` probe; `commands_changed` arm → REPLACE + `freshAgent.session.changed` broadcast |
-| `server/fresh-agent/adapters/claude/normalize.ts` | snapshot.commands mapping |
-| `server/fresh-agent/adapters/opencode/` (gated) | commands fetch at create/attach via serve client; template-expansion decision per Stage-2 probe |
-| Tests | per-task lists in §7 |
-| Rollback | §8 |
+| `shared/fresh-agent-contract.ts` | +`FreshAgentSessionCommandSchema` (zod, strict), +optional `commands` on the snapshot schema |
+| `shared/fresh-agent-slash-commands.ts` | +session-row type union + `mergeSessionSlashCommands(statics, sessionCmds)` (static-first, static-wins dedupe incl. aliases) |
+| `test/fixtures/fresh-agent/contract-traceability.js` | register new schema/type per convention |
+| `server/sdk-bridge.ts` | `state.commands` capture; `commands_changed` arm (REPLACE + rebroadcast `freshAgent.session.changed`-class edge); keep default-arm tolerance; probe `supportedCommands()` post-create |
+| `server/fresh-agent/adapters/claude/normalize.ts` | fold `state.commands` → snapshot `commands` |
+| `server/fresh-agent/adapters/opencode/` (model-catalog region or new commands-catalog.ts per implementer's read) | +fetch commands at create from sidecar `GET /command?directory=`, null-tolerant normalize, attach to snapshot |
+| `src/components/fresh-agent/FreshAgentComposer.tsx` | menu list = merged rows; session-row select = insert `/name ` into input (canonical name), never auto-send |
+| `src/components/fresh-agent/FreshAgentView.tsx` | pass snapshot-derived `commands` merged list into composer (slashCommands memo) |
+| Tests | shared schema/merge tests; sdk-bridge commands_changed arm test; claude adapter probe test; claude normalize fold test; opencode fetch/normalize tests; composer unit tests (insert-not-send, mixed filter, ARIA untouched, dedupe); FreshAgentView wiring test; e2e extension (see Task 6) |
+| Rust | none |
 
 ## 7. Tasks
 
-### Task 1: Shared catalog types + snapshot schema + merge helper (TDD)
+### Task 1: Shared contract — session-command schema + optional snapshot field + merge helper (TDD)
 
-**Files:** `shared/fresh-agent-slash-commands.ts`, `shared/fresh-agent-contract.ts`, `test/fixtures/fresh-agent/contract-traceability.js`, `test/unit/shared/fresh-agent-slash-commands.test.ts`, `test/unit/shared/fresh-agent-contract.test.ts` (+ traceability test if it enumerates names)
+**Files:** `shared/fresh-agent-contract.ts`, `shared/fresh-agent-slash-commands.ts`, `test/fixtures/fresh-agent/contract-traceability.js`, `test/unit/shared/fresh-agent-contract.test.ts`, `test/unit/shared/fresh-agent-slash-commands.test.ts` (+ new-file-if-convention for schema tests — match existing layout)
 
-- [ ] **Step 1 (RED):** tests for `buildFreshAgentSlashCommandMenu`: statics arrive unchanged in `action` group; catalog rows normalized (trim name of leading `/`; drop empties; dedupe by name within session group) into `session` group; cross-kind same-name coexistence; null/undefined/empty catalog → session group empty; malformed catalog rows dropped (never throw).
-- [ ] **Step 2 (GREEN):** implement types + helper. `FreshAgentSessionCommandSchema = { name: string(min1), description: string, argumentHint?: string, aliases?: string[] }`; `FreshAgentSnapshotSchema` gains `commands: z.array(FreshAgentSessionCommandSchema).optional()`. Verify traceability registration requirement exact (register names so `fresh-agent-contract-traceability.test.ts` passes).
-- [ ] **Step 3 (REFACTOR + verify):** `npm run test:vitest -- run test/unit/shared/` (default config) → all green incl. existing slash-command tests (name-list regression witness).
-- [ ] **Step 4:** Commit: `feat(fresh-agent): shared session-command catalog schema + grouped menu merge helper`.
+- [ ] Step 1 RED: (a) snapshot schema accepts `commands` list of `{name,description,argumentHint?,aliases?}` and REJECTS garbage rows (missing name; extra keys if strict); (b) absence of `commands` parses identical to before (regression witness); (c) merge helper: session rows appended after statics; static-wins dedupe by case-insensitive name AND static aliases; session rows dedupe amongst themselves by canonical name; alias fields preserved verbatim.
+- [ ] Step 2 GREEN: implement schema + type + `mergeSessionSlashCommands`. Exact-interface note: session row wrapper `{ name, description, argumentHint?, aliases?, kind: 'session' }` so composer dispatch switches on it (action rows keep existing shape + implicit action kind). Traceability registration.
+- [ ] Step 3 REFACTOR: only if real duplication with existing helpers.
+- [ ] Step 4 focused: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts test/unit/shared/fresh-agent-slash-commands.test.ts test/unit/shared/fresh-agent-contract-traceability.test.ts` (all default config).
+- [ ] Step 5: commit `feat(fresh-agent): session-command contract + snapshot slot + static-first merge helper`.
 
-### Task 2: Composer + View wiring (TDD)
+### Task 2: Server — claude bridge probe + commands_changed arm + snapshot fold (TDD)
 
-**Files:** `src/components/fresh-agent/FreshAgentComposer.tsx`, `src/components/fresh-agent/FreshAgentView.tsx`, `test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`, `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+**Files:** `server/sdk-bridge.ts`, `server/fresh-agent/adapters/claude/normalize.ts`, `test/unit/server/sdk-bridge.test.ts`, `test/unit/server/fresh-agent/claude-adapter.test.ts`, `test/unit/server/fresh-agent/claude-normalize.test.ts` (+ parity/contract tests if they enumerate schema fields — discover at execution)
 
-- [ ] **Step 1 (RED):** composer tests (existing api-mock conventions): (a) menu shows labelled action + session groups when catalog rows present; (b) selecting a session command sets textbox value `/name ` and does NOT call onSend or any action dispatch; (c) selecting an action behaves exactly as today (regression witness); (d) typed `/clear x` + Enter with session command listed sends verbatim via onSend (no action dispatch); (e) typed `/compact` still dispatches the static action (statics-first); (f) ARIA: no combobox/menu semantics leak when menu closed (existing pins keep passing); (g) capability gating (/fork hidden without flag) unchanged with catalog present.
-- [ ] **Step 2 (GREEN):** implement: View computes grouped list from `getFreshAgentSlashCommands(sessionType)` + `snapshot?.commands` (read the existing snapshot flow at view L674-680 — commands arrive there) and passes grouped structure (or flat list + helper grouping in composer — pick the composition that keeps composer props narrowest); composer renders groups; session selection inserts `/name ` + focuses; executeSlashText filters to `kind==='action'`.
-- [ ] **Step 3 (REFACTOR + verify):** focused runs for both component files + `npm run test:vitest -- run test/unit/client/components/fresh-agent/`; `npm run typecheck`.
-- [ ] **Step 4 (e2e):** `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent.spec.ts` (menu-adjacent coverage) → PASS.
-- [ ] **Step 5:** Commit: `feat(fresh-agent): grouped slash menu — provider session commands compose text, actions unchanged`.
+Prerequisite interface from Task 1. Behaviors:
+- After `createSession` (sdk-bridge.ts:189-225 region), `await probeQuery.supportedCommands()` guarded with try/catch + the bridge's existing 10s-abort harness pattern IF that pattern is the house norm for query-handle calls (match it), storing normalized rows into session `state.commands`; failure = empty/absent, never session-fatal.
+- Normalize SDK rows → contract rows: drop nothing but must-not-crash on missing description (fork does nullish-coalesce; match: description ?? '').
+- New `commands_changed` arm in `handleSdkMessage`: REPLACE state.commands with the message's rows (same normalization) and broadcastToSession the same invalidation class the ordinal session-changed edge uses (read the exact existing broadcast that triggers client refetch — reuse verbatim).
+- `normalizeClaudeThreadSnapshot` folds state.commands → snapshot.commands (omit when undefined).
+- [ ] Steps RED→GREEN for: probe-folds-into-state (claude-adapter.test.ts with mocked supportedCommands), commands_changed REPLACE + invalidation broadcast + liveness follow-up (sdk-bridge.test.ts mockGenerator pattern from last run's locks), normalize fold (claude-normalize.test.ts), probe-failure tolerance (adapter test: supportedCommands rejects → session still creates, commands absent).
+- [ ] Impacted: `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts test/unit/server/fresh-agent/ --config config/vitest/vitest.server.config.ts`.
+- [ ] Commit: `feat(sdk-bridge): probe + relay claude slash-command catalogs (create-time supportedCommands + commands_changed REPLACE)`.
 
-### Task 3: Claude catalog — probe + live updates + snapshot surface (TDD)
+### Task 3: Server — freshopencode commands from sidecar `/command` (TDD)
 
-**Files:** `server/sdk-bridge.ts`, `server/fresh-agent/adapters/claude/normalize.ts`, `server/fresh-agent/adapters/claude/adapter.ts` (if the probe belongs at adapter level), tests: `test/unit/server/sdk-bridge.test.ts`, `test/unit/server/fresh-agent/claude-adapter.test.ts`, `test/unit/server/fresh-agent/claude-normalize.test.ts` (verify exact names), parity/contract suites.
+**Files:** new `server/fresh-agent/adapters/opencode/commands-catalog.ts` (or extend model-catalog.ts — implementer chooses per house shape, note in report), opencode adapter create path, `test/unit/server/fresh-agent/opencode-*.test.ts` matching new/changed module.
 
-- [ ] **Step 1 (RED, bridge):** tests: createSession with mock SDK exposing `supportedCommands()` → stored normalized catalog (name/desc/argumentHint/aliases); `system/commands_changed` arm → REPLACE + one `freshAgent.session.changed` broadcast; init-arm captures `slash_commands` names as placeholder ordering (probe overwrites). RED-witness via temporarily-wrong assertion, paste.
-- [ ] **Step 2 (GREEN):** implement in `handleSdkMessage` arms + post-create fire-and-forget probe (catch → keep placeholder, debug-log; never reject the session create).
-- [ ] **Step 3 (adapter normalize):** `normalizeClaudeThreadSnapshot` maps bridge state.commands → snapshot.commands (omit when absent — field is optional); kilroy inherits (verify same adapter registration). Tests incl. snapshot-schema round-trip.
-- [ ] **Step 4 (verify):** `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts test/unit/server/fresh-agent/ --config config/vitest/vitest.server.config.ts` then `npm run test:vitest -- run test/unit/server/ --config config/vitest/vitest.server.config.ts`.
-- [ ] **Step 5 (live smoke):** scratch server on a recorded port (3494): create freshclaude pane via REST, assert snapshot REST contains non-empty `commands` (curl + jq), send `/clear`? NO — do not mutate session state needlessly: assertion stops at presence+shape. Teardown by PID; `.env` copy removed after.
-- [ ] **Step 6:** Commit: `feat(freshclaude): advertise SDK slash commands on the session snapshot (init capture + probe + commands_changed REPLACE)`.
+- Null-tolerant zod for sidecar rows; normalize to contract rows (description ?? '', argumentHint from `hints`? — E4: no structured arg hints; LEAVE argumentHint unset; do NOT map template hints).
+- Wire at session create: fetch `GET ${baseUrl}/command?directory=<cwd>` with the existing fetchWithTimeout pattern; failure/absent = empty (never session-fatal).
+- Attach to snapshot.commands at normalize path for freshopencode.
+- [ ] RED→GREEN: mocked-fetch tests (row normalization incl. explicit nulls; failure tolerance; directory param forwarded; snapshot fold).
+- [ ] Impacted server suite run.
+- [ ] Commit: `feat(freshopencode): advertise sidecar /command catalog in session snapshot`.
 
-### Task 4: Opencode arm (GATED on Stage-2 validator result)
+### Task 4: Client — composer mixed menu + insert-not-send (TDD)
 
-- [ ] **Gate outcome `expand-server-side`:** commands listed on snapshot; session select inserts `/name ` verbatim (serve expands). Wire: adapter fetch `GET {baseUrl}/command?directory=<pane cwd>` at create and on attach (mirror `model-catalog.ts` `fetchWithTimeout`), null-tolerant mapping (`description??''`, drop `source`-irrelevant fields), dedupe by name; tests with serve-client mocked at the fetch boundary; client behavior unchanged from Task 2.
-- [ ] **Gate outcome `expand-client-side`:** Task 2's session-insert remains `/name `, but the SEND path for freshopencode session commands expands `template` with `$ARGUMENTS` ← args (only in composer execute-at-submit for a matched opencode catalog row with template); server arm identical to above. Record the decision + template snapshots in the report.
-- [ ] **Gate outcome `vacuous` (no usable invocation):** ship empty slot; write kata; record in recap. This task becomes docs-only: a short comment in the adapter noting the probe outcome.
-- [ ] **Step final:** Commit per outcome: `feat(freshopencode): serve-advertised commands in the slash catalog` or `docs: record opencode command-surface probe outcome`.
+**Files:** `src/components/fresh-agent/FreshAgentComposer.tsx`, `src/components/fresh-agent/FreshAgentView.tsx`, `test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`, `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`.
 
-### Task 5: Close-out gate
+- FreshAgentView slashCommands memo (L674-680 region): merged = `mergeSessionSlashCommands(getFreshAgentSlashCommands(sessionType), snapshot?.commands ?? [])`; capability gating intact.
+- Composer: session rows render AFTER statics in the same filtered list; choose visual treatment minimally (a source tag or sectioned order — match the file's existing styling idioms; e.g. description suffix); select inserts `/canonicalName ` into the input via the same text-set mechanism typing uses (setInputValue path), focuses input, does NOT send.
+- unknown-command fallthrough unchanged.
+- [ ] RED→GREEN tests: merge order; static-wins dedupe (session 'compact' dropped when static compact exists incl. alias collisions 'compress'); alias select inserts canonical name; insert does not dispatch send/onCommand; filter matches description too? (match CURRENT filter semantics — substring on name+description today? composer L222-225 filter: name only per E1 note "substring-filters with no dedupe"; keep name-substring only, verify and pin); menu ARIA roles unchanged (structure test asserting no combobox attrs when closed and menu roles when open — if such coverage already exists, extend it).
+- [ ] Impacted: composer+view unit files + `npm run typecheck` + `npm run lint` (a11y clean).
+- [ ] Commit: `feat(fresh-agent): composer surfaces provider-advertised slash commands (insert, never auto-send)`.
 
-- [ ] `npm run typecheck && npm run lint`; `FRESHELL_TEST_SUMMARY="slash-command-catalogs close-out" npm test` (record holder/status); e2e fresh-agent + restore-matrix specs; update run-state; STOP for delta Fresh Eyes.
+### Task 5: e2e + live smoke evidence
+
+- [ ] e2e: extend the existing fresh-agent control spec (`test/e2e-browser/specs/fresh-agent-control-rust.spec.ts` home of capability-gate pins) or the matching node-equivalent spec if that's the harness for composer scenarios — AT EXECUTION pick whichever harness mocks/stubs the snapshot (read the spec conventions); add: snapshot with commands rows ⇒ menu shows merged rows; session row select inserts text without sending; static rows behave identically to today. `npm run test:e2e:local -- <chosen spec>` PASS; do not weaken any existing assertion.
+- [ ] Live smoke (cheap, high-value): scratch dev server unique port 3597, PID-filed; copy .env (delete after); create freshclaude pane via agent-api; GET its REST snapshot; ASSERT snapshot.commands non-empty and contains a known builtin (e.g. name 'compact' or 'clear'); teardown + hygiene verify. Receipts to run ledger. (No turn execution needed — create suffices.)
+- [ ] Commit e2e additions only.
+
+### Task 6: Close-out gate
+
+- [ ] `npm run typecheck && npm run lint` → 0.
+- [ ] Fullsuite final gate: `FRESHELL_TEST_SUMMARY="slash-command catalogs final gate" npm test` (cloud backend expected working again — gcloud reauthed; do NOT force local).
+- [ ] Update run-state; STOP for Fresh Eyes delta rounds.
 
 ## 8. Rollback
 
-Worktree branch; rollback = abandon. Granular: Task 2 revert restores static-only menu; Task 3/4 reverts drop provider rows from snapshots (schema field is optional so old clients parse fine); Task 1 revert removes the helper/schema field (covered by ripple tests).
-
-## Appendix A: deferred questions
-
-- Whether to show opencode `source:"skill"` rows distinctly (E4: 39 of 44 rows are skills) — during Task 4 presentation polish only if cheap; default = one session group regardless of source.
+Abandon = delete branch. Targeted: revert Task 4 (menu) leaving server slot inert; revert Task 2/3 server filling; revert Task 1 contract last. Rust/prod never involved.
