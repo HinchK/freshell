@@ -290,8 +290,6 @@ export function getFreshAgentSettingsModelOptions(args: ResolveFreshAgentModelSe
 export interface ClaudeSelectorOptions {
   /** Statics first, then deduped probed rows. */
   modelOptions: readonly FreshAgentModelOption[]
-  /** Static labels + probed id displayNames (for current-model display lookups). */
-  labelById: Readonly<Record<string, string>>
 }
 
 /**
@@ -307,20 +305,17 @@ export function mergeClaudeSelectorOptions(
   catalog: FreshAgentModelCapabilities | null | undefined,
   staticOptions: readonly FreshAgentModelOption[],
 ): ClaudeSelectorOptions {
-  const labelById: Record<string, string> = {}
   const seen = new Set<string>()
   for (const option of staticOptions) {
     seen.add(option.value)
-    labelById[option.value] = option.label
   }
   const modelOptions: FreshAgentModelOption[] = [...staticOptions]
   for (const model of catalog?.models ?? []) {
     if (seen.has(model.id)) continue
     seen.add(model.id)
-    labelById[model.id] = model.displayName
     modelOptions.push({ value: model.id, label: model.displayName })
   }
-  return { modelOptions, labelById }
+  return { modelOptions }
 }
 
 export type FreshAgentModelSourceGroup = {

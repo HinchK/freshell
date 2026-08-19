@@ -450,18 +450,12 @@ describe('mergeClaudeSelectorOptions', () => {
       { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
       { value: 'sonnet', label: 'Sonnet' },
     ])
-    expect(merged.labelById).toEqual({
-      'opus[1m]': 'Claude Opus 5 (1M context)',
-      'claude-opus-4-7': 'Claude Opus 4.7',
-      'sonnet': 'Sonnet',
-    })
   })
 
   it('returns statics and static labels unchanged for a null catalog', () => {
     const merged = mergeClaudeSelectorOptions(null, staticOptions)
 
     expect(merged.modelOptions).toEqual(staticOptions)
-    expect(merged.labelById).toEqual({ 'opus[1m]': 'Claude Opus 5 (1M context)' })
   })
 
   it('returns statics and static labels unchanged for an empty catalog', () => {
@@ -474,7 +468,6 @@ describe('mergeClaudeSelectorOptions', () => {
     }, staticOptions)
 
     expect(merged.modelOptions).toEqual(staticOptions)
-    expect(merged.labelById).toEqual({ 'opus[1m]': 'Claude Opus 5 (1M context)' })
   })
 })
 
