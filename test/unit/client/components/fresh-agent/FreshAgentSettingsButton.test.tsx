@@ -90,6 +90,14 @@ function createStore() {
   })
 }
 
+function readPaneContent(store: ReturnType<typeof createStore>) {
+  const layout = store.getState().panes.layouts['tab-1']
+  if (!layout || layout.type !== 'leaf' || layout.id !== 'pane-1' || layout.content.kind !== 'fresh-agent') {
+    throw new Error('Missing fresh-agent pane pane-1')
+  }
+  return layout.content
+}
+
 function seedPane(
   store: ReturnType<typeof createStore>,
   content: Record<string, unknown>,
@@ -353,6 +361,145 @@ describe('FreshAgentSettingsButton', () => {
     // haiku declares no effort levels — the static opus[1m] five-level menu
     // must NOT stand in for it
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
+  })
+
+  it('renders the freshclaude popover with static rows only (and no opencode unavailable notice) when the catalog fetch rejects', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockRejectedValue(new Error('probe down'))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
+    })
+    // the rejected probe degrades to statics only — the popover must not crash
+    expect(await screen.findByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
+    expect(screen.getAllByRole('radio')).toHaveLength(1)
+    // the opencode-style catalog-unavailable notice stays opencode-only
+    expect(screen.queryByText('Model catalog unavailable — try again')).not.toBeInTheDocument()
+  })
+
+  it('clamps effort against the switched-to probed claude row’s own levels, not the static fallback', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet',
+          provider: 'claude' as const,
+          supportsEffort: true,
+          supportedEffortLevels: ['alpha', 'beta'],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'max',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    fireEvent.click(await screen.findByRole('radio', { name: 'Sonnet' }))
+
+    const content = readPaneContent(store)
+    expect(content.model).toBe('sonnet')
+    // 'max' is valid for the static opus[1m] default but NOT for this probed
+    // row: the clamp lands on the row’s first declared level, not the static
+    // table’s fallback
+    expect(content.effort).toBe('alpha')
+  })
+
+  it('clears the pane effort when switching to a probed claude row that declares no effort levels', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'max',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    fireEvent.click(await screen.findByRole('radio', { name: 'Haiku' }))
+
+    const content = readPaneContent(store)
+    expect(content.model).toBe('haiku')
+    // the probed row declares NO levels — never fabricate a clamp from the
+    // static default’s table (pre-fix kept 'max' because opus[1m] allows it)
+    expect(content.effort).toBeUndefined()
+  })
+
+  it('keeps the existing static-table normalization when switching to the static opus[1m] row', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet',
+          provider: 'claude' as const,
+          supportsEffort: true,
+          supportedEffortLevels: ['alpha', 'beta'],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'alpha',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    fireEvent.click(await screen.findByRole('radio', { name: 'Claude Opus 5 (1M context)' }))
+
+    const content = readPaneContent(store)
+    expect(content.model).toBe('opus[1m]')
+    // regression witness: 'alpha' is unknown to the static opus[1m] row, so the
+    // row’s declared defaultEffort ('high') stands in — exactly the pre-fix
+    // normalizeFreshAgentEffort result
+    expect(content.effort).toBe('high')
   })
 
   it('sources the Thinking select from the active probed claude row’s own levels', async () => {
