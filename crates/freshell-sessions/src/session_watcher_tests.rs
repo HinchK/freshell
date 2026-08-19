@@ -3070,7 +3070,7 @@ async fn retry_drain_recovers_reported_misnamed_root() {
 /// 1 (projects root) + 12 (sessions dirs) + 4 (stand-ins) + 12×3 (root session dirs) = 53
 /// watches — never a subagent dir, never context-intelligence — while every
 /// root session (incl. one old+externally-resumed) updates instantly through
-/// the real watcher path and all 72 subagent rows still index.
+/// the real watcher path and all 72 rows (36 of them subagent rows) still index.
 #[tokio::test]
 async fn amplifier_managed_watch_set_proof_of_reduction_and_root_liveness() {
     let home = unique_temp_dir("amp-proof");

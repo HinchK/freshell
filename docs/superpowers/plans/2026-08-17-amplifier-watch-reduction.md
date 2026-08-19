@@ -93,7 +93,11 @@ old, updates instantly, including external resumes. No age cutoff, ever
   it disappears. Arm failures go to a bounded retry set with exponential
   backoff — never the absent list (which retries forever) — and entries with
   deterministic errors (ENOENT/ENOTDIR) are dropped immediately rather than
-  retried: a dir's reappearance is a fresh structural create anyway. The
+  retried only where a watched parent guarantees reappearance signaling
+  (Standin, SessionDir: a dir's reappearance is a fresh structural create
+  anyway); a deterministic `sessions/` arm failure instead absent-tracks the
+  sessions dir and arms the project as the stand-in (as-built correction,
+  commit 3e41e683d), since no watched parent exists in that corner. The
   cascade's readdir classifies entry types (`file_type` is already available)
   so a stray file at project depth never generates a doomed `<file>/sessions`
   arm attempt. If the retry set overflows its bound, evicted dirs are simply
