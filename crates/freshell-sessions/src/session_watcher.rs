@@ -335,9 +335,12 @@ pub(crate) struct ManagedBook {
     /// Every armed path (projects root, sessions dirs, stand-ins, root
     /// session dirs).
     armed: std::collections::HashSet<PathBuf>,
-    /// Structural targets (the projects root chiefly) whose path is
-    /// currently absent — re-checked by the rearm tick. Session dirs are
-    /// never absence-tracked (design).
+    /// Structural targets whose path is currently absent: the projects root
+    /// (re-checked by the rearm tick, with its late-root ancestor fast path)
+    /// and sessions dirs whose arm caught ENOENT/ENOTDIR in the scan→arm
+    /// window (delta D2-1 — their PROJECT's armed stand-in owns reappearance
+    /// detection; the absence entry clears on the successful re-arm).
+    /// Session dirs are never absence-tracked (design).
     absent: std::collections::HashSet<PathBuf>,
     /// Transient arm failures under bounded exponential backoff
     /// (retry_backoff doubling to its 60s cap, RETRY_CAP entries).
@@ -478,13 +481,16 @@ struct ArmOutcome {
 
 /// Shared arming clause for every managed target: one NonRecursive
 /// `watch_path`, then the bookkeeping the design pins. Success: the path
-/// lands in `armed` and any stale retry entry clears. Deterministic
-/// failure (ENOENT/ENOTDIR): dropped immediately for the non-root kinds
-/// (a reappearance is a fresh structural create anyway) — the PROJECTS
-/// ROOT routes to `absent` + provider dirty instead (the scan→arm ENOENT
-/// race is never silently dropped). Transient failure: enters `retry` at
-/// doubled, capped backoff with the kind retained (a re-failure bumps the
-/// count in place). Returns true when the path is armed.
+/// lands in `armed` and any stale retry/absence entry clears. Deterministic
+/// failure (ENOENT/ENOTDIR): the PROJECTS ROOT routes to `absent` +
+/// provider dirty (the scan→arm ENOENT race is never silently dropped); a
+/// SESSIONS DIR is routed by its caller to the project's stand-in + `absent`
+/// (delta D2-1 — the parent-is-watched guarantee does not extend to it);
+/// the remaining kinds (Standin, SessionDir) are dropped immediately (their
+/// parents ARE watched, so a reappearance is a fresh structural create).
+/// Transient failure: enters `retry` at doubled, capped backoff with the
+/// kind retained (a re-failure bumps the count in place). Returns true when
+/// the path is armed.
 fn watch_and_record(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
@@ -497,6 +503,11 @@ fn watch_and_record(
         Ok(()) => {
             book.armed.insert(path.to_path_buf());
             book.retry.remove(path);
+            // A landed arm clears any absence booked for the exact path —
+            // the D2-1 corner's sessions-dir entry disappears with the
+            // successful re-arm/swap; a ProjectsRoot landing covers the
+            // return flow the same way (the explicit removals stay as belt).
+            book.absent.remove(path);
             true
         }
         Err(e) => {
@@ -579,6 +590,29 @@ fn arm_managed_dir(
                 // LIVE watch, so a create landing between the readdir and
                 // the arm can never be lost.
                 cascade_session_children(book, watcher, outcome, path, emit_marks);
+            } else if !book.retry.contains_key(path) {
+                // Delta D2-1: a DETERMINISTIC failure (ENOENT/ENOTDIR — the
+                // sessions dir vanished in the scan→arm window) must not
+                // drop the target into the orphaned corner: planning SAW an
+                // existing sessions dir, so no stand-in was armed for the
+                // project, and the non-recursive root watch cannot observe
+                // a grandchild's reappearance (a plain drop defers root
+                // sessions created there to the 15-minute reconcile,
+                // violating the zero-latency requirement). The corner is
+                // only sound where the parent is guaranteed watched —
+                // SessionDir's parent (the sessions dir) is, Standin's
+                // parent (the root) is — so arm the PROJECT dir as the
+                // stand-in, the same object a missing-at-plan sessions dir
+                // produces (`arm_sessions_or_standin`, swap included: a
+                // sessions/ reappearing mid-window swaps first-line), and
+                // absent-track the sessions dir. A later reappearance
+                // surfaces as the existing depth-2 `Create(sessions)` →
+                // swap path. Transient failures entered `retry` instead
+                // and own the target — the stand-in must not double-own it.
+                book.absent.insert(path.to_path_buf());
+                if let Some(project) = path.parent() {
+                    arm_sessions_or_standin(book, watcher, outcome, project, emit_marks);
+                }
             }
         }
         ArmKind::SessionDir => {

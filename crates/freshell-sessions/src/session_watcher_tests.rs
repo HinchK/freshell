@@ -833,6 +833,119 @@ async fn deterministic_arm_failure_never_enters_retry_set() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Delta D2-1 (scan→arm window, `SessionsDir` kind): a `<proj>/sessions/`
+/// dir that existed at plan time but VANISHED before its arm must NOT be
+/// dropped silently — planning saw it, so NO stand-in was armed for the
+/// project and the non-recursive root watch cannot observe the grandchild's
+/// reappearance (a plain drop orphans the project until the reconcile). The
+/// project must be armed as the stand-in — the same object a missing-at-plan
+/// sessions dir produces — and the sessions dir absent-tracked, so a later
+/// reappearance surfaces as the existing depth-2 `Create(sessions)` → swap
+/// path, promptly (never the 60s tick or the 15-minute reconcile). Driven
+/// deterministically with the established no-loop idiom (split production
+/// startup into its ordered steps and mutate the window), then proven live:
+/// the armed stand-in observes the reappearance, and the loop's dispatch +
+/// deferred cascade executor arms the sessions dir and its new root session
+/// first-line.
+#[tokio::test]
+async fn sessions_dir_vanishing_between_plan_and_arm_arms_the_project_standin() {
+    let home = unique_temp_dir("amp-plan-arm-race");
+    let _pre = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let projects_root = home.join("projects");
+    let proj = projects_root.join("p");
+    let sessions_dir = proj.join("sessions");
+
+    // Production startup step A: the plan scan sees the sessions dir.
+    let plan = crate::watch_plan::plan_amplifier_targets(&projects_root).unwrap();
+    assert!(plan.sessions_dirs.contains(&sessions_dir));
+    // THE WINDOW: sessions/ vanishes after the scan, before the arms.
+    std::fs::remove_dir_all(&sessions_dir).unwrap();
+
+    // Production startup step B: the arms (in production inside
+    // spawn_blocking; the sync core here is the identical code path).
+    let (tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+    apply_amplifier_startup_plan(&mut book, &mut watcher, &mut outcome, &projects_root, plan);
+
+    assert!(
+        !book.armed.contains(&sessions_dir),
+        "the vanished sessions dir never arms"
+    );
+    assert!(
+        book.armed.contains(&proj),
+        "the project MUST be armed as the stand-in (the orphaned corner): {:?}",
+        book.armed
+    );
+    assert!(
+        book.absent.contains(&sessions_dir),
+        "the vanished sessions dir is absent-tracked"
+    );
+
+    // The stand-in is LIVE: re-creating sessions/ surfaces the depth-2
+    // `Create(<proj>/sessions)` event through it.
+    let recreated = write_amplifier_session(&home, "p", "bb2584be-9478-4801-a62d-4e5da428b3a0");
+    let seen = collect_file_paths(&mut rx, Duration::from_secs(2), |s| {
+        s.contains(&sessions_dir)
+    })
+    .await;
+    assert!(
+        seen.contains(&sessions_dir),
+        "the stand-in observes the re-created sessions/ (the depth-2 create): {seen:?}"
+    );
+
+    // The loop's depth-2 create route defers the project to the cascade
+    // executor — drive exactly that (dispatch → cascades → cascade_new_project).
+    let index = amplifier_index(&home);
+    let interest = std::sync::atomic::AtomicUsize::new(0);
+    let mut pending: HashMap<(PathBuf, String), Instant> = HashMap::new();
+    let mut cascades: Vec<PathBuf> = Vec::new();
+    dispatch_amplifier_path(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        &interest,
+        &sessions_dir,
+        WatchKind::CreateFolder,
+        &mut pending,
+        &index,
+        &mut cascades,
+    );
+    assert_eq!(
+        cascades,
+        vec![proj.clone()],
+        "the depth-2 create defers the project"
+    );
+    for project in cascades {
+        cascade_new_project(&mut book, &mut watcher, &mut outcome, &project, true);
+    }
+    assert!(
+        book.armed.contains(&sessions_dir),
+        "re-created sessions/ armed by the swap"
+    );
+    assert!(
+        !book.absent.contains(&sessions_dir),
+        "the successful re-arm clears the absence"
+    );
+    assert!(
+        book.armed.contains(&recreated),
+        "the root session created in the window cascades promptly — not the 15-minute reconcile"
+    );
+    assert!(
+        outcome.marks.contains(&recreated.join("metadata.json")),
+        "watch-then-scan scoped mark lands first-line: {:?}",
+        outcome.marks
+    );
+    assert!(
+        !book.armed.contains(&proj),
+        "the stand-in swaps off once the sessions arm lands"
+    );
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Regression 7 (check→arm window): the stand-in arm IMMEDIATELY re-checks
 /// for sessions/ and swaps when it has appeared in the window.
 #[tokio::test]
