@@ -75,6 +75,13 @@ function makeFakeManager() {
     abort: vi.fn(async () => undefined),
     compact: vi.fn(async () => undefined),
     fork: vi.fn(async (): Promise<{ id: string; directory?: string }> => ({ id: 'ses_child_1' })),
+    // Slash-command catalog + dispatch routes. Default REJECT keeps every pre-existing
+    // test byte-identical: the catalog stays gracefully absent, so no dispatch can ever
+    // match and the command route never fires.
+    listCommands: vi.fn(async (): Promise<unknown> => { throw new Error('catalog unavailable') }),
+    runCommand: vi.fn(async (): Promise<{ info: Record<string, any>; parts: Array<Record<string, any>> }> => {
+      throw new Error('command route unavailable')
+    }),
     onceIdle: vi.fn(async () => undefined),
     subscribe: vi.fn((id: string, listener: (e: unknown) => void) => {
       const e = emitterFor(id)
@@ -1768,5 +1775,221 @@ describe('inspectSessions: read-only incident summary (zrrj)', () => {
       monitorArmed: false,
     }])
     expect(JSON.stringify(result)).not.toContain('freshopencode-req-cold')
+  })
+})
+
+describe('OpenCode serve adapter: slash-command catalog + dispatch', () => {
+  const CATALOG_ROWS = [
+    { name: 'Review', description: 'review the diff', source: 'command' },
+    { name: 'val-b-probe', description: 'VAL-B-PROBE', source: 'command' },
+    { name: 'goal', description: null, agent: null, model: null, source: 'command', subtask: null },
+    { name: 'browsing', description: 'skill row', source: 'skill' },
+  ]
+
+  it('captures the /command catalog at create scoped to the pane directory, folds it into the snapshot, and emits the invalidation edge', async () => {
+    const catalog = createDeferred<unknown>()
+    const manager = makeFakeManager()
+    manager.listCommands.mockReturnValue(catalog.promise)
+    const adapter = makeAdapter(manager)
+
+    const events: unknown[] = []
+    await adapter.create({ requestId: 'req-cat', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    adapter.subscribe?.('freshopencode-req-cat', (e) => events.push(e))
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalledWith({ cwd: '/repo' }))
+
+    catalog.resolve(CATALOG_ROWS)
+    // The claude-side invalidation precedent: sdk.session.changed is already one of the
+    // client's snapshot-invalidating events, so a live composer refetches and sees the rows.
+    await vi.waitFor(() => expect(events).toContainEqual({
+      type: 'sdk.session.changed', sessionId: 'freshopencode-req-cat', reason: 'session-commands',
+    }))
+
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-req-cat',
+    })
+    expect(snapshot?.commands).toEqual([
+      { name: 'Review', description: 'review the diff' },
+      { name: 'val-b-probe', description: 'VAL-B-PROBE' },
+      { name: 'goal', description: '' },
+      { name: 'browsing', description: 'skill row' },
+    ])
+  })
+
+  it('captures the catalog when resuming a durable session too', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue(CATALOG_ROWS)
+    const adapter = makeAdapter(manager)
+
+    await adapter.resume?.({
+      requestId: 'req-resume-cat', sessionType: 'freshopencode', provider: 'opencode',
+      resumeSessionId: 'ses_resumed', cwd: '/repo/resumed',
+    })
+    expect(manager.listCommands).toHaveBeenCalledWith({ cwd: '/repo/resumed' })
+
+    await vi.waitFor(async () => {
+      const snapshot = await adapter.getSnapshot?.({
+        sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_resumed', cwd: '/repo/resumed',
+      })
+      expect(snapshot?.commands?.map((row) => row.name)).toEqual(['Review', 'val-b-probe', 'goal', 'browsing'])
+    })
+  })
+
+  it('tolerates a catalog fetch failure: snapshot omits commands and slash text stays on the verbatim prompt path', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockRejectedValue(new Error('catalog boom'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-nofail', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalled())
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-req-nofail',
+    })
+    expect(snapshot).not.toHaveProperty('commands')
+
+    // The verbatim prompt path must be untouched by the failed catalog.
+    const result = await adapter.send?.('freshopencode-req-nofail', { text: '/review please' })
+    expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    expect(manager.runCommand).not.toHaveBeenCalled()
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_real_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: '/review please' }] }),
+      { cwd: '/repo' },
+    )
+    expect(manager.onceIdle).toHaveBeenCalled()
+  })
+
+  it('routes a catalog-matching slash send to POST /session/:id/command with canonical casing + verbatim args and never sends the verbatim prompt', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue(CATALOG_ROWS)
+    manager.runCommand.mockResolvedValue({
+      info: { id: 'msg_cmd_1', role: 'assistant', time: { created: 1, completed: 2 }, finish: 'stop' },
+      parts: [{ id: 'prt_1', type: 'text', text: 'command turn done' }],
+    })
+    const adapter = makeAdapter(manager, { turnTimeoutMs: 123_456 })
+    await adapter.create({ requestId: 'req-cmd', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-cmd', (e) => events.push(e))
+
+    const result = await adapter.send?.('freshopencode-req-cmd', { text: '/REVIEW  a  b ' })
+
+    expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    // Canonical casing from the catalog; args verbatim after the separator run
+    // (inner and trailing spacing preserved). The POST awaits at TURN scale.
+    expect(manager.runCommand).toHaveBeenCalledWith(
+      'ses_real_1',
+      { command: 'Review', arguments: 'a  b ' },
+      { cwd: '/repo' },
+      123_456,
+    )
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+    // The completion edge is the synchronous POST response — no onceIdle waiter.
+    expect(manager.onceIdle).not.toHaveBeenCalled()
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
+  it('leaves non-matching slash text on the verbatim prompt path (existing behavior witness)', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue(CATALOG_ROWS)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-verbatim', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    const result = await adapter.send?.('freshopencode-req-verbatim', { text: '/unknown-cmd do the thing' })
+
+    expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    expect(manager.runCommand).not.toHaveBeenCalled()
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_real_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: '/unknown-cmd do the thing' }] }),
+      { cwd: '/repo' },
+    )
+    expect(manager.onceIdle).toHaveBeenCalled()
+  })
+
+  it('folds the command turn into the transcript/read path exactly like a prompt turn (expanded user part + assistant parts recorded)', async () => {
+    const now = Date.now()
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue([{ name: 'val-b-probe', description: 'VAL-B-PROBE', source: 'command' }])
+    // The sidecar records the expanded template as the user part and the reply as the
+    // completed assistant message (VAL-A LB-04b); the read path must surface both.
+    manager.listMessages.mockResolvedValue({
+      messages: [
+        { info: { id: 'msg_user_expanded', role: 'user', time: { created: now } }, parts: [{ id: 'prt_u', type: 'text', text: 'VALPROBE-EXPANDED: MARKER_B2' }] },
+        { info: { id: 'msg_assistant_cmd', role: 'assistant', time: { created: now + 1, completed: now + 2 } }, parts: [{ id: 'prt_a', type: 'text', text: 'command turn done' }] },
+      ],
+      nextCursor: null,
+    })
+    manager.runCommand.mockResolvedValue({
+      info: { id: 'msg_assistant_cmd', role: 'assistant', time: { created: now + 1, completed: now + 2 }, finish: 'stop' },
+      parts: [{ id: 'prt_a', type: 'text', text: 'command turn done' }],
+    })
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-fold', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    await adapter.send?.('freshopencode-req-fold', { text: '/val-b-probe MARKER_B2' })
+
+    // The dispatch lane must actually fire (otherwise the primed transcript would make
+    // this test pass vacuously on the verbatim path).
+    expect(manager.runCommand).toHaveBeenCalledWith(
+      'ses_real_1',
+      { command: 'val-b-probe', arguments: 'MARKER_B2' },
+      { cwd: '/repo' },
+      expect.any(Number),
+    )
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-req-fold', cwd: '/repo',
+    })
+    const visibleTexts = snapshot?.turns.flatMap((turn) => turn.items.map((item) => item.kind === 'text' ? item.text : ''))
+    expect(visibleTexts).toContain('VALPROBE-EXPANDED: MARKER_B2')
+    expect(visibleTexts).toContain('command turn done')
+  })
+
+  it('surfaces a failing command POST as a send error — no silent drop, no turn-complete chime', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue([{ name: 'review', description: '', source: 'command' }])
+    manager.runCommand.mockRejectedValue(new Error('opencode serve POST /session/ses_real_1/command → 500 exploded'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-cmdfail', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-cmdfail', (e) => events.push(e))
+
+    await expect(adapter.send?.('freshopencode-req-cmdfail', { text: '/review' }))
+      .rejects.toThrow('→ 500 exploded')
+
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'running' })
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'idle' })
+    expect(events.find((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toBeUndefined()
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('brackets the synchronous command POST with adapter-synthesized busy→idle (no SSE, no onceIdle armed)', async () => {
+    // Mocks can pin the adapter's behavior but not live-serve SSE: VAL-A did not sample
+    // whether 1.18.18 emits busy SSE around /command turns. This mock emits NOTHING on
+    // the SSE channel around the POST, and the adapter must still show busy for the whole
+    // await and idle exactly once the response lands.
+    const posted = createDeferred<{ info: Record<string, any>; parts: Array<Record<string, any>> }>()
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue([{ name: 'review', description: '', source: 'command' }])
+    manager.runCommand.mockReturnValue(posted.promise)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-busy', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-busy', (e) => events.push(e))
+
+    const send = adapter.send?.('freshopencode-req-busy', { text: '/review now' })
+    await vi.waitFor(() => expect(manager.runCommand).toHaveBeenCalled())
+
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'running' })
+    expect(events).not.toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle' })
+    expect(manager.onceIdle).not.toHaveBeenCalled()
+
+    posted.resolve({ info: { id: 'msg_cmd_2', role: 'assistant', time: { created: 1, completed: 2 } }, parts: [] })
+    await send
+
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle' })
+    expect(events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toHaveLength(1)
+    expect(manager.onceIdle).not.toHaveBeenCalled()
   })
 })

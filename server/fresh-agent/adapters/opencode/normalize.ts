@@ -1,4 +1,5 @@
 import type {
+  FreshAgentSessionCommand,
   FreshAgentSnapshot,
   FreshAgentTranscriptItem,
   FreshAgentTurn,
@@ -428,6 +429,9 @@ export function normalizeOpencodeSnapshot(input: {
    * adapter holds live state whose initial status reconcile completed. Absent
    * when the caller has no live-state notion (e.g. turn pages). */
   statusFromLiveState?: boolean
+  /** Sidecar-advertised session commands captured for this session's directory;
+   * absent until the create-time catalog fetch lands (graceful absence). */
+  commands?: readonly FreshAgentSessionCommand[]
 }): FreshAgentSnapshot {
   const info = input.exported?.info ?? {}
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
@@ -466,6 +470,7 @@ export function normalizeOpencodeSnapshot(input: {
     worktrees: [],
     diffs: [],
     childThreads: [],
+    ...(input.commands ? { commands: input.commands } : {}),
     turns,
     extensions: {
       opencode: {

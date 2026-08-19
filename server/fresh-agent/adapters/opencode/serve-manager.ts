@@ -189,8 +189,9 @@ export class OpencodeServeManager {
     url: string,
     requestPath: string,
     init: RequestInit | undefined,
+    timeoutMs: number = this.requestTimeoutMs,
   ): Promise<Response> {
-    if (this.requestTimeoutMs <= 0) {
+    if (timeoutMs <= 0) {
       return await this.fetchFn(url, init)
     }
     const controller = new AbortController()
@@ -205,14 +206,14 @@ export class OpencodeServeManager {
     const timeout = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, this.requestTimeoutMs)
+    }, timeoutMs)
     timeout.unref?.()
 
     try {
       return await this.fetchFn(url, { ...init, signal: controller.signal })
     } catch (error) {
       if (timedOut) {
-        throw new OpencodeServeRequestTimeoutError(init?.method ?? 'GET', requestPath, this.requestTimeoutMs)
+        throw new OpencodeServeRequestTimeoutError(init?.method ?? 'GET', requestPath, timeoutMs)
       }
       throw error
     } finally {
@@ -368,10 +369,10 @@ export class OpencodeServeManager {
     return baseUrl
   }
 
-  private async json<T>(requestPath: string, init?: RequestInit & { notFoundValue?: T }): Promise<T> {
+  private async json<T>(requestPath: string, init?: RequestInit & { notFoundValue?: T; timeoutMs?: number }): Promise<T> {
     const base = await this.requireBase()
     try {
-      const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, requestPath, init)
+      const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, requestPath, init, init?.timeoutMs ?? this.requestTimeoutMs)
       if (!res.ok && res.status !== 204) {
         if (res.status === 404 && init?.notFoundValue !== undefined) return init.notFoundValue
         const text = await res.text().catch(() => '')
@@ -475,6 +476,32 @@ export class OpencodeServeManager {
       withRoute(`/session/${encodeURIComponent(id)}/fork`, route),
       { method: 'POST' },
     )
+  }
+
+  /** Raw payload of the sidecar's slash-command listing (`GET /command`, directory-scoped
+   * per the withRoute convention — VAL-A LB-02 proved cross-directory project commands
+   * surface without a rescan). Returned unvalidated: row shape validation lives in
+   * commands-catalog.ts so this layer stays a thin HTTP client. */
+  async listCommands(route: ServeRoute = {}): Promise<unknown> {
+    return this.json<unknown>(withRoute('/command', route), { method: 'GET' })
+  }
+
+  /** Execute a slash command in a session (VAL-A LB-04b). The route is SYNCHRONOUS at
+   * turn scale (~14 s observed): it returns only after the turn completes and the
+   * response IS the completed assistant message {info, parts}, so callers pass a
+   * turn-scale timeoutMs — the default request-timeout is request-scale. */
+  async runCommand(
+    id: string,
+    body: { command: string; arguments: string },
+    route: ServeRoute = {},
+    timeoutMs?: number,
+  ): Promise<OpencodeServeMessage> {
+    return this.json<OpencodeServeMessage>(withRoute(`/session/${encodeURIComponent(id)}/command`, route), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(typeof timeoutMs === 'number' ? { timeoutMs } : {}),
+    })
   }
 
   // ── SSE fan-out (Task A3 adds subscribe/onceIdle) ──────────────────────
