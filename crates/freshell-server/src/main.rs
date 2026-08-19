@@ -51,6 +51,7 @@ mod sessions;
 mod settings;
 mod settings_store;
 mod shutdown_forensics;
+mod subagent_cadence;
 mod tabs_snapshots;
 mod terminals;
 #[cfg(test)]
@@ -706,6 +707,9 @@ async fn main() -> ExitCode {
     // Session-directory watcher — must live for the process lifetime (dropping
     // the SessionWatcher sends the stop signal, killing the watcher loop).
     let _session_watcher = if let Some(ref index) = session_index {
+        // The subagent-mkdir escalation gate (Task 3) reads the SAME
+        // registry the cadence (spawned below) reads.
+        let subagent_count = subagent_interest.count_handle();
         session_directory::provider_home().map(|home| {
             let providers = vec![
                 freshell_sessions::session_watcher::WatchedProvider {
@@ -728,7 +732,17 @@ async fn main() -> ExitCode {
             let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
                 Arc::clone(index),
                 providers,
-            );
+            )
+            .with_subagent_interest(subagent_count);
+            // Watch-reduction cold-start gate (Task 9): every boot-time
+            // session-index publish (the warm spawn, the sessions sweep's
+            // initial signature snapshot, the auto-title first pass,
+            // pre-readiness request routes, mark-driven background
+            // refreshes) funnels through the index's two publish entries;
+            // installing the receiver HERE — BETWEEN construction and
+            // start() — orders the FIRST publish provably after the watcher
+            // reports its startup arms settled.
+            index.set_startup_gate(watcher.startup_ready());
             watcher.start();
             watcher
         })
@@ -1288,6 +1302,16 @@ async fn main() -> ExitCode {
             ws_state.clone(),
             terminal_identity.clone(),
             SESSIONS_SWEEP_INTERVAL,
+        );
+        // Amplifier watch-reduction kata (Task 9): demand-driven subagent
+        // rescan cadence — 15s while any connected WS client lists
+        // subagents (the SAME registry instance wired into WsState and the
+        // watcher); zero otherwise. `mark_provider_dirty("amplifier")` only
+        // — never the index-global TTL, never a fetch-recency window.
+        subagent_cadence::spawn_subagent_cadence(
+            Arc::clone(index),
+            subagent_interest.clone(),
+            subagent_cadence::SUBAGENT_CADENCE_INTERVAL,
         );
         // Task 5: the background auto-name pass (dir -> first-message ->
         // Gemini AI) -- `server/index.ts:868-950`. Same cadence + index

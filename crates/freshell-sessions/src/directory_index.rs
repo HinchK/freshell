@@ -892,6 +892,17 @@ pub struct SessionIndex {
     /// so dirs are derived from the private `file_cache` KEYS (canonical
     /// metadata.json paths), never from published rows.
     amplifier_root_report: Arc<StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>>,
+    /// The startup watcher-ready barrier (amplifier watch-reduction Task
+    /// 9): an OPTIONAL gate, fed by `SessionWatcher::startup_ready` (never
+    /// installed when no session watcher runs — today's exact behavior).
+    /// Consulted COLD-ONLY: while installed AND no snapshot has ever been
+    /// published, the two publish entries (`run_refresh_inline` and the
+    /// spawned task inside `spawn_background_refresh`) await readiness
+    /// before sweeping, so the FIRST publish of the process is provably
+    /// ordered after the watcher's startup arm pass settles. `Arc`-wrapped
+    /// for the same reason `snapshot` is: the detached background refresh
+    /// consults its own clone.
+    startup_gate: Arc<StdMutex<Option<tokio::sync::watch::Receiver<bool>>>>,
 }
 
 /// One published sweep GENERATION: the snapshot items AND the scan-failure
@@ -978,6 +989,7 @@ impl SessionIndex {
             change_tx,
             change_rx,
             amplifier_root_report: Arc::new(StdMutex::new(None)),
+            startup_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1056,6 +1068,46 @@ impl SessionIndex {
         sink: tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>,
     ) {
         *self.amplifier_root_report.lock().unwrap() = Some(sink);
+    }
+
+    /// Install the cold-start publish gate (amplifier watch-reduction Task
+    /// 9's startup watcher-ready barrier). Boot-time, install-once, fed by
+    /// `SessionWatcher::startup_ready()`: while a gate is installed AND no
+    /// snapshot has ever been published, the two publish entries
+    /// (`run_refresh_inline` and the spawned task inside
+    /// `spawn_background_refresh`) await readiness BEFORE sweeping, so every
+    /// boot-time snapshot caller (the warm spawn, the sessions sweep's
+    /// initial signature snapshot, the auto-title first pass, pre-readiness
+    /// request routes, mark-driven background refreshes — all of which
+    /// funnel through exactly those two entries) publishes its FIRST
+    /// generation provably after the watcher's startup arm pass settled.
+    /// No watcher ⇒ no gate installed ⇒ today's exact behavior.
+    pub fn set_startup_gate(&self, ready: tokio::sync::watch::Receiver<bool>) {
+        *self.startup_gate.lock().unwrap() = Some(ready);
+    }
+
+    /// The cold-only startup-gate consult shared by both publish entries:
+    /// while a gate is installed AND no snapshot has ever been published,
+    /// await watcher readiness before sweeping — fail-OPEN on sender drop
+    /// (`wait_for` errors when every sender is gone; a crashed watcher task
+    /// must never wedge session serving). After the first publish the
+    /// consult degenerates to a one-lock `is_some` no-op, so steady-state
+    /// request/sweep paths pay nothing. Holding the refresh lock across the
+    /// wait is deadlock-free: the readiness send happens in the watch loop,
+    /// whose only index touches reach `request_refresh`'s non-blocking
+    /// `try_lock`.
+    async fn await_startup_gate(
+        startup_gate: &StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+        snapshot: &StdMutex<Option<CachedSnapshot>>,
+    ) {
+        let gate = startup_gate.lock().unwrap().clone();
+        let Some(mut gate) = gate else {
+            return;
+        };
+        if snapshot.lock().unwrap().is_some() {
+            return; // already published: steady-state no-op
+        }
+        let _ = gate.wait_for(|done| *done).await;
     }
 
     /// Subscribe to snapshot-change notifications. The receiver's value
@@ -1194,6 +1246,10 @@ impl SessionIndex {
         &self,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        // Task 9 cold-start publish gate: reachable ONLY cold (a published
+        // snapshot short-circuits `snapshot_with_failures` before this
+        // path), so the consult's own cold re-check is belt-and-braces.
+        Self::await_startup_gate(&self.startup_gate, &self.snapshot).await;
         let pair = Self::perform_refresh(
             self.sources.clone(),
             Arc::clone(&self.file_cache),
@@ -1231,7 +1287,14 @@ impl SessionIndex {
         let ttl = self.ttl;
         let change_tx = self.change_tx.clone();
         let amplifier_root_report = Arc::clone(&self.amplifier_root_report);
+        let startup_gate = Arc::clone(&self.startup_gate);
         tokio::spawn(async move {
+            // Task 9 cold-start publish gate: `request_refresh` (mark_dirty /
+            // mark_provider_dirty — incl. the subagent cadence itself) reaches
+            // this entry possibly-cold, so the consult MUST live here too —
+            // and it is a one-lock no-op once anything has published, so the
+            // steady-state stale-while-revalidate path never waits on it.
+            Self::await_startup_gate(&startup_gate, &snapshot).await;
             let _ = Self::perform_refresh(
                 sources,
                 file_cache,

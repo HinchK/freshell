@@ -630,6 +630,85 @@ async fn startup_arms_session_dirs_created_in_the_scan_arm_window() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Startup-barrier race, PRODUCTION ORDER (extends
+/// `startup_arms_session_dirs_created_in_the_scan_arm_window`): the real
+/// boot race is the detached sweep tasks issued while the watcher arms —
+/// the warm spawn (`main.rs:1287`) AND `spawn_sessions_sweep`'s initial
+/// signature snapshot (`main.rs:2637`). The cold-start publish gate
+/// (`SessionIndex::set_startup_gate`, fed by `SessionWatcher::startup_ready`)
+/// must hold the FIRST publish until the startup arms settle, so a metadata
+/// write landing in the scan↔arm window is visible in that SAME boot
+/// snapshot — never stale until the 15-minute reconcile.
+#[tokio::test]
+async fn boot_snapshot_gate_covers_window_raced_writes() {
+    let home = unique_temp_dir("amp-barrier");
+    let _pre = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    // Production order (main.rs): construct → consumers subscribe via
+    // `startup_ready()` → `start()`. The accessor clones the retained
+    // receiver, so the gate install AND this test's awaiter both subscribe
+    // before start — exactly as the main.rs wiring does.
+    index.set_startup_gate(watcher.startup_ready());
+    let mut ready = watcher.startup_ready();
+    let book = watcher.amplifier_book_handle().unwrap();
+
+    // The sessions sweep's boot snapshot (main.rs:2637): issued
+    // immediately, pre-start — the task that raced ahead ungated in
+    // production.
+    let mut early = tokio::spawn({
+        let index = Arc::clone(&index);
+        async move { index.snapshot().await }
+    });
+
+    // The raced write: lands after the sweep's call, before its arm
+    // (startup is markless by design).
+    let racer = write_amplifier_session(&home, "p", "cc2584be-9478-4801-a62d-4e5da428b3a0");
+
+    // Deterministic gate proof (no sleep-race): `timeout` DRIVES `early` —
+    // ungated, the snapshot completes right here (a pre-arm publish, the
+    // bug, and the assertion fails); gated, it can only still be pending —
+    // the gate cannot open because `start()` has not been called, so the
+    // 250ms window's length decides nothing.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut early)
+            .await
+            .is_err(),
+        "the boot sweep's snapshot is gated: no publish before watcher readiness"
+    );
+
+    let handle = watcher.start();
+
+    // Readiness fires only AFTER the startup arms settle; the raced dir is
+    // provably armed by then.
+    tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|done| *done))
+        .await
+        .expect("startup readiness fires")
+        .expect("sender alive");
+    assert!(
+        book.lock().unwrap().armed.contains(&racer),
+        "readiness implies the raced dir is armed"
+    );
+
+    // The boot sweep's OWN snapshot — the first post-readiness publish —
+    // covers the window-raced write. NO provider-dirty kick: the production
+    // boot sequence makes no such call.
+    let items = tokio::time::timeout(Duration::from_secs(5), early)
+        .await
+        .expect("the gated snapshot completes after readiness")
+        .unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|s| s.provider == "amplifier"
+                && s.session_id == "cc2584be-9478-4801-a62d-4e5da428b3a0"),
+        "the first post-readiness publish covers the window-raced write"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Regression 7 (event path): a `sessions/` dir created under a stand-in
 /// project is observed — the stand-in swaps to the real sessions watch, and
 /// existing session dirs under it are armed and scanned.

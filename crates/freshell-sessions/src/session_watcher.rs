@@ -180,6 +180,17 @@ pub struct SessionWatcher {
     /// events BEFORE start via `test_event_tx`.
     event_tx: mpsc::UnboundedSender<WatchEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<WatchEvent>>,
+    /// The startup watcher-ready barrier (amplifier watch-reduction Task 9):
+    /// the `watch::channel(false)` pair is created ONCE at construction and
+    /// BOTH ends stored. Consumers subscribe via `startup_ready()` — a CLONE
+    /// of the retained receiver (any number of consumers, before or after
+    /// `start()`, identically) — and `start()` moves ONLY the sender into
+    /// the loop. `watch`, not a bare `Notify`: the sender may fire BEFORE
+    /// any awaiter exists and `Notify::notify_waiters` loses such signals;
+    /// the watch receiver's `wait_for(|done| *done)` returns immediately
+    /// once the value is set, whenever it subscribed.
+    startup_ready_tx: Option<tokio::sync::watch::Sender<bool>>,
+    startup_ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Event filter: same logic as `activity.rs::fs_event_is_relevant` —
@@ -1478,6 +1489,7 @@ impl SessionWatcher {
             .any(|p| p.layout.name() == "amplifier")
             .then(|| Arc::new(std::sync::Mutex::new(ManagedBook::default())));
         let (event_tx, event_rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let (startup_ready_tx, startup_ready_rx) = tokio::sync::watch::channel(false);
         Self {
             index,
             providers,
@@ -1487,6 +1499,8 @@ impl SessionWatcher {
             subagent_interest: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             event_tx,
             event_rx: Some(event_rx),
+            startup_ready_tx: Some(startup_ready_tx),
+            startup_ready_rx,
         }
     }
 
@@ -1505,6 +1519,20 @@ impl SessionWatcher {
     ) -> Self {
         self.subagent_interest = interested;
         self
+    }
+
+    /// The startup watcher-ready barrier (amplifier watch-reduction Task 9):
+    /// returns a CLONE of the retained receiver, so any number of consumers
+    /// (the index's cold-start publish gate, tests) subscribe identically
+    /// BEFORE or AFTER `start()` — production call order is construct →
+    /// subscribe/install → `start()`. The retained receiver never touches
+    /// the sender; `start()` moves only the sender into the loop. Resolves
+    /// `true` once the initial startup arming pass for EVERY configured
+    /// provider has settled (amplifier's spawn_blocking plan+apply joined
+    /// and its `ArmOutcome` drained into the index, success or planner-Err
+    /// absent-branch alike), before the select loop begins.
+    pub fn startup_ready(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.startup_ready_rx.clone()
     }
 
     /// Test-only probe: observe the amplifier managed book (armed / absent
@@ -1545,6 +1573,13 @@ impl SessionWatcher {
             .event_rx
             .take()
             .expect("SessionWatcher::start may be called only once");
+        // Readiness barrier: ONLY the sender moves into the loop; the
+        // retained receiver stays here so `startup_ready()` clones keep
+        // resolving after start (receiver clones never touch the sender).
+        let startup_ready_tx = self
+            .startup_ready_tx
+            .take()
+            .expect("SessionWatcher::start may be called only once");
 
         // The self-correction channel (refresh → watcher, one-way) exists
         // iff the amplifier managed book does: the index reports its
@@ -1566,6 +1601,7 @@ impl SessionWatcher {
                 subagent_interest,
                 (event_tx, event_rx),
                 root_report_rx,
+                startup_ready_tx,
             )
             .await;
         })
@@ -1605,6 +1641,7 @@ async fn run_watcher_loop(
         mpsc::UnboundedReceiver<WatchEvent>,
     ),
     root_report_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>,
+    startup_ready_tx: tokio::sync::watch::Sender<bool>,
 ) {
     let (event_tx, mut event_rx) = event;
     let mut root_report_rx = root_report_rx;
@@ -1806,6 +1843,23 @@ async fn run_watcher_loop(
             }
         }
     }
+
+    // Startup watcher-ready barrier (amplifier watch-reduction Task 9):
+    // fire ONCE, here — every configured provider's startup arming pass has
+    // SETTLED by this line: legacy recursive arms completed inline above,
+    // and the amplifier `spawn_blocking` plan+apply JoinHandle was awaited
+    // with its `ArmOutcome` drained into the index (`marks` → `pending` →
+    // `index.mark_dirty` at the first flush; `provider_dirty` →
+    // `index.mark_provider_dirty("amplifier")` already) — success OR
+    // planner-Err absent-branch alike, so a failed plan never wedges the
+    // boot sweeps. The index's cold-start publish gate (`set_startup_gate`)
+    // opens now: the FIRST session-index publish of the process is provably
+    // ordered AFTER these arms, so a metadata.json written in the scan↔arm
+    // window is covered by that publish instead of sitting stale until the
+    // 15-minute reconcile. `let _ =`: a receiver-less send (no gate
+    // installed) is a valid steady state, and late subscribers still see
+    // the retained value.
+    let _ = startup_ready_tx.send(true);
 
     // Keep the sender alive for re-arming absent providers.
     let rearm_tx = event_tx;
