@@ -865,6 +865,68 @@ async fn subagent_mkdir_dropped_when_no_interest_escalates_when_interested() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Whole-branch review Finding 2: an INTERESTED subagent-mkdir escalation
+/// is the design's provider-dirty lever (design "Subagent-dir mkdir events
+/// escalate to provider-dirty (full amplifier discover) ONLY while the
+/// subagents-subscribed flag is set") — NOT a strict whole-tree watch-set
+/// replan per interested-burst flush. The replan path is reserved for true
+/// need_rescan / queue-overflow events. The escalation still runs a REAL
+/// discover (observable: `discover_calls` moves — the find-the-row work
+/// the toggle is paying for) while `book.replans` (applied replans only)
+/// stays put.
+#[tokio::test]
+async fn interested_subagent_mkdir_escalates_to_provider_dirty_without_replan() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = unique_temp_dir("amp-subgate-dirtyonly");
+    let _root = write_amplifier_session(&home, "p", "012584be-9478-4801-a62d-4e5da428b3a0");
+    let counted = counted_amplifier_index(&home);
+    let index = counted.index.clone();
+    let interest = Arc::new(AtomicUsize::new(1)); // interested from the start
+    let mut watcher =
+        amplifier_watcher(&index, &home).with_subagent_interest(Arc::clone(&interest));
+    let book = watcher.amplifier_book_handle().unwrap();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let baseline_discovers = counted.discover_calls.load(Ordering::SeqCst);
+    let baseline_replans = book.lock().unwrap().replans;
+
+    let sub = home
+        .join("projects")
+        .join("p")
+        .join("sessions")
+        .join("0000000000000000-014b6af1c2ac4ab5_new");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // The escalation fires as a provider dirty: a real amplifier discover
+    // runs (observable work), exactly as designed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if counted.discover_calls.load(Ordering::SeqCst) > baseline_discovers {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("interested subagent mkdir escalates to provider dirty");
+
+    // ...but it must NOT pay a watch-set replan: a subagent mkdir is not a
+    // need_rescan, so the applied-replans counter stays put.
+    assert_eq!(
+        book.lock().unwrap().replans,
+        baseline_replans,
+        "the subagent-mkdir escalation is provider-dirty only, not a replan"
+    );
+    assert!(
+        !book.lock().unwrap().armed.contains(&sub),
+        "subagent dirs are never armed"
+    );
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Retry lifecycle (design "Absence/retry"): a transient arm failure lands
 /// in `retry`; the rearm tick's drain re-attempts it once `next_attempt`
 /// arrives — a STILL-failing attempt re-enters with doubled backoff, and

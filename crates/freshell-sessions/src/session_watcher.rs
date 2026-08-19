@@ -21,8 +21,9 @@
 //!   remove-ish kinds at depths 0–3 tear the target's bookkeeping down
 //!   (idempotently — a rename's untracked duplicate `Name(From)` is a clean
 //!   no-op), a paired `Name(Both)` splits into its remove + create
-//!   endpoints, and depth-3 subagent mkdirs escalate only on declared
-//!   interest. Depth-4 file events fold onto scoped `metadata.json` marks
+//!   endpoints, and depth-3 subagent mkdirs escalate to an immediate
+//!   provider-dirty mark only on declared interest. Depth-4 file events fold
+//!   onto scoped `metadata.json` marks
 //!   (a depth-4 folder create is dropped), and anything not routed is
 //!   dropped by default — amplifier events never take the legacy
 //!   pending-map escalation path. Two resource alarms guard the accepted
@@ -1327,7 +1328,6 @@ fn dispatch_amplifier_path(
     path: &Path,
     kind: WatchKind,
     pending: &mut HashMap<(PathBuf, String), Instant>,
-    pending_rescans: &mut std::collections::HashSet<String>,
     index: &SessionIndex,
 ) {
     let createish = matches!(
@@ -1354,9 +1354,13 @@ fn dispatch_amplifier_path(
             }
         }
         // Depth 3: a sessions-dir child. Root-classified dirs arm with the
-        // watch-then-scan scoped mark; subagent dirs escalate ONLY while a
-        // connected client has declared subagent interest — otherwise the
-        // mkdir is dropped silently (the 15-minute reconcile owns it).
+        // watch-then-scan scoped mark; subagent dirs escalate via a DIRECT
+        // provider-dirty mark (the design lever — a full amplifier
+        // discover) ONLY while a connected client has declared subagent
+        // interest — otherwise the mkdir is dropped silently (the
+        // 15-minute reconcile owns it). The escalation never takes the
+        // pending-rescan channel: its amplifier branch runs the strict
+        // whole-tree replan reserved for true need_rescan events.
         (Some(3), true) if path.is_dir() => {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if is_watch_target(classify_basename(name)) {
@@ -1370,7 +1374,7 @@ fn dispatch_amplifier_path(
                     true,
                 );
             } else if interest.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                pending_rescans.insert("amplifier".to_owned());
+                index.mark_provider_dirty("amplifier");
             }
         }
         // Depth 4: file-level events inside an armed root session dir. A
@@ -1959,7 +1963,6 @@ async fn run_watcher_loop(
                                             &paths[0],
                                             WatchKind::NameFrom,
                                             &mut pending,
-                                            &mut pending_rescans,
                                             &index,
                                         );
                                         dispatch_amplifier_path(
@@ -1971,7 +1974,6 @@ async fn run_watcher_loop(
                                             &paths[1],
                                             WatchKind::NameTo,
                                             &mut pending,
-                                            &mut pending_rescans,
                                             &index,
                                         );
                                     } else {
@@ -1985,7 +1987,6 @@ async fn run_watcher_loop(
                                                 path,
                                                 kind,
                                                 &mut pending,
-                                                &mut pending_rescans,
                                                 &index,
                                             );
                                         }
