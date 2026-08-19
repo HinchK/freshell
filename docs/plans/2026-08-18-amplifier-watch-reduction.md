@@ -1,5 +1,7 @@
 # Amplifier Watch Reduction Implementation Plan
 
+> Executed 2026-08-18 against f185bad003ad15e8392c03ccb44bbab014cfb441; the source tree supersedes all code and patch listings in this document. Only the `## User Request` block, Goal, Architecture, Global Constraints, and task intent remain authoritative.
+
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
