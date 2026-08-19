@@ -35,6 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -875,6 +876,17 @@ pub struct SessionIndex {
     /// Providers marked fully dirty (e.g. its root directory appeared/disappeared).
     /// Triggers a full discover() for that provider on next refresh.
     dirty_providers: Arc<StdMutex<HashSet<String>>>,
+    /// Wake-up handoff for the check-to-unlock window (delta D5-1).
+    /// `mark_dirty`/`mark_provider_dirty` store `true` AFTER enqueuing and
+    /// BEFORE attempting `refresh_lock.try_lock()`, so a mark whose
+    /// try-lock fails (a sweep — or a cold-cache awaiter — still holds the
+    /// guard) is causally ordered before that holder's end-of-work consult.
+    /// Every sweep iteration absorbs the flag at its start (a plain
+    /// `store(false)`, paired with that iteration's later drain: every mark
+    /// whose store preceded the absorb has its enqueue ordered before the
+    /// drain, so the drain provably covers it) and every guard release is
+    /// followed by a consult of the flag. See [`Self::perform_refresh`].
+    wake_pending: Arc<AtomicBool>,
     /// When the last full reconciliation completed (all providers discovered).
     /// `None` means no full reconciliation has ever run. Used to ensure the
     /// TTL-based full sweep fires even when scoped refreshes keep the
@@ -985,6 +997,7 @@ impl SessionIndex {
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
             dirty_paths: Arc::new(StdMutex::new(HashMap::new())),
             dirty_providers: Arc::new(StdMutex::new(HashSet::new())),
+            wake_pending: Arc::new(AtomicBool::new(false)),
             last_full_at: Arc::new(StdMutex::new(None)),
             change_tx,
             change_rx,
@@ -1028,6 +1041,28 @@ impl SessionIndex {
         }
     }
 
+    /// Test-only arming for the D5-1 tail seam ([`PERFORM_REFRESH_TAIL_HOOK`]):
+    /// installs the one-shot pause keyed to THIS index's `wake_pending`
+    /// allocation (the only key `perform_refresh`'s tail will match), and
+    /// returns the receiver the sweep signals once parked plus the sender
+    /// that releases it.
+    #[cfg(test)]
+    fn install_refresh_tail_hook_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *PERFORM_REFRESH_TAIL_HOOK.lock().unwrap() = Some((
+            Arc::as_ptr(&self.wake_pending) as usize,
+            parked_tx,
+            resume_rx,
+        ));
+        (parked_rx, resume_tx)
+    }
+
     /// Mark specific file paths as dirty. The next `snapshot()` call will
     /// re-stat these paths (and re-parse any that actually changed) even
     /// if the TTL hasn't expired. Paths not tracked by any source are
@@ -1042,6 +1077,11 @@ impl SessionIndex {
                 dirty.insert(path.clone(), provider.clone());
             }
         }
+        // D5-1: raise the wake flag after enqueuing and strictly BEFORE the
+        // try-lock inside `request_refresh` (unconditionally — a store
+        // ordered only after a FAILED try-lock is not causally fenced
+        // against the sweeper's end-of-work consult; see `perform_refresh`).
+        self.wake_pending.store(true, Ordering::SeqCst);
         self.request_refresh();
     }
 
@@ -1053,6 +1093,9 @@ impl SessionIndex {
             let mut dirty = self.dirty_providers.lock().unwrap();
             dirty.insert(provider.to_string());
         }
+        // Same wake-flag ordering as `mark_dirty` (see it and
+        // `perform_refresh`): flag strictly before the try-lock attempt.
+        self.wake_pending.store(true, Ordering::SeqCst);
         self.request_refresh();
     }
 
@@ -1173,10 +1216,42 @@ impl SessionIndex {
                 // THEIR sweep instead of starting a second one (preserves
                 // B-T5's "N concurrent misses -> 1 sweep" guarantee for the
                 // cold-cache case).
-                let _guard = self.refresh_lock.lock().await;
-                self.cached_pair(true)
+                let guard = self.refresh_lock.lock().await;
+                let pair = self
+                    .cached_pair(true)
                     .or_else(|| self.cached_pair(false))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                drop(guard);
+                // D5-1: this caller held `refresh_lock` (however briefly),
+                // so any mark whose try-lock failed during that window
+                // stored the wake flag beforehand and relies on a holder's
+                // exit consult — the same consult every other guard release
+                // performs (see `perform_refresh`'s tail). If the consult's
+                // own try-lock fails, the then-current holder's exit consult
+                // sees the same still-set flag.
+                if self.wake_pending.load(Ordering::SeqCst) {
+                    if let Ok(next) = Arc::clone(&self.refresh_lock).try_lock_owned() {
+                        let _ = Self::perform_refresh(
+                            next,
+                            Arc::clone(&self.refresh_lock),
+                            Arc::clone(&self.wake_pending),
+                            self.sources.clone(),
+                            Arc::clone(&self.file_cache),
+                            Arc::clone(&self.direct_cache),
+                            Arc::clone(&self.snapshot),
+                            self.persist_path.clone(),
+                            Arc::clone(&self.persist_state),
+                            Arc::clone(&self.dirty_paths),
+                            Arc::clone(&self.dirty_providers),
+                            Arc::clone(&self.last_full_at),
+                            self.ttl,
+                            self.change_tx.clone(),
+                            Arc::clone(&self.amplifier_root_report),
+                        )
+                        .await;
+                    }
+                }
+                pair
             }
         }
     }
@@ -1240,7 +1315,9 @@ impl SessionIndex {
     /// Cold-start path: run the sweep and wait for it (there is nothing else
     /// to serve). `guard` is held for the sweep's full duration -- exactly
     /// the pre-fix behavior, but now reachable ONLY when no snapshot has
-    /// ever been published, never for a routine stale-cache refresh.
+    /// ever been published, never for a routine stale-cache refresh. The
+    /// guard moves INTO `perform_refresh`, which owns the end-of-work
+    /// quiescence handoff (release + wake-flag consult, delta D5-1).
     async fn run_refresh_inline(
         &self,
         guard: tokio::sync::OwnedMutexGuard<()>,
@@ -1249,7 +1326,10 @@ impl SessionIndex {
         // snapshot short-circuits `snapshot_with_failures` before this
         // path), so the consult's own cold re-check is belt-and-braces.
         Self::await_startup_gate(&self.startup_gate, &self.snapshot).await;
-        let pair = Self::perform_refresh(
+        Self::perform_refresh(
+            guard,
+            Arc::clone(&self.refresh_lock),
+            Arc::clone(&self.wake_pending),
             self.sources.clone(),
             Arc::clone(&self.file_cache),
             Arc::clone(&self.direct_cache),
@@ -1263,17 +1343,19 @@ impl SessionIndex {
             self.change_tx.clone(),
             Arc::clone(&self.amplifier_root_report),
         )
-        .await;
-        drop(guard);
-        pair
+        .await
     }
 
     /// Warm-cache path: run the sweep DETACHED, so the caller that triggered
     /// it (and every other concurrent caller) can go on serving the stale
-    /// snapshot immediately. `guard` moves into the spawned task and is
-    /// dropped only once that sweep fully completes, so `try_lock_owned`
-    /// correctly rejects any other concurrent sweeper until then.
+    /// snapshot immediately. `guard` moves into the spawned task and —
+    /// inside `perform_refresh`, which owns the end-of-work quiescence
+    /// handoff (delta D5-1) — is released only once that sweep fully
+    /// completes, so `try_lock_owned` correctly rejects any other concurrent
+    /// sweeper until then.
     fn spawn_background_refresh(&self, guard: tokio::sync::OwnedMutexGuard<()>) {
+        let refresh_lock = Arc::clone(&self.refresh_lock);
+        let wake_pending = Arc::clone(&self.wake_pending);
         let sources = self.sources.clone();
         let file_cache = Arc::clone(&self.file_cache);
         let direct_cache = Arc::clone(&self.direct_cache);
@@ -1295,6 +1377,9 @@ impl SessionIndex {
             // steady-state stale-while-revalidate path never waits on it.
             Self::await_startup_gate(&startup_gate, &snapshot).await;
             let _ = Self::perform_refresh(
+                guard,
+                refresh_lock,
+                wake_pending,
                 sources,
                 file_cache,
                 direct_cache,
@@ -1309,7 +1394,6 @@ impl SessionIndex {
                 amplifier_root_report,
             )
             .await;
-            drop(guard);
         });
     }
 
@@ -1320,22 +1404,58 @@ impl SessionIndex {
     /// so it runs identically whether awaited inline (cold start) or inside
     /// a detached `tokio::spawn` (warm, stale-while-revalidate refresh).
     ///
-    /// Delta D4-2 (the lost-wakeup race): `mark_dirty` / `mark_provider_dirty`
-    /// attempt `request_refresh` ONCE; a refresh already in flight holds
-    /// `refresh_lock`, so that attempt is DROPPED — and a sweep drains the
-    /// dirty maps at its START, so a mark landing MID-sweep would otherwise
-    /// sit until some unrelated caller happened to refresh again (the
-    /// pre-watch-reduction handling serviced such marks sub-second). After
-    /// each sweep, re-check the dirty state: if any mark arrived while it
-    /// ran, run ONE follow-up sweep, looping until the re-check comes back
-    /// empty ("quiescent"). The loop is bounded in practice by the marks
-    /// themselves — it re-sweeps only on a NON-EMPTY re-check, and real
-    /// mark floods are already debounce-bounded by the watcher's 200ms
-    /// flush. The caller's `refresh_lock` guard outlives the whole call, so
-    /// no second sweeper can start mid-loop and the one-sweeper invariant
-    /// holds across every pass.
+    /// Delta D4-2 (the lost-wakeup race, mid-sweep form): `mark_dirty` /
+    /// `mark_provider_dirty` attempt `request_refresh` ONCE; a refresh
+    /// already in flight holds `refresh_lock`, so that attempt is DROPPED —
+    /// and a sweep drains the dirty maps at its START, so a mark landing
+    /// MID-sweep would otherwise sit until some unrelated caller happened
+    /// to refresh again (the pre-watch-reduction handling serviced such
+    /// marks sub-second). After each sweep, re-check the dirty state: if
+    /// any mark arrived while it ran, run ONE follow-up sweep, looping
+    /// until the re-check comes back empty ("quiescent").
+    ///
+    /// Delta D5-1 (the lost-wakeup race, check-to-unlock form): the D4-2
+    /// re-check alone leaves a terminal window — a mark landing AFTER the
+    /// final re-check yet BEFORE the guard release failed its one try-lock
+    /// (the guard was still held) and was never serviced. The close-out is
+    /// a wake-flag handshake with `wake_pending`, with the orderings that
+    /// exclude every interleaving — NO MARK IS EVER LOST:
+    ///
+    /// * Markers ALWAYS store `wake_pending = true` after enqueueing and
+    ///   BEFORE attempting the try-lock (unconditionally: a store ordered
+    ///   only behind a FAILED try-lock would not be causally fenced against
+    ///   the sweeper's end-of-work consult — preemption between the failed
+    ///   try-lock and the store would re-open the hole).
+    /// * Every sweep iteration begins by ABSORBING the flag (store
+    ///   `false`). The iteration's drain runs later in program order, so
+    ///   every mark whose store preceded the absorb has its enqueue ordered
+    ///   before that drain and is covered by it — an absorb can therefore
+    ///   never orphan a mark.
+    /// * The sweeper's end-of-work consult happens strictly AFTER the guard
+    ///   release. A mark whose try-lock failed against THIS guard stored
+    ///   the flag beforehand, and the failed try-lock precedes the release
+    ///   (a try-lock fails only while the guard is held), so the
+    ///   post-release consult provably runs after the store: it reads the
+    ///   flag set, re-acquires the guard, and loops — the next iteration's
+    ///   absorb + drain services the mark. If the consult's try-lock fails,
+    ///   another holder exists, and every guard release performs the same
+    ///   consult on the still-set flag — unless some sweep iteration's
+    ///   absorb already consumed it, in which case that iteration's paired
+    ///   drain covered the mark.
+    ///
+    /// The refresh_lock guard moves INTO this call (from `run_refresh_inline`,
+    /// `spawn_background_refresh`, or the cold-cache awaiter): the release
+    /// and the wake-flag consult are the end-of-work path of the sweep
+    /// itself. The loop is bounded exactly as in D4-2 — it continues only
+    /// on a non-empty dirty re-check or a set wake flag, both driven by
+    /// real marks (already debounce-bounded by the watcher's 200ms flush);
+    /// a set flag over quiesced dirty maps costs exactly one empty pass and
+    /// leaves the flag clear.
     #[allow(clippy::too_many_arguments)]
     async fn perform_refresh(
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        refresh_lock: Arc<AsyncMutex<()>>,
+        wake_pending: Arc<AtomicBool>,
         sources: Vec<Arc<dyn SessionSource>>,
         file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
         direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
@@ -1351,7 +1471,13 @@ impl SessionIndex {
             StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
         >,
     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        let mut guard = guard;
         loop {
+            // Absorb the wake flag at iteration start; this iteration's
+            // drain (inside `perform_refresh_once`) is ordered after the
+            // absorb, and every mark whose store preceded the absorb has
+            // its enqueue ordered before that drain.
+            wake_pending.store(false, Ordering::SeqCst);
             let pair = Self::perform_refresh_once(
                 sources.clone(),
                 Arc::clone(&file_cache),
@@ -1367,13 +1493,45 @@ impl SessionIndex {
                 Arc::clone(&amplifier_root_report),
             )
             .await;
-            // Post-completion dirty drain: a mark that landed mid-sweep is
-            // picked up by exactly one follow-up; marks landing BETWEEN the
-            // re-check and the caller's guard release are serviced by their
-            // own successful `try_lock` once the guard drops.
-            if !has_dirty_parts(&dirty_paths, &dirty_providers) {
+            // D4-2: a mark that landed MID-sweep is picked up by exactly one
+            // follow-up iteration; loop until the re-check comes back empty.
+            if has_dirty_parts(&dirty_paths, &dirty_providers) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let hook = {
+                    let key = Arc::as_ptr(&wake_pending) as usize;
+                    let mut slot = PERFORM_REFRESH_TAIL_HOOK.lock().unwrap();
+                    match slot.as_ref() {
+                        Some((armed_for, _, _)) if *armed_for == key => slot.take(),
+                        _ => None,
+                    }
+                };
+                if let Some((_, parked, resume)) = hook {
+                    let _ = parked.send(());
+                    let _ = resume.await;
+                }
+            }
+            drop(guard);
+            // D5-1: the final dirty re-check ran BEFORE the guard release
+            // above, so a mark landing in the check-to-unlock window failed
+            // its try-lock against this guard — and stored the wake flag
+            // before that try-lock, hence provably before this consult. A
+            // set flag means: re-acquire and run one more iteration (its
+            // absorb + drain services the mark); a clean flag means real
+            // quiescence.
+            if !wake_pending.load(Ordering::SeqCst) {
                 return pair;
             }
+            guard = match Arc::clone(&refresh_lock).try_lock_owned() {
+                Ok(next) => next,
+                // Another holder sweep exists; its own end-of-work consult
+                // reads the same still-set flag (or an iteration absorb
+                // consumed it, pairing the flag with that iteration's
+                // drain — either way the mark is covered).
+                Err(_) => return pair,
+            };
         }
     }
 
@@ -1597,16 +1755,47 @@ fn sorted_names(failures: &HashSet<String>) -> Vec<String> {
     names
 }
 
+/// Test-only seam for the D5-1 regression test (see `mod tests`): a
+/// one-shot pause INSIDE [`SessionIndex::perform_refresh`]'s tail — after
+/// the final quiescence re-check has reported clean and BEFORE the sweep's
+/// `refresh_lock` guard is released — so a test can land a dirty mark
+/// strictly inside the check-to-unlock window, deterministically. Never
+/// armed in production (`cfg(test)`-only, and only ever constructed by the
+/// one test that installs it). The hook is keyed by the identity of the
+/// arming index's `wake_pending` allocation, so a CONCURRENT test's sweep
+/// (which reaches the same tail code under the shared test binary) can
+/// never consume it: only a sweep of the arming test's own index matches
+/// and takes. `take()` makes it fire exactly once, and a panicking test
+/// can never leak an armed hook that a later test would match (a new index
+/// is a new allocation).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static PERFORM_REFRESH_TAIL_HOOK: StdMutex<
+    Option<(
+        usize,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = StdMutex::new(None);
+
 /// The dirty-state re-check shape shared by [`SessionIndex::has_dirty`]
-/// (the public probe) and [`SessionIndex::perform_refresh`]'s
-/// post-completion re-check (delta D4-2): true iff any scoped path or whole
-/// provider is marked pending. Two short lock acquisitions, never held
-/// across an await point.
+/// (the public probe) and [`SessionIndex::perform_refresh`]'s sweep-end
+/// re-check (delta D4-2): true iff any scoped path or whole provider is
+/// marked pending. ONE locked section consulting BOTH maps (paths before
+/// providers — the only nested acquisition of these two locks anywhere;
+/// markers lock exactly one map each and the sweep's drain takes them one
+/// at a time, so no lock cycle is possible), never held across an await
+/// point. The atomicity matters (delta D5-1): a quiescence decision must
+/// observe both maps at a single point — a scoped-path mark and a
+/// whole-provider mark landing on opposite sides of two independent reads
+/// could otherwise straddle the sweeper's final check.
 fn has_dirty_parts(
     dirty_paths: &StdMutex<HashMap<PathBuf, String>>,
     dirty_providers: &StdMutex<HashSet<String>>,
 ) -> bool {
-    !dirty_paths.lock().unwrap().is_empty() || !dirty_providers.lock().unwrap().is_empty()
+    let paths = dirty_paths.lock().unwrap();
+    let providers = dirty_providers.lock().unwrap();
+    !paths.is_empty() || !providers.is_empty()
 }
 
 /// One cached direct-listed source's last successful listing, keyed by
@@ -2979,7 +3168,14 @@ pub(crate) mod tests {
         let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
 
         let (change_tx, _change_rx) = tokio::sync::watch::channel(0u64);
+        let refresh_lock = Arc::new(AsyncMutex::new(()));
+        let guard = Arc::clone(&refresh_lock)
+            .try_lock_owned()
+            .expect("a fresh lock is uncontended");
         let (result, result_failures) = SessionIndex::perform_refresh(
+            guard,
+            refresh_lock,
+            Arc::new(AtomicBool::new(false)),
             vec![panicking_source],
             Arc::clone(&file_cache),
             Arc::clone(&direct_cache),
@@ -5078,6 +5274,97 @@ pub(crate) mod tests {
             discovers.load(Ordering::SeqCst),
             3,
             "the follow-up loop must stop once the dirty state is quiescent"
+        );
+    }
+
+    /// Delta-review D5-1: the D4-2 follow-up re-check closes the MID-sweep
+    /// window but leaves a terminal one. A mark landing AFTER the sweeper's
+    /// final `has_dirty_parts` re-check yet BEFORE its caller releases the
+    /// `refresh_lock` guard fails its one and only `request_refresh`
+    /// try-lock attempt (the guard is still held) and receives no later
+    /// wake-up — it sits until some unrelated refresh trigger happens along.
+    ///
+    /// Ordering is made DETERMINISTIC with the `PERFORM_REFRESH_TAIL_HOOK`
+    /// seam: sweep 2 parks inside `perform_refresh`'s tail, which provably
+    /// places the subsequent mark inside the window — the final re-check
+    /// has already run (it reported clean, which is why the tail is
+    /// reached) and the guard is still held. With every periodic trigger
+    /// held out of scope (TTL is an hour and no snapshot() poller exists
+    /// here), only the sweeper's own end-of-work wake-up path can service
+    /// the mark — observed as exactly one extra discover pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mark_landing_between_final_dirty_check_and_guard_release_is_serviced() {
+        struct CountingSource {
+            discovers: Arc<AtomicUsize>,
+        }
+        impl SessionSource for CountingSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                self.discovers.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let discovers = Arc::new(AtomicUsize::new(0));
+        let index = std::sync::Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(CountingSource {
+                discovers: Arc::clone(&discovers),
+            }) as _],
+            std::time::Duration::from_secs(3600), // TTL holds out every non-mark trigger
+            None,
+        ));
+
+        // Warm publish: exactly one sweep has run.
+        let _ = index.snapshot().await;
+        assert_eq!(discovers.load(Ordering::SeqCst), 1);
+
+        // Arm the one-shot tail pause (keyed to THIS index — a concurrent
+        // test's sweep can never consume it), then kick the refresh that
+        // parks in it (sweep 2, with refresh_lock held start to finish).
+        let (parked_rx, resume_tx) = index.install_refresh_tail_hook_for_test();
+        index.request_refresh();
+        tokio::time::timeout(std::time::Duration::from_secs(2), parked_rx)
+            .await
+            .expect("sweep 2 must reach the perform_refresh tail")
+            .expect("the tail-pause signal must be delivered");
+        assert_eq!(discovers.load(Ordering::SeqCst), 2);
+
+        // The mark lands STRICTLY inside the window: the sweeper's final
+        // dirty re-check has already run (it reported clean — that is why
+        // the tail was reached), and `refresh_lock` is still held, so this
+        // mark's one `request_refresh` try-lock attempt provably fails.
+        index.mark_provider_dirty("claude");
+        assert!(index.has_dirty(), "the in-window mark is pending");
+
+        // Let the sweeper return and release the guard, then the mark MUST
+        // be serviced promptly by the sweeper's own end-of-work follow-up.
+        let _ = resume_tx.send(());
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || discovers
+                .load(Ordering::SeqCst)
+                == 3)
+            .await,
+            "a mark landing between the final dirty check and guard release must be \
+             serviced by a follow-up refresh: {}",
+            discovers.load(Ordering::SeqCst)
+        );
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || !index.has_dirty()).await,
+            "the follow-up refresh must drain the pending mark"
+        );
+        // No refresh storm: the wake path must quiesce after servicing.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            discovers.load(Ordering::SeqCst),
+            3,
+            "the wake-flag follow-up must stop once the mark is serviced"
         );
     }
 
