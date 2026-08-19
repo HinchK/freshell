@@ -1,5 +1,7 @@
 # Dynamic provider-advertised slash commands in fresh-agent panes — Implementation Plan
 
+> Executed 2026-08-19 against 85b471812c5ccffd68e8e305e22ba75d581e0258; the source tree supersedes all code and patch listings in this document. Only the `## User Request` block, Goal, Architecture, Global Constraints, and task intent remain authoritative.
+
 > **For agentic workers:** REQUIRED: Use the usual-subagents (subagent-driven-development / executing-plans) and the-usual TDD (test-driven-development) subskills to implement this plan task-by-task and subtask-by-subtask. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **User Request:**
