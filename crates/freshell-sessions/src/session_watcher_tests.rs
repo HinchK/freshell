@@ -1899,6 +1899,120 @@ async fn replan_arms_newly_appeared_sessions_dir_kind_correctly_with_cascade() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Whole-branch review Finding 1: the replan's unwatch cleanup must SPARE
+/// the entries it armed (or retained) in the same apply. The arm loop runs
+/// before the unwatch loop, and a prefix wipe of a stale stand-in would
+/// otherwise drop the freshly-armed `<proj>/sessions` (and its cascaded
+/// root session) out of the book while their KERNEL watches stay live —
+/// an unwatch of the parent drops nothing else — desyncing the ledger
+/// from the kernel (the depth-2 swap-back gate misfires, project teardown
+/// misses the live watches, the budget WARN undercounts). The corner is
+/// the replan's own purpose made concrete: `<proj>` sits armed as a
+/// STAND-IN while on disk `<proj>/sessions` + a root session already
+/// exist (the depth-2 create event was lost).
+#[tokio::test]
+async fn replan_unwatch_cleanup_spares_desired_armed_descendants() {
+    let home = unique_temp_dir("amp-replan-spare");
+    let projects_root = home.join("projects");
+    let project = projects_root.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+    // Pre-arm `<proj>` as a REAL stand-in (no `sessions/` yet): the kernel
+    // watch is live, exactly as in the lost-event corner.
+    arm_sessions_or_standin(&mut book, &mut watcher, &mut outcome, &project, false);
+    assert!(book.armed.contains(&project), "stand-in pre-armed");
+    // The lost depth-2 event: `sessions/` + a root session appear silently.
+    let session = write_amplifier_session(&home, "p", "550e8400-e29b-41d4-a716-4466554400aa");
+    let sessions_dir = project.join("sessions");
+
+    let applied = replan_amplifier_watch_set(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        "amplifier",
+    );
+
+    assert!(applied, "a clean plan applies");
+    assert!(
+        !book.armed.contains(&project),
+        "the stale stand-in IS unwatched (it is not desired)"
+    );
+    assert!(
+        book.armed.contains(&sessions_dir),
+        "the sessions dir the replan JUST armed (kernel-live) must stay in the book"
+    );
+    assert!(
+        book.armed.contains(&session),
+        "the cascaded root session (kernel-live) must stay in the book"
+    );
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Finding 1, retry corner: the same prefix wipe also silently DROPPED a
+/// retry entry under the stale stand-in — breaching the "backoff never
+/// bypassed" design letter on the replan path. Here `<proj>/sessions`
+/// sits in `retry` (a transient arm failure — reachable when the depth-2
+/// create's swap arm failed transiently, which leaves the stand-in armed)
+/// while `<proj>` is still armed as a stand-in and `sessions/` + a root
+/// session exist on disk. The replan must NOT arm the backed-off sessions
+/// dir (backoff is never bypassed) and must NOT wipe its retry entry
+/// either: the desired-aware cleanup spares every book entry that is a
+/// key of the desired map, whichever set it lives in.
+#[tokio::test]
+async fn replan_unwatch_cleanup_spares_desired_retry_entries() {
+    let home = unique_temp_dir("amp-replan-spare-retry");
+    let session = write_amplifier_session(&home, "p", "550e8400-e29b-41d4-a716-4466554400aa");
+    let projects_root = home.join("projects");
+    let project = projects_root.join("p");
+    let sessions_dir = project.join("sessions");
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    book.armed.insert(project.clone());
+    book.retry.insert(
+        sessions_dir.clone(),
+        RetryEntry {
+            failures: 1,
+            next_attempt: Instant::now() + Duration::from_secs(60),
+            kind: ArmKind::SessionsDir,
+        },
+    );
+    let mut outcome = ArmOutcome::default();
+
+    let applied = replan_amplifier_watch_set(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        &projects_root,
+        "amplifier",
+    );
+
+    assert!(applied, "a clean plan applies");
+    assert!(
+        !book.armed.contains(&project),
+        "the stale stand-in IS unwatched (it is not desired)"
+    );
+    assert!(
+        !book.armed.contains(&sessions_dir),
+        "backoff is never bypassed: the retrying sessions dir is NOT re-armed"
+    );
+    assert!(
+        book.retry.contains_key(&sessions_dir),
+        "backoff is never silently dropped: the retry entry survives the unwatch cleanup"
+    );
+    assert!(
+        book.armed.contains(&session),
+        "the root session dir (desired, armed this apply) stays in the book"
+    );
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ---------- refresh→watcher self-correction channel (misnamed-root recovery) ----------
 
 // Regression 4 (round trip): a subagent-NAMED dir holding root CONTENT

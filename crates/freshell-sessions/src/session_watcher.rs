@@ -836,6 +836,33 @@ fn structural_remove(book: &mut ManagedBook, path: &Path) {
     book.retry.retain(|p, _| !p.starts_with(path));
 }
 
+/// The replan variant of [`structural_remove`]: an unwatch-diff path's
+/// subtree cleanup SPARES every entry that remains a key of the replan's
+/// desired map (which names exact paths, so a `contains_key` check covers
+/// both the unwatch path itself — never desired by construction — and the
+/// path's desired descendants). The arm loop runs BEFORE the unwatch loop,
+/// so a stale stand-in's unwatch (`<proj>`, while `<proj>/sessions` is now
+/// desired) would otherwise prefix-wipe the freshly-armed sessions dir and
+/// its cascaded children out of `armed` while their KERNEL watches stay
+/// live (unwatching the parent drops nothing else) — desyncing the ledger
+/// from the kernel: the depth-2 swap-back gate (`armed.contains(sessions)`)
+/// would misfire, project teardown would miss the live watches, and the
+/// budget WARN would undercount. The same wipe would also silently drop a
+/// desired entry sitting in `retry` (backoff silently ended). Sparing
+/// desired keys on all three sets keeps the ledger matched to the kernel.
+fn structural_remove_except(
+    book: &mut ManagedBook,
+    path: &Path,
+    desired: &HashMap<PathBuf, ArmKind>,
+) {
+    book.armed
+        .retain(|p| !p.starts_with(path) || desired.contains_key(p));
+    book.absent
+        .retain(|p| !p.starts_with(path) || desired.contains_key(p));
+    book.retry
+        .retain(|p, _| !p.starts_with(path) || desired.contains_key(p));
+}
+
 /// Forget ONE removed session dir: the explicit unwatch is belt-and-braces
 /// (LB-01 sub-claim 3 nuance: in the managed-set shape the armed parent's
 /// MOVED_FROM auto-drops the old-path watch, so this unwatch commonly
@@ -1171,7 +1198,11 @@ fn apply_amplifier_plan(
 /// never flattened: `SessionsDir` arms cascade their children, `Standin`
 /// arms run the swap, `SessionDir` arms watch-then-scan; a path still in
 /// `retry` is NOT re-armed (backoff is never bypassed). Each unwatch path
-/// gets `unwatch_tolerated` + `structural_remove` bookkeeping cleanup.
+/// gets `unwatch_tolerated` + DESIRED-aware bookkeeping cleanup
+/// ([`structural_remove_except`], which spares prefixed entries that are
+/// keys of the desired map — the arm loop runs first, so a stale stand-in's
+/// unwatch must not wipe the freshly-armed, kernel-live descendants it
+/// just recorded, nor drop a desired entry sitting in `retry`).
 /// Arm-failure routing (deterministic drop / absence / retry insert) stays
 /// with `watch_and_record` inside the arm helpers. Every applied replan —
 /// and the root-vanish/absence route — escalates `provider_dirty`.
@@ -1237,7 +1268,7 @@ fn replan_amplifier_watch_set(
     }
     for path in &diff.unwatch {
         unwatch_tolerated(watcher, provider, path);
-        structural_remove(book, path);
+        structural_remove_except(book, path, &desired);
     }
     true
 }
