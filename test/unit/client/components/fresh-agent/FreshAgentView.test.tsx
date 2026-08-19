@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
@@ -6298,5 +6298,90 @@ describe('FreshAgentView /model slash command', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Model catalog unavailable — try again')
     expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
+  })
+})
+
+describe('FreshAgentView provider-advertised session commands', () => {
+  function sessionCommandPaneContent() {
+    return {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshopencode' as const,
+      provider: 'opencode' as const,
+      createRequestId: 'req-session-commands',
+      sessionId: 'ses_session_commands',
+      status: 'idle' as const,
+    }
+  }
+
+  function renderSessionCommandPane(store: ReturnType<typeof createStore>) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: sessionCommandPaneContent(),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+  }
+
+  it('lists snapshot-advertised commands in an Agent session group after the pane actions', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...freshopencodeSnapshot('done', 1),
+      commands: [
+        { name: 'review', description: 'Review the current diff', argumentHint: '[file]' },
+        { name: 'init', description: 'Scan the project and write AGENTS.md' },
+      ],
+    })
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    const paneActions = await within(menu).findByRole('group', { name: 'Pane actions' })
+    const agentSession = within(menu).getByRole('group', { name: 'Agent session' })
+    // Static pane actions survive verbatim (ungated /new remains listed).
+    expect(within(paneActions).getByRole('menuitem', { name: /\/new/ })).toBeInTheDocument()
+    // Session rows arrive from the snapshot with description + argumentHint.
+    const reviewRow = within(agentSession).getByRole('menuitem', { name: /\/review/ })
+    expect(reviewRow).toHaveTextContent('Review the current diff')
+    expect(reviewRow).toHaveTextContent('[file]')
+    expect(within(agentSession).getByRole('menuitem', { name: /\/init/ })).toBeInTheDocument()
+  })
+
+  it('renders the flat static-only menu when the snapshot advertises no commands', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 1))
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    expect(within(menu).queryByRole('group')).toBeNull()
+    expect(within(menu).queryByText('Agent session')).toBeNull()
+    expect(within(menu).getByRole('menuitem', { name: /\/new/ })).toBeInTheDocument()
+    expect(within(menu).getByRole('menuitem', { name: /\/model/ })).toBeInTheDocument()
+  })
+
+  it('keeps /fork capability-gated while snapshot commands surface ungated', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...freshopencodeSnapshot('done', 1),
+      capabilities: { send: true, interrupt: true, fork: false },
+      commands: [{ name: 'review', description: 'Review the current diff' }],
+    })
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    await within(menu).findByRole('group', { name: 'Agent session' })
+    expect(within(menu).queryByRole('menuitem', { name: /\/fork/ })).toBeNull()
+    expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
   })
 })

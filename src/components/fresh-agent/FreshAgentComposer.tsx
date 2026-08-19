@@ -14,7 +14,7 @@ import { getAuthToken } from '@/lib/auth'
 import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import type { FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 export type FreshAgentAttachment = {
   /** Server-side saved path, present once uploaded. */
@@ -44,7 +44,7 @@ type FreshAgentComposerProps = {
   onShellCommand?: (command: string) => void
   onInterrupt?: () => void
   canInterrupt?: boolean
-  commands?: readonly FreshAgentSlashCommand[]
+  commands?: FreshAgentSlashCommandMenu
   onCommand?: (command: FreshAgentSlashCommand, args: string) => void
   focusOnReady?: boolean
   thinking?: boolean
@@ -56,6 +56,20 @@ export type FreshAgentComposerHandle = {
   appendText: (text: string) => void
 }
 
+/**
+ * The slash menu's two groups: static pane actions (dispatch through
+ * `onCommand`) plus provider-advertised session commands (selected rows
+ * insert `/name ` text — they never dispatch or auto-send).
+ */
+export type FreshAgentSlashCommandMenu = {
+  action: readonly FreshAgentSlashCommand[]
+  session: readonly FreshAgentSessionMenuRow[]
+}
+
+type SlashMenuRow =
+  | { kind: 'action'; command: FreshAgentSlashCommand }
+  | { kind: 'session'; command: FreshAgentSessionMenuRow }
+
 type MenuMode = 'chat' | 'browse' | 'files'
 
 type FileSuggestion = {
@@ -64,6 +78,7 @@ type FileSuggestion = {
 }
 
 const HISTORY_LIMIT = 50
+const EMPTY_SLASH_COMMAND_MENU: FreshAgentSlashCommandMenu = { action: [], session: [] }
 const TEXTUAL_EXTENSIONS = new Set([
   'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'yaml', 'yml', 'toml', 'xml', 'html', 'css',
   'js', 'jsx', 'ts', 'tsx', 'py', 'rs', 'go', 'java', 'c', 'cc', 'cpp', 'h', 'hpp', 'sh', 'bash',
@@ -176,7 +191,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   onShellCommand,
   onInterrupt,
   canInterrupt = false,
-  commands = [],
+  commands = EMPTY_SLASH_COMMAND_MENU,
   onCommand,
   placeholder,
   focusOnReady = false,
@@ -219,11 +234,22 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const mention = useMemo(() => getMentionToken(text), [text])
   const isShellInput = onShellCommand !== undefined && text.startsWith('!')
   const activeFilter = menuMode === 'chat' ? (chatPrefix ?? '') : filter.toLowerCase()
-  const visibleCommands = useMemo(() => {
-    const normalizedFilter = activeFilter.replace(/^\//, '')
-    return commands.filter((command) => command.name.includes(normalizedFilter))
-  }, [activeFilter, commands])
-  const menuLength = menuMode === 'files' ? fileSuggestions.length : visibleCommands.length
+  // Pinned semantics: name-substring only (never description), shared by both
+  // groups.
+  const normalizedFilter = activeFilter.replace(/^\//, '')
+  const visibleActionCommands = useMemo(() => (
+    commands.action.filter((command) => command.name.includes(normalizedFilter))
+  ), [normalizedFilter, commands.action])
+  const visibleSessionCommands = useMemo(() => (
+    commands.session.filter((command) => command.name.includes(normalizedFilter))
+  ), [normalizedFilter, commands.session])
+  // Action rows first, session rows after — keyboard highlight walks the flat
+  // concatenation.
+  const visibleRows = useMemo<readonly SlashMenuRow[]>(() => ([
+    ...visibleActionCommands.map((command): SlashMenuRow => ({ kind: 'action', command })),
+    ...visibleSessionCommands.map((command): SlashMenuRow => ({ kind: 'session', command })),
+  ]), [visibleActionCommands, visibleSessionCommands])
+  const menuLength = menuMode === 'files' ? fileSuggestions.length : visibleRows.length
 
   useEffect(() => {
     if (!storageKey || typeof window === 'undefined') return
@@ -337,13 +363,27 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const executeSlashText = useCallback((value: string): boolean => {
     const parsed = parseSlashCommand(value)
     if (!parsed) return false
-    const command = commands.find((entry) => (
+    // Typed-Enter dispatch consults ACTION rows only: a session row with a
+    // colliding (or alias-matching) name never hijacks typed text — anything
+    // unmatched falls through and ships verbatim.
+    const command = commands.action.find((entry) => (
       entry.name === parsed.name || entry.aliases?.includes(parsed.name)
     ))
     if (!command) return false
     executeCommand(command, parsed.args)
     return true
   }, [commands, executeCommand])
+
+  // Selecting a provider session row inserts the canonical `/name ` text via
+  // the same setText typing uses, closes the menu, and refocuses the input.
+  // It NEVER dispatches (onCommand) and NEVER sends (onSend) — the following
+  // Enter submits the text verbatim, straight or with args appended.
+  const insertSessionCommand = useCallback((command: FreshAgentSessionMenuRow) => {
+    if (disabled) return
+    setText(`/${command.name} `)
+    closeMenu()
+    requestAnimationFrame(() => textareaRef.current?.focus())
+  }, [closeMenu, disabled])
 
   const insertFileSuggestion = useCallback((suggestion: FileSuggestion) => {
     if (mention === null) return
@@ -450,23 +490,29 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         return true
       }
       event.preventDefault()
-      const selected = visibleCommands[highlightedIndex]
+      const selected = visibleRows[highlightedIndex]
       if (selected) {
-        if (menuMode === 'chat') {
+        if (selected.kind === 'session') {
+          insertSessionCommand(selected.command)
+        } else if (menuMode === 'chat') {
           const executed = executeSlashText(text.trim())
-          if (!executed) executeCommand(selected)
+          if (!executed) executeCommand(selected.command)
         } else {
-          executeCommand(selected)
+          executeCommand(selected.command)
         }
       }
       return true
     }
     if (event.key === 'Tab' && menuMode === 'chat') {
       event.preventDefault()
-      const selected = visibleCommands[highlightedIndex]
+      const selected = visibleRows[highlightedIndex]
       if (selected) {
-        setText(`/${selected.name} `)
-        closeMenu()
+        if (selected.kind === 'session') {
+          insertSessionCommand(selected.command)
+        } else {
+          setText(`/${selected.command.name} `)
+          closeMenu()
+        }
       }
       return true
     }
@@ -478,11 +524,51 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     fileSuggestions,
     highlightedIndex,
     insertFileSuggestion,
+    insertSessionCommand,
     menuLength,
     menuMode,
     text,
-    visibleCommands,
+    visibleRows,
   ])
+
+  const renderActionMenuItem = (command: FreshAgentSlashCommand, index: number) => (
+    <button
+      key={command.name}
+      type="button"
+      role="menuitem"
+      className={[
+        'fresh-agent-composer-menu-item flex min-h-[2.75rem] w-full flex-col justify-center px-3 py-2 text-left text-sm sm:min-h-0',
+        index === highlightedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
+      ].join(' ')}
+      onMouseEnter={() => setHighlightedIndex(index)}
+      onClick={() => executeCommand(command)}
+    >
+      <span className="font-medium">/{command.name}</span>
+      <span className="text-xs text-muted-foreground">{command.description}</span>
+    </button>
+  )
+
+  const renderSessionMenuItem = (command: FreshAgentSessionMenuRow, index: number) => (
+    <button
+      key={`session:${command.name}`}
+      type="button"
+      role="menuitem"
+      className={[
+        'fresh-agent-composer-menu-item flex min-h-[2.75rem] w-full flex-col justify-center px-3 py-2 text-left text-sm sm:min-h-0',
+        index === highlightedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
+      ].join(' ')}
+      onMouseEnter={() => setHighlightedIndex(index)}
+      onClick={() => insertSessionCommand(command)}
+    >
+      <span className="font-medium">
+        /{command.name}
+        {command.argumentHint ? (
+          <span className="font-normal text-muted-foreground"> {command.argumentHint}</span>
+        ) : null}
+      </span>
+      <span className="text-xs text-muted-foreground">{command.description}</span>
+    </button>
+  )
 
   return (
     <form
@@ -534,22 +620,29 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
                   : <File className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />}
                 <span className="truncate font-mono text-xs">{relativizePath(suggestion.path, cwd)}</span>
               </button>
-            )) : visibleCommands.map((command, index) => (
-              <button
-                key={command.name}
-                type="button"
-                role="menuitem"
-                className={[
-                  'fresh-agent-composer-menu-item flex min-h-[2.75rem] w-full flex-col justify-center px-3 py-2 text-left text-sm sm:min-h-0',
-                  index === highlightedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
-                ].join(' ')}
-                onMouseEnter={() => setHighlightedIndex(index)}
-                onClick={() => executeCommand(command)}
-              >
-                <span className="font-medium">/{command.name}</span>
-                <span className="text-xs text-muted-foreground">{command.description}</span>
-              </button>
-            ))}
+            )) : visibleSessionCommands.length > 0 ? (
+              // Two labelled groups. The non-focusable divider text sits inside
+              // a role="group" whose aria-label carries the same name; session
+              // rows are the only ones that insert-instead-of-dispatch.
+              <>
+                {visibleActionCommands.length > 0 ? (
+                  <div role="group" aria-label="Pane actions" className="fresh-agent-composer-menu-group">
+                    <div className="fresh-agent-composer-menu-group-label px-3 pb-0.5 pt-1.5 text-xs font-medium text-muted-foreground">
+                      Pane actions
+                    </div>
+                    {visibleActionCommands.map((command, index) => renderActionMenuItem(command, index))}
+                  </div>
+                ) : null}
+                <div role="group" aria-label="Agent session" className="fresh-agent-composer-menu-group">
+                  <div className="fresh-agent-composer-menu-group-label px-3 pb-0.5 pt-1.5 text-xs font-medium text-muted-foreground">
+                    Agent session
+                  </div>
+                  {visibleSessionCommands.map((command, index) => (
+                    renderSessionMenuItem(command, visibleActionCommands.length + index)
+                  ))}
+                </div>
+              </>
+            ) : visibleActionCommands.map((command, index) => renderActionMenuItem(command, index))}
           </div>
           <div className="fresh-agent-composer-menu-help flex gap-3 border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
             <span>Arrow keys navigate</span>
@@ -706,7 +799,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
             <TooltipTrigger asChild>
               <button
                 type="button"
-                disabled={commands.length === 0}
+                disabled={commands.action.length + commands.session.length === 0}
                 className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
                 aria-label="Slash commands"
                 title="Slash commands"

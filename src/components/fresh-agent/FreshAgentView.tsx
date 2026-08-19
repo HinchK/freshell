@@ -40,7 +40,11 @@ import {
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
 } from '@shared/fresh-agent-turns'
-import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import {
+  buildFreshAgentSlashCommandMenu,
+  getFreshAgentSlashCommands,
+  type FreshAgentSlashCommand,
+} from '@shared/fresh-agent-slash-commands'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -670,14 +674,17 @@ export function FreshAgentView({
   const lostSessionRetryRef = useRef<Set<string>>(new Set())
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
-  // confirms the provider supports the action.
-  const slashCommands = useMemo(() => (
-    getFreshAgentSlashCommands(paneContent.sessionType).filter((command) => (
+  // confirms the provider supports the action. Provider-advertised session
+  // commands from the same snapshot merge in under their own group; they
+  // select-to-insert, never auto-send.
+  const slashCommands = useMemo(() => {
+    const actions = getFreshAgentSlashCommands(paneContent.sessionType).filter((command) => (
       command.requiresCapability
         ? snapshot?.capabilities?.[command.requiresCapability] === true
         : true
     ))
-  ), [paneContent.sessionType, snapshot?.capabilities])
+    return buildFreshAgentSlashCommandMenu(actions, snapshot?.commands)
+  }, [paneContent.sessionType, snapshot?.capabilities, snapshot?.commands])
   const paneContentRef = useRef(paneContent)
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
