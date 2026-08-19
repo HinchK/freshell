@@ -1858,6 +1858,92 @@ describe('OpenCode serve adapter: slash-command catalog + dispatch', () => {
     expect(manager.onceIdle).toHaveBeenCalled()
   })
 
+  it('retries the catalog capture lazily on a send after a failed create-time capture, then classifies with the recovered catalog', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockRejectedValue(new Error('catalog boom'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-retry', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalledTimes(1))
+
+    // The create-time capture failed; once past the backoff window the next send
+    // re-attempts the capture BEFORE classifying, so a recovered catalog dispatches.
+    const pastWindow = Date.now() + 120_000
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(pastWindow)
+    try {
+      manager.listCommands.mockResolvedValue([{ name: 'review', description: 'recovered', source: 'command' }])
+      manager.runCommand.mockResolvedValue({
+        info: { id: 'msg_cmd_retry', role: 'assistant', time: { created: 1, completed: 2 } },
+        parts: [],
+      })
+      const result = await adapter.send?.('freshopencode-req-retry', { text: '/review the plan' })
+      expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    expect(manager.listCommands).toHaveBeenCalledTimes(2)
+    expect(manager.listCommands).toHaveBeenLastCalledWith({ cwd: '/repo' })
+    expect(manager.runCommand).toHaveBeenCalledWith(
+      'ses_real_1',
+      { command: 'review', arguments: 'the plan' },
+      { cwd: '/repo' },
+      expect.any(Number),
+    )
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('observes the retry backoff: a send within 60s of the failed capture neither re-fetches nor dispatches', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockRejectedValue(new Error('catalog boom'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-backoff', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalledTimes(1))
+
+    const result = await adapter.send?.('freshopencode-req-backoff', { text: '/review now' })
+
+    expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    expect(manager.listCommands).toHaveBeenCalledTimes(1)
+    expect(manager.runCommand).not.toHaveBeenCalled()
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_real_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: '/review now' }] }),
+      { cwd: '/repo' },
+    )
+  })
+
+  it('does not re-fetch the catalog on send after a successful create-time capture', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockResolvedValue([{ name: 'review', description: '', source: 'command' }])
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-noretry', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalledTimes(1))
+
+    await adapter.send?.('freshopencode-req-noretry', { text: 'plain prose, no slash' })
+
+    expect(manager.listCommands).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries at most once per session: a failed retry is not re-attempted on later sends even past the backoff', async () => {
+    const manager = makeFakeManager()
+    manager.listCommands.mockRejectedValue(new Error('catalog boom'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-once', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await vi.waitFor(() => expect(manager.listCommands).toHaveBeenCalledTimes(1))
+
+    const t0 = Date.now()
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0 + 120_000)
+    try {
+      await adapter.send?.('freshopencode-req-once', { text: 'first send' })
+      // The retry fired (and failed again). Farther past the backoff a later send
+      // must NOT re-attempt — the session's one lazy retry is burned.
+      nowSpy.mockReturnValue(t0 + 300_000)
+      await adapter.send?.('freshopencode-req-once', { text: 'second send' })
+    } finally {
+      nowSpy.mockRestore()
+    }
+    expect(manager.listCommands).toHaveBeenCalledTimes(2)
+  })
+
   it('routes a catalog-matching slash send to POST /session/:id/command with canonical casing + verbatim args and never sends the verbatim prompt', async () => {
     const manager = makeFakeManager()
     manager.listCommands.mockResolvedValue(CATALOG_ROWS)

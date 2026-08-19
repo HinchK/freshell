@@ -133,8 +133,6 @@ export interface SdkSessionState {
   lastTurnCompleteAt?: number
   /** Last emitted turn-waiting `at`, kept per session so the waiting edge stays strictly monotonic, independent of the completion edge. */
   lastWaitingAt?: number
-  /** Latest system/init `slash_commands` name-list, refreshed on each init frame. Diagnostic only; the publish subtract uses terminalCommandNames. */
-  slashCommandNames?: string[]
   /** Latest system/init `terminal_slash_commands` name-list. The SDK marks it optional: absent = empty subtract list (data-driven; no name denylist). */
   terminalCommandNames?: string[]
   /** True once the first system/init frame has landed — the join gate for publishing the command catalog. */

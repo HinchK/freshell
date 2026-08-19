@@ -53,6 +53,10 @@ const TRANSCRIPT_SETTLE_POLL_MS = 150
 const TRANSCRIPT_SETTLE_MAX_POLLS = 10 // ~1.5 s worst case
 const TRANSCRIPT_SETTLE_PAGE_LIMIT = 20
 const CLOCK_SKEW_MS = 5_000
+/** Lazy catalog re-capture gate: after a failed create/resume/attach-time capture, the
+ * send path re-attempts at most ONCE per session, and only once this much wall time has
+ * passed since the failure (a persistently failing sidecar must not be pounded per send). */
+const COMMANDS_CAPTURE_RETRY_BACKOFF_MS = 60_000
 
 const defaultSettleSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -111,14 +115,20 @@ type OpencodeSessionState = {
    * on the state for test determinism. Never rejects — failures are logged internally.
    */
   pendingRecovery?: Promise<void>
-  /** Sidecar /command catalog for the session's directory, captured once per established
-   * adapter state (create/resume/attach). Absent while the fetch is in flight or when it
-   * failed — the send path then never matches and slash text stays verbatim. */
+  /** Sidecar /command catalog for the session's directory, captured per established
+   * adapter state (create/resume/attach) plus at most one lazy send-path retry after a
+   * failed capture. Absent while the fetch is in flight or when it failed — the send
+   * path then never matches and slash text stays verbatim. */
   commands?: FreshAgentSessionCommand[]
   /** The in-flight catalog capture (fire-and-forget for callers; kept on the state so the
    * send path can await it before classifying leading-slash text — a send fired the
    * instant after create must not miss its match and leak verbatim to the model). */
   pendingCommands?: Promise<void>
+  /** Wall-clock of the last failed (or malformed) catalog capture; undefined on success.
+   * Gates the lazy send-path retry (see COMMANDS_CAPTURE_RETRY_BACKOFF_MS). */
+  commandsCaptureFailedAt?: number
+  /** True once the session's single lazy send-path re-capture has been fired. */
+  commandsCaptureRetried?: boolean
 }
 
 /** Content-free per-session summary served by the read-only incident endpoint
@@ -525,6 +535,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         const raw = route ? await serveManager.listCommands(route) : await serveManager.listCommands()
         const rows = normalizeOpencodeCommandCatalog(raw)
         if (!rows) {
+          state.commandsCaptureFailedAt = Date.now()
           log.warn({
             provider: 'opencode',
             sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
@@ -533,11 +544,13 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
           return
         }
         state.commands = rows
+        state.commandsCaptureFailedAt = undefined
         // The claude-side invalidation precedent: freshAgent.session.changed (translated
         // from sdk.session.changed) is already in the client's snapshot-invalidating set,
         // so a live composer refetches the snapshot and sees the catalog — no new WS shape.
         state.events.emit('event', { type: 'sdk.session.changed', sessionId: state.placeholderId, reason: 'session-commands' })
       } catch (error) {
+        state.commandsCaptureFailedAt = Date.now()
         log.warn({
           provider: 'opencode',
           sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
@@ -546,6 +559,21 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         }, 'opencode command catalog fetch failed; advertising no session commands')
       }
     })()
+  }
+
+  /** Settle the catalog before the send path classifies leading-slash text. Always
+   * awaits any in-flight capture; when the last capture FAILED (or was malformed) and
+   * the backoff has elapsed, also fires this session's single lazy re-capture and
+   * awaits it — a create-time failure otherwise leaves commands permanently absent
+   * and every slash send leaks verbatim to the model. Never rejects. */
+  async function settleCommandsBeforeSend(state: OpencodeSessionState): Promise<void> {
+    await state.pendingCommands
+    if (state.commands || state.commandsCaptureRetried) return
+    if (state.commandsCaptureFailedAt === undefined) return
+    if (Date.now() - state.commandsCaptureFailedAt < COMMANDS_CAPTURE_RETRY_BACKOFF_MS) return
+    state.commandsCaptureRetried = true
+    captureCommands(state)
+    await state.pendingCommands
   }
 
   /**
@@ -727,8 +755,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         // it BEFORE classifying the text so a leading-slash send issued the instant after
         // create cannot miss its match and leak verbatim to the model as prose. The settle
         // is cheap in the steady state (the fetch resolved with the sidecar startup that
-        // materialization above already waited on) and never rejects.
-        await state.pendingCommands
+        // materialization above already waited on) and never rejects; a failed create-time
+        // capture gets its one lazy re-attempt here, gated by backoff.
+        await settleCommandsBeforeSend(state)
         const slashCommand = matchOpencodeSlashCommand(text, state.commands)
         // Freshness anchor (kata zrrj): the settle proof below accepts only assistant
         // messages created at/after this send (minus clock skew).

@@ -153,7 +153,6 @@ export class SdkBridge extends EventEmitter {
       })),
       pendingPermissions: new Map(state.pendingPermissions),
       pendingQuestions: new Map(state.pendingQuestions),
-      slashCommandNames: state.slashCommandNames ? [...state.slashCommandNames] : undefined,
       terminalCommandNames: state.terminalCommandNames ? [...state.terminalCommandNames] : undefined,
       commandCatalog: state.commandCatalog ? [...state.commandCatalog] : undefined,
       commands: state.commands ? [...state.commands] : undefined,
@@ -429,10 +428,9 @@ export class SdkBridge extends EventEmitter {
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
           state.status = 'connected'
-          // Capture the init frame's slash-command name-lists (both optional per
-          // sdk.d.ts:4766-4770). The terminal list drives the publish subtract;
-          // absent = empty subtract list (data-driven, no name denylist).
-          state.slashCommandNames = Array.isArray(init.slash_commands) ? [...init.slash_commands] : undefined
+          // Capture the init frame's terminal slash-command name-list (optional per
+          // sdk.d.ts:4766-4770). It drives the publish subtract; absent = empty
+          // subtract list (data-driven, no name denylist).
           state.terminalCommandNames = Array.isArray(init.terminal_slash_commands) ? [...init.terminal_slash_commands] : undefined
           state.commandsInitSeen = true
           this.syncRestoreLedger(state)

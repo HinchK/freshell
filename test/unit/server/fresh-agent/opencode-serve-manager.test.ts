@@ -601,11 +601,11 @@ describe('OpencodeServeManager command catalog + command dispatch', () => {
     expect(JSON.parse(post.init.body)).toEqual({ command: 'Review', arguments: 'a  b ' })
   })
 
-  it('honors a turn-scale timeout override for the synchronous command route instead of the request-scale default', async () => {
+  it('honors a turn-scale timeout override for the synchronous command route, rejects the send, and leaves the shared sidecar alive', async () => {
     let commandSignal: AbortSignal | undefined
     const fetchFn = vi.fn(async (url: string, init: any) => {
       if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
-      if (url.includes('/command')) {
+      if (url.includes('/session/ses_x/command')) {
         commandSignal = init.signal
         return await new Promise((_, reject) => {
           init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
@@ -614,12 +614,21 @@ describe('OpencodeServeManager command catalog + command dispatch', () => {
       return jsonResponse({})
     })
     // The default request timeout is generous; the override bounds this turn at 5ms.
-    const { manager, child } = makeManager({ fetchFn: fetchFn as any, requestTimeoutMs: 60_000 })
+    const { manager, child, spawnFn } = makeManager({ fetchFn: fetchFn as any, requestTimeoutMs: 60_000 })
 
+    // The send error still surfaces: the caller's turn fails with the timeout error.
     await expect(manager.runCommand('ses_x', { command: 'review', arguments: '' }, {}, 5))
       .rejects.toThrow('opencode serve POST /session/ses_x/command timed out after 5ms')
     expect(commandSignal?.aborted).toBe(true)
-    expect(child.kill).toHaveBeenCalled()
+    // …but the command route is SYNCHRONOUS AT TURN SCALE: a timeout here is one
+    // long-running turn overrunning, not evidence of a wedged sidecar. Killing the
+    // shared sidecar would rob every other freshopencode pane, so this route must
+    // reject WITHOUT discarding (the prompt path's own turn timeout behaves the same).
+    expect(child.kill).not.toHaveBeenCalled()
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    // The same sidecar keeps serving subsequent requests (no discard-and-respawn).
+    await expect(manager.getSession('ses_x')).resolves.toEqual({})
+    expect(spawnFn).toHaveBeenCalledTimes(1)
   })
 })
 

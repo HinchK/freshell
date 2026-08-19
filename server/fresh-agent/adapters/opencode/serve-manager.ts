@@ -369,7 +369,7 @@ export class OpencodeServeManager {
     return baseUrl
   }
 
-  private async json<T>(requestPath: string, init?: RequestInit & { notFoundValue?: T; timeoutMs?: number }): Promise<T> {
+  private async json<T>(requestPath: string, init?: RequestInit & { notFoundValue?: T; timeoutMs?: number; discardOnRequestTimeout?: boolean }): Promise<T> {
     const base = await this.requireBase()
     try {
       const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, requestPath, init, init?.timeoutMs ?? this.requestTimeoutMs)
@@ -381,7 +381,10 @@ export class OpencodeServeManager {
       if (res.status === 204) return undefined as T
       return (await res.json()) as T
     } catch (error) {
-      if (error instanceof OpencodeServeRequestTimeoutError) {
+      // A request-scale timeout is treated as a wedged sidecar and discarded —
+      // UNLESS the route opted out (runCommand: its turn-scale timeout is one turn
+      // overrunning, not a hung sidecar, and discarding would rob every other pane).
+      if (error instanceof OpencodeServeRequestTimeoutError && init?.discardOnRequestTimeout !== false) {
         this.discardRunning('request_timeout')
       }
       throw error
@@ -489,7 +492,9 @@ export class OpencodeServeManager {
   /** Execute a slash command in a session (VAL-A LB-04b). The route is SYNCHRONOUS at
    * turn scale (~14 s observed): it returns only after the turn completes and the
    * response IS the completed assistant message {info, parts}, so callers pass a
-   * turn-scale timeoutMs — the default request-timeout is request-scale. */
+   * turn-scale timeoutMs — the default request-timeout is request-scale. That timeout
+   * must only reject the send (discardOnRequestTimeout: false), never kill the shared
+   * sidecar — the prompt path's own turn timeout likewise leaves the sidecar alive. */
   async runCommand(
     id: string,
     body: { command: string; arguments: string },
@@ -500,6 +505,7 @@ export class OpencodeServeManager {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      discardOnRequestTimeout: false,
       ...(typeof timeoutMs === 'number' ? { timeoutMs } : {}),
     })
   }
