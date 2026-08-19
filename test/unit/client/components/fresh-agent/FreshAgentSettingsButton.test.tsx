@@ -55,6 +55,32 @@ const CATALOG_RESPONSE = {
   ],
 }
 
+const CLAUDE_CATALOG_RESPONSE = {
+  ok: true as const,
+  sessionType: 'freshclaude' as const,
+  runtimeProvider: 'claude' as const,
+  status: 'fresh' as const,
+  fetchedAt: 1_234,
+  models: [
+    {
+      id: 'opus[1m]',
+      displayName: 'Opus (1M context)',
+      provider: 'claude' as const,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'sonnet',
+      displayName: 'Sonnet',
+      provider: 'claude' as const,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high'],
+      supportsAdaptiveThinking: false,
+    },
+  ],
+}
+
 function createStore() {
   return configureStore({
     reducer: {
@@ -137,6 +163,59 @@ describe('FreshAgentSettingsButton', () => {
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toBeInTheDocument()
     // the shared dialog path is not offered to freshclaude
     expect(screen.queryByRole('button', { name: /Change/ })).not.toBeInTheDocument()
+  })
+
+  it('merges the probed claude catalog (aliases included) into the freshclaude model radio list', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CLAUDE_CATALOG_RESPONSE)
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+      effort: 'high',
+      initialCwd: '/repo/project-b',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshclaude', expect.objectContaining({ cwd: '/repo/project-b' }))
+
+    // statics render instantly and stay first; probed rows swap in when the fetch resolves
+    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeInTheDocument()
+    expect(await screen.findByRole('radio', { name: 'Opus (1M context)' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Sonnet' })).toBeInTheDocument()
+
+    // one row per unique id: 1 static + 2 probed
+    expect(screen.getAllByRole('radio')).toHaveLength(3)
+    // the checked radio is the persisted static model
+    expect(screen.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeChecked()
+  })
+
+  it('fires exactly one capabilities fetch for a kilroy popover via its claude provider', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ...CLAUDE_CATALOG_RESPONSE,
+      sessionType: 'kilroy',
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'kilroy',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+      effort: 'high',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('kilroy', expect.anything())
+    expect(await screen.findByRole('radio', { name: 'Opus (1M context)' })).toBeInTheDocument()
   })
 
   it('shows a compact Model row for freshcodex and retires the radio list and Thinking dropdown', () => {

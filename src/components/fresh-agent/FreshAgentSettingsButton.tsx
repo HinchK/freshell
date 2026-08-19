@@ -13,7 +13,10 @@ import {
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { getFreshAgentModelCapabilities } from '@/lib/api'
-import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
+import {
+  FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE,
+  mergeClaudeSelectorOptions,
+} from '@/lib/fresh-agent-model-capabilities'
 import { cn } from '@/lib/utils'
 import {
   DEFAULT_FRESH_AGENT_STYLE,
@@ -76,17 +79,26 @@ export function FreshAgentSettingsButton({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
-  const [opencodeCapabilities, setOpencodeCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
+  const [probedCapabilities, setProbedCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
 
   const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
-  const modelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
   const modelValue = activeModel ?? ''
   const isFreshopencode = paneContent.sessionType === 'freshopencode'
   // freshclaude/kilroy keep the simple radio list + Thinking dropdown, exactly
   // as before; freshopencode and freshcodex get the compact Model row that
   // opens the shared two-column dialog.
   const keepsSimpleModelList = paneContent.provider === 'claude'
+  // claude providers: merge the probed catalog (aliases included) into the
+  // static menu once the fetch resolves. freshcodex/freshopencode keep the
+  // pure static table here (their Model row resolves names via the dialog).
+  const staticModelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
+  const modelOptions = keepsSimpleModelList
+    ? mergeClaudeSelectorOptions(
+        probedCapabilities?.ok === true ? probedCapabilities : undefined,
+        staticModelOptions,
+      ).modelOptions
+    : staticModelOptions
   const opensModelDialog = paneContent.sessionType === 'freshopencode' || paneContent.sessionType === 'freshcodex'
 
   const thinkingOptions = keepsSimpleModelList
@@ -106,10 +118,10 @@ export function FreshAgentSettingsButton({
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
 
-  const opencodeCatalogUnavailable = isFreshopencode && opencodeCapabilities?.ok === false
+  const opencodeCatalogUnavailable = isFreshopencode && probedCapabilities?.ok === false
   const modelDisplayName = isFreshopencode
-    ? (opencodeCapabilities?.ok
-        ? opencodeCapabilities.models.find((model) => model.id === activeModel)?.displayName ?? activeModel
+    ? (probedCapabilities?.ok
+        ? probedCapabilities.models.find((model) => model.id === activeModel)?.displayName ?? activeModel
         : activeModel)
     : (modelOptions.find((option) => option.value === activeModel)?.label ?? activeModel)
   const effortLabel = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'
@@ -132,16 +144,19 @@ export function FreshAgentSettingsButton({
     }))
   }, [dispatch, paneContent.sessionType])
 
-  // freshopencode: fetch the live catalog when the popover opens so the Model
-  // row can render the real display name and report catalog unavailability.
+  // freshopencode + claude providers (freshclaude/kilroy): fetch the live
+  // catalog when the popover opens. freshopencode renders display names and
+  // reports catalog unavailability; claude providers merge the probed rows
+  // (aliases included) into the simple radio list. Statics render instantly
+  // either way — no loading gate.
   useEffect(() => {
-    if (!open || !isFreshopencode) return
+    if (!open || (!isFreshopencode && !keepsSimpleModelList)) return
     let cancelled = false
-    void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
-      .then((result) => { if (!cancelled) setOpencodeCapabilities(result) })
-      .catch(() => { if (!cancelled) setOpencodeCapabilities(makeUnavailableCapabilitiesResponse()) })
+    void getFreshAgentModelCapabilities(paneContent.sessionType, { cwd: paneContent.initialCwd })
+      .then((result) => { if (!cancelled) setProbedCapabilities(result) })
+      .catch(() => { if (!cancelled) setProbedCapabilities(makeUnavailableCapabilitiesResponse()) })
     return () => { cancelled = true }
-  }, [open, isFreshopencode, paneContent.initialCwd])
+  }, [open, isFreshopencode, keepsSimpleModelList, paneContent.sessionType, paneContent.initialCwd])
 
   useEffect(() => {
     if (!open) return

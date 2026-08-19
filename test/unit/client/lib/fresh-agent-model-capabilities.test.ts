@@ -12,6 +12,7 @@ import {
   groupFreshAgentModelCapabilitiesBySource,
   isFreshAgentEffortSupported,
   isFreshAgentModelCapabilitiesFresh,
+  mergeClaudeSelectorOptions,
   parseFreshAgentSettingsModelValue,
   requiresFreshAgentModelCapabilityValidation,
   resolveFreshAgentModelSelection,
@@ -392,6 +393,88 @@ describe('fresh-agent-model-capabilities opencode catalog helpers', () => {
 
     expect(capped.groups.flatMap((group) => group.models)).toHaveLength(250)
     expect(capped.hiddenCount).toBe(50)
+  })
+})
+
+describe('mergeClaudeSelectorOptions', () => {
+  const staticOptions = [
+    {
+      value: 'claude-opus-4-6',
+      label: 'Claude Opus 4.6',
+      thinkingEfforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    },
+  ] as const
+
+  it('appends non-duplicate probed rows after the statics, deduping by id', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'opus[1m]',
+          displayName: 'Opus (1M context)',
+          provider: 'claude',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: true,
+        },
+        {
+          id: 'claude-opus-4-7',
+          displayName: 'Claude Opus 4.7',
+          provider: 'claude',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: false,
+        },
+        {
+          id: 'claude-opus-4-6',
+          displayName: 'Probed duplicate that must not replace the static',
+          provider: 'claude',
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    }, staticOptions)
+
+    expect(merged.modelOptions).toEqual([
+      {
+        value: 'claude-opus-4-6',
+        label: 'Claude Opus 4.6',
+        thinkingEfforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      },
+      { value: 'opus[1m]', label: 'Opus (1M context)' },
+      { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
+    ])
+    expect(merged.labelById).toEqual({
+      'claude-opus-4-6': 'Claude Opus 4.6',
+      'opus[1m]': 'Opus (1M context)',
+      'claude-opus-4-7': 'Claude Opus 4.7',
+    })
+  })
+
+  it('returns statics and static labels unchanged for a null catalog', () => {
+    const merged = mergeClaudeSelectorOptions(null, staticOptions)
+
+    expect(merged.modelOptions).toEqual(staticOptions)
+    expect(merged.labelById).toEqual({ 'claude-opus-4-6': 'Claude Opus 4.6' })
+  })
+
+  it('returns statics and static labels unchanged for an empty catalog', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [],
+    }, staticOptions)
+
+    expect(merged.modelOptions).toEqual(staticOptions)
+    expect(merged.labelById).toEqual({ 'claude-opus-4-6': 'Claude Opus 4.6' })
   })
 })
 
