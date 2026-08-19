@@ -1683,6 +1683,86 @@ fn watch_budget_warn_needed_trips_only_above_a_quarter_of_the_limit() {
     }
 }
 
+/// Delta-review D1-4: the drift alarm counts unknown-format dirs that were
+/// actually ARMED — never arm ATTEMPTS. An unknown-format dir whose arm
+/// fails transiently (EACCES here: the replan-abort test's chmod-000 idiom)
+/// retries on the capped-backoff drain; if each attempt counted, ONE dir
+/// that never acquires a watch would eventually trip the "50 unknown-format
+/// dirs armed" WARN without a single watch existing. Count only successful
+/// arms.
+#[test]
+fn unknown_format_transient_arm_failures_never_count_as_drift() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = unique_temp_dir("amp-drift-transient");
+    let sessions = home.join("projects").join("p").join("sessions");
+    let oddball = sessions.join("oddball-format"); // neither UUID nor subagent-pattern ⇒ Unknown
+    std::fs::create_dir_all(&oddball).unwrap();
+    std::fs::set_permissions(&oddball, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+
+    // Same euid guard as `replan_aborts_and_keeps_armed_set_on_planner_error`:
+    // root can watch a 0o000 dir, voiding the transient-error simulation.
+    if watch_path(
+        &mut watcher,
+        "amplifier",
+        &oddball,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .is_ok()
+    {
+        eprintln!("skipping: euid can watch a 0o000 dir");
+        unwatch_tolerated(&mut watcher, "amplifier", &oddball);
+        std::fs::set_permissions(&oddball, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        return;
+    }
+
+    // Three repeated attempts (the retry drain re-arms through this same
+    // first-line helper): each fails transiently and re-enters retry.
+    for _ in 0..3 {
+        arm_managed_dir(
+            &mut book,
+            &mut watcher,
+            &mut outcome,
+            "amplifier",
+            &oddball,
+            ArmKind::SessionDir,
+            true,
+        );
+    }
+    assert!(
+        !book.armed.contains(&oddball) && book.retry.contains_key(&oddball),
+        "transient failures never arm, always re-enter retry"
+    );
+    assert_eq!(
+        book.drift.count, 0,
+        "a dir that never acquired a watch must NOT count toward the drift alarm"
+    );
+
+    // The success half: once it DOES arm, the unknown-format arm counts
+    // exactly once (the threshold test's semantics stay on real arms).
+    std::fs::set_permissions(&oddball, std::fs::Permissions::from_mode(0o755)).unwrap();
+    arm_managed_dir(
+        &mut book,
+        &mut watcher,
+        &mut outcome,
+        "amplifier",
+        &oddball,
+        ArmKind::SessionDir,
+        true,
+    );
+    assert!(book.armed.contains(&oddball));
+    assert_eq!(
+        book.drift.count, 1,
+        "a SUCCESSFUL unknown-format arm counts exactly once"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Drift alarm: daily-bucketed, warns once per day on crossing.
 #[test]
 fn unknown_format_drift_alarm_is_daily_bucketed() {
@@ -2646,4 +2726,99 @@ async fn amplifier_managed_watch_set_proof_of_reduction_and_root_liveness() {
 
 fn projects_with_sessions_path(home: &Path, slug: &str, id: &str) -> PathBuf {
     home.join("projects").join(slug).join("sessions").join(id)
+}
+
+/// Delta-review D1-5: moving an ALREADY-POPULATED project (multiple root
+/// sessions with metadata) into the watched corpus must arm every staged
+/// root session dir FIRST-LINE through the event-time cascade (never a
+/// replan / reconcile), and events from its sessions must flow promptly.
+/// This is the cascade-class event path the design's spawn_blocking bulk
+/// rule targets: one depth-1 `Name(To)` whose handling expands to a
+/// readdir + a batch of arms.
+#[tokio::test]
+async fn moved_in_populated_project_is_cascaded_immediately_and_events_flow() {
+    let home = unique_temp_dir("amp-mvin");
+    // One initial project so the watcher starts with a live armed set.
+    write_amplifier_session(&home, "p0", "002584be-9478-4801-a62d-4e5da428b3a0");
+
+    // The populated project, staged OUTSIDE the corpus (its eventual name
+    // classifies every session dir as a root session).
+    let ids = [
+        "112584be-9478-4801-a62d-4e5da428b3a0",
+        "122584be-9478-4801-a62d-4e5da428b3a0",
+        "132584be-9478-4801-a62d-4e5da428b3a0",
+    ];
+    let staging = home.join("staging").join("pop_proj");
+    for id in ids {
+        let dir = staging.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            format!(
+                r#"{{"session_id":"{id}","working_dir":"/p/pop_proj","created":"2026-03-01T00:00:00.000Z","name":"t","description":"s","turn_count":1}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let index = amplifier_index(&home);
+    let mut watcher = amplifier_watcher(&index, &home);
+    let book = watcher.amplifier_book_handle().unwrap();
+    let mut rx = index.subscribe_changes();
+    let handle = watcher.start();
+    let _ = index.snapshot().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if book.lock().unwrap().armed.len() == 3 {
+                break; // root + p0/sessions + p0 session dir
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("startup arming completes");
+
+    // ONE mv into the watched corpus.
+    let projects = home.join("projects");
+    std::fs::rename(&staging, projects.join("pop_proj")).unwrap();
+
+    // First-line cascade: the sessions dir AND every staged root session
+    // dir arm off the single depth-1 event.
+    let pop = projects.join("pop_proj");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let done = {
+                let b = book.lock().unwrap();
+                b.armed.contains(&pop.join("sessions"))
+                    && ids
+                        .iter()
+                        .all(|id| b.armed.contains(&pop.join("sessions").join(id)))
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("moved-in project's sessions + root session dirs armed first-line");
+
+    // Events from its sessions flow promptly: a transcript write inside one
+    // armed dir reaches the index quickly (the scoped fold-aware stat lands
+    // the change — same shape as the proof test's old-root write).
+    let _ = rx.borrow_and_update();
+    std::fs::write(
+        pop.join("sessions").join(ids[0]).join("transcript.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+    assert!(
+        changed.is_ok(),
+        "events from the moved-in project's sessions flow promptly"
+    );
+
+    watcher.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    std::fs::remove_dir_all(&home).ok();
 }

@@ -22,7 +22,11 @@
 //!   (idempotently — a rename's untracked duplicate `Name(From)` is a clean
 //!   no-op), a paired `Name(Both)` splits into its remove + create
 //!   endpoints, and depth-3 subagent mkdirs escalate to an immediate
-//!   provider-dirty mark only on declared interest. Depth-4 file events fold
+//!   provider-dirty mark only on declared interest. Event-time work is
+//!   SPLIT by class: single-target arms/marks run inline on the loop, while
+//!   cascade-class routes (a project move-in / `sessions/` appearance — a
+//!   readdir plus a batch of arms) run as ONE `spawn_blocking` batch per
+//!   event (the design's bulk arm rule). Depth-4 file events fold
 //!   onto scoped `metadata.json` marks
 //!   (a depth-4 folder create is dropped), and anything not routed is
 //!   dropped by default — amplifier events never take the legacy
@@ -601,25 +605,31 @@ fn arm_managed_dir(
             if book.armed.contains(path) {
                 return;
             }
-            if class == BasenameClass::Unknown {
-                // Drift alarm: each unknown-format arm mints a permanent
-                // inotify watch; the day-bucketed counter WARNs once per
-                // threshold-crossing day.
-                if let Some(msg) = book.drift.note_unknown_arm(SystemTime::now()) {
-                    tracing::warn!("{msg}");
-                }
-            }
             tracing::debug!(
                 provider = %provider,
                 path = %path.display(),
                 class = ?class,
                 "session-watcher: arming session dir",
             );
-            if watch_and_record(book, watcher, outcome, provider, path, arm_kind) && emit_marks {
-                // File-state watch-then-scan: a scoped mark on a
-                // (possibly missing) metadata.json is a safe no-op /
-                // correct prune downstream.
-                outcome.marks.push(path.join("metadata.json"));
+            if watch_and_record(book, watcher, outcome, provider, path, arm_kind) {
+                if class == BasenameClass::Unknown {
+                    // Drift alarm: each SUCCESSFUL unknown-format arm mints
+                    // a permanent inotify watch; the day-bucketed counter
+                    // WARNs once per threshold-crossing day. Post-success
+                    // ONLY (delta review D1-4): counted pre-arm, one
+                    // transiently-failing unknown dir would re-count on every
+                    // capped-backoff retry until the WARN claimed 50 armed
+                    // dirs that never held a single watch.
+                    if let Some(msg) = book.drift.note_unknown_arm(SystemTime::now()) {
+                        tracing::warn!("{msg}");
+                    }
+                }
+                if emit_marks {
+                    // File-state watch-then-scan: a scoped mark on a
+                    // (possibly missing) metadata.json is a safe no-op /
+                    // correct prune downstream.
+                    outcome.marks.push(path.join("metadata.json"));
+                }
             }
         }
         ArmKind::ProjectsRoot => {
@@ -1358,6 +1368,17 @@ fn amplifier_depth(projects_root: &Path, path: &Path) -> Option<usize> {
 /// folder creation, which is dropped outright. Everything else is dropped
 /// by default: amplifier events NEVER reach the legacy pending map's
 /// provider-escalation branch.
+///
+/// CASCADE-CLASS create routes (depth-1 project appeared; depth-2
+/// `sessions/` appeared under a stand-in) never execute here — each expands
+/// to a readdir plus a BATCH of arms (swap + cascaded children), which is
+/// bulk work under the design's spawn_blocking rule (delta review D1-5).
+/// They append the cascade's PROJECT dir to `cascades` instead; the caller
+/// runs that list as ONE spawn_blocking batch per event batch
+/// ([`cascade_new_project`] is the deferred executor — its is_dir guard
+/// re-verifies at execution time, so the deferral itself never arms a
+/// vanished-in-between target). SINGLE-target arms (a depth-3 session dir)
+/// stay inline.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_amplifier_path(
     book: &mut ManagedBook,
@@ -1369,6 +1390,7 @@ fn dispatch_amplifier_path(
     kind: WatchKind,
     pending: &mut HashMap<(PathBuf, String), Instant>,
     index: &SessionIndex,
+    cascades: &mut Vec<PathBuf>,
 ) {
     let createish = matches!(
         kind,
@@ -1381,16 +1403,18 @@ fn dispatch_amplifier_path(
     }
     match (amplifier_depth(projects_root, path), createish) {
         // Depth 1: a project appeared under the root watch (create_dir_all
-        // surfaces only `Create(<proj>)` at the root) — cascade arms its
-        // sessions dir / stand-in and scans its existing children.
-        (Some(1), true) => cascade_new_project(book, watcher, outcome, path, true),
-        // Depth 2: `sessions/` appearing under an armed stand-in — swap to
-        // the real sessions arm (which cascades). Other stand-in children
-        // (e.g. a `{project}/recipe-sessions/` tree) are dropped by default
+        // surfaces only `Create(<proj>)` at the root) — CASCADE-CLASS: defer
+        // the project dir to the caller's spawn_blocking batch (its
+        // sessions dir / stand-in swap then scans its existing children).
+        (Some(1), true) => cascades.push(path.to_path_buf()),
+        // Depth 2: `sessions/` appearing under an armed stand-in —
+        // CASCADE-CLASS: defer the parent project (the swap to the real
+        // sessions arm cascades). Other stand-in children (e.g. a
+        // `{project}/recipe-sessions/` tree) are dropped by default
         // (regression 14b).
         (Some(2), true) if path.file_name().and_then(|n| n.to_str()) == Some("sessions") => {
             if let Some(project) = path.parent() {
-                arm_sessions_or_standin(book, watcher, outcome, project, true);
+                cascades.push(project.to_path_buf());
             }
         }
         // Depth 3: a sessions-dir child. Root-classified dirs arm with the
@@ -1979,16 +2003,34 @@ async fn run_watcher_loop(
                             None
                         };
                         match amp {
-                            // Amplifier managed dispatch, per-event on the
-                            // async loop (single events are not bulk work —
-                            // the spawn_blocking rule covers the batch
-                            // phases only): structural arms feed a fresh
-                            // ArmOutcome, drained immediately afterwards.
+                            // Amplifier managed dispatch, one event per
+                            // iteration, SPLIT by work class (delta review
+                            // D1-5 — the design's spawn_blocking bulk rule
+                            // applied at event time): SINGLE-TARGET work
+                            // (structural removes + bookkeeping, depth-3
+                            // session-dir arms, scoped marks) runs inline on
+                            // the async loop as before; CASCADE-CLASS routes
+                            // (a project move-in / a `sessions/` appearance —
+                            // one readdir plus a batch of arms, potentially
+                            // thousands of blocking watch() syscalls off one
+                            // event) are collected into `cascades` and run as
+                            // ONE spawn_blocking batch over the locked book
+                            // guard, the provider watcher moved out and
+                            // reinserted afterwards (RecommendedWatcher is
+                            // Send, so nothing blocks the watch-loop worker;
+                            // events arriving during the await buffer on the
+                            // unbounded channel and are processed after
+                            // re-insertion, exactly as the replan batch
+                            // arranges; the ArmOutcome sink is what makes
+                            // this split safe — index mutation still happens
+                            // only on the loop, at the shared drain below).
                             Some(amp) => {
                                 let mut outcome = ArmOutcome::default();
+                                let mut cascades: Vec<PathBuf> = Vec::new();
+                                let mut armed_before = None;
                                 if let Some(pw) = watches.get_mut(&amp.prov_idx) {
                                     let mut book = amp.book.lock().unwrap();
-                                    let armed_before = book.armed.len();
+                                    armed_before = Some(book.armed.len());
                                     if kind == WatchKind::NameBoth && paths.len() == 2 {
                                         // LB-01 paired shape: `Name(Both)`
                                         // carries [from, to] — the From
@@ -2004,6 +2046,7 @@ async fn run_watcher_loop(
                                             WatchKind::NameFrom,
                                             &mut pending,
                                             &index,
+                                            &mut cascades,
                                         );
                                         dispatch_amplifier_path(
                                             &mut book,
@@ -2015,6 +2058,7 @@ async fn run_watcher_loop(
                                             WatchKind::NameTo,
                                             &mut pending,
                                             &index,
+                                            &mut cascades,
                                         );
                                     } else {
                                         for path in &paths {
@@ -2028,24 +2072,78 @@ async fn run_watcher_loop(
                                                 kind,
                                                 &mut pending,
                                                 &index,
+                                                &mut cascades,
                                             );
                                         }
-                                    }
-                                    // The 25% watch-budget WARN is
-                                    // re-evaluated after every arm batch —
-                                    // the structural-create cascade dispatch
-                                    // is one of its call sites, checked once
-                                    // per drained batch (not per arm), and
-                                    // only when the batch actually changed
-                                    // the armed set.
-                                    if book.armed.len() != armed_before {
-                                        check_watch_budget(&mut book);
                                     }
                                 } else {
                                     // No watcher (startup creation failed):
                                     // nothing to arm with — legacy flow.
                                     for path in paths {
                                         pending.insert((path, provider.clone()), Instant::now());
+                                    }
+                                }
+                                if !cascades.is_empty() {
+                                    let pw = watches
+                                        .remove(&amp.prov_idx)
+                                        .expect("cascades imply the watcher was present");
+                                    let book = Arc::clone(&amp.book);
+                                    let cascade_batch = tokio::task::spawn_blocking(move || {
+                                        let mut watcher = pw.watcher;
+                                        let mut cascade_outcome = ArmOutcome::default();
+                                        {
+                                            let mut book = book.lock().unwrap();
+                                            for project in cascades {
+                                                cascade_new_project(
+                                                    &mut book,
+                                                    &mut watcher,
+                                                    &mut cascade_outcome,
+                                                    &project,
+                                                    true,
+                                                );
+                                            }
+                                        }
+                                        (watcher, cascade_outcome)
+                                    })
+                                    .await;
+                                    match cascade_batch {
+                                        Ok((watcher, cascade_outcome)) => {
+                                            watches.insert(
+                                                amp.prov_idx,
+                                                ProviderWatch {
+                                                    watcher,
+                                                    targets: Vec::new(),
+                                                },
+                                            );
+                                            outcome.marks.extend(cascade_outcome.marks);
+                                            outcome.provider_dirty |=
+                                                cascade_outcome.provider_dirty;
+                                        }
+                                        Err(e) => {
+                                            // The helpers never panic, so
+                                            // this is unreachable in
+                                            // practice — same degrade shape
+                                            // as the replan batch: the data
+                                            // plane recovers via discover.
+                                            tracing::warn!(
+                                                error = %e,
+                                                "session-watcher: amplifier cascade batch failed; provider marked dirty",
+                                            );
+                                            index.mark_provider_dirty("amplifier");
+                                        }
+                                    }
+                                }
+                                // The 25% watch-budget WARN is re-evaluated
+                                // after every arm batch — the event-time
+                                // dispatch (inline singles + the deferred
+                                // cascade batch) is one of its call sites,
+                                // checked once per processed event (not per
+                                // arm), and only when the event actually
+                                // changed the armed set.
+                                if let Some(before) = armed_before {
+                                    let mut book = amp.book.lock().unwrap();
+                                    if book.armed.len() != before {
+                                        check_watch_budget(&mut book);
                                     }
                                 }
                                 drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
