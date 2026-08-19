@@ -1009,7 +1009,7 @@ fn amplifier_root_vanished(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
     projects_root: &Path,
-) {
+) -> bool {
     let doomed: Vec<PathBuf> = book
         .armed
         .iter()
@@ -1023,7 +1023,12 @@ fn amplifier_root_vanished(
     book.absent.insert(projects_root.to_path_buf());
     // The ancestor is a strict PREFIX of the root, so it survived every
     // cleanup above — converge it to the new absence (arm if not armed).
-    sync_ancestor_watch(book, watcher, "amplifier", projects_root);
+    // D3-1: if the root ALREADY stands again (a delete-and-recreate inside
+    // this event's dispatch latency — the ancestor was not armed when the
+    // creation happened, so it queued no event), the sync reports TRUE and
+    // the caller defers the FULL return cascade, exactly like a depth-0
+    // create observed via the ancestor watch.
+    sync_ancestor_watch(book, watcher, "amplifier", projects_root)
 }
 
 /// The structural Remove / rename-From routing (design "Structural removes
@@ -1039,6 +1044,11 @@ fn amplifier_root_vanished(
 /// so it calls `index.mark_dirty` / `mark_provider_dirty` directly (never
 /// the `ArmOutcome` sink — that exists for the `spawn_blocking` arm
 /// helpers). True = structurally handled; false → depth-4 mark fold or drop.
+/// The depth-0 vanish may additionally SET `root_return` (delta D3-1): the
+/// ancestor sync found the root standing again inside the remove→dispatch
+/// window (a delete-and-recreate no armed ancestor could have observed),
+/// so the full return cascade is deferred to the caller's spawn_blocking
+/// batch exactly like a depth-0 create.
 fn write_remove_dispatch(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
@@ -1046,15 +1056,17 @@ fn write_remove_dispatch(
     index: &SessionIndex,
     projects_root: &Path,
     path: &Path,
+    root_return: &mut bool,
 ) -> bool {
     match amplifier_depth(projects_root, path) {
         // Depth 0: the ARMED projects root's own tagless self-removal —
         // the only way the watcher learns the root is gone (there is no
         // depth-0 Create to route; the root's RETURN is owned by the
-        // rearm-tick absent re-check's full cascade). Provider dirty: a
-        // provider discover reconciles the now-empty tree.
+        // late-root ancestor watch + deferred full cascade, with the
+        // rearm-tick absent re-check's full cascade as the safety net).
+        // Provider dirty: a provider discover reconciles the now-empty tree.
         Some(0) => {
-            amplifier_root_vanished(book, watcher, projects_root);
+            *root_return |= amplifier_root_vanished(book, watcher, projects_root);
             index.mark_provider_dirty("amplifier");
             true
         }
@@ -1144,6 +1156,23 @@ fn apply_amplifier_return_plan(
     apply_amplifier_plan(book, watcher, outcome, projects_root, plan, true);
 }
 
+/// The plan an apply pass is reading: the CALLER's plan, or a FRESH plan
+/// re-scanned by the D3-1 ancestor-sync recovery (the caller's plan went
+/// stale when the root appeared inside the ancestor sync's window).
+enum ApplyPlan<'a> {
+    Caller(&'a PlanTargets),
+    Fresh(PlanTargets),
+}
+
+impl ApplyPlan<'_> {
+    fn plan(&self) -> &PlanTargets {
+        match self {
+            ApplyPlan::Caller(plan) => plan,
+            ApplyPlan::Fresh(plan) => plan,
+        }
+    }
+}
+
 /// The ordered managed-set apply:
 /// 1. Arm the projects root FIRST (NonRecursive, `ArmKind::ProjectsRoot`;
 ///    a deterministic failure routes to `absent` inside the shared
@@ -1169,41 +1198,80 @@ fn apply_amplifier_plan(
     plan: &PlanTargets,
     emit_marks: bool,
 ) {
-    if !plan.root_exists {
-        // Missing root: absence-track (the late-root ancestor fast path is
-        // converged at the end; the rearm tick re-checks as the safety
-        // net). Provider dirty only on the RUNTIME paths (emit_marks ⇔ the
-        // absent-return cascade): a hot index may hold stale rows for the
-        // vanished root and must prune them. At initial startup
-        // (emit_marks == false) the mark is deliberately NOT set — the boot
-        // discover covers initial state, nothing published can be stale
-        // yet, and a boot-time detached refresh is unsynchronized with
-        // startup-settle observability (it could publish content that only
-        // the not-yet-armed watch set should have surfaced — the
-        // pre-managed engine likewise armed the home ancestor then without
-        // a provider-dirty mark). The planner-Err and arm-race paths keep
-        // provider dirty unconditionally (both are runtime-informative).
-        book.absent.insert(projects_root.to_path_buf());
-        if emit_marks {
-            outcome.provider_dirty = true;
+    let mut plan = ApplyPlan::Caller(plan);
+    let mut emit_marks = emit_marks;
+    let mut recoveries = 0u32;
+    // The D3-1 recovery pass-loop: EITHER ancestor sync below reporting
+    // TRUE means the absent-booked root is present — it appeared while no
+    // ancestor watch was live (between THIS pass's plan scan and the sync,
+    // or inside the sync's own arm's check→arm window), so no return event
+    // was queued. Restart the pass from a FRESH plan with the return
+    // semantics (marks on — a scoped mark is a safe no-op downstream, and
+    // the boot warm sweep races the return, so only the marks guarantee
+    // first-line freshness; the provider-dirty startup carve-out stays off
+    // the missing-root branch itself). Bounded by ROOT_RETURN_RECOVERY_CAP
+    // per pass against a flapping root.
+    loop {
+        if !plan.plan().root_exists {
+            // Missing root: absence-track (the late-root ancestor fast path
+            // is converged at the end; the rearm tick re-checks as the
+            // safety net). Provider dirty only on the RUNTIME paths
+            // (emit_marks ⇔ the absent-return cascade): a hot index may
+            // hold stale rows for the vanished root and must prune them. At
+            // initial startup (emit_marks == false) the mark is
+            // deliberately NOT set — the boot discover covers initial
+            // state, nothing published can be stale yet, and a boot-time
+            // detached refresh is unsynchronized with startup-settle
+            // observability (it could publish content that only the
+            // not-yet-armed watch set should have surfaced — the
+            // pre-managed engine likewise armed the home ancestor then
+            // without a provider-dirty mark). The planner-Err and arm-race
+            // paths keep provider dirty unconditionally (both are
+            // runtime-informative).
+            book.absent.insert(projects_root.to_path_buf());
+            if emit_marks {
+                outcome.provider_dirty = true;
+            }
+            if !sync_ancestor_watch(book, watcher, "amplifier", projects_root) {
+                return;
+            }
+            // D3-1 window (a)/(b): the root was present at the sync (it
+            // appeared between this pass's plan scan and the ancestor
+            // convergence) — recover via a fresh plan, never the tick.
+            let Some(fresh) = replan_returned_root(outcome, projects_root, &mut recoveries) else {
+                return;
+            };
+            plan = ApplyPlan::Fresh(fresh);
+            emit_marks = true;
+            continue;
         }
-        sync_ancestor_watch(book, watcher, "amplifier", projects_root);
-        return;
+        // 1. Root first.
+        arm_managed_dir(
+            book,
+            watcher,
+            outcome,
+            "amplifier",
+            projects_root,
+            ArmKind::ProjectsRoot,
+            emit_marks,
+        );
+        // The root arm converged the absence state both ways (a
+        // deterministic failure booked the absence; a landed arm clears
+        // it) — converge the late-root ancestor watch to match. D3-1: a
+        // TRUE report means the ProjectsRoot arm caught a vanish and the
+        // root reappeared inside that arm→sync window — recover via a fresh
+        // plan rather than leaving the returned root to the rearm tick.
+        if sync_ancestor_watch(book, watcher, "amplifier", projects_root) {
+            let Some(fresh) = replan_returned_root(outcome, projects_root, &mut recoveries) else {
+                return;
+            };
+            plan = ApplyPlan::Fresh(fresh);
+            emit_marks = true;
+            continue;
+        }
+        break;
     }
-    // 1. Root first.
-    arm_managed_dir(
-        book,
-        watcher,
-        outcome,
-        "amplifier",
-        projects_root,
-        ArmKind::ProjectsRoot,
-        emit_marks,
-    );
-    // The root arm converged the absence state both ways (a deterministic
-    // failure booked the absence; a landed arm clears it) — converge the
-    // late-root ancestor watch to match.
-    sync_ancestor_watch(book, watcher, "amplifier", projects_root);
+    let plan = plan.plan();
     // 2. Plan-listed structural targets, kind-correct. Track every ARMED
     //    sessions dir for the 3(b) union re-pass, and every plan-covered
     //    project dir for 3(a)'s skip set.
@@ -1386,8 +1454,13 @@ fn replan_amplifier_watch_set(
     }
     // Converge the late-root ancestor fast path with the replan's own
     // absence bookkeeping — the root-vanish branch inserted the absence,
-    // and an apply that found the root again cleared it.
-    sync_ancestor_watch(book, watcher, provider, projects_root);
+    // and an apply that found the root again cleared it. D3-1: a TRUE
+    // report means the root reappeared between the replan's plan scan and
+    // this convergence — run the full root-return application now, inline
+    // (the replan already runs inside a spawn_blocking batch).
+    if sync_ancestor_watch(book, watcher, provider, projects_root) {
+        recover_returned_root(book, watcher, outcome, projects_root);
+    }
     true
 }
 
@@ -1446,7 +1519,10 @@ fn amplifier_depth(projects_root: &Path, path: &Path) -> Option<usize> {
 /// vanished-in-between target). A depth-0 create — the ABSENT projects root
 /// itself reappearing, observed via the late-root ancestor watch (delta
 /// D2-2) — sets `root_return` instead (the deferred full plan + return
-/// cascade). DEPTH-CORRECTED: ancestor-watch events carry the root's OWN
+/// cascade); so does a depth-0 VANISH whose ancestor sync finds the root
+/// standing again inside the remove→dispatch window (delta D3-1 — the
+/// remove path above sets the same flag). DEPTH-CORRECTED: ancestor-watch
+/// events carry the root's OWN
 /// path, which is depth 0 measured from the provider root — the ancestor's
 /// OTHER children (`~/.amplifier/keys.env`, …) are not under the root at
 /// all (depth None) and are dropped by default. SINGLE-target arms (a
@@ -1470,7 +1546,15 @@ fn dispatch_amplifier_path(
         WatchKind::Create | WatchKind::CreateFolder | WatchKind::NameTo | WatchKind::NameBoth
     );
     if matches!(kind, WatchKind::Remove | WatchKind::NameFrom)
-        && write_remove_dispatch(book, watcher, outcome, index, projects_root, path)
+        && write_remove_dispatch(
+            book,
+            watcher,
+            outcome,
+            index,
+            projects_root,
+            path,
+            root_return,
+        )
     {
         return;
     }
@@ -1902,8 +1986,10 @@ async fn run_watcher_loop(
                             // late-root fast path converges too: when the
                             // scan raced a real deletion the ancestor arms;
                             // when the root itself exists (a NESTED read
-                            // failed) sync's never-arm-the-root rule leaves
-                            // arming to the tick's return cascade.
+                            // failed, or it appeared between the failed scan
+                            // and this sync — D3-1) the sync reports TRUE and
+                            // the full return application runs inline, never
+                            // deferred to the tick's return cascade.
                             tracing::warn!(
                                 provider = %batch_name,
                                 path = %projects_root.display(),
@@ -1912,7 +1998,15 @@ async fn run_watcher_loop(
                             );
                             book.absent.insert(projects_root.clone());
                             outcome.provider_dirty = true;
-                            sync_ancestor_watch(&mut book, &mut watcher, &batch_name, &projects_root);
+                            if sync_ancestor_watch(&mut book, &mut watcher, &batch_name, &projects_root)
+                            {
+                                recover_returned_root(
+                                    &mut book,
+                                    &mut watcher,
+                                    &mut outcome,
+                                    &projects_root,
+                                );
+                            }
                         }
                     }
                 }
@@ -2231,12 +2325,26 @@ async fn run_watcher_loop(
                                             // the root stands (re-converges
                                             // identically when the return
                                             // raced another deletion).
-                                            sync_ancestor_watch(
+                                            // D3-1: a TRUE report means the
+                                            // root reappeared in the sync's
+                                            // window (e.g. a return plan scan
+                                            // failed transiently while the
+                                            // root stood) — run the full
+                                            // return application inline,
+                                            // never the tick.
+                                            if sync_ancestor_watch(
                                                 &mut book,
                                                 &mut watcher,
                                                 "amplifier",
                                                 &projects_root,
-                                            );
+                                            ) {
+                                                recover_returned_root(
+                                                    &mut book,
+                                                    &mut watcher,
+                                                    &mut cascade_outcome,
+                                                    &projects_root,
+                                                );
+                                            }
                                         }
                                         (watcher, cascade_outcome)
                                     })
@@ -2582,12 +2690,25 @@ async fn run_watcher_loop(
                                     // ancestor_unsynced trigger, the return
                                     // cascade's absence clear, and a
                                     // ProjectsRoot retry arm that landed.
-                                    sync_ancestor_watch(
+                                    // D3-1: a TRUE report means the root
+                                    // reappeared in the sync's window (e.g.
+                                    // a failed return plan scan or a
+                                    // ProjectsRoot retry arm's vanish) —
+                                    // run the full return application
+                                    // inline, inside this same batch.
+                                    if sync_ancestor_watch(
                                         &mut book,
                                         &mut watcher,
                                         "amplifier",
                                         &projects_root,
-                                    );
+                                    ) {
+                                        recover_returned_root(
+                                            &mut book,
+                                            &mut watcher,
+                                            &mut outcome,
+                                            &projects_root,
+                                        );
+                                    }
                                 }
                                 (watcher, outcome)
                             })
@@ -2624,60 +2745,142 @@ async fn run_watcher_loop(
     }
 }
 
+/// What one ancestor-sync pass must converge to — the SELECT half, split
+/// from the arm half so tests can interleave a root creation INSIDE the
+/// check→arm window (delta D3-1) between the two production steps.
+enum AncestorSelection {
+    /// Nothing to watch: the absence state is gone (or the root is already
+    /// armed), or nothing above the root exists (the ghost corner — the
+    /// rearm tick owns the return, exactly as the pre-change absent list
+    /// did).
+    NoWatch,
+    /// Arm this nearest existing ancestor (bounded at the provider home —
+    /// the same bound the pre-change recursive late-root rule used), so
+    /// `Create(<projects>)` is observed instantly.
+    Watch(PathBuf),
+    /// The absent-booked, unarmed root is PRESENT on disk (delta D3-1
+    /// window (a): it appeared between the missing-root plan/decision and
+    /// this sync, while NO ancestor watch was live, so its creation queued
+    /// no return event). Arm nothing — an ancestor watch for a creation
+    /// that already happened observes nothing, and the root itself is never
+    /// its own ancestor; the caller runs the full root-return application
+    /// (plan + kind-correct apply, marks on) NOW.
+    RootReturn,
+}
+
+/// The SELECT half of [`sync_ancestor_watch`] (existence checks + the
+/// nearest-existing-ancestor walk; no watcher side effects).
+fn select_ancestor_watch(book: &ManagedBook, projects_root: &Path) -> AncestorSelection {
+    if !book.absent.contains(projects_root) || book.armed.contains(projects_root) {
+        return AncestorSelection::NoWatch;
+    }
+    if projects_root.exists() {
+        return AncestorSelection::RootReturn;
+    }
+    let bound = projects_root.parent().unwrap_or(projects_root);
+    let candidate = nearest_existing_ancestor(projects_root, bound);
+    if candidate != projects_root && candidate.exists() {
+        AncestorSelection::Watch(candidate)
+    } else {
+        AncestorSelection::NoWatch
+    }
+}
+
+/// The ARM half of [`sync_ancestor_watch`]: converge `book.ancestor` to the
+/// selection. Returns true when the caller must run the full root-return
+/// application (plan + kind-correct apply, marks on) through its own
+/// channel — spawn_blocking contexts run it inline, the async-loop vanish
+/// dispatch defers it via the existing `root_return` cascade batch.
+fn apply_ancestor_selection(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    provider: &str,
+    projects_root: &Path,
+    selection: AncestorSelection,
+) -> bool {
+    let target = match selection {
+        AncestorSelection::NoWatch => {
+            if let Some(current) = book.ancestor.take() {
+                unwatch_tolerated(watcher, provider, &current);
+            }
+            return false;
+        }
+        AncestorSelection::RootReturn => {
+            if let Some(current) = book.ancestor.take() {
+                unwatch_tolerated(watcher, provider, &current);
+            }
+            return true;
+        }
+        AncestorSelection::Watch(target) => target,
+    };
+    if book.ancestor.as_deref() == Some(target.as_path()) {
+        return false; // already converged — idempotent, side-effect-free
+    }
+    if let Some(current) = book.ancestor.take() {
+        unwatch_tolerated(watcher, provider, &current);
+    }
+    // A failed arm is logged by `watch_path`; `None` stays booked and
+    // the rearm tick's convergence re-runs this — bounded backoff adds
+    // nothing to a single watch on an existing dir.
+    if watch_path(
+        watcher,
+        provider,
+        &target,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    tracing::info!(
+        provider = %provider,
+        path = %target.display(),
+        "session-watcher: projects root absent, watching nearest existing ancestor",
+    );
+    book.ancestor = Some(target.clone());
+    // ARM-THEN-RECHECK (delta D3-1 window (b) — the check→arm window, the
+    // same closure the stand-in swap applies to a sessions/ appearing
+    // mid-arm): a root created between the ancestor-SELECT existence walk
+    // and this arm produced NO event the just-armed watch could see — the
+    // watch only reports creations from its arming moment on. Re-check the
+    // root's existence NOW; if it appeared in that window, swap the
+    // ancestor for the root-return handoff.
+    if projects_root.exists() {
+        unwatch_tolerated(watcher, provider, &target);
+        book.ancestor = None;
+        return true;
+    }
+    false
+}
+
 /// Converge the late-root ancestor watch (delta D2-2) with the absence
 /// state: the projects root absent-tracked AND not currently armed ⇒ exactly
 /// one NonRecursive watch on the nearest existing ancestor (bounded at the
 /// provider home — the same bound the pre-change recursive late-root rule
 /// used), so `Create(<projects>)` is observed instantly; otherwise ⇒ no
 /// ancestor watch. Idempotent and side-effect-free when already converged.
-/// Never arms the root ITSELF as its own ancestor (it reappeared between
-/// the absence insert and this sync — the return cascade arms it
-/// kind-correctly). When nothing above the root exists, no watch is armed
-/// and the rearm tick owns the return, exactly as the pre-change absent
-/// list did. A failed ancestor arm leaves `None` (the kernel auto-drops a
-/// vanished ancestor's watch, so a stale entry is unbooked the same way);
-/// the rearm tick re-runs this convergence while the root stays absent, so
-/// transient pressure never wedges the fast path permanently. Every path
-/// that inserts or removes the root's absence calls this before returning.
+/// Never arms the root ITSELF as its own ancestor: when the root is present
+/// at sync time — or appears inside the arm's check→arm window (delta
+/// D3-1) — the sync instead returns TRUE and the caller runs the full
+/// root-return application (plan + kind-correct apply, marks on), so a root
+/// created while no ancestor watch was live is armed with its whole
+/// structural tree immediately, never deferred to the 60s rearm tick (which
+/// stays the safety net). When nothing above the root exists, no watch is
+/// armed and the rearm tick owns the return, exactly as the pre-change
+/// absent list did. A failed ancestor arm leaves `None` (the kernel
+/// auto-drops a vanished ancestor's watch, so a stale entry is unbooked the
+/// same way); the rearm tick re-runs this convergence while the root stays
+/// absent, so transient pressure never wedges the fast path permanently.
+/// Every path that inserts or removes the root's absence calls this before
+/// returning and honors the TRUE handoff.
 fn sync_ancestor_watch(
     book: &mut ManagedBook,
     watcher: &mut notify::RecommendedWatcher,
     provider: &str,
     projects_root: &Path,
-) {
-    let want = if book.absent.contains(projects_root) && !book.armed.contains(projects_root) {
-        let bound = projects_root.parent().unwrap_or(projects_root);
-        let candidate = nearest_existing_ancestor(projects_root, bound);
-        (candidate != projects_root && candidate.exists()).then_some(candidate)
-    } else {
-        None
-    };
-    if book.ancestor == want {
-        return;
-    }
-    if let Some(current) = book.ancestor.take() {
-        unwatch_tolerated(watcher, provider, &current);
-    }
-    if let Some(target) = want {
-        // A failed arm is logged by `watch_path`; `None` stays booked and
-        // the rearm tick's convergence re-runs this — bounded backoff adds
-        // nothing to a single watch on an existing dir.
-        if watch_path(
-            watcher,
-            provider,
-            &target,
-            notify::RecursiveMode::NonRecursive,
-        )
-        .is_ok()
-        {
-            tracing::info!(
-                provider = %provider,
-                path = %target.display(),
-                "session-watcher: projects root absent, watching nearest existing ancestor",
-            );
-            book.ancestor = Some(target);
-        }
-    }
+) -> bool {
+    let selection = select_ancestor_watch(book, projects_root);
+    apply_ancestor_selection(book, watcher, provider, projects_root, selection)
 }
 
 /// Walk up from `target` toward `bound`, returning the first ancestor that
@@ -2694,6 +2897,68 @@ fn nearest_existing_ancestor(target: &Path, bound: &Path) -> PathBuf {
         current
     } else {
         bound.to_path_buf()
+    }
+}
+
+/// Bound on D3-1 ancestor-sync recoveries inside ONE convergence pass: each
+/// recovery means the root vanished-and-returned again inside the previous
+/// recovery's microseconds-wide window, so a continuously flapping root
+/// degrades to the rearm tick (plus this WARN and a provider-dirty mark)
+/// instead of an unbounded plan-scan loop.
+const ROOT_RETURN_RECOVERY_CAP: u32 = 4;
+
+/// The D3-1 recovery for a `sync_ancestor_watch` TRUE report (the
+/// absent-booked projects root is present — it appeared in a window with no
+/// live ancestor watch, so no return event was queued): re-scan a FRESH
+/// plan for the caller to apply with the return semantics (marks on). Caps
+/// the per-pass recovery count (`ROOT_RETURN_RECOVERY_CAP`) against a
+/// flapping root. Returns `None` on a transient scan failure (stay absent —
+/// provider dirty set, the rearm tick retries, exactly as the tick's own
+/// return cascade degrades) and at the cap (the tick owns the flap), so a
+/// `None` never wedges the fast path.
+fn replan_returned_root(
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+    recoveries: &mut u32,
+) -> Option<PlanTargets> {
+    if *recoveries >= ROOT_RETURN_RECOVERY_CAP {
+        tracing::warn!(
+            path = %projects_root.display(),
+            "session-watcher: amplifier root keeps vanishing/returning inside the ancestor-sync window; the rearm tick owns the next convergence",
+        );
+        outcome.provider_dirty = true;
+        return None;
+    }
+    *recoveries += 1;
+    match plan_amplifier_targets(projects_root) {
+        Ok(plan) => Some(plan),
+        Err(e) => {
+            tracing::warn!(
+                path = %projects_root.display(),
+                error = %e,
+                "session-watcher: amplifier return plan scan failed; keeping the root absent",
+            );
+            outcome.provider_dirty = true;
+            None
+        }
+    }
+}
+
+/// The D3-1 recovery at a spawn_blocking call site whose ancestor sync
+/// reported the absent-booked root present: run the full root-return
+/// application (fresh plan + kind-correct apply, marks on) inline — never
+/// deferred to the rearm tick. (The ONE non-spawn_blocking call site, the
+/// depth-0 vanish dispatch, defers instead via the `root_return` cascade
+/// batch.)
+fn recover_returned_root(
+    book: &mut ManagedBook,
+    watcher: &mut notify::RecommendedWatcher,
+    outcome: &mut ArmOutcome,
+    projects_root: &Path,
+) {
+    let mut recoveries = 0;
+    if let Some(fresh) = replan_returned_root(outcome, projects_root, &mut recoveries) {
+        apply_amplifier_return_plan(book, watcher, outcome, projects_root, &fresh);
     }
 }
 

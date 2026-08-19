@@ -635,13 +635,14 @@ async fn moved_projects_root_releases_every_descendant_watch_and_rearms_on_retur
     }
 
     // Re-create the root at the ORIGINAL path with a session while the root
-    // is tracked absent: only the rearm tick's full return cascade can pick
-    // this up first-line.
+    // is tracked absent: the ancestor watch armed on the vanish observes
+    // the re-creation, and the deferred full return cascade picks it up
+    // first-line (the 1s rearm tick stands behind it as the safety net).
     let _ = rx.borrow_and_update();
     let returned = write_amplifier_session(&home, "p3", "dd2584be-9478-4801-a62d-4e5da428b3a0");
     tokio::time::timeout(Duration::from_secs(8), rx.changed())
         .await
-        .expect("the return cascade's marks refresh the index promptly (1s rearm tick)")
+        .expect("the return cascade's marks refresh the index promptly (ancestor watch; 1s tick is the safety net)")
         .unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -1445,10 +1446,13 @@ async fn transient_arm_failure_is_retried_by_the_rearm_drain_and_eventually_arms
 
 /// Absence lifecycle, startup half (design: the provider root is the ONLY
 /// target that re-enters absence tracking): root missing at startup →
-/// absent; once it appears, the rearm tick re-arms it AND runs the full
-/// structural cascade (plan + apply, `emit_marks: true`), so sessions
+/// absent; once it appears, the late-root ancestor watch observes the
+/// creation and the deferred return cascade (plan + apply, `emit_marks:
+/// true`) re-arms it AND runs the full structural cascade, so sessions
 /// created while it was absent are armed AND scanned first-line — no
-/// reconcile wait. Uses the established `with_rearm_interval` idiom. (The
+/// reconcile wait. The 1s rearm tick stands behind the ancestor fast path
+/// as the safety net (either mechanism satisfies these prompt-window
+/// expectations). Uses the established `with_rearm_interval` idiom. (The
 /// deletion half — armed root → depth-0 removal routing → absent — is
 /// Task 4's `deleted_projects_root_enters_absence_and_rearms_with_full_cascade_on_return`.)
 #[tokio::test]
@@ -1589,8 +1593,12 @@ async fn absent_projects_root_creation_is_observed_via_the_ancestor_watch_not_th
 
 /// The ancestor-watch convergence itself, driven without a loop: absent ⇒
 /// armed, live (a `Create(<projects>)` surfaces through it), never the root
-/// itself, never a path below nothing, and dropped once the root stands —
-/// with the absence bookkeeping intact throughout.
+/// itself as its own ancestor, never a path below nothing, and dropped once
+/// the root stands — with the absence bookkeeping intact throughout. D3-1:
+/// a root PRESENT at sync time (it appeared while no ancestor watch was
+/// live, so its creation queued no event) is NEVER left tick-owned — the
+/// sync hands the caller the full root-return application, which arms root
+/// + descendants immediately.
 #[tokio::test]
 async fn ancestor_watch_converges_with_absence_state() {
     let home = unique_temp_dir("amp-ancestor-sync");
@@ -1601,9 +1609,15 @@ async fn ancestor_watch_converges_with_absence_state() {
     let mut book = ManagedBook::default();
     let mut outcome = ArmOutcome::default();
 
-    // Absent + nothing armed ⇒ the nearest existing ancestor arms.
+    // Absent + nothing armed ⇒ the nearest existing ancestor arms; no
+    // root-return handoff while the root is genuinely missing.
     book.absent.insert(projects.clone());
-    sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects);
+    assert!(!sync_ancestor_watch(
+        &mut book,
+        &mut watcher,
+        "amplifier",
+        &projects
+    ));
     assert_eq!(
         book.ancestor.as_deref(),
         Some(home.as_path()),
@@ -1612,29 +1626,54 @@ async fn ancestor_watch_converges_with_absence_state() {
     assert!(book.absent.contains(&projects), "the absence stays");
 
     // Idempotent while converged (the fs state has not moved).
-    sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects);
+    assert!(!sync_ancestor_watch(
+        &mut book,
+        &mut watcher,
+        "amplifier",
+        &projects
+    ));
     assert_eq!(book.ancestor.as_deref(), Some(home.as_path()));
 
     // The arm is LIVE: creating the root surfaces through it.
-    std::fs::create_dir_all(projects.join("p")).unwrap();
+    let session = write_amplifier_session(&home, "p", "bb2584be-9478-4801-a62d-4e5da428b3a0");
     let seen = collect_file_paths(&mut rx, Duration::from_secs(2), |s| s.contains(&projects)).await;
     assert!(
         seen.contains(&projects),
         "the ancestor observes the root's creation: {seen:?}"
     );
 
-    // Never-arm-the-root rule: with the root on disk but absent-booked and
-    // not yet armed (the create event is in flight / the return cascade
-    // transiently failed), the ancestor drops — the root itself would be
-    // the nearest existing candidate, and watching it for a creation that
-    // already happened is useless; the return cascade (event) plus the tick
-    // (safety net) own the arming.
-    sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects);
+    // D3-1 immediate recovery: with the root on disk but absent-booked and
+    // not yet armed (here the create event is merely in flight — but the
+    // SAME state arises when the creation happened with NO ancestor watch
+    // live, and then no event could ever arrive), the sync does not leave
+    // arming to the rearm tick: it reports the return, and the caller runs
+    // the full root-return application (plan + kind-correct apply, marks
+    // on) — root + structural descendants armed NOW.
+    assert!(
+        sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects),
+        "a root present while absent-booked and unarmed is handed to the caller, not the tick"
+    );
     assert!(book.ancestor.is_none());
     assert!(book.absent.contains(&projects), "the absence is honest");
+    let plan = plan_amplifier_targets(&projects).unwrap();
+    apply_amplifier_return_plan(&mut book, &mut watcher, &mut outcome, &projects, &plan);
+    assert!(book.armed.contains(&projects), "root armed immediately");
+    assert!(
+        book.armed.contains(&projects.join("p").join("sessions")),
+        "the returned tree's sessions dir armed immediately"
+    );
+    assert!(
+        book.armed.contains(&session),
+        "the returned tree's session dir armed immediately"
+    );
+    assert!(!book.absent.contains(&projects));
+    assert!(
+        outcome.marks.contains(&session.join("metadata.json")),
+        "the return application runs with marks on"
+    );
 
-    // The root stands (a real ProjectsRoot arm — which clears the absence
-    // on success) ⇒ no ancestor watch.
+    // The root stands (armed — a real ProjectsRoot arm also clears the
+    // absence on success) ⇒ no ancestor watch, no handoff.
     arm_managed_dir(
         &mut book,
         &mut watcher,
@@ -1645,14 +1684,24 @@ async fn ancestor_watch_converges_with_absence_state() {
         false,
     );
     assert!(!book.absent.contains(&projects));
-    sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects);
+    assert!(!sync_ancestor_watch(
+        &mut book,
+        &mut watcher,
+        "amplifier",
+        &projects
+    ));
     assert!(book.ancestor.is_none(), "armed root ⇒ no ancestor watch");
 
     // The ghost corner: nothing above the root exists ⇒ no arm, absence
     // stays (the tick owns the return — the pre-change absent-list parity).
     let ghost = unique_temp_dir("amp-ancestor-ghost").join("projects");
     book.absent.insert(ghost.clone());
-    sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &ghost);
+    assert!(!sync_ancestor_watch(
+        &mut book,
+        &mut watcher,
+        "amplifier",
+        &ghost
+    ));
     assert!(
         book.ancestor.is_none(),
         "nothing existing above the root ⇒ nothing armed"
@@ -1661,6 +1710,130 @@ async fn ancestor_watch_converges_with_absence_state() {
 
     drop(watcher);
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// Delta D3-1 (the ancestor sync's check→arm windows): a projects root
+/// created while NO ancestor watch is live queues NO return event, so a
+/// sync that merely declines (or re-arms blind) would leave the root and
+/// its structural descendants unwatched until the rearm tick. The sync
+/// must instead close both windows itself, the same way the stand-in swap
+/// closes its check→arm TOCTOU: (a) the root present at sync ENTRY ⇒
+/// hand the caller the full root-return application — never arm the root
+/// as its own ancestor; (b) the root appearing between the ancestor-SELECT
+/// existence walk and the ancestor ARM ⇒ the arm-then-recheck swaps to the
+/// same handoff. Driven without a spawned loop by splitting the sync into
+/// its production steps (select → interleave the creation → arm) — so no
+/// rearm tick can be the mechanism here (no loop exists to tick; the
+/// loop-level pin for the event path,
+/// `absent_projects_root_creation_is_observed_via_the_ancestor_watch_not_the_tick`,
+/// runs its rearm interval at 3600s for the same reason). The tick stays
+/// the safety net behind both.
+#[tokio::test]
+async fn ancestor_sync_recovers_a_root_created_inside_the_check_to_arm_window() {
+    // Window (a): the root (with a full session tree) is present at sync
+    // ENTRY — it appeared between a missing-root plan and the sync, while
+    // no ancestor watch was armed yet.
+    let home = unique_temp_dir("amp-ancestor-window-a");
+    std::fs::create_dir_all(&home).unwrap();
+    let projects = home.join("projects");
+    let (tx, _rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let mut watcher = create_provider_watcher(&tx, "amplifier", false).unwrap();
+    let mut book = ManagedBook::default();
+    let mut outcome = ArmOutcome::default();
+    book.absent.insert(projects.clone());
+    let session = write_amplifier_session(&home, "p", "aa2584be-9478-4801-a62d-4e5da428b3a0");
+    assert!(
+        sync_ancestor_watch(&mut book, &mut watcher, "amplifier", &projects),
+        "window (a): the sync reports the present root instead of declining"
+    );
+    assert!(
+        book.ancestor.is_none(),
+        "window (a): no ancestor is armed for a creation that already happened"
+    );
+    assert!(book.absent.contains(&projects), "the absence is honest");
+    // The caller's production recovery: the full root-return application
+    // (plan + kind-correct apply, marks on — the rearm tick's own shape).
+    let plan = plan_amplifier_targets(&projects).unwrap();
+    apply_amplifier_return_plan(&mut book, &mut watcher, &mut outcome, &projects, &plan);
+    assert!(book.armed.contains(&projects), "root armed immediately");
+    assert!(
+        book.armed.contains(&projects.join("p").join("sessions")),
+        "sessions dir armed immediately"
+    );
+    assert!(
+        book.armed.contains(&session),
+        "session dir armed immediately"
+    );
+    assert!(!book.absent.contains(&projects));
+    assert!(
+        outcome.marks.contains(&session.join("metadata.json")),
+        "the recovery runs with marks on"
+    );
+
+    // Window (b): the root appears between the SELECT and the ARM halves of
+    // the sync — driven deterministically through the production steps with
+    // the creation interleaved in the gap.
+    let home_b = unique_temp_dir("amp-ancestor-window-b");
+    std::fs::create_dir_all(&home_b).unwrap();
+    let projects_b = home_b.join("projects");
+    let mut book_b = ManagedBook::default();
+    let mut outcome_b = ArmOutcome::default();
+    book_b.absent.insert(projects_b.clone());
+    // SELECT (production step 1): the root is missing ⇒ the provider home
+    // (the bound) is selected as the ancestor.
+    let selection = select_ancestor_watch(&book_b, &projects_b);
+    assert!(
+        matches!(&selection, AncestorSelection::Watch(target) if *target == home_b),
+        "the still-missing root selects its nearest existing ancestor"
+    );
+    // INTERLEAVE: the root (with a full session tree) is created INSIDE the
+    // check→arm window — no ancestor was armed when the creation happened.
+    let session_b = write_amplifier_session(&home_b, "q", "dd2584be-9478-4801-a62d-4e5da428b3a0");
+    // ARM (production step 2): the arm-then-recheck must catch the root in
+    // the window and swap the just-armed ancestor for the return handoff.
+    assert!(
+        apply_ancestor_selection(
+            &mut book_b,
+            &mut watcher,
+            "amplifier",
+            &projects_b,
+            selection
+        ),
+        "window (b): the arm-then-recheck reports the root that appeared in the gap"
+    );
+    assert!(
+        book_b.ancestor.is_none(),
+        "window (b): the ancestor is swapped away, not left watching blind"
+    );
+    // The caller's production recovery arms root + descendants immediately.
+    let plan_b = plan_amplifier_targets(&projects_b).unwrap();
+    apply_amplifier_return_plan(
+        &mut book_b,
+        &mut watcher,
+        &mut outcome_b,
+        &projects_b,
+        &plan_b,
+    );
+    assert!(book_b.armed.contains(&projects_b), "root armed immediately");
+    assert!(
+        book_b
+            .armed
+            .contains(&projects_b.join("q").join("sessions")),
+        "sessions dir armed immediately"
+    );
+    assert!(
+        book_b.armed.contains(&session_b),
+        "session dir armed immediately"
+    );
+    assert!(!book_b.absent.contains(&projects_b));
+    assert!(
+        outcome_b.marks.contains(&session_b.join("metadata.json")),
+        "the recovery runs with marks on"
+    );
+
+    drop(watcher);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&home_b).ok();
 }
 
 /// The retry schedule is bounded exponential: 1, 2, 4, … 60s cap, no
