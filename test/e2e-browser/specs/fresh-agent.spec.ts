@@ -191,13 +191,13 @@ test.describe('Fresh Agent', () => {
     await page.getByRole('option').first().click()
 
     const dialog = await openFreshAgentSettings(page, 'Freshclaude')
-    await expect(dialog.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeChecked()
+    await expect(dialog.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
 
     const thinking = dialog.getByRole('combobox', { name: /^Thinking level$/i })
     const thinkingOptions = await thinking.locator('option').evaluateAll(
       (options) => options.map((option) => option.textContent),
     )
-    expect(thinkingOptions).toEqual(['low', 'medium', 'high'])
+    expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     await expect(thinking).toHaveValue('high')
 
     await expect.poll(async () => {
@@ -207,7 +207,7 @@ test.describe('Fresh Agent', () => {
       type: 'freshAgent.create',
       sessionType: 'freshclaude',
       provider: 'claude',
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'high',
     })
   })

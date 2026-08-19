@@ -30,9 +30,14 @@ export {
   normalizeFreshAgentModel,
   normalizeFreshcodexModel,
 } from '@/lib/fresh-agent-models'
-// `export ... from` above does not bind module-scope names; import the two
-// normalizers for the effective-value helpers below.
-import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '@/lib/fresh-agent-models'
+// `export ... from` above does not bind module-scope names; import the
+// normalizers and the static options table for the effective-value helpers
+// below.
+import {
+  FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
+  normalizeFreshAgentEffort,
+  normalizeFreshAgentModel,
+} from '@/lib/fresh-agent-models'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
 export type FreshAgentRegistryEntry = {
@@ -64,7 +69,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'claude',
     label: 'Freshclaude',
     icon: FreshclaudeIcon,
-    defaultModel: 'claude-opus-4-6',
+    defaultModel: 'opus[1m]',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {
@@ -101,7 +106,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'claude',
     label: 'Kilroy',
     icon: KilroyIcon,
-    defaultModel: 'claude-opus-4-6',
+    defaultModel: 'opus[1m]',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {
@@ -177,15 +182,36 @@ export function resolveEffectiveFreshAgentModel(
  * persisted provider default, normalized against the model's known levels.
  * For opencode live-catalog models an absent value stays absent (the model
  * selector's explicit Default — no variant is sent).
+ *
+ * Probed-only claude models (absent from the static menu) clamp against the
+ * levels stamped onto the pane at selection time (`modelEffortLevels`)
+ * instead of falling through to the static table's default-model fallback:
+ * the staged value survives when the stamp knows it, an unknown staged value
+ * re-clamps to the stamp's first level, and an empty stamp (the model
+ * declared no levels) clears the effort. No stamp (REST/MCP/restored panes)
+ * keeps the static-table normalization, unchanged.
  */
 export function getEffectiveFreshAgentEffort(
-  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection' | 'effort'>,
+  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection' | 'effort' | 'modelEffortLevels'>,
   providerDefaults?: FreshAgentProviderDefaultsForModel,
 ): string | undefined {
+  const resolvedModel = resolveEffectiveFreshAgentModel(content, providerDefaults)
+  if (
+    content.provider === 'claude'
+    && resolvedModel
+    && Array.isArray(content.modelEffortLevels)
+    && !(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[content.sessionType] ?? [])
+      .some((option) => option.value === resolvedModel)
+  ) {
+    const levels = content.modelEffortLevels
+    const staged = content.effort ?? providerDefaults?.effort
+    if (staged && levels.includes(staged)) return staged
+    return levels.length > 0 ? levels[0] : undefined
+  }
   return normalizeFreshAgentEffort(
     content.sessionType,
     content.provider,
-    resolveEffectiveFreshAgentModel(content, providerDefaults),
+    resolvedModel,
     content.effort ?? providerDefaults?.effort,
   )
 }

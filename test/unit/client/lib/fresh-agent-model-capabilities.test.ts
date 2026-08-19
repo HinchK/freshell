@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import type { FreshAgentModelCapabilities } from '@shared/fresh-agent-model-capabilities'
 import {
   FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
   getFreshAgentStaticModelCapabilities,
@@ -12,6 +13,7 @@ import {
   groupFreshAgentModelCapabilitiesBySource,
   isFreshAgentEffortSupported,
   isFreshAgentModelCapabilitiesFresh,
+  mergeClaudeSelectorOptions,
   parseFreshAgentSettingsModelValue,
   requiresFreshAgentModelCapabilityValidation,
   resolveFreshAgentModelSelection,
@@ -392,6 +394,144 @@ describe('fresh-agent-model-capabilities opencode catalog helpers', () => {
 
     expect(capped.groups.flatMap((group) => group.models)).toHaveLength(250)
     expect(capped.hiddenCount).toBe(50)
+  })
+})
+
+describe('mergeClaudeSelectorOptions', () => {
+  const staticOptions = [
+    {
+      value: 'opus[1m]',
+      label: 'Claude Opus 5 (1M context)',
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      defaultEffort: 'high',
+    },
+  ] as const
+
+  it('appends non-duplicate probed rows after the statics, deduping by id', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'opus[1m]',
+          displayName: 'Probed duplicate that must not replace the static',
+          provider: 'claude',
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+        {
+          id: 'claude-opus-4-7',
+          displayName: 'Claude Opus 4.7',
+          provider: 'claude',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: false,
+        },
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet',
+          provider: 'claude',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'medium', 'high'],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    }, staticOptions)
+
+    expect(merged.modelOptions).toEqual([
+      {
+        value: 'opus[1m]',
+        label: 'Claude Opus 5 (1M context)',
+        thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultEffort: 'high',
+      },
+      { value: 'claude-opus-4-7', label: 'Claude Opus 4.7', thinkingEfforts: ['low', 'high'] },
+      { value: 'sonnet', label: 'Sonnet', thinkingEfforts: ['low', 'medium', 'high'] },
+    ])
+  })
+
+  it('carries catalog effort levels onto probed rows as thinkingEfforts, never a defaultEffort', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet',
+          provider: 'claude',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    }, staticOptions)
+
+    expect(merged.modelOptions.at(-1)).toEqual({
+      value: 'sonnet',
+      label: 'Sonnet',
+      thinkingEfforts: ['low', 'high'],
+    })
+    expect(merged.modelOptions.at(-1)).not.toHaveProperty('defaultEffort')
+  })
+
+  it('yields empty thinkingEfforts for probed rows without usable effort data', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude',
+          supportsEffort: false,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: false,
+        },
+        {
+          id: 'levels-absent-at-runtime',
+          displayName: 'Levels absent',
+          provider: 'claude',
+          supportsEffort: true,
+          supportsAdaptiveThinking: false,
+        },
+      ] as unknown as FreshAgentModelCapabilities['models'],
+    }, staticOptions)
+
+    expect(merged.modelOptions.at(-2)).toEqual({
+      value: 'haiku',
+      label: 'Haiku',
+      thinkingEfforts: [],
+    })
+    expect(merged.modelOptions.at(-1)).toEqual({
+      value: 'levels-absent-at-runtime',
+      label: 'Levels absent',
+      thinkingEfforts: [],
+    })
+  })
+
+  it('returns statics and static labels unchanged for a null catalog', () => {
+    const merged = mergeClaudeSelectorOptions(null, staticOptions)
+
+    expect(merged.modelOptions).toEqual(staticOptions)
+  })
+
+  it('returns statics and static labels unchanged for an empty catalog', () => {
+    const merged = mergeClaudeSelectorOptions({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [],
+    }, staticOptions)
+
+    expect(merged.modelOptions).toEqual(staticOptions)
   })
 })
 

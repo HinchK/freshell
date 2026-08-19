@@ -7,13 +7,16 @@ import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getEffectiveFreshAgentEffort,
-  getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
   resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { getFreshAgentModelCapabilities } from '@/lib/api'
-import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
+import {
+  FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE,
+  mergeClaudeSelectorOptions,
+} from '@/lib/fresh-agent-model-capabilities'
+import type { FreshAgentModelOption } from '@shared/fresh-agent-models'
 import { cn } from '@/lib/utils'
 import {
   DEFAULT_FRESH_AGENT_STYLE,
@@ -22,6 +25,10 @@ import {
   type FreshAgentStyle,
 } from '@shared/settings'
 import { FreshAgentModelDialog } from './FreshAgentModelDialog'
+import type {
+  FreshAgentRuntimeProvider,
+  FreshAgentSessionType,
+} from '@shared/fresh-agent'
 import type {
   FreshAgentModelCapabilitiesResponse,
 } from '@shared/fresh-agent-model-capabilities'
@@ -47,16 +54,37 @@ const PERMISSION_MODES_BY_PROVIDER: Record<string, PermissionModeOption[]> = {
   ],
 }
 
-function makeUnavailableCapabilitiesResponse(): FreshAgentModelCapabilitiesResponse {
+function makeUnavailableCapabilitiesResponse(
+  sessionType: FreshAgentSessionType,
+  runtimeProvider: FreshAgentRuntimeProvider,
+): FreshAgentModelCapabilitiesResponse {
   return {
     ok: false,
-    sessionType: 'freshopencode',
-    runtimeProvider: 'opencode',
+    sessionType,
+    runtimeProvider,
     status: 'unavailable',
     fetchedAt: Date.now(),
     models: [],
     error: { code: 'CAPABILITY_PROBE_FAILED', message: 'Catalog fetch failed' },
   }
+}
+
+/**
+ * Effort after a model switch in the simple selector: keep the current pane
+ * effort when the SELECTED row's own levels include it, otherwise take the
+ * row's declared defaultEffort (then first level). A row declaring no levels
+ * clears the pane effort — never fabricate a clamp from the static default
+ * model's table. (Only called for rows present in the merged selector list;
+ * rows absent entirely keep the shared static-table normalizer.)
+ */
+function effortForSwitchedModelRow(
+  row: FreshAgentModelOption,
+  currentEffort: string | undefined,
+): string | undefined {
+  const levels = row.thinkingEfforts
+  if (!levels || levels.length === 0) return undefined
+  if (currentEffort && levels.includes(currentEffort)) return currentEffort
+  return row.defaultEffort ?? levels[0]
 }
 
 export function FreshAgentSettingsButton({
@@ -76,21 +104,37 @@ export function FreshAgentSettingsButton({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
-  const [opencodeCapabilities, setOpencodeCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
+  const [probedCapabilities, setProbedCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
 
   const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
-  const modelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
   const modelValue = activeModel ?? ''
   const isFreshopencode = paneContent.sessionType === 'freshopencode'
   // freshclaude/kilroy keep the simple radio list + Thinking dropdown, exactly
   // as before; freshopencode and freshcodex get the compact Model row that
   // opens the shared two-column dialog.
   const keepsSimpleModelList = paneContent.provider === 'claude'
+  // claude providers: merge the probed catalog (aliases included) into the
+  // static menu once the fetch resolves. freshcodex/freshopencode keep the
+  // pure static table here (their Model row resolves names via the dialog).
+  const staticModelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
+  const modelOptions = keepsSimpleModelList
+    ? mergeClaudeSelectorOptions(
+        probedCapabilities?.ok === true ? probedCapabilities : undefined,
+        staticModelOptions,
+      ).modelOptions
+    : staticModelOptions
   const opensModelDialog = paneContent.sessionType === 'freshopencode' || paneContent.sessionType === 'freshcodex'
 
+  // Simple-list path: thinking levels come from the merged selector rows, so
+  // probed-only models use their own catalog levels instead of the static
+  // table's default-model fallback. Static rows resolve identically to the
+  // old getFreshAgentThinkingOptions call — for claude providers,
+  // normalizeFreshAgentModel is the identity. Models in neither list
+  // legitimately show no Thinking select.
   const thinkingOptions = keepsSimpleModelList
-    ? getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
+    ? (modelOptions.find((option) => option.value === activeModel)?.thinkingEfforts ?? [])
+        .map((value) => ({ value, label: value }))
     : []
   const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
@@ -106,10 +150,10 @@ export function FreshAgentSettingsButton({
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
 
-  const opencodeCatalogUnavailable = isFreshopencode && opencodeCapabilities?.ok === false
+  const opencodeCatalogUnavailable = isFreshopencode && probedCapabilities?.ok === false
   const modelDisplayName = isFreshopencode
-    ? (opencodeCapabilities?.ok
-        ? opencodeCapabilities.models.find((model) => model.id === activeModel)?.displayName ?? activeModel
+    ? (probedCapabilities?.ok
+        ? probedCapabilities.models.find((model) => model.id === activeModel)?.displayName ?? activeModel
         : activeModel)
     : (modelOptions.find((option) => option.value === activeModel)?.label ?? activeModel)
   const effortLabel = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'
@@ -132,16 +176,26 @@ export function FreshAgentSettingsButton({
     }))
   }, [dispatch, paneContent.sessionType])
 
-  // freshopencode: fetch the live catalog when the popover opens so the Model
-  // row can render the real display name and report catalog unavailability.
+  // freshopencode + claude providers (freshclaude/kilroy): fetch the live
+  // catalog when the popover opens. freshopencode renders display names and
+  // reports catalog unavailability; claude providers merge the probed rows
+  // (aliases included) into the simple radio list. Statics render instantly
+  // either way — no loading gate.
   useEffect(() => {
-    if (!open || !isFreshopencode) return
+    if (!open || (!isFreshopencode && !keepsSimpleModelList)) return
     let cancelled = false
-    void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
-      .then((result) => { if (!cancelled) setOpencodeCapabilities(result) })
-      .catch(() => { if (!cancelled) setOpencodeCapabilities(makeUnavailableCapabilitiesResponse()) })
+    void getFreshAgentModelCapabilities(paneContent.sessionType, { cwd: paneContent.initialCwd })
+      .then((result) => { if (!cancelled) setProbedCapabilities(result) })
+      .catch(() => {
+        if (!cancelled) {
+          setProbedCapabilities(makeUnavailableCapabilitiesResponse(
+            paneContent.sessionType,
+            paneContent.provider,
+          ))
+        }
+      })
     return () => { cancelled = true }
-  }, [open, isFreshopencode, paneContent.initialCwd])
+  }, [open, isFreshopencode, keepsSimpleModelList, paneContent.sessionType, paneContent.initialCwd])
 
   useEffect(() => {
     if (!open) return
@@ -238,16 +292,36 @@ export function FreshAgentSettingsButton({
                         disabled={settingsDisabled}
                         onChange={() => {
                           const nextModel = option.value
-                          const nextEffort = normalizeFreshAgentEffort(
-                            paneContent.sessionType,
-                            paneContent.provider,
-                            nextModel,
-                            paneContent.effort,
-                          )
+                          // Clamp against the row actually being selected from
+                          // the merged list (probed rows carry their own
+                          // catalog levels). Unknown models — absent from the
+                          // list entirely — keep the shared static-table
+                          // normalizer, unchanged.
+                          const nextRow = modelOptions.find((row) => row.value === nextModel)
+                          const nextEffort = nextRow
+                            ? effortForSwitchedModelRow(nextRow, paneContent.effort)
+                            : normalizeFreshAgentEffort(
+                                paneContent.sessionType,
+                                paneContent.provider,
+                                nextModel,
+                                paneContent.effort,
+                              )
                           dispatch(mergePaneContent({
                             tabId,
                             paneId,
-                            updates: { model: nextModel, effort: nextEffort },
+                            updates: {
+                              model: nextModel,
+                              effort: nextEffort,
+                              // Stamp the switched-to row's known levels
+                              // (static or probed) so effort normalization
+                              // clamps against THEM — never re-derived from
+                              // the static table's default-model fallback for
+                              // probed-only models. Absent row → field clears
+                              // back to static-table normalization.
+                              modelEffortLevels: nextRow?.thinkingEfforts
+                                ? [...nextRow.thinkingEfforts]
+                                : undefined,
+                            },
                           }))
                           persistProviderDefaults({
                             modelSelection: { kind: 'exact', modelId: nextModel },

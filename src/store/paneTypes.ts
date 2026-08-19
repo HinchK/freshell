@@ -64,6 +64,13 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
   return trimmed.length > 0 ? trimmed : undefined
 }
 
+export function normalizeFreshAgentModelEffortLevels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+  return value.filter((level): level is string => typeof level === 'string')
+}
+
 /**
  * Terminal pane content with full lifecycle management.
  * Each terminal pane owns its backend terminal process.
@@ -201,6 +208,12 @@ export type FreshAgentPaneContent = {
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   effort?: string
+  /** Effort levels for the current model as known at selection time (static
+   * or probed catalog), stamped by the settings selector's model switch. An
+   * empty array is still a stamp: the selected model declared no levels.
+   * Absent for panes created outside the selector (REST/MCP/restored) —
+   * those fall back to static-table normalization, unchanged. */
+  modelEffortLevels?: string[]
   plugins?: string[]
   /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
   style?: FreshAgentStyle

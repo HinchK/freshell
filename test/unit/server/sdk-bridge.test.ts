@@ -58,7 +58,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   }),
 }))
 
-import { SdkBridge } from '../../../server/sdk-bridge.js'
+import { SdkBridge, createClaudeSdkCleanEnv, createClaudeSdkOptions } from '../../../server/sdk-bridge.js'
 
 describe('SdkBridge', () => {
   let bridge: SdkBridge
@@ -1574,6 +1574,113 @@ describe('SdkBridge', () => {
       bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
       bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
       await Promise.all([p, q])
+    })
+  })
+
+  describe('createClaudeSdkOptions: 0.3 defensive-options lock', () => {
+    it('strips precisely CLAUDECODE and ANTHROPIC_API_KEY from the child env, passing unrelated vars through', () => {
+      const cleaned = createClaudeSdkCleanEnv({
+        CLAUDECODE: '1',
+        ANTHROPIC_API_KEY: 'sk-ant-sentinel',
+        HOME: '/home/tester',
+        PATH: '/usr/bin:/bin',
+      })
+
+      expect(cleaned.CLAUDECODE).toBeUndefined()
+      expect(cleaned.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(cleaned.HOME).toBe('/home/tester')
+      expect(cleaned.PATH).toBe('/usr/bin:/bin')
+    })
+
+    it('pins settingSources to [user, project, local] and carries the abortController reference', () => {
+      const abortController = new AbortController()
+      const options = createClaudeSdkOptions({ cwd: '/tmp', abortController })
+
+      expect(options.settingSources).toEqual(['user', 'project', 'local'])
+      expect(options.abortController).toBe(abortController)
+    })
+  })
+
+  describe('ClaudeSdkBridge 0.3 benign control shapes', () => {
+    it('silently consumes mcp_servers control messages and stays live', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'mcp_servers',
+        servers: [{ status: 'pending' }],
+      })
+      mockMessages.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'post-benign liveness: mcp_servers' }] },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // The benign control shape produces NO user/assistant/result-shaped emission;
+      // the sole sdk.assistant broadcast must be the follow-up liveness probe (its
+      // arrival proves the benign message was consumed and the session unwedged).
+      const assistantBroadcasts = received.filter((m) => m.type === 'sdk.assistant')
+      expect(assistantBroadcasts).toHaveLength(1)
+      expect(assistantBroadcasts[0].content).toEqual([{ type: 'text', text: 'post-benign liveness: mcp_servers' }])
+      expect(received.find((m) => m.type === 'sdk.result')).toBeUndefined()
+    })
+
+    it('silently consumes system/model_refusal_fallback control messages and stays live', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'system',
+        subtype: 'model_refusal_fallback',
+      })
+      mockMessages.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'post-benign liveness: model_refusal_fallback' }] },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const assistantBroadcasts = received.filter((m) => m.type === 'sdk.assistant')
+      expect(assistantBroadcasts).toHaveLength(1)
+      expect(assistantBroadcasts[0].content).toEqual([{ type: 'text', text: 'post-benign liveness: model_refusal_fallback' }])
+      expect(received.find((m) => m.type === 'sdk.result')).toBeUndefined()
+    })
+
+    it('silently consumes system/model_refusal_no_fallback control messages and stays live', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'system',
+        subtype: 'model_refusal_no_fallback',
+      })
+      mockMessages.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'post-benign liveness: model_refusal_no_fallback' }] },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const assistantBroadcasts = received.filter((m) => m.type === 'sdk.assistant')
+      expect(assistantBroadcasts).toHaveLength(1)
+      expect(assistantBroadcasts[0].content).toEqual([{ type: 'text', text: 'post-benign liveness: model_refusal_no_fallback' }])
+      expect(received.find((m) => m.type === 'sdk.result')).toBeUndefined()
     })
   })
 })

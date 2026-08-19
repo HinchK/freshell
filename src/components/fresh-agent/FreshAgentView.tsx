@@ -25,8 +25,8 @@ import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
 import {
-  normalizeFreshAgentEffort,
-  normalizeFreshAgentModel,
+  getEffectiveFreshAgentEffort,
+  resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
@@ -199,27 +199,10 @@ function mergeSnapshotForDisplay(
   return { ...next, turns: mergedTurns }
 }
 
-function resolveEffectiveFreshAgentModel(
-  content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
-): string | undefined {
-  const configuredModel = content.model
-    ?? content.modelSelection?.modelId
-    ?? providerDefaults?.modelSelection?.modelId
-  return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
-}
-
-function getEffectiveFreshAgentEffort(
-  content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
-): string | undefined {
-  return normalizeFreshAgentEffort(
-    content.sessionType,
-    content.provider,
-    resolveEffectiveFreshAgentModel(content, providerDefaults),
-    content.effort ?? providerDefaults?.effort,
-  )
-}
+// resolveEffectiveFreshAgentModel + getEffectiveFreshAgentEffort are the
+// shared registry helpers (imported above): display, model dialog, and the
+// send/create payloads all read one central normalization so a stamped
+// probed-model effort survives everywhere.
 
 function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): string | undefined {
   return content.provider === 'opencode' ? undefined : content.permissionMode

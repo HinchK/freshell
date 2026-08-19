@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { resolveFreshAgentType, resolveFreshAgentPaneCreateEffort } from '@/lib/fresh-agent-registry'
+import {
+  getEffectiveFreshAgentEffort,
+  resolveFreshAgentType,
+  resolveFreshAgentPaneCreateEffort,
+} from '@/lib/fresh-agent-registry'
 
 describe('fresh-agent registry', () => {
   it('keeps kilroy as a hidden claude-backed fresh-agent type', () => {
@@ -66,5 +70,75 @@ describe('resolveFreshAgentPaneCreateEffort', () => {
       providerEffort: undefined,
       fallbackEffort: 'max',
     })).toBe('max')
+  })
+})
+
+describe('getEffectiveFreshAgentEffort', () => {
+  it('keeps a staged probed-model effort the stamped selection-time levels know', () => {
+    // 'sonnet' is a probed-only claude model (absent from the static table):
+    // static-table normalization would re-clamp 'alpha' to the static
+    // default's 'high', silently losing the staged value.
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'alpha',
+      modelEffortLevels: ['alpha', 'beta'],
+    })).toBe('alpha')
+  })
+
+  it('re-clamps a staged effort the stamped levels do not know to the first stamped level', () => {
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'high',
+      modelEffortLevels: ['alpha', 'beta'],
+    })).toBe('alpha')
+  })
+
+  it('clears the effort when the stamp records a probed model with no levels', () => {
+    // An empty stamped array is still a stamp: the selected model declared
+    // zero effort levels, so the pane has no effort — never the static
+    // default's fabricated fallback.
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'haiku',
+      effort: 'high',
+      modelEffortLevels: [],
+    })).toBeUndefined()
+  })
+
+  it('keeps static-table normalization for a probed model with no stamp (restored/REST panes)', () => {
+    // Regression witness: no stamp means the selector never ran for this
+    // pane, so the pre-fix static fallback ('alpha' unknown to the static
+    // default's levels → its defaultEffort 'high') is unchanged.
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'alpha',
+    })).toBe('high')
+  })
+
+  it('ignores the stamp for static-table models (their static levels are authoritative)', () => {
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'alpha',
+      modelEffortLevels: ['alpha', 'beta'],
+    })).toBe('high')
+  })
+
+  it('does not consult the stamp on the opencode path (byte-identical behavior)', () => {
+    expect(getEffectiveFreshAgentEffort({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'deepseek/deepseek-v4-pro',
+      effort: 'high',
+      modelEffortLevels: ['alpha'],
+    })).toBe('high')
   })
 })

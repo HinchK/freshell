@@ -79,12 +79,12 @@ describe('Claude fresh-agent adapter', () => {
     await expect(adapter.create({
       requestId: 'req-1',
       sessionType: 'freshclaude',
-      model: 'claude-opus-4-6',
-      effort: 'xhigh',
+      model: 'opus[1m]',
+      effort: 'bogus',
     })).resolves.toEqual({ sessionId: 'sdk-claude-1' })
 
     expect(sdkBridge.createSession).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'high',
     }))
   })
@@ -108,27 +108,29 @@ describe('Claude fresh-agent adapter', () => {
       sessionType: 'freshclaude',
     })
     await adapter.create({
-      requestId: 'req-stale-max',
+      requestId: 'req-persisted-max',
       sessionType: 'freshclaude',
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'max',
     })
     await adapter.resume?.({
-      requestId: 'req-resume-stale-max',
+      requestId: 'req-resume-persisted-max',
       sessionType: 'freshclaude',
       resumeSessionId: 'resume-claude-1',
-      model: 'claude-opus-4-6',
+      model: 'opus[1m]',
       effort: 'max',
     })
 
     expect(sdkBridge.createSession).toHaveBeenNthCalledWith(1, expect.objectContaining({
       effort: 'high',
     }))
+    // 'max' is a legal opus[1m] effort, so a persisted max passes through
+    // unchanged instead of clamping to the default
     expect(sdkBridge.createSession).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      effort: 'high',
+      effort: 'max',
     }))
     expect(sdkBridge.createSession).toHaveBeenNthCalledWith(3, expect.objectContaining({
-      effort: 'high',
+      effort: 'max',
     }))
   })
 
