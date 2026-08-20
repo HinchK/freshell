@@ -66,8 +66,29 @@ React 18 + TypeScript client; Vitest + RTL; cargo test; Playwright e2e
   structure; client component tests asserting the scroll-region structure;
   new e2e scenario proving R1 (connected ⇒ no offer, then after disconnect ⇒
   offer) and a phone-viewport e2e proving R3; the three existing recovery
-  scenarios (R2) green; final full local verification (`npm test`,
-  `cargo test -p freshell-server`, focused e2e) green on the final HEAD.
+  scenarios (R2) green; final full local verification (`npm run check`,
+  `cargo test -p freshell-server -p freshell-ws`, `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, focused e2e)
+  green on the final HEAD.
+
+### Product decision (explicit, plan-review-driven)
+
+The gate suppresses the offer whenever any OTHER client is **currently
+connected**. Residual the gate deliberately cannot remove: a phone booting
+while ALL clients are disconnected (e.g. desktop asleep/offline) still
+receives an offer — now scrollable, phone-contained, and one-tap dismissible
+(dismissal dedupes by contentId), but present. Complete "never on a
+brand-new device" silence is impossible without a wipe-surviving device
+identity, and none exists: `deviceId` is a random id in localStorage that
+regenerates on the very storage wipe the recovery flow exists for, and
+`deviceLabel` is the SERVER host's name (identical for the phone and the
+desktop). Verified live data during planning: the incident offer contained
+19 pane rows + 301 ledgerOnly rows drawn substantially from months-old dead
+browser-profile device dirs. The chosen heuristic eliminates exactly that
+incident class (the user's desktop is connected essentially always) while
+preserving every documented recovery promise (post-restart, sole-browser
+loss). If the disconnected-desktop residual ever bites in practice, revisit
+with a settings opt-out — recorded as a follow-up, not built here.
 
 ---
 
@@ -99,40 +120,56 @@ React 18 + TypeScript client; Vitest + RTL; cargo test; Playwright e2e
 
 **Files:**
 - Create: `crates/freshell-ws/src/connected_clients.rs` — `#[derive(Clone, Default)]
-  pub struct ConnectedTabClients { inner: Arc<Mutex<HashMap<u64, HashSet<String>>>> }`
+  pub struct ConnectedTabClients { by_conn: Arc<Mutex<HashMap<u64, String>>> }`
   with `note_push(&self, conn_id: u64, client_instance_id: &str)`,
   `remove_connection(&self, conn_id: u64)`, `live_client_ids(&self) -> HashSet<String>`.
+  `note_push` REPLACES the connection's prior stamp — one connection pushes for
+  exactly one current client, and a single connection can legitimately rotate its
+  `clientInstanceId` (BroadcastChannel lease-collision rotation,
+  `src/store/tabRegistrySync.ts:412-431`: the same socket pushes the old ID then
+  the replacement). A per-connection HashSet would strand the old ID as a phantom
+  "other" client and wrongly suppress later offers.
   Export from `crates/freshell-ws/src/lib.rs` (`pub mod connected_clients;`).
-- Modify: `crates/freshell-ws/src/lib.rs` (WsState field
-  `pub connected_clients: ConnectedTabClients` next to the other shared
-  handles ~:96-382), `crates/freshell-ws/src/terminal.rs` (`handle_tabs_push`
-  ~:5090-5107 — stamp after the clientInstanceId validation ~:5171-5173 using
-  the handler's connection id; teardown block ~:579-615 — call
-  `connected_clients.remove_connection(conn_id)` beside `remove_client`).
+- Modify: `crates/freshell-ws/src/tabs.rs` — `TabsRegistry` owns the new
+  `ConnectedTabClients` field (delegating accessors `note_connected_push`,
+  `clear_connected_connection`, `connected_client_ids`). TabsRegistry is
+  constructed exactly once (`main.rs:564-591`) and is Clone-cheap (Arc inside).
+  Deliberately NO new `WsState` field: `WsState` struct literals exist in ~36
+  files (incl. `freshell-ws/tests/common/mod.rs` and integration suites), so a
+  new pub field would break compilation across the workspace.
+- Modify: `crates/freshell-ws/src/terminal.rs` — `handle_tabs_push`
+  (~:5090-5107) stamps `state.tabs.note_connected_push(conn_id, &client_instance_id)`
+  right after the existing non-empty validation (~:5171-5173); the WS teardown
+  block (~:579-615) calls `state.tabs.clear_connected_connection(conn_id)` at a
+  point BEFORE its first await (validated: teardown's only await is the bounded
+  ≤500ms/lease kill-confirm loop at :605; everything before :602 is sync).
 - Modify: `crates/freshell-server/src/recovery_inventory.rs` —
-  `RecoveryInventoryState` gains `pub connected: ConnectedTabClients`;
-  `inventory_handler` gates after auth; update stale doc comment (registry now
-  constructed at `main.rs:389`, not `:249`).
-- Modify: `crates/freshell-server/src/main.rs` (~:1615-1625 merge) — pass the
-  shared `ConnectedTabClients` (constructed once where the other shared state
-  is built) into both the `WsState` construction (~:1011) and
-  `RecoveryInventoryState`.
+  `RecoveryInventoryState` gains `pub tabs: freshell_ws::tabs::TabsRegistry`;
+  `inventory_handler` gates after auth (see Behavior); update stale doc comment
+  (registry constructed at `main.rs:389`, not `:249`).
+- Modify: `crates/freshell-server/src/main.rs` (~:1615-1625 merge) — pass
+  `tabs.clone()` (the existing shared registry) into `RecoveryInventoryState`.
+  No new construction site needed.
 - Modify: `crates/freshell-server/src/recovery_inventory_tests.rs` — new tests
-  (see below); existing tests construct `test_state(...)` — extend the helper
-  to accept (or default to) an empty `ConnectedTabClients` so existing tests
-  keep passing unchanged in behavior.
+  (see below); the `test_state` helper (~:372-436) is the single construction
+  site — extend it with an empty `TabsRegistry` so existing tests keep
+  identical behavior.
 - Modify: `docs/plans/2026-07-26-recover-my-panes.md` — residual text update.
 
 **Interfaces:**
-- Consumes: WS push/teardown sites, `build_inventory(unions, bindings, live)`
-  (existing, unchanged), `is_authed`.
-- Produces: `ConnectedTabClients` (public, Clone); the gated handler. No
-  response-shape change; no new query params.
+- Consumes: `state.tabs` in push/teardown sites, `build_inventory(unions,
+  bindings, live)` (existing, unchanged), `is_authed`.
+- Produces: `ConnectedTabClients` (public, Clone) and its three TabsRegistry
+  delegation methods; the gated handler. No response-shape change; no new query
+  params; no WsState surface change.
 
 **Test cases:**
-- `ConnectedTabClients`: note/remove round-trip; two connections for the same
-  client — removing one keeps the client live; removing the only connection
-  clears it; `live_client_ids` unions across connections.
+- `ConnectedTabClients` (unit, in the new module): note/remove round-trip; two
+  connections for the same client — removing one keeps the client live;
+  removing the only connection clears it; `live_client_ids` unions across
+  connections; **rotation**: the same connection first stamps `old` then `new`
+  ⇒ `live_client_ids` contains `new` and NOT `old` (the phantom-suppression
+  regression pin).
 - Route: seeded foreign union + live set `{other-client}` + requester `me` →
   200, `recoverable:false`, `device:null`, `otherDevices:[]`,
   `ledgerOnly:[]` (seed a ledgerOnly-eligible binding row too, proving rows
@@ -143,29 +180,34 @@ React 18 + TypeScript client; Vitest + RTL; cargo test; Playwright e2e
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add to `recovery_inventory_tests.rs`: the three route tests above (extend
-`test_state` helper minimally) and the `ConnectedTabClients` unit tests in the
-new module (`#[cfg(test)]` in `connected_clients.rs`, matching crate
-conventions). The route tests must fail today because the gate does not exist
-(suppressed-case test gets `recoverable:true`).
+Add to `recovery_inventory_tests.rs`: the three route tests above (extend the
+`test_state` helper with an empty `TabsRegistry`). These compile against
+today's handler and the suppressed-case test FAILS behaviorally
+(`recoverable:true` observed). The `ConnectedTabClients` unit tests land WITH
+the implementation in Step 3 (their pre-implementation "red" would be
+compile-level only, which proves nothing; the rotation unit test is an
+anti-regression pin for the HashMap-replacement contract, motivated by the
+real rotation path `tabRegistrySync.ts:412-431`).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-server recovery_inventory` and
-`cargo test -p freshell-ws connected_clients`
+Run: `cargo test -p freshell-server recovery_inventory`
 
-Expected: FAIL — the suppressed-case route test observes
-`recoverable:true` (no gate), and the unit tests fail to compile (no module);
-both failures are for the missing behavior only.
+Expected: FAIL — only the suppressed-case route test fails, observing
+`recoverable:true` plus non-empty `device`/`ledgerOnly` (the missing gate),
+not a compile/setup error; the other two new tests pass.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Create `connected_clients.rs`; add `pub mod connected_clients;` + WsState
-field; stamp in `handle_tabs_push` after the non-empty validation; clear in
-the teardown block; gate in `inventory_handler` (early return via
-`Json(build_inventory(vec![], vec![], HashSet::new()))`); wire through
-`main.rs` (one instance, cloned into `WsState` and `RecoveryInventoryState`);
-extend `RecoveryInventoryState`; fix the stale doc comment; update the
+Create `connected_clients.rs` (module + unit tests incl. rotation); add
+`pub mod connected_clients;` to `lib.rs` (no WsState change); add the
+`ConnectedTabClients` field + three delegating accessors to `TabsRegistry`;
+stamp in `handle_tabs_push` after the non-empty validation; clear in the
+teardown block before its first await; gate in `inventory_handler` (after
+auth: `let mut others = state.tabs.connected_client_ids(); others.remove(&exclude);
+if !others.is_empty() { return Json(build_inventory(vec![], vec![],
+HashSet::new())).into_response() }`); extend `RecoveryInventoryState` + pass
+`tabs.clone()` at the `main.rs` merge; fix the stale doc comment; update the
 plan-doc residual.
 
 - [ ] **Step 4: Run the focused test**
@@ -190,7 +232,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-ws/src/connected_clients.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/src/terminal.rs crates/freshell-server/src/recovery_inventory.rs crates/freshell-server/src/recovery_inventory_tests.rs crates/freshell-server/src/main.rs docs/plans/2026-07-26-recover-my-panes.md
+git add crates/freshell-ws/src/connected_clients.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/src/tabs.rs crates/freshell-ws/src/terminal.rs crates/freshell-server/src/recovery_inventory.rs crates/freshell-server/src/recovery_inventory_tests.rs crates/freshell-server/src/main.rs docs/plans/2026-07-26-recover-my-panes.md
 git commit -m "fix(server): suppress recovery inventory offers while other clients are connected"
 ```
 
@@ -273,39 +315,50 @@ git commit -m "fix(client): make recovery offer dialog fit small viewports with 
 `test/e2e-browser/specs/recover-my-panes-rust.spec.ts`, owning the same
 RustServer, appended after scenario 3):**
 
-- **Scenario 4 (R1 pin):** context A boots, creates a tab containing a
-  UNIQUE needle record (use browser-pane URL `https://example.org` — never
-  used elsewhere in this file) and waits for a snapshot generation containing
-  it (`waitForSnapshotContaining`). A STAYS OPEN. Fresh context B boots with a
-  response listener capturing the `GET /api/recovery/inventory` response:
-  assert HTTP 200 AND `recoverable === false` AND the panel never appears
-  (`toHaveCount(0)` evaluated only after the captured response resolved —
-  bounded wait, no blind retry). Then close B AND close A (the suite's
-  no-overlapping-contexts invariant: the gate suppresses offers while ANY
-  other client is connected, so both must be gone); poll the endpoint with an
-  authed probe (`page.request.get` of
-  `/api/recovery/inventory?clientInstanceId=probe-s4&bootAgoMs=0`) until
-  `recoverable === true` (30s budget — teardown may lag the close); finally
-  boot fresh context C and REQUIRE the panel (reuse
-  `openFreshContextWithOffer`), decline it, close C. This proves suppression
-  was connectedness, not data loss, and R2's re-appearance.
-- **Teardown-lag guard (applies wherever a required offer follows a context
-  close with NO server restart):** after `ctxC.close()` (end of scenario 2)
-  before scenario 3's context-D boot, and after `ctxD.close()` before context
-  E's boot, and before scenario 5's phone boot, poll the probe endpoint until
-  `recoverable === true` (30s). Reuse one file-local helper
-  (e.g. `waitForRecoverable`). Restart-based transitions (scenario 1) need no
-  guard — restart clears the set. Scenarios 1–3 keep every existing assertion
-  byte-identical; the guard additions are wait-only.
-- **Scenario 5 (R3 pin):** a populating context creates 20 tabs (the pane
-  records may be plain picker tabs — pickers are snapshotted records per
-  SESSION-05 evidence) using the UI control
+- **Scenario 4 (R1 pin):** context A boots and FIRST declines the suite-order
+  offer it receives itself (at A's boot nobody else is connected, so an offer
+  appears and its overlay would intercept the picker controls — the established
+  idiom in this suite: scenario 3's context-D decline at
+  `recover-my-panes-rust.spec.ts:395-403`; a tolerant decline helper like
+  `declineRecoveryOfferIfShowing` from the sidebar suites is fine). A then
+  creates a tab containing a UNIQUE needle record (browser-pane URL
+  `https://example.org` — never used elsewhere in this file) and waits for a
+  snapshot generation containing it (`waitForSnapshotContaining`). A STAYS OPEN
+  (connected). Fresh context B boots with a response listener capturing the
+  `GET /api/recovery/inventory` response: assert HTTP 200 AND
+  `recoverable === false` AND the panel never appears (`toHaveCount(0)`
+  evaluated only after the captured response resolved — bounded wait, no blind
+  retry). Then close B AND close A (the suite's no-overlapping-contexts
+  invariant: the gate suppresses offers while ANY other client is connected,
+  so both must be gone). Probe-poll until `recoverable === true` (30s budget —
+  teardown may lag the close) using a STANDALONE request context:
+  `const probe = await request.newContext({ baseURL: info.baseUrl, extraHTTPHeaders: { 'x-auth-token': info.token } })`
+  then loop `probe.get('/api/recovery/inventory?clientInstanceId=probe-s4&bootAgoMs=0')`,
+  `await probe.dispose()` after. Do NOT use `page.request` (bound to a closed
+  context) and do NOT navigate a probe page to Freshell (that would create a
+  tracked client and self-suppress). Finally boot fresh context C and REQUIRE
+  the panel (reuse `openFreshContextWithOffer`), decline it, close C. This
+  proves suppression was connectedness, not data loss, and R2's
+  re-appearance.
+- **Teardown-lag guard (applies at EVERY context close followed by a
+  required-offer boot with NO intervening server restart):** after
+  `ctxB.close()` (scenario 1 → 2 transition), after `ctxC.close()` (2 → 3),
+  after `ctxD.close()` (scenario 3, D → E), after scenario 4's B+A closes, and
+  after scenario 5's populating-context close: probe-poll until
+  `recoverable === true` (30s) via one file-local helper `waitForRecoverable`
+  built on the standalone request context above. Restart-based transitions
+  (scenario 1's A→restart→B) need no guard — restart clears the set.
+  Scenarios 1–3 keep every existing assertion byte-identical; the guard
+  additions are wait-only.
+- **Scenario 5 (R3 pin):** a populating context boots and FIRST declines its
+  own suite-order offer (same idiom as scenario 4's A), then creates 20 shell
+  tabs using the UI control
   `getByRole('button', { name: 'New shell tab' })` (idiom donor:
   `automation-layout-rust.spec.ts:143`; tab-count progress observable via
-  `harness.getTabCount()`), then wait for persistence with a records-count
+  `harness.getTabCount()`), then waits for persistence with a records-count
   fs-poll (newest generation for that context's client has ≥ 20 records —
   read the JSON gen files like `waitForSnapshotContaining` does). Close the
-  context. Boot a fresh context with
+  context, run the `waitForRecoverable` guard, then boot a fresh context with
   `browser.newContext({ serviceWorkers: 'block', viewport: { width: 390, height: 844 } })`:
   panel visible; dialog bounding box fits within 390x844; the `<ul>` has
   `scrollHeight > clientHeight` (internal scrolling exists — with a footer
@@ -341,21 +394,35 @@ RustServer, appended after scenario 3):**
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Write scenarios 4 and 5 in full.
+Write scenarios 4 and 5 in full, plus the file-local `waitForRecoverable`
+probe helper and the scenario-5 records-count poll. This task runs AFTER Tasks
+1 and 2 (production behavior already landed), so the red evidence is produced
+by mutation, below — not by running against absent behavior.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the test and verify the intended failure (mutation red)**
 
-Run (from the worktree):
-`npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts -g "scenario 4"`
-Expected: FAIL — scenario 4's response assertion sees `recoverable:true`
-(gate absent), proving the test observes the missing behavior. Scenario 5's
-containment assertions likewise fail on the uncapped dialog.
+Run the two new scenarios against mutated production to prove they detect the
+missing behavior (restore immediately after each observed failure; the
+mutations are never committed):
+1. Gate off: comment out the early-return block in `inventory_handler`
+   (recovery_inventory.rs), then run
+   `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts -g "scenario 4"`
+   Expected: FAIL — the response assertion sees `recoverable:true`.
+   Restore the gate.
+2. Containment off: temporarily remove `max-h-[80vh] flex flex-col` from the
+   dialog and `overflow-y-auto flex-1 min-h-0` from the `<ul>` in
+   RecoveryOfferPanel.tsx, then run
+   `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts -g "scenario 5"`
+   Expected: FAIL — the containment/scroll assertions fail.
+   Restore the classes.
+Both failures must be for the missing behavior only (assertion mismatches on
+`recoverable` / bounding boxes / scroll metrics — never harness errors).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-None — production changes landed in Tasks 1–2; if Task 3 runs first
-(task-order independent), scenarios are red until those land. Run after Tasks
-1 and 2.
+None — production changes landed in Tasks 1–2. This step is limited to
+restoring/confirming the un-mutated tree (`git status` clean of production
+changes).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -388,9 +455,11 @@ git commit -m "test(e2e): pin recovery-offer suppression while connected and pho
   (command, commit, exit code, counts) in the execution ledger:
   1. `npm run check` (typecheck + coordinated full vitest suite) — PASS
   2. `cargo test -p freshell-server -p freshell-ws` — PASS
-  3. `cargo clippy -p freshell-server -p freshell-ws -- -D warnings` — PASS
-  4. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts` — PASS (5 scenarios)
-  5. `npm run lint` (a11y gate on changed client file) — PASS
+  3. `cargo clippy --workspace --all-targets -- -D warnings` — PASS (CI shape)
+  4. `cargo fmt --all -- --check` — PASS (CI shape)
+  5. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts` — PASS (5 scenarios)
+  6. `npm run lint` (a11y gate on changed client file) — PASS
+  7. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — PASS (other recovery-offer-entangled spec)
 - [ ] Docs decisions recorded in the ledger: `docs/index.html` not updated
   (internal recovery dialog, not part of the default-experience mock — repo
   rule requires mock updates only for major user-facing changes);
