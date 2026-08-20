@@ -35,7 +35,7 @@ equivalence.
 
 **Tech Stack:** React 18 + Tailwind (dialog containment; `overflow-y-auto`,
 `max-h-[80vh]` per DeadSessionPanel precedent), TS (testids unchanged), Rust
-axum server (`GET /api/recovery-inventory` — no changes), Playwright e2e under
+axum server (`GET /api/recovery/inventory` — no changes), Playwright e2e under
 `test/e2e-browser/` (rust-chromium project, serial single worker,
 `FRESHELL_E2E_BACKEND` unset ⇒ local runs only; never cloud without asking).
 
@@ -106,7 +106,8 @@ Load-bearing evidence (validated this run, receipt at
   scenario 4 plus a teardown-lag guard (`waitForRecoverable`) at every
   close→required-offer transition without restart (after scenario 1's
   ctxB.close(), scenario 2's ctxC.close(), scenario 3's ctxD.close(), and
-  scenario 4's populating-context close).
+  scenario 4's populating-context close; context-E's close is deliberately
+  unguarded because scenario 4's populating boot uses a conditional decline).
 - Modify: NONE on the server. The untouched `data-testid` attrs keep the
   pinned contract (R2 pins).
 
@@ -139,7 +140,9 @@ Load-bearing evidence (validated this run, receipt at
   offer) must be preserved/kept true at every later transition — otherwise the
   next scenario's required-offer assertion is compromised by teardown lag.
   Mechanically the plan adds an enforced probe-poll guard
-  (`waitForRecoverable` helper polling the inventory endpoint with
+  (`waitForRecoverable` helper polling
+  `GET /api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0`
+  until `recoverable === true` with
   `x-auth-token` via a STANDALONE `request.newContext({ baseURL:
   info.baseUrl, extraHTTPHeaders: { 'x-auth-token': info.token } })` — note
   `TestServerInfo` exposes `baseUrl` (lowercase), while Playwright's option
@@ -147,9 +150,15 @@ Load-bearing evidence (validated this run, receipt at
   `page.request` on a doomed page/context (handle is invalidated by `close()`),
   NOT a navigated page (that would create a tracked tabs.sync client and
   entangle the bootstrap fetch) — disposed after success) wherever a later
-  step REQUIRES the offer to appear after a close (after scenario 1's
-  context-B close, scenario 2's context-C close, scenario 3's context-D close,
-  and scenario 4's populating-context close).
+  step REQUIRES the offer to appear after a close — in this spec that is
+  after scenario 1's context-B close (before scenario 2's offer-requiring
+  boot), after scenario 2's context-C close (before scenario 3's context-D
+  boot), after scenario 3's context-D close (before scenario 3's own
+  context-E boot), and after scenario 4's populating-context close (before
+  scenario 4's phone-viewport boot). Scenario 3's context-E close is
+  deliberately NOT guarded: scenario 4's populating context uses a conditional
+  decline (below) precisely so it is robust whether or not an offer is
+  pending.
 - **R3 (interactions completeness).** Every panel interaction (restore/decline
   buttons, focus trap, Escape dismiss, backdrop-click dismiss) keeps working on
   the phone viewport, preserving today's semantics (dismissal keeps the offer
@@ -161,7 +170,7 @@ Load-bearing evidence (validated this run, receipt at
 | # | Requirement | Invariant | Pinning tests |
 |---|-------------|-----------|---------------|
 | R1 | R1 (containment) | Dialog `max-h` + internal scroll + reachable buttons | Component structural test + e2e scenario 4 (390x844 bounding box + `scrollHeight > clientHeight` + decline actionability) |
-| R2a | R2 (restart-independence) | A probe/guard poll exists at every close→required-offer transition without restart | Recover spec scenario transitions 1→2, 2→3, within-3, and before-4 all guarded; attacker text filed below |
+| R2a | R2 (restart-independence) | A probe/guard poll exists at every close→required-offer transition without restart | Recover spec scenario transitions 1→2, 2→3, within-3 (D→E), and populating→phone all guarded (context-E close deliberately unguarded — scenario 4 uses a conditional decline); attacker text filed below |
 | R2b | R2 (unmodified spec coherence) | `RESTORE-01..04` assertions unchanged & passing on `recover-my-panes-rust.spec.ts` and the sidebar pair | The four specs keep running in the same serial order with unchanged assertions |
 | R3 | R3 (interactions) | Dismiss/Accept/Escape/backdrop/focus keep working on the phone viewport | e2e scenario 4 decline actionability + unchanged unit interaction suite (all existing tests + new structural test) |
 
@@ -198,7 +207,7 @@ blocks, and the focus trap keep their current behavior.)
 
 ### Server WS handlers + routes
 
-**Unchanged.** `POST/GET /api/recovery-inventory` response shape stays as-is;
+**Unchanged.** `GET /api/recovery/inventory` response shape stays as-is;
 `tabs.sync.push` handler untouched; no rate-limit/auth changes.
 
 ## E2E story tests (canonical user stories + request-explicit coverage)
@@ -212,13 +221,16 @@ the full dialog and the decline control is tappable`. **One serial e2e spec
 untouched and their close→required-offer transitions get the common
 `waitForRecoverable` guard.** The suite:
 
-- **Scenario 4 (R1 + R3 pins):** a populating context boots and FIRST declines
-  its own suite-order offer (same idiom as the spec's existing decline flow):
-  at this point scenarios 1–3 all left nothing connected, so the populating
-  context's boot fetches the inventory and shows the modal, which would
-  otherwise intercept the `header-action-*`/`New shell tab` clicks it needs.
-  Only after `recovery-decline` does it create 20 shell tabs using the UI
-  control `getByRole('button', { name: 'New shell tab' })` (idiom donor:
+- **Scenario 4 (R1 + R3 pins):** a populating context boots. In a full serial
+  run, scenarios 1–3 left persisted records, so this boot shows the offer
+  modal — which would intercept the header clicks it needs next — so it FIRST
+  performs a conditional decline: wait for `recovery-offer-panel` with a short
+  timeout (~3s); if visible, click `recovery-decline`; if not visible (the
+  case in isolated `-g "scenario 4"` runs against a fresh server/home where
+  nothing is persisted yet), proceed. The conditional keeps the scenario
+  correct both in the canonical full-spec run AND when filtered alone (the
+  mutation-red lane relies on this). Then it creates 20 shell tabs using the
+  UI control `getByRole('button', { name: 'New shell tab' })` (idiom donor:
   `automation-layout-rust.spec.ts:143`; tab-count progress observable via
   `harness.getTabCount()`), then waits for persistence with a records-count
   fs-poll (newest generation for that context's client has ≥ 20 records —
@@ -233,8 +245,9 @@ untouched and their close→required-offer transitions get the common
 
 ### Attacker texts filed by Completion Critic (load-bearing, DO NOT SKIP ANY)
 
-- Probe-poll guarantee for scenario 4's close→boot transition and the three
-  existing scenario transitions: 30s budget (poll 500ms) per transition —
+- Probe-poll guarantee for the four close→required-offer transitions
+  (after ctxB.close(), ctxC.close(), ctxD.close(), and scenario 4's
+  populating-context close): 30s budget (poll 500ms) per transition —
   totals ≤2min worst case; validated: 10x+ headroom versus the lived behavior
   (a few ms after teardown-completing closes). New-server (`info.token`)
   provisioning reuses `startRustServer` token; kept in `recover-offer.ts`
@@ -323,12 +336,18 @@ not by running against absent behavior.
 - [ ] **Step 2: Run the test and verify the intended failure (mutation red)**
 
 Run scenario 4 against mutated production to prove it detects the missing
-behavior (restore immediately after; the mutation is never committed):
+behavior (restore immediately after; the mutation is never committed).
+Scenario 4's conditional decline means a filtered `-g "scenario 4"` run
+against the fresh isolated server/home stays on-path (no stale offer blocks
+the population UI), so the failure lands exactly on the containment
+assertions:
 1. Containment off: temporarily remove `max-h-[80vh] flex flex-col` from the
    dialog and `overflow-y-auto flex-1 min-h-0` from the `<ul>` in
    RecoveryOfferPanel.tsx, then run
    `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts -g "scenario 4"`
-   Expected: FAIL — the containment/scroll assertions fail.
+   Expected: FAIL — inside scenario 4, the containment/scroll assertions fail
+   (bounding-box overflow / `scrollHeight > clientHeight` false), NOT at the
+   boot/decline phase.
    Restore the classes.
 The failure must be for the missing behavior only (assertion mismatches on
 bounding boxes / scroll metrics — never harness errors).
