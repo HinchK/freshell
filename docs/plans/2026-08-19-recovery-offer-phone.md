@@ -396,8 +396,14 @@ conventions.
 
 - [ ] **Step 6: Run broader verification**
 
-Run: `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts test/e2e-browser/specs/sidebar-remote-status-rings-rust.spec.ts`
-Expected: PASS (the other specs with recovery-offer entanglement).
+Run BOTH of these (the rings spec is not matched by `rust-chromium`'s
+`testMatch` — it is registered only under the `chromium` project, whose
+`e2eServerKind` fixture defaults to `legacy`; explicit CLI file filters are
+applied AFTER project `testMatch` selection, so it must be invoked via its
+configured project):
+1. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — PASS
+2. `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/sidebar-remote-status-rings-rust.spec.ts` — PASS
+(the other specs with recovery-offer entanglement).
 
 - [ ] **Step 7: Commit the task**
 
@@ -419,7 +425,8 @@ containment); class literals as specified.
   2. `npm run lint` (a11y gate on changed client file) — PASS
   3. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts` — PASS (4 scenarios)
   4. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — PASS (other recovery-offer-entangled spec)
-  5. `docs/index.html` assessment (AGENTS.md gate) — answer: not needed;
+  5. `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/sidebar-remote-status-rings-rust.spec.ts` — PASS (registered only under the `chromium` project lane)
+  6. `docs/index.html` assessment (AGENTS.md gate) — answer: not needed;
      the dialog is transparent to the mock's shape; no new copy is added.
 - [ ] FreshEyes delta review (read-only, full delta): round-of-3 via
   `.worktrees/.the-usual-logs/recovery-offer-phone/workflow/scripts/fresheyes/run-review.sh`
