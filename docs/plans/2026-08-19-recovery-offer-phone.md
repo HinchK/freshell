@@ -138,10 +138,16 @@ with a settings opt-out — recorded as a follow-up, not built here.
   files (incl. `freshell-ws/tests/common/mod.rs` and integration suites), so a
   new pub field would break compilation across the workspace.
 - Modify: `crates/freshell-ws/src/terminal.rs` — `handle_tabs_push`
-  (~:5090-5107) stamps `state.tabs.note_connected_push(conn_id, &client_instance_id)`
-  right after the existing non-empty validation (~:5171-5173); the WS teardown
-  block (~:579-615) calls `state.tabs.clear_connected_connection(conn_id)` at a
-  point BEFORE its first await (validated: teardown's only await is the bounded
+  (~:5090-5107) gains a leading `conn_id: u64` parameter supplied by its
+  dispatcher (`terminal.rs:645`, the site that owns the connection id);
+  inside, stamped as `state.tabs.note_connected_push(conn_id, &client_instance_id)`
+  AFTER `process_tabs_push` validation succeeds (SUCCESS-only stamping —
+  validation lives in `process_tabs_push`; `tabs_push_response` and
+  `process_tabs_push` signatures stay untouched, so their six unit-test call
+  sites keep compiling. Only `handle_tabs_push`'s caller set changes: the
+  dispatcher plus any direct test callers). The WS teardown block (~:579-615)
+  calls `state.tabs.clear_connected_connection(conn_id)` at a point BEFORE
+  its first await (validated: teardown's only await is the bounded
   ≤500ms/lease kill-confirm loop at :605; everything before :602 is sync).
 - Modify: `crates/freshell-server/src/recovery_inventory.rs` —
   `RecoveryInventoryState` gains `pub tabs: freshell_ws::tabs::TabsRegistry`;
@@ -180,14 +186,20 @@ with a settings opt-out — recorded as a follow-up, not built here.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add to `recovery_inventory_tests.rs`: the three route tests above (extend the
-`test_state` helper with an empty `TabsRegistry`). These compile against
-today's handler and the suppressed-case test FAILS behaviorally
-(`recoverable:true` observed). The `ConnectedTabClients` unit tests land WITH
-the implementation in Step 3 (their pre-implementation "red" would be
-compile-level only, which proves nothing; the rotation unit test is an
-anti-regression pin for the HashMap-replacement contract, motivated by the
-real rotation path `tabRegistrySync.ts:412-431`).
+1a. First, behavior-preserving plumbing (so the red in 1b is behavioral, not a
+compile failure): create `connected_clients.rs` (module + its unit tests incl.
+rotation — they pass immediately; rotation is the anti-regression pin for the
+HashMap-replacement contract, motivated by `tabRegistrySync.ts:412-431`), add
+`pub mod connected_clients;` to `lib.rs`, add the `tabs` field to
+`RecoveryInventoryState`, add the three delegating accessors to `TabsRegistry`,
+extend the `test_state` helper with an empty `TabsRegistry`, add the `conn_id`
+parameter to `handle_tabs_push` + dispatcher callsite, pass `tabs.clone()` into
+`RecoveryInventoryState` at the `main.rs` merge (~:1615-1625), and the teardown
+clear-call. Run `cargo test -p freshell-server recovery_inventory` and
+`cargo test -p freshell-ws connected_clients` — ALL pass (no behavior change).
+
+1b. Now write the three route tests above. They compile (all surfaces exist)
+and the suppressed-case test FAILS behaviorally (gate absent).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -199,15 +211,10 @@ not a compile/setup error; the other two new tests pass.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Create `connected_clients.rs` (module + unit tests incl. rotation); add
-`pub mod connected_clients;` to `lib.rs` (no WsState change); add the
-`ConnectedTabClients` field + three delegating accessors to `TabsRegistry`;
-stamp in `handle_tabs_push` after the non-empty validation; clear in the
-teardown block before its first await; gate in `inventory_handler` (after
-auth: `let mut others = state.tabs.connected_client_ids(); others.remove(&exclude);
+Add ONLY the gate in `inventory_handler` (after auth:
+`let mut others = state.tabs.connected_client_ids(); others.remove(&exclude);
 if !others.is_empty() { return Json(build_inventory(vec![], vec![],
-HashSet::new())).into_response() }`); extend `RecoveryInventoryState` + pass
-`tabs.clone()` at the `main.rs` merge; fix the stale doc comment; update the
+HashSet::new())).into_response() }`). Fix the stale doc comment; update the
 plan-doc residual.
 
 - [ ] **Step 4: Run the focused test**
@@ -265,8 +272,8 @@ git commit -m "fix(server): suppress recovery inventory offers while other clien
   carries `max-h-[80vh] flex flex-col`.
 - `recovery-decline` and `recovery-accept` are NOT descendants of the
   scrolling `<ul>` (reachable without scrolling within it).
-- Existing 10 tests in the file keep passing (scroll-lock, focus trap,
-  backdrop, Escape, accept/decline flows).
+- All existing tests in the file keep passing (scroll-lock, focus trap,
+  backdrop, Escape, accept/decline flows — do not cite a count; counts drift).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
