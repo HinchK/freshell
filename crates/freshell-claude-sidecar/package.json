@@ -9,6 +9,6 @@
     "start": "node index.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.40"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.195"
   }
 }
