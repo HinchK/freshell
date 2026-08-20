@@ -17,6 +17,20 @@
  * fresh context's offer shows the live-session note, and accepting recreates
  * the pane WITHOUT `--resume` — the running session is left untouched.
  *
+ * Scenario 4 (phone containment, R1/R3): a populating context records a
+ * 40-shell-tab layout and is lost WITHOUT a server restart; a fresh
+ * 390x844-viewport context is then offered the layout — the dialog must fit
+ * the viewport (bounding box), the records list must scroll internally
+ * (`scrollHeight > clientHeight`), and the decline control must be tappable
+ * (Playwright actionability IS the user-level phone proof). The inventory
+ * must OVERFLOW the dialog's 80vh-capped list budget (~525px at 844px tall,
+ * ~24px/record) to exercise containment at all — 20 records measure ~500px
+ * and fit under the cap, making every scroll/bounding assertion vacuous
+ * (identical metrics with and without the containment classes). Every
+ * close→required-offer transition without a restart is preceded by the
+ * file-local `waitForRecoverable` probe-poll guard (R2a) so WS-teardown lag
+ * can never starve a later boot's required offer.
+ *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
  * per-spec-ownership convention.
@@ -31,7 +45,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
-import type { BrowserContext, Page } from '@playwright/test'
+import { request, type BrowserContext, type Page } from '@playwright/test'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
 import type { TestServerInfo } from '../helpers/test-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -154,6 +168,48 @@ async function createBrowserPane(page: Page, url: string): Promise<void> {
   await iframe.waitFor({ state: 'attached', timeout: 10_000 })
 }
 
+/**
+ * Close→required-offer guard (teardown-lag pin): poll
+ * `GET /api/recovery/inventory` with a PROBE clientInstanceId until the last
+ * closed context's records resolve as recoverable, so a later boot that
+ * REQUIRES the offer can never race WS-teardown lag. Uses a STANDALONE
+ * APIRequestContext — NOT `page.request` (its handle dies with the page's
+ * browser context) and NOT a navigated page (a booted page would register as
+ * a tracked tabs.sync client and entangle the very inventory it polls); the
+ * probe is a plain auth'd GET that never opens a WS socket, so it leaves no
+ * connected-state of its own. Disposed after use.
+ */
+async function waitForRecoverable(
+  info: TestServerInfo,
+  { timeoutMs = 30_000 }: { timeoutMs?: number } = {},
+): Promise<void> {
+  const req = await request.newContext({
+    baseURL: info.baseUrl,
+    extraHTTPHeaders: { 'x-auth-token': info.token },
+  })
+  try {
+    const deadline = Date.now() + timeoutMs
+    let lastPayload: unknown
+    while (Date.now() < deadline) {
+      const res = await req
+        .get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+        .catch(() => null)
+      if (res?.ok()) {
+        const body = (await res.json().catch(() => null)) as { recoverable?: unknown } | null
+        lastPayload = body
+        if (body?.recoverable === true) return
+      }
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    throw new Error(
+      `waitForRecoverable: inventory never reported recoverable=true within ${timeoutMs}ms; `
+      + `last payload: ${JSON.stringify(lastPayload)}`,
+    )
+  } finally {
+    await req.dispose()
+  }
+}
+
 test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   // Scenarios share ONE owned server and build on each other's durable state
   // (snapshots, ledger rows, a still-running PTY) — strict ordering required.
@@ -188,6 +244,61 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await new Promise((r) => setTimeout(r, 500))
     }
     throw new Error(`No tabs-snapshot generation contained [${needles.join(', ')}] within ${timeoutMs}ms`)
+  }
+
+  /**
+   * Wait until the NEWEST persisted tabs-snapshot generation FOR THE GIVEN
+   * CLIENT carries >= minRecords records — the scenario-4 size pin. Same
+   * fs-poll idiom as waitForSnapshotContaining (snapshot pushes fire on ready
+   * + every 5s, so the registry's JSON generation files lag the UI by
+   * seconds): read every generation file, keep only the given
+   * clientInstanceId's, rank newest by (snapshotRevision, capturedAt) — the
+   * server's own per-client monotonic ordering (tabs_persist.rs
+   * `generation_rank`) — and insist the newest generation has the full tab
+   * set on disk.
+   */
+  async function waitForNewestGenerationRecordCount(
+    clientInstanceId: string,
+    minRecords: number,
+    timeoutMs = 30_000,
+  ): Promise<void> {
+    const snapshotsDir = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    const deadline = Date.now() + timeoutMs
+    let lastObserved = 0
+    while (Date.now() < deadline) {
+      const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
+      for (const device of devices) {
+        const deviceDir = path.join(snapshotsDir, device)
+        const files = (await fs.readdir(deviceDir).catch(() => [] as string[]))
+          .filter((f) => f.endsWith('.json'))
+        let newest: { revision: number; capturedAt: number; count: number } | null = null
+        for (const f of files) {
+          const raw = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
+          let doc: any = null
+          try {
+            doc = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          if (doc?.clientInstanceId !== clientInstanceId) continue
+          const revision = Number(doc?.snapshotRevision ?? 0)
+          const capturedAt = Number(doc?.capturedAt ?? 0)
+          const count = Array.isArray(doc?.records) ? doc.records.length : 0
+          if (!newest || revision > newest.revision || (revision === newest.revision && capturedAt > newest.capturedAt)) {
+            newest = { revision, capturedAt, count }
+          }
+        }
+        if (newest) {
+          lastObserved = Math.max(lastObserved, newest.count)
+          if (newest.count >= minRecords) return
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    throw new Error(
+      `No persisted generation for client ${clientInstanceId} reached ${minRecords} records `
+      + `within ${timeoutMs}ms (last observed: ${lastObserved})`,
+    )
   }
 
   test.beforeAll(async () => {
@@ -362,6 +473,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(pageB.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     await ctxB.close()
+    // Guard (R2a): scenario 2's ctxC boot REQUIRES the offer — wait until B's
+    // closed records resolve as recoverable so teardown lag cannot starve it.
+    await waitForRecoverable(info)
   })
 
   test('scenario 2: decline path — panel closes, no recovered tabs added', async ({ browser, e2eServerKind }) => {
@@ -386,6 +500,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     expect(await harnessC.getTabCount()).toBe(1)
 
     await ctxC.close()
+    // Guard (R2a): scenario 3's ctxD boot REQUIRES the offer.
+    await waitForRecoverable(info)
   })
 
   test('scenario 3: no-restart browser loss — live session recreates WITHOUT resume (D7)', async ({ browser, e2eServerKind }) => {
@@ -432,6 +548,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // ---- Lose the browser WITHOUT restarting the server: the claude PTY
     // stays Running (registry-owned, not connection-owned). ----
     await ctxD.close()
+    // Guard (R2a): context E's boot below REQUIRES the offer for D's layout.
+    await waitForRecoverable(info)
 
     // ---- Context E: the offer appears (the new session changed the
     // recoverable substance — scenario 2's dismissal cannot suppress it, and
@@ -462,6 +580,112 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       'live session must be recreated WITHOUT --resume (left untouched, D7)',
     ).toBe(false)
 
+    // Deliberately UNGUARDED close (R2a): scenario 4's populating boot never
+    // branches on offer visibility timing — it captures the boot inventory
+    // response payload and declines only when the payload says recoverable,
+    // so it is correct whether or not E's teardown has settled.
     await ctxE.close()
+  })
+
+  test('scenario 4: small-viewport boots offer the full dialog and the decline control is tappable', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    // ---- Populating context: record a 40-shell-tab layout ----
+    // 40 records overflow the dialog's 80vh-capped list budget on an 844px
+    // viewport (measured ~24px/record ⇒ ~950px of content vs a ~525px list
+    // budget); the plan's 20 records measure ~500px and fit UNDER the cap,
+    // which made scrollHeight === clientHeight with AND without the
+    // containment classes — a non-discriminating assertion.
+    // A boot offer MODALLY intercepts the "New shell tab" clicks below — the
+    // canonical full serial run has recoverable state from scenarios 1–3,
+    // while an isolated `-g "scenario 4"` run against a fresh server/home has
+    // none. Branch on the boot inventory RESPONSE PAYLOAD (captured BEFORE
+    // navigation), never on visibility timing: offer render latency of >10s
+    // has been observed, so a short visibility probe would race a delayed
+    // modal into a false "no offer" read.
+    const ctxP = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageP = await ctxP.newPage()
+    traceInventoryFailures(pageP, 'scenario4-populating')
+    const inventoryResponsePromise = pageP.waitForResponse((r) => r.url().includes('/api/recovery/inventory'))
+    const harnessP = await connect(pageP, info)
+    const inventoryBody = (await (await inventoryResponsePromise).json().catch(() => null)) as { recoverable?: unknown } | null
+    if (inventoryBody?.recoverable === true) {
+      const bootPanel = pageP.getByTestId('recovery-offer-panel')
+      await expect(bootPanel).toBeVisible({ timeout: 30_000 })
+      await pageP.getByTestId('recovery-decline').click()
+      await expect(bootPanel).toHaveCount(0)
+    }
+
+    // 40 shell tabs via the tab strip (idiom donor: automation-layout-rust.spec.ts:143
+    // — TabBar.tsx:535 `addTab({mode:'shell'})`; multirow-tabs.spec.ts's
+    // click-loop + waitForTabCount same shape).
+    const newShellTab = pageP.getByRole('button', { name: 'New shell tab' })
+    for (let i = 0; i < 40; i++) {
+      await newShellTab.click()
+    }
+    await harnessP.waitForTabCount(41, 30_000) // 1 boot tab + 40 shell tabs
+
+    // The populating client's claimed tabs-registry clientInstanceId (the
+    // TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY value,
+    // src/store/storage-keys.ts:17) selects its generations out of every
+    // device dir in the poll below.
+    const populatingClientId = await pageP.evaluate(() =>
+      window.sessionStorage.getItem('freshell.tabs.client-instance-id.v1'),
+    )
+    expect(populatingClientId, 'populating context claimed a tabs-registry clientInstanceId').toBeTruthy()
+
+    // The 40-tab layout must be IN DISK before the context dies: newest
+    // generation for this client carries >= 40 records (the boot picker tab
+    // may contribute a 41st).
+    await waitForNewestGenerationRecordCount(populatingClientId!, 40)
+
+    // ---- Lose the populating browser WITHOUT a server restart ----
+    await ctxP.close()
+    // Guard (R2a): the phone boot below REQUIRES the 40-tab offer.
+    await waitForRecoverable(info)
+
+    // ---- Phone-viewport context: the offer must contain itself + scroll ----
+    const ctxPhone = await browser.newContext({
+      serviceWorkers: 'block',
+      viewport: { width: 390, height: 844 },
+    })
+    const pagePhone = await ctxPhone.newPage()
+    traceInventoryFailures(pagePhone, 'scenario4-phone')
+    await connect(pagePhone, info)
+
+    const panel = pagePhone.getByTestId('recovery-offer-panel')
+    await expect(panel).toBeVisible({ timeout: 30_000 })
+
+    // R1 containment: the dialog's rendered box never escapes the 390x844
+    // viewport (the phone incident: the dialog filled the screen and cropped
+    // the decline button off-viewport).
+    const box = await panel.boundingBox()
+    expect(box, 'recovery dialog must have a layout box').not.toBeNull()
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.y).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(390)
+    expect(box!.y + box!.height).toBeLessThanOrEqual(844)
+
+    // R1 internal scroll: the records list is the sole scroll region
+    // (RecoveryOfferPanel's <ul>) and provably overflows its own box with a
+    // 40-record inventory.
+    const recordsList = panel.locator('ul').first()
+    const listMetrics = await recordsList.evaluate((el) => ({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }))
+    expect(
+      listMetrics.scrollHeight,
+      'records list must scroll internally with a 40-record inventory',
+    ).toBeGreaterThan(listMetrics.clientHeight)
+
+    // R1/R3 phone proof: Playwright's click does the full actionability sweep
+    // (attached, visible, stable, receives events) — "Not now" really is one
+    // tap away on the phone-sized screen.
+    await pagePhone.getByTestId('recovery-decline').click()
+    await expect(panel).toHaveCount(0)
+
+    await ctxPhone.close()
   })
 })
