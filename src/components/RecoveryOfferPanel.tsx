@@ -188,7 +188,7 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         aria-modal="true"
         aria-labelledby={HEADING_ID}
         data-testid="recovery-offer-panel"
-        className="bg-background border border-border rounded-lg shadow-lg w-full max-w-md mx-4 p-5"
+        className="bg-background border border-border rounded-lg shadow-lg w-full max-w-md mx-4 p-5 max-h-[80vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key !== 'Tab') return
@@ -217,7 +217,8 @@ export function RecoveryOfferPanel(): JSX.Element | null {
           Restore {paneCount} {paneCount === 1 ? 'pane' : 'panes'} from server memory?
         </h2>
         {device && <p className="mt-1 text-xs text-muted-foreground">{device.deviceLabel}</p>}
-        <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1">
+        {/* Sole scroll region (R1): keeps heading, notes, and buttons out of the scrollable area. */}
+        <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1 overflow-y-auto flex-1 min-h-0">
           {(device?.tabs ?? []).flatMap((tab) =>
             tab.panes.map((pane) => (
               <li key={`${tab.tabKey}:${pane.paneId}`}>

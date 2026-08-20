@@ -215,6 +215,43 @@ describe('RecoveryOfferPanel', () => {
     expect(isDismissed('cid-1')).toBe(false)
   })
 
+  // R1 (dialog containment): the dialog must be viewport-bounded with the
+  // records list as the sole scroll region, so phone-sized viewports can reach
+  // the buttons (DeadSessionPanel.tsx:55,62 is the idiom donor).
+  it('bounds the dialog to the viewport and makes the records <ul> the sole scroll region (R1: dialog containment)', async () => {
+    const pane = INVENTORY.device!.tabs[0].panes[0]
+    const multiInventory: RecoveryInventory = {
+      ...INVENTORY,
+      device: {
+        ...INVENTORY.device!,
+        tabs: [
+          {
+            tabKey: 'k',
+            tabName: 'work',
+            panes: Array.from({ length: 12 }, (_, i) => ({ ...pane, paneId: `p${i}` })),
+          },
+        ],
+      },
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(multiInventory)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+
+    const dialog = await screen.findByTestId('recovery-offer-panel')
+    expect(dialog).toHaveClass('max-h-[80vh]')
+    expect(dialog).toHaveClass('flex')
+    expect(dialog).toHaveClass('flex-col')
+
+    const ul = dialog.querySelector('ul')
+    expect(ul).not.toBeNull()
+    expect(ul).toHaveClass('overflow-y-auto')
+    expect(ul).toHaveClass('flex-1')
+    expect(ul).toHaveClass('min-h-0')
+
+    // Buttons stay outside the scroll region so they remain visible/reachable
+    expect(ul!.contains(screen.getByTestId('recovery-decline'))).toBe(false)
+    expect(ul!.contains(screen.getByTestId('recovery-accept'))).toBe(false)
+  })
+
   it('shows the live note for live panes and recreates them without sessionRef (D7)', async () => {
     const liveInventory: RecoveryInventory = {
       ...INVENTORY,
