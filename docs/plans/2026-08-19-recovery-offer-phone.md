@@ -22,7 +22,7 @@ unusable (screen-filling, unscrollable) dialog; once contained and scrollable,
 **Architecture:** One presentation-only change to the dialog (viewport cap +
 internal scroll region + buttons outside the scroll region), pinned by a
 structural unit test and validated at real browser level by a new e2e scenario
-(390x844 viewport, 20 records, decline actionability). No API/protocol/WS
+(390x844 viewport, 40 records, decline actionability). No API/protocol/WS
 changes; the fetch stays unconditional.
 
 **Verification gate (closes incident loop, validated in the load-bearing
@@ -46,7 +46,7 @@ axum server (`GET /api/recovery/inventory` — no changes), Playwright e2e under
    phone-sized screens; the records list scrolls internally; all controls
    reachable and clickable on a 390x844 viewport).
 2. Mobile-viewport e2e pinning that containment plus the phone user story
-   (Deliverable/Verification: e2e scenario with 20 records asserting bounding
+   (Deliverable/Verification: e2e scenario with 40 records asserting bounding
    box, internal scroll, and decline actionability on 390x844).
 3. Guarded e2e sequencing (Deliverable/Verification: teardown-lag guards at
    every close→required-offer transition so scenarios never coerce on stale
@@ -237,7 +237,7 @@ untouched and their close→required-offer transitions get the common
 
 - **Scenario 4 (R1 + R3 pins):** `test.setTimeout(240_000)` — the repo
   Playwright default is 60s and every existing scenario raises it to 120s or
-  240s; this scenario's own budget (decline ≤30s + 20-tab creation + ≤30s
+  240s; this scenario's own budget (decline ≤30s + 40-tab creation + ≤30s
   persistence poll + ≤30s guard + phone-boot assertions) can exceed 60s.
   A populating context boots. Offer rendering is asynchronous — the existing
   recovery helper documents observed delays exceeding 10s and therefore waits
@@ -253,12 +253,19 @@ untouched and their close→required-offer transitions get the common
   runs against a fresh server/home), skip declining and proceed — the
   mutation-red lane relies on this determinism, and it is also why
   context-E's close needs no guard: the branch is driven by the response
-  payload, never by visibility timing. Then it creates 20 shell tabs using
+  payload, never by visibility timing. Then it creates 40 shell tabs using
   the UI control `getByRole('button', { name: 'New shell tab' })` (idiom donor:
   `automation-layout-rust.spec.ts:143`; tab-count progress observable via
   `harness.getTabCount()`), then waits for persistence with a records-count
-  fs-poll (newest generation for that context's client has ≥ 20 records —
-  read the JSON gen files like `waitForSnapshotContaining` does). Close the
+  fs-poll (newest generation for that context's client has ≥ 40 records —
+  read the JSON gen files like `waitForSnapshotContaining` does).
+  (Execution-discovered, reviewer-verified deviation: the original 20 records
+  is non-discriminating at 390x844 — ~21 records render ≈500px of list content
+  while the capped dialog leaves a ≈525px list budget, so
+  `scrollHeight === clientHeight` in BOTH the un-fixed and fixed states and
+  the assertion cannot distinguish them. 40 records (~950px) reproduces the
+  overflow cleanly: mutation run failed containment with dialog top at
+  y = −141, exactly (844−1126)/2.) Close the
   context, run the `waitForRecoverable` guard, then boot a fresh context with
   `browser.newContext({ serviceWorkers: 'block', viewport: { width: 390, height: 844 } })`:
   panel visible; dialog bounding box fits within 390x844; the `<ul>` has
@@ -424,7 +431,7 @@ containment); class literals as specified.
   1. `npm run check` (typecheck + coordinated full vitest suite) — PASS
   2. `npm run lint` (a11y gate on changed client file) — PASS
   3. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts` — PASS (4 scenarios)
-  4. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — PASS (other recovery-offer-entangled spec)
+  4. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — receipt: recovery-entangled case-d PASS; cases a/b/c are blocked by a PRE-EXISTING codex managed-launch breakage (default flipped ON by `6a8733a3a`, 2026-07-30; the spec's `fake-codex-terminal.mjs` has no `app-server` support; confirmed pre-existing and disjoint from this delta by two independent reviews; recorded in out-of-scope-findings.md) — run it, record the exact outcome, and do NOT attempt to fix it here
   5. `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/sidebar-remote-status-rings-rust.spec.ts` — PASS (registered only under the `chromium` project lane)
   6. `docs/index.html` assessment (AGENTS.md gate) — answer: not needed;
      the dialog is transparent to the mock's shape; no new copy is added.
