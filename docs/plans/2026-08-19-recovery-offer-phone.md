@@ -17,7 +17,7 @@ their names or comments.
 other changes."_ The over-offer gate investigated in earlier revisions is OUT
 of scope: no server changes, no gating. The incident's annoyance was the
 unusable (screen-filling, unscrollable) dialog; once contained and scrollable,
-"Dismiss" is one tap away on any device.
+"Not now" (decline) is one tap away on any device.
 
 **Architecture:** One presentation-only change to the dialog (viewport cap +
 internal scroll region + buttons outside the scroll region), pinned by a
@@ -130,8 +130,8 @@ Load-bearing evidence (validated this run, receipt at
 ## Requirements Spec
 
 - **R1 (formerly R3 — containment).** On a phone-sized viewport the dialog fits
-  the viewport, its list scrolls internally, and every control (`Dismiss`,
-  `Add tabs…`, focus trap, Escape dismiss, backdrop-click dismiss) remains
+  the viewport, its list scrolls internally, and every control (`Not now`,
+  `Restore`, focus trap, Escape dismiss, backdrop-click dismiss) remains
   reachable and functional.
 - **R2 (regression gate + no-seam).** `RESTORE-01..05` assertions + both
   recovery-offer-entangled specs (`recover-my-panes-rust`, `sidebar-registry-sync-rust` +
@@ -173,7 +173,7 @@ Load-bearing evidence (validated this run, receipt at
 | R1 | R1 (containment) | Dialog `max-h` + internal scroll + reachable buttons | Component structural test + e2e scenario 4 (390x844 bounding box + `scrollHeight > clientHeight` + decline actionability) |
 | R2a | R2 (restart-independence) | A probe/guard poll exists at every close→required-offer transition without restart | Recover spec scenario transitions 1→2, 2→3, within-3 (D→E), and populating→phone all guarded (context-E close deliberately unguarded — scenario 4's populating boot branches on the inventory response payload with a 30s render-latency-matching panel wait, so no visibility race); attacker text filed below |
 | R2b | R2 (unmodified spec coherence) | `RESTORE-01..04` assertions unchanged & passing on `recover-my-panes-rust.spec.ts` and the sidebar pair | The four specs keep running in the same serial order with unchanged assertions |
-| R3 | R3 (interactions) | Dismiss/Accept/Escape/backdrop/focus keep working on the phone viewport | e2e scenario 4 decline actionability + unchanged unit interaction suite (all existing tests + new structural test) |
+| R3 | R3 (interactions) | Not now/Restore/Escape/backdrop/focus keep working on the phone viewport | e2e scenario 4 decline actionability + unchanged unit interaction suite (all existing tests + new structural test) |
 
 ## Design (execution checklist after this plan)
 
@@ -190,21 +190,34 @@ rescoped by user decision._
 
 ### Client UI
 
-```
+The existing markup is preserved exactly; only the two annotated class tokens
+are added (`+` marks the change):
+
+```jsx
 <div data-testid="recovery-offer-panel" role="dialog" aria-modal="true"
-     className="relative w-full max-w-md mx-4 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-5 shadow-xl max-h-[80vh] flex flex-col">
-  <h3 ...> ...
-  <p ...> ...
-  <strong[data-testid="recovery-live-note"]>
-  <ul className="mt-3 max-h-40 overflow-y-auto flex-1 min-h-0 rounded border ...">...
-  <div className="mt-5 flex justify-end gap-2">
-    <button data-testid="recovery-decline" .../>
-    <button data-testid="recovery-accept" .../>
+     aria-labelledby={HEADING_ID}
+     className="bg-background border border-border rounded-lg shadow-lg w-full max-w-md mx-4 p-5
+                + max-h-[80vh] flex flex-col">
+  <h2 id={HEADING_ID} className="text-lg font-semibold">Restore {paneCount} ...</h2>
+  {device && <p className="mt-1 text-xs text-muted-foreground">{device.deviceLabel}</p>}
+  <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1
+                 + overflow-y-auto flex-1 min-h-0">
+    {/* pane list items (per-tab panes, then ledger-only entries) */}
+  </ul>
+  {anyLive && <p data-testid="recovery-live-note" className="mt-3 text-xs text-muted-foreground">...</p>}
+  <div className="mt-4 flex justify-end gap-2">
+    <Button data-testid="recovery-decline" variant="ghost" size="sm">Not now</Button>
+    <Button data-testid="recovery-accept" variant="default" size="sm" ref={acceptRef}>Restore</Button>
+  </div>
+</div>
 ```
 
-(The boot harness and dismissal semantics are UNCHANGED: dismissal keeps the
-offer pending for a later boot. All testids, the two scroll-lock
-blocks, and the focus trap keep their current behavior.)
+(The wrapper portal/overlay, focus-trap `onKeyDown` on the dialog, scroll-lock
+effect, every existing class token, and both buttons' labels (`Not now` /
+`Restore`) stay byte-identical. The overlay already centers the dialog;
+`max-h-[80vh]` caps it at 80% of the viewport; the `<ul>` becomes the sole
+internal scroll region; the button row remains a sibling below the list, so
+both buttons are always within the dialog's bounded box.)
 
 ### Server WS handlers + routes
 
