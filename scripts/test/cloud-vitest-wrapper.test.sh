@@ -155,7 +155,10 @@ if [[ "$*" == *"executions describe"* ]]; then
   if [[ "$*" == *"succeededCount"* ]]; then
     CC=$(cat "${FAKE_GCLOUD_LOG}.desccount" 2>/dev/null || echo 0); CC=$((CC+1)); echo "$CC" > "${FAKE_GCLOUD_LOG}.desccount"
     if [ "$CC" -le 2 ]; then exit 1; fi
-    echo "1"   # one succeeded shard
+    # Report every requested shard as succeeded (the wrapper must require
+    # succeeded == shards, so the stub must satisfy that to stay green).
+    N=$(grep -oP -- '--tasks=\K[0-9]+' "$FAKE_GCLOUD_LOG" | tail -1)
+    echo "${N:-4}"
   else
     echo "0"   # zero failed shards
   fi
@@ -171,6 +174,178 @@ rm -f "${FAKE_GCLOUD_LOG}.desccount"
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 check "transient describe failures retried (2 failures, then success)" bash -c "bash '$SCRIPT' run --cloud --config=default >/dev/null 2>&1"
 check "describe was retried (>=3 describe calls logged)" bash -c "[ \$(grep -c 'executions describe' '$FAKE_GCLOUD_LOG') -ge 3 ]"
+
+# Check 11: each cloud run uses its OWN unique Cloud Run job. A shared job is
+# a concurrency hole: `gcloud run jobs execute` snapshots the job's CURRENT
+# template, so a concurrent run's job update can swap the image of an
+# in-flight run, and a later run's own settings race on the same resource.
+# The run must create one job named <prefix>-<imagerag>-<random>, execute it,
+# and delete it on every exit path.
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE3'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"succeededCount"* ]]; then
+    N=$(grep -oP -- '--tasks=\K[0-9]+' "$FAKE_GCLOUD_LOG" | tail -1)
+    echo "${N:-4}"
+  else
+    echo "0"
+  fi
+  exit 0
+fi
+if [[ "$*" == *"executions list"* ]]; then echo "test-execution-1"; exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution [test-execution-1] has successfully completed."; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE3
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+UNIQ_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default 2>&1) || {
+  echo "FAIL: unique-job cloud run errored"
+  echo "$UNIQ_OUTPUT" | tail -5
+  FAILURES=$((FAILURES + 1))
+  UNIQ_OUTPUT=""
+}
+JOB1=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$UNIQ_OUTPUT" | head -1 || true)
+check "run header reports its unique Job name" bash -c "[ -n '${JOB1:-}' ]"
+if [ -n "${JOB1:-}" ]; then
+  check "job name is unique per run (prefix-imagetag-random)" \
+    grep -qP '^freshell-vitest-[a-z0-9]{12}(-dirty)?-[a-z0-9]{6}$' <<< "$JOB1"
+  check "create/execute/delete all target the run's own job" bash -c "
+    grep -q 'run jobs create .* ${JOB1} ' '$FAKE_GCLOUD_LOG' &&
+    grep -q 'run jobs execute .* ${JOB1} --tasks=' '$FAKE_GCLOUD_LOG' &&
+    grep -q 'run jobs delete .* ${JOB1} --quiet' '$FAKE_GCLOUD_LOG'"
+  check "no job update happens (the job is single-owner)" \
+    bash -c "! grep -q 'run jobs update' '$FAKE_GCLOUD_LOG'"
+  rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+  UNIQ2_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default 2>&1 || true)
+  JOB2=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$UNIQ2_OUTPUT" | head -1 || true)
+  check "a second run gets a different job name" \
+    bash -c "[ -n '${JOB2:-}' ] && [ '${JOB1}' != '${JOB2:-}' ]"
+fi
+
+# Check 12: `gcloud run jobs execute` failing (quota, permissions, ...) must
+# fail the run — and the run-owned job must STILL be deleted.
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE4'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then echo "0"; exit 0; fi
+if [[ "$*" == *"executions list"* ]]; then exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "ERROR: (gcloud.run.jobs.execute) quota exceeded"; exit 7; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE4
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+EXECFAIL_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default 2>&1) && EXECFAIL_RC=0 || EXECFAIL_RC=$?
+check "execute failure exits nonzero" bash -c "[ $EXECFAIL_RC -ne 0 ]"
+if grep -q 'All tasks completed successfully' <<< "$EXECFAIL_OUTPUT"; then
+  echo "FAIL: execute failure prints no success footer"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: execute failure prints no success footer"
+fi
+EXECFAIL_JOB=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$EXECFAIL_OUTPUT" | head -1 || true)
+check "failed run still deletes its own job" bash -c \
+  "[ -n '${EXECFAIL_JOB:-}' ] && grep -q 'run jobs delete .* ${EXECFAIL_JOB} --quiet' '$FAKE_GCLOUD_LOG'"
+
+# Check 13: "zero failed tasks" is not success — the number of succeeded
+# tasks must equal the requested shard count, else the run fails closed
+# (a cancelled/preempted task has succeeded=0, failed=0, and zero tests ran).
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE5'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"succeededCount"* ]]; then echo "1"; else echo "0"; fi
+  exit 0
+fi
+if [[ "$*" == *"executions list"* ]]; then echo "test-execution-1"; exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution [test-execution-1] has successfully completed."; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE5
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+SHORT_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default --shards=4 2>&1) && SHORT_RC=0 || SHORT_RC=$?
+check "succeeded < shards exits nonzero (1 of 4)" bash -c "[ $SHORT_RC -ne 0 ]"
+if grep -q 'All tasks completed successfully' <<< "$SHORT_OUTPUT"; then
+  echo "FAIL: succeeded < shards prints no success footer"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: succeeded < shards prints no success footer"
+fi
+
+# Check 14: when the execution id can't be parsed from execute output, the
+# fallback listing MUST be scoped to this run's own job (--job=<unique>) —
+# never the shared job, where it could return another run's execution.
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE6'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"succeededCount"* ]]; then
+    N=$(grep -oP -- '--tasks=\K[0-9]+' "$FAKE_GCLOUD_LOG" | tail -1)
+    echo "${N:-4}"
+  else
+    echo "0"
+  fi
+  exit 0
+fi
+if [[ "$*" == *"executions list"* ]]; then echo "fallback-exec-9"; exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Creating execution..."; echo "OK."; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE6
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+FALLBACK_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default 2>&1 || true)
+FALLBACK_JOB=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$FALLBACK_OUTPUT" | head -1 || true)
+check "id-parse fallback lists executions of THIS run's job only" bash -c \
+  "[ -n '${FALLBACK_JOB:-}' ] && grep 'executions list' '$FAKE_GCLOUD_LOG' | grep -q -- '--job=${FALLBACK_JOB}'"
+
+# Check 15: Ctrl-C (SIGINT to the process group) mid-execution still deletes
+# the run's own job via the exit trap.
+cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE7'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
+if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then echo "0"; exit 0; fi
+if [[ "$*" == *"executions list"* ]]; then exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then sleep 60; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+FAKE7
+chmod +x "$FAKE_GCLOUD_DIR/gcloud"
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+setsid bash "$SCRIPT" run --cloud --config=default >/dev/null 2>&1 &
+INT_PID=$!
+for _ in $(seq 1 100); do
+  grep -q 'run jobs execute' "$FAKE_GCLOUD_LOG" 2>/dev/null && break
+  sleep 0.1
+done
+kill -INT -- -"$INT_PID" 2>/dev/null || kill -INT "$INT_PID" 2>/dev/null || true
+wait "$INT_PID" 2>/dev/null || true
+check "SIGINT mid-run still deletes the run's own job" \
+  grep -q 'run jobs delete' "$FAKE_GCLOUD_LOG"
 
 # Cleanup
 rm -rf "$FAKE_GCLOUD_DIR"
