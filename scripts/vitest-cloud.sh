@@ -92,6 +92,20 @@ gcloud_flags() {
   echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
 }
 
+# Unique per-run job. `gcloud run jobs execute` snapshots the job's CURRENT
+# template, so sharing one job across runs lets a concurrent run's job update
+# swap the image of an in-flight run, and forces "find my execution" to fall
+# back to "the latest execution of the shared job" — which may be another
+# run's results. Every run therefore creates its own job
+# (<prefix>-<imagetag>-<random6>), executes it, and deletes it on every exit
+# path (success, failure, SIGINT/SIGTERM). FRESHELL_GCP_VITEST_JOB is the
+# prefix.
+unique_job_name() {
+  local rand
+  rand=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)
+  printf '%s-%s-%s' "$GCP_JOB" "$(image_tag_for_head)" "$rand"
+}
+
 # gcloud artifacts commands use --location, not --region
 gcloud_artifacts_flags() {
   echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
@@ -122,6 +136,14 @@ Flags:
 
 Environment:
   FRESHELL_VITEST_BACKEND  "local" (default) or "cloud"
+  FRESHELL_GCP_VITEST_JOB  Cloud Run job-name prefix (default: freshell-vitest)
+
+Cloud job lifecycle: each cloud run creates its OWN unique job
+(<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it
+afterwards — never a shared job — so concurrent runs cannot overwrite each
+other's image or read each other's results. The 'logs' subcommand reads the
+legacy shared job only; per-run logs are printed in full during the run and
+remain in Cloud Logging afterwards.
 
 Examples:
   scripts/vitest-cloud.sh run --local test/unit/lib/pane-utils.test.ts
@@ -371,31 +393,41 @@ cmd_run() {
     vitest_args_json=$(printf '%s\n' "${vt_args[@]}" | jq -R . | jq -sc .)
   fi
 
-  # Ensure the job exists with the correct image (create fails if it already
-  # exists, fall back to update image only — NOT tasks/timeout/env, which are
-  # per-execution overrides passed to `execute` below to avoid racing with
-  # concurrent agents on the shared job).
-  gcloud run jobs create $(gcloud_flags) "$GCP_JOB" \
-    --image="$IMAGE_REMOTE" \
-    --max-retries=0 \
-    --memory=4Gi \
-    --cpu=4 \
-    2>/dev/null || \
-  gcloud run jobs update $(gcloud_flags) "$GCP_JOB" \
+  # Create THIS run's own unique job (see unique_job_name). Create-only: a
+  # name collision would mean the job is not unique to this run, so fail
+  # rather than fall back to mutating a shared job. Per-run overrides
+  # (tasks/timeout/env) are passed to `execute` below; the job only carries
+  # the image. Delete the job on EVERY exit path: success, failure,
+  # Ctrl-C/TERM.
+  RUN_JOB_NAME="$(unique_job_name)"
+  if ! [[ "$RUN_JOB_NAME" =~ ^[a-z][a-z0-9-]{0,48}$ ]]; then
+    echo "[vitest-cloud] ERROR: invalid job name '$RUN_JOB_NAME' (check FRESHELL_GCP_VITEST_JOB prefix)" >&2
+    exit 1
+  fi
+  echo "[vitest-cloud]   Job:     $RUN_JOB_NAME"
+  cleanup_run_job() {
+    if [ -n "${RUN_JOB_NAME:-}" ]; then
+      gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup_run_job EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  gcloud run jobs create $(gcloud_flags) "$RUN_JOB_NAME" \
     --image="$IMAGE_REMOTE" \
     --max-retries=0 \
     --memory=4Gi \
     --cpu=4
 
-  # Execute the job with per-execution overrides (tasks, timeout, env-vars).
-  # This avoids mutating the shared job with per-run state, preventing races
-  # with concurrent agents. Capture the execution ID from the output.
+  # Execute the job with per-execution overrides (tasks, timeout, env-vars),
+  # and capture the execution ID from the output.
   echo "[vitest-cloud] Executing Cloud Run Job..."
   local execute_output
   local execute_exit=0
   # Use ^@^ delimiter for --update-env-vars to handle commas in JSON arrays.
   local env_overrides="^@^TEST_MODE=vitest@VITEST_CONFIGS=${configs}@VITEST_ARGS_JSON=${vitest_args_json}"
-  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" \
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" \
     --tasks="$shards" \
     --task-timeout="$timeout" \
     --update-env-vars="$env_overrides" \
@@ -414,20 +446,24 @@ cmd_run() {
     | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
     | head -1 || true)
   if [ -z "$execution_id" ]; then
-    echo "[vitest-cloud] WARNING: could not capture execution ID, falling back to latest"
+    # Fallback: list executions of THIS run's own job only — attribution-safe
+    # because no other run ever creates executions under it.
+    echo "[vitest-cloud] WARNING: could not capture execution ID, falling back to listing this run's job"
     execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
-      --job="$GCP_JOB" \
+      --job="$RUN_JOB_NAME" \
       --sort-by="~metadata.creationTimestamp" \
       --format="value(name)" \
-      --limit=1)
+      --limit=1 || true)
   fi
 
   # If execute itself failed, report and exit — don't mask with status queries.
   if [ "$execute_exit" -ne 0 ]; then
     echo "[vitest-cloud] Cloud Run Job execution failed (exit code $execute_exit)."
-    # Still fetch logs for debugging
-    echo "[vitest-cloud] Fetching logs..."
-    gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
+    # Still fetch logs for debugging when an execution was created at all.
+    if [ -n "${execution_id:-}" ]; then
+      echo "[vitest-cloud] Fetching logs..."
+      gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
+    fi
     exit 1
   fi
 
@@ -486,6 +522,14 @@ cmd_run() {
     exit 1
   fi
 
+  # Zero failures is not success: require every requested task to have
+  # succeeded (a cancelled/preempted task yields succeeded=0, failed=0 — and
+  # ran zero tests).
+  if [ "$succeeded" != "$shards" ]; then
+    echo "[vitest-cloud] ERROR: expected $shards succeeded task(s), got $succeeded."
+    exit 1
+  fi
+
   echo "[vitest-cloud] All tasks completed successfully."
 }
 
@@ -493,6 +537,10 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
+  # NOTE: cloud runs now use unique per-run jobs that are deleted when the
+  # run ends — this legacy lookup only helps for executions of the old shared
+  # job. Per-run logs are printed in full during the run and remain queryable
+  # in Cloud Logging by job/execution name afterwards.
   local execution_id
   execution_id=$(gcloud run jobs executions list $(gcloud_flags) --job="$GCP_JOB" --sort-by="~metadata.creationTimestamp" --format="value(name)" --limit=1)
   if [ -z "$execution_id" ]; then

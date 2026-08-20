@@ -46,7 +46,15 @@ if [[ "$*" == *"run jobs execute"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"executions describe"* ]]; then
-  if [[ "$*" == *"succeededCount"* ]]; then echo "1"; else echo "0"; fi
+  if [[ "$*" == *"succeededCount"* ]]; then
+    # Report every requested shard as succeeded (vitest passes per-execution
+    # --tasks=N; e2e creates the job with --tasks=N). The wrappers require
+    # succeeded == shards, so the stub must satisfy that to stay green.
+    N=$(grep -oP -- '--tasks=\K[0-9]+' "$FAKE_LOG" | tail -1)
+    echo "${N:-1}"
+  else
+    echo "0"
+  fi
   exit 0
 fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi

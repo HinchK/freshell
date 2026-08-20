@@ -95,6 +95,19 @@ gcloud_flags() {
   echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
 }
 
+# Unique per-run job. `gcloud run jobs execute` snapshots the job's CURRENT
+# template, so sharing one job across runs lets a concurrent run's job update
+# swap the image/config of an in-flight run, and forces "find my execution"
+# to fall back to "the latest execution of the shared job" — which may be
+# another run's results. Every run therefore creates its own job
+# (<prefix>-<imagetag>-<random6>), executes it, and deletes it on every exit
+# path (success, failure, SIGINT/SIGTERM). FRESHELL_GCP_JOB is the prefix.
+unique_job_name() {
+  local rand
+  rand=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)
+  printf '%s-%s-%s' "$GCP_JOB" "$(image_tag_for_head)" "$rand"
+}
+
 # gcloud artifacts commands use --location, not --region
 gcloud_artifacts_flags() {
   echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
@@ -126,6 +139,14 @@ Flags:
 
 Environment:
   FRESHELL_E2E_BACKEND  "local" (default) or "cloud"
+  FRESHELL_GCP_JOB      Cloud Run job-name prefix (default: freshell-e2e)
+
+Cloud job lifecycle: each cloud run creates its OWN unique job
+(<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it
+afterwards — never a shared job — so concurrent runs cannot overwrite each
+other's image/config or read each other's results. The 'logs' subcommand
+reads the legacy shared job only; per-run logs are printed in full during
+the run and remain in Cloud Logging afterwards.
 
 Examples:
   scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/auth.spec.ts
@@ -385,7 +406,7 @@ cmd_run() {
   echo "[e2e-cloud]   Timeout: $timeout"
   echo "[e2e-cloud]   Args:    ${pw_args[*]}"
 
-  # Build a YAML env-vars file for the Cloud Run Job.
+  # Build a YAML env-vars file for this run's Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
   # --set-env-vars splits on spaces, breaking PLAYWRIGHT_ARGS.
   # PLAYWRIGHT_ARGS is NEWLINE-delimited (one arg per line, YAML literal
@@ -394,65 +415,88 @@ cmd_run() {
   # re-split on spaces by the entrypoint and quotes could corrupt the YAML.
   # Note: CLOUD_RUN_TASK_COUNT and CLOUD_RUN_TASK_INDEX are reserved env vars
   # set automatically by Cloud Run when --tasks > 1 — do NOT set them here.
-  local env_file
-  env_file=$(mktemp /tmp/e2e-env-vars.XXXXXX.yaml)
+  RUN_ENV_FILE=$(mktemp /tmp/e2e-env-vars.XXXXXX.yaml)
   if [ "${#pw_args[@]}" -gt 0 ]; then
     {
       echo "PLAYWRIGHT_ARGS: |-"
       printf '  %s\n' "${pw_args[@]}"
-    } > "$env_file"
+    } > "$RUN_ENV_FILE"
   else
-    echo 'PLAYWRIGHT_ARGS: ""' > "$env_file"
+    echo 'PLAYWRIGHT_ARGS: ""' > "$RUN_ENV_FILE"
   fi
 
-  # Create or update the Cloud Run Job (create fails if it already exists,
-  # fall back to update).
-  gcloud run jobs create $(gcloud_flags) "$GCP_JOB" \
+  # Create THIS run's own unique job (see unique_job_name). Create-only: a
+  # name collision would mean the job is not unique to this run, so fail
+  # rather than fall back to mutating a shared job. The job carries all
+  # per-run state (image, tasks, timeout, arg env file) — safe to store on
+  # the job precisely because no other run ever touches it. Delete the job
+  # (and temp env file) on EVERY exit path: success, failure, Ctrl-C/TERM.
+  RUN_JOB_NAME="$(unique_job_name)"
+  if ! [[ "$RUN_JOB_NAME" =~ ^[a-z][a-z0-9-]{0,48}$ ]]; then
+    echo "[e2e-cloud] ERROR: invalid job name '$RUN_JOB_NAME' (check FRESHELL_GCP_JOB prefix)" >&2
+    rm -f "$RUN_ENV_FILE"
+    exit 1
+  fi
+  echo "[e2e-cloud]   Job:     $RUN_JOB_NAME"
+  cleanup_run_job() {
+    if [ -n "${RUN_JOB_NAME:-}" ]; then
+      gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+    fi
+    if [ -n "${RUN_ENV_FILE:-}" ]; then
+      rm -f "$RUN_ENV_FILE"
+    fi
+  }
+  trap cleanup_run_job EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  gcloud run jobs create $(gcloud_flags) "$RUN_JOB_NAME" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
     --task-timeout="$timeout" \
     --max-retries=0 \
-    --env-vars-file="$env_file" \
-    --memory=2Gi \
-    --cpu=2 \
-    2>/dev/null || \
-  gcloud run jobs update $(gcloud_flags) "$GCP_JOB" \
-    --image="$IMAGE_REMOTE" \
-    --tasks="$shards" \
-    --task-timeout="$timeout" \
-    --max-retries=0 \
-    --env-vars-file="$env_file" \
+    --env-vars-file="$RUN_ENV_FILE" \
     --memory=2Gi \
     --cpu=2
 
-  rm -f "$env_file"
-
-  # Execute the job and wait for completion.
-  # Capture the execution ID from the execute output to avoid a race with
-  # concurrent agents updating/executing the same shared job.
+  # Execute this run's job and wait for completion, capturing the exit
+  # status: an execute failure (quota, permissions, template error) MAY NOT
+  # masquerade as a test outcome.
   echo "[e2e-cloud] Executing Cloud Run Job..."
   local execute_output
-  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait 2>&1) || true
+  local execute_exit=0
+  local execution_id=""
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" --wait 2>&1) || execute_exit=$?
   echo "$execute_output"
 
   # Extract the execution ID from the execute output. gcloud prints
   # `Execution [NAME] has successfully completed.` — brackets are literal and,
   # on color-capable captures, the name is wrapped in ANSI SGR codes — so strip
-  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captured the
-  # bracket+escapes; downstream describe/logs then addressed a nonexistent
+  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captured
+  # the bracket+escapes; downstream describe/logs then addressed a nonexistent
   # execution and the `|| echo 0` masking below reported succeeded=0 forever.)
   execution_id=$(echo "$execute_output" \
     | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
     | head -1 || true)
   if [ -z "$execution_id" ]; then
-    # Fallback: query the latest execution (may race with concurrent agents)
-    echo "[e2e-cloud] WARNING: could not capture execution ID, falling back to latest"
+    # Fallback: list executions of THIS run's own job only — attribution-safe
+    # because no other run ever creates executions under it.
+    echo "[e2e-cloud] WARNING: could not capture execution ID, falling back to listing this run's job"
     execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
-      --job="$GCP_JOB" \
+      --job="$RUN_JOB_NAME" \
       --sort-by="~metadata.creationTimestamp" \
       --format="value(name)" \
-      --limit=1)
+      --limit=1 || true)
+  fi
+
+  if [ "$execute_exit" -ne 0 ]; then
+    echo "[e2e-cloud] Cloud Run Job execution failed (exit code $execute_exit)."
+    if [ -n "$execution_id" ]; then
+      echo "[e2e-cloud] Fetching logs..."
+      gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
+    fi
+    exit 1
   fi
 
   # Fetch logs (requires beta track for logs read).
@@ -473,17 +517,31 @@ cmd_run() {
   echo "[e2e-cloud] Per-shard summary:"
   echo "$log_output" | grep -E '(\[e2e-entrypoint\] Shard [0-9]+/[0-9]+ assignment|^\s+[0-9]+ (passed|failed))' || true
 
-  # Check execution status
+  # Check execution status — transient describe errors right after
+  # `execute --wait` are a real flake class, so retry briefly; a PERMANENT
+  # query failure must fail the run, never read as succeeded=0/failed=0.
+  query_count() {
+    local field="$1" val attempt
+    for attempt in 1 2 3 4 5; do
+      if val=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+        --format="value($field)" 2>/dev/null); then
+        echo "${val:-0}"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
   local succeeded
   local failed
-  succeeded=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.succeededCount)" 2>/dev/null || echo "0")
-  failed=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.failedCount)" 2>/dev/null || echo "0")
-
-  # Normalize empty/null to 0
-  succeeded="${succeeded:-0}"
-  failed="${failed:-0}"
+  if ! succeeded=$(query_count status.succeededCount); then
+    echo "[e2e-cloud] ERROR: failed to query execution status"
+    exit 1
+  fi
+  if ! failed=$(query_count status.failedCount); then
+    echo "[e2e-cloud] ERROR: failed to query execution status"
+    exit 1
+  fi
 
   echo ""
   echo "[e2e-cloud] Succeeded tasks: $succeeded"
@@ -494,6 +552,14 @@ cmd_run() {
     exit 1
   fi
 
+  # Zero failures is not success: require every requested task to have
+  # succeeded (a cancelled/preempted task yields succeeded=0, failed=0 — and
+  # ran zero tests).
+  if [ "$succeeded" != "$shards" ]; then
+    echo "[e2e-cloud] ERROR: expected $shards succeeded task(s), got $succeeded."
+    exit 1
+  fi
+
   echo "[e2e-cloud] All tasks completed successfully."
 }
 
@@ -501,8 +567,11 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
-  # `logs read` takes an EXECUTION name, not the job name — resolve the
-  # latest execution exactly like cmd_run does before fetching its logs.
+  # `logs read` takes an EXECUTION name, not the job name. NOTE: cloud runs
+  # now use unique per-run jobs that are deleted when the run ends — this
+  # legacy lookup only helps for executions of the old shared job. Per-run
+  # logs are printed in full during the run and remain queryable in Cloud
+  # Logging by job/execution name afterwards.
   local execution_id
   execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
     --job="$GCP_JOB" \

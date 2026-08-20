@@ -337,5 +337,182 @@ if ! echo "$SPLIT_OUTPUT" | grep -q "3 passed"; then
 fi
 echo "PASS: split-form value flags are normalized before dispatch"
 
+# ---------------------------------------------------------------------------
+# Check 15: per-run unique job lifecycle + result hardening (stubbed gcloud).
+#
+# The run must:
+#  (a) create its OWN unique job (<prefix>-<imagetag>-<random>), execute it,
+#      and delete it on every exit path — a shared job lets a concurrent run
+#      overwrite the image/config of an in-flight run (execute snapshots the
+#      job's CURRENT template) and forces the cross-run "latest execution"
+#      fallback;
+#  (b) fail nonzero when `gcloud run jobs execute` itself fails — never print
+#      the success footer;
+#  (c) propagate permanent status-query errors (transient ones retry);
+#  (d) require succeeded tasks == requested shards, not merely failed == 0;
+#  (e) scope any execution-id fallback listing to the run's own job;
+#  (f) still delete the run's job on SIGINT mid-execution.
+# ---------------------------------------------------------------------------
+STUB2_DIR="$(mktemp -d /tmp/e2e-cloud-stub2.XXXXXX)"
+export STUB2_CAPTURE="$STUB2_DIR/capture"
+mkdir -p "$STUB2_CAPTURE"
+cat > "$STUB2_DIR/gcloud" <<'STUB2'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB2_CAPTURE/gcloud.args"
+case "$*" in
+  "info "*) echo "/nonexistent-sdk-root"; exit 0 ;;
+  *"artifacts repositories describe"*) exit 0 ;;
+  *"artifacts repositories create"*) exit 0 ;;
+  *"artifacts docker images describe"*) exit 0 ;;
+  *"auth print-access-token"*) echo stub-token; exit 0 ;;
+  *"builds submit"*) exit 0 ;;
+  *"run jobs create"*) exit 0 ;;
+  *"run jobs delete"*) exit 0 ;;
+  *"run jobs execute"*)
+    if [ -n "${STUB2_EXECUTE_SLEEP:-}" ]; then sleep "$STUB2_EXECUTE_SLEEP"; exit 0; fi
+    if [ -n "${STUB2_EXECUTE_RC:-}" ]; then echo "ERROR: STUB2_EXECUTE_RC=$STUB2_EXECUTE_RC"; exit "$STUB2_EXECUTE_RC"; fi
+    if [ -n "${STUB2_EXECUTE_NOEXECLINE:-}" ]; then echo "Creating execution..."; echo "OK."; exit 0; fi
+    echo "Execution [exec-stub-7] has successfully completed."
+    exit 0 ;;
+  *"executions list"*) echo "exec-stub-7"; exit 0 ;;
+  *"executions describe"*)
+    if [ -n "${STUB2_DESCRIBE_FAIL:-}" ]; then
+      DCOUNT_FILE="$STUB2_CAPTURE/desc.count"
+      C=$(cat "$DCOUNT_FILE" 2>/dev/null || echo 0); C=$((C+1)); echo "$C" > "$DCOUNT_FILE"
+      if [ "$STUB2_DESCRIBE_FAIL" = "always" ] || [ "$C" -le "$STUB2_DESCRIBE_FAIL" ]; then exit 1; fi
+    fi
+    case "$*" in
+      *failedCount*) echo "${STUB2_FAILED:-0}" ;;
+      *succeededCount*) echo "${STUB2_SUCCEEDED:-1}" ;;
+      *) echo "1" ;;
+    esac
+    exit 0 ;;
+  *"logs read"*) echo "  6 passed (4.2s)"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB2
+cat > "$STUB2_DIR/docker" <<'STUB2D'
+#!/usr/bin/env bash
+if [ ! -t 0 ]; then cat >/dev/null 2>&1 || true; fi
+exit 0
+STUB2D
+chmod +x "$STUB2_DIR/gcloud" "$STUB2_DIR/docker"
+
+stub2_reset() {
+  rm -f "$STUB2_CAPTURE/gcloud.args" "$STUB2_CAPTURE/desc.count"
+  touch "$STUB2_CAPTURE/gcloud.args"
+}
+
+# (a) unique job lifecycle on the happy path
+echo "Testing: cloud run creates/executes/deletes its own unique job"
+stub2_reset
+UNIQ_OUT=$(env PATH="$STUB2_DIR:$PATH" STUB2_SUCCEEDED=2 "$SCRIPT" run --cloud --shards=2 2>&1) || {
+  echo "FAIL: unique-job cloud run errored"; echo "$UNIQ_OUT" | tail -10; rm -rf "$STUB2_DIR"; exit 1
+}
+E2E_JOB1=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$UNIQ_OUT" | head -1 || true)
+if [ -z "$E2E_JOB1" ]; then
+  echo "FAIL: run header does not report a Job name"; echo "$UNIQ_OUT" | tail -10; rm -rf "$STUB2_DIR"; exit 1
+fi
+if ! grep -qP '^freshell-e2e-[a-z0-9]{12}(-dirty)?-[a-z0-9]{6}$' <<< "$E2E_JOB1"; then
+  echo "FAIL: job name '$E2E_JOB1' is not unique per run"; rm -rf "$STUB2_DIR"; exit 1
+fi
+for verb in create execute; do
+  if ! grep "run jobs $verb" "$STUB2_CAPTURE/gcloud.args" | grep -q -- "$E2E_JOB1"; then
+    echo "FAIL: 'run jobs $verb' did not target the run's own job ($E2E_JOB1)"
+    cat "$STUB2_CAPTURE/gcloud.args"; rm -rf "$STUB2_DIR"; exit 1
+  fi
+done
+if ! grep "run jobs delete" "$STUB2_CAPTURE/gcloud.args" | grep -q -- "$E2E_JOB1 --quiet\|--quiet .*$E2E_JOB1\|$E2E_JOB1$"; then
+  echo "FAIL: run did not delete its own job"; cat "$STUB2_CAPTURE/gcloud.args"; rm -rf "$STUB2_DIR"; exit 1
+fi
+if grep -q "run jobs update" "$STUB2_CAPTURE/gcloud.args"; then
+  echo "FAIL: run still mutates a job with 'run jobs update' (shared-job hazard)"
+  rm -rf "$STUB2_DIR"; exit 1
+fi
+# The unique job carries its own config, so per-run state (--tasks, the
+# PLAYWRIGHT_ARGS env file) lives on the created job — verify it is passed.
+if ! grep "run jobs create" "$STUB2_CAPTURE/gcloud.args" | grep -q -- "--tasks=2"; then
+  echo "FAIL: --tasks not applied for this run"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: unique job created/executed/deleted with its own config"
+
+# a second run must get a different job
+stub2_reset
+UNIQ2_OUT=$(env PATH="$STUB2_DIR:$PATH" "$SCRIPT" run --cloud --shards=1 2>&1 || true)
+E2E_JOB2=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$UNIQ2_OUT" | head -1 || true)
+if [ -z "$E2E_JOB2" ] || [ "$E2E_JOB1" = "$E2E_JOB2" ]; then
+  echo "FAIL: two runs share a job name ('$E2E_JOB1' vs '$E2E_JOB2')"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: second run gets a different job name"
+
+# (b) execute failure fails the run (and still deletes the job)
+echo "Testing: execute failure fails the run, no success footer, job deleted"
+stub2_reset
+EXECFAIL_OUT=$(env PATH="$STUB2_DIR:$PATH" STUB2_EXECUTE_RC=7 "$SCRIPT" run --cloud --shards=1 2>&1) && EXECFAIL_RC=0 || EXECFAIL_RC=$?
+if [ "$EXECFAIL_RC" -eq 0 ]; then
+  echo "FAIL: wrapper reported success when execute exited 7"; rm -rf "$STUB2_DIR"; exit 1
+fi
+if grep -q "All tasks completed successfully" <<< "$EXECFAIL_OUT"; then
+  echo "FAIL: success footer printed despite execute failure"; rm -rf "$STUB2_DIR"; exit 1
+fi
+if ! grep -q "run jobs delete" "$STUB2_CAPTURE/gcloud.args"; then
+  echo "FAIL: run-owned job not deleted after execute failure"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: execute failure fails the run and still deletes the job"
+
+# (c) status queries: transient errors retry; permanent errors fail the run
+echo "Testing: transient describe errors retry, permanent ones fail"
+stub2_reset
+env PATH="$STUB2_DIR:$PATH" STUB2_DESCRIBE_FAIL=2 "$SCRIPT" run --cloud --shards=1 >/dev/null 2>&1 || {
+  echo "FAIL: transient describe errors (2x) were not retried to success"; rm -rf "$STUB2_DIR"; exit 1
+}
+stub2_reset
+env PATH="$STUB2_DIR:$PATH" STUB2_DESCRIBE_FAIL=always "$SCRIPT" run --cloud --shards=1 >/dev/null 2>&1 && {
+  echo "FAIL: permanent describe errors were masked as success"; rm -rf "$STUB2_DIR"; exit 1
+}
+echo "PASS: describe errors retry then fail closed"
+
+# (d) succeeded must equal shards, not merely failed == 0
+echo "Testing: succeeded < shards fails the run"
+stub2_reset
+SHORT_OUT=$(env PATH="$STUB2_DIR:$PATH" STUB2_SUCCEEDED=0 STUB2_FAILED=0 "$SCRIPT" run --cloud --shards=1 2>&1) && SHORT_RC=0 || SHORT_RC=$?
+if [ "$SHORT_RC" -eq 0 ]; then
+  echo "FAIL: succeeded=0/1 shards reported as success ('zero failed' is not success)"; rm -rf "$STUB2_DIR"; exit 1
+fi
+if grep -q "All tasks completed successfully" <<< "$SHORT_OUT"; then
+  echo "FAIL: success footer printed with succeeded < shards"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: succeeded < shards fails closed"
+
+# (e) execution-id fallback listing stays scoped to the run's own job
+echo "Testing: id-parse fallback lists executions of the run's own job only"
+stub2_reset
+FALLBACK_OUT=$(env PATH="$STUB2_DIR:$PATH" STUB2_EXECUTE_NOEXECLINE=1 "$SCRIPT" run --cloud --shards=1 2>&1 || true)
+FALLBACK_JOB=$(grep -oP 'Job:\s+\K[a-z0-9-]+' <<< "$FALLBACK_OUT" | head -1 || true)
+if [ -z "$FALLBACK_JOB" ] || ! grep "executions list" "$STUB2_CAPTURE/gcloud.args" | grep -q -- "--job=$FALLBACK_JOB"; then
+  echo "FAIL: fallback listing not scoped to the run's own job ($FALLBACK_JOB)"
+  cat "$STUB2_CAPTURE/gcloud.args"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: fallback listing scoped to the run's own job"
+
+# (f) SIGINT mid-execution still deletes the run's job
+echo "Testing: SIGINT mid-run still deletes the run's job"
+stub2_reset
+setsid env PATH="$STUB2_DIR:$PATH" STUB2_EXECUTE_SLEEP=60 "$SCRIPT" run --cloud --shards=1 >/dev/null 2>&1 &
+E2E_INT_PID=$!
+for _ in $(seq 1 100); do
+  grep -q 'run jobs execute' "$STUB2_CAPTURE/gcloud.args" 2>/dev/null && break
+  sleep 0.1
+done
+kill -INT -- -"$E2E_INT_PID" 2>/dev/null || kill -INT "$E2E_INT_PID" 2>/dev/null || true
+wait "$E2E_INT_PID" 2>/dev/null || true
+if ! grep -q "run jobs delete" "$STUB2_CAPTURE/gcloud.args"; then
+  echo "FAIL: run-owned job not deleted after SIGINT"; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: SIGINT mid-run still deletes the job"
+
+rm -rf "$STUB2_DIR"
+unset STUB2_CAPTURE
+
 echo ""
 echo "=== All checks passed ==="
