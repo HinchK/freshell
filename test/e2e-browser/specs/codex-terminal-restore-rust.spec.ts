@@ -179,6 +179,15 @@ test.describe('Codex Terminal Restore (Rust only)', () => {
           env: {
             CODEX_CMD: fakeCodexPath,
             FAKE_CODEX_TERMINAL_ARGV_LOG: argLogPath,
+            // Codex managed-launch opt-out (kata cnwc): 6a8733a3a flipped
+            // FRESHELL_CODEX_MANAGED_LAUNCH's default ON (only exact "0"
+            // disables, launch_plan.rs), but fake-codex-terminal.mjs only
+            // speaks the plain-CLI contract (prompt + Enter-gated rollout) --
+            // under the managed app-server plan every codex create 500s
+            // ("creating Codex terminal: app-server error 500"). Same pin the
+            // flag-flip commit set in the Rust plain-CLI unit/integration
+            // suites (set_var(FRESHELL_CODEX_MANAGED_LAUNCH, "0")).
+            FRESHELL_CODEX_MANAGED_LAUNCH: '0',
           },
           // PanePicker only renders a CLI option when THREE conditions all
           // hold (`src/components/panes/PanePicker.tsx`'s `cliOptions`

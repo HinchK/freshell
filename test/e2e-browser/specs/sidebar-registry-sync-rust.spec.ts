@@ -184,6 +184,15 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
         CODEX_CMD: fakeCodex,
         FAKE_CLAUDE_ARGV_LOG: path.join(sharedRoot, 'claude-argv.jsonl'),
         FAKE_CODEX_TERMINAL_ARGV_LOG: path.join(sharedRoot, 'codex-argv.jsonl'),
+        // Codex managed-launch opt-out (kata cnwc): 6a8733a3a flipped
+        // FRESHELL_CODEX_MANAGED_LAUNCH's default ON (only exact "0" disables,
+        // launch_plan.rs), but fake-codex-terminal.mjs only speaks the
+        // plain-CLI contract (prompt + Enter-gated rollout) -- under the
+        // managed app-server plan every codex create 500s
+        // ("creating Codex terminal: app-server error 500"). Same pin the
+        // flag-flip commit set in the Rust plain-CLI unit/integration suites
+        // (set_var(FRESHELL_CODEX_MANAGED_LAUNCH, "0")).
+        FRESHELL_CODEX_MANAGED_LAUNCH: '0',
       },
       setupHome: async (homeDir: string) => {
         await fs.mkdir(PROJECT_DIR, { recursive: true })
@@ -612,12 +621,38 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // context never sees (donor scenario 3 relies on the same isolation).
     await declineRecoveryOfferIfShowing(page)
 
+    // #540's D7 live-session guard (70c43c656) 409-rejects this test's resume
+    // create while case-a's respawned claude terminal still owns
+    // SEEDED_CLAUDE_ID -- kill the earlier serial cases' live owners first,
+    // VERBATIM case-a's #540 reconciliation above (WS terminal.kill through
+    // the harness socket, EVERY running terminal: a pre-adoption codex
+    // terminal hides its resume id from the REST directory JSON, yet the D7
+    // guard's row arm still sees it as the live owner). Latent since #540 --
+    // only reachable once case-a passes again, which the cnwc managed-launch
+    // pin restores.
+    const liveOwners = async (): Promise<string[]> => {
+      const res = await page.request.get(`${info.baseUrl}/api/terminals`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(res.ok()).toBe(true)
+      const items: Array<{ terminalId: string; status: string }> = await res.json()
+      return items.filter((i) => i.status === 'running').map((i) => i.terminalId)
+    }
+    for (const terminalId of await liveOwners()) {
+      await page.evaluate((tid) => {
+        (window as any).__FRESHELL_TEST_HARNESS__?.sendWsMessage({ type: 'terminal.kill', terminalId: tid })
+      }, terminalId)
+    }
+    await expect(async () => {
+      expect(await liveOwners()).toHaveLength(0)
+    }).toPass({ timeout: 15_000 })
+
     // Open a claude resume pane so there is something to lose + recover.
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
       headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
       data: { mode: 'claude', cwd: PROJECT_DIR, sessionRef: { provider: 'claude', sessionId: SEEDED_CLAUDE_ID } },
     })
-    expect(res.ok()).toBe(true)
+    expect(res.ok(), `POST /api/tabs claude resume: ${res.status()} ${await res.text()}`).toBe(true)
     const restTabId: string = (await res.json())?.data?.tabId
     expect(restTabId).toBeTruthy()
     await expect(page.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`))
