@@ -107,7 +107,8 @@ Load-bearing evidence (validated this run, receipt at
   close→required-offer transition without restart (after scenario 1's
   ctxB.close(), scenario 2's ctxC.close(), scenario 3's ctxD.close(), and
   scenario 4's populating-context close; context-E's close is deliberately
-  unguarded because scenario 4's populating boot uses a conditional decline).
+  unguarded because scenario 4's populating boot branches on the boot
+  inventory response payload, never on visibility timing — see scenario 4).
 - Modify: NONE on the server. The untouched `data-testid` attrs keep the
   pinned contract (R2 pins).
 
@@ -170,7 +171,7 @@ Load-bearing evidence (validated this run, receipt at
 | # | Requirement | Invariant | Pinning tests |
 |---|-------------|-----------|---------------|
 | R1 | R1 (containment) | Dialog `max-h` + internal scroll + reachable buttons | Component structural test + e2e scenario 4 (390x844 bounding box + `scrollHeight > clientHeight` + decline actionability) |
-| R2a | R2 (restart-independence) | A probe/guard poll exists at every close→required-offer transition without restart | Recover spec scenario transitions 1→2, 2→3, within-3 (D→E), and populating→phone all guarded (context-E close deliberately unguarded — scenario 4 uses a conditional decline); attacker text filed below |
+| R2a | R2 (restart-independence) | A probe/guard poll exists at every close→required-offer transition without restart | Recover spec scenario transitions 1→2, 2→3, within-3 (D→E), and populating→phone all guarded (context-E close deliberately unguarded — scenario 4's populating boot branches on the inventory response payload with a 30s render-latency-matching panel wait, so no visibility race); attacker text filed below |
 | R2b | R2 (unmodified spec coherence) | `RESTORE-01..04` assertions unchanged & passing on `recover-my-panes-rust.spec.ts` and the sidebar pair | The four specs keep running in the same serial order with unchanged assertions |
 | R3 | R3 (interactions) | Dismiss/Accept/Escape/backdrop/focus keep working on the phone viewport | e2e scenario 4 decline actionability + unchanged unit interaction suite (all existing tests + new structural test) |
 
@@ -221,16 +222,26 @@ the full dialog and the decline control is tappable`. **One serial e2e spec
 untouched and their close→required-offer transitions get the common
 `waitForRecoverable` guard.** The suite:
 
-- **Scenario 4 (R1 + R3 pins):** a populating context boots. In a full serial
-  run, scenarios 1–3 left persisted records, so this boot shows the offer
-  modal — which would intercept the header clicks it needs next — so it FIRST
-  performs a conditional decline: wait for `recovery-offer-panel` with a short
-  timeout (~3s); if visible, click `recovery-decline`; if not visible (the
-  case in isolated `-g "scenario 4"` runs against a fresh server/home where
-  nothing is persisted yet), proceed. The conditional keeps the scenario
-  correct both in the canonical full-spec run AND when filtered alone (the
-  mutation-red lane relies on this). Then it creates 20 shell tabs using the
-  UI control `getByRole('button', { name: 'New shell tab' })` (idiom donor:
+- **Scenario 4 (R1 + R3 pins):** `test.setTimeout(240_000)` — the repo
+  Playwright default is 60s and every existing scenario raises it to 120s or
+  240s; this scenario's own budget (decline ≤30s + 20-tab creation + ≤30s
+  persistence poll + ≤30s guard + phone-boot assertions) can exceed 60s.
+  A populating context boots. Offer rendering is asynchronous — the existing
+  recovery helper documents observed delays exceeding 10s and therefore waits
+  30s for the panel — so a fixed short visibility timeout races a delayed
+  modal. Instead the populating page attaches a response listener for the boot
+  `GET /api/recovery/inventory` request BEFORE navigation
+  (`page.waitForResponse(r => r.url().includes('/api/recovery/inventory'))`),
+  then branches on the parsed payload: if `recoverable === true` (canonical
+  full serial run — scenarios 1–3 left persisted records), wait up to 30s for
+  `recovery-offer-panel` and click `recovery-decline` (the modal would
+  otherwise intercept the header clicks needed next; the full-latency wait
+  closes the race); if `recoverable === false` (isolated `-g "scenario 4"`
+  runs against a fresh server/home), skip declining and proceed — the
+  mutation-red lane relies on this determinism, and it is also why
+  context-E's close needs no guard: the branch is driven by the response
+  payload, never by visibility timing. Then it creates 20 shell tabs using
+  the UI control `getByRole('button', { name: 'New shell tab' })` (idiom donor:
   `automation-layout-rust.spec.ts:143`; tab-count progress observable via
   `harness.getTabCount()`), then waits for persistence with a records-count
   fs-poll (newest generation for that context's client has ≥ 20 records —
@@ -337,7 +348,8 @@ not by running against absent behavior.
 
 Run scenario 4 against mutated production to prove it detects the missing
 behavior (restore immediately after; the mutation is never committed).
-Scenario 4's conditional decline means a filtered `-g "scenario 4"` run
+Scenario 4's response-payload-driven populating boot means a filtered
+`-g "scenario 4"` run
 against the fresh isolated server/home stays on-path (no stale offer blocks
 the population UI), so the failure lands exactly on the containment
 assertions:
