@@ -45,6 +45,7 @@ Existing only: Rust workspace (toolchain 1.96.0, edition 2021, `cargo test/clipp
 8. **Test discipline.** Repo wrappers only: focused vitest via `npm run test:vitest -- run <paths> --config <cfg>` (explicit `--config` required for server/oracle paths); broad close-out via the coordinated `FRESHELL_TEST_SUMMARY=... npm test` — check `npm run test:status` first and WAIT on a foreign coordinator holder, never kill it. No raw `npx vitest`. If `FRESHELL_VITEST_BACKEND` / `FRESHELL_E2E_BACKEND` is unset, do not force a cloud backend from this plan; ask the user first per repo policy (local is the safe default).
 9. **TDD red/green is genuine.** Task 1's RED is the executable version-track assertion failing on pin `^0.2.40` / locked `0.2.71`. Task 2's RED is the mirror test updated to the new expectations FIRST and observed failing against the old statics row before the implementation edit. Paste RED and GREEN outputs into the run ledger.
 10. **Kata bookkeeping is out of plan scope.** Closing tracking kata fpxj after successful delivery belongs to the user/orchestrator, not to any task below.
+11. **Ambient OneCLI env must be scrubbed for every real-Anthropic-turn command.** This host exports `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` (OneCLI) and the harness spawn chains inherit them whole; unscrubbed probes 401 against OneCLI's locked-down Anthropic account, while `env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL` variants authenticate via the user's own claude OAuth login (VAL-A, receipts in `load-bearing-validator-val-a.md`). This affects 3.10 (mandatory), 3.11 (advised), and ANY improvised claude verification command during execution — bake the scrub into every such invocation verbatim.
 
 ## File Responsibility Map
 
@@ -175,21 +176,21 @@ Complete patches:
   cargo test -p freshell-ws --test freshagent_claude_kill_interrupt --test claude_session_rebind
   ```
   Green.
-- [ ] **3.8 Release build (worktree target):** `cargo build --release -p freshell-server` → exit 0.
+- [ ] **3.8 Release build (worktree target):** Preconditions pinned before building (VAL-B: a foreign `CARGO_TARGET_DIR` or seam override would silently build/route the WRONG artifact): `env | grep -E '^(CARGO_TARGET_DIR|FRESHELL_CLAUDE_SIDECAR|FRESHELL_CLAUDE_SDK_QUERY_MODULE)='` must print nothing. Then `cargo build --release -p freshell-server` → exit 0. Anti-false-green bake receipt (mandatory): `strings target/release/freshell-server | grep -F "$(pwd)/crates/freshell-claude-sidecar/index.mjs"` prints the exact worktree sidecar path — `claude.rs:1980` bakes `env!("CARGO_MANIFEST_DIR")/../freshell-claude-sidecar/index.mjs` at compile time; if the strings receipt shows any other path, STOP and resolve target-dir/env causes before proceeding.
 - [ ] **3.9 Scratch-port launch smoke (:3001 NEVER touched).** Ensure `dist/client` exists (`npm run build:client` first if missing); provide `AUTH_TOKEN` (env var, or copy the main checkout's `.env` into the worktree root — `.env` is gitignored); then:
   ```bash
   scripts/launch-rust.sh --skip-build --port 3499
   curl -fsS http://127.0.0.1:3499/api/health
   ```
   Expect "freshell-server is ready! (pid N, port 3499)" and a 200 health response. Confirm provenance in `~/.freshell/logs/rust-server-3499.log`: the `listening ... [commit <sha>] [dirty ...]` line names THIS worktree's HEAD. Then stop: `scripts/launch-rust.sh --stop --port 3499`.
-- [ ] **3.10 DECISIVE — oracle T2 real-SDK turn.** Prerequisites met: 3.1 (node_modules at 0.3.x), 3.8 (release binary), real `claude` CLI on PATH with credentials. Run:
+- [ ] **3.10 DECISIVE — oracle T2 real-SDK turn.** Prerequisites met: 3.1 (node_modules at 0.3.x), 3.8 (release binary incl. bake receipt), real `claude` CLI on PATH with credentials. **MANDATORY env-scrub (load-bearing VAL-A falsified the unscrubbed invocation):** this host carries ambient OneCLI `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`; the T2 harness inherits the invoking `process.env` whole (`external-server.ts:357`) and the ambient OneCLI key PREEMPTS the harness's seeded OAuth credential (probe failed 401 unscrubbed; identical probe with both vars unset returned `PROBE_OK` from a real Haiku turn). Run:
   ```bash
-  FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/unit/port/oracle/t2-claude-equivalence-rust.test.ts --config config/vitest/vitest.oracle.config.ts
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/unit/port/oracle/t2-claude-equivalence-rust.test.ts --config config/vitest/vitest.oracle.config.ts
   ```
   Expect PASS: one real `freshclaude` Haiku turn driven through a scratch-port Rust server → real sidecar → real vendored 0.3.x SDK → real CLI under an isolated `CLAUDE_HOME`; 9 fatal invariants hold; structural deep-equal against `port/oracle/baselines/t2/claude-haiku.json`; `liveModelCalls <= 2`. The harness (`port/oracle/harness/external-server.ts`) boots its own ephemeral port and reaps only sentinel-owned pids — :3001 untouched (and expressly pinned not-3001 by the test). **A skip is not a pass:** if the test self-skips (gate env, missing binary/creds), record the skip reason verbatim and surface it to the orchestrator as an UNRESOLVED COVERAGE GAP.
-- [ ] **3.11 Advisory CLI-health smoke (optional, not required for green).**
+- [ ] **3.11 Advisory CLI-health smoke (optional, not required for green).** Same ambient-OneCLI env-scrub applies (VAL-A):
   ```bash
-  FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/coding-cli-session-contract.test.ts --config config/vitest/vitest.server.config.ts
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/coding-cli-session-contract.test.ts --config config/vitest/vitest.server.config.ts
   ```
   SDK-agnostic smoke that the PATH `claude` CLI itself is healthy. Known pre-existing external-CLI drifts reproduce at this base (VAL-3: claude cross-cwd `--resume` exit-0 change; two opencode 60s JSON timeouts) — if seen, attribute as pre-existing, do NOT fix here.
 - [ ] **3.12 Coordinator close-out.** `npm run test:status` (inspect holder + recent results; WAIT on any foreign holder), then:
