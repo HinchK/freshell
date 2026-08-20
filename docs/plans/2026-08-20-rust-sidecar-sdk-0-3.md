@@ -1,5 +1,7 @@
 # Rust Claude Sidecar SDK 0.3 Upgrade + Model Statics Port Implementation Plan
 
+> Executed 2026-08-20 against 9cc7d46c6117a16c7cecb987b862b07db5421b1c (+ plan-doc corrections); the source tree supersedes all code and patch listings in this document. Only the `## User Request` block, Goal, Architecture, Global Constraints, and task intent remain authoritative.
+
 > **For agentic workers:** REQUIRED: Use the usual-subagents (subagent-driven-development / executing-plans) and the-usual TDD (test-driven-development) subskills to implement this plan task-by-task and subtask-by-subtask. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 ## User Request
