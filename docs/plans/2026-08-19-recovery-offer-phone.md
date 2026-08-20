@@ -55,12 +55,12 @@ axum server (`GET /api/recovery-inventory` — no changes), Playwright e2e under
 
 ## Context map
 
-RESTORE-01 (offer query at boot) flows: `App.tsx:874-895` boot harness →
-`src/lib/api.ts:36-40` `fetchRecoveryInventory` → Rust `inventory_handler`
-(`crates/freshell-server/src/recovery_inventory.rs:384-420`) → `RecoveryOfferPanel.suggestedPaneRecords`. RESTORE-03/04: panel + `WindowSuggester` +
-`applyRecoverySuggestion` (App.tsx:961-973). The e2e reality (recover spec
-`openFreshContextWithOffer` + RESTORE-05 test site := App.tsx:874-895) +
-`recheck` behavior at RESTORE-06 (re-offer withheld until next connect). Full
+RESTORE-01 (offer query at boot) flows: the panel self-fetches via
+`getRecoveryInventory` (`src/lib/api.ts`) → Rust `inventory_handler`
+(`crates/freshell-server/src/recovery_inventory.rs:384-420`); the panel is
+rendered by App at `App.tsx:1926`. RESTORE-03/04: panel + suggestion/apply
+flow (App.tsx). Dismissal semantics (RESTORE-06): closing via Escape/backdrop
+keeps the offer pending for a later boot rather than starting a timer. Full
 evidence: `.worktrees/.the-usual-logs/recovery-offer-phone/reports/plan-rust-inventory.md`, `plan-client-panel.md`, `plan-test-coverage.md`.
 
 Load-bearing evidence (validated this run, receipt at
@@ -95,10 +95,13 @@ Load-bearing evidence (validated this run, receipt at
   `recovery-offer-panel`, `recovery-decline`, `recovery-accept`,
   `recovery-live-note` unchanged.
 - Modify: `test/unit/client/components/RecoveryOfferPanel.test.tsx` — one new
-  structural test: dialog has `max-h-[80vh] flex flex-col`, the
-  `recovery-live-note` element has `overflow-y-auto`, and the buttons render
-  as dialog children OUTSIDE the scrollable element (`note.parentElement !==
-  dialog.parentElement`).
+  structural test: the dialog (selected via `getByTestId('recovery-offer-panel')`)
+  has the classes `max-h-[80vh]` and `flex flex-col`; the `<ul>` descendant of
+  the dialog has `overflow-y-auto`, `flex-1`, and `min-h-0`; AND neither
+  `recovery-decline` nor `recovery-accept` is a descendant of that `<ul>`
+  (assert via `ul.contains(declineButton)` / `ul.contains(acceptButton)` ===
+  false — the footer lives in the dialog's flex column but outside the scroll
+  region).
 - Modify: `test/e2e-browser/specs/recover-my-panes-rust.spec.ts` — new serial
   scenario 4 plus a teardown-lag guard (`waitForRecoverable`) at every
   close→required-offer transition without restart (after scenario 1's
@@ -126,8 +129,8 @@ Load-bearing evidence (validated this run, receipt at
 
 - **R1 (formerly R3 — containment).** On a phone-sized viewport the dialog fits
   the viewport, its list scrolls internally, and every control (`Dismiss`,
-  `Add tabs…`, focus trap, Escape→recheck timer, backdrop click→recheck timer)
-  remains reachable and functional.
+  `Add tabs…`, focus trap, Escape dismiss, backdrop-click dismiss) remains
+  reachable and functional.
 - **R2 (regression gate + no-seam).** `RESTORE-01..05` assertions + both
   recovery-offer-entangled specs (`recover-my-panes-rust`, `sidebar-registry-sync-rust` +
   `sidebar-remote-status-rings-rust`) keep passing against ONE fixed run-mode
@@ -138,7 +141,9 @@ Load-bearing evidence (validated this run, receipt at
   Mechanically the plan adds an enforced probe-poll guard
   (`waitForRecoverable` helper polling the inventory endpoint with
   `x-auth-token` via a STANDALONE `request.newContext({ baseURL:
-  info.baseURL, extraHTTPHeaders: { 'x-auth-token': info.token } })` — NOT
+  info.baseUrl, extraHTTPHeaders: { 'x-auth-token': info.token } })` — note
+  `TestServerInfo` exposes `baseUrl` (lowercase), while Playwright's option
+  key is `baseURL`; `request` is imported from `@playwright/test`. NOT
   `page.request` on a doomed page/context (handle is invalidated by `close()`),
   NOT a navigated page (that would create a tracked tabs.sync client and
   entangle the bootstrap fetch) — disposed after success) wherever a later
@@ -146,10 +151,10 @@ Load-bearing evidence (validated this run, receipt at
   context-B close, scenario 2's context-C close, scenario 3's context-D close,
   and scenario 4's populating-context close).
 - **R3 (interactions completeness).** Every panel interaction (restore/decline
-  buttons, focus trap including outside buttons, Escape→recheck timer,
-  backdrop click) keeps working on the phone viewport. Satisfied by the e2e
-  decline actionability plus the unchanged unit tests; no changed interaction
-  semantics.
+  buttons, focus trap, Escape dismiss, backdrop-click dismiss) keeps working on
+  the phone viewport, preserving today's semantics (dismissal keeps the offer
+  pending for a later boot). Satisfied by the e2e decline actionability plus
+  the unchanged unit tests; no changed interaction semantics.
 
 ## Invariant risk table for pinning
 
@@ -187,7 +192,8 @@ rescoped by user decision._
     <button data-testid="recovery-accept" .../>
 ```
 
-(The boots and recheck loops are UNCHANGED. All testids, the two scroll-lock
+(The boot harness and dismissal semantics are UNCHANGED: dismissal keeps the
+offer pending for a later boot. All testids, the two scroll-lock
 blocks, and the focus trap keep their current behavior.)
 
 ### Server WS handlers + routes
@@ -243,13 +249,16 @@ untouched and their close→required-offer transitions get the common
 - [ ] **Step 1: Write the failing behavioral test**
 
 Add to `test/unit/client/components/RecoveryOfferPanel.test.tsx` (the file
-already mocks `getRecoveryInventory`, `acceptRecoverySuggestion`, etc.):
+already mocks the recovery-inventory API):
 
 - Renders panel with N records ⇒ the `recovery-offer-panel` dialog has Tailwind
-  classes `max-h-[80vh]` and `flex flex-col`; the `recovery-live-note`'s sibling
-  `<ul>` has `overflow-y-auto`, `min-h-0`, `flex-1`; AND the two buttons are
-  NOT descendants of the scrollable `<ul>` (pointer: the buttons stay in the
-  dialog's flex column but outside the scroll region).
+  classes `max-h-[80vh]` and `flex flex-col`; a `<ul>` descendant of the
+  dialog (select via `dialog.querySelector('ul')` — no new testids) has
+  `overflow-y-auto`, `min-h-0`, `flex-1`; AND the two buttons are NOT
+  descendants of that `<ul>`
+  (`ul.contains(getByTestId('recovery-decline')) === false`, same for
+  `recovery-accept` — the buttons stay in the dialog's flex column but outside
+  the scroll region).
   Test name/comment must reference **R1 (dialog containment)**.
 - Existing tests in the file keep passing (scroll-lock, focus trap, backdrop,
   Escape, accept/decline flows — do not cite a count; counts drift).
@@ -419,7 +428,8 @@ returns; any dead-time drift at open time is out-of-scope for the plan.)
    repo state (class names, `data-testid` strings, ws kind strings, route
    paths); cross-checked versus `src/lib/api.ts`, `src/store/tabRegistrySync.ts`,
    `crates/freshell-ws/src/tabs.rs` snapshots. Also confirmed RESTORE-06's
-   `recheck` invariant remains untouched.
+   dismissal semantics (pending offer re-surfaces on a later boot) remain
+   untouched.
 4. **Cycle check:** tasks and steps topologically ordered.
 5. **Assumption audit:** no standard-library euphemisms; precise React idioms
    (`getByTestId`, `BoundingBox`, `scrollHeight`); no duck-typed "framework"
