@@ -280,13 +280,23 @@ RustServer, appended after scenario 3):**
   response listener capturing the `GET /api/recovery/inventory` response:
   assert HTTP 200 AND `recoverable === false` AND the panel never appears
   (`toHaveCount(0)` evaluated only after the captured response resolved —
-  bounded wait, no blind retry). Then close A; poll the endpoint with an
+  bounded wait, no blind retry). Then close B AND close A (the suite's
+  no-overlapping-contexts invariant: the gate suppresses offers while ANY
+  other client is connected, so both must be gone); poll the endpoint with an
   authed probe (`page.request.get` of
   `/api/recovery/inventory?clientInstanceId=probe-s4&bootAgoMs=0`) until
   `recoverable === true` (30s budget — teardown may lag the close); finally
   boot fresh context C and REQUIRE the panel (reuse
   `openFreshContextWithOffer`), decline it, close C. This proves suppression
   was connectedness, not data loss, and R2's re-appearance.
+- **Teardown-lag guard (applies wherever a required offer follows a context
+  close with NO server restart):** after `ctxC.close()` (end of scenario 2)
+  before scenario 3's context-D boot, and after `ctxD.close()` before context
+  E's boot, and before scenario 5's phone boot, poll the probe endpoint until
+  `recoverable === true` (30s). Reuse one file-local helper
+  (e.g. `waitForRecoverable`). Restart-based transitions (scenario 1) need no
+  guard — restart clears the set. Scenarios 1–3 keep every existing assertion
+  byte-identical; the guard additions are wait-only.
 - **Scenario 5 (R3 pin):** a populating context creates 20 tabs (the pane
   records may be plain picker tabs — pickers are snapshotted records per
   SESSION-05 evidence) using the UI control
