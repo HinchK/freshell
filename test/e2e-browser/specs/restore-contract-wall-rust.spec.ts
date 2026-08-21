@@ -27,6 +27,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -520,21 +521,7 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
 
 /** Single-executable `codex` shim: app-server argv -> fake app-server; else terminal fake. */
 async function installDualRoleCodex(binDir: string, argLogPath: string): Promise<string> {
-  await fs.mkdir(binDir, { recursive: true })
-  const target = path.join(binDir, 'codex')
-  const script = `#!/usr/bin/env node
-const { spawnSync } = require('node:child_process')
-const argv = process.argv.slice(2)
-if (argv.includes('app-server')) {
-  const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_APP_SERVER_SOURCE)}, ...argv], { stdio: 'inherit', env: process.env })
-  process.exit(result.status ?? 1)
-}
-const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_CLI_SOURCE)}, ...argv], { stdio: 'inherit', env: { ...process.env, FAKE_CODEX_ARGV_LOG: ${JSON.stringify(argLogPath)} } })
-process.exit(result.status ?? 1)
-`
-  await fs.writeFile(target, script, 'utf8')
-  await fs.chmod(target, 0o755)
-  return target
+  return installDualRoleCodexCli(binDir, FAKE_CODEX_CLI_SOURCE, { FAKE_CODEX_ARGV_LOG: argLogPath })
 }
 
 /** Single-executable `opencode` shim: `serve` argv -> fake sidecar; else terminal fake. */
@@ -797,11 +784,10 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
-    const fakeCodexPath = await installFakeCli(
-      FAKE_CODEX_CLI_SOURCE,
-      'codex',
-      path.join(sharedRoot, 'bin'),
-    )
+    // Dual-role: the Rust server's codex terminal lane boots a `codex
+    // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
+    // must answer both app-server argv (fake app-server) and terminal argv.
+    const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
 
     const { server, harness } = await bootWall(page, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
@@ -2025,6 +2011,9 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
+    // Cloud (2-worker shard) wall-clock: SIGKILL + dual-client recovery + a
+    // stable-count settle on the arg log exceeds the describe-level 180s.
+    test.setTimeout(300_000)
     // P1.7 (D8, §4.3) LANDED -- pin flipped by the reconcile-client-adoption
     // lane: the server now runs a per-sessionRef single-flight lease on the
     // create path (losers get error{SESSION_RESERVED}) and reconcile verdicts
@@ -2036,11 +2025,10 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
-    const fakeCodexPath = await installFakeCli(
-      FAKE_CODEX_CLI_SOURCE,
-      'codex',
-      path.join(sharedRoot, 'bin'),
-    )
+    // Dual-role: the Rust server's codex terminal lane boots a `codex
+    // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
+    // must answer both app-server argv (fake app-server) and terminal argv.
+    const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
     const { server, harness, info } = await bootWall(page, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
@@ -2215,11 +2203,10 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
-    const fakeCodexPath = await installFakeCli(
-      FAKE_CODEX_CLI_SOURCE,
-      'codex',
-      path.join(sharedRoot, 'bin'),
-    )
+    // Dual-role: the Rust server's codex terminal lane boots a `codex
+    // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
+    // must answer both app-server argv (fake app-server) and terminal argv.
+    const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
     const { server, harness, info } = await bootWall(page, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),

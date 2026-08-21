@@ -8,6 +8,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
 /**
  * Codex status completeness (Rust only) — wire-level proof that codex panes
@@ -34,6 +35,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const FAKE_BEL_CLI = path.resolve(__dirname, '../fixtures/fake-bel-cli.mjs')
+const FAKE_CODEX_CLI = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 
 async function installFakeCli(binDir: string, name: string, source: string): Promise<string> {
   await fs.mkdir(binDir, { recursive: true })
@@ -42,6 +44,10 @@ async function installFakeCli(binDir: string, name: string, source: string): Pro
   await fs.chmod(target, 0o755)
   return target
 }
+
+// Dual-role codex shim: shared helper (test/e2e-browser/fixtures/codex-dual-role.ts).
+// A terminal-only fake at CODEX_CMD dies instantly on the codex app-server
+// sidecar spawn and every codex create fails PTY_SPAWN_FAILED.
 
 /**
  * A raw, node-side WS capture client: performs the real hello handshake and
@@ -309,11 +315,9 @@ test.describe('Codex status completeness (Rust only)', () => {
   }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-restart-'))
-    const fakeCodex = await installFakeCli(
-      path.join(sharedRoot, 'bin'),
-      'codex',
-      path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs'),
-    )
+    // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
+    // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_CODEX_CLI)
     let rolloutPath = ''
     const server = new RustServer({
       env: { CODEX_CMD: fakeCodex },
@@ -415,7 +419,9 @@ test.describe('Codex status completeness (Rust only)', () => {
   }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-twin-'))
-    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+    // Dual-role (see note at site one): the codex lane boots an app-server
+    // sidecar first; the BEL fake must cover only the terminal branch.
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
     const mkServer = () =>
       new RustServer({
         env: { CODEX_CMD: fakeCodex },
