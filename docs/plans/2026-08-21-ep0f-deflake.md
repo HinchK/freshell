@@ -29,7 +29,7 @@ No `Date.now()`/timing-based production behavior changes are introduced by this 
 
 ## Tech Stack
 
-**Runtime:** Node ≥20.19, Vitest 3.2.4, pino 9.14, rotating-file-stream 3.2.9, node:worker_threads, node:sqlite
+**Runtime:** Node ≥22.5 (package.json engines), Vitest 3.2.4, pino 9.14, rotating-file-stream 3.2.9, node:worker_threads, node:sqlite
 
 **Skills:** the-usual-beta (this run pipeline incl. focused repair loop after any FAILED delta round), test-driven-development (inverted: for test-only fixes RED = induced-load stress repro + recorded failure, GREEN = repeated loaded green), executing-plans (order + receipt discipline).
 
@@ -130,4 +130,4 @@ Skill protocols in this plan are fixed by reference (the-usual-beta at `~/.confi
 2. Registry :3317 test no longer spawns worker threads or touches the host opencode DB; the waitFor condition passes on its first interval evaluation (~50ms). Honesty note (round-1 Minor): vi.waitFor's initial synchronous evaluation may still observe the stale flag because the mock's resolve lands one microtask later — the condition is then constant and time-independent of host load, which is the actual acceptance property.
 3. Focused suites green repeatedly under induced load (×50 / ×5 / ×20) + full-file passes quiet.
 4. Coordinated full suite green at final HEAD (cloud backend; any surviving failure must be a DIFFERENT ep0f-family flake and gets ledgered, not fixed here).
-5. kata ep0f advanced; zero production-file changes in the final diff. Statics-hygiene honest statement (round-3 Minor): the repo has no lint/typecheck coverage of test/** (kata f884); no such claim is made for these changes — static fitness is established by the executed stress suites, all of which transpile+run every edited line every iteration.
+5. kata ep0f advanced; zero production-file changes in the final diff. Statics-hygiene honest statement (round-3 Minor): the repo has no lint/typecheck coverage of test/** (kata f884); no such claim is made for these changes. Static fitness: the stress suites transpile every edited line and execute every success-path line each iteration; the two failure branches were exercised as one-off manual receipts (banked in the run ledger).
