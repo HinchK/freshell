@@ -48,7 +48,7 @@ Fix the flaky integration test `test/integration/server/logger.separation.test.t
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-Part A — unit test (in `test/unit/server/logger.test.ts`): first merge any missing imports (`readFileSync` from `node:fs`, `fsp` from `node:fs/promises`, `os` from `node:os`, `path` from `node:path`) into the file's import block — skip any already present. Then append a new `describe` at the end of the file's existing top-level `describe`, reusing the file's existing `vi.resetModules()`-in-`beforeEach` + dynamic re-import convention:
+Part A — unit test (in `test/unit/server/logger.test.ts`): first merge any missing imports (`readFileSync` and `existsSync` from `node:fs`, `fsp` from `node:fs/promises`, `os` from `node:os`, `path` from `node:path`) into the file's import block — skip any already present. Then append a new `describe` at the end of the file's existing top-level `describe`, reusing the file's existing `vi.resetModules()`-in-`beforeEach` + dynamic re-import convention:
 
 ```ts
 import { readFileSync } from 'node:fs'
@@ -62,6 +62,7 @@ import path from 'node:path'
     it('writes the resolved-path marker synchronously during logger construction', async () => {
       const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-logger-marker-'))
       const debugPath = path.join(dir, 'debug.jsonl')
+      delete process.env.LOG_LEVEL
       process.env.LOG_DEBUG_PATH = debugPath
       try {
         await import("../../../server/logger")
@@ -98,8 +99,11 @@ import path from 'node:path'
       process.env.LOG_LEVEL = 'warn'
       try {
         await import("../../../server/logger")
-        const exists = readFileSync(debugPath, 'utf8')
-        expect(exists).not.toContain('Resolved debug log path')
+        // The file may not exist yet: at warn level nothing is written
+        // synchronously, and the lazily-opened stream may never have landed.
+        // Absence IS the suppressed outcome — only guard content if present.
+        const content = existsSync(debugPath) ? readFileSync(debugPath, 'utf8') : ''
+        expect(content).not.toContain('Resolved debug log path')
       } finally {
         delete process.env.LOG_DEBUG_PATH
         delete process.env.LOG_LEVEL
@@ -180,9 +184,10 @@ In `server/logger.ts`, add the helper next to `createDebugFileStream` (~line 231
  * imports this module and exits promptly would otherwise lose the marker
  * (observed as a hung-then-empty debug file in the logger.separation
  * integration suite under CI shard contention). The direct append makes the
- * receipt durable before createLogger() returns. Emitted before the stream's
- * first write so rotating-file-stream's stat-based size bookkeeping already
- * sees these bytes. Kept under createLogger()'s existing try/catch.
+ * receipt durable before createLogger() returns. One out-of-band line per
+ * process launch: rotating-file-stream's open-time stat may or may not see
+ * these bytes yet (threadpool race), so rotation size accounting can be off
+ * by at most this one line at the 10M cap — negligible.
  */
 function writeDebugLogPathMarkerSync(resolved: {
   filePath: string
@@ -251,8 +256,11 @@ Expected: PASS — both new tests and every pre-existing test in both files.
 
 - [ ] **Step 5: Refactor while green**
 
-- Remove now-unneeded machinery only if the marker's old pino route left anything (it did not add any). 
+- Remove now-unneeded machinery only if the marker's old pino route left anything (it did not add any).
 - Keep the 30s `FILE_CONTENT_TIMEOUT_MS` — it bounds content gates, not durability; the file's header comment about the 2026-08-18 observation stays accurate but should gain one sentence noting the durability fix (edit the comment, do not change the timeout value).
+- Recorded behavior deltas, accepted deliberately:
+  - If the debug file is already at the 10MB rotation cap at process start, rotating-file-stream rotates at open time, which can move the freshly appended receipt into the rotated archive, leaving the active file without the marker. Diagnostic-only, never exercised by any test; no guard added.
+  - The first integration test's `LOG_LEVEL_PROBE` (50ms timer) keeps the theoretical exit-before-open loss window for its `error-level` content line; the reported flake concerned the marker receipt, which is now durable. No change in scope.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -268,6 +276,14 @@ rg -l "createDebugFileStream|Resolved debug log path" test/ | tr '\n' ' '
 Run any additional files the `rg` lists that actually execute the marker path (not docs).
 
 Expected: PASS for the full impacted set.
+
+Then verify on the configured CLOUD backend — the venue where the flake lives (the local-focused commands above never reach it). The repo's cloud script takes `=`-joined flags:
+
+```bash
+bash scripts/vitest-cloud.sh run --cloud --config=server test/integration/server/logger.separation.test.ts
+```
+
+Expected: all tests in the file pass on Cloud Run. (Local `npm run test:vitest -- run <file> --config <path>` demonstrably selects the intended file and config — verified by observation earlier today; keep it for local loops only.)
 
 - [ ] **Step 7: Commit the task**
 
