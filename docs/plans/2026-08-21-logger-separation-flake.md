@@ -139,6 +139,10 @@ Part B — integration test (append inside `describe('debug log separation', ...
             FRESHELL_LOG_DIR: logDir,
             FRESHELL_LOG_INSTANCE_ID: 'immediate-exit',
             NODE_ENV: 'development',
+            // The harness does not scrub ambient LOG_LEVEL; the marker is
+            // info-level, so an operator's LOG_LEVEL=warn would suppress it
+            // and keep this test red. Pin the supported default instead.
+            LOG_LEVEL: 'debug',
           },
           REPO_ROOT,
         )
@@ -164,9 +168,11 @@ Part B — integration test (append inside `describe('debug log separation', ...
 
 Run:
 ```bash
-npm run test:vitest -- run test/unit/server/logger.test.ts
+npm run test:vitest -- run test/unit/server/logger.test.ts --config config/vitest/vitest.server.config.ts
 npm run test:vitest -- run test/integration/server/logger.separation.test.ts --config config/vitest/vitest.server.config.ts
 ```
+
+Command-form note (verified empirically this run): `test/unit/server/**` lives in the SERVER vitest config — the default config excludes it. The explicit `--config` keeps the coordinator's `test:vitest` passthrough verbatim; WITHOUT it the coordinator infers the server owner and prepends a second `run`, which vitest then treats as a filename filter — an unscoped `npm run test:vitest -- run test/unit/server/logger.test.ts` selected 11 files / 243 tests instead of 1 file / 36 tests.
 
 Expected: FAIL for exactly two new tests, for the durability reason: the unit durability test finds no `Resolved debug log path` line (file missing or empty at assertion time), and the integration test fails with `expect(content).toContain('Resolved debug log path')` receiving `''`. The second new unit test (`respects info-level suppression...`) may PASS pre-fix — pre-fix nothing reaches the file promptly at any level, so `not.toContain` is satisfied vacuously; it is a guard test whose real value is post-fix (marker written when allowed, still suppressed at `warn`). All pre-existing tests in both files still pass.
 
@@ -248,7 +254,7 @@ This is the intended final shape: one synchronous receipt, swallowed-with-warnin
 
 Run:
 ```bash
-npm run test:vitest -- run test/unit/server/logger.test.ts
+npm run test:vitest -- run test/unit/server/logger.test.ts --config config/vitest/vitest.server.config.ts
 npm run test:vitest -- run test/integration/server/logger.separation.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
@@ -268,7 +274,7 @@ The change affects only `createLogger()` marker emission. Impacted set: every te
 
 Run:
 ```bash
-npm run test:vitest -- run test/unit/server/logger.test.ts
+npm run test:vitest -- run test/unit/server/logger.test.ts --config config/vitest/vitest.server.config.ts
 npm run test:vitest -- run test/integration/server/logger.separation.test.ts --config config/vitest/vitest.server.config.ts
 rg -l "createDebugFileStream|Resolved debug log path" test/ | tr '\n' ' '
 ```
