@@ -3,6 +3,7 @@ import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegi
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import { defaultSettings } from '../../../server/config-store'
 import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability'
+import { isOpencodeSubagentSession } from '../../../server/coding-cli/providers/opencode-subagent-query.js'
 import * as fs from 'fs'
 import os from 'os'
 import {
@@ -55,6 +56,10 @@ vi.mock('../../../server/logger', () => {
 })
 
 // Mock MCP config writer
+vi.mock('../../../server/coding-cli/providers/opencode-subagent-query.js', () => ({
+  isOpencodeSubagentSession: vi.fn(),
+}))
+
 vi.mock('../../../server/mcp/config-writer.js', () => ({
   generateMcpInjection: vi.fn((mode: string, terminalId: string, cwd?: string, _platform?: string) => {
     if (mode === 'claude' || mode === 'kimi') {
@@ -3291,6 +3296,12 @@ describe('TerminalRegistry', () => {
   })
 
   describe('resumeTargetIsSubagent (opencode subagent-target classification)', () => {
+    beforeEach(() => {
+      // The outer TerminalRegistry describe's beforeEach runs vi.resetAllMocks(),
+      // so the mock must be (re)established here, not in the vi.mock factory.
+      vi.mocked(isOpencodeSubagentSession).mockResolvedValue(false)
+    })
+
     it('stores the flag from create opts and surfaces it from list()', () => {
       registry.create({
         mode: 'opencode',
@@ -3314,7 +3325,11 @@ describe('TerminalRegistry', () => {
       expect(registry.list()[0].resumeTargetIsSubagent).toBeUndefined()
     })
 
-    it('re-classifies resumeTargetIsSubagent when bindSession changes the resume target (both directions)', async () => {
+    // Both-directions coverage lives in
+    // test/unit/server/terminal-registry.rebind-metadata-resync.test.ts; this test
+    // uses a constant-false classifier mock (hermetic), so it exercises only the
+    // child->root clearing direction.
+    it('clears resumeTargetIsSubagent when bindSession retargets from child to root', async () => {
       const created = registry.create({
         mode: 'opencode',
         cwd: '/home/user/project',
@@ -3323,8 +3338,8 @@ describe('TerminalRegistry', () => {
         providerSettings: { opencodeServer: TEST_OPENCODE_SERVER },
       })
       // Rebind to a ROOT id: the fire-and-forget re-classification must clear
-      // the stale flag (no opencode.db here -> isOpencodeSubagentSession
-      // resolves false, which is exactly the root/unknown answer).
+      // the stale flag (classifier mocked constant-false — the root/unknown
+      // answer; hermetic: no worker thread, no host opencode.db read — kata ep0f).
       const bound = registry.bindSession(created.terminalId, 'opencode', 'ses_root0000000000000000000000', 'association')
       expect(bound.ok).toBe(true)
       await vi.waitFor(() => {

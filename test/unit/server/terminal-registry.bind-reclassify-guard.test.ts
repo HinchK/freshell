@@ -5,12 +5,14 @@ import * as pty from 'node-pty'
 import { isOpencodeSubagentSession } from '../../../server/coding-cli/providers/opencode-subagent-query.js'
 
 // This file exists SEPARATELY from terminal-registry.test.ts on purpose:
-// vi.mock is file-wide, and that file's re-classification test depends on the
-// REAL isOpencodeSubagentSession (missing-DB -> false). Here we need
-// controlled promise resolution to prove the out-of-order guard
+// vi.mock is file-wide. The main file's re-classification test now mocks the
+// classifier constant-false (hermetic, kata ep0f); HERE we need controlled,
+// deferred promise resolution to prove the out-of-order guard
 // (`current.resumeSessionId === normalized` in bindSession's re-classification
 // callback) drops a SLOW first classification that resolves after a SECOND
-// rebind has already changed the target.
+// rebind has already changed the target. Real-path classifier coverage (real
+// sqlite DBs, missing/garbage DB fast paths) lives in
+// test/unit/server/coding-cli/opencode-subagent-query.test.ts.
 vi.mock('../../../server/coding-cli/providers/opencode-subagent-query.js', () => ({
   isOpencodeSubagentSession: vi.fn(),
 }))
