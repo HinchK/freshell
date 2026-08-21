@@ -429,10 +429,12 @@ fn g_o1_opencode_fresh_explicit_model() {
     assert_eq!(launch.env.len(), 1);
 }
 
-/// G-O2 — opencode, fresh, no model, `GEMINI_API_KEY=k1` (env-key default
-/// model + GOOGLE_GENERATIVE_AI_API_KEY override).
+/// G-O2 — opencode, fresh, no model, `GEMINI_API_KEY=k1` — no `--model` is
+/// injected (kata 7mtf: the retired env-key heuristic guessed
+/// `google/gemini-3-pro-preview`, which outranked opencode's own MRU model);
+/// the `GOOGLE_GENERATIVE_AI_API_KEY` env aliasing still applies.
 #[test]
-fn g_o2_opencode_gemini_key_default_model_and_env_override() {
+fn g_o2_opencode_gemini_key_no_model_with_env_override() {
     let expected_tui_config = golden_rebind_tui_config();
     let mut inputs = opencode_inputs();
     inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
@@ -447,8 +449,6 @@ fn g_o2_opencode_gemini_key_default_model_and_env_override() {
             "127.0.0.1".to_string(),
             "--port".to_string(),
             "51234".to_string(),
-            "--model".to_string(),
-            "google/gemini-3-pro-preview".to_string(),
         ]
     );
     assert_eq!(
@@ -465,47 +465,135 @@ fn g_o2_opencode_gemini_key_default_model_and_env_override() {
     );
 }
 
-/// Opencode env-key default fallbacks: OPENAI, ANTHROPIC, none. Every case
-/// also carries the rebind injection (the env-only key never affects argv).
+/// Kata 7mtf regression — the retired env-key heuristic: a FRESH opencode
+/// spawn with NO explicit model must emit no `--model` flag no matter which
+/// provider API keys are present. The heuristic sniffed
+/// Google/OpenAI/Anthropic keys in the merged `{ parent ∪ commandEnv }` view
+/// and injected `google/gemini-3-pro-preview` / `openai/gpt-5` /
+/// `anthropic/claude-sonnet-4-5`, which outranked opencode's own MRU model
+/// state in every spawned pane. Sweep: no keys, each single key, all keys at
+/// once (parent env), and every key delivered through the manifest's
+/// `base_env` (the commandEnv half of the merge — the heuristic read the
+/// merged view, so both halves of the sweep are load-bearing).
 #[test]
-fn opencode_env_key_model_fallbacks() {
-    let expected_tui_config = golden_rebind_tui_config();
-    let inputs_with_rebind = || {
-        let mut inputs = opencode_inputs();
-        inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
-        inputs
+fn opencode_fresh_without_explicit_model_never_injects_env_key_model() {
+    const PROVIDER_KEYS: [&str; 5] = [
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ];
+    /// The exact bytes the heuristic used to inject — pinned so the test
+    /// names the regression, not just "some flag".
+    const GUESSED_MODELS: [&str; 3] = [
+        "google/gemini-3-pro-preview",
+        "openai/gpt-5",
+        "anthropic/claude-sonnet-4-5",
+    ];
+    let endpoint_only_argv = s(&["--hostname", "127.0.0.1", "--port", "51234"]);
+    let assert_no_model = |launch: &CliLaunch, case: &str| {
+        assert_eq!(
+            launch.args, endpoint_only_argv,
+            "{case}: fresh opencode without an explicit model must emit endpoint-only argv",
+        );
+        assert!(
+            !launch.args.iter().any(|a| a == "--model"),
+            "{case}: no --model flag allowed"
+        );
+        for guessed in GUESSED_MODELS {
+            assert!(
+                !launch.args.iter().any(|a| a == guessed),
+                "{case}: heuristic model {guessed} must not appear"
+            );
+        }
     };
-    let l1 = resolve_coding_cli_command(
-        &specs(),
-        &inputs_with_rebind(),
-        &env_of(&[("OPENAI_API_KEY", "x")]),
-    )
-    .unwrap()
-    .unwrap();
-    assert!(l1.args.contains(&"openai/gpt-5".to_string()));
-    assert_eq!(
-        l1.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
-        Some(expected_tui_config.as_str())
-    );
-    let l2 = resolve_coding_cli_command(
-        &specs(),
-        &inputs_with_rebind(),
-        &env_of(&[("ANTHROPIC_API_KEY", "x")]),
-    )
-    .unwrap()
-    .unwrap();
-    assert!(l2.args.contains(&"anthropic/claude-sonnet-4-5".to_string()));
-    assert_eq!(
-        l2.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
-        Some(expected_tui_config.as_str())
-    );
-    let l3 = resolve_coding_cli_command(&specs(), &inputs_with_rebind(), &env_of(&[]))
+
+    let mut cases: Vec<(String, Vec<(&str, &str)>)> =
+        vec![("no provider keys".to_string(), Vec::new())];
+    for key in PROVIDER_KEYS {
+        cases.push((format!("only {key}"), vec![(key, "k")]));
+    }
+    cases.push((
+        "every provider key".to_string(),
+        PROVIDER_KEYS.map(|k| (k, "k")).to_vec(),
+    ));
+    for (case, pairs) in cases {
+        let launch = resolve_coding_cli_command(&specs(), &opencode_inputs(), &env_of(&pairs))
+            .unwrap()
+            .unwrap();
+        assert_no_model(&launch, &case);
+    }
+
+    // commandEnv half of the merged view: provider keys arriving via
+    // `spec.base_env` must likewise not produce a model.
+    for key in PROVIDER_KEYS {
+        let mut all_specs = specs();
+        all_specs
+            .iter_mut()
+            .find(|sp| sp.name == "opencode")
+            .unwrap()
+            .base_env
+            .insert(key.to_string(), "k".to_string());
+        let launch = resolve_coding_cli_command(&all_specs, &opencode_inputs(), &env_of(&[]))
+            .unwrap()
+            .unwrap();
+        assert_no_model(&launch, &format!("{key} via base_env"));
+    }
+}
+
+/// Kata 7mtf passthrough pin: an EXPLICIT model still emits `--model` even
+/// with every provider key in the env, and a RESUME emits no `--model` even
+/// with an explicit model requested (both pre-existing rules; they must
+/// survive the heuristic's removal).
+#[test]
+fn opencode_model_flag_only_from_explicit_model_on_fresh_launch() {
+    let all_keys: Vec<(&str, &str)> = [
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ]
+    .map(|k| (k, "k"))
+    .to_vec();
+
+    // Explicit model + armed env → exact `--model` pair.
+    let mut fresh = opencode_inputs();
+    fresh.model = Some("umans-ai-coding-plan/umans-kimi-k2.7");
+    let launch = resolve_coding_cli_command(&specs(), &fresh, &env_of(&all_keys))
         .unwrap()
         .unwrap();
-    assert_eq!(l3.args, s(&["--hostname", "127.0.0.1", "--port", "51234"]));
     assert_eq!(
-        l3.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
-        Some(expected_tui_config.as_str())
+        launch.args,
+        s(&[
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "51234",
+            "--model",
+            "umans-ai-coding-plan/umans-kimi-k2.7"
+        ]),
+        "explicit model must pass through unchanged with an armed env"
+    );
+
+    // Resume + armed env (no explicit model) → no model args at all.
+    let mut resume = opencode_inputs();
+    resume.resume_session_id = Some("ses_regress");
+    let launch = resolve_coding_cli_command(&specs(), &resume, &env_of(&all_keys))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        launch.args,
+        s(&[
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "51234",
+            "--session",
+            "ses_regress"
+        ]),
+        "resume must stay model-free with an armed env"
     );
 }
 

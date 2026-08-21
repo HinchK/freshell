@@ -39,7 +39,7 @@ import type {
   TerminalSessionUnboundEvent,
   TerminalSubagentClassifiedEvent,
 } from './terminal-stream/registry-events.js'
-import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
+import { getOpencodeEnvOverrides } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
 // Stage 1a (plan §6, panel m8): a codex resume pty is a process-GROUP registration (pgid == pid),
@@ -352,10 +352,11 @@ function resolveCodingCliCommand(
       String(endpoint.port),
     )
   }
-  const effectiveModel = mode === 'opencode'
-    ? (resumeSessionId
-        ? undefined
-        : resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv }))
+  // Opencode resume never carries --model; a fresh opencode spawn carries
+  // --model only for an explicit model (kata 7mtf: the env-key heuristic was
+  // removed — it outranked opencode's own MRU model state in every pane).
+  const effectiveModel = mode === 'opencode' && resumeSessionId
+    ? undefined
     : providerSettings?.model
   if (effectiveModel && spec.modelArgs) {
     settingsArgs.push(...spec.modelArgs(effectiveModel))

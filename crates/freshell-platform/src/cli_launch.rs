@@ -313,27 +313,6 @@ pub fn get_opencode_env_overrides(
     overrides
 }
 
-/// `resolveOpencodeLaunchModel` (`server/opencode-launch.ts:20-29`).
-pub fn resolve_opencode_launch_model(
-    explicit_model: Option<&str>,
-    parent: &dyn Env,
-    command_env: &BTreeMap<String, String>,
-) -> Option<String> {
-    if let Some(m) = explicit_model.filter(|m| !m.is_empty()) {
-        return Some(m.to_string());
-    }
-    if resolve_google_api_key(parent, command_env).is_some() {
-        return Some("google/gemini-3-pro-preview".to_string());
-    }
-    if merged_env_truthy(parent, command_env, "OPENAI_API_KEY").is_some() {
-        return Some("openai/gpt-5".to_string());
-    }
-    if merged_env_truthy(parent, command_env, "ANTHROPIC_API_KEY").is_some() {
-        return Some("anthropic/claude-sonnet-4-5".to_string());
-    }
-    None
-}
-
 /// A minimal `new URL(wsUrl)` stand-in for the codex `--remote` validation
 /// (`terminal-registry.ts:297-305`): returns `(protocol_with_colon, hostname)`
 /// or `None` when the parse would throw. Faithful for every live input (the
@@ -526,12 +505,15 @@ pub fn resolve_coding_cli_command(
         settings_args.push("--port".to_string());
         settings_args.push(port.to_string());
     }
-    let effective_model: Option<String> = if inputs.mode == "opencode" {
-        if inputs.resume_session_id.filter(|s| !s.is_empty()).is_some() {
-            None
-        } else {
-            resolve_opencode_launch_model(inputs.model, env, &command_env)
-        }
+    // Opencode resume never carries `--model`; a FRESH opencode spawn carries
+    // `--model` only for an explicit model (kata 7mtf: the removed env-key
+    // heuristic guessed a model from provider API keys, which outranked
+    // opencode's own MRU model state — `opencode-launch.ts` likewise no
+    // longer resolves one).
+    let effective_model: Option<String> = if inputs.mode == "opencode"
+        && inputs.resume_session_id.filter(|s| !s.is_empty()).is_some()
+    {
+        None
     } else {
         inputs.model.filter(|m| !m.is_empty()).map(str::to_string)
     };
