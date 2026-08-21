@@ -31,15 +31,21 @@ const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'server/index.ts']",
-  "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
+  "  const { logger } = await import('./server/logger.ts')",
+  // Stream-routed, process-specific proof line. Emitted at info level: the
+  // tests using this probe already require info enabled because the resolved-
+  // path marker is info-gated. No self-exit timer — the child idles until the
+  // harness's afterEach stopProcess kills it, so the rotating stream's async
+  // open always wins before the proof line must be durable (a timed exit
+  // here was the exact exit-before-stream-open race that flaked the marker).
+  "  logger.info('stream-write-proof instance=' + (process.env.FRESHELL_LOG_INSTANCE_ID || process.env.FRESHELL_DEBUG_STREAM_INSTANCE || 'unknown'))",
   '})()',
 ].join('\n')
 const DIST_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'dist/server/index.js']",
-  "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
+  "  const { logger } = await import('./server/logger.ts')",
+  "  logger.info('stream-write-proof instance=' + (process.env.FRESHELL_LOG_INSTANCE_ID || process.env.FRESHELL_DEBUG_STREAM_INSTANCE || 'unknown'))",
   '})()',
 ].join('\n')
 const LOG_LEVEL_PROBE = [
@@ -214,6 +220,12 @@ describe('debug log separation', () => {
         const distPath = path.join(logDir, 'server-debug.production.dist-mode.jsonl')
         await waitForFileContent(devPath, /Resolved debug log path/)
         await waitForFileContent(distPath, /Resolved debug log path/)
+        // Stream-routed proof: the marker above lands via a synchronous
+        // out-of-band append, so it cannot prove the per-process rotating
+        // stream actually opened and wrote to this file. Require one record
+        // that went through pino's multistream in each destination instead.
+        await waitForFileContent(devPath, /stream-write-proof instance=source-mode/)
+        await waitForFileContent(distPath, /stream-write-proof instance=dist-mode/)
 
         expect(devPath).toContain('server-debug.development.source-mode.jsonl')
         expect(distPath).toContain('server-debug.production.dist-mode.jsonl')
@@ -247,6 +259,13 @@ describe('debug log separation', () => {
         const pathB = path.join(logDir, 'server-debug.development.concurrent-b.jsonl')
         await waitForFileContent(pathA, /Resolved debug log path/)
         await waitForFileContent(pathB, /Resolved debug log path/)
+        // Stream-routed proof: each concurrent process must put a record
+        // through its own pino multistream, and neither file may contain the
+        // other process's record.
+        const contentA = await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/)
+        const contentB = await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/)
+        expect(contentA).not.toContain('instance=concurrent-b')
+        expect(contentB).not.toContain('instance=concurrent-a')
 
         expect(pathA).toContain('server-debug.development.concurrent-a.jsonl')
         expect(pathB).toContain('server-debug.development.concurrent-b.jsonl')
@@ -280,6 +299,10 @@ describe('debug log separation', () => {
         const pathB = path.join(logDir, 'server-debug.production.ci-run-beta.jsonl')
         await waitForFileContent(pathA, /Resolved debug log path/)
         await waitForFileContent(pathB, /Resolved debug log path/)
+        // Stream-routed proof: one record through pino's multistream per process.
+        await waitForFileContent(pathA, /stream-write-proof instance=alpha/)
+        await waitForFileContent(pathB, /stream-write-proof instance=ci-run-beta/)
+
         expect(pathA).toContain('server-debug.development.alpha.jsonl')
         expect(pathB).toContain('server-debug.production.ci-run-beta.jsonl')
       })
@@ -346,7 +369,7 @@ describe('debug log separation', () => {
           REPO_ROOT,
         )
         activeProcesses.push(proc)
-        await once(proc.process, 'exit')
+        const [exitCode] = await once(proc.process, 'exit')
 
         const markerPath = path.join(logDir, 'server-debug.development.immediate-exit.jsonl')
         const content = await fsp.readFile(markerPath, 'utf8').catch(() => '')
@@ -358,6 +381,9 @@ describe('debug log separation', () => {
           debugMode: 'development',
           debugInstance: 'immediate-exit',
         })
+        // The child completed the import and reached its explicit exit —
+        // not a crash after the synchronous marker write.
+        expect(exitCode).toBe(0)
       })
     },
   )
