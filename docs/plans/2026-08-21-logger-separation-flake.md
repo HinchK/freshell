@@ -51,7 +51,7 @@ Fix the flaky integration test `test/integration/server/logger.separation.test.t
 Part A — unit test (in `test/unit/server/logger.test.ts`): first merge any missing imports (`readFileSync` and `existsSync` from `node:fs`, `fsp` from `node:fs/promises`, `os` from `node:os`, `path` from `node:path`) into the file's import block — skip any already present. Then append a new `describe` at the end of the file's existing top-level `describe`, reusing the file's existing `vi.resetModules()`-in-`beforeEach` + dynamic re-import convention:
 
 ```ts
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
