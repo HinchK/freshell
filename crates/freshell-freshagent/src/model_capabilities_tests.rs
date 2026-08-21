@@ -323,11 +323,11 @@ async fn non_opencode_session_types_serve_static_catalogs() {
                 "fetchedAt": 1_000,
                 "models": [
                     {
-                        "id": "claude-opus-4-6",
-                        "displayName": "Claude Opus 4.6",
+                        "id": "opus[1m]",
+                        "displayName": "Claude Opus 5 (1M context)",
                         "provider": "claude",
                         "supportsEffort": true,
-                        "supportedEffortLevels": ["low", "medium", "high"],
+                        "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
                         "supportsAdaptiveThinking": true,
                     },
                 ],

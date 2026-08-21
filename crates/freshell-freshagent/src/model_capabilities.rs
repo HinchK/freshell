@@ -366,9 +366,9 @@ fn static_models(session_type: SessionType) -> Vec<ModelCapability> {
         // DEVIATION (module doc): Node probes the Claude SDK `supportedModels()`
         // for the claude providers; the Rust port serves the shared static table.
         SessionType::FreshClaude | SessionType::Kilroy => &[(
-            "claude-opus-4-6",
-            "Claude Opus 4.6",
-            &["low", "medium", "high"],
+            "opus[1m]",
+            "Claude Opus 5 (1M context)",
+            &["low", "medium", "high", "xhigh", "max"],
         )],
         SessionType::FreshOpencode => &[],
     };
