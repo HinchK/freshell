@@ -53,7 +53,7 @@ Key verified facts (proven by mechanism + strategy reports in `.worktrees/.the-u
 
 1. **No production changes.** Both fixes are test-file-only edits. If a fix seems to need a `server/` change, stop and surface.
 2. **Never widen timing budgets to "fix" a flake.** Logger: no bump to `FILE_CONTENT_TIMEOUT_MS` or probe delays; Registry: no bump to the `vi.waitFor` timeout. (Rejected hypotheses per strategy doc.)
-3. **No raw `npx vitest`.** All vitest via `npm run test:vitest -- run <file> [--config config/vitest/vitest.server.config.ts]`; broad runs via `npm test` (coordinator). Env backends: cloud default (unset); do NOT export overrides.
+3. **No raw `npx vitest`.** All vitest via `npm run test:vitest -- run <file> [--config config/vitest/vitest.server.config.ts]`; broad runs via `npm test` (coordinator). Env backends: unset means LOCAL (repo dispatch selects cloud only when FRESHELL_VITEST_BACKEND/FRESHELL_E2E_BACKEND=cloud). The final full-suite gate pins cloud EXPLICITLY (`FRESHELL_VITEST_BACKEND=cloud npm test`) because full-suite local runs on this heavily-loaded multi-agent host are themselves flake-lotteries; the scratch base-gate validated cloud green at a clean origin/main.
 4. **Process safety:** induced-load burners use individually-timeout-capped recording PIDs; stop via recorded PIDs only; no pkill patterns, no foreign-process kills.
 5. **No behavior loss:** keep both-directions coverage claims honest (registry sibling files), keep the `concurrent launches` logger test truly concurrent, keep real-path classifier coverage in `opencode-subagent-query.test.ts`.
 6. **Do not touch the other ep0f families** (remote-proxy, opencode-serve-manager, codex-session-flow) — tracked for later episodes.
@@ -79,7 +79,7 @@ Skill protocols in this plan are fixed by reference (the-usual-beta at `~/.confi
 
 **Test plan (inverted TDD):**
 - RED: under induced load (Task 3 recipe), loop the focused test until a `Timed out in waitFor!` failure (expect within ~10 iterations at loadavg ≥ 50). Fallback RED: kata ep0f recorded failure + the 222ms-vs-1000ms margin measurement (both documented). Capture log into the run ledger.
-- GREEN: post-fix, same focused command ×50 under load — all pass, first-poll resolution; full file ×5 under load + ×1 quiet; sibling files ×3 each under load.
+- GREEN: post-fix, same focused command ×50 under load — all pass, resolving within one waitFor interval; full file ×5 under load + ×1 quiet; sibling files ×3 each under load.
 
 **Steps:**
 - [x] Read `test/unit/server/terminal-registry.test.ts` around :3293-3336 and the two sibling mock blocks; verify the strategy's audit (no other classifier consumer).
@@ -104,6 +104,7 @@ Skill protocols in this plan are fixed by reference (the-usual-beta at `~/.confi
 - [ ] Commit 2a: `test(logger.separation): dump logDir listing+sizes on content-wait timeouts (kata ep0f)`
 - [ ] **2b:** rewrite all three probes: source/dist poll for their own `resolveDebugLogPath()` output containing `Resolved debug log path`; log-level probe polls its `LOG_DEBUG_PATH` file for `error-level console and file`. Poll interval ~100ms, cap ~10s; on cap expiry write `PROBE-FATAL: record never landed in <path>` to stderr and `process.exit(1)`; on success `process.exit(0)`. No extra output on success (preserve the negative-output assertions at :175-178).
 - [ ] Use `Promise.all` for the two sequential file waits in the failing test (halves worst-case gate burn) — neutral to correctness.
+- [ ] Make the GREEN criterion observable in-test: in each multi-probe test, after the content waits pass, poll each probe's `proc.process.exitCode !== null` (up to 5s), assert `exitCode === 0`, and assert `proc.readOutput()` (harness-captured stdout+stderr) contains no `PROBE-FATAL`. (Prior wording — 'no PROBE-FATAL in any server.log' — was unobservable: afterEach deletes the stderr dirs before any check could run; green would have been a phantom.)
 - [ ] Commit 2b: `test(logger.separation): probes exit only after their debug record is on disk — kills exit-before-flush race (kata ep0f)`
 
 **Risks:** probe string edits compile through the same tsx `-e` pipeline; 10s cap sits far under the 120s test budget; the only new failure mode is an informative `PROBE-FATAL` (gate burns once with diagnostics attached).
@@ -111,19 +112,21 @@ Skill protocols in this plan are fixed by reference (the-usual-beta at `~/.confi
 ### Task 3: verification gauntlet + close-out (no new code)
 
 **Steps:**
-- [ ] Load recipe: `for i in $(seq 1 48); do timeout 3600 bash -c 'while :; do :; done' & echo $! >> /tmp/ep0f-burners.pids; done` (self-terminating ≤60min each); plus 3–4 parallel focused vitest lanes for the two suites. Record PIDs in the run ledger; stop ONLY via those PIDs.
+- [ ] Load recipe: `BURN_PIDFILE=$(mktemp /tmp/ep0f-burners-XXXXXX.pids)` (fresh unique file per session; path recorded in the run ledger); `for i in $(seq 1 48); do timeout 3600 bash -c 'while :; do :; done' & echo $! >> "$BURN_PIDFILE"; done` (each burner individually self-terminating ≤60min); plus 3–4 parallel focused vitest lanes. Cleanup is a separate explicit step below: kill ONLY PIDs listed in $BURN_PIDFILE, each ownership-checked via `ps -fp` (must show our `while :; do :; done` bash) before signaling.
 - [ ] Execute RED (Task 1 before Task 1's edit; Task 2 after 2a, before 2b) — capture into `.worktrees/.the-usual-logs/ep0f-deflake/`.
 - [ ] Execute GREEN per task specs.
 - [ ] Re-stress both suites back-to-back post-Task-2 (full sequence once more under load).
-- [ ] `npm run test:status` → coordinated full suite at final HEAD (cloud default backend). Also run the unit default config (registry file lives there) coverage via `npm run test:unit` in cloud (or per coordinator defaults).
-- [ ] `npm run lint` on changed files; `npx tsc --noEmit` (or repo typecheck) on the test files.
-- [ ] Update kata ep0f: comment the two fixes + receipts; body acceptance note that these two families are closed pending sustained green runs; kotlin leave remote-proxy/opencode-serve/codex-flow rows open.
+- [ ] Cleanup: ownership-checked kill of all burner PIDs from $BURN_PIDFILE BEFORE the final full-suite gate; confirm load decay via `uptime`; remove the pidfile.
+- [ ] Coordinated full suite at final HEAD with the backend pinned explicitly: `FRESHELL_VITEST_BACKEND=cloud npm test`. Ledger records the pinned env + coordinator holder/test receipts.
+- [ ] Honest type/lint verification: `npm run lint` covers only `src/**` (not tests) — run it as an unchanged-guard sanity. Real typecheck of the two changed test files via a temp tsconfig extending tsconfig.server.json whose include lists those two files (`npx tsc --noEmit -p tsconfig.ep0f-spot.json`, temp file deleted after; expected clean).
+- [ ] Update kata ep0f: comment the two fixes + receipts; note in the kata that these two families are fixed pending sustained green runs; leave remote-proxy/opencode-serve/codex-flow rows tracked-open.
 - [ ] Executed marker + recap + outcome block (the-usual-beta format; focused-loop accounting only if it ran).
+- [ ] Landing sequence (User Request requires a PR per repo rules): push `the-usual/ep0f-deflake` with full provenance AFTER the run converges; notify the user the branch is PR-ready and STOP for explicit approval; only after approval `gh pr create` target main (danshapiro account), watch required checks green, merge per repo policy (self-merge), fast-forward local main, retire worktree+branch per the merge checklist. The push and PR-approval blocks are mandatory; the plan is not 'done' at gate green.
 
 ## Success Criteria
 
 1. Logger probes cannot exit before their own record lands on disk (termination condition = the test's own assertion).
-2. Registry :3317 test no longer spawns worker threads or touches the host opencode DB; first `waitFor` poll passes.
+2. Registry :3317 test no longer spawns worker threads or touches the host opencode DB; the waitFor condition passes on its first interval evaluation (~50ms). Honesty note (round-1 Minor): vi.waitFor's initial synchronous evaluation may still observe the stale flag because the mock's resolve lands one microtask later — the condition is then constant and time-independent of host load, which is the actual acceptance property.
 3. Focused suites green repeatedly under induced load (×50 / ×5 / ×20) + full-file passes quiet.
 4. Coordinated full suite green at final HEAD (cloud backend; any surviving failure must be a DIFFERENT ep0f-family flake and gets ledgered, not fixed here).
 5. Lint/types clean; kata ep0f advanced; zero production-file changes in the final diff.
