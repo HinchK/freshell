@@ -612,8 +612,23 @@ describe("logger", () => {
         expect(parsed.debugInstance).toBeDefined()
         expect(parsed).not.toHaveProperty('pid')
         expect(parsed).not.toHaveProperty('hostname')
+        // env is captured at module import via `NODE_ENV || 'development'`;
+        // this test never touches NODE_ENV between import and assertion.
+        expect(parsed.env).toBe(process.env.NODE_ENV || 'development')
+        // version mirrors the appVersion rule: JSON.stringify drops an
+        // undefined version, so under 'test' env without explicit
+        // npm_package_version/APP_VERSION the key is absent, not null.
+        const explicitVersion = process.env.npm_package_version || process.env.APP_VERSION
+        if (explicitVersion) {
+          expect(parsed.version).toBe(explicitVersion)
+        } else if ((process.env.NODE_ENV || 'development') === 'test') {
+          expect(parsed).not.toHaveProperty('version')
+        } else {
+          expect(typeof parsed.version).toBe('string')
+        }
       } finally {
         delete process.env.LOG_DEBUG_PATH
+        await fsp.rm(dir, { recursive: true, force: true })
       }
     })
 
@@ -632,6 +647,7 @@ describe("logger", () => {
       } finally {
         delete process.env.LOG_DEBUG_PATH
         delete process.env.LOG_LEVEL
+        await fsp.rm(dir, { recursive: true, force: true })
       }
     })
   })
