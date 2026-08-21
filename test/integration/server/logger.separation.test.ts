@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -22,6 +23,9 @@ const DEFAULT_TEST_TIMEOUT_MS = 120_000
 // which filename was chosen, never about how fast). A cold `tsx` start under
 // full-suite shard contention on a shared Cloud Run vCPU exceeded the old 5s
 // gate (observed 2026-08-18, execution freshell-vitest-l68jz); unify at 30s.
+// Since 2026-08-21 the resolved-path receipt is appended synchronously by
+// createLogger(), so marker durability no longer depends on this wait — it
+// only covers the stream-routed content lines.
 const FILE_CONTENT_TIMEOUT_MS = 30_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
@@ -307,6 +311,52 @@ describe('debug log separation', () => {
         expect(startupPayload).toMatchObject({
           debugMode: 'production',
           debugInstance: 'ci-run-1',
+        })
+      })
+    },
+  )
+
+  it(
+    'keeps the resolved-path receipt durable when the process exits immediately after import',
+    { timeout: DEFAULT_TEST_TIMEOUT_MS },
+    async () => {
+      await withLogDir(async (logDir) => {
+        // The red lever: NO post-import timer at all — the child exits on the
+        // first macrotask after the import resolves, so rotating-file-stream's
+        // async open can never win. Pre-fix this is 100% red on any machine;
+        // post-fix the synchronous receipt makes it 100% green.
+        const IMMEDIATE_EXIT_PROBE = [
+          '(async () => {',
+          "  process.argv = ['node', 'server/index.ts']",
+          "  await import('./server/logger.ts')",
+          '  process.exit(0)',
+          '})()',
+        ].join('\n')
+        const proc = await startServerProcess(
+          [process.execPath, getTSXCLI(), '-e', IMMEDIATE_EXIT_PROBE],
+          {
+            FRESHELL_LOG_DIR: logDir,
+            FRESHELL_LOG_INSTANCE_ID: 'immediate-exit',
+            NODE_ENV: 'development',
+            // The harness does not scrub ambient LOG_LEVEL; the marker is
+            // info-level, so an operator's LOG_LEVEL=warn would suppress it
+            // and keep this test red. Pin the supported default instead.
+            LOG_LEVEL: 'debug',
+          },
+          REPO_ROOT,
+        )
+        activeProcesses.push(proc)
+        await once(proc.process, 'exit')
+
+        const markerPath = path.join(logDir, 'server-debug.development.immediate-exit.jsonl')
+        const content = await fsp.readFile(markerPath, 'utf8').catch(() => '')
+        expect(content).toContain('Resolved debug log path')
+
+        const startupPayload = parseStartupLogPayload(content)
+        expect(startupPayload).not.toBeNull()
+        expect(startupPayload).toMatchObject({
+          debugMode: 'development',
+          debugInstance: 'immediate-exit',
         })
       })
     },

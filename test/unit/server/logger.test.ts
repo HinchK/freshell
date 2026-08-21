@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
+import { existsSync, readFileSync } from 'node:fs'
 import os from "os"
 import path from "path"
 import fsp from "fs/promises"
@@ -580,5 +581,58 @@ describe("logger", () => {
       },
       TEST_TIMEOUT_MS,
     )
+  })
+
+  describe('startup debug marker durability', () => {
+    it('writes the resolved-path marker synchronously during logger construction', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-logger-marker-'))
+      const debugPath = path.join(dir, 'debug.jsonl')
+      delete process.env.LOG_LEVEL
+      process.env.LOG_DEBUG_PATH = debugPath
+      try {
+        await import("../../../server/logger")
+        // No waiting: the receipt must be durable before createLogger() returns.
+        // Pre-fix the marker only sat buffered in the lazily-opened rotating
+        // stream, so this file is missing or empty at this point.
+        const content = readFileSync(debugPath, 'utf8')
+        const line = content
+          .split(/\r?\n/)
+          .find((l) => l.includes('Resolved debug log path'))
+        expect(line).toBeDefined()
+        const parsed = JSON.parse(line as string)
+        expect(parsed).toMatchObject({
+          msg: 'Resolved debug log path',
+          level: 30,
+          severity: 'info',
+          app: 'freshell',
+          filePath: debugPath,
+        })
+        expect(typeof parsed.time).toBe('string')
+        expect(parsed.debugMode).toBeDefined()
+        expect(parsed.debugInstance).toBeDefined()
+        expect(parsed).not.toHaveProperty('pid')
+        expect(parsed).not.toHaveProperty('hostname')
+      } finally {
+        delete process.env.LOG_DEBUG_PATH
+      }
+    })
+
+    it('respects info-level suppression for the marker', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-logger-marker-suppressed-'))
+      const debugPath = path.join(dir, 'debug.jsonl')
+      process.env.LOG_DEBUG_PATH = debugPath
+      process.env.LOG_LEVEL = 'warn'
+      try {
+        await import("../../../server/logger")
+        // The file may not exist yet: at warn level nothing is written
+        // synchronously, and the lazily-opened stream may never have landed.
+        // Absence IS the suppressed outcome — only guard content if present.
+        const content = existsSync(debugPath) ? readFileSync(debugPath, 'utf8') : ''
+        expect(content).not.toContain('Resolved debug log path')
+      } finally {
+        delete process.env.LOG_DEBUG_PATH
+        delete process.env.LOG_LEVEL
+      }
+    })
   })
 })
