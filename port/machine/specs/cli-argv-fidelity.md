@@ -301,11 +301,11 @@ Order: `[providerArgs..., settingsArgs..., resumeArgs...]`.
 4. **Model (`settingsArgs`)** — `['--model', <model>]` (`extensions/opencode/freshell.json:11`)
    with opencode-specific effective-model logic (`terminal-registry.ts:340-347`):
    - resuming (`resumeSessionId` truthy) → **no model arg ever**;
-   - fresh: `providerSettings.model` if set, else
-     `resolveOpencodeLaunchModel` (`opencode-launch.ts:20-29`) picks by env:
-     Google key → `'google/gemini-3-pro-preview'`; else `OPENAI_API_KEY` →
-     `'openai/gpt-5'`; else `ANTHROPIC_API_KEY` → `'anthropic/claude-sonnet-4-5'`;
-     else no arg.
+   - fresh: `providerSettings.model` if set, else **no arg**. Kata 7mtf
+     removed the old env-key heuristic (`resolveOpencodeLaunchModel`, which
+     guessed Google/OpenAI/Anthropic models from API keys); the injected flag
+     outranked opencode's own MRU model state, so a fresh spawn now leaves
+     model selection to opencode.
 5. **Sandbox / permission mode** — no `sandboxArgs`/`permissionModeArgs` in the
    opencode manifest → no args regardless of settings.
 6. **Resume (`resumeArgs`)** — iff `resumeSessionId`:
@@ -316,9 +316,9 @@ Order: `[providerArgs..., settingsArgs..., resumeArgs...]`.
 
 **Full opencode argv (unix, fresh, GEMINI_API_KEY set, no explicit model):**
 ```
-[ '--hostname', '127.0.0.1', '--port', '<port>',
-  '--model', 'google/gemini-3-pro-preview' ]
+[ '--hostname', '127.0.0.1', '--port', '<port>' ]
 ```
+(post-kata-7mtf: no heuristic `--model`; opencode's own MRU/default applies)
 plus env `GOOGLE_GENERATIVE_AI_API_KEY=<key>`, plus the `<cwd>/.opencode/opencode.json`
 side-effect. Note argv contains **no MCP flags** for opencode.
 
@@ -472,9 +472,11 @@ Extend the existing pure builders; keep IO (file writes, port allocation) out.
    - claude: `["--settings", <compact JSON per §2.1(1)>]` (`tr:216-238`) —
      build with `serde_json` compact serialization; the bell strings are `const`s
      with unit tests pinning the exact bytes.
-   Opencode model default: port `resolveOpencodeLaunchModel` + `getOpencodeEnvOverrides`
-   (`ol:1-29`) as pure functions over `&dyn Env` (the env source is
-   `parent ∪ commandEnv`, `tr:293,343`).
+   Opencode env aliasing: port `getOpencodeEnvOverrides` (`ol:1-19`) as a pure
+   function over `&dyn Env` (the env source is `parent ∪ commandEnv`,
+   `tr:293,343`). The `resolveOpencodeLaunchModel` env-key model heuristic was
+   removed by kata 7mtf — a fresh opencode spawn emits `--model` only for an
+   explicit `providerSettings.model`; a resume never does (§2.3 item 4).
 4. **`build_cli_spawn_spec` / `build_windows_cli_spawn_spec`
    (`spawn.rs:505-527,550-650`)**: no ordering changes needed — they already
    append `launch.args` verbatim and layer `launch.env`; they inherit fidelity

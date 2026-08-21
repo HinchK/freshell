@@ -69,10 +69,9 @@ pub enum WindowsExe {
 // ===========================================================================
 pub use crate::cli_launch::{
     claude_settings_json, get_opencode_env_overrides, resolve_cli_launch,
-    resolve_coding_cli_command, resolve_opencode_launch_model, CliCommandSpec, CliLaunch,
-    CliLaunchError, CliLaunchInputs, LaunchIntent, McpInjection, ProviderTarget,
-    CLAUDE_BELL_COMMAND_UNIX, CLAUDE_BELL_COMMAND_WINDOWS, CODEX_MANAGED_REMOTE_CONFIG_ARGS,
-    CODEX_TUI_NOTIFICATION_ARGS,
+    resolve_coding_cli_command, CliCommandSpec, CliLaunch, CliLaunchError, CliLaunchInputs,
+    LaunchIntent, McpInjection, ProviderTarget, CLAUDE_BELL_COMMAND_UNIX,
+    CLAUDE_BELL_COMMAND_WINDOWS, CODEX_MANAGED_REMOTE_CONFIG_ARGS, CODEX_TUI_NOTIFICATION_ARGS,
 };
 
 /// The resolved shell spawn specification (shell mode).

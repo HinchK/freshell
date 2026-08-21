@@ -1128,7 +1128,7 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).not.toContain('google/gemini-3-pro-preview')
     })
 
-    it('defaults OpenCode to a usable Google model and alias env when only GEMINI_API_KEY is set', () => {
+    it('keeps the GOOGLE_GENERATIVE_AI_API_KEY alias but injects no model when only GEMINI_API_KEY is set (kata 7mtf)', () => {
       delete process.env.OPENCODE_CMD
       delete process.env.GOOGLE_GENERATIVE_AI_API_KEY
       delete process.env.GOOGLE_API_KEY
@@ -1140,9 +1140,94 @@ describe('buildSpawnSpec Unix paths', () => {
         opencodeServer: TEST_OPENCODE_SERVER,
       })
 
-      expect(spec.args).toContain('--model')
-      expect(spec.args).toContain('google/gemini-3-pro-preview')
+      expect(spec.args).not.toContain('--model')
+      expect(spec.args).not.toContain('google/gemini-3-pro-preview')
       expect(spec.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-key')
+    })
+
+    // Kata 7mtf: the retired resolveOpencodeLaunchModel heuristic sniffed
+    // provider API keys in { ...process.env, ...commandEnv } and injected a
+    // guessed --model (google/gemini-3-pro-preview / openai/gpt-5 /
+    // anthropic/claude-sonnet-4-5) into EVERY fresh opencode pane, which
+    // outranked opencode's own MRU model state. A fresh spawn without an
+    // explicit model must now emit no --model flag no matter which provider
+    // keys are armed; opencode decides the model itself.
+    describe('opencode launches never inject a heuristic model (kata 7mtf)', () => {
+      const ALL_PROVIDER_KEYS = [
+        'GOOGLE_GENERATIVE_AI_API_KEY',
+        'GEMINI_API_KEY',
+        'GOOGLE_API_KEY',
+        'OPENAI_API_KEY',
+        'ANTHROPIC_API_KEY',
+      ]
+      const GUESSED_MODELS = [
+        'google/gemini-3-pro-preview',
+        'openai/gpt-5',
+        'anthropic/claude-sonnet-4-5',
+      ]
+
+      beforeEach(() => {
+        delete process.env.OPENCODE_CMD
+        // Hermetic: process.env is restored from the REAL shell env after
+        // each test, and this host arms provider keys — clear them all.
+        for (const key of ALL_PROVIDER_KEYS) delete process.env[key]
+      })
+
+      for (const onlyKey of [...ALL_PROVIDER_KEYS, undefined]) {
+        it(`fresh spawn with ${onlyKey ? `only ${onlyKey}` : 'no provider keys'} emits no --model`, () => {
+          if (onlyKey) process.env[onlyKey] = 'key'
+
+          const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+            opencodeServer: TEST_OPENCODE_SERVER,
+          })
+
+          expect(spec.args).not.toContain('--model')
+          for (const guessed of GUESSED_MODELS) expect(spec.args).not.toContain(guessed)
+          // The endpoint pair is always present — the spawn still resolves.
+          expect(spec.args).toContain('--hostname')
+          expect(spec.args).toContain('127.0.0.1')
+          expect(spec.args).toContain('--port')
+        })
+      }
+
+      it('fresh spawn with every provider key armed emits no --model', () => {
+        for (const key of ALL_PROVIDER_KEYS) process.env[key] = 'key'
+
+        const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+          opencodeServer: TEST_OPENCODE_SERVER,
+        })
+
+        expect(spec.args).not.toContain('--model')
+        for (const guessed of GUESSED_MODELS) expect(spec.args).not.toContain(guessed)
+      })
+
+      it('fresh spawn with an explicit model passes it through even with every provider key armed', () => {
+        for (const key of ALL_PROVIDER_KEYS) process.env[key] = 'key'
+
+        const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+          model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+          opencodeServer: TEST_OPENCODE_SERVER,
+        })
+
+        expect(spec.args).toContain('--model')
+        expect(spec.args).toContain('umans-ai-coding-plan/umans-kimi-k2.7')
+        for (const guessed of GUESSED_MODELS) expect(spec.args).not.toContain(guessed)
+      })
+
+      it('resume spawn emits no --model even with an explicit model and every provider key armed', () => {
+        for (const key of ALL_PROVIDER_KEYS) process.env[key] = 'key'
+
+        const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', 'ses_existing', {
+          model: 'openai/gpt-5-mini',
+          opencodeServer: TEST_OPENCODE_SERVER,
+        })
+
+        expect(spec.args).toContain('--session')
+        expect(spec.args).toContain('ses_existing')
+        expect(spec.args).not.toContain('--model')
+        expect(spec.args).not.toContain('openai/gpt-5-mini')
+        for (const guessed of GUESSED_MODELS) expect(spec.args).not.toContain(guessed)
+      })
     })
 
     it('does not set OPENCODE_PERMISSION for OpenCode when permission mode is provided', () => {
