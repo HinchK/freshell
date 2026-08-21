@@ -34,10 +34,13 @@ const SOURCE_LOGGER_PROBE = [
   "  const { logger } = await import('./server/logger.ts')",
   // Stream-routed, process-specific proof line. Emitted at info level: the
   // tests using this probe already require info enabled because the resolved-
-  // path marker is info-gated. No self-exit timer — the child idles until the
-  // harness's afterEach stopProcess kills it, so the rotating stream's async
-  // open always wins before the proof line must be durable (a timed exit
-  // here was the exact exit-before-stream-open race that flaked the marker).
+  // path marker is info-gated. No self-exit timer: the proof line is written
+  // through the rotating stream before the event loop can drain (the pending
+  // stream open/write keeps Node alive until it lands), then the child exits
+  // naturally — an open file descriptor alone does not keep the loop alive,
+  // and the harness's afterEach stopProcess remains as a harmless backstop.
+  // A timed exit here was the exact exit-before-stream-open race that flaked
+  // the marker.
   "  logger.info('stream-write-proof instance=' + (process.env.FRESHELL_LOG_INSTANCE_ID || process.env.FRESHELL_DEBUG_STREAM_INSTANCE || 'unknown'))",
   '})()',
 ].join('\n')
@@ -262,8 +265,14 @@ describe('debug log separation', () => {
         // Stream-routed proof: each concurrent process must put a record
         // through its own pino multistream, and neither file may contain the
         // other process's record.
-        const contentA = await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/)
-        const contentB = await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/)
+        await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/)
+        await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/)
+        // Fresh re-reads AFTER both proof waits: the wait's returned content
+        // is a snapshot taken before the other process finished writing, so
+        // negative assertions on it would miss cross-contamination appended
+        // between the two snapshots.
+        const contentA = await fsp.readFile(pathA, 'utf8')
+        const contentB = await fsp.readFile(pathB, 'utf8')
         expect(contentA).not.toContain('instance=concurrent-b')
         expect(contentB).not.toContain('instance=concurrent-a')
 
