@@ -97,7 +97,7 @@ Skill protocols in this plan are fixed by reference (the-usual-beta at `~/.confi
 
 **Test plan (inverted TDD):**
 - RED: land the diagnostics change first (its own pre-commit) so any loaded-stress repro self-classifies; loop the file ×20 under induced load (Task 3 recipe) until a failure shows the `development.source-mode` file absent/zero-size while `production.dist-mode` has content (or probe server.log shows the process exited at ~25ms). Fallback RED: kata-recorded failure + mechanism report. Runtime fallback if flake refuses to reproduce: an UNCOMMITTED throwaway edit shrinking probe delays to 0 demonstrates exit-before-flush deterministically (then revert/rewrite properly).
-- GREEN: post-fix, file ×20 under induced load all green with both file waits finishing in seconds; ×1 quiet (~37s baseline); no `PROBE-FATAL` in any `server.log`.
+- GREEN: post-fix, file ×20 under induced load all green with both file waits finishing in seconds; ×1 quiet (~37s baseline); per-test assertions verify probe exitCode===0 and no `PROBE-FATAL` in captured output (Task 2b steps).
 
 **Steps:**
 - [ ] **2a (diagnostics first, own commit):** on timeout, `waitForFileContent` includes `fsp.readdir(path.dirname(filePath))` + per-file `fsp.stat` sizes in the thrown message.
