@@ -46,7 +46,7 @@ Fix the flaky integration test `test/integration/server/logger.separation.test.t
 - Consumes: `createLogger()` (`server/logger.ts`), `resolveDebugLogPath()` semantics (explicit `LOG_DEBUG_PATH` short-circuits the test-runtime null — that is what makes the unit test possible under vitest), the existing `logger.separation.test.ts` harness (`startSourceLoggerProcess`, `activeProcesses`).
 - Produces: no new exported interface; `createLogger()` behavior change only (marker durability).
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 Part A — unit test (in `test/unit/server/logger.test.ts`): first merge any missing imports (`readFileSync` and `existsSync` from `node:fs`, `fsp` from `node:fs/promises`, `os` from `node:os`, `path` from `node:path`) into the file's import block — skip any already present. Then append a new `describe` at the end of the file's existing top-level `describe`, reusing the file's existing `vi.resetModules()`-in-`beforeEach` + dynamic re-import convention:
 
@@ -164,7 +164,7 @@ Part B — integration test (append inside `describe('debug log separation', ...
   )
 ```
 
-- [ ] **Step 2: Run the tests and verify the intended failures**
+- [x] **Step 2: Run the tests and verify the intended failures**
 
 Run:
 ```bash
@@ -178,7 +178,7 @@ Expected: FAIL for exactly two new tests, for the durability reason: the unit du
 
 If either new test unexpectedly PASSES pre-fix, stop: the repro is not load-bearing; re-investigate before implementing (do not weaken the test to manufacture a failure).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `server/logger.ts`, add the helper next to `createDebugFileStream` (~line 231):
 
@@ -250,7 +250,7 @@ Placement detail: the `writeDebugLogPathMarkerSync` call replaces — not duplic
 
 This is the intended final shape: one synchronous receipt, swallowed-with-warning on failure, console streams untouched.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run:
 ```bash
@@ -260,7 +260,7 @@ npm run test:vitest -- run test/integration/server/logger.separation.test.ts --c
 
 Expected: PASS — both new tests and every pre-existing test in both files.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 - Remove now-unneeded machinery only if the marker's old pino route left anything (it did not add any).
 - Keep the 30s `FILE_CONTENT_TIMEOUT_MS` — it bounds content gates, not durability; the file's header comment about the 2026-08-18 observation stays accurate but should gain one sentence noting the durability fix (edit the comment, do not change the timeout value).
@@ -268,7 +268,7 @@ Expected: PASS — both new tests and every pre-existing test in both files.
   - If the debug file is already at the 10MB rotation cap at process start, rotating-file-stream rotates at open time, which can move the freshly appended receipt into the rotated archive, leaving the active file without the marker. Diagnostic-only, never exercised by any test; no guard added.
   - The first integration test's `LOG_LEVEL_PROBE` (50ms timer) keeps the theoretical exit-before-open loss window for its `error-level` content line; the reported flake concerned the marker receipt, which is now durable. No change in scope.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 The change affects only `createLogger()` marker emission. Impacted set: every test that imports the real `server/logger.ts` marker path (the two files above) plus any test asserting on `createDebugFileStream`/debug streams. Unit runtime is gated away from the marker by `isTestRuntime`/env deletion except via explicit `LOG_DEBUG_PATH`, which only `logger.test.ts` uses.
 
@@ -291,7 +291,7 @@ bash scripts/vitest-cloud.sh run --cloud --config=server test/integration/server
 
 Expected: all tests in the file pass on Cloud Run. (Local `npm run test:vitest -- run <file> --config <path>` demonstrably selects the intended file and config — verified by observation earlier today; keep it for local loops only.)
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add server/logger.ts test/unit/server/logger.test.ts test/integration/server/logger.separation.test.ts
