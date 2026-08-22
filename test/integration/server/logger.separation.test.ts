@@ -147,7 +147,12 @@ async function startDistLoggerProcess(env: NodeJS.ProcessEnv) {
   )
 }
 
-async function waitForFileContent(filePath: string, pattern: RegExp, timeoutMs = FILE_CONTENT_TIMEOUT_MS): Promise<string> {
+async function waitForFileContent(
+  filePath: string,
+  pattern: RegExp,
+  timeoutMs = FILE_CONTENT_TIMEOUT_MS,
+  capturedOutput?: () => string,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs
   let lastContent = ''
 
@@ -161,7 +166,20 @@ async function waitForFileContent(filePath: string, pattern: RegExp, timeoutMs =
     await new Promise<void>((resolve) => setTimeout(resolve, 120))
   }
 
-  throw new Error(`Timed out waiting for ${pattern} in ${filePath}. Log: ${lastContent}`)
+  // Diagnostics on failure: the whole logDir listing with per-file sizes, plus
+  // the probes' captured stdout/stderr when provided. Without these a timeout
+  // is a blind 30s gate with no way to tell "record never landed" apart from
+  // "slow" (kata ep0f).
+  const dirEntries = await fsp.readdir(path.dirname(filePath)).catch(() => [] as string[])
+  const dirLines: string[] = []
+  for (const entry of dirEntries) {
+    const st = await fsp.stat(path.join(path.dirname(filePath), entry)).catch(() => undefined)
+    dirLines.push(`${entry} size=${st?.size ?? '?'}`)
+  }
+  const outputNote = capturedOutput ? `\nCaptured probe output:\n${capturedOutput()}` : ''
+  throw new Error(
+    `Timed out waiting for ${pattern} in ${filePath}. Log: ${lastContent}\nLogDir contents: [${dirLines.join(', ')}]${outputNote}`,
+  )
 }
 
 describe('debug log separation', () => {
@@ -181,7 +199,7 @@ describe('debug log separation', () => {
         )
         activeProcesses.push(proc)
 
-        const fileContent = await waitForFileContent(debugLogPath, /error-level console and file/)
+        const fileContent = await waitForFileContent(debugLogPath, /error-level console and file/, undefined, () => proc.readOutput())
         const processOutput = readFileSync(proc.stderrLogPath, 'utf8')
 
         expect(processOutput).toContain('error-level console and file')
@@ -221,14 +239,14 @@ describe('debug log separation', () => {
 
         const devPath = path.join(logDir, 'server-debug.development.source-mode.jsonl')
         const distPath = path.join(logDir, 'server-debug.production.dist-mode.jsonl')
-        await waitForFileContent(devPath, /Resolved debug log path/)
-        await waitForFileContent(distPath, /Resolved debug log path/)
+        await waitForFileContent(devPath, /Resolved debug log path/, undefined, () => devProc.readOutput())
+        await waitForFileContent(distPath, /Resolved debug log path/, undefined, () => distProc.readOutput())
         // Stream-routed proof: the marker above lands via a synchronous
         // out-of-band append, so it cannot prove the per-process rotating
         // stream actually opened and wrote to this file. Require one record
         // that went through pino's multistream in each destination instead.
-        await waitForFileContent(devPath, /stream-write-proof instance=source-mode/)
-        await waitForFileContent(distPath, /stream-write-proof instance=dist-mode/)
+        await waitForFileContent(devPath, /stream-write-proof instance=source-mode/, undefined, () => devProc.readOutput())
+        await waitForFileContent(distPath, /stream-write-proof instance=dist-mode/, undefined, () => distProc.readOutput())
 
         expect(devPath).toContain('server-debug.development.source-mode.jsonl')
         expect(distPath).toContain('server-debug.production.dist-mode.jsonl')
@@ -260,13 +278,13 @@ describe('debug log separation', () => {
 
         const pathA = path.join(logDir, 'server-debug.development.concurrent-a.jsonl')
         const pathB = path.join(logDir, 'server-debug.development.concurrent-b.jsonl')
-        await waitForFileContent(pathA, /Resolved debug log path/)
-        await waitForFileContent(pathB, /Resolved debug log path/)
+        await waitForFileContent(pathA, /Resolved debug log path/, undefined, () => processA.readOutput())
+        await waitForFileContent(pathB, /Resolved debug log path/, undefined, () => processB.readOutput())
         // Stream-routed proof: each concurrent process must put a record
         // through its own pino multistream, and neither file may contain the
         // other process's record.
-        await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/)
-        await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/)
+        await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/, undefined, () => processA.readOutput())
+        await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/, undefined, () => processB.readOutput())
         // Fresh re-reads AFTER both proof waits: the wait's returned content
         // is a snapshot taken before the other process finished writing, so
         // negative assertions on it would miss cross-contamination appended
@@ -306,11 +324,11 @@ describe('debug log separation', () => {
 
         const pathA = path.join(logDir, 'server-debug.development.alpha.jsonl')
         const pathB = path.join(logDir, 'server-debug.production.ci-run-beta.jsonl')
-        await waitForFileContent(pathA, /Resolved debug log path/)
-        await waitForFileContent(pathB, /Resolved debug log path/)
+        await waitForFileContent(pathA, /Resolved debug log path/, undefined, () => procA.readOutput())
+        await waitForFileContent(pathB, /Resolved debug log path/, undefined, () => procB.readOutput())
         // Stream-routed proof: one record through pino's multistream per process.
-        await waitForFileContent(pathA, /stream-write-proof instance=alpha/)
-        await waitForFileContent(pathB, /stream-write-proof instance=ci-run-beta/)
+        await waitForFileContent(pathA, /stream-write-proof instance=alpha/, undefined, () => procA.readOutput())
+        await waitForFileContent(pathB, /stream-write-proof instance=ci-run-beta/, undefined, () => procB.readOutput())
 
         expect(pathA).toContain('server-debug.development.alpha.jsonl')
         expect(pathB).toContain('server-debug.production.ci-run-beta.jsonl')
@@ -334,7 +352,7 @@ describe('debug log separation', () => {
         activeProcesses.push(proc)
 
         const resolvedPath = path.join(logDir, 'server-debug.production.ci-run-1.jsonl')
-        await waitForFileContent(resolvedPath, /Resolved debug log path/)
+        await waitForFileContent(resolvedPath, /Resolved debug log path/, undefined, () => proc.readOutput())
         expect(resolvedPath).toContain('server-debug.production.ci-run-1.jsonl')
 
         const startupLog = readFileSync(resolvedPath, 'utf8')
