@@ -230,6 +230,36 @@ export function createDebugFileStream(filePath: string, options: DebugFileStream
   return createStream(path.basename(filePath), { path: dir, size, maxFiles })
 }
 
+/**
+ * One-time startup receipt for the resolved debug log destination, appended
+ * SYNCHRONOUSLY at logger construction. rotating-file-stream opens lazily and
+ * buffers writes until its async open completes; a short-lived process that
+ * imports this module and exits promptly would otherwise lose the marker
+ * (observed as a hung-then-empty debug file in the logger.separation
+ * integration suite under CI shard contention). The direct append makes the
+ * receipt durable before createLogger() returns. One out-of-band line per
+ * process launch: rotating-file-stream's open-time stat may or may not see
+ * these bytes yet (threadpool race), so rotation size accounting can be off
+ * by at most this one line at the 10M cap — negligible.
+ */
+function writeDebugLogPathMarkerSync(resolved: {
+  filePath: string
+  debugMode: LogMode
+  debugInstance: string
+}): void {
+  const line = {
+    level: 30,
+    severity: 'info',
+    time: new Date().toISOString(),
+    app: 'freshell',
+    env,
+    version: appVersion,
+    ...resolved,
+    msg: 'Resolved debug log path',
+  }
+  fs.appendFileSync(resolved.filePath, `${JSON.stringify(line)}\n`)
+}
+
 type DedicatedFileLoggerOptions = {
   filePath: string
   level?: LevelWithSilent
@@ -342,8 +372,12 @@ export function createLogger(destination?: DestinationStream) {
   }
 
   const nextLogger = pino(createPinoOptions(), pino.multistream(streams))
-  if (resolvedDebugLog) {
-    nextLogger.info(resolvedDebugLog, 'Resolved debug log path')
+  if (resolvedDebugLog && nextLogger.isLevelEnabled('info')) {
+    try {
+      writeDebugLogPathMarkerSync(resolvedDebugLog)
+    } catch (err) {
+      consoleDiagnosticLogger.warn({ err, filePath: resolvedDebugLog.filePath }, 'Debug log marker write failed')
+    }
   }
   return nextLogger
 }

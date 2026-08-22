@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -22,20 +23,32 @@ const DEFAULT_TEST_TIMEOUT_MS = 120_000
 // which filename was chosen, never about how fast). A cold `tsx` start under
 // full-suite shard contention on a shared Cloud Run vCPU exceeded the old 5s
 // gate (observed 2026-08-18, execution freshell-vitest-l68jz); unify at 30s.
+// Since 2026-08-21 the resolved-path receipt is appended synchronously by
+// createLogger(), so marker durability no longer depends on this wait — it
+// only covers the stream-routed content lines.
 const FILE_CONTENT_TIMEOUT_MS = 30_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'server/index.ts']",
-  "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
+  "  const { logger } = await import('./server/logger.ts')",
+  // Stream-routed, process-specific proof line. Emitted at info level: the
+  // tests using this probe already require info enabled because the resolved-
+  // path marker is info-gated. No self-exit timer: the proof line is written
+  // through the rotating stream before the event loop can drain (the pending
+  // stream open/write keeps Node alive until it lands), then the child exits
+  // naturally — an open file descriptor alone does not keep the loop alive,
+  // and the harness's afterEach stopProcess remains as a harmless backstop.
+  // A timed exit here was the exact exit-before-stream-open race that flaked
+  // the marker.
+  "  logger.info('stream-write-proof instance=' + (process.env.FRESHELL_LOG_INSTANCE_ID || process.env.FRESHELL_DEBUG_STREAM_INSTANCE || 'unknown'))",
   '})()',
 ].join('\n')
 const DIST_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'dist/server/index.js']",
-  "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
+  "  const { logger } = await import('./server/logger.ts')",
+  "  logger.info('stream-write-proof instance=' + (process.env.FRESHELL_LOG_INSTANCE_ID || process.env.FRESHELL_DEBUG_STREAM_INSTANCE || 'unknown'))",
   '})()',
 ].join('\n')
 const LOG_LEVEL_PROBE = [
@@ -210,6 +223,12 @@ describe('debug log separation', () => {
         const distPath = path.join(logDir, 'server-debug.production.dist-mode.jsonl')
         await waitForFileContent(devPath, /Resolved debug log path/)
         await waitForFileContent(distPath, /Resolved debug log path/)
+        // Stream-routed proof: the marker above lands via a synchronous
+        // out-of-band append, so it cannot prove the per-process rotating
+        // stream actually opened and wrote to this file. Require one record
+        // that went through pino's multistream in each destination instead.
+        await waitForFileContent(devPath, /stream-write-proof instance=source-mode/)
+        await waitForFileContent(distPath, /stream-write-proof instance=dist-mode/)
 
         expect(devPath).toContain('server-debug.development.source-mode.jsonl')
         expect(distPath).toContain('server-debug.production.dist-mode.jsonl')
@@ -243,6 +262,19 @@ describe('debug log separation', () => {
         const pathB = path.join(logDir, 'server-debug.development.concurrent-b.jsonl')
         await waitForFileContent(pathA, /Resolved debug log path/)
         await waitForFileContent(pathB, /Resolved debug log path/)
+        // Stream-routed proof: each concurrent process must put a record
+        // through its own pino multistream, and neither file may contain the
+        // other process's record.
+        await waitForFileContent(pathA, /stream-write-proof instance=concurrent-a/)
+        await waitForFileContent(pathB, /stream-write-proof instance=concurrent-b/)
+        // Fresh re-reads AFTER both proof waits: the wait's returned content
+        // is a snapshot taken before the other process finished writing, so
+        // negative assertions on it would miss cross-contamination appended
+        // between the two snapshots.
+        const contentA = await fsp.readFile(pathA, 'utf8')
+        const contentB = await fsp.readFile(pathB, 'utf8')
+        expect(contentA).not.toContain('instance=concurrent-b')
+        expect(contentB).not.toContain('instance=concurrent-a')
 
         expect(pathA).toContain('server-debug.development.concurrent-a.jsonl')
         expect(pathB).toContain('server-debug.development.concurrent-b.jsonl')
@@ -276,6 +308,10 @@ describe('debug log separation', () => {
         const pathB = path.join(logDir, 'server-debug.production.ci-run-beta.jsonl')
         await waitForFileContent(pathA, /Resolved debug log path/)
         await waitForFileContent(pathB, /Resolved debug log path/)
+        // Stream-routed proof: one record through pino's multistream per process.
+        await waitForFileContent(pathA, /stream-write-proof instance=alpha/)
+        await waitForFileContent(pathB, /stream-write-proof instance=ci-run-beta/)
+
         expect(pathA).toContain('server-debug.development.alpha.jsonl')
         expect(pathB).toContain('server-debug.production.ci-run-beta.jsonl')
       })
@@ -308,6 +344,55 @@ describe('debug log separation', () => {
           debugMode: 'production',
           debugInstance: 'ci-run-1',
         })
+      })
+    },
+  )
+
+  it(
+    'keeps the resolved-path receipt durable when the process exits immediately after import',
+    { timeout: DEFAULT_TEST_TIMEOUT_MS },
+    async () => {
+      await withLogDir(async (logDir) => {
+        // The red lever: NO post-import timer at all — the child exits on the
+        // first macrotask after the import resolves, so rotating-file-stream's
+        // async open can never win. Pre-fix this is 100% red on any machine;
+        // post-fix the synchronous receipt makes it 100% green.
+        const IMMEDIATE_EXIT_PROBE = [
+          '(async () => {',
+          "  process.argv = ['node', 'server/index.ts']",
+          "  await import('./server/logger.ts')",
+          '  process.exit(0)',
+          '})()',
+        ].join('\n')
+        const proc = await startServerProcess(
+          [process.execPath, getTSXCLI(), '-e', IMMEDIATE_EXIT_PROBE],
+          {
+            FRESHELL_LOG_DIR: logDir,
+            FRESHELL_LOG_INSTANCE_ID: 'immediate-exit',
+            NODE_ENV: 'development',
+            // The harness does not scrub ambient LOG_LEVEL; the marker is
+            // info-level, so an operator's LOG_LEVEL=warn would suppress it
+            // and keep this test red. Pin the supported default instead.
+            LOG_LEVEL: 'debug',
+          },
+          REPO_ROOT,
+        )
+        activeProcesses.push(proc)
+        const [exitCode] = await once(proc.process, 'exit')
+
+        const markerPath = path.join(logDir, 'server-debug.development.immediate-exit.jsonl')
+        const content = await fsp.readFile(markerPath, 'utf8').catch(() => '')
+        expect(content).toContain('Resolved debug log path')
+
+        const startupPayload = parseStartupLogPayload(content)
+        expect(startupPayload).not.toBeNull()
+        expect(startupPayload).toMatchObject({
+          debugMode: 'development',
+          debugInstance: 'immediate-exit',
+        })
+        // The child completed the import and reached its explicit exit —
+        // not a crash after the synchronous marker write.
+        expect(exitCode).toBe(0)
       })
     },
   )
