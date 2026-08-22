@@ -1,5 +1,7 @@
 # ep0f Deflake: logger.separation + terminal-registry Load Flakes Implementation Plan
 
+> **Addendum (2026-08-22, rebase onto PR #674):** while this run's PR was open, another agent's the-usual run landed PR #674 — a PRODUCTION-level root fix for the logger.separation marker loss (synchronous `fs.appendFileSync` receipt in `server/logger.ts` + stream-write-proof assertions + a pinned immediate-exit durability test). This branch rebased onto it and SUPERSEDED Task 2b (probe self-poll rewrite): the exit-before-flush hazard for the marker no longer exists in the probes' shape on main. This branch retains: Task 1 (registry hermetic mock), Task 2a (timeout diagnostics — re-applied onto #674's file shape, incl. wiring the stream-write-proof waits), and the plan doc. Final net delta: 4 files, tests+docs only.
+
 > **For agentic workers:** REQUIRED: Use the usual-subagents (subagent-driven-development / executing-plans) and the-usual TDD (test-driven-development) subskills to implement this plan task-by-task and subtask-by-subtask. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 ## User Request
