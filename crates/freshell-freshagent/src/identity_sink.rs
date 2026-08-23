@@ -267,4 +267,27 @@ mod tests {
         assert_eq!(fake.load_rollback("opencode", "ses_1"), Some(record));
         assert!(fake.load_rollback("opencode", "nope").is_none());
     }
+
+    /// A stored row whose version mismatches the schema reads as None — never
+    /// reinterpreted across a future schema bump (the version gate is the only
+    /// eviction of stale-shape rows).
+    #[tokio::test]
+    async fn fake_sink_load_rollback_version_gate_returns_none() {
+        let fake = std::sync::Arc::new(FakeIdentitySink::default());
+        let record = crate::rollback_record::RollbackRecord::empty(10);
+        fake.record_rollback("opencode", "ses_v0", record)
+            .await
+            .expect("write ok");
+        {
+            let mut rows = fake.rollbacks.lock().unwrap();
+            rows.get_mut(&("opencode".to_string(), "ses_v0".to_string()))
+                .expect("row present")
+                .version = 0;
+        }
+        assert_eq!(
+            fake.load_rollback("opencode", "ses_v0"),
+            None,
+            "a version-mismatched row reads as absent, not partial"
+        );
+    }
 }

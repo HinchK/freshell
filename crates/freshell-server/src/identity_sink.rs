@@ -222,4 +222,28 @@ mod tests {
             "boot scan indexes rollback rows"
         );
     }
+
+    /// Version gate on the durable read path: a stored row whose version does
+    /// not match `ROLLBACK_RECORD_VERSION` deserializes to absent, never to a
+    /// reinterpreted stale shape (the gate is the schema-eviction contract the
+    /// handlers across restarts depend on).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollback_record_version_gate_reads_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let mut tampered = freshell_freshagent::RollbackRecord::empty(100);
+        tampered.version = 0;
+        let payload = serde_json::to_value(&tampered).expect("serialize");
+        ledger
+            .record_rollback_row("codex", "thr-v0", &payload, 100)
+            .expect("row write ok");
+        assert_eq!(
+            sink.load_rollback("codex", "thr-v0"),
+            None,
+            "version-mismatched durable row reads as absent"
+        );
+    }
 }

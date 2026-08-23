@@ -139,7 +139,7 @@ pub struct RollbackRecord {
     /// permanently dies (decision 5), the marker bucket survives (decision 6).
     pub redo_destroyed: bool,
     /// Redo availability STAMPED AT WRITE TIME by the provider handler —
-    /// never derived at read (`entries` is empty by design for claude).
+    /// never derived at read (stored at write time; never entries-derived).
     pub can_redo: bool,
     /// Claude fork-chain root (the session retaining full history). None for
     /// codex/opencode.
@@ -352,7 +352,7 @@ mod tests {
         record.set_can_redo(true, 60);
         assert!(
             record.can_redo(),
-            "the provider-stamped bit is the only source (claude keeps entries empty by design)"
+            "the provider-stamped bit is the only source (stored at write time; never entries-derived)"
         );
         record.destroy_redo(70);
         assert!(!record.can_redo(), "destroyed redo never revives");
