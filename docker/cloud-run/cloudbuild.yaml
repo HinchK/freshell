@@ -31,4 +31,9 @@ steps:
 options:
   machineType: 'E2_HIGHCPU_32'
   diskSizeGb: 200
+  # Build logs land in Cloud Logging, readable with roles/logging.viewer —
+  # the legacy default GCS log bucket would need project-wide roles/viewer
+  # for the submitting identity (gcloud-robot conversion). Note: this mode
+  # does not stream logs during submit; read after with `gcloud builds log`.
+  logging: 'CLOUD_LOGGING_ONLY'
 timeout: '3600s'
