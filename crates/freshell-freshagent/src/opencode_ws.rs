@@ -66,7 +66,7 @@ use tokio::sync::Mutex as TokioMutex;
 use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_opencode::{
     normalize_opencode_effort, normalize_opencode_model, ChangedReason, OpencodeServeManager,
-    SdkProviderEvent, SessionSignal, SnapshotStatus,
+    SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
@@ -127,6 +127,13 @@ pub struct FreshOpencodeState {
     /// would otherwise mint a second child whose reply can no longer correlate after
     /// the first fork re-keys the pane — an orphaned `ses_*` row + serve session.
     fork_in_flight: crate::InFlightRegistry,
+    /// Rollback-vs-rollback single-flight (kata 1wxv Task 3) — the opencode arm of
+    /// [`crate::FreshCodexState::rollback_in_flight`]'s rationale. Acquired FIRST in
+    /// [`FreshOpencodeState::handle_rollback`], before the per-session mutex (lock
+    /// order is never the reverse); `handle_send` NEVER acquires or consults it —
+    /// its only wait point is the per-session mutex, so a send issued mid-rollback
+    /// blocks behind it, then proceeds and destroys redo (no circular wait).
+    rollback_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -258,6 +265,7 @@ impl FreshOpencodeState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
+            rollback_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -625,6 +633,25 @@ impl FreshOpencodeState {
         // serve-stream bridge flips `turn_errored` if the turn reports an error.
         session.turn_aborted.store(false, Ordering::SeqCst);
         session.turn_errored.store(false, Ordering::SeqCst);
+
+        // Decision 5 (kata 1wxv Task 3): any new submission permanently destroys redo
+        // (AWAITED before the prompt POST; the r3 marker-union `entries` survives —
+        // only the redo-capable chain state dies). r2 lock discipline: the
+        // per-session mutex is ALREADY held at this point — a send issued while a
+        // rollback held it simply WAITED on the mutex (`handle_send` NEVER
+        // acquires/consults `rollback_in_flight`, so no circular wait exists).
+        if let Some(real_id) = session.real_session_id.clone() {
+            if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+                &self.identity_sink(),
+                PROVIDER,
+                &real_id,
+                crate::rollback_record::now_ms(),
+            )
+            .await
+            {
+                tracing::warn!(error = %err, session = %real_id, "freshagent.opencode.redo_destroy_write_failed");
+            }
+        }
 
         // `normalizeOpencodeInput(settings)` (adapter.ts:82-83, materializeOrSend:325-328):
         // when `settings` is present, model/effort are normalized PURELY from it (the
@@ -1321,6 +1348,611 @@ impl FreshOpencodeState {
         }));
     }
 
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 3) ─────────────────
+
+    /// Handle a `freshAgent.undo`/`freshAgent.redo` for opencode: opencode's NATIVE
+    /// message-targeted `revert`/`unrevert` on the shared serve (1.18.21, verified):
+    /// the boundary is INCLUSIVE of the named message (an empty-prefix revert — the
+    /// first user message — legally empties the conversation); stepwise redo =
+    /// re-revert at a LATER in-tail user message; full restore = `unrevert`
+    /// (all-or-nothing).
+    ///
+    /// Ordering (durable-BEFORE-mutation + the r2 serialization discipline):
+    ///   1. `rollback_in_flight` single-flight (rollback-vs-rollback only — the
+    ///      registry never grows send-path legs), acquired FIRST, then the
+    ///      per-session mutex HELD ACROSS THE WHOLE REST OF THIS HANDLER (busy check
+    ///      → reads → record pre-write → mutate → post-verify read →
+    ///      broadcast/reply). `handle_send` NEVER acquires/consults
+    ///      `rollback_in_flight`: it simply waits on the same mutex, then proceeds
+    ///      and destroys redo — no circular wait exists (pinned semantic: send
+    ///      waits, rollback wins, then the trailing send destroys);
+    ///   2. the busy gate (`turn_task` unfinished ⇒ `BUSY_TURN`) — no HTTP call at
+    ///      all leaves this handler for a refused attempt;
+    ///   3. the post-op record is computed from the PRE-mutation reads, then AWAITED
+    ///      BEFORE revert/unrevert runs — a pre-write failure refuses with
+    ///      `INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY` and the provider history
+    ///      is NEVER mutated;
+    ///   4. the mutation + post-verify read run through
+    ///      [`Self::mutate_and_verify`]'s r3 triad — NEVER a compensating rewrite
+    ///      after a possibly-applied mutation.
+    ///
+    /// Record semantics (r3 UNION rule): the marker bucket is the union of EVERY
+    /// epoch's rolled-back turns — FROZEN prior-epoch markers (recorded turns whose
+    /// ids no longer appear in the served message list: their tail rows were natively
+    /// DELETED by a resend, so the ledger is their only home, decision 6) PRECEDE the
+    /// rebuilt current-epoch tail in conversation order, and a redo removes EXACTLY
+    /// the restored turns from the current-epoch portion. An undo landing while
+    /// `redo_destroyed` is set starts a NEW epoch that clears ONLY the redo-capable
+    /// chain state (`redo_destroyed` clears; the prior chain's redo stays permanently
+    /// dead — its provider tail no longer exists). `can_redo` is STAMPED AT WRITE
+    /// TIME and gates ONLY on the current chain's remaining tail (frozen markers are
+    /// not restorable, so they must not keep redo alive). The serve owns the current
+    /// chain's boundary pointer (top-level `session.revert.messageID`); the record
+    /// owns the destroyed bit, the stored `can_redo`, and the union marker bucket.
+    /// A rollback NEVER chimes: the broadcast is `freshAgent.session.rolledBack`
+    /// with `revokeAttention:true`, never a `turn.complete`.
+    pub async fn handle_rollback(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: FrameSink,
+    ) {
+        use crate::rollback_record::*;
+
+        // Rollback-vs-rollback single-flight, acquired FIRST (lock order:
+        // rollback_in_flight, then the per-session mutex — never the reverse).
+        let Some(_guard) = self.rollback_in_flight.try_acquire(&op.session_id) else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                &format!("rollback already in progress for {}", op.session_id),
+            ));
+            return;
+        };
+        let session_arc = { self.sessions.lock().await.get(&op.session_id).cloned() };
+        let Some(session_arc) = session_arc else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_SESSION_ID",
+                &format!(
+                    "opencode fresh-agent session {} is not available.",
+                    op.session_id
+                ),
+            ));
+            return;
+        };
+        // The per-session mutex is HELD ACROSS THE ENTIRE HANDLER — no mid-handler
+        // release (a send issued while this holds waits behind it; the busy check's
+        // check-then-act window against concurrent sends is closed).
+        let session = session_arc.lock().await;
+        let Some(real_id) = session.real_session_id.clone() else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_SESSION_ID",
+                &format!(
+                    "OpenCode session {} has not materialized; cannot roll back.",
+                    session.placeholder_id
+                ),
+            ));
+            return;
+        };
+        if session.turn_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            reply_sink(rollback_error_frame(
+                &op,
+                "BUSY_TURN",
+                ROLLBACK_BUSY_MESSAGE,
+            ));
+            return;
+        }
+        // `turnId` absent on a toTurn frame is a server-side validation error (never
+        // a zod refinement — the frozen contract keeps bare objects).
+        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_ROLLBACK_TARGET",
+                "rollback toTurn requires a turnId",
+            ));
+            return;
+        }
+        let route = session.cwd.clone();
+        let manager = self.fresh_agent.ensure_manager().await;
+        let info = match manager.get_session(&real_id, &route).await {
+            Ok(v) => v,
+            Err(err) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    &err.to_string(),
+                ));
+                return;
+            }
+        };
+        let messages: Vec<Value> = match manager.list_messages(&real_id, &route).await {
+            Ok(v) => v.as_array().cloned().unwrap_or_default(),
+            Err(err) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    &err.to_string(),
+                ));
+                return;
+            }
+        };
+        // VERIFIED shape (load-bearing correction item 2): `revert` is TOP-LEVEL on
+        // the session body — session.revert = { messageID, snapshot?, diff?, partID? },
+        // omitted entirely when no rollback is active. No `info.revert` exists
+        // anywhere. The list returns the reverted tail UNFLAGGED; the boundary is
+        // INCLUSIVE of the named message.
+        let pointer: Option<String> = info
+            .get("revert")
+            .and_then(|r| r.get("messageID"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let boundary_idx = pointer
+            .as_deref()
+            .and_then(|p| {
+                messages
+                    .iter()
+                    .position(|m| m.pointer("/info/id").and_then(Value::as_str) == Some(p))
+            })
+            .unwrap_or(messages.len());
+
+        match op.direction {
+            RollbackDirection::Undo => {
+                let active = &messages[..boundary_idx];
+                let target = match op.mode {
+                    RollbackModeReq::Step => match last_user_message_id(active) {
+                        Some(id) => id,
+                        None => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "NOTHING_TO_UNDO",
+                                UNDO_EMPTY_MESSAGE,
+                            ));
+                            return;
+                        }
+                    },
+                    RollbackModeReq::ToTurn => {
+                        let t = op.turn_id.clone().expect("validated above");
+                        // The boundary removes target-and-after regardless of role
+                        // (assistant ids normalize to their parent user message
+                        // serve-side; the icons only appear on user rows client-side,
+                        // and the server stays correct for either).
+                        if !(t.starts_with("msg")
+                            && active.iter().any(|m| {
+                                m.pointer("/info/id").and_then(Value::as_str) == Some(t.as_str())
+                            }))
+                        {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "INVALID_ROLLBACK_TARGET",
+                                &format!("turn {t} is not in the active conversation"),
+                            ));
+                            return;
+                        }
+                        t
+                    }
+                };
+                let target_idx = active
+                    .iter()
+                    .position(|m| {
+                        m.pointer("/info/id").and_then(Value::as_str) == Some(target.as_str())
+                    })
+                    .expect("validated in range");
+                let removed_msgs = &active[target_idx..];
+                let removed_turns: Vec<Value> = removed_msgs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| crate::opencode_message_turn_json(m, target_idx + i))
+                    .collect();
+                let removed_ids: Vec<String> = removed_msgs
+                    .iter()
+                    .filter_map(|m| {
+                        m.pointer("/info/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                // The composer-refill payload: plain text of the first removed USER
+                // message.
+                let prompt = first_user_prompt_text(removed_msgs);
+                // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket is
+                // the UNION — frozen prior-epoch markers PRECEDE this op's removed
+                // slice ++ the still-served prior tail (undo 3 then undo 2 ⇒ markers
+                // [2, 3] in the tail's conversation order).
+                let now = crate::rollback_record::now_ms();
+                let previous = self
+                    .identity_sink()
+                    .and_then(|s| s.load_rollback(PROVIDER, &real_id));
+                let mut record = match previous.clone() {
+                    Some(mut p) => {
+                        // Epoch rule (r3): an undo landing while redo_destroyed is set
+                        // starts a NEW epoch that clears ONLY the redo-capable chain
+                        // state — `entries` (the marker union) is NEVER cleared.
+                        if p.redo_destroyed {
+                            p.redo_destroyed = false;
+                        }
+                        p
+                    }
+                    None => RollbackRecord::empty(now),
+                };
+                let served_ids: std::collections::HashSet<&str> = messages
+                    .iter()
+                    .filter_map(|m| m.pointer("/info/id").and_then(Value::as_str))
+                    .collect();
+                let old_turns: Vec<Value> = record
+                    .entries
+                    .drain(..)
+                    .flat_map(|e| e.removed_turns)
+                    .collect();
+                let (frozen, current): (Vec<Value>, Vec<Value>) =
+                    old_turns.into_iter().partition(|t| {
+                        marker_turn_id(t)
+                            .map(|id| !served_ids.contains(id))
+                            .unwrap_or(true)
+                    });
+                let combined: Vec<Value> = frozen
+                    .into_iter()
+                    .chain(removed_turns)
+                    .chain(current)
+                    .collect();
+                record.entries = vec![RollbackEntry {
+                    removed_turns: combined,
+                    prompt_text: prompt.clone(),
+                    at_ms: now,
+                }];
+                record.last_op_at_ms = now;
+                // The new tail is provably non-empty (it contains the target), so the
+                // fresh chain is redoable.
+                record.set_can_redo(true, now);
+                if !self
+                    .persist_record_or_refuse(&op, &real_id, record.clone(), &reply_sink)
+                    .await
+                {
+                    return; // provider history NEVER mutated on this path
+                }
+                if !self
+                    .mutate_and_verify(
+                        &manager,
+                        &op,
+                        &real_id,
+                        &route,
+                        OpencodeMutationPlan {
+                            boundary: Some(&target),
+                            previous: previous.as_ref(),
+                            now,
+                            verb: "revert",
+                        },
+                        reply_sink.clone(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                let can_redo = record.can_redo();
+                // Converge siblings + revoke attention (decisions 6/10); NEVER a
+                // chime. The broadcast carries NO prompt text (other devices'
+                // composers are untouched).
+                self.broadcast(&event_frame(
+                    &real_id,
+                    changed_event(&real_id, "opencode-rollback"),
+                ));
+                self.broadcast(&rollback_broadcast_frame(
+                    &op,
+                    &real_id,
+                    &removed_ids,
+                    can_redo,
+                ));
+                reply_sink(rollback_ack_frame(
+                    &op,
+                    &real_id,
+                    Some(&prompt),
+                    &removed_ids,
+                    can_redo,
+                    None,
+                ));
+            }
+            RollbackDirection::Redo => {
+                let Some(_pointer) = pointer else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                };
+                let existing = self
+                    .identity_sink()
+                    .and_then(|s| s.load_rollback(PROVIDER, &real_id));
+                // The durable record's STORED write-time bit gates redo availability
+                // (never entries-derived) ahead of the served-tail math.
+                match existing.as_ref() {
+                    Some(r) if r.can_redo() => {}
+                    Some(r) if r.redo_destroyed => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_DESTROYED_MESSAGE,
+                        ));
+                        return;
+                    }
+                    _ => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    }
+                }
+                let tail = &messages[boundary_idx..];
+                if tail.is_empty() {
+                    // A stale pointer (named message no longer served) leaves nothing
+                    // restorable.
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                }
+                // Uniform group math, one formula for both modes: Step restores the
+                // pointer's own group (t_pos = 0); toTurn restores through T's group.
+                // Kept-through end = the first USER message strictly AFTER the
+                // address; unrevert (all-or-nothing) when none. (r3: the rolled-back
+                // TAIL the pointer defines is the CURRENT epoch only — the frozen
+                // prior-epoch markers live in the ledger union, never the served
+                // list, so this math can never name them.)
+                let t_pos = match op.mode {
+                    RollbackModeReq::Step => 0usize,
+                    RollbackModeReq::ToTurn => {
+                        let t = op.turn_id.clone().expect("validated");
+                        match tail.iter().position(|m| {
+                            m.pointer("/info/id").and_then(Value::as_str) == Some(t.as_str())
+                        }) {
+                            Some(pos) => pos,
+                            None => {
+                                reply_sink(rollback_error_frame(
+                                    &op,
+                                    "INVALID_ROLLBACK_TARGET",
+                                    &format!("turn {t} is not in the rolled-back tail"),
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                };
+                let kept_end = messages
+                    .iter()
+                    .enumerate()
+                    .skip(boundary_idx + t_pos + 1)
+                    .find(|(_, m)| m.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+                    .map(|(i, _)| i);
+                let new_boundary_id: Option<String> = kept_end.map(|i| {
+                    messages[i]
+                        .pointer("/info/id")
+                        .and_then(Value::as_str)
+                        .expect("served message id")
+                        .to_string()
+                });
+                let restored_slice = &messages[boundary_idx..kept_end.unwrap_or(messages.len())];
+                // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket
+                // rebuilds to the remaining current-epoch tail BEFORE the
+                // revert/unrevert POST goes out — frozen prior-epoch markers PRECEDE
+                // the remaining tail and are never dropped by a redo (r3).
+                let remaining_start = kept_end.unwrap_or(messages.len());
+                let remaining_turns: Vec<Value> = messages[remaining_start..]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| crate::opencode_message_turn_json(m, remaining_start + i))
+                    .collect();
+                let now = crate::rollback_record::now_ms();
+                let previous = existing.clone();
+                let mut record = existing.unwrap_or_else(|| RollbackRecord::empty(now));
+                let served_ids: std::collections::HashSet<&str> = messages
+                    .iter()
+                    .filter_map(|m| m.pointer("/info/id").and_then(Value::as_str))
+                    .collect();
+                let frozen: Vec<Value> = record
+                    .entries
+                    .drain(..)
+                    .flat_map(|e| e.removed_turns)
+                    .filter(|t| {
+                        marker_turn_id(t)
+                            .map(|id| !served_ids.contains(id))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                let current_tail_non_empty = !remaining_turns.is_empty();
+                record.entries = if !current_tail_non_empty && frozen.is_empty() {
+                    vec![]
+                } else {
+                    vec![RollbackEntry {
+                        removed_turns: frozen.into_iter().chain(remaining_turns).collect(),
+                        prompt_text: first_user_prompt_text(&messages[remaining_start..]),
+                        at_ms: now,
+                    }]
+                };
+                record.last_op_at_ms = now;
+                // can_redo gates ONLY on the current chain's remaining tail (r3).
+                record.set_can_redo(!record.redo_destroyed && current_tail_non_empty, now);
+                if !self
+                    .persist_record_or_refuse(&op, &real_id, record.clone(), &reply_sink)
+                    .await
+                {
+                    return; // provider history NEVER mutated on this path
+                }
+                if !self
+                    .mutate_and_verify(
+                        &manager,
+                        &op,
+                        &real_id,
+                        &route,
+                        OpencodeMutationPlan {
+                            boundary: new_boundary_id.as_deref(),
+                            previous: previous.as_ref(),
+                            now,
+                            verb: "redo",
+                        },
+                        reply_sink.clone(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                let restored_ids: Vec<String> = restored_slice
+                    .iter()
+                    .filter_map(|m| {
+                        m.pointer("/info/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                let can_redo = record.can_redo();
+                self.broadcast(&event_frame(
+                    &real_id,
+                    changed_event(&real_id, "opencode-rollback"),
+                ));
+                self.broadcast(&rollback_broadcast_frame(
+                    &op,
+                    &real_id,
+                    &restored_ids,
+                    can_redo,
+                ));
+                reply_sink(rollback_ack_frame(
+                    &op,
+                    &real_id,
+                    None,
+                    &restored_ids,
+                    can_redo,
+                    None,
+                ));
+            }
+        }
+    }
+
+    /// The shared mutation + post-verify tail of both rollback directions: issue
+    /// `POST /session/:id/revert{messageID}` (boundary `Some`) or `/unrevert`
+    /// (`None`), then re-read the session and classify the r3 TRIAD (NEVER a
+    /// compensating rewrite after a possibly-applied mutation):
+    ///   (a) the read SUCCEEDS and the observed pointer equals exactly the requested
+    ///       boundary (or is ABSENT after a full unrevert) ⇒ success (`true`);
+    ///   (b) the read SUCCEEDS and the pointer provably did NOT move (the verified
+    ///       silent-200 rule is pointer-untouched-on-no-op, so the provider is
+    ///       PROVABLY unmoved) ⇒ `INVALID_ROLLBACK_TARGET` + a compensating rewrite
+    ///       (the ledger never describes a rollback the serve provably rejected);
+    ///   (c) the read ITSELF FAILS (transport/5xx — the mutation may have applied) ⇒
+    ///       `INTERNAL_ERROR`, the ledger KEPT verbatim (never compensated), and the
+    ///       retry/reconciliation note: the next snapshot derives the active prefix
+    ///       from provider rows, so pane + record reconverge automatically.
+    /// Mutation-RPC ERROR legs compensate ONLY on an HTTP ANSWER (a 4xx/5xx the serve
+    /// provably sent back — the revert provably did not apply); transport legs (no
+    /// answer at all) are treated like (c): keep the ledger.
+    async fn mutate_and_verify(
+        &self,
+        manager: &OpencodeServeManager,
+        op: &crate::rollback_record::RollbackRequest,
+        real_id: &str,
+        route: &freshell_opencode::Route,
+        plan: OpencodeMutationPlan<'_>,
+        reply_sink: FrameSink,
+    ) -> bool {
+        let result = match plan.boundary {
+            Some(target) => manager.revert(real_id, target, route).await,
+            None => manager.unrevert(real_id, route).await,
+        };
+        if let Err(err) = result {
+            if matches!(err, ServeError::Http { .. }) {
+                self.compensate_opencode_record(real_id, plan.previous, plan.now)
+                    .await;
+            }
+            reply_sink(map_opencode_serve_error(op, &err));
+            return false;
+        }
+        // POST-VERIFY (unknown/stale messageID is a silent 200 no-op serve-side).
+        let verb = plan.verb;
+        let verified = match manager.get_session(real_id, route).await {
+            Ok(v) => v
+                .get("revert")
+                .and_then(|r| r.get("messageID"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(err) => {
+                // (c) the READ failed — the mutation may have applied: KEEP the
+                // ledger (no compensating rewrite) and report INTERNAL_ERROR.
+                reply_sink(crate::rollback_record::rollback_error_frame(
+                    op,
+                    "INTERNAL_ERROR",
+                    &format!("{verb} issued but the post-rollback verification read failed: {err}"),
+                ));
+                return false;
+            }
+        };
+        let verified_ok = match plan.boundary {
+            Some(target) => verified.as_deref() == Some(target),
+            None => verified.is_none(),
+        };
+        if !verified_ok {
+            // (b) read SUCCEEDED + the pointer provably did not move ⇒ compensate,
+            // then refuse.
+            self.compensate_opencode_record(real_id, plan.previous, plan.now)
+                .await;
+            reply_sink(crate::rollback_record::rollback_error_frame(
+                op,
+                "INVALID_ROLLBACK_TARGET",
+                &format!(
+                    "the serve accepted the {verb} but the rollback pointer did not move (unknown or stale messageID)"
+                ),
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// The durable-BEFORE-mutation pre-write shared by both rollback directions:
+    /// AWAIT the post-op record write; a failure REFUSES the rollback
+    /// (`INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY`) and the provider history is
+    /// NEVER mutated. `true` when the mutation may proceed.
+    async fn persist_record_or_refuse(
+        &self,
+        op: &crate::rollback_record::RollbackRequest,
+        real_id: &str,
+        record: crate::rollback_record::RollbackRecord,
+        reply_sink: &FrameSink,
+    ) -> bool {
+        if let Some(sink) = self.identity_sink() {
+            if let Err(e) = sink.record_rollback(PROVIDER, real_id, record).await {
+                tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.rollback_pre_write_failed");
+                reply_sink(crate::rollback_record::rollback_error_frame(
+                    op,
+                    "INTERNAL_ERROR",
+                    crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY,
+                ));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Compensating write after a provider failure that followed a successful record
+    /// pre-write: restores the pre-op record (or an empty one) so the ledger never
+    /// describes a rollback the serve provably rejected. Warn-only — the refusal is
+    /// answered regardless.
+    async fn compensate_opencode_record(
+        &self,
+        real_id: &str,
+        previous: Option<&crate::rollback_record::RollbackRecord>,
+        now: i64,
+    ) {
+        if let Some(sink) = self.identity_sink() {
+            let restore = previous
+                .cloned()
+                .unwrap_or_else(|| crate::rollback_record::RollbackRecord::empty(now));
+            if let Err(e) = sink.record_rollback(PROVIDER, real_id, restore).await {
+                tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.rollback_compensate_failed");
+            }
+        }
+    }
+
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
 
     /// Handle a `freshAgent.attach` for opencode: emit a session snapshot carrying the
@@ -1768,6 +2400,71 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
             "message": format!("opencode session {session_id} not found"),
         }),
     )
+}
+
+// ── kata 1wxv Task 3: opencode rollback turn math + error mapping ────────────────
+
+/// One direction's mutation plan for `mutate_and_verify` — the requested post-state
+/// boundary (`Some(id)` ⇒ `revert`; `None` ⇒ `unrevert`), the pre-op record for the
+/// compensation legs, and the copy noun for refusal messages.
+struct OpencodeMutationPlan<'a> {
+    boundary: Option<&'a str>,
+    previous: Option<&'a crate::rollback_record::RollbackRecord>,
+    now: i64,
+    verb: &'static str,
+}
+
+/// The LAST user-role message id of `msgs` (conversation order), if any.
+fn last_user_message_id(msgs: &[Value]) -> Option<String> {
+    msgs.iter()
+        .rev()
+        .find(|m| m.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| {
+            m.pointer("/info/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// Plain text of the FIRST user message's text parts — the composer-refill payload.
+fn first_user_prompt_text(msgs: &[Value]) -> String {
+    msgs.iter()
+        .find(|m| m.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("parts").and_then(Value::as_array))
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
+/// A marker row's conversation id — `turnId`, falling back to `id`.
+fn marker_turn_id(turn: &Value) -> Option<&str> {
+    turn.get("turnId")
+        .or_else(|| turn.get("id"))
+        .and_then(Value::as_str)
+}
+
+/// Revert/unrevert error mapping (load-bearing correction item 4 + r1 remediation):
+/// an HTTP 404 / unknown-route ANSWER means the CLI predates the revert surface;
+/// only unknown transport/other failures map to INTERNAL_ERROR.
+fn map_opencode_serve_error(
+    op: &crate::rollback_record::RollbackRequest,
+    err: &ServeError,
+) -> ServerMessage {
+    if matches!(err, ServeError::Http { status: 404, .. }) {
+        crate::rollback_record::rollback_error_frame(
+            op,
+            "UNSUPPORTED_CAPABILITY",
+            crate::rollback_record::OPENCODE_OLD_CLI_COPY,
+        )
+    } else {
+        crate::rollback_record::rollback_error_frame(op, "INTERNAL_ERROR", &err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -4817,5 +5514,950 @@ mod tests {
         assert!(ts.ends_with('Z'), "{ts}");
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 3) ────────────────
+
+    use crate::identity_sink::PaneIdentitySink;
+    use crate::rollback_record::{
+        RollbackDirection, RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest,
+        LEDGER_WRITE_REFUSAL_COPY, OPENCODE_OLD_CLI_COPY, REDO_DESTROYED_MESSAGE,
+        REDO_EMPTY_MESSAGE, ROLLBACK_BUSY_MESSAGE, UNDO_EMPTY_MESSAGE,
+    };
+
+    fn captured_frames(captured: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<Value> {
+        captured
+            .lock()
+            .expect("captured mutex")
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("frame serializes"))
+            .collect()
+    }
+
+    /// The rollback-suite serve fake: records EVERY request; scripts session info with a
+    /// TOP-LEVEL `revert` pointer (the VERIFIED wire shape — never `info.revert`) and a
+    /// message list that is returned IN FULL at all times (the real serve returns the
+    /// reverted tail UNFLAGGED; freshell computes the active prefix strictly before
+    /// `revert.messageID`). POST revert 200s and moves the pointer to the body's
+    /// messageID (unless `revert_moves_pointer` is false — the verified silent-200
+    /// no-op for an unknown/stale id); POST unrevert clears it; POST prompt_async
+    /// natively DELETES the reverted tail and clears the pointer (decision 5), then
+    /// appends the resent user/assistant pair.
+    struct RollbackFakeHttp {
+        requests: StdMutex<Vec<RecordedRequest>>,
+        messages: StdMutex<Vec<Value>>,
+        /// `session.revert.messageID` — TOP-LEVEL on the session body; omitted when None.
+        revert_pointer: StdMutex<Option<String>>,
+        /// 200 default; a 404 simulates a CLI predating the revert route.
+        revert_status: StdMutex<u16>,
+        /// false simulates the silent-200 no-op (unknown/stale messageID).
+        revert_moves_pointer: StdMutex<bool>,
+        /// Fail every `GET /session/<id>` past the Nth (post-verify read triad leg (c)).
+        get_session_fail_after: StdMutex<Option<usize>>,
+        get_session_calls: StdMutex<usize>,
+        /// When armed, the NEXT revert POST records itself then parks on `notified()` —
+        /// the deterministic "rollback in flight" window (the fork-gate idiom).
+        revert_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// `prompt_async` re-arms one busy status poll so `run_turn` resolves via the
+        /// status-fallback path (observed activity → two absent polls → idle).
+        busy_budget: StdMutex<u32>,
+        /// Appended-turn counter (the resent turn mints msg_u4/msg_a4, then u5/a5, …).
+        next_appended: AtomicUsize,
+    }
+
+    impl RollbackFakeHttp {
+        fn new(pointer: Option<&str>) -> Self {
+            Self {
+                requests: StdMutex::new(Vec::new()),
+                messages: StdMutex::new(Self::three_turn_json()),
+                revert_pointer: StdMutex::new(pointer.map(str::to_string)),
+                revert_status: StdMutex::new(200),
+                revert_moves_pointer: StdMutex::new(true),
+                get_session_fail_after: StdMutex::new(None),
+                get_session_calls: StdMutex::new(0),
+                revert_gate: StdMutex::new(None),
+                busy_budget: StdMutex::new(0),
+                next_appended: AtomicUsize::new(3),
+            }
+        }
+
+        fn three_turn_json() -> Vec<Value> {
+            vec![
+                json!({ "info": { "id": "msg_u1", "role": "user" }, "parts": [{ "type": "text", "text": "prompt one" }] }),
+                json!({ "info": { "id": "msg_a1", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer one" }] }),
+                json!({ "info": { "id": "msg_u2", "role": "user" }, "parts": [{ "type": "text", "text": "prompt two" }] }),
+                json!({ "info": { "id": "msg_a2", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer two" }] }),
+                json!({ "info": { "id": "msg_u3", "role": "user" }, "parts": [{ "type": "text", "text": "prompt three" }] }),
+                json!({ "info": { "id": "msg_a3", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer three" }] }),
+            ]
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests mutex").clone()
+        }
+
+        /// Forget the harness's own requests (the `ensure_started` health probe etc.)
+        /// so tests assert on handler-driven traffic only.
+        fn clear(&self) {
+            self.requests.lock().expect("requests mutex").clear();
+        }
+
+        /// POST /session/<id>/revert records (parsed JSON bodies only).
+        fn revert_posts(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.ends_with("/revert"))
+                .collect()
+        }
+
+        /// Arm the slow-revert gate; the returned Notify releases the parked POST.
+        fn arm_revert_gate(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            *self.revert_gate.lock().expect("gate mutex") = Some(gate.clone());
+            gate
+        }
+
+        /// The current marker-bucket turn ids in the given sink's rollback record.
+        fn turn_ids(turns: &[Value]) -> Vec<&str> {
+            turns.iter().filter_map(|t| t["turnId"].as_str()).collect()
+        }
+
+        /// A minimal verbatim `FreshAgentTurn`-shaped row for the seeded record.
+        fn marker_turn(id: &str, role: &str, text: &str) -> Value {
+            json!({ "id": id, "turnId": id, "role": role, "summary": text, "items": [] })
+        }
+    }
+
+    impl ServeHttp for RollbackFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body_value = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.requests
+                .lock()
+                .expect("requests mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body: body_value.clone(),
+                });
+
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if method == "GET" && req.url.contains("/session/status") {
+                let mut budget = self.busy_budget.lock().expect("budget mutex");
+                let body = if *budget > 0 {
+                    *budget -= 1;
+                    serde_json::to_vec(&json!({ "ses_real": { "type": "busy" } })).unwrap()
+                } else {
+                    b"{}".to_vec()
+                };
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "POST" && req.url.contains("/unrevert") {
+                *self.revert_pointer.lock().expect("pointer mutex") = None;
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"true".to_vec())) });
+            }
+            if method == "POST" && req.url.contains("/revert") {
+                let status = *self.revert_status.lock().expect("status mutex");
+                let moves = *self.revert_moves_pointer.lock().expect("flag mutex");
+                let gate = self.revert_gate.lock().expect("gate mutex").take();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    if status != 200 {
+                        return Ok(ServeHttpResponse::new(
+                            status,
+                            br#"{"error":"unknown route"}"#.to_vec(),
+                        ));
+                    }
+                    if moves {
+                        *self.revert_pointer.lock().expect("pointer mutex") = body_value
+                            .as_ref()
+                            .and_then(|b| b.get("messageID"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                    Ok(ServeHttpResponse::new(200, b"true".to_vec()))
+                });
+            }
+            if method == "POST" && req.url.contains("/prompt_async") {
+                // Decision 5 native behavior: a subsequent send DELETES the reverted
+                // tail rows and clears the pointer; the ledger (not opencode storage)
+                // is the durable marker source.
+                let text = body_value
+                    .as_ref()
+                    .and_then(|b| b.pointer("/parts/0/text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let pointer = self.revert_pointer.lock().expect("pointer mutex").take();
+                if let Some(pointer) = pointer {
+                    let mut messages = self.messages.lock().expect("messages mutex");
+                    if let Some(idx) = messages
+                        .iter()
+                        .position(|m| m["info"]["id"].as_str() == Some(pointer.as_str()))
+                    {
+                        messages.truncate(idx);
+                    }
+                }
+                let n = self.next_appended.fetch_add(1, Ordering::SeqCst) + 1;
+                {
+                    let mut messages = self.messages.lock().expect("messages mutex");
+                    messages.push(json!({ "info": { "id": format!("msg_u{n}"), "role": "user" }, "parts": [{ "type": "text", "text": text }] }));
+                    messages.push(json!({ "info": { "id": format!("msg_a{n}"), "role": "assistant" }, "parts": [{ "type": "text", "text": format!("answer {n}") }] }));
+                }
+                *self.busy_budget.lock().expect("budget mutex") = 1;
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"true".to_vec())) });
+            }
+            if method == "GET" && req.url.contains("/message") {
+                let body = serde_json::to_vec(&Value::Array(
+                    self.messages.lock().expect("messages mutex").clone(),
+                ))
+                .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "GET" && req.url.contains("/session/") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                let mut calls = self.get_session_calls.lock().expect("calls mutex");
+                *calls += 1;
+                let n_calls = *calls;
+                let fail_after = *self.get_session_fail_after.lock().expect("flag mutex");
+                if fail_after.is_some_and(|after| n_calls > after) {
+                    return Box::pin(async {
+                        Ok(ServeHttpResponse::new(500, b"read exploded".to_vec()))
+                    });
+                }
+                let pointer = self.revert_pointer.lock().expect("pointer mutex").clone();
+                let mut info = json!({ "id": id, "time": { "updated": 10 } });
+                if let Some(pointer) = pointer {
+                    // VERIFIED shape: top-level session.revert = {messageID}, omitted when inactive.
+                    info["revert"] = json!({ "messageID": pointer });
+                }
+                let body = serde_json::to_vec(&info).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`RollbackFakeHttp`]-backed serve manager
+    /// with ONE already-materialized session registered (`ses_real`; the fork-tests
+    /// register idiom) and a wired in-memory identity sink. When `pointer` is set, the
+    /// record a matching undo would have written is seeded (the redo gate consults the
+    /// stored write-time `can_redo` bit).
+    async fn state_with_rollback_fake(
+        pointer: Option<&str>,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+        Arc<RollbackFakeHttp>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(RollbackFakeHttp::new(pointer));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(
+            deps,
+            ServeConfig {
+                idle_poll_interval: std::time::Duration::from_millis(5),
+                ..ServeConfig::default()
+            },
+        );
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let mut session = OpencodeSession::new("ses_real".to_string(), None, None, None);
+        session.real_session_id = Some("ses_real".to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert("ses_real".to_string(), Arc::new(TokioMutex::new(session)));
+        let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        if let Some(pointer) = pointer {
+            // Seed exactly the record a prior undo at this pointer would have written.
+            let messages = http.messages.lock().expect("messages mutex").clone();
+            let boundary = messages
+                .iter()
+                .position(|m| m["info"]["id"].as_str() == Some(pointer))
+                .expect("the seeded pointer exists in the served list");
+            let tail_turns: Vec<Value> = messages[boundary..]
+                .iter()
+                .map(|m| {
+                    RollbackFakeHttp::marker_turn(
+                        m["info"]["id"].as_str().expect("id"),
+                        m["info"]["role"].as_str().expect("role"),
+                        m.pointer("/parts/0/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    )
+                })
+                .collect();
+            let prompt_text = messages[boundary..]
+                .iter()
+                .find(|m| m["info"]["role"].as_str() == Some("user"))
+                .and_then(|m| m.pointer("/parts/0/text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut record = RollbackRecord::empty(1);
+            record.push_entry(
+                RollbackEntry {
+                    removed_turns: tail_turns,
+                    prompt_text,
+                    at_ms: 1,
+                },
+                1,
+            );
+            record.set_can_redo(true, 1);
+            sink.record_rollback(PROVIDER, "ses_real", record)
+                .await
+                .expect("seed the rollback record");
+        }
+        http.clear();
+        (st, rx, sink, http)
+    }
+
+    /// Same harness, then mark the session mid-turn (an unfinished send drive — the
+    /// send-while-compact busy rig's shape).
+    async fn state_with_rollback_fake_busy_turn() -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+        Arc<RollbackFakeHttp>,
+    ) {
+        let (st, rx, sink, http) = state_with_rollback_fake(None).await;
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_real")
+            .cloned()
+            .expect("registered session");
+        session_arc.lock().await.turn_task = Some(TurnTask {
+            kind: TurnTaskKind::Send,
+            handle: tokio::spawn(async { std::future::pending::<()>().await }),
+        });
+        (st, rx, sink, http)
+    }
+
+    fn undo_op(session_id: &str, request_id: &str) -> RollbackRequest {
+        RollbackRequest {
+            direction: RollbackDirection::Undo,
+            mode: RollbackModeReq::Step,
+            turn_id: None,
+            session_id: session_id.into(),
+            session_type: SessionType::Freshopencode,
+            provider: AgentProvider::Opencode,
+            request_id: request_id.into(),
+            cwd: None,
+        }
+    }
+
+    /// Wait until the session's registered turn task has finished (the send's detached
+    /// drive has run the fake's prompt/delete-tail/settle through).
+    async fn await_turn_settled(st: &FreshOpencodeState, session_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let guard = st.sessions.lock().await;
+                    let session_arc = guard.get(session_id).cloned().expect("session exists");
+                    let s = session_arc.lock().await;
+                    s.turn_task
+                        .as_ref()
+                        .map(|t| t.is_finished())
+                        .unwrap_or(true)
+                };
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the turn task finishes within the budget");
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_step_reverts_at_the_last_user_message_and_refills() {
+        let (st, mut rx, st_sink, http) = state_with_rollback_fake(None).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-1"), sink).await;
+
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "one ack: {frames:?}");
+        assert_eq!(frames[0]["event"]["type"], json!("freshAgent.rolledBack"));
+        assert_eq!(frames[0]["event"]["requestId"], json!("rb-1"));
+        assert_eq!(
+            frames[0]["event"]["removedPromptText"],
+            json!("prompt three")
+        );
+        assert_eq!(frames[0]["event"]["canRedo"], json!(true));
+        let reverts = http.revert_posts();
+        assert_eq!(reverts.len(), 1, "exactly one revert POST");
+        assert_eq!(
+            reverts[0].body,
+            Some(json!({ "messageID": "msg_u3" })),
+            "Step targets the last USER message of the active prefix"
+        );
+        // Broadcast: session.changed invalidation + session.rolledBack
+        // (revokeAttention) — and a rollback NEVER chimes.
+        let mut saw_changed = false;
+        let mut saw_rolledback = false;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("broadcast json");
+            assert_ne!(
+                v["event"]["type"],
+                json!("freshAgent.turn.complete"),
+                "rollback never chimes"
+            );
+            saw_changed |= v["event"]["type"] == json!("freshAgent.session.changed");
+            if v["event"]["type"] == json!("freshAgent.session.rolledBack") {
+                saw_rolledback = true;
+                assert_eq!(v["event"]["revokeAttention"], json!(true));
+                assert_eq!(v["event"]["canRedo"], json!(true));
+            }
+        }
+        assert!(
+            saw_changed && saw_rolledback,
+            "invalidation + convergence broadcasts fired"
+        );
+        // The durable record is rebuilt to exactly the current revert tail.
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].prompt_text, "prompt three");
+        assert_eq!(
+            record.entries[0].removed_turns.len(),
+            2,
+            "msg_u3 + msg_a3 marked"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_to_turn_removes_n_turns_in_one_revert_call() {
+        let (st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-2");
+        op.mode = RollbackModeReq::ToTurn;
+        op.turn_id = Some("msg_u2".into());
+        st.handle_rollback(op, sink).await;
+        let reverts = http.revert_posts();
+        assert_eq!(
+            reverts.len(),
+            1,
+            "undo-to-here is ONE revert, never N round trips (decision 3)"
+        );
+        assert_eq!(reverts[0].body, Some(json!({ "messageID": "msg_u2" })));
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["removedPromptText"], json!("prompt two"));
+        assert_eq!(
+            frames[0]["event"]["removedTurnIds"]
+                .as_array()
+                .expect("ids")
+                .len(),
+            4,
+            "two turns away: msg_u2..msg_a3"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_step_moves_the_boundary_forward_by_one_user_step() {
+        // Pointer at msg_u2 (msg_u2..msg_a3 rolled back); one redo step restores
+        // msg_u2+msg_a2 and re-points the boundary at msg_u3.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-3");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let reverts = http.revert_posts();
+        assert_eq!(reverts.len(), 1);
+        assert_eq!(
+            reverts[0].body,
+            Some(json!({ "messageID": "msg_u3" })),
+            "stepwise redo = re-revert to the NEXT user message (decision 5)"
+        );
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["type"], json!("freshAgent.redone"));
+        assert_eq!(frames[0]["event"]["restoredThroughTurnId"], json!("msg_a2"));
+        assert_eq!(
+            frames[0]["event"]["canRedo"],
+            json!(true),
+            "msg_u3+msg_a3 are still rolled back"
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(
+            record.entries[0].removed_turns.len(),
+            2,
+            "the marker bucket was rebased to the remaining tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_full_restore_uses_unrevert() {
+        // Pointer at msg_u3 — the only removed user step: full restore is the
+        // all-or-nothing unrevert.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u3")).await;
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-4");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        assert!(
+            http.recorded()
+                .iter()
+                .any(|r| r.method == "POST" && r.url.contains("/unrevert")),
+            "all-or-nothing redo = POST unrevert"
+        );
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["canRedo"], json!(false));
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert!(record.entries.is_empty(), "nothing rolled back remains");
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_after_destroy_is_redo_unavailable_and_never_posts() {
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        st_sink
+            .record_rollback(PROVIDER, "ses_real", {
+                let mut r = RollbackRecord::empty(1);
+                r.redo_destroyed = true;
+                r.last_op_at_ms = 2;
+                r
+            })
+            .await
+            .expect("seed");
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-5");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("REDO_UNAVAILABLE"));
+        assert_eq!(frames[0]["event"]["message"], json!(REDO_DESTROYED_MESSAGE));
+        assert!(
+            http.recorded()
+                .iter()
+                .all(|r| !(r.method == "POST" && r.url.contains("revert"))),
+            "destroyed redo issues ZERO POSTs"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_without_a_pointer_is_nothing_to_redo() {
+        // No active revert + a well-formed record => REDO_EMPTY, no POSTs.
+        let (st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-5e");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("REDO_UNAVAILABLE"));
+        assert_eq!(frames[0]["event"]["message"], json!(REDO_EMPTY_MESSAGE));
+        assert!(
+            http.recorded().iter().all(|r| r.method == "GET"),
+            "reads only — a refused redo never mutates"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_mid_turn_is_busy() {
+        let (st, _rx, _sink, http) = state_with_rollback_fake_busy_turn().await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-6"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one refusal: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("BUSY_TURN"));
+        assert_eq!(frames[0]["event"]["message"], json!(ROLLBACK_BUSY_MESSAGE));
+        assert!(
+            http.recorded().is_empty(),
+            "busy rollback issues ZERO HTTP calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_placeholder_session_is_lost_session_shape() {
+        let (st, _rx, _sink, _http) = state_with_rollback_fake(None).await;
+        // Register an UNMATERIALIZED placeholder (no durable ses_* id yet).
+        st.sessions.lock().await.insert(
+            "freshopencode-placeholder-1".to_string(),
+            Arc::new(TokioMutex::new(OpencodeSession::new(
+                "freshopencode-placeholder-1".to_string(),
+                None,
+                None,
+                None,
+            ))),
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("freshopencode-placeholder-1", "rb-7"), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one refusal: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("INVALID_SESSION_ID"));
+        assert!(frames[0]["event"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has not materialized; cannot roll back."));
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(undo_op("never-seen", "rb-7b"), sink2)
+            .await;
+        let frames2 = captured_frames(&captured2);
+        assert_eq!(frames2[0]["event"]["code"], json!("INVALID_SESSION_ID"));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_twice_keeps_markers_in_conversation_order() {
+        // Undo (removes the msg_u3 group), then undo again (removes the msg_u2
+        // group): the marker bucket is the tail in its ORIGINAL CONVERSATION ORDER
+        // [u2,a2,u3,a3] — never wire order [u3,a3,u2,a2].
+        let (st, _rx, st_sink, _http) = state_with_rollback_fake(None).await;
+        let (sink, _captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-8a"), sink).await;
+        let (sink2, _captured2) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-8b"), sink2)
+            .await;
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "the current-epoch tail is rebuilt as one entry: {record:?}"
+        );
+        let ids = RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns);
+        assert_eq!(
+            ids,
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "markers follow the tail's conversation order"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_step_on_an_empty_active_prefix_is_nothing_to_undo() {
+        // Empty-prefix LEGALITY (r2/first-turn amendment): rolling back the FIRST
+        // user message empties the conversation; ONE further step past that has
+        // nothing left to undo.
+        let (st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        // Undo toTurn msg_u1 — legal empty prefix.
+        let mut op = undo_op("ses_real", "rb-9a");
+        op.mode = RollbackModeReq::ToTurn;
+        op.turn_id = Some("msg_u1".into());
+        st.handle_rollback(op, capturing_sink().0).await;
+        assert_eq!(
+            http.revert_posts().len(),
+            1,
+            "the empty-prefix revert issued"
+        );
+        // Now the active prefix is empty: one more step is NOTHING_TO_UNDO.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-9b"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("NOTHING_TO_UNDO"));
+        assert_eq!(frames[0]["event"]["message"], json!(UNDO_EMPTY_MESSAGE));
+        assert_eq!(
+            http.revert_posts().len(),
+            1,
+            "the empty-prefix step issues no new revert"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_silent_noop_revert_is_invalid_target() {
+        // Triad leg (b) (r3): revert 200s and the post-verify read SUCCEEDS but the
+        // pointer provably did NOT move (unknown/stale messageID simulation — the
+        // verified silent-200 rule is pointer-untouched-on-no-op, so the provider is
+        // provably unmoved): INVALID_ROLLBACK_TARGET + the pre-written record is
+        // compensated back (the ledger never describes a rollback the serve provably
+        // rejected).
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        *http.revert_moves_pointer.lock().expect("flag") = false;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-10"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("INVALID_ROLLBACK_TARGET"));
+        assert!(
+            st_sink
+                .load_rollback(PROVIDER, "ses_real")
+                .map(|r| r.entries.is_empty())
+                .unwrap_or(true),
+            "the pre-written record was compensated away"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_undo_post_verify_read_failure_keeps_the_ledger_and_reports_internal_error(
+    ) {
+        // Triad leg (c) (r3, undo leg): the revert POST 200s, but the post-verify
+        // get_session READ FAILS (transport/5xx — the mutation may have applied).
+        // Exactly one frame, INTERNAL_ERROR (never INVALID_ROLLBACK_TARGET); NO
+        // compensating rewrite (a compensate after a possibly-applied mutation would
+        // falsify the ledger — the pre-written post-op record is still in the sink
+        // verbatim). Note in the handler: the next snapshot derives its prefix from
+        // provider rows, so pane + record reconverge automatically on retry.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        *http.get_session_fail_after.lock().expect("flag") = Some(1);
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-11a"), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one frame: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("post-rollback verification read failed"),
+            "the read-failure copy: {frames:?}"
+        );
+        let record = st_sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the ledger is KEPT, never compensated");
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u3", "msg_a3"],
+            "the post-op record is verbatim"
+        );
+        assert_eq!(
+            *http.get_session_calls.lock().expect("calls"),
+            2,
+            "the initial read + the failed post-verify read — and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_post_verify_read_failure_keeps_the_ledger_and_reports_internal_error(
+    ) {
+        // Triad leg (c) (r3, redo leg): same rig over a seeded pointer + record; the
+        // failed read after a re-revert yields the same INTERNAL_ERROR + ledger-kept
+        // outcome.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        *http.get_session_fail_after.lock().expect("flag") = Some(1);
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-11b");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one frame: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        let record = st_sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the ledger is KEPT");
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u3", "msg_a3"],
+            "the redo post-op record (the remaining tail) is verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_revert_404_is_unsupported_capability() {
+        let (st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        *http.revert_status.lock().expect("status") = 404; // CLI predates the revert route
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-12"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(frames[0]["event"]["message"], json!(OPENCODE_OLD_CLI_COPY));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_revert_http_500_is_internal_error() {
+        // A non-404 5xx on revert: only unknown transport/other failures map to
+        // INTERNAL_ERROR (never an uncontextualized 404, never an unclassified error
+        // class).
+        let (st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        *http.revert_status.lock().expect("status") = 500;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-13"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_ne!(frames[0]["event"]["message"], json!(OPENCODE_OLD_CLI_COPY));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_record_write_failure_refuses_and_never_posts_revert() {
+        // Durable-BEFORE-mutation: the record pre-write fails => INTERNAL_ERROR +
+        // LEDGER_WRITE_REFUSAL_COPY and NO revert/unrevert POST is ever issued.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        st_sink.set_fail_writes(true);
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-14"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(LEDGER_WRITE_REFUSAL_COPY)
+        );
+        assert!(
+            http.recorded()
+                .iter()
+                .all(|r| !(r.method == "POST" && r.url.contains("revert"))),
+            "provider history is never mutated once the record cannot be saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_send_issued_mid_rollback_strictly_follows_it() {
+        // Pinned semantic (send waits; rollback wins; then the send destroys redo)
+        // under the r2 lock discipline: the per-session mutex is held across the
+        // whole rollback handler, and handle_send NEVER acquires/consults
+        // rollback_in_flight — its ONLY wait point is that same mutex, so a send
+        // issued while a rollback is in flight blocks behind it with no circular
+        // wait.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        let gate = http.arm_revert_gate();
+        let rollback = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_op("ses_real", "rb-15"), capturing_sink().0)
+                    .await
+            })
+        };
+        // Wait until the rollback is parked INSIDE the revert POST.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !http.revert_posts().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the rollback reaches the revert POST");
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("ses_real", "again")).await })
+        };
+        // Give the send a moment to line up behind the session mutex.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            http.recorded()
+                .iter()
+                .all(|r| !r.url.contains("/prompt_async")),
+            "the send waits on the per-session mutex"
+        );
+        gate.notify_one();
+        // Bounded completion == no deadlock between the two handlers' lock waits.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (r, s) = tokio::join!(rollback, send);
+            r.expect("rollback task");
+            s.expect("send task");
+        })
+        .await
+        .expect("send+rollback must serialize, never deadlock");
+        let recorded = http.recorded();
+        let revert_pos = recorded
+            .iter()
+            .position(|r| r.method == "POST" && r.url.ends_with("/revert"))
+            .expect("revert happened");
+        let prompt_pos = recorded
+            .iter()
+            .position(|r| r.method == "POST" && r.url.contains("/prompt_async"))
+            .expect("prompt happened");
+        assert!(
+            revert_pos < prompt_pos,
+            "the send strictly follows the rollback — never concurrent"
+        );
+        assert!(
+            st_sink
+                .load_rollback(PROVIDER, "ses_real")
+                .expect("record")
+                .redo_destroyed,
+            "the trailing send destroyed redo on the post-rollback record (decision 5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_after_a_resend_starts_a_new_epoch_and_redo_still_works() {
+        // r3 epoch rule end-to-end on this lane: undo (removes the msg_u3 group) →
+        // resend the edited prompt (the fake's /prompt_async arm natively DELETES the
+        // reverted tail rows and clears the pointer, mirroring decision-5 native
+        // behavior; destroy_redo_on_submit sets redo_destroyed) → undo AGAIN (removes
+        // the resent turn) → redo. The marker bucket is the UNION: the old u3-group
+        // markers PERSIST as frozen prior-epoch entries (their serve rows were
+        // natively deleted; the ledger is their only home, decision 6) PRECEDING the
+        // newest epoch's markers in conversation order; only the redo-capable chain
+        // state reset (redo available again for the NEW chain); and one redo step
+        // restores the newest epoch's removed tail (never the frozen rows).
+        let (st, _rx, st_sink, _http) = state_with_rollback_fake(None).await;
+
+        st.handle_rollback(undo_op("ses_real", "rb-16a"), capturing_sink().0)
+            .await;
+        st.handle_send(send_msg("ses_real", "prompt three (edited)"))
+            .await;
+        await_turn_settled(&st, "ses_real").await;
+
+        // Undo AGAIN — this op lands while redo_destroyed is set: a NEW epoch.
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-16b"), sink2)
+            .await;
+        let frames2 = captured_frames(&captured2);
+        assert_eq!(frames2[0]["event"]["type"], json!("freshAgent.rolledBack"));
+        assert_eq!(
+            frames2[0]["event"]["removedTurnIds"],
+            json!(["msg_u4", "msg_a4"]),
+            "the resent turn is the removed step"
+        );
+        assert_eq!(
+            frames2[0]["event"]["removedPromptText"],
+            json!("prompt three (edited)"),
+            "the composer refill is the RESENT prompt"
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u3", "msg_a3", "msg_u4", "msg_a4"],
+            "UNION markers: frozen prior-epoch rows PRECEDE the new epoch's (conversation order)"
+        );
+        assert!(
+            record.can_redo() && !record.redo_destroyed,
+            "only the redo-capable chain state reset; the NEW chain is redoable"
+        );
+
+        // One redo step restores EXACTLY the new epoch's tail — never the frozen rows.
+        let (sink3, captured3) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-16c");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink3).await;
+        let frames3 = captured_frames(&captured3);
+        assert_eq!(frames3[0]["event"]["type"], json!("freshAgent.redone"));
+        assert_eq!(
+            frames3[0]["event"]["restoredThroughTurnId"],
+            json!("msg_a4"),
+            "redo restores the NEWEST epoch's tail, never the frozen rows"
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u3", "msg_a3"],
+            "the frozen prior-epoch markers survive the redo (decision 6)"
+        );
+        assert!(
+            !record.can_redo(),
+            "the new chain is fully restored; the frozen rows stay ledger-only"
+        );
     }
 }

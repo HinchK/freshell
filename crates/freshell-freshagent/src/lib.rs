@@ -1388,7 +1388,13 @@ fn opencode_turn_summary(items: &[Value]) -> String {
 /// `tool`, `file`, and `patch` parts all become visible transcript items today; only
 /// structural (`step-start`/`step-finish`) and truly unrecognized part types are dropped,
 /// matching the reference's own `return []` default.
-fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
+///
+/// kata 1wxv Task 3: the projection is factored as the shared per-message turn
+/// builder — the rollback record's marker entries and `rolledBackTurns` bucket use the
+/// SAME projection as `turns[]`, so markers match the transcript the model saw.
+/// `None` for a message the transcript itself drops (an unknown role carrying
+/// displayable items) — call sites `filter_map`.
+pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
     let info = message.get("info").cloned().unwrap_or_else(|| json!({}));
     let id = info
         .get("id")
@@ -1445,11 +1451,38 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
 /// covers the live case, this endpoint's job is the committed transcript.
 fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value) -> Value {
     let messages = messages.as_array().cloned().unwrap_or_default();
-    let turns: Vec<Value> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(ordinal, message)| build_opencode_turn_json(message, ordinal))
-        .collect();
+    // kata 1wxv Task 3 (VERIFIED wire shape, load-bearing correction item 2): the
+    // serve returns the reverted tail rows UNFLAGGED in the message list; the
+    // boundary is TOP-LEVEL `session.revert.messageID` (omitted when inactive —
+    // there is no `info.revert` anywhere). `turns[]` is EXACTLY what the model sees
+    // next (messages strictly before the pointer); the tail rows at-or-after the
+    // pointer are projected as `rolledBackTurns` markers in conversation order,
+    // each stamped `rolledBack:true` (decision 6). A stale/unknown pointer keeps
+    // the whole list in `turns[]` (never silently empties the transcript).
+    let boundary = info
+        .get("revert")
+        .and_then(|r| r.get("messageID"))
+        .and_then(Value::as_str)
+        .and_then(|pointer| {
+            messages
+                .iter()
+                .position(|m| m.pointer("/info/id").and_then(Value::as_str) == Some(pointer))
+        })
+        .unwrap_or(messages.len());
+    let mut turns: Vec<Value> = Vec::new();
+    let mut rolled_back: Vec<Value> = Vec::new();
+    for (ordinal, message) in messages.iter().enumerate() {
+        let Some(turn) = opencode_message_turn_json(message, ordinal) else {
+            continue;
+        };
+        if ordinal < boundary {
+            turns.push(turn);
+        } else {
+            let mut turn = turn;
+            turn["rolledBack"] = json!(true);
+            rolled_back.push(turn);
+        }
+    }
     let session_id = info
         .get("id")
         .and_then(Value::as_str)
@@ -1497,6 +1530,11 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
     snapshot.insert("diffs".to_string(), json!([]));
     snapshot.insert("childThreads".to_string(), json!([]));
     snapshot.insert("turns".to_string(), json!(turns));
+    // The marker bucket is omitted entirely when nothing is rolled back (the strict
+    // contract key is optional; a legacy-server payload simply never carries it).
+    if !rolled_back.is_empty() {
+        snapshot.insert("rolledBackTurns".to_string(), json!(rolled_back));
+    }
     snapshot.insert("extensions".to_string(), json!({ "opencode": {} }));
     Value::Object(snapshot)
 }
@@ -3350,7 +3388,7 @@ mod tests {
     }
 
     #[test]
-    fn build_opencode_turn_json_renders_both_tool_and_text_parts_in_one_message() {
+    fn opencode_message_turn_json_renders_both_tool_and_text_parts_in_one_message() {
         let message = json!({
             "info": { "id": "msg-1", "role": "assistant" },
             "parts": [
@@ -3358,7 +3396,7 @@ mod tests {
                 { "type": "text", "id": "x-1", "text": "Ran the command." },
             ],
         });
-        let turn = build_opencode_turn_json(&message, 0).expect("turn builds");
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
         let items = turn["items"].as_array().expect("items array");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["kind"], json!("dynamic_tool"));
@@ -3367,6 +3405,110 @@ mod tests {
         assert_eq!(items[1]["text"], json!("Ran the command."));
         // Summary joins the (single) text item's text.
         assert_eq!(turn["summary"], json!("Ran the command."));
+    }
+
+    // ── kata 1wxv Task 3: the FUNCTIONAL active-prefix / tail-marker filter ──────
+    //
+    // The serve returns the reverted tail rows UNFLAGGED in the message list; the
+    // VERIFIED wire shape puts the boundary at TOP-LEVEL `session.revert.messageID`
+    // (no `info.revert` exists anywhere). `turns[]` is EXACTLY what the model sees
+    // next (messages strictly before the pointer); the tail becomes
+    // `rolledBackTurns` markers in conversation order, each stamped rolledBack:true.
+
+    fn three_turn_opencode_messages() -> Value {
+        json!([
+            { "info": { "id": "msg_u1", "role": "user" }, "parts": [{ "type": "text", "text": "prompt one" }] },
+            { "info": { "id": "msg_a1", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer one" }] },
+            { "info": { "id": "msg_u2", "role": "user" }, "parts": [{ "type": "text", "text": "prompt two" }] },
+            { "info": { "id": "msg_a2", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer two" }] },
+            { "info": { "id": "msg_u3", "role": "user" }, "parts": [{ "type": "text", "text": "prompt three" }] },
+            { "info": { "id": "msg_a3", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer three" }] },
+        ])
+    }
+
+    #[test]
+    fn opencode_snapshot_filters_turns_to_the_active_prefix_and_marks_the_tail() {
+        // Top-LEVEL session.revert.messageID = the middle USER message; the message
+        // list is served in FULL (tail unflagged, exactly like the real provider).
+        let info = json!({ "id": "ses_x", "title": "t", "revert": { "messageID": "msg_u2" } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &three_turn_opencode_messages());
+
+        let turns = snap["turns"].as_array().expect("turns array");
+        let ids: Vec<&str> = turns.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["msg_u1", "msg_a1"],
+            "turns[] == the active prefix ONLY (strictly before the pointer) — a \
+             regression to mapping every served message into turns[] fails here"
+        );
+
+        let markers = snap["rolledBackTurns"]
+            .as_array()
+            .expect("the marker bucket is present while a tail is rolled back");
+        let marker_ids: Vec<&str> = markers
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            marker_ids,
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "the tail rows in their ORIGINAL conversation order"
+        );
+        assert!(
+            markers.iter().all(|t| t["rolledBack"] == json!(true)),
+            "every marker is stamped rolledBack:true (decision 6)"
+        );
+    }
+
+    #[test]
+    fn opencode_snapshot_marker_order_is_stable_across_repeated_undos() {
+        // Revert the LAST user message, build; then revert the MIDDLE user message,
+        // build: the second snapshot's rolledBackTurns order equals the surviving
+        // tail's conversation order — never wire/undo order ([u3,a3,u2,a2]).
+        let first = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x", "revert": { "messageID": "msg_u3" } }),
+            &three_turn_opencode_messages(),
+        );
+        let first_ids: Vec<&str> = first["rolledBackTurns"]
+            .as_array()
+            .expect("markers after the first undo")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(first_ids, vec!["msg_u3", "msg_a3"]);
+
+        let second = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x", "revert": { "messageID": "msg_u2" } }),
+            &three_turn_opencode_messages(),
+        );
+        let second_ids: Vec<&str> = second["rolledBackTurns"]
+            .as_array()
+            .expect("markers after the second undo")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            second_ids,
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "markers follow the surviving tail's conversation order across repeated undos"
+        );
+        // No revert pointer (legacy behavior): everything stays in turns[], no bucket.
+        let plain = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x" }),
+            &three_turn_opencode_messages(),
+        );
+        assert_eq!(
+            plain["turns"].as_array().expect("turns").len(),
+            6,
+            "no pointer ⇒ no filtering (legacy-server parity)"
+        );
+        assert!(
+            plain.get("rolledBackTurns").is_none(),
+            "the marker bucket is omitted entirely when nothing is rolled back"
+        );
     }
 }
 

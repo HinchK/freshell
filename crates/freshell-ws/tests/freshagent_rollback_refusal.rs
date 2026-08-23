@@ -68,18 +68,14 @@ fn assert_rollback_refusal(
 
 #[tokio::test]
 async fn undo_is_refused_for_providers_whose_leg_has_not_landed() {
-    // Kata 1wxv Task 2: the codex x undo cell left this matrix — it is REAL
-    // DISPATCH now (`FreshCodexState::handle_rollback`; a codex undo for an
-    // unknown session answers INVALID_SESSION_ID, never the table). Claude
-    // (freshclaude + kilroy) and opencode stay refused until Tasks 3/4;
-    // amplifier cells are refused permanently (no amplifier fresh-agent
-    // runtime exists).
+    // Kata 1wxv Tasks 2+3: the codex x undo and opencode x undo cells left this
+    // matrix — they are REAL DISPATCH now (`FreshCodexState::handle_rollback` /
+    // `FreshOpencodeState::handle_rollback`; an undo for an unknown session
+    // answers INVALID_SESSION_ID, never the table). Claude (freshclaude +
+    // kilroy) stays refused until Task 4; amplifier cells are refused
+    // permanently (no amplifier fresh-agent runtime exists).
     let (url, _registry) = spawn_server().await;
-    for (provider, session_type) in [
-        ("claude", "freshclaude"),
-        ("claude", "kilroy"),
-        ("opencode", "freshopencode"),
-    ] {
+    for (provider, session_type) in [("claude", "freshclaude"), ("claude", "kilroy")] {
         let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
         send_json(
             &mut ws,
@@ -105,15 +101,15 @@ async fn undo_is_refused_for_providers_whose_leg_has_not_landed() {
 async fn redo_is_refused_for_every_provider_until_its_leg_lands() {
     // The codex x redo row NEVER leaves this matrix: codex history revert is
     // destructive and codex has no redo primitive (decision 5) — the refusal
-    // is PERMANENT for that cell. Claude/opencode redo stay refused only until
-    // their legs land (Tasks 3/4).
+    // is PERMANENT for that cell. Kata 1wxv Task 3: the opencode x redo cell is
+    // REAL DISPATCH (re-revert/unrevert), no longer refused. Claude redo stays
+    // refused only until its leg lands (Task 4).
     let (url, _registry) = spawn_server().await;
     for (provider, session_type) in [
         ("claude", "freshclaude"),
         ("claude", "kilroy"),
         // PERMANENT (decision 5): codex x redo.
         ("codex", "freshcodex"),
-        ("opencode", "freshopencode"),
     ] {
         let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
         send_json(

@@ -1202,6 +1202,22 @@ async fn handle_client_text(
                     }
                     .instrument(tracing::Span::current()),
                 );
+            } else if is_opencode_provider(m.provider) {
+                // Task 3: opencode x undo is REAL DISPATCH (revert/unrevert in
+                // `FreshOpencodeState::handle_rollback`), same fork-arm shape.
+                let fresh_opencode = state.fresh_opencode.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_opencode
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
             } else {
                 conn_sink(rollback_refusal_frame(
                     &freshell_freshagent::RollbackRequest::from_undo(m),
@@ -1211,13 +1227,30 @@ async fn handle_client_text(
             true
         }
         // Codex x redo stays refused PERMANENTLY (decision 5 — codex history
-        // revert is destructive; there is no redo primitive); the claude/
-        // opencode redo legs land in Tasks 3/4.
+        // revert is destructive; there is no redo primitive); Task 3 makes
+        // opencode x redo REAL DISPATCH (re-revert/unrevert); the claude redo
+        // leg lands in Task 4.
         ClientMessage::FreshAgentRedo(m) => {
-            conn_sink(rollback_refusal_frame(
-                &freshell_freshagent::RollbackRequest::from_redo(m),
-                "Redo is",
-            ));
+            if is_opencode_provider(m.provider) {
+                let fresh_opencode = state.fresh_opencode.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_opencode
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_redo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else {
+                conn_sink(rollback_refusal_frame(
+                    &freshell_freshagent::RollbackRequest::from_redo(m),
+                    "Redo is",
+                ));
+            }
             true
         }
         // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
@@ -5127,6 +5160,12 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
 /// the prior swallow behavior until a later PR adds their handlers.
 fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
     matches!(provider, freshell_protocol::AgentProvider::Codex)
+}
+
+/// Whether a `freshAgent.undo`/`freshAgent.redo` frame should route to the opencode
+/// handler (kata 1wxv Task 3).
+fn is_opencode_provider(provider: freshell_protocol::AgentProvider) -> bool {
+    matches!(provider, freshell_protocol::AgentProvider::Opencode)
 }
 
 // ── tabs.sync.* (ws-handler.ts:3058-3145) ────────────────────────────────────

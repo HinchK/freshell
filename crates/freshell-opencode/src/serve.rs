@@ -39,6 +39,20 @@ use crate::events::{
 /// detached listener (`OWNERSHIP_ENV`, `serve-manager.ts:11`).
 pub const OPENCODE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_OPENCODE_SIDECAR_ID";
 
+/// kata 1wxv Task 3 (decision 1 — conversation rollback NEVER touches files): the
+/// env-var lane the vendored opencode 1.18.21 CLI merges as an inline config document
+/// (parsed with the highest-precedence "local" scope — `loaded custom config from
+/// OPENCODE_CONFIG_CONTENT`).
+pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// The managed fresh-agent serve's pinned config: opencode snapshots DISABLED via the
+/// vendored CLI's verified config key (`snapshot: false`, 1.18.21). Probe-verified at
+/// Stage 2: with snapshots enabled, native `revert` re-applies FILE state for
+/// patch-carrying turns — as long as the managed sidecar carries this, conversation
+/// rollback can never touch the working tree (the Task 7 byte-identical-tree e2e is
+/// the behavioral arbiter).
+pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
+
 /// A boxed, `Send` future — the object-safe async return used by the injected IO
 /// traits (keeps them `dyn`-compatible without an `async-trait` dependency).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -428,6 +442,14 @@ impl OpencodeServeManager {
             OPENCODE_SIDECAR_OWNERSHIP_ENV.to_string(),
             ownership_id.clone(),
         ));
+        // kata 1wxv Task 3 (decision 1): the MANAGED fresh-agent serve ALWAYS carries
+        // opencode snapshots disabled — layered AFTER any caller-supplied env so the
+        // command-line env map's duplicate-key semantics make it win. Conversation
+        // rollback (revert/unrevert) must never re-apply file state.
+        env.push((
+            OPENCODE_CONFIG_CONTENT_ENV.to_string(),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
+        ));
         let process = self
             .inner
             .deps
@@ -767,6 +789,44 @@ impl OpencodeServeManager {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         })
+    }
+
+    /// `POST /session/:id/revert` (opencode 1.18.21, kata 1wxv Task 3) —
+    /// message-targeted conversation rollback: `{messageID}` marks that message AND
+    /// everything after it as reverted (the boundary is INCLUSIVE of the named
+    /// message; an assistant target normalizes to its parent user message). Body
+    /// discipline mirrors `fork` (additionalProperties:false upstream): EXACTLY one
+    /// key.
+    pub async fn revert(
+        &self,
+        id: &str,
+        message_id: &str,
+        route: &Route,
+    ) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/revert", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(
+            HttpMethod::Post,
+            &path,
+            Some(json!({ "messageID": message_id })),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `POST /session/:id/unrevert` — restores ALL reverted messages (opencode's
+    /// all-or-nothing redo). No body.
+    pub async fn unrevert(&self, id: &str, route: &Route) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/unrevert", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(HttpMethod::Post, &path, None, None)
+            .await?;
+        Ok(())
     }
 
     // ── SSE fan-out (serve-manager.ts:419-438) ──────────────────────────────────
@@ -1165,6 +1225,7 @@ mod tests {
         fork_status: u16,
         fork_body: Vec<u8>,
         config_body: Vec<u8>,
+        revert_status: u16,
     }
 
     impl RecordingHttp {
@@ -1175,6 +1236,7 @@ mod tests {
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
+                revert_status: 200,
             }
         }
 
@@ -1212,6 +1274,15 @@ mod tests {
             if req.url.contains("/fork") {
                 let status = self.fork_status;
                 let body = self.fork_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            if req.url.contains("/revert") {
+                let status = self.revert_status;
+                let body = if status == 200 {
+                    b"true".to_vec()
+                } else {
+                    br#"{"error":"unknown route"}"#.to_vec()
+                };
                 return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/config") {
@@ -1427,5 +1498,134 @@ mod tests {
             }
             other => panic!("expected a 400 Http error, got {other:?}"),
         }
+    }
+
+    // ── revert/unrevert + snapshots-disabled launch (kata 1wxv Task 3) ────────
+
+    /// The recorded revert-family POST requests, if any (`/revert` AND `/unrevert` —
+    /// the latter never contains the former as a substring).
+    fn revert_requests(http: &RecordingHttp) -> Vec<(String, String, Option<String>)> {
+        http.recorded()
+            .into_iter()
+            .filter(|(method, url, _)| method == "POST" && url.contains("revert"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn revert_posts_exactly_the_message_id_key() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.revert("ses_9", "msg_u3", &Some("/work dir".to_string()))
+            .await
+            .expect("200 revert succeeds");
+
+        let requests = revert_requests(&http);
+        assert_eq!(requests.len(), 1, "exactly one revert POST");
+        let (_, url, body) = requests.into_iter().next().expect("one revert POST");
+        assert!(
+            url.contains("/session/ses_9/revert"),
+            "the revert path carries the session id: {url}"
+        );
+        assert!(
+            url.contains("directory=%2Fwork%20dir"),
+            "the route is preserved: {url}"
+        );
+        // additionalProperties:false upstream: EXACTLY the one key.
+        let body: Value =
+            serde_json::from_str(body.as_deref().expect("revert carries a JSON body")).unwrap();
+        assert_eq!(body, serde_json::json!({ "messageID": "msg_u3" }), "{body}");
+    }
+
+    #[tokio::test]
+    async fn unrevert_posts_no_body() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.unrevert("ses_9", &None)
+            .await
+            .expect("200 unrevert succeeds");
+
+        let requests = revert_requests(&http);
+        assert_eq!(requests.len(), 1, "exactly one unrevert POST");
+        let (_, url, body) = requests.into_iter().next().expect("one unrevert POST");
+        assert!(
+            url.contains("/session/ses_9/unrevert"),
+            "the unrevert path carries the session id: {url}"
+        );
+        assert!(
+            body.is_none(),
+            "unrevert is the legacy no-POST-body shape: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_surfaces_a_404_as_an_http_error() {
+        // A CLI predating the revert surface answers 404/unknown-route; the caller
+        // maps it to UNSUPPORTED_CAPABILITY (never an uncontextualized INTERNAL_ERROR).
+        let http = Arc::new(RecordingHttp {
+            revert_status: 404,
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http).await;
+
+        match mgr.revert("ses_9", "msg_u3", &None).await {
+            Err(ServeError::Http { method, status, .. }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(status, 404);
+            }
+            other => panic!("expected a 404 Http error, got {other:?}"),
+        }
+    }
+
+    /// A spawner that CAPTURES its spawn requests (the launch-config assertion).
+    struct CapturingSpawner {
+        requests: Mutex<Vec<SpawnRequest>>,
+    }
+    impl ProcessSpawner for CapturingSpawner {
+        fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            self.requests.lock().expect("spawns mutex").push(req);
+            Ok(Box::new(NeverExitsProcess))
+        }
+    }
+
+    /// kata 1wxv Task 3 (decision 1 — rollback NEVER touches files): native
+    /// revert re-applies FILE state for patch-carrying turns when snapshots are
+    /// enabled (probe-verified against the vendored 1.18.21 CLI), so the managed
+    /// fresh-agent `opencode serve` sidecar ALWAYS launches with opencode
+    /// snapshots DISABLED via `OPENCODE_CONFIG_CONTENT={"snapshot": false}`
+    /// (the vendored CLI's verified config key; merged config, highest-precedence
+    /// env lane). The Task 7 byte-identical-working-tree e2e is the behavioral
+    /// arbiter; this pins the launch config itself.
+    #[tokio::test]
+    async fn the_managed_serve_launches_with_opencode_snapshots_disabled() {
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        assert_eq!(requests.len(), 1, "exactly one sidecar spawn");
+        let entry = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .expect("the managed serve carries OPENCODE_CONFIG_CONTENT");
+        assert_eq!(
+            entry.1, OPENCODE_SNAPSHOTS_DISABLED_CONFIG,
+            "the managed config is exactly the snapshots-disabled document"
+        );
+        let parsed: Value =
+            serde_json::from_str(&entry.1).expect("the managed config is valid JSON");
+        assert_eq!(parsed, serde_json::json!({ "snapshot": false }));
     }
 }
