@@ -126,11 +126,23 @@ account (export it). All skill scripts are invoked via
    "probe passes, build 403s" failure):
 
    ```bash
-   # Staging bucket Cloud Build uploads source to (confirm the name; the
-   # default is <project>_cloudbuild):
-   BUCKET="$(gcloud storage buckets list --project=misc-puttering-project \
-       --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --format='value(name)' | grep cloudbuild)"
-   for role in roles/storage.objectAdmin roles/storage.legacyBucketReader; do
+   # Staging bucket Cloud Build uploads source to (the default is
+   # <project>_cloudbuild). Discovery must be deterministic: exactly one
+   # *cloudbuild* bucket or the operator stops and picks by hand.
+   mapfile -t BUCKETS < <(gcloud storage buckets list --project=misc-puttering-project \
+     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --format='value(name)' | grep cloudbuild)
+   if [ "${#BUCKETS[@]}" -ne 1 ]; then
+     printf 'expected exactly one *cloudbuild* bucket, found %d:\n' "${#BUCKETS[@]}" >&2
+     printf '  %s\n' "${BUCKETS[@]}" >&2
+     exit 1
+   fi
+   BUCKET="${BUCKETS[0]}"
+   echo "scoping storage grants to staging bucket: $BUCKET"
+   # objectUser (object CRUD/list/multipart), NOT objectAdmin: the submitter
+   # only stages ordinary source objects, and objectAdmin would add object
+   # setIamPolicy/retention powers the bearer key must never hold. (This
+   # diverges from the gcloud-robot skill's example role on purpose.)
+   for role in roles/storage.objectUser roles/storage.legacyBucketReader; do
      gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
        --member="serviceAccount:gcloud-robot@misc-puttering-project.iam.gserviceaccount.com" \
        --role="$role" \

@@ -91,9 +91,14 @@ Exact project-wide constraints every task must honor:
   Cloud Build access requirements explicitly demand
   `serviceusage.services.use` to run `gcloud builds` commands — without it a
   robot passes the create-probe yet fails `builds submit`). SCOPED GRANTS
-  (checklist, not bootstrap): `roles/storage.objectAdmin` +
+  (checklist, not bootstrap): `roles/storage.objectUser` +
   `roles/storage.legacyBucketReader` on the Cloud Build staging bucket
-  (default `misc-puttering-project_cloudbuild`, operator confirms);
+  (default `misc-puttering-project_cloudbuild`, discovered deterministically
+  — exactly one match required). objectUser, NOT objectAdmin: the lane only
+  stages ordinary objects; objectAdmin would add object setIamPolicy/
+  retention powers the bearer key must never hold (delta-review remediation —
+  the runbook code listing in Task 3 is a frozen draft and was superseded by
+  the executed runbook);
   `roles/artifactregistry.writer` on the `freshell-e2e` REPOSITORY ONLY
   (repository-level binding — project-wide would give the bearer key write
   access to every current and future repo; and writer CANNOT create
