@@ -85,40 +85,45 @@ Exact project-wide constraints every task must honor:
   commit per task; no PR creation; no production-server restarts; no broad
   kill patterns.
 - **Role set (documented, human-applied)** for project
-  `misc-puttering-project`, robot `gcloud-robot`: project-level
-  `roles/cloudbuild.builds.editor`, `roles/artifactregistry.writer`,
-  `roles/run.developer`, `roles/logging.viewer`; bucket-scoped
-  `roles/storage.objectAdmin` + `roles/storage.legacyBucketReader` on the
-  Cloud Build staging bucket (default `misc-puttering-project_cloudbuild`,
-  operator confirms); `roles/iam.serviceAccountUser` (actAs) on the project's
-  default compute service account
-  (`<projectNumber>-compute@developer.gserviceaccount.com`), plus — ONLY IF
-  the project's Cloud Build default service account (`gcloud builds
-  get-default-service-account`) is an identity the project controls — actAs
-  on that identity too (the LEGACY Cloud Build SA
+  `misc-puttering-project`, robot `gcloud-robot`. PROJECT-LEVEL (bootstrap):
+  `roles/cloudbuild.builds.editor`, `roles/run.developer`,
+  `roles/logging.viewer`, `roles/serviceusage.serviceUsageConsumer` (Google's
+  Cloud Build access requirements explicitly demand
+  `serviceusage.services.use` to run `gcloud builds` commands — without it a
+  robot passes the create-probe yet fails `builds submit`). SCOPED GRANTS
+  (checklist, not bootstrap): `roles/storage.objectAdmin` +
+  `roles/storage.legacyBucketReader` on the Cloud Build staging bucket
+  (default `misc-puttering-project_cloudbuild`, operator confirms);
+  `roles/artifactregistry.writer` on the `freshell-e2e` REPOSITORY ONLY
+  (repository-level binding — project-wide would give the bearer key write
+  access to every current and future repo; and writer CANNOT create
+  repositories, so the operator ensures the repo exists first);
+  `roles/iam.serviceAccountUser` (actAs) on the project's default compute
+  service account (`<projectNumber>-compute@developer.gserviceaccount.com`),
+  plus — ONLY IF the project's Cloud Build default service account
+  (`gcloud builds get-default-service-account`) is an identity the project
+  controls — actAs on that identity too (the LEGACY Cloud Build SA
   `<projectNumber>@cloudbuild.gserviceaccount.com` is Google-owned and
   accepts no bindings, and
   `service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com` is the
   service AGENT, never a build-execution identity — grant nothing on either).
-  NO `roles/serviceusage.serviceUsageConsumer` (not justified by the surface).
   Role-set reasoning, verified against the official role permission lists
-  (review round-1 remediation): `roles/run.developer` subsumes
+  (review rounds 1–3): `roles/run.developer` subsumes
   `run.invoker`/`run.jobsExecutor`/`run.viewer` for job lanes and is the
   tightest built-in that also carries `run.jobs.runWithOverrides` — REQUIRED
   because the vitest wrapper's `run jobs execute --tasks/--task-timeout/
   --update-env-vars` supplies per-execution overrides. `run.jobsExecutor`,
   `run.jobsExecutorWithOverrides`, `run.invoker`, and `run.viewer` are
   deliberately NOT in the list (each is either too narrow or redundant under
-  developer). The wrapper's create-if-missing Artifact Registry path
-  (`artifacts repositories create`) is NOT granted
-  (`artifactregistry.repositories.create` would need repoAdmin): the operator
-  checklist ensures the repository exists instead. Build-log access comes
-  from routing Cloud Build logs to Cloud Logging
-  (`options.logging: CLOUD_LOGGING_ONLY` in cloudbuild.yaml — Task 2 edit
-  E12), which `roles/logging.viewer` covers; the legacy default GCS
+  developer). Build-log access comes from routing Cloud Build logs to Cloud
+  Logging (`options.logging: CLOUD_LOGGING_ONLY` in cloudbuild.yaml — Task 2
+  edit E12), which `roles/logging.viewer` covers; the legacy default GCS
   log-bucket path is documented upstream as requiring project-wide
   `roles/viewer` for manual builds reading its logs and is deliberately not
-  granted.
+  granted. Tradeoff, honest: CLOUD_LOGGING_ONLY disables live log streaming
+  during `gcloud builds submit` (upstream LoggingMode reference); builds
+  complete normally and logs are read after the fact with
+  `gcloud builds log <id>` (covered by editor's builds.get + logging.viewer).
 - **Files explicitly out of scope (untouched, with reason):**
   `scripts/run-standard-tests.ts` (it `execFileSync`s `vitest-cloud.sh` with
   inherited env; identity resolution lives inside the wrapper so the
@@ -170,14 +175,26 @@ Exact project-wide constraints every task must honor:
   checklist ensures the AR repo exists instead of granting repoAdmin.
 - **A7** (raised by plan-review round 2; RESOLVED against the upstream docs
   the reviewer cited — Cloud Build troubleshooting + build-log storage
-  behavior): with `logging` unspecified, Cloud Build writes build logs to the
-  legacy default GCS bucket, and reading them as the submitting identity
-  requires project-wide `roles/viewer` — refused as too wide. Fix instead:
+  behavior, plus the LoggingMode API reference from round 3): with `logging`
+  unspecified, Cloud Build writes build logs to the legacy default GCS bucket,
+  and reading them as the submitting identity requires project-wide
+  `roles/viewer` — refused as too wide. Fix instead:
   `options.logging: CLOUD_LOGGING_ONLY` in
   `docker/cloud-run/cloudbuild.yaml` (Task 2 E12), which puts build logs in
   Cloud Logging where the already-granted `roles/logging.viewer` suffices.
-  Human workflows' `builds submit` log streaming is unchanged; the Console
-  log link target changes (native bucket viewer → Logs Explorer).
+  Honest tradeoff (review round 3): this mode does NOT allow live log
+  streaming during submit — builds complete normally; logs are read after
+  the fact with `gcloud builds log <build-id>`; the Console log link target
+  changes (native bucket viewer → Logs Explorer).
+- **A8** (raised by plan-review round 3; RESOLVED against cited upstream
+  docs): (i) `serviceusage.services.use` is REQUIRED for principals running
+  `gcloud builds` commands (Cloud Build access-requirements doc) →
+  `roles/serviceusage.serviceUsageConsumer` added to the project level (the
+  earlier decision to omit it was wrong); (ii) Artifact Registry repository-
+  level IAM bindings are supported and recommended (AR access-control doc) →
+  `roles/artifactregistry.writer` moved from project level to a binding on
+  the existing `freshell-e2e` repository in the checklist's scoped-grant
+  step.
 
 These are properties of external contracts; the plan's tasks do not depend on
 any other unproven claim. If A1/A2 invalidate a probe permission, swap the
@@ -876,10 +893,11 @@ options:
 (One edit, one wrapper-neutral file — no V-mirror.) Rationale: the default
 (legacy GCS log bucket) requires project-wide `roles/viewer` for the
 submitting identity to read/stream build logs; Cloud Logging needs only the
-already-granted `roles/logging.viewer`. This changes where build logs land
-for humans too (streamed `builds submit` output is identical; only the
-Console link target moves from the bucket viewer to Logs Explorer) — called
-out in the Risk notes.
+already-granted `roles/logging.viewer`. Honest tradeoff (upstream LoggingMode
+reference): CLOUD_LOGGING_ONLY does NOT allow live log streaming during
+`gcloud builds submit` — builds complete normally, and logs are read after
+the fact with `gcloud builds log <build-id>`; the Console link target moves
+from the bucket viewer to Logs Explorer. Called out in the Risk notes.
 
 **E11 / V11 — help + header text.** e2e-cloud.sh:29 header line and
 e2e-cloud.sh usage(); vitest-cloud.sh:28 header line and
@@ -952,7 +970,12 @@ GREEN_LOG="$TDIR/green-gcloud.log"
 cat > "$GTDIR/gcloud" <<'GREEN_FAKE'
 #!/usr/bin/env bash
 echo "GCLOUD_ARGS: $*" >> "${GREEN_LOG:?set GREEN_LOG}"
-grep -oP -- '--account=\S+' <<< "$*" >> "${GREEN_LOG}.accounts" 2>/dev/null || true
+# Shell redirection creates its target eagerly, so `grep ... >> FILE` would
+# materialize an EMPTY accounts file even when no --account token exists —
+# breaking every "--account was omitted" assertion. Capture, write only when
+# non-empty: an ABSENT accounts file therefore proves omission.
+ACCT_TOKENS="$(grep -oP -- '--account=\S+' <<< "$*" 2>/dev/null || true)"
+if [ -n "$ACCT_TOKENS" ]; then printf '%s\n' "$ACCT_TOKENS" >> "${GREEN_LOG}.accounts"; fi
 if [[ "$*" == *"info"* ]]; then echo "/nonexistent-sdk-root"; exit 0; fi
 if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 1; fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
@@ -1123,6 +1146,10 @@ for nested in scripts/test/cloud-build.test.sh \
 done
 
 # --- W8: help works with no gcloud, no account, fake HOME — and silently ---
+# The silence assertion matches ONLY the ladder's runtime diagnostic prefixes
+# ("gcloud-robot: skill not found", "gcloud-robot: no probed identity") — the
+# help text itself legitimately documents the ladder by name (E11), so a bare
+# "gcloud-robot" match would forbid the docs and break the suite by design.
 CLEAN_PATH="$PATH"
 if GCLOUD_PATH_RESOLVED=$(command -v gcloud 2>/dev/null); then
   GCLOUD_DIRNAME="$(cd "$(dirname "$GCLOUD_PATH_RESOLVED")" && pwd)"
@@ -1153,7 +1180,7 @@ if [ -n "$CLEAN_PATH" ]; then
       check "W8 $lane help: exit 0, prints usage, no identity activity, silent" \
         bash -c '
           [ "$1" = "0" ] && grep -qi "usage" <<<"$2" &&
-          ! grep -q "gcloud-robot" <<<"$2" && [ ! -e "$3" ]
+          ! grep -qE "gcloud-robot: (skill not found|no probed identity)" <<<"$2" && [ ! -e "$3" ]
         ' _ "$HELP_RC" "$HELP_OUT" "$SELECTOR_MARKER"
     done
   fi
@@ -1169,7 +1196,7 @@ check "W9 vitest --local: runs real local vitest, no selector, no ladder output"
   bash -c '
     [ "$1" = "0" ] &&
     grep -qE "Test Files|passed" <<<"$2" &&
-    ! grep -q "gcloud-robot" <<<"$2" && [ ! -e "$3" ]
+    ! grep -qE "gcloud-robot: (skill not found|no probed identity)" <<<"$2" && [ ! -e "$3" ]
   ' _ "$W9_RC" "$W9_OUT" "$SELECTOR_MARKER"
 
 # --- W12: e2e standalone lanes (build / push / logs) run their OWN ladder ---
@@ -1528,7 +1555,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor run.developer logging.viewer serviceusage.serviceUsageConsumer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --name gcloud-robot --activate
    ```
@@ -1552,6 +1579,15 @@ account (export it). All skill scripts are invoked via
    gcloud artifacts repositories create freshell-e2e \
      --repository-format=docker --location=us-west1 --project=misc-puttering-project \
      --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT"
+
+   # Push/write power is granted on THIS repository only (repository-level
+   # binding), never project-wide — the bearer key must not gain write access
+   # to every current and future repo:
+   gcloud artifacts repositories add-iam-policy-binding freshell-e2e \
+     --location=us-west1 --project=misc-puttering-project \
+     --member="serviceAccount:gcloud-robot@misc-puttering-project.iam.gserviceaccount.com" \
+     --role=roles/artifactregistry.writer \
+     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --condition=None
    ```
 
 2. Scoped grants (bootstrap does NOT do these; skipping them is the classic
@@ -1642,7 +1678,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor run.developer logging.viewer serviceusage.serviceUsageConsumer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --rekey --activate
    ```
@@ -1708,10 +1744,11 @@ for immediacy.)
 - Push 403s or the run logs "Creating Artifact Registry repository" then
   fails → step 1's repo-exists check was skipped: writer cannot create
   repositories. Run the describe/create block from provisioning.
-- "Where did build logs go?" → build logs now land in Cloud Logging by
-  design (`options.logging: CLOUD_LOGGING_ONLY`), so the
-  robot's `logging.viewer` covers them and no project-wide viewer grant is
-  needed. Streamed `builds submit` output is unchanged.
+- "Where did build logs go?" / "submit doesn't stream anymore" → by design:
+  `options.logging: CLOUD_LOGGING_ONLY` puts logs in Cloud Logging (the
+  robot's `logging.viewer` covers reads; no project-wide viewer grant), and
+  this mode does not stream during submit. Builds complete normally; read
+  logs with `gcloud builds log <build-id> --project=misc-puttering-project`.
 - A grant that definitely exists 403s for the first minutes → IAM
   propagation lag; the verifier's retries (12 × 30s default) absorb it.
 - A lane prints the ambient-fallback note and then gcloud's
@@ -1827,10 +1864,12 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
   is the fix.
 - **Build-log location changes for everyone.** `options.logging:
   CLOUD_LOGGING_ONLY` moves build logs from the legacy GCS bucket to Cloud
-  Logging for human lanes too. The streamed `gcloud builds submit` output is
-  unchanged; only the Console link target moves (bucket viewer → Logs
-  Explorer). The alternative (granting the robot project-wide
-  `roles/viewer`) was refused as over-broad.
+  Logging for human lanes too — and (per the LoggingMode API reference)
+  `gcloud builds submit` no longer streams logs live during the ~13-minute
+  cold build; output appears at completion, and logs are readable any time
+  via `gcloud builds log <id>` (covered by builds editor +
+  `roles/logging.viewer`). The alternative (project-wide `roles/viewer` for
+  the robot) was refused as over-broad.
 - **Standalone lanes gain flag parsing.** `push`/`logs` now parse
   `--account=`/`--project-id=`/`--region=`; unknown args keep their old
   behavior (push ignores them; logs passes them through to `logs read`).
