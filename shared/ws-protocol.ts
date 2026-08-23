@@ -35,6 +35,7 @@ export const ErrorCode = z.enum([
   'SESSION_RESERVED',
   'FRESH_AGENT_LOST_SESSION',
   'FRESH_AGENT_CREATE_FAILED',
+  'RECONCILE_NOT_NEGOTIATED',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -764,6 +765,8 @@ export type ErrorMessage = {
   actualSessionRef?: SessionLocator
   /** SESSION_RESERVED only: how long the loser should wait before re-sending its create. Additive; omitted everywhere else. */
   retryAfterMs?: number
+  /** RESTORE_UNAVAILABLE only (D7): the live terminal that owns the refused session, so the create-error fold can reattach instead of dead-ending. Additive; omitted everywhere else. */
+  liveTerminalId?: string
   timestamp: string
 }
 

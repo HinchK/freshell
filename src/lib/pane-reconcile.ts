@@ -18,6 +18,7 @@ import type {
   PaneReconcileResultMessage,
   ReconcilePane,
 } from '@shared/ws-protocol'
+import type { FreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { buildRestoreError } from '@shared/session-contract'
 import type { AppDispatch, RootState } from '@/store/store'
 import type {
@@ -36,10 +37,14 @@ import {
   setPaneRestoreError,
   setReconcileWarming,
 } from '@/store/panesSlice'
+import { clearSessionLost } from '@/store/freshAgentSlice'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
+
+/** Bounded wait for a boot `pane.reconcile.result`: > the server's single 2s warming deferral + round-trip margin. */
+export const RECONCILE_RESULT_WAIT_MS = 10_000
 
 export function paneKeyFor(tabId: string, paneId: string): string {
   return `${tabId}:${paneId}`
@@ -304,6 +309,13 @@ function foldFreshAgentVerdict(
         serverInstanceId: result.serverInstanceId,
         corrected: verdict.corrected,
         duplicate: verdict.duplicate ? true : undefined,
+      }))
+      // Server said Live: the verdict itself is positive existence evidence —
+      // revoke a stale `lost` flag left by a transient dead-window race, or the
+      // snapshot fetch stays suppressed and the .lost driver re-fires forever.
+      dispatch(clearSessionLost({
+        sessionId: verdict.sessionRef.sessionId,
+        provider: verdict.sessionRef.provider as FreshAgentRuntimeProvider,
       }))
       outcome.attached++
       return true
