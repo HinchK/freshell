@@ -465,6 +465,24 @@ function readOpencodeAudit(auditLogPath: string): any[] {
   return readJsonl(auditLogPath)
 }
 
+/**
+ * Read the codex fake's persisted per-thread turn records ([] when absent —
+ * mirrors the fixture's own load semantics). turn/start sends are RECORDED
+ * here (recordTurns opt-in); they are never op-logged (the op log only
+ * carries thread/* methods), so this is the surface that proves a send did
+ * or did not reach the provider.
+ */
+async function readRecordedCodexTurns(homeDir: string, threadId: string): Promise<any[]> {
+  try {
+    const parsed = JSON.parse(
+      await fs.readFile(path.join(homeDir, '.codex', 'fake-turns', `${threadId}.json`), 'utf8'),
+    )
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
 /** Send a prompt, wait for materialization (placeholder → ses_*), settle idle. */
 async function sendOpencodeTurn(
   page: Page,
@@ -739,6 +757,34 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         'the REDO_CODEX_UNSUPPORTED_NOTICE prefix renders on the notice banner',
       ).toBeVisible({ timeout: 15_000 })
       expect(userRows(await snap())).toBe(0) // transcript unchanged
+
+      // The pinned-notice path never touches the provider: after the notice
+      // poll + the REST round trip above (a timed, failure-observable window —
+      // the interception is synchronous client-side), re-read the recording
+      // surfaces. The op log must still hold exactly ONE thread/revert for the
+      // pane's thread (an escaped /redo issuing a second revert would leave
+      // the prefix already empty, so the zero-row assertion alone could not
+      // catch it), and the recorded-turns store must hold NO turn carrying the
+      // typed text (a leaked freshAgent.send lands there via turn/start —
+      // turn/start is never op-logged).
+      const paneThreadReverts = readJsonl(lane.opLogPath)
+        .filter((o) => o?.method === 'thread/revert' && o?.threadId === 'thread-new-1')
+      expect(
+        paneThreadReverts,
+        'still exactly ONE thread/revert on the pane thread after the typed /redo — the pinned notice issued no provider-side rollback',
+      ).toHaveLength(1)
+      const recordedTurnsAfterRedo = await readRecordedCodexTurns(lane.info.homeDir, 'thread-new-1')
+      expect(
+        recordedTurnsAfterRedo.some((turn) =>
+          (turn?.items ?? []).some(
+            (item: any) => item?.type === 'userMessage'
+              && (item?.content ?? []).some(
+                (part: any) => typeof part?.text === 'string' && part.text.includes('/redo'),
+              ),
+          ),
+        ),
+        'no freshAgent.send (turn/start) carried the typed /redo to the codex provider',
+      ).toBe(false)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -973,6 +1019,25 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         page.getByText(/the removed prompt is back in the composer/),
         'UNDO_REFILL_NOTICE: the post-turn /undo succeeds',
       ).toBeVisible({ timeout: 15_000 })
+      // The tail /undo provably rolled back through EXACTLY ONE create event
+      // for the session: the busy window was proven window-silent above, so a
+      // frame leaked there plus the tail's legitimate rollback create would
+      // surface as TWO — as would a silent second create from the guard-retry
+      // or adoption seams (every attempt mints a fresh "rollback-<uuid>"
+      // requestId and lands on the raw-stdin audit BEFORE its `created`
+      // response, so the row is on disk before the ack that refills the
+      // composer). NOTE: this tail is a FIRST-TURN rollback — the resume point
+      // resolves to None (claude_snapshot.rs), so the rollback create is a
+      // FRESH-conversation create carrying NO resumeSessionId/forkSession keys;
+      // counting forkSession:true frames here would count ZERO by design.
+      const isRollbackCreate = (f: any) =>
+        f?.type === 'create' && typeof f?.requestId === 'string' && (f.requestId as string).startsWith('rollback-')
+      await waitForStdinFrame(lane.stdinLog, isRollbackCreate, 'the tail /undo rollback create')
+      const rollbackCreates = readStdinFrames(lane.stdinLog).filter(isRollbackCreate)
+      expect(
+        rollbackCreates,
+        'exactly ONE rollback create for the session — no second silent create from any retry/adoption race',
+      ).toHaveLength(1)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
