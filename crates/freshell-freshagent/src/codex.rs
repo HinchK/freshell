@@ -1682,6 +1682,9 @@ impl FreshCodexState {
         let previous = self
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, &thread_id));
+        // The epoch state AT LOAD (before the bit clears) selects the marker
+        // splice point below.
+        let starts_new_epoch = previous.as_ref().map(|p| p.redo_destroyed).unwrap_or(false);
         let mut record = match previous.clone() {
             Some(mut p) => {
                 // Epoch rule (r3): an undo landing while redo_destroyed is set
@@ -1695,13 +1698,40 @@ impl FreshCodexState {
             }
             None => RollbackRecord::empty(now),
         };
-        record.push_entry(
+        // Review Minor-3: the marker bucket is CONVERSATION order on every
+        // lane (the plan :165 union rule wins over the :166 codex append
+        // bullet). Within the CURRENT epoch a new undo removes an
+        // EARLIER-in-conversation turn, so the new entry is spliced BEFORE the
+        // existing same-epoch entries (sequential undos read t1..tn
+        // ascending — the opencode rebuild / claude splice shape). The
+        // frozen/current split point:
+        // - a NEW epoch (redo_destroyed was set at load) freezes EVERY prior
+        //   entry — append behind them;
+        // - otherwise the split is unambiguous ONLY when every prior entry is
+        //   provably current-epoch: this lane keeps the current-epoch suffix
+        //   in strictly DESCENDING at_ms (each splice puts the newest op
+        //   ahead) and any intervening submission would have set
+        //   redo_destroyed — so a strictly-descending prior list is exactly an
+        //   all-current-epoch list and the new entry goes first;
+        // - any at_ms rise/tie (a stacked frozen+current stack whose boundary
+        //   is no longer recorded, or a legacy append-ordered record) means NO
+        //   unambiguous split — APPEND, never reorder past an unknown
+        //   boundary.
+        // The revision floor is restamped by the set_can_redo below.
+        let insert_at = if starts_new_epoch {
+            record.entries.len()
+        } else if record.entries.windows(2).all(|w| w[0].at_ms > w[1].at_ms) {
+            0
+        } else {
+            record.entries.len()
+        };
+        record.entries.insert(
+            insert_at,
             RollbackEntry {
                 removed_turns: removed,
                 prompt_text: prompt.clone(),
                 at_ms: now,
             },
-            now,
         );
         record.set_can_redo(false, now); // codex is undo-only (decision 5)
         if let Some(sink) = self.identity_sink() {
@@ -7575,10 +7605,18 @@ pub(crate) mod tests {
             "no compensating rewrite after a possibly-applied mutation — the \
              new marker stays"
         );
-        assert_eq!(
-            record.entries.last().expect("the pushed entry").prompt_text,
-            "second prompt",
-            "the ledger still describes the rollback the provider may have applied"
+        let prompts: Vec<&str> = record
+            .entries
+            .iter()
+            .map(|e| e.prompt_text.as_str())
+            .collect();
+        assert!(
+            prompts.contains(&"second prompt"),
+            "the ledger still describes the rollback the provider may have applied: {prompts:?}"
+        );
+        assert!(
+            prompts.contains(&"prior"),
+            "the prior marker survives in the kept union: {prompts:?}"
         );
     }
 
@@ -7714,6 +7752,191 @@ pub(crate) mod tests {
         );
         assert_eq!(record.entries[0].prompt_text, "old");
         assert_eq!(record.entries[1].prompt_text, "second prompt");
+    }
+
+    /// One remaining completed turn — the post-revert read shape after the
+    /// two-turn fixture's tail is gone.
+    fn one_turn_thread_read(thread_id: &str) -> Value {
+        json!({ "thread": { "id": thread_id, "turns": [
+            { "id": "turn-1", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t1-u", "content": [{ "type": "text", "text": "first prompt" }] },
+                { "type": "agentMessage", "id": "t1-a", "text": "first answer" },
+            ]},
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_double_undo_within_one_epoch_keeps_the_marker_bucket_in_conversation_order(
+    ) {
+        // Whole-branch review Minor-3: the codex marker bucket is CONVERSATION
+        // order (the plan :165 union rule wins over the codex bullet at :166).
+        // Two sequential undos inside ONE epoch (no submission between) remove
+        // turn-2 then turn-1; the second op's entry is spliced BEFORE the
+        // first's, so the bucket reads [turn-1 markers…, turn-2 markers…]
+        // ascending — the opencode rebuild / claude splice parity.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-order",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-order",
+        )
+        .await;
+
+        // First undo: the two-turn thread loses turn-2 ("second prompt").
+        let (sink1, cap1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o1", None), sink1)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, m1, _p1) = peer.expect_request().await;
+        assert_eq!(m1, "thread/read");
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-order"));
+        let (revert_id, m2, p2) = peer.expect_request().await;
+        assert_eq!(m2, "thread/revert");
+        assert_eq!(p2["beforeTurnId"], json!("turn-2"));
+        peer.respond(&revert_id, json!({}));
+        driver1.await.expect("first rollback task");
+        assert_eq!(
+            captured_frames(&cap1).len(),
+            1,
+            "the ack plane is untouched by the ordering change"
+        );
+
+        // Second undo, SAME epoch (redo_destroyed never set): the thread now
+        // reads as one turn, so the step removes turn-1 ("first prompt").
+        let (sink2, _cap2) = capturing_sink();
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id2, m3, _p3) = peer.expect_request().await;
+        assert_eq!(m3, "thread/read");
+        peer.respond(&read_id2, one_turn_thread_read("thr-undo-order"));
+        let (revert_id2, m4, p4) = peer.expect_request().await;
+        assert_eq!(m4, "thread/revert");
+        assert_eq!(p4["beforeTurnId"], json!("turn-1"));
+        peer.respond(&revert_id2, json!({}));
+        driver2.await.expect("second rollback task");
+
+        let record = fake
+            .load_rollback("codex", "thr-undo-order")
+            .expect("record");
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| e.prompt_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first prompt", "second prompt"],
+            "the second undo's entry splices BEFORE the first's — sequential undos within one \
+             epoch read t1..tn ascending"
+        );
+        let bucket_ids: Vec<String> = record
+            .entries
+            .iter()
+            .flat_map(|e| e.removed_turns.iter())
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            bucket_ids.len(),
+            4,
+            "each removed step is a user+assistant row pair: {bucket_ids:?}"
+        );
+        assert!(
+            bucket_ids[..2].iter().all(|id| id.starts_with("turn-1"))
+                && bucket_ids[2..].iter().all(|id| id.starts_with("turn-2")),
+            "the flattened marker bucket reads [t1_markers…, t2_markers…]: {bucket_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_without_an_unambiguous_frozen_split_appends_never_reorders() {
+        // Minor-3 guardrail: a bit-false record whose prior entries are NOT in
+        // strictly-descending at_ms (a stacked frozen+current stack whose epoch
+        // boundary is no longer recorded, or a legacy append-ordered record)
+        // has NO unambiguous frozen/current split — the new entry is APPENDED:
+        // frozen prior-epoch markers keep preceding and nothing reorders past
+        // an unknown boundary.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-ambiguous",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-ambiguous",
+        )
+        .await;
+        let frozen_entry = crate::rollback_record::RollbackEntry {
+            removed_turns: vec![json!({ "id": "frozen-u", "turnId": "frozen-u" })],
+            prompt_text: "frozen prompt".into(),
+            at_ms: 2,
+        };
+        let stacked_entry = crate::rollback_record::RollbackEntry {
+            removed_turns: vec![json!({ "id": "stacked-u", "turnId": "stacked-u" })],
+            prompt_text: "stacked prompt".into(),
+            // An at_ms RISE over the frozen entry — where the frozen prefix
+            // ends is unknowable from this record alone.
+            at_ms: 5,
+        };
+        fake.record_rollback("codex", "thr-ambiguous", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(1);
+            r.push_entry(frozen_entry.clone(), 2);
+            r.push_entry(stacked_entry.clone(), 5);
+            r
+        })
+        .await
+        .expect("seed");
+        let (sink, _captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-ambiguous", "rb-amb", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-ambiguous"));
+        let (revert_id, _m2, _p2) = peer.expect_request().await;
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+
+        let record = fake
+            .load_rollback("codex", "thr-ambiguous")
+            .expect("record");
+        assert_eq!(record.entries.len(), 3, "the union still accumulates");
+        assert_eq!(
+            record.entries[0], frozen_entry,
+            "frozen prior-epoch markers keep preceding, untouched at the front"
+        );
+        assert_eq!(
+            record.entries[1], stacked_entry,
+            "no reorder past an unknown frozen/current boundary"
+        );
+        assert_eq!(
+            record.entries[2].prompt_text, "second prompt",
+            "the new entry is APPENDED when no unambiguous split exists"
+        );
     }
 
     #[tokio::test]
