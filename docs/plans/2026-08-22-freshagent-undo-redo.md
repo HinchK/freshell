@@ -112,7 +112,7 @@ Codes: `UNSUPPORTED_CAPABILITY` (unsupported provider/op; amplifier always; code
 
 ### Snapshot surface (strict contract; all keys optional so legacy-server payloads still parse)
 
-- `FreshAgentCapabilitiesSchema` gains `undo: z.boolean().optional()`, `redo: z.boolean().optional()`. Stamps (busy gating stays client-side): codex `{undo:<true iff CodexSession.history_mode == Some(Paginated) — session-scoped per Task 5, carried on the freshell-side session record and NEVER live-probed (the app-server has no mode read-back; the record is the SoT); legacy/None threads stamp undo:false>, redo:false}`; claude (freshclaude AND kilroy) `{undo:true, redo:true}`; opencode `{undo:true, redo:true}`. Legacy TS server emits neither key → client treats absent as false.
+- `FreshAgentCapabilitiesSchema` gains `undo: z.boolean().optional()`, `redo: z.boolean().optional()`. Stamps (busy gating stays client-side): codex `{undo:<true iff CodexSession.history_mode == Some(Paginated) — session-scoped per Task 5, NEVER live-probed (the app-server has no mode read-back); the DURABLE source is the rollout's persisted session_meta.history_mode (r3): set Some(Paginated) at thread/start and REHYDRATED by parsing that durable meta at every resume/adoption (validator-C proved the mode persists there; freshell-codex already reads rollouts for durability) — only a missing/unparseable mode stamps legacy undo:false, so a paginated thread keeps undo capability across normal session rehydration>, redo:false}`; claude (freshclaude AND kilroy) `{undo:true, redo:true}`; opencode `{undo:true, redo:true}`. Legacy TS server emits neither key → client treats absent as false.
 - `FreshAgentTurnSchema` gains `rolledBack: z.boolean().optional()`.
 - `FreshAgentSnapshotSchema` gains `rolledBackTurns: z.array(FreshAgentTurnSchema).optional()` (each stamped `rolledBack:true`) and `rollback: z.object({ canRedo: z.boolean(), undoneDepth: z.number().int().nonnegative() }).strict().optional()`. `turns[]` always equals exactly what the model sees next (prefix) — the marker bucket is separate.
 - Snapshot `revision` takes `max(existingBasis, rollbackRecord.lastOpAtMs)` in every builder so the client's monotonic revision watermark never drops the post-rollback snapshot.
@@ -162,20 +162,21 @@ pub struct RollbackEntry {
 
 Per-provider record semantics (defined here, referenced by the provider tasks):
 
-- **codex** — append-only `entries` (one per undo; never popped: no redo exists). `rolledBackTurns` = flattened entry turns. New-send destroy sets `redo_destroyed` (markers stay). `can_redo` is stored false at every write.
-- **opencode** — after every op, `entries` is REBUILT to exactly the current serve-revert tail (single entry when non-empty) in the tail's ORIGINAL CONVERSATION ORDER. `can_redo` is stored at write time: `!redo_destroyed && rebuilt tail non-empty`. The serve owns the boundary pointer (top-level `session.revert.messageID`); the record owns the destroyed bit, the stored `can_redo`, and the marker bucket.
-- **claude/kilroy** — `entries` stays empty. `original_session_id` = the chain-root durable id; `original_tip_uuid` = the original's raw-chain tip uuid recorded at undo time. Markers are computed AT SNAPSHOT READ: the current transcript is always a prefix of the original (rollback only ever shortens/extends the prefix; a new send makes it diverge but then redo is destroyed and markers are still well-defined), so `rolledBackTurns` = the original transcript's turns beyond the longest common prefix (LCP matched on message uuids), stamped `rolledBack:true`. `can_redo` is stored at write time: `!redo_destroyed && original tip strictly beyond the new current tip` — never `entries`-derived.
-- **epochs (r2)** — a new UNDO landing while `redo_destroyed` is true starts a NEW epoch: the entries list is CLEARED and rebuilt from this op forward, `redo_destroyed` is cleared, and (claude) `original_session_id`/`original_tip_uuid` are re-rooted to the CURRENT durable id / (codex) the append-only entries list restarts from now / (opencode) the bucket rebuilds from the provider tail ONLY (the native send already deleted the old tail rows, so prior entries must not be merged). Old-epoch markers drop out of the LIVE marker display — they describe a branch a resend already permanently replaced — while durable transcript browsing still shows them as long as rows exist in provider storage. `destroy_redo_on_submit` keeps destroying redo on EVERY submission regardless of epoch. The Task 5 snapshot bucket is fed exclusively from the current epoch by construction.
+- **markers accumulate (r3 UNION rule, supersedes every "entries cleared"/"markers drop out" statement below):** `entries` is the UNION of EVERY epoch's rolled-back turns — frozen prior-epoch markers first (in their original conversation order), then the current epoch's markers (conversation order) — DURABLE in the ledger even after native provider deletion (codex revert destroys the tail; opencode deletes it on the next send; only the ledger satisfies decision 6's "persist marked", while decision 5's submission-destroy kills ONLY redo). Entries are NEVER dropped by an epoch reset, a send, or `destroy_redo_on_submit`; a redo removes EXACTLY the restored turns from the CURRENT-epoch portion (only current-epoch turns are restorable — the chain-root/pointer math cannot name frozen prior-epoch ids).
+- **codex** — `entries` = the accumulating union (one entry pushed per undo; never popped: no redo exists; an epoch reset does NOT restart the list — r3). `rolledBackTurns` = flattened entry turns. New-send destroy sets `redo_destroyed` (markers stay). `can_redo` is stored false at every write.
+- **opencode** — after every op the CURRENT-epoch portion of `entries` is REBUILT to exactly the current serve-revert tail (single entry when non-empty, in the tail's ORIGINAL CONVERSATION ORDER), while FROZEN prior-epoch markers PRECEDE it: frozen markers are the recorded entries whose turn ids no longer appear in the serve's message list (their tail rows were natively DELETED by a resend — they persist only in the ledger, r3). `can_redo` is stored at write time: `!redo_destroyed && rebuilt current tail non-empty`. The serve owns the current chain's boundary pointer (top-level `session.revert.messageID`); the record owns the destroyed bit, the stored `can_redo`, and the union marker bucket.
+- **claude/kilroy** — `original_session_id` = the CURRENT epoch's chain-root durable id; `original_tip_uuid` = that original's raw-chain tip uuid recorded at undo time. `entries` NO LONGER stays empty (r3): each undo APPENDS that op's removed display-turn slice to the union (in conversation position), and each redo removes the restored turn ids from the CURRENT-epoch portion — the snapshot bucket is sourced from ledger `entries` (union), durable even if an old original's JSONL is later compacted or garbage-collected. `can_redo` is stored at write time: `!redo_destroyed && original tip strictly beyond the new current tip` — never `entries`-derived; the redo VALIDATION still re-reads the chain root (tip equality + LCP) per the contract below.
+- **epochs (r3)** — a new UNDO landing while `redo_destroyed` is true starts a NEW epoch that clears ONLY the *redo-capable chain state*: the record's redo fields henceforth describe the NEW chain — `redo_destroyed` clears (the PRIOR chain's redo stays permanently dead: its provider tail no longer exists, so it can never be restored — "stays true for the prior chain"), `can_redo` is restamped per provider, and the per-epoch chain root is replaced at the new undo — (claude) `original_session_id`/`original_tip_uuid` re-root to the CURRENT durable id/tip, (opencode) the serve pointer retargets via the new revert, (codex) n/a (undo-only). `entries` (the marker union) is NEVER cleared. `destroy_redo_on_submit` keeps destroying redo on EVERY submission regardless of epoch and never touches `entries`. Task 5 snapshot sourcing (r3): `rolledBackTurns` = the ledger `entries` union; `canRedo`/redo math = the current-epoch chain state only.
 
-Storage layout: `~/.freshell/pane-ledger/rollback/<enc(provider)>/<enc(sessionId)>.json`, same atomic temp+rename+fsync discipline as binding rows (`write_row_atomic`), write-through in-memory index answering sync reads, per-row quarantine on corruption (never per-store). Write discipline (durable-BEFORE-mutation): the post-op record is computed from the pre-mutation reads, then AWAITED BEFORE the provider mutation runs — a pre-write failure REFUSES the rollback with `INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY` and the provider history is NEVER mutated. On Claude the record is keyed by the current durable id BEFORE the fork, and the existing `sdk.session.init` adoption leg (which already AWAIT-writes the binding row with `supersedes: old id`) re-keys the rollback row old→new inside the same awaited write batch, so there is still exactly one rollback-record-specific write and it always precedes the mutation. Provider failure AFTER a successful pre-write triggers a COMPENSATING rewrite of the pre-op record before the refusal is answered, so the ledger never describes a rollback the provider rejected. (The earlier draft's "reply success, then warn via a ledger-write-failed event" discipline is void and appears nowhere in this plan.)
+Storage layout: `~/.freshell/pane-ledger/rollback/<enc(provider)>/<enc(sessionId)>.json`, same atomic temp+rename+fsync discipline as binding rows (`write_row_atomic`), write-through in-memory index answering sync reads, per-row quarantine on corruption (never per-store). Write discipline (durable-BEFORE-mutation): the post-op record is computed from the pre-mutation reads, then AWAITED BEFORE the provider mutation runs — a pre-write failure REFUSES the rollback with `INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY` and the provider history is NEVER mutated. On Claude the record is keyed by the current durable id BEFORE the fork, and the existing `sdk.session.init` adoption leg (which already AWAIT-writes the binding row with `supersedes: old id`) re-keys the rollback row old→new inside the same awaited write batch, so there is still exactly one rollback-record-specific write and it always precedes the mutation. Provider failure AFTER a successful pre-write triggers a COMPENSATING rewrite of the pre-op record before the refusal is answered — but ONLY on legs where the provider PROVABLY rejected/unmoved (r3): a mutation-RPC error leg and (opencode) a SUCCESSFUL post-verify read whose pointer provably did not move compensate; a FAILED post-verify read leg (transport/5xx — the mutation may have applied) NEVER compensates: it answers `INTERNAL_ERROR` and KEEPS the ledger (the Task 3 triad governs; the next snapshot derives its prefix from provider rows, so pane + record reconverge automatically). So the ledger never describes a rollback the provider provably rejected, and is never rewritten to contradict a possibly-applied mutation. (The earlier draft's "reply success, then warn via a ledger-write-failed event" discipline is void and appears nowhere in this plan.)
 
 ## Load-bearing corrections (Stage 2, 2026-08-22 — VALIDATED)
 
 All ten finder claims were settled by four validators (reports/load-bearing-validator-{A,B,C,desk}.md; ledger at `.worktrees/.the-usual-logs/freshagent-undo-redo/load-bearing-ledger.md`). The amendments below are binding on the tasks they name:
 
-1. **Codex history-mode gate (LBC-1, verified).** `thread/revert` REFUSES legacy threads (`"thread/revert only supports paginated threads"`, -32600) and freshell starts every thread legacy today. Task 2 is amended: freshcodex `thread/start` calls SET `historyMode:"paginated"` and the freshell-side session record (`CodexSession`) gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` only for threads freshell started (we SET the mode at start); `thread/resume` takes no mode param, so resumed/adopted threads record `None` (unknown ⇒ legacy stamps). The app-server exposes no mode read-back; the session record is the source of truth. Rollback on a codex thread that is legacy (pre-existing back-catalog and any legacy start) is refused with `UNSUPPORTED_CAPABILITY` + the added pinned copy `CODEX_LEGACY_THREAD_COPY` = `Undo is unavailable for this session — it was started before conversation rollback support (codex threads created earlier use the legacy history format). Start a new session to undo.` (Out-of-scope: `codex migrate-rollouts --apply` back-catalog migration — follow-up kata.) Empty-prefix revert is LEGAL on codex (empties the thread; probe-verified) so codex has NO first-turn refusal. Codex mid-turn behavior (extra-1, verified): provider revert FORCE-INTERRUPTS then proceeds — the freshell busy gate is the sole mid-turn protection and its refusal test must assert the provider is never reached. Zero-turn paginated threads answer -32601 on read/includeTurns+turns/list (existing fallback covers).
+1. **Codex history-mode gate (LBC-1, verified).** `thread/revert` REFUSES legacy threads (`"thread/revert only supports paginated threads"`, -32600) and freshell starts every thread legacy today. Task 2 is amended: freshcodex `thread/start` calls SET `historyMode:"paginated"` and the freshell-side session record (`CodexSession`) gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` for threads freshell started (we SET the mode at start); `thread/resume` takes no mode param, so resume/adoption reads the DURABLE mode (r3 amendment): the rollout's persisted `session_meta.history_mode` is parsed (validator-C proved the mode persists there; freshell-codex already reads rollouts for durability) and records `Some(Paginated)` when it says paginated — only a missing/unparseable durable mode stamps legacy (`None` ⇒ `undo:false`); a paginated thread created by this feature keeps undo capability across normal session rehydration. The app-server exposes no live mode read-back; the durable rollout meta (cached on the session record) is the source of truth. Rollback on a codex thread that is legacy (pre-existing back-catalog and any legacy start) is refused with `UNSUPPORTED_CAPABILITY` + the added pinned copy `CODEX_LEGACY_THREAD_COPY` = `Undo is unavailable for this session — it was started before conversation rollback support (codex threads created earlier use the legacy history format). Start a new session to undo.` (Out-of-scope: `codex migrate-rollouts --apply` back-catalog migration — follow-up kata.) Empty-prefix revert is LEGAL on codex (empties the thread; probe-verified) so codex has NO first-turn refusal. Codex mid-turn behavior (extra-1, verified): provider revert FORCE-INTERRUPTS then proceeds — the freshell busy gate is the sole mid-turn protection and its refusal test must assert the provider is never reached. Zero-turn paginated threads answer -32601 on read/includeTurns+turns/list (existing fallback covers).
 2. **Opencode verified semantics (LBC-2, verified; one plan shape falsified → corrected).** Boundary is INCLUSIVE of the named message; assistant-message targets normalize to their parent user message (the icon acts on user turns anyway); unknown messageID is a silent 200 no-op (defense: post-revert verify read). The `revert` field lives top-level on the session body: `session.revert = {messageID, snapshot, diff, partID?}`, omitted entirely when no rollback is active — corrected wherever sample code nests it otherwise. The message LIST still returns the reverted tail without flags: freshell computes the active prefix strictly-before `revert.messageID`. Stepwise redo = re-revert at a later in-tail user message (verified); unrevert is all-or-nothing. Any subsequent send/command/summarize natively DELETES the reverted tail rows (matches decision 5; therefore the durable marker can only come from freshell's own ledger — never from opencode storage). **Binding correction:** native revert re-applies FILE state for patch-carrying turns (probe-verified). To keep "rollback never touches files" (decision 1 + accepted residual) true, Task 3 launches the freshopencode serve sidecar with opencode snapshots DISABLED in its managed config, and Task 7's opencode case proves byte-identical working tree after reverting a patch-carrying turn.
-3. **Claude fork-at-point (LBC-3/4/8/9, verified with constraints).** Use ONLY the `query()` options lane (`{resume, resumeSessionAt, forkSession: true, resumeDropsTurn: <guard uuid>}`) — the standalone `forkSession()` fn remaps every uuid and is forbidden. `resumeSessionAt` keeps up-to-AND-including the named uuid over the RAW parentUuid chain (not the display list); the armed guard is mandatory, with the refusal-prefix `Resume rejected by --resume-drops-turn:` mapped to plain-resume recovery, and the plan's `resume_at_uuid` two-definition conflict is resolved to the raw-chain rule everywhere (the line-1774 display-predecessor variant is void). Task 4's claude `in_turn` busy truth CLEAR-SET is amended (LBC-10 falsified): clear on `sdk.result` (ANY subtype — a result frame ends the turn; the earlier "success-only" variant is void) AND `sdk.status:idle` AND sidecar EOF/death (`SIDECAR_EXITED`) AND after a completed `handle_interrupt` (interrupts yield no `result` at all) — no `sdk.error`/`compacting`/`assistant` edge, fail-closed otherwise (a missing arm wedges `BUSY_TURN` refusals forever). Claude redo validity contract (LBC-9): undo records `original_session_id` + `original_tip_uuid`; redo re-reads the chain-root original and loudly refuses `REDO_UNAVAILABLE` when the tip moved or the LCP no longer resolves (compaction/snips can relink/remove uuids). Claude transcript line comparison matches on `uuid`/`message` only and skips fork header/tail line kinds (`mode`, `atis-latch`, `queue-operation`, `last-prompt`). R2 amendment (fresh-eyes r2 F1): claude FIRST-TURN rollback is LEGAL — `resolve_resume_point` yielding `resume_at_uuid: None` means "before the first message"; the handler cancels pending cards, kills the sidecar, and creates a FRESH conversation (create with NO resume), recording the discarded session as the record's `original_session_id`/`original_tip_uuid` and adopting the fresh id through the existing sdk.session.init leg (cli_index + awaited binding + rollback-row re-key); `canRedo` = the original tip strictly beyond the live tip (none here); redo re-forks the original at its first user-anchor uuid (fork-at-point — the proved full-retention path) and adopts. `CLAUDE_FIRST_TURN_REFUSAL` is REMOVED; rollback to an empty conversation is uniformly legal across codex/opencode/claude.
+3. **Claude fork-at-point (LBC-3/4/8/9, verified with constraints).** Use ONLY the `query()` options lane (`{resume, resumeSessionAt, forkSession: true, resumeDropsTurn: <guard uuid>}`) — the standalone `forkSession()` fn remaps every uuid and is forbidden. `resumeSessionAt` keeps up-to-AND-including the named uuid over the RAW parentUuid chain (not the display list); the armed guard is mandatory, with the refusal-prefix `Resume rejected by --resume-drops-turn:` mapped to plain-resume recovery, and the plan's `resume_at_uuid` two-definition conflict is resolved to the raw-chain rule everywhere (the line-1774 display-predecessor variant is void). Task 4's claude `in_turn` busy truth CLEAR-SET is amended (LBC-10 falsified): clear on `sdk.result` (ANY subtype — a result frame ends the turn; the earlier "success-only" variant is void) AND `sdk.status:idle` AND sidecar EOF/death (`SIDECAR_EXITED`) AND after a completed `handle_interrupt` (interrupts yield no `result` at all) — no `sdk.error`/`compacting`/`assistant` edge, fail-closed otherwise (a missing arm wedges `BUSY_TURN` refusals forever). Claude redo validity contract (LBC-9): undo records `original_session_id` + `original_tip_uuid`; redo re-reads the chain-root original and loudly refuses `REDO_UNAVAILABLE` when the tip moved or the LCP no longer resolves (compaction/snips can relink/remove uuids). Claude transcript line comparison matches on `uuid`/`message` only and skips fork header/tail line kinds (`mode`, `atis-latch`, `queue-operation`, `last-prompt`). R2 amendment (fresh-eyes r2 F1): claude FIRST-TURN rollback is LEGAL — `resolve_resume_point` yielding `resume_at_uuid: None` means "before the first message"; the handler cancels pending cards, kills the sidecar, and creates a FRESH conversation (create with NO resume), recording the discarded session as the record's `original_session_id`/`original_tip_uuid` and adopting the fresh id through the existing sdk.session.init leg (cli_index + awaited binding + rollback-row re-key); `canRedo` = the original tip strictly beyond the live tip (none here); redo re-forks the original at THE LAST RAW-CHAIN UUID OF THE RESTORED FIRST STEP'S GROUP — its assistant tail (r3 boundary fix: `resumeSessionAt` keeps through-AND-including the named uuid, so redo of the `u1`/`a1` step resumes at `a1`, NOT `u1`; "the next turn's first uuid" formulations of this rule are void) — fork-at-point, the proved full-retention path — and adopts. `CLAUDE_FIRST_TURN_REFUSAL` is REMOVED; rollback to an empty conversation is uniformly legal across codex/opencode/claude.
 4. **Version/refusal surface (LBC-5/6, verified).** No provider version gating exists anywhere today (PATH spawns via `CODEX_CMD`/`OPENCODE_CMD`/`CLAUDE_CMD`). Task 1 adds spawn-time version recording (logged at spawn; used to classify failures): codex `-32600 "thread/revert only supports paginated threads"` maps to `UNSUPPORTED_CAPABILITY` + `CODEX_LEGACY_THREAD_COPY` (item 1); codex unknown-method/`-32601` or a missing `thread/revert` shape maps to `UNSUPPORTED_CAPABILITY` + `CODEX_OLD_CLI_COPY`; an opencode revert-route 404/unknown route maps to `UNSUPPORTED_CAPABILITY` + `OPENCODE_OLD_CLI_COPY` (both pinned in the Wire Design copy list) — never an uncontextualized `INTERNAL_ERROR`; only unknown transport/other failures map to `INTERNAL_ERROR`. First-turn semantics per provider (r2-corrected): ALL providers legally roll back to an empty conversation — codex/opencode empty the prefix in place; claude/kilroy take the item-3 fresh-conversation path (the discarded session is retained for redo). The earlier "claude structurally refuses" rule is void.
 5. **Refusal codes final set:** `UNSUPPORTED_CAPABILITY` (unsupported provider/op; codex redo permanently; old-CLI; legacy codex thread) · `INVALID_SESSION_ID` · `BUSY_TURN` · `INVALID_ROLLBACK_TARGET` (missing/unknown turnId; r2: NO first-turn case for any provider) · `NOTHING_TO_UNDO` · `REDO_UNAVAILABLE` (codex always — paired with `REDO_CODEX_UNSUPPORTED_NOTICE`; claude moved-tip) · `INTERNAL_ERROR` (unknown failures). Task 1's W2 refusal matrix is amended accordingly (Task 5 stamps capabilities accordingly — codex `{undo:true(paginated-only), redo:false}`).
 
@@ -184,18 +185,31 @@ Self-review over the corrected sections: User Request block unchanged; correctio
 R1 remediation self-review (fresh-eyes round 1, 2026-08-22 — over ONLY the r1-changed sections): the User Request block is byte-identical; all eleven major and three minor findings are fixed at their named loci — Task 1 (record-write discipline is durable-BEFORE-mutation with `LEDGER_WRITE_REFUSAL_COPY` refusal and compensating rewrite; `RollbackRecord` gains the stored `can_redo` bit + `original_tip_uuid`; per-provider old-CLI copies pinned; the codex catalog is capability-filtered; every multi-filter cargo command split; the contract-cleanliness check moved post-commit), Task 2 (record pre-write precedes `thread/revert`; three-way error mapping), Task 3 (per-session mutex held across the whole handler + `handle_send` consults `rollback_in_flight`, pinned semantic "send waits, rollback wins, then destroys"; top-level `session.revert` reads and a fake that never hides the tail; post-verify re-read + 404→`OPENCODE_OLD_CLI_COPY`; conversation-order marker bucket; snapshots-disabled managed serve launch), Task 4 (`original_tip_uuid` stored at undo + tip/LCP redo validation with `REDO_REMOVED_HISTORY_COPY`; raw-`parentUuid`-chain resolver everywhere; `resumeDropsTurn` guard + refusal-prefix plain-resume recovery; exactly-four-edge busy clear-set, fail-closed), Task 5 (session-scoped codex stamps — no hard-coded `"undo": true`; stored-bit + tip-rechecked claude canRedo), Task 6 (server `message` rendered verbatim; direction-correct busy copy; no codex /redo affordance), Task 7 (patch-carrying turn with byte-identical tree assertion; double-undo marker-order assertion; fake serves the tail unflagged). Cross-refs between the wire-design record semantics and the per-provider tasks re-pointed; no placeholders introduced; the Stage-2 corrections section above stays as the decision record (item 4 now names the per-provider pinned copy constants). Verdict PASS.
 
 R2 remediation notes (fresh-eyes round 2, 2026-08-23 — all Major findings adjudicated SUBSTANTIATED; the Minor per-marker "Redo to here" finding adjudicated UNSUBSTANTIATED via the owner's "redo works in that case too" icon-path decision, kata decision 3 — that affordance stays):
-1. Claude first-turn undo is now LEGAL (replaces the `INVALID_ROLLBACK_TARGET` first-turn refusal; `CLAUDE_FIRST_TURN_REFUSAL` removed): `resume_at_uuid: None` = "before the first message" → pending-cancel frames, sidecar kill, FRESH conversation (no resume), discarded session recorded as `original_session_id`/`original_tip_uuid`, adoption via sdk.session.init incl. rollback-row re-key; redo re-forks the original at its first user-anchor uuid (correction item 3 above; Task 4 handler/tests/integration; Task 5 claude bucket variant).
+1. Claude first-turn undo is now LEGAL (replaces the `INVALID_ROLLBACK_TARGET` first-turn refusal; `CLAUDE_FIRST_TURN_REFUSAL` removed): `resume_at_uuid: None` = "before the first message" → pending-cancel frames, sidecar kill, FRESH conversation (no resume), discarded session recorded as `original_session_id`/`original_tip_uuid`, adoption via sdk.session.init incl. rollback-row re-key; redo re-forks the original (the "first user-anchor uuid" target this note originally stated is SUPERSEDED by R3 note 4: the resume point is the LAST raw-chain uuid of the restored step's group — its assistant tail: redo of the `u1`/`a1` step resumes at `a1`). Also SUPERSEDED by R3 note 1: "Task 5 claude bucket variant" now sources markers from ledger `entries` (union), not the read-time LCP alone (correction item 3 above; Task 4 handler/tests/integration; Task 5 claude bucket variant).
 2. Serialization lock discipline (Tasks 2/3/4): ONE per-session async turn lock per provider lane, held across the whole rollback handler (busy-check → reads → provider mutation → post-verify → record write → reply); lock order when the two primitives co-occur = `rollback_in_flight` FIRST, then the turn lock; `handle_send` NEVER acquires/consults `rollback_in_flight` (a live send simply waits on the turn lock behind a rollback, then proceeds and destroys redo — no circular wait, no deadlock); codex/claude sends set their busy truth UNDER the same turn lock BEFORE writing to the provider (check-then-set window closed); the concurrency test asserts deterministic serialization + bounded completion.
-3. Epoch reset across submissions (Tasks 2/3/4 + wire-design record semantics): a new undo while `redo_destroyed` starts a NEW epoch — entries cleared, `redo_destroyed` cleared, claude re-roots `original_session_id`/tip to the CURRENT durable id, codex restarts its entries list, opencode rebuilds the bucket from the provider tail only; old-epoch markers leave the LIVE marker display (they describe a branch a resend permanently replaced) while durable transcript browsing still shows provider-stored rows; `destroy_redo_on_submit` keeps destroying redo on every submission; new unit tests pin undo→send→undo↔redo per lane.
+3. Epoch reset across submissions (Tasks 2/3/4 + wire-design record semantics): a new undo while `redo_destroyed` starts a NEW epoch — `redo_destroyed` cleared, claude re-roots `original_session_id`/tip to the CURRENT durable id; `destroy_redo_on_submit` keeps destroying redo on every submission; new unit tests pin undo→send→undo↔redo per lane. (The marker half of this note — "entries cleared", "codex restarts its entries list", "opencode rebuilds the bucket from the provider tail only", "old-epoch markers leave the LIVE marker display... while durable transcript browsing still shows provider-stored rows" — is SUPERSEDED by R3 note 1: markers are the ledger-entries UNION of every epoch, never dropped; only the redo-capable chain state resets per epoch. Codex thread/revert destroys the tail and opencode deletes it on next send, so provider storage cannot carry old-epoch markers.)
 4. The opencode snapshot builder change is NO LONGER a pure refactor: after extracting `opencode_message_turn_json`, `build_opencode_snapshot_json` gains the FUNCTIONAL filter — `turns[]` = the active prefix (messages strictly before top-level `session.revert.messageID`; no `info.revert` exists) and the unflagged tail rows become `rolledBackTurns` markers in conversation order; tests pin the middle-message revert + stable order across repeated undos; the Task 7 fake keeps serving the tail unflagged (cross-check).
-5. `/undo` and `/redo` are RESERVED slash names (Tasks 1/6): `runSlashCommand` intercepts them BEFORE the fallback-to-text/onSend path for EVERY fresh-agent provider; capability-false (freshcodex `/redo`, legacy caps) answers with the pinned `REDO_CODEX_UNSUPPORTED_NOTICE`/`rollbackUnsupportedNotice` and never sends text to the model; the catalog MENU still hides capability-false entries (r1 F2 stays); Task 6 tests pin menu-absence + typed-`/redo`-yields-notice + no send; the codex e2e expectation (typed `/redo` → notice) is unchanged and consistent.
-6. Codex history-mode persistence (Tasks 2/5): `CodexSession` gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` recorded at start for threads freshell starts; `None` (unknown ⇒ legacy stamps) for resumed/adopted threads; the capability stamp is `undo ⟺ Some(Paginated)`; the runtime `-32600` mapping stays as belt (a thread paginated externally is `None` to us ⇒ `undo:false`, never over-advertised — known-legacy copy on refusal); read-back of a mode is not exposed, so the session record is the SoT.
+5. `/undo` and `/redo` are RESERVED slash names (Tasks 1/6): capability-false (freshcodex `/redo`, legacy caps) answers with the pinned `REDO_CODEX_UNSUPPORTED_NOTICE`/`rollbackUnsupportedNotice` and never sends text to the model; the catalog MENU still hides capability-false entries (r1 F2 stays); Task 6 tests pin menu-absence + typed-`/redo`-yields-notice + no send; the codex e2e expectation (typed `/redo` → notice) is unchanged and consistent. (The seam named here — "`runSlashCommand` intercepts them BEFORE the fallback-to-text path" — is SUPERSEDED by R3 note 8: runSlashCommand only ever sees catalog-RESOLVED commands, so the interception lives in the COMPOSER's submit path pre-catalog-resolution.)
+6. Codex history-mode persistence (Tasks 2/5): `CodexSession` gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` recorded at start for threads freshell starts; the capability stamp is `undo ⟺ Some(Paginated)`; the runtime `-32600` mapping stays as belt (a thread paginated externally... legacy copy on refusal); live read-back of a mode is not exposed by the app-server. (The "resumed/adopted threads record `None` (unknown ⇒ legacy stamps) ... session record is the SoT" half of this note is SUPERSEDED by R3 note 2: resume/adoption parses the rollout's persisted `session_meta.history_mode` — validator-C proved the mode persists there — so only a missing/unparseable mode stamps legacy; a paginated thread survives rehydration with undo capability intact.)
 7. Task 7's double-undo assertion now filters marker summaries to user-role rows before comparing to the two prompts (marker ROWS include assistant rows; one undone step = two rows); Task 6's `Rolled back (N)` label counts rollback STEPS (user-role marker groups), not raw rows.
 8. Task 7's provider matrix gains a KILROY e2e case (seven tests): a `sessionType=kilroy` pane on the claude lane drives typed `/undo` dispatch → fork-at-point create with a minted new id → refill + marker, reusing the freshclaude fake sidecar with kilroy config.
 9. Claude busy clear-set contradiction deleted: the four clear edges are `sdk.result` (ANY subtype), `sdk.status:idle`, sidecar EOF/`SIDECAR_EXITED`, completed `handle_interrupt`; the file-summary `sdk.error` mention is removed; the enumerated test also asserts `sdk.error`/`compacting`/`assistant` never clear (fail-closed).
 10. SDK version note corrected: the sidecar's OWN lockfile pins `@anthropic-ai/claude-agent-sdk` 0.3.237 while repo-level `node_modules` materializes 0.3.235 — Task 4 cites both; the observed `query()` options exist in each.
 
 R2 remediation self-review (re-run over ONLY the r2-changed sections): the User Request block is byte-identical; each of the ten adjudicated corrections is applied at its locus with code samples, tests, and Steps kept mutually consistent (one per-session turn lock named uniformly across the three lanes; `resume_at_uuid: Option<String>` threaded through Task 4's resolver, handler tuple, spawn legs, and redo target rule; epoch rule stated once in the wire design and applied identically in all three handlers + tests; reserved-name rule stated once in Task 6 with Task 1's menu filtering untouched; F11 left unchanged per the UNSUBSTANTIATED adjudication); no new placeholders; verdict PASS.
+
+R3 remediation notes (fresh-eyes round 3, 2026-08-23 — all eight findings adjudicated SUBSTANTIATED; each correction applied at its loci and cross-referenced SUPERSEDED where it replaces r2 text):
+
+1. **Markers accumulate; epochs reset only redo state.** The r2 epoch rule's marker half is replaced everywhere it appeared: `entries` is the UNION of every epoch's rolled-back turns (frozen prior-epoch markers first, in original conversation order), durable in the ledger even after native provider deletion (codex `thread/revert` destroys the tail; opencode deletes it on the next send — only the ledger satisfies decision 6's "persist marked", while decision 5's submission-destroy kills ONLY redo). An epoch reset clears ONLY the redo-capable chain state: `redo_destroyed` clears so the record's redo fields describe the NEW chain (the prior chain's redo stays permanently dead — its provider tail no longer exists), and the per-epoch chain root is replaced at the new undo (claude re-roots as r2 specified; opencode retargets the serve pointer; codex n/a). Amended: wire-design record semantics (codex/opencode/claude bullets + the epochs bullet) and the storage-discipline paragraph; Task 2 (epoch comment + codex epoch test now asserts the two-entry union); Task 3 (amendment bullet, undo-branch union rebuild code + epoch comment, the resend epoch test); Task 4 (epoch test asserts union markers + re-rooted chain state; the handler's record write merges the union — undo splices the slice in conversation position, redo drops restored ids from the current-epoch portion); Task 5 (`rolledBackTurns` sourced from ledger `entries` on ALL three lanes; current-epoch redo state — claude tip/LCP recheck, opencode pointer — stays chain-root-driven).
+2. **Codex history-mode durably readable.** `CodexSession.history_mode` is filled at `thread/start` (`Some(Paginated)` — we SET the mode) AND at resume/adoption by parsing the rollout's persisted `session_meta.history_mode` (validator-C proved the mode persists there; freshell-codex already reads rollouts for durability). "Resumed/adopted ⇒ `None` ⇒ legacy" is no longer a permanent verdict — ONLY a missing/unparseable durable mode stamps legacy (`undo:false`), so a paginated thread keeps undo capability across normal session rehydration. Amended IN PLACE: correction item 1's verdict sentence, the wire-design stamp parenthetical, R2 note 6 (supersede marker), Task 2's amendment bullet + constructor text (plus a new `resume_parses_the_rollouts_durable_history_mode` test), and Task 5's amendment bullet + codex builder text.
+3. **Opencode post-verify failure triads.** Never a compensating rewrite after a possibly-applied mutation. The post-revert read classifies as: (a) pointer observed == the requested boundary (or absent after a full unrevert) ⇒ success; (b) read SUCCEEDED and the pointer provably unchanged (record reads fine, pointer mismatch — the verified silent-200 rule is pointer-untouched-on-no-op, so the provider is provably unmoved) ⇒ `INVALID_ROLLBACK_TARGET` + compensating rewrite; (c) the read ITSELF FAILED (transport/5xx) ⇒ `INTERNAL_ERROR`, the ledger is KEPT, and the retry-conciliation note: the next snapshot derives the prefix from provider rows, so pane + record reconverge automatically. Applied to BOTH the undo and redo legs; the old `.await.ok()`-flattened classification is replaced by an explicit `match` on the read `Result`; new test `handle_rollback_post_verify_READ_failure_keeps_the_ledger_and_reports_internal_error` pins leg (c) on both directions; the silent-noop test comment re-names leg (b); the mutation-RPC-error legs (404/5xx from revert itself) provably did not apply and still compensate.
+4. **Claude redo boundary math.** Redo-through-target's resume point = THE LAST chain uuid belonging to the target turn's raw-chain group (its assistant tail), never the next turn's first: `resumeSessionAt` keeps through-AND-including the named uuid, so redo of the `u1`/`a1` step resumes at `a1` (undo→redo is invertible; resuming at `u1` would restore only the bare prompt). Amended: the first-turn integration test's redo expectation (`resumeSessionAt == a1`), the `redo_resume_target` helper test list (empty-current case → `a1`), the handler's Redo-branch comment, the None-leg comment, correction item 3's R2 amendment sentence, and the R2 note 1 (supersede marker).
+5. **`undoneDepth` = user-step count of the marker bucket.** `rollback.undoneDepth` is the count of USER-role turns in the `rolledBackTurns` bucket (the currently rolled-back step set — the redoable set in the single-epoch case), NEVER `entries.len()` (a rebuilt single-entry tail over `[u2,a2,u3,a3]` yields 2, not 1). The client's `Rolled back (N)` label uses the same user-step count of the same bucket. Amended: Task 5 codex + opencode builder text (both `entries.len()` formulations deleted); Task 5 opencode test gains the two-step-undo `undoneDepth == 2` variant; the claude rule already counted user turns and now reads the entries-sourced bucket; Task 6 label comment ties the two counts.
+6. **Task 6 red-phase commands.** Step 1 now writes the `FreshAgentTranscript.test.tsx` (rolled-back section render, user-step label, redo-to-here rows) AND `FreshAgentView.test.tsx` (slash dispatch + reserved-seam + verbatim server message) coverage alongside the other suites, and Step 2's command runs BOTH files (plus the pre-existing five), so every stated Step-2 failure is reachable pre-implementation; Step 2's Expected text names the transcript/view failure modes explicitly.
+7. **Attention revocation is pane-scoped.** `revokeFreshAgentAttention` clears ONLY the rolled-back pane's attention entry, then re-derives tab-level green as the OR over the tab's REMAINING panes (`attentionByPane` over the tab's layout, minus the revoked pane) — never a blanket tab clear when a sibling pane still holds attention. The Task 6 test pins a same-tab SIBLING pane's attention (and the derived tab flag) surviving a rollback, plus a single-pane-tab clear variant; the stranger-tab check stays.
+8. **Reserved-command interception seam.** `/undo` and `/redo` interception lives in the COMPOSER's submit path (`sendText`, before `parseSlashCommand`-driven catalog resolution and before any `onSend` fallthrough) via the new `onReservedRollbackCommand` prop — `runSlashCommand` only executes catalog-RESOLVED commands, and the catalog omits capability-false ones, so an in-`runSlashCommand` intercept could never fire for them (the draft's `commandInput` reference is deleted — it had no such variable in scope and could not compile). The view supplies the pinned-notice routing (`REDO_CODEX_UNSUPPORTED_NOTICE` for codex `/redo`; `rollbackUnsupportedNotice` otherwise); `shared/fresh-agent-slash-commands.ts` exports `RESERVED_ROLLBACK_SLASH_NAMES` (Task 1). Tests: composer-level (typed `/redo` unresolvable ⇒ `onReservedRollbackCommand('redo')`, `onSend` never called; resolvable ⇒ normal command path) and view-level (typed `/redo` on a freshcodex pane ⇒ the pinned codex notice, no send) per corrections 6/8; the codex e2e expectation is unchanged.
+
+R3 remediation self-review PASS (fresh-eyes round 3, 2026-08-23 — over ONLY the r3-changed sections): the "## User Request" block is byte-identical; all eight adjudicated findings are fixed at their named loci with Tasks 1/2/3/4/5 code, tests, and Steps kept mutually consistent (one union-marker rule stated once in the wire design and applied identically across the three providers' handlers + snapshot sourcing; one codex history-mode durability rule across the stamp-emitting sites; one opencode post-verify triad across interface bullet, code legs, and tests; one claude redo boundary rule with no residual "first user-anchor uuid" resume targets; `undoneDepth` user-step-counted at every stamp site and matched by the label; the reserved-name seam pinned at the composer with `runSlashCommand`-only interception deleted); red-phase commands are runnable and list every suite whose failure is claimed; pinned copies referenced (`REDO_CODEX_UNSUPPORTED_NOTICE`, `rollbackUnsupportedNotice`, `LEDGER_WRITE_REFUSAL_COPY`, `OPENCODE_OLD_CLI_COPY`, `REDO_REMOVED_HISTORY_COPY`, `RESERVED_ROLLBACK_SLASH_NAMES`) exist in the plan's pinned-copy/code sections. The plan-review loop verdict stays recorded: FAILED / NON-CONVERGED — the 3-round cap is reached (3/3), the loop closes here, and independent verification continues in the Stage-5 delta review.
 
 ## Load-bearing assumptions for Stage-2 validation (re-verify before/alongside Task 1)
 
@@ -392,10 +406,12 @@ describe('fresh-agent slash commands: /undo + /redo (kata 1wxv decision 8)', () 
     expect(resolveFreshAgentSlashCommand('freshclaude', '/undo')?.action).toBe('undo')
     expect(resolveFreshAgentSlashCommand('freshopencode', 'redo')?.action).toBe('redo')
   })
-  // Reserved names (r2): the CATALOG filtering above only governs the menu. /undo and /redo
-  // are additionally reserved at runSlashCommand level so a TYPED '/redo' on freshcodex is
-  // intercepted with the pinned notice instead of falling through to model text — the
-  // view-level tests for that path live in Task 6.
+  // Reserved names (r2; seam corrected r3 correction 8): the CATALOG filtering above only
+  // governs the menu. /undo and /redo are additionally reserved at the COMPOSER's submit
+  // path (pre-catalog-resolution — a seam runSlashCommand could never provide, since the
+  // filtered catalog omits capability-false commands and unresolved names fall through to
+  // model text), so a TYPED '/redo' on freshcodex is intercepted with the pinned notice
+  // instead of falling through to the model — the composer/view-level tests live in Task 6.
 })
 ```
 
@@ -643,6 +659,10 @@ export type FreshAgentSlashCommandAction = 'new' | 'compact' | 'fork' | 'model' 
     description: 'Restore the last rolled-back turn',
     action: 'redo',
   },
+
+// r3 correction 8: the reserved-name set the COMPOSER intercepts before catalog resolution
+// (Task 6's seam); exported so composer + view + tests share one source.
+export const RESERVED_ROLLBACK_SLASH_NAMES = ['undo', 'redo'] as const
 ```
 
 `crates/freshell-protocol/src/client_messages.rs`:
@@ -805,7 +825,7 @@ git diff --exit-code HEAD -- port/contract && echo CONTRACT_REGEN_CLEAN
 ### Task 2: Codex undo leg (`thread/revert`; undo-only)
 
 **Stage-2 binding amendments (from "## Load-bearing corrections", item 1):**
-- ALL freshcodex `thread/start` calls SET `historyMode:"paginated"` and record it on the freshell-side session record: `CodexSession` gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` for threads freshell started (we SET the mode at start); `thread/resume` takes no mode param, so resumed/adopted threads record `None` (unknown ⇒ legacy stamps). The app-server exposes no mode read-back; the session record is the source of truth, and the runtime `-32600` mapping below stays as belt (a thread paginated externally is `None` to us ⇒ `undo:false` — capability never over-advertised; the known-legacy copy still fires on the refusal path). Files list gains the start-path modification (same `app_server.rs` client + the `codex.rs` create/resume paths that build StartParams).
+- ALL freshcodex `thread/start` calls SET `historyMode:"paginated"` and record it on the freshell-side session record: `CodexSession` gains `history_mode: Option<HistoryMode>` — `Some(Paginated)` for threads freshell started (we SET the mode at start). RESUME/ADOPTION IS DURABLY READABLE (r3 — replaces "resumed/adopted threads record `None` (unknown ⇒ legacy)" as the permanent verdict): `thread/resume` takes no mode param, but the rollout persists the mode — `CodexSession::resume`/adoption parses the rollout file's persisted `session_meta.history_mode` (validator-C proved the mode persists there; freshell-codex already reads rollouts for durability) and records `Some(Paginated)` when the meta says paginated; ONLY a missing/unparseable mode stamps legacy (`None` ⇒ `undo:false`). The app-server exposes no live mode read-back — the durable rollout meta is the source of truth (the in-memory record caches it), and the runtime `-32600` mapping below stays as belt (a thread paginated externally whose meta is unreadable by us ⇒ `undo:false` — capability never over-advertised; the known-legacy copy still fires on the refusal path). Files list gains the start-path modification (same `app_server.rs` client + the `codex.rs` create/resume paths that build StartParams) plus the resume-path rollout-meta parse in `crates/freshell-codex` (the existing rollout-reader module).
 - Legacy threads (created before this feature): do NOT detect pre-emptively — call `thread/revert`, and map the observed `-32600 "thread/revert only supports paginated threads"` error to `UNSUPPORTED_CAPABILITY` + `CODEX_LEGACY_THREAD_COPY` (pinned in the corrections section). Non-destructive: the refusal only fires when revert FAILED.
 - The mid-turn `BUSY_TURN` refusal test must additionally prove the provider was never reached: assert NO `thread/revert` (and no `turn/interrupt`) frame appears on the fake transport during the refused attempt (validator extra-1: provider revert force-interrupts then proceeds — a gate hole is silent corruption).
 - Codex empty-prefix toTurn (undo-to-here on the first turn) is LEGAL: `thread/revert` before the first turn succeeds and empties the thread (validator-C). No `INVALID_ROLLBACK_TARGET` first-turn case exists for codex; only `NOTHING_TO_UNDO` on empty history.
@@ -1047,11 +1067,14 @@ async fn handle_send_permanently_destroys_redo() {
 }
 
 #[tokio::test]
-async fn handle_rollback_after_a_destroyed_redo_starts_a_new_epoch() {
-    // r2 epoch rule: seed a record { entries: [<old-epoch marker>], redo_destroyed: true }
-    // (the undo→send path above), then drive one more undo against the two-turn read; the
-    // record must carry ONLY the new op's removed turns (old-epoch markers dropped — they
-    // describe a branch the resend permanently replaced), redo_destroyed cleared, can_redo false.
+async fn handle_rollback_after_a_destroyed_redo_starts_a_new_epoch_but_keeps_all_markers() {
+    // r3 epoch rule (supersedes r2's "old entries dropped"): seed a record
+    // { entries: [<old-epoch marker>], redo_destroyed: true } (the undo→send path above),
+    // then drive one more undo against the two-turn read; the record must carry the UNION
+    // of both epochs' entries in conversation order (markers persist marked in the ledger —
+    // thread/revert DESTROYED the old tail, so only the ledger keeps them, decision 6),
+    // redo_destroyed cleared (the record's redo state now describes the NEW chain; the prior
+    // chain's redo stays permanently dead), can_redo false (codex is undo-only).
     let (st, _rx) = state_with_sink();
     let (transport, peer) = freshell_codex::new_channel_transport();
     let (client, _notifs) = CodexAppServerClient::connect(transport);
@@ -1074,9 +1097,10 @@ async fn handle_rollback_after_a_destroyed_redo_starts_a_new_epoch() {
     peer.respond(&revert_id, json!({}));
     driver.await.expect("rollback task");
     let record = st.2.load_rollback("codex", "thr-epoch").expect("record");
-    assert!(!record.redo_destroyed, "the new epoch cleared the destroyed bit");
-    assert_eq!(record.entries.len(), 1, "exactly the new epoch's entries");
-    assert_eq!(record.entries[0].prompt_text, "second prompt");
+    assert!(!record.redo_destroyed, "the redo state now describes the new chain (the prior chain's redo stays dead)");
+    assert_eq!(record.entries.len(), 2, "r3: the UNION of every epoch's markers — entries are never dropped");
+    assert_eq!(record.entries[0].prompt_text, "old");
+    assert_eq!(record.entries[1].prompt_text, "second prompt");
 }
 
 #[tokio::test]
@@ -1086,8 +1110,18 @@ async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock(
     // (no deadlock); assert the request order shows thread/revert strictly BEFORE turn/start
     // (the send waited on the session turn lock held across the rollback), and assert the
     // final record is the post-rollback record with redo_destroyed applied (send waits,
-    // rollback wins, then the send destroys redo). handle_send never touches
+    // rollback wins, then destroys). handle_send never touches
     // rollback_in_flight — its ONLY wait point is the turn lock.
+}
+
+#[tokio::test]
+async fn resume_parses_the_rollouts_durable_history_mode() {
+    // r3 durability (fresh-eyes r3 F2): write a fake rollout whose session_meta carries
+    // history_mode "paginated" (the validator-C-verified persistence site), drive the
+    // thread/resume / adoption path, and assert the resulting CodexSession.history_mode ==
+    // Some(Paginated) — undo capability SURVIVES normal session rehydration. Variants:
+    // meta missing and meta unparseable => None (legacy stamps, undo:false). The existing
+    // freshell-codex rollout-reader fixture idioms are reused, not reinvented.
 }
 ```
 
@@ -1135,7 +1169,7 @@ pub async fn revert_thread(
 }
 ```
 
-`crates/freshell-freshagent/src/codex.rs` — struct + constructor: add `rollback_in_flight: crate::InFlightRegistry` beside `fork_in_flight` (codex.rs:163-174), initialized identically. `CodexSession` gains `history_mode: Option<HistoryMode>` (per the stage-2 amendment: `Some(Paginated)` recorded at `thread/start` time; resumed/adopted threads `None`) and `turn_lock: Arc<tokio::sync::Mutex<()>>` (the per-session async turn lock from the r2 serialization discipline). Then:
+`crates/freshell-freshagent/src/codex.rs` — struct + constructor: add `rollback_in_flight: crate::InFlightRegistry` beside `fork_in_flight` (codex.rs:163-174), initialized identically. `CodexSession` gains `history_mode: Option<HistoryMode>` (per the stage-2 amendment as r3-corrected: `Some(Paginated)` recorded at `thread/start` time; resumed/adopted threads take the mode parsed from the rollout's persisted `session_meta.history_mode` — `None` ONLY when that durable meta is missing/unparseable ⇒ legacy stamps) and `turn_lock: Arc<tokio::sync::Mutex<()>>` (the per-session async turn lock from the r2 serialization discipline). Then:
 
 ```rust
 /// The codex rollback target math (kata decision 2/3): `raw_turns` from
@@ -1243,11 +1277,13 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
     // history is never mutated. (Append-only entries for codex; the stored can_redo stays false.)
     let now = crate::rollback_record::now_ms(); // reuse this file's timestamp helper; else SystemTime now_ms
     let previous = self.identity_sink.as_ref().and_then(|s| s.load_rollback("codex", &thread_id));
-    // Epoch rule (r2): an undo landing while redo_destroyed is set starts a NEW epoch — the
-    // old entries list is dropped (it describes a branch a resend already permanently
-    // replaced) and restarts from this op; redo_destroyed clears with the fresh record.
+    // Epoch rule (r3): an undo landing while redo_destroyed is set starts a NEW epoch —
+    // ONLY the redo-capable chain state resets (`redo_destroyed` clears — the record's redo
+    // state now describes the new chain; the prior chain's redo stays permanently dead);
+    // `entries` is NEVER cleared (the union of every epoch's markers persists — codex
+    // thread/revert destroyed the old tail, so the ledger is their only home, decision 6).
     let mut record = match previous.clone() {
-        Some(p) if !p.redo_destroyed => p,
+        Some(p) => { let mut p = p; if p.redo_destroyed { p.redo_destroyed = false; } p }
         _ => RollbackRecord::empty(now),
     };
     record.push_entry(RollbackEntry { removed_turns: removed, prompt_text: prompt.clone(), at_ms: now }, now);
@@ -1295,7 +1331,9 @@ Add to `crates/freshell-freshagent/src/rollback_record.rs`:
 
 ```rust
 /// Decision 5: any new submission (send/steer/queue firing) permanently destroys
-/// redo; markers survive. AWAITED before the prompt goes out. A write failure is
+/// redo — the redo-capable CHAIN STATE only; `entries` (the r3 marker union) is
+/// NEVER touched and survives with the "rolled back" marker per decision 6.
+/// AWAITED before the prompt goes out. A write failure is
 /// returned — callers `tracing::warn!` it but never block the send and never emit a
 /// user-facing event (providers degrade gracefully: opencode natively deletes the
 /// reverted tail on send; claude's redo path re-validates the recorded tip).
@@ -1307,10 +1345,10 @@ pub async fn destroy_redo_on_submit(
 ) -> Option<std::io::Error> {
     let sink = sink.as_ref()?;
     let mut record = sink.load_rollback(provider, live_id)?;
-    if record.redo_destroyed || record.entries.is_empty() && record.original_session_id.is_none() {
+    if record.redo_destroyed || (record.entries.is_empty() && record.original_session_id.is_none()) {
         return None;
     }
-    record.destroy_redo(now_ms);
+    record.destroy_redo(now_ms); // sets redo_destroyed + clears can_redo; entries untouched (r3)
     sink.record_rollback(provider, live_id, record).await.err()
 }
 ```
@@ -1364,7 +1402,7 @@ git commit -m "feat(fresh-codex): undo-only conversation rollback via thread/rev
 - Verified `revert` field shape (REPLACES any different sample nesting in this task): top-level on the session body — `session.revert = { "messageID": string, "snapshot"?: ..., "diff"?: ..., "partID"?: string }`, omitted entirely when no rollback is active. The serve fake and the read path use exactly this.
 - The served message LIST returns reverted tail rows UNFLAGGED. `build_opencode_snapshot_json` (and its per-message projection) computes the ACTIVE PREFIX as messages strictly before `revert.messageID`; the tail beyond the pointer is projected as `rolledBackTurns` markers for Task 5 (never from freshell guessing).
 - Undo/redo targets name USER message ids; an assistant-message id normalizes to its parent user message (serve-verified). Unknown messageID is a silent 200 no-op — the handler must post-verify by re-reading the session and treating "pointer didn't move" as `INVALID_ROLLBACK_TARGET`.
-- Any subsequent send/command/summarize natively DELETES the reverted tail rows (matches decision 5); freshell's ledger remains the durable marker source post-send. The handler's `destroy_redo_on_submit` covers our side; the native deletion makes redo-destroy non-repairable — do not try to preserve.
+- Any subsequent send/command/summarize natively DELETES the reverted tail rows (kills that chain's redo — matches decision 5) while freshell's ledger REMAINS the durable marker source (r3: the deleted rows' markers persist in the ledger union — do not try to preserve them PROVIDER-side, and never drop them freshell-side). The handler's `destroy_redo_on_submit` covers our side.
 - **Binding (decision 1 keeps force):** the freshopencode serve sidecar launches with opencode snapshots DISABLED in the managed config (probe-verified that native revert re-applies patch files otherwise). Add to this task's Steps: revert of a patch-carrying turn leaves the working tree byte-identical (hash before/after). If disabling snapshots turns out to also disable revert entirely, the alternative is NOT falling back to file-touching: it is emulating via fork-at-point (opencode fork is message-targeted, serve.rs:748-770) — but only snapshots-off probing decides.
 - Empty-prefix (revert of the first user message) is legal: active prefix empties; no first-turn refusal exists for opencode; only `NOTHING_TO_UNDO` on empty active prefix.
 
@@ -1386,7 +1424,7 @@ git commit -m "feat(fresh-codex): undo-only conversation rollback via thread/rev
   - `pub(crate) fn opencode_message_turn_json(msg: &Value) -> Value` — the one-message turn projection factored out of `build_opencode_snapshot_json` (lib.rs:1384-1429), call sites unchanged.
   - `InFlightRegistry` — UNCHANGED under the r2 lock discipline (`try_acquire` only; `handle_send` never consults it — the per-session mutex is the sole send-side wait point, so no `is_in_flight`/`wait_for` legs are added).
   - Turn math contract: the serve session's top-level `revert.messageID` (when present — the VERIFIED shape is `session.revert = {messageID, snapshot?, diff?, partID?}` top-level on the session body, omitted when inactive; no `info.revert` exists anywhere) is the FIRST removed message. Active prefix = messages strictly before it; the message LIST returns the reverted tail UNFLAGGED (never hidden). Undo Step target = last `role=="user"` message of the active prefix; the revert removes target-and-after within the active prefix. Redo Step: from the removed tail, move the boundary forward one USER step — `revert{messageID: <next user message strictly after the current pointer>}`, or `unrevert` when no such user message exists (all-or-nothing restore). Redo toTurn(turnId=T) restores through T's group: `revert{messageID: <first user message strictly after T>}` or `unrevert`. A message id must match `^msg` and sit inside the addressed range (active prefix for undo, removed tail for redo), else `INVALID_ROLLBACK_TARGET` from the handler.
-  - Post-op discipline (all legs): compute the POST-OP record from the pre-mutation reads → AWAIT-write it BEFORE the mutation (failure ⇒ `INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY`, history never mutated) → mutate (`revert`/`unrevert`) → POST-VERIFY by re-reading the session: the pointer must equal exactly the requested boundary (or be ABSENT after a full `unrevert`); a silent-200 no-op (unknown/stale messageID — pointer didn't move) ⇒ `INVALID_ROLLBACK_TARGET`; a revert-route 404/unknown route ⇒ `UNSUPPORTED_CAPABILITY` + `OPENCODE_OLD_CLI_COPY`; only other transport failures ⇒ `INTERNAL_ERROR`. On any post-pre-write failure leg, a COMPENSATING rewrite of the pre-op record goes out before the refusal.
+  - Post-op discipline (all legs): compute the POST-OP record from the pre-mutation reads → AWAIT-write it BEFORE the mutation (failure ⇒ `INTERNAL_ERROR` + `LEDGER_WRITE_REFUSAL_COPY`, history never mutated) → mutate (`revert`/`unrevert`) → POST-VERIFY by re-reading the session — classified as the r3 TRIAD (NEVER a compensating rewrite after a possibly-applied mutation): (a) the read SUCCEEDS and the observed pointer equals exactly the requested boundary (or is ABSENT after a full `unrevert`) ⇒ success; (b) the read SUCCEEDS and the pointer provably did NOT move (the silent-200 no-op: unknown/stale messageID — the verified rule is pointer-untouched on no-op, so the provider is provably unmoved) ⇒ `INVALID_ROLLBACK_TARGET` + compensating rewrite of the pre-op record; (c) the read ITSELF FAILED (transport/5xx — the mutation may have applied) ⇒ `INTERNAL_ERROR`, the ledger is KEPT (no compensation — it may describe the truth), and the retry/reconciliation note: the next snapshot derives the prefix from provider rows, so pane + record reconverge automatically. The mutation-RPC error legs (revert-route 404/unknown route ⇒ `UNSUPPORTED_CAPABILITY` + `OPENCODE_OLD_CLI_COPY`; other transport failures ⇒ `INTERNAL_ERROR`) PROVABLY did not apply and compensate as before. The same triad governs the REDO path.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1582,9 +1620,11 @@ async fn handle_rollback_twice_keeps_markers_in_conversation_order() {
 
 #[tokio::test(start_paused = true)]
 async fn handle_rollback_silent_noop_revert_is_invalid_target() {
-    // revert 200s but the pointer does NOT move (unknown/stale messageID simulation):
-    // the post-verify re-read catches it => INVALID_ROLLBACK_TARGET, and the record
-    // was compensated back (the ledger never describes a rollback the serve rejected).
+    // Triad leg (b) (r3): revert 200s and the post-verify read SUCCEEDS but the pointer
+    // provably did NOT move (unknown/stale messageID simulation — the verified silent-200
+    // rule is pointer-untouched-on-no-op, so the provider is provably unmoved): the
+    // post-verify catches it => INVALID_ROLLBACK_TARGET, and the record
+    // was compensated back (the ledger never describes a rollback the serve provably rejected).
     let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
     *http.revert_moves_pointer.lock().expect("flag") = false;
     let (sink, captured) = capturing_sink();
@@ -1593,6 +1633,20 @@ async fn handle_rollback_silent_noop_revert_is_invalid_target() {
     assert_eq!(frames[0]["event"]["code"], json!("INVALID_ROLLBACK_TARGET"));
     assert!(st_sink.load_rollback("opencode", "ses_real").map(|r| r.entries.is_empty()).unwrap_or(true),
         "the pre-written record was compensated away");
+}
+
+#[tokio::test(start_paused = true)]
+async fn handle_rollback_post_verify_READ_failure_keeps_the_ledger_and_reports_internal_error() {
+    // Triad leg (c) (r3, undo + redo): the revert/unrevert POST 200s, but the post-verify
+    // get_session READ FAILS (transport/5xx — the mutation may have applied). Assert:
+    // exactly one frame, INTERNAL_ERROR (never INVALID_ROLLBACK_TARGET); NO compensating
+    // rewrite issued (the pre-written post-op record is still in the sink verbatim — a
+    // compensate after a possibly-applied mutation would falsify the ledger); and a code
+    // comment in the handler records the reconvergence note: the next snapshot derives its
+    // prefix from provider rows, so pane + record reconverge automatically on retry.
+    // (RollbackFakeHttp gains a fail_next_get_session flag for this.)
+    // Redo leg: same rig with a seeded pointer + record; the failed read after a re-revert
+    // yields the same INTERNAL_ERROR + ledger-kept outcome.
 }
 
 #[tokio::test(start_paused = true)]
@@ -1660,15 +1714,18 @@ async fn handle_send_issued_mid_rollback_strictly_follows_it() {
 
 #[tokio::test(start_paused = true)]
 async fn handle_rollback_after_a_resend_starts_a_new_epoch_and_redo_still_works() {
-    // r2 epoch rule end-to-end on this lane: undo (removes the msg_u3 group) → resend the
+    // r3 epoch rule end-to-end on this lane: undo (removes the msg_u3 group) → resend the
     // edited prompt (the fake's /message arm natively DELETES the reverted tail rows and
     // clears the pointer, mirroring decision-5 native behavior; destroy_redo_on_submit sets
     // redo_destroyed) → undo AGAIN (removes the resent turn) → redo. Assert: after the
-    // second undo the marker bucket carries ONLY the newest epoch's turns (the old u3-group
-    // markers are GONE from the live marker display — they describe a branch the resend
-    // permanently replaced), redo is available again, and one redo step restores the newest
-    // epoch's removed tail. (Extend RollbackFakeHttp's message store to track prompt
-    // appends + the native tail deletion so this sequence is representable.)
+    // second undo the marker bucket is the UNION — the old u3-group markers PERSIST as
+    // frozen prior-epoch entries (their serve rows were natively deleted; the ledger is
+    // their only home, decision 6) PRECEDING the newest epoch's markers in conversation
+    // order; only the redo-capable chain state reset (redo available again for the NEW
+    // chain: the prior chain's tail no longer exists, so its redo stays permanently dead);
+    // and one redo step restores the newest epoch's removed tail (never the frozen rows).
+    // (Extend RollbackFakeHttp's message store to track prompt appends + the native tail
+    // deletion so this sequence is representable.)
 }
 ```
 
@@ -1795,22 +1852,33 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
             let removed_ids: Vec<String> = removed_msgs.iter().filter_map(|m| m["info"]["id"].as_str().map(str::to_string)).collect();
             let prompt = removed_msgs.iter().find(|m| m["info"]["role"] == "user")
                 .and_then(|m| m["parts"].as_array()).map(|parts| parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
-            // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket is the
-            // post-op revert tail in its ORIGINAL CONVERSATION ORDER — the newly removed
-            // slice PRECEDES the prior tail (undo 3 then undo 2 => markers [2,3]).
-            // Epoch rule (r2): an undo landing while redo_destroyed is set starts a NEW
-            // epoch — the serve already DELETED the old reverted tail natively on the
-            // resend, so prior entries must NOT merge in (they describe a branch the resend
-            // permanently replaced); the bucket rebuilds from this op onward and
-            // redo_destroyed clears.
+            // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket is the UNION
+            // (r3) — FROZEN prior-epoch markers (recorded entries whose turn ids no longer
+            // appear in the serve's message list: their tail rows were natively DELETED by a
+            // resend, so the ledger is their only home, decision 6) PRECEDE the rebuilt
+            // current-epoch tail in its ORIGINAL CONVERSATION ORDER — the newly removed
+            // slice PRECEDES the prior current tail (undo 3 then undo 2 => markers [2,3]).
+            // Epoch rule (r3): an undo landing while redo_destroyed is set starts a NEW
+            // epoch that clears ONLY the redo-capable chain state — `redo_destroyed` clears
+            // (the record's redo state now describes the NEW chain; the prior chain's redo
+            // stays permanently dead because its provider tail no longer exists) — while
+            // `entries` (the marker union) is NEVER cleared.
             let now = crate::rollback_record::now_ms();
             let previous = self.identity_sink.as_ref().and_then(|s| s.load_rollback("opencode", &real_id));
             let mut record = match previous.clone() {
-                Some(p) if !p.redo_destroyed => p,
+                Some(p) => { let mut p = p; if p.redo_destroyed { p.redo_destroyed = false; } p }
                 _ => RollbackRecord::empty(now),
             };
-            let prior_tail: Vec<Value> = record.entries.drain(..).flat_map(|e| e.removed_turns).collect();
-            let combined: Vec<Value> = removed_turns.into_iter().chain(prior_tail).collect();
+            // Frozen prior-epoch markers survive; only the CURRENT-epoch portion (turns still
+            // present in the served message list) is rebuilt from the pointer-defined tail:
+            //   frozen  = recorded marker turns whose ids are ABSENT from the served list;
+            //   current = this op's newly removed slice ++ the still-served prior tail turns.
+            let served_ids: std::collections::HashSet<&str> = messages.iter().filter_map(|m| m["info"]["id"].as_str()).collect();
+            let old_turns: Vec<Value> = record.entries.drain(..).flat_map(|e| e.removed_turns).collect();
+            let (frozen, current): (Vec<Value>, Vec<Value>) = old_turns.into_iter().partition(|t|
+                t.get("turnId").or_else(|| t.get("id")).and_then(Value::as_str)
+                    .map(|id| !served_ids.contains(id)).unwrap_or(true));
+            let combined: Vec<Value> = frozen.into_iter().chain(removed_turns.into_iter().chain(current)).collect();
             record.entries = vec![RollbackEntry { prompt_text: prompt.clone(), removed_turns: combined, at_ms: now }];
             record.last_op_at_ms = now;
             record.set_can_redo(true, now);
@@ -1826,14 +1894,27 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
                 reply_sink(map_opencode_serve_error(&op, &err));
                 return;
             }
-            // POST-VERIFY (unknown/stale messageID is a silent 200 no-op serve-side):
-            let verified = manager.get_session(&real_id, &route).await.ok()
-                .and_then(|v| v.get("revert").and_then(|r| r.get("messageID")).and_then(Value::as_str).map(str::to_string));
+            // POST-VERIFY (unknown/stale messageID is a silent 200 no-op serve-side) — the r3
+            // triad; NEVER compensate after a possibly-applied mutation:
+            let verified = match manager.get_session(&real_id, &route).await {
+                Ok(v) => v.get("revert").and_then(|r| r.get("messageID")).and_then(Value::as_str).map(str::to_string),
+                Err(err) => {
+                    // (c) the READ failed (transport/5xx) — the revert may have applied: KEEP the
+                    // ledger (no compensating rewrite) and report INTERNAL_ERROR. The next
+                    // snapshot derives the active prefix from provider rows, so pane + record
+                    // reconverge automatically on the client's retry/refetch.
+                    reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &format!("revert issued but the post-rollback verification read failed: {err}")));
+                    return;
+                }
+            };
             if verified.as_deref() != Some(target.as_str()) {
+                // (b) read SUCCEEDED and the pointer provably did not move (the verified
+                // silent-200 rule is pointer-untouched-on-no-op) => provider PROVABLY unmoved:
                 self.compensate_opencode_record(&real_id, previous.as_ref(), now).await;
                 reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", "the serve accepted the revert but the rollback pointer did not move (unknown or stale messageID)"));
                 return;
             }
+            // (a) pointer observed == the requested boundary => success.
             let can_redo = record.can_redo();
             self.broadcast(&ServerMessage::FreshAgentEvent(changed_event_frame(&real_id))); // invalidation — see note
             self.broadcast(&rollback_broadcast_frame(&op, &real_id, &removed_ids, can_redo));
@@ -1852,6 +1933,9 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
             // Uniform group math, one formula for both modes: Step restores the pointer's
             // own group (t_pos = 0); toTurn restores through T's group. Kept-through end =
             // the first USER message strictly AFTER the address; unrevert when none.
+            // (r3: the rolled-back TAIL the pointer defines is the CURRENT epoch only —
+            // frozen prior-epoch markers live in the ledger union, not in the served list,
+            // so the tail math can never name them.)
             let t_pos = match op.mode {
                 RollbackModeReq::Step => 0usize,
                 RollbackModeReq::ToTurn => {
@@ -1868,19 +1952,28 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
                 None => (&messages[boundary_idx..], None),
             };
             // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket rebuilds to
-            // the remaining tail BEFORE the revert/unrevert POST goes out.
+            // the remaining tail BEFORE the revert/unrevert POST goes out — UNION rule (r3):
+            // FROZEN prior-epoch markers (recorded turns whose ids are absent from the served
+            // list) PRECEDE the remaining current tail; they are never dropped by a redo.
             let remaining_start = kept_end.unwrap_or(messages.len());
             let remaining_turns: Vec<Value> = messages[remaining_start..].iter().map(crate::opencode_message_turn_json).collect();
             let now = crate::rollback_record::now_ms();
             let previous = existing.clone();
             let mut record = existing.unwrap_or_else(|| RollbackRecord::empty(now));
-            record.entries = if remaining_turns.is_empty() { vec![] } else { vec![RollbackEntry {
-                removed_turns: remaining_turns,
+            let served_ids: std::collections::HashSet<&str> = messages.iter().filter_map(|m| m["info"]["id"].as_str()).collect();
+            let frozen: Vec<Value> = record.entries.drain(..).flat_map(|e| e.removed_turns)
+                .filter(|t| t.get("turnId").or_else(|| t.get("id")).and_then(Value::as_str).map(|id| !served_ids.contains(id)).unwrap_or(true))
+                .collect();
+            let current_tail_non_empty = !remaining_turns.is_empty();
+            record.entries = if !current_tail_non_empty && frozen.is_empty() { vec![] } else { vec![RollbackEntry {
+                removed_turns: frozen.into_iter().chain(remaining_turns).collect(),
                 prompt_text: remaining_prompt(&messages[remaining_start..]),
                 at_ms: now,
             }]};
             record.last_op_at_ms = now;
-            record.set_can_redo(!record.redo_destroyed && !record.entries.is_empty(), now);
+            // can_redo gates ONLY on the current chain's remaining tail — frozen prior-epoch
+            // markers are not restorable, so they must not keep redo alive (r3):
+            record.set_can_redo(!record.redo_destroyed && current_tail_non_empty, now);
             if let Some(sink) = self.identity_sink.clone() {
                 if let Err(e) = sink.record_rollback("opencode", &real_id, record.clone()).await {
                     tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.rollback_pre_write_failed");
@@ -1898,14 +1991,24 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
                 reply_sink(map_opencode_serve_error(&op, &err));
                 return;
             }
-            // POST-VERIFY: pointer == the new boundary, or ABSENT after a full unrevert.
-            let verified = manager.get_session(&real_id, &route).await.ok()
-                .and_then(|v| v.get("revert").and_then(|r| r.get("messageID")).and_then(Value::as_str).map(str::to_string));
+            // POST-VERIFY (same r3 triad as the undo leg): pointer == the new boundary, or
+            // ABSENT after a full unrevert.
+            let verified = match manager.get_session(&real_id, &route).await {
+                Ok(v) => v.get("revert").and_then(|r| r.get("messageID")).and_then(Value::as_str).map(str::to_string),
+                Err(err) => {
+                    // (c) READ failed — the mutation may have applied: KEEP the ledger (no
+                    // compensating rewrite), report INTERNAL_ERROR; the next snapshot derives the
+                    // prefix from provider rows, so pane + record reconverge automatically.
+                    reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &format!("redo issued but the post-rollback verification read failed: {err}")));
+                    return;
+                }
+            };
             let verified_ok = match &new_boundary_id {
                 Some(id) => verified.as_deref() == Some(id.as_str()),
                 None => verified.is_none(),
             };
             if !verified_ok {
+                // (b) read SUCCEEDED + pointer provably unmoved => compensate, then refuse:
                 self.compensate_opencode_record(&real_id, previous.as_ref(), now).await;
                 reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", "the serve accepted the redo but the rollback pointer did not move"));
                 return;
@@ -1997,7 +2100,7 @@ git commit -m "feat(fresh-opencode): undo/redo conversation rollback via revert/
 - Redo validity contract: at undo, record `original_session_id` + `original_tip_uuid` in the rollback record (both fields exist in Task 1's `RollbackRecord`). Redo re-reads the chain-root original JSONL: it must still exist and its tip must still equal the recorded tip AND the LCP of current-session vs original must still resolve past the redo target; else refuse loudly with `REDO_UNAVAILABLE` (`REDO_REMOVED_HISTORY_COPY` = `Redo is no longer available — the original conversation's history changed since the undo.`). Compaction/snips can legitimately relink/remove uuids; this is the detection contract, not prevention.
 - `in_turn` busy truth CLEAR-SET (LBC-10 falsified the original): clear on (a) `sdk.result` with ANY subtype — a result frame ends the turn (r2: the earlier "success-only" wording is void; `sdk.error` is NOT an edge), (b) `sdk.status:idle`, (c) sidecar EOF/death arm (`SIDECAR_EXITED` at claude.rs:1500-1553), (d) a completed `handle_interrupt` (claude.rs:706-734 — interrupts produce NO result frame). No other edges (no `sdk.error`, no `compacting`, no `assistant`, no status-kludge). The busy-clear test enumerates all four arms plus the fail-closed negatives; a missing arm = permanent BUSY_TURN wedge.
 - Transcript line matching for the LCP/marker/removed-set computations compares `uuid` + `message` content ONLY and ignores `sessionId`/`entrypoint`/`gitBranch`/`promptId` (rewritten on copies) and skips fork header/tail line kinds (`mode`, `atis-latch`, `queue-operation`, `last-prompt`).
-- Claude FIRST-TURN rollback is LEGAL (r2; replaces the earlier `INVALID_ROLLBACK_TARGET` first-turn refusal — `CLAUDE_FIRST_TURN_REFUSAL` is removed): `resolve_resume_point` yielding `resume_at_uuid: None` means "before the first message". The handler emits the pending-cancel frames, kills the sidecar, and spawns a FRESH conversation (create with NO resume); the discarded durable session is recorded as the record's `original_session_id` with `original_tip_uuid` = its raw-chain tip; adoption rides the existing sdk.session.init leg (cli_index insert + awaited binding + rollback-row re-key). `canRedo` from the record = the original tip strictly beyond the live chain tip (live tip = none here); redo = re-fork the original at its first user message uuid (fork-at-point — the proved-full-retention path) and adopt. Rollback to an empty conversation is thus uniformly legal across codex/opencode/claude.
+- Claude FIRST-TURN rollback is LEGAL (r2; replaces the earlier `INVALID_ROLLBACK_TARGET` first-turn refusal — `CLAUDE_FIRST_TURN_REFUSAL` is removed): `resolve_resume_point` yielding `resume_at_uuid: None` means "before the first message". The handler emits the pending-cancel frames, kills the sidecar, and spawns a FRESH conversation (create with NO resume); the discarded durable session is recorded as the record's `original_session_id` with `original_tip_uuid` = its raw-chain tip; adoption rides the existing sdk.session.init leg (cli_index insert + awaited binding + rollback-row re-key). `canRedo` from the record = the original tip strictly beyond the live chain tip (live tip = none here); redo = re-fork the original at THE LAST RAW-CHAIN UUID OF THE RESTORED FIRST STEP'S GROUP — its assistant tail (r3: `resumeSessionAt` keeps through-AND-including the named uuid, so restoring the `u1`/`a1` step resumes at `a1`, never `u1`; "first user message uuid" is the group anchor, not the resume point) — fork-at-point, the proved-full-retention path — and adopt. Rollback to an empty conversation is thus uniformly legal across codex/opencode/claude.
 
 **Files:**
 - Modify: `crates/freshell-claude-sidecar/index.mjs:236-258` (pass `resumeSessionAt` + `forkSession` into the SDK `query` options; header protocol doc updated)
@@ -2146,12 +2249,15 @@ async fn emit_pending_cancellations_maps_every_parked_entry() {
 
 #[tokio::test]
 async fn handle_rollback_after_a_resend_re_roots_the_chain_and_redo_restores_the_new_epoch() {
-    // r2 epoch rule on this lane (undo→send→undo↔redo): seed live session S' (a fork of
+    // r3 epoch rule on this lane (undo→send→undo↔redo): seed live session S' (a fork of
     // original O whose record carries original_session_id=O with redo_destroyed=true) and
     // drive one more undo; assert the NEW record's original_session_id == S' (re-rooted to
-    // the CURRENT durable id — O's chain is never reused) and original_tip_uuid == S' chain
-    // tip; assert a following redo re-forks from S' (restore the newest epoch), and the
-    // read-time marker bucket shows only the newest epoch's removed turns.
+    // the CURRENT durable id — O's chain is never reused for redo: O's redo stays
+    // permanently dead) and original_tip_uuid == S' chain tip; assert the marker bucket is
+    // the UNION — the old epoch's removed turns PERSIST in ledger `entries` ahead of the
+    // newest epoch's (decision 6; r3 — only the redo-capable chain state re-roots,
+    // markers never drop); and assert a following redo re-forks from S' (restores EXACTLY
+    // the newest epoch's removed tail — the frozen prior-epoch markers are not restorable).
 }
 
 #[tokio::test]
@@ -2226,9 +2332,12 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
     // conversation — the empty fresh transcript IS the rollback target); the materialized
     // broadcast re-keys the pane to a NEW durable id; the rollback record carries
     // originalSessionId == the discarded id and originalTipUuid == the discarded chain's
-    // tip (a1). A following freshAgent.redo re-forks the ORIGINAL at its first user-anchor
-    // uuid (create with forkSession:true, resumeSessionId == original, resumeSessionAt ==
-    // u1) and adopts the re-keyed id again.
+    // tip (a1). A following freshAgent.redo re-forks the ORIGINAL at the LAST raw-chain
+    // uuid of the restored u1/a1 step's group — its assistant tail (r3 boundary fix —
+    // resumeSessionAt keeps through-AND-including the named uuid): create with
+    // forkSession:true, resumeSessionId == original, resumeSessionAt == a1 (NOT u1 — that
+    // would restore only the bare prompt and make undo/redo non-invertible), and adopts
+    // the re-keyed id again.
 }
 ```
 
@@ -2383,8 +2492,10 @@ pub async fn handle_rollback(&self, op: RollbackRequest, reply_sink: FrameSink) 
             // kept end = the uuid ENDING the addressed group (last uuid before the next user uuid).
             // Empty live chain (r2 first-turn case): the current transcript has no raw-chain
             // lines, its tip is None, and the LCP resolves vacuously; redo_resume_target then
-            // answers the ORIGINAL's FIRST user-anchor uuid (re-fork at u1 — the proved
-            // full-retention path).
+            // answers THE LAST UUID OF THE ORIGINAL'S FIRST STEP GROUP — its assistant tail
+            // (r3 boundary fix: re-fork at `a1` for the u1/a1 step — resumeSessionAt keeps
+            // through-AND-including the named uuid — NEVER at the first user-anchor uuid
+            // itself, which would restore only the bare prompt).
             let resume_at = match redo_resume_target(&original_text, &current_text, &op) {
                 Ok(Some(uuid)) => uuid,
                 Ok(None) => { reply_sink(rollback_error_frame(&op, "REDO_UNAVAILABLE", REDO_EMPTY_MESSAGE)); return; }
@@ -2405,7 +2516,37 @@ pub async fn handle_rollback(&self, op: RollbackRequest, reply_sink: FrameSink) 
     // AWAITED write batch (supersedes: old durable id), so there is exactly one
     // rollback-record-specific write and it always precedes the mutation. Pre-write failure
     // REFUSES the rollback — no pending-cancel storm, no sidecar churn, no fork.
-    let mut record = RollbackRecord::empty(now);
+    // r3: `entries` carries the UNION marker bucket on this lane too (no longer empty) —
+    // prior markers always survive; this op's slice is spliced in conversation position:
+    let mut record = existing.clone().unwrap_or_else(|| RollbackRecord::empty(now));
+    match op.direction {
+        RollbackDirection::Undo => {
+            // Epoch rule (r3): an undo landing while redo_destroyed clears the destroyed bit
+            // (the record's redo state now describes the NEW chain — the prior chain's redo
+            // stays permanently dead) and NEVER clears entries. Conversation-position splice:
+            // a NEW epoch (redo_destroyed was set, or the chain root re-roots away from the
+            // prior record's original) FROZES every prior entry (they stay first, unchanged);
+            // otherwise the prior entries are the CURRENT epoch's and the new slice is
+            // inserted ahead of them (later undos move the boundary backward).
+            let new_epoch: bool = record.redo_destroyed
+                || (existing.as_ref().map(|r| r.original_session_id.is_some()).unwrap_or(false)
+                    && existing.as_ref().and_then(|r| r.original_session_id.clone()).as_deref() != Some(chain_root.as_str()));
+            if record.redo_destroyed { record.redo_destroyed = false; /* prior chain's redo stays dead */ }
+            let prior: Vec<RollbackEntry> = record.entries.drain(..).collect();
+            let (frozen, current): (Vec<RollbackEntry>, Vec<RollbackEntry>) =
+                if new_epoch { (prior, vec![]) } else { (vec![], prior) };
+            record.entries = frozen.into_iter()
+                .chain(std::iter::once(RollbackEntry { removed_turns: removed_turns.clone(), prompt_text: prompt_text.clone(), at_ms: now }))
+                .chain(current).collect();
+        }
+        RollbackDirection::Redo => {
+            // The restored turns leave the CURRENT-epoch marker portion (they are live
+            // again); frozen prior-epoch markers can never match a restorable id (the redo
+            // contract's LCP/tip validation can only restore from the current chain root).
+            let restored_id_set: std::collections::HashSet<&str> = removed_turns.iter().filter_map(|t| t.get("turnId").or_else(|| t.get("id")).and_then(Value::as_str)).collect();
+            record.entries.retain_mut(|e| { e.removed_turns.retain(|t| !t.get("turnId").or_else(|| t.get("id")).and_then(Value::as_str).map(|id| restored_id_set.contains(id)).unwrap_or(false)); !e.removed_turns.is_empty() });
+        }
+    }
     record.original_session_id = Some(chain_root.clone());
     record.original_tip_uuid = original_tip_uuid.clone();
     record.last_op_at_ms = now;
@@ -2433,8 +2574,10 @@ pub async fn handle_rollback(&self, op: RollbackRequest, reply_sink: FrameSink) 
     //     empty fresh transcript IS the rollback target. The discarded session is already
     //     recorded as original_session_id/original_tip_uuid; canRedo = the original tip
     //     strictly beyond the live tip (none ⇒ the recorded tip qualifies); a later redo
-    //     re-forks the ORIGINAL at its first user-anchor uuid (the proved full-retention
-    //     fork-at-point path) and adopts.
+    //     re-forks the ORIGINAL at THE LAST RAW-CHAIN UUID OF THE RESTORED FIRST STEP'S
+    //     GROUP — its assistant tail (r3: `a1` for the u1/a1 step, never the first
+    //     user-anchor uuid itself) — the proved full-retention fork-at-point path —
+    //     and adopts.
     // where guard uuid (Some leg only) = the ORIGINAL chain tip uuid (the same value stored
     // as original_tip_uuid): any resume that would have to drop at-or-past the tip is a
     // resolver bug and must loudly refuse rather than silently mis-fork. A create whose
@@ -2466,7 +2609,7 @@ pub async fn handle_rollback(&self, op: RollbackRequest, reply_sink: FrameSink) 
 }
 ```
 
-`redo_resume_target` + `restored_slice_turns` are pure uuid-math helpers unit-tested in `claude_snapshot.rs` (write the tests for them alongside the ones above: Step from a 2-uuid prefix against the 4-uuid original → `a2`; toTurn("u2") → `a2`; toTurn on unknown uuid → Err; prefix == original → Ok(None); EMPTY current transcript — the r2 first-turn case — → the ORIGINAL's first user-anchor uuid `u1`).
+`redo_resume_target` + `restored_slice_turns` are pure uuid-math helpers unit-tested in `claude_snapshot.rs` (write the tests for them alongside the ones above — r3 boundary rule: every resume point is THE LAST UUID OF THE TARGET STEP'S RAW-CHAIN GROUP, its assistant tail: Step from a 2-uuid prefix against the 4-uuid original → `a2`; toTurn("u2") → `a2`; toTurn on unknown uuid → Err; prefix == original → Ok(None); EMPTY current transcript — the r2 first-turn case — → `a1` — the uuid ending the ORIGINAL's first step group (u1/a1), NOT the first user-anchor uuid `u1`).
 
 4. `handle_send` (claude.rs:743): after resolve and BEFORE the sidecar write — with `turn_lock` held and `in_turn` SET under it first (item 1; the check-then-set window vs `handle_rollback` is closed; `handle_send` NEVER acquires/consults `rollback_in_flight` — while a rollback holds the turn lock the send waits on the lock, then proceeds) — `destroy_redo_on_submit(&self.identity_sink, "claude", &durable_id, now)` (warn-only on failure; opencode leg shows the pattern).
 
@@ -2520,7 +2663,7 @@ git commit -m "feat(fresh-claude): undo/redo via resume+resumeSessionAt+forkSess
 ### Task 5: Snapshot surfacing — capability stamps, rolledBackTurns marker bucket, revision floor
 
 **Stage-2 binding amendments (from "## Load-bearing corrections", items 1 & 4):**
-- Codex capability stamp is session-scoped by history mode: `{undo:true, redo:false}` ⟺ `CodexSession.history_mode == Some(Paginated)` (every thread freshell starts after Task 2); `{undo:false, redo:false}` for legacy threads AND for `None` (resumed/adopted — mode unknown ⇒ legacy stamps; capability never over-advertised). The mode lives on the freshell-side session record, written at start/resume time — never probed live per snapshot (the app-server exposes no mode read-back; the record is the source of truth).
+- Codex capability stamp is session-scoped by history mode: `{undo:true, redo:false}` ⟺ `CodexSession.history_mode == Some(Paginated)`; `{undo:false, redo:false}` for legacy threads AND for `None` — where `None` now means ONLY "the durable read found no parseable mode" (r3: resumed/adopted threads get their mode from the rollout's persisted `session_meta.history_mode` — validator-C proved persistence; freshell-codex already reads rollouts for durability — so a paginated thread keeps undo after normal rehydration; capability still never over-advertised). Never probed live per snapshot (the app-server exposes no mode read-back; the durable rollout meta is the source of truth, cached on the session record).
 - Claude/kilroy: `{undo:true, redo:true}` statically (no SDK capability query exists); old-CLI runtime failure classifies to `UNSUPPORTED_CAPABILITY` refusal at op time (never `INTERNAL_ERROR`).
 - Spawn-time version recording for all three providers (codex/OPENCODE/CLAUDE `--version` captured once per spawn into the structured log line and stashed on the session record for refusal classification).
 
@@ -2544,7 +2687,8 @@ In all three files the tests call the builder through the file's OWN existing sn
 ```rust
 // codex.rs — build the snapshot via the file's existing `build_codex_snapshot_json`
 // fixture call (revision basis 7), passing `Some(&record)` where `record` is a
-// RollbackRecord with one entry { removed_turns: [turn-9 display json], prompt_text: "later", at_ms: 100 }.
+// RollbackRecord with one entry { removed_turns: [turn-9 USER-role display json] (r3: undoneDepth is the
+// user-role step count of the bucket — the fixture's one user turn yields 1), prompt_text: "later", at_ms: 100 }.
 // The fixture session's stored history mode is "paginated" (the stamp is session-scoped):
     assert_eq!(snap["capabilities"]["undo"], json!(true));
     assert_eq!(snap["capabilities"]["redo"], json!(false));
@@ -2566,25 +2710,35 @@ In all three files the tests call the builder through the file's OWN existing sn
     assert_eq!(snap["capabilities"]["redo"], json!(true));
     assert_eq!(snap["rollback"], json!({"canRedo": true, "undoneDepth": 1}));
     assert_eq!(snap["rolledBackTurns"][0]["rolledBack"], json!(true));
+// ...a TWO-STEP-UNDO variant (r3, finding 5): a single rebuilt entry carrying the
+// [msg_u2, msg_a2, msg_u3, msg_a3] tail asserts undoneDepth == 2 — the USER-role step
+// count of the bucket (and the same count the client label shows), never entries.len() (1);
 // ...and with `record.destroy_redo(..)` (clears the stored bit): rollback.canRedo == false
-// while the bucket still has length 1 (decision 6).
+// while the bucket still has length 1 (decision 6; undoneDepth still counts the user steps).
 
 // claude_snapshot.rs — tmp CLAUDE_HOME: original.jsonl = u1 a1 u2 a2 (uuid-chained),
 // current.jsonl = u1 a1; record.original_session_id = Some(<original id>),
-// record.original_tip_uuid = Some("a2"), set_can_redo(true):
+// record.original_tip_uuid = Some("a2"), set_can_redo(true), AND record.entries carrying
+// the undo-op-recorded [u2, a2] turn json (r3: the bucket is the ledger union, durable even
+// if the original's JSONL is later compacted/GC'd):
     assert_eq!(snap["capabilities"]["undo"], json!(true));
     assert_eq!(snap["capabilities"]["redo"], json!(true));
     let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
     let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
-    assert_eq!(ids, vec!["u2", "a2"], "the original's turns beyond the LCP tip are the marker bucket");
+    assert_eq!(ids, vec!["u2", "a2"], "the marker bucket is the ledger entries union");
     assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
-    assert_eq!(snap["rollback"], json!({"canRedo": true, "undoneDepth": 1}));
+    assert_eq!(snap["rollback"], json!({"canRedo": true, "undoneDepth": 1})); // user-role count of the bucket
 // ...a variant whose original.jsonl is EXTENDED past the recorded tip (tip moved)
-// asserts rollback.canRedo == false (the snapshot re-reads the original's tip and
-// requires equality — no device shows a redo that Task 4 would refuse);
-// ...an r2 first-turn variant: current.jsonl EMPTY (the fresh-conversation leg) with the
-// same record asserts the bucket == ALL of the original's turns [u1,a1,u2,a2] and
-// rollback.canRedo == true (live tip none ⇒ the original tip counts as strictly beyond);
+// asserts rollback.canRedo == false (the snapshot re-reads the CHAIN ROOT's tip and
+// requires equality — current-epoch redo state comes from the chain root; no device
+// shows a redo that Task 4 would refuse);
+// ...an r2 first-turn variant (the fresh-conversation leg): entries carry ALL of [u1,a1,u2,a2]
+// (recorded when the first-turn undo ran) and the same original record asserts the bucket
+// == all four and rollback.canRedo == true (live tip none ⇒ the original tip counts as
+// strictly beyond);
+// ...a UNION variant (r3): entries = old-epoch [o1,o2-turns] ++ current-epoch [u2,a2]
+// asserts the bucket shows BOTH epochs in order (markers persist marked — the original
+// transcript is NOT needed to keep them);
 // ...re-run with `record.destroy_redo(..)`: same bucket, canRedo false; one
 // assertion leg re-runs the whole fixture with session_type "kilroy" (identical stamps).
 ```
@@ -2597,11 +2751,11 @@ Expected: FAIL because the builders emit no undo/redo capability keys, no `rolle
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Codex (`build_codex_snapshot_json`, codex.rs:3620): add `rollback: Option<&RollbackRecord>` param; capabilities map gains `"undo": <session.history_mode == Some(HistoryMode::Paginated)>, "redo": false` — the mode comes from `CodexSession.history_mode` (written at start/resume time in Task 2: `Some(Paginated)` only where we SET the mode, `None` on resumed/adopted), NEVER live-probed per snapshot (no read-back exists; the session record is the SoT), so legacy AND unknown sessions stamp `undo:false` (no hard-coded `"undo": true` line exists); when `Some(record)` and `!record.entries.is_empty()`: `"rolledBackTurns": <flattened entries with "rolledBack": true injected per turn>`, `"rollback": {"canRedo": record.can_redo(), "undoneDepth": record.entries.len()}`; final `revision = max(basis, record.last_op_at_ms)`. `get_snapshot` loads the record (`self.identity_sink.as_ref().and_then(|s| s.load_rollback("codex", thread_id))`) and passes it.
+Codex (`build_codex_snapshot_json`, codex.rs:3620): add `rollback: Option<&RollbackRecord>` param; capabilities map gains `"undo": <session.history_mode == Some(HistoryMode::Paginated)>, "redo": false` — the mode comes from `CodexSession.history_mode` (Task 2 fills it at `thread/start` AND rehydrates it at resume/adoption from the rollout's persisted `session_meta.history_mode` — r3; `None` only when that durable meta is missing/unparseable ⇒ legacy), NEVER live-probed per snapshot (no read-back exists; the durable rollout meta cached on the session record is the SoT), so legacy AND unknown sessions stamp `undo:false` (no hard-coded `"undo": true` line exists); when `Some(record)` and `!record.entries.is_empty()`: `"rolledBackTurns": <flattened entries (the r3 union) with "rolledBack": true injected per turn>`, `"rollback": {"canRedo": record.can_redo(), "undoneDepth": <r3: count of USER-role turns in the flattened bucket — the same user-step count the client's `Rolled back (N)` label shows, NEVER entries.len()>}`; final `revision = max(basis, record.last_op_at_ms)`. `get_snapshot` loads the record (`self.identity_sink.as_ref().and_then(|s| s.load_rollback("codex", thread_id))`) and passes it.
 
-Opencode (`build_opencode_snapshot_json`, lib.rs:1439): params + capabilities `"undo": true, "redo": true`; bucket from `record.entries` (already the exact current tail); `"rollback": {"canRedo": record.can_redo(), "undoneDepth": <flattened count as step count = entries.len()>}`; revision floor. `get_opencode_snapshot` loads + passes.
+Opencode (`build_opencode_snapshot_json`, lib.rs:1439): params + capabilities `"undo": true, "redo": true`; bucket from `record.entries` (the r3 union — frozen prior-epoch markers ++ the current serve-revert tail); `"rollback": {"canRedo": record.can_redo(), "undoneDepth": <r3: count of USER-role turns in the marker bucket — with a rebuilt single-entry tail over [u2,a2,u3,a3] this is 2 (two undone user steps), NOT entries.len() (1) — the same user-step count the `Rolled back (N)` label shows>}`; revision floor. `get_opencode_snapshot` loads + passes.
 
-Claude (`claude_snapshot.rs`): `build_claude_snapshot_json` gains the capability stamps (`"undo": true, "redo": true` — static; approvals/questions stay presence-driven). The bucket needs the ORIGINAL transcript, so it is computed in `get_claude_snapshot` (+ its route caller): when `record.original_session_id` is `Some(original)` and `locate_transcript(original)` hits, parse both transcripts' raw chains, compute the LCP, and append everything beyond it as bucket turns (fresh projections via `parse_transcript_turns` on the original, sliced, each stamped `rolledBack: true`); `canRedo = record.can_redo() && raw_chain_tip(original) == record.original_tip_uuid` (the original's tip is RE-READ at snapshot time — a moved tip forces `canRedo:false` so no device shows a redo that Task 4 would refuse with `REDO_REMOVED_HISTORY_COPY`); `undoneDepth` = number of USER turns in the bucket; revision = `max(mtime_or_count, record.last_op_at_ms)`. `snapshot.rs` route arms load the record per provider (`codex`/`opencode` states load inside their get_snapshot methods as above; the claude route loads in its arm and passes to `get_claude_snapshot`'s new param — pick the single-seam-per-provider split and apply it consistently in all three arms).
+Claude (`claude_snapshot.rs`): `build_claude_snapshot_json` gains the capability stamps (`"undo": true, "redo": true` — static; approvals/questions stay presence-driven). The bucket is LEDGER-SOURCED (r3 — no longer computed purely from a read-time LCP): when a record is present, its `entries` union is projected with `rolledBack: true` (durable even if an old original's JSONL is later compacted/GC'd); `canRedo = record.can_redo() && raw_chain_tip(original) == record.original_tip_uuid` — the CURRENT-epoch redo state still comes from the chain root: when `record.original_session_id` is `Some(original)` and `locate_transcript(original)` hits, the original's tip is RE-READ at snapshot time and a moved tip forces `canRedo:false` so no device shows a redo that Task 4 would refuse with `REDO_REMOVED_HISTORY_COPY`; `undoneDepth` = number of USER-role turns in the bucket (r3 — the same user-step count as the label); revision = `max(mtime_or_count, record.last_op_at_ms)`. `snapshot.rs` route arms load the record per provider (`codex`/`opencode` states load inside their get_snapshot methods as above; the claude route loads in its arm and passes to `get_claude_snapshot`'s new param — pick the single-seam-per-provider split and apply it consistently in all three arms).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -2634,7 +2788,7 @@ git commit -m "feat(fresh-agent): surface rollback capabilities, marker bucket, 
 
 **Files:**
 - Create: `src/lib/fresh-agent-rollback.ts` (pinned copy constants + `gateRollbackCommand` pure gate + `buildRollbackFrame` + ack/error type guards)
-- Modify: `src/components/fresh-agent/FreshAgentComposer.tsx` (`FreshAgentComposerHandle` gains `replaceText`; :53-57 handle type, :205-216 implementation)
+- Modify: `src/components/fresh-agent/FreshAgentComposer.tsx` (`FreshAgentComposerHandle` gains `replaceText`; :53-57 handle type, :205-216 implementation; AND the submit path's RESERVED-slash intercept at `sendText`/`executeSlashText` :337-346/:390-409 per r3 correction 8 — the pre-catalog-resolution seam, with the new `onReservedRollbackCommand` prop)
 - Modify: `src/components/fresh-agent/FreshAgentTurnActions.tsx` (`TurnActionCallbacks` gains rollback slots; `buildTurnActionItems` gains "Undo to here"/"Redo to here"; hover toolbar gains the `Undo2` icon button beside the fork button)
 - Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (thread new callbacks through `TurnActionProps`; render the rolled-back section)
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx:78-89` (`SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS` gains the four rollback event types), `:1096-1124` (`runSlashCommand` undo/redo branches), ws-subscribe effect (:1650-1717: ack/error interception + refill), icons wiring in the `content` memo (:2492-2512), pane-action registration effect
@@ -2772,6 +2926,20 @@ it('replaceText overwrites the box (decision 4: replace, never append) and focus
   expect(document.activeElement).toBe(textarea)
   expect(window.sessionStorage.getItem('t-rb')).toBe('removed prompt')
 })
+
+// r3 correction 8: the composer's submit path intercepts RESERVED rollback names BEFORE
+// catalog resolution, so a capability-filtered-out command never falls through to onSend.
+it('typed /redo unresolvable against the catalog calls onReservedRollbackCommand and NEVER onSend', () => {
+  // Render the composer with a catalog that lacks /redo (the freshcodex shape) and an
+  // onReservedRollbackCommand spy; type '/redo' + Enter via the textbox:
+  //   expect(onReservedRollbackCommand).toHaveBeenCalledWith('redo')
+  //   expect(onSend).not.toHaveBeenCalled()
+  //   the box is cleared and the text is pushed to history exactly like a resolved command.
+})
+it('typed /redo resolvable against the catalog still dispatches the normal command path', () => {
+  // Catalog WITH /redo (freshopencode shape): onCommand receives the redo command,
+  // onReservedRollbackCommand is NOT consulted.
+})
 ```
 
 `test/unit/client/components/fresh-agent/FreshAgentTurnActions.test.tsx` — append:
@@ -2815,14 +2983,44 @@ describe('rollback affordance (kata 1wxv decisions 3, 8)', () => {
 })
 ```
 
+`test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` — append (written in Step 1 with the other suites; the section does not exist pre-implementation, so these fail red):
+
+```ts
+describe('rolled-back section (kata 1wxv decision 6)', () => {
+  it('renders nothing when rolledBackTurns is empty', () => {
+    // render a transcript with turns + rolledBackTurns: [] -> no 'Rolled back turns' region
+    expect(screen.queryByRole('region', { name: 'Rolled back turns' })).toBeNull()
+  })
+  it('renders the marker rows with the USER-STEP count label (r3 correction 5)', () => {
+    // rolledBackTurns = [user u2, assistant a2, user u3, assistant a3] (two undone steps)
+    // -> the label reads 'Rolled back (2)' — the same user-step count rollback.undoneDepth
+    // carries — never the raw row count (4).
+  })
+  it('per-row Redo to here fires onRedoToTurn only on user rows when canRedo', () => {
+    // canRedo=true: user rows expose role=button name 'Redo to here' calling onRedoToTurn(turnId);
+    // assistant rows never expose the button; canRedo=false exposes none.
+  })
+})
+```
+
 `test/unit/client/store/turnCompletionAttention.test.ts` — append:
 
 ```ts
-it('revokeFreshAgentAttention clears pane + tab attention for the session owner only', () => {
-  // Build the store rig exactly this file's dismissTabGreen tests use: a tab whose pane
-  // resolves sessionKey 'opencode:ses_1'; mark attention on BOTH the owning pane/tab and
-  // an unrelated tab; run revoke; assert the owner is cleared and the stranger survives.
-  expect(getState().turnCompletion.attentionByTab[ownerTabId]).toBeUndefined()
+it('revokeFreshAgentAttention is PANE-SCOPED and re-derives tab attention (r3 correction 7)', () => {
+  // Build the store rig exactly this file's dismissTabGreen tests use, with TWO panes in
+  // the SAME tab (a split): the rollback owner pane resolves sessionKey 'opencode:ses_1';
+  // the sibling pane is unrelated (another fresh-agent session or terminal with its own
+  // completion). Mark attention on BOTH panes (tab attention derived set) AND on an
+  // unrelated tab; run revoke; assert:
+  //   - the OWNER pane's attention entry is cleared;
+  //   - the SIBLING pane's attention entry SURVIVES (rollback revokes only the undone
+  //     turn's attention, never unrelated completions in the same tab);
+  //   - TAB-level green is the OR over remaining panes: attentionByTab[tabId] is STILL SET
+  //     (derived from the surviving sibling — never blanket-dismissed);
+  //   - the unrelated tab is untouched.
+  // Second variant (single-pane tab): owner cleared AND attentionByTab[tabId] cleared.
+  expect(getState().turnCompletion.attentionByTab[ownerTabId]).toBeDefined()
+  expect(getState().turnCompletion.attentionByPane[siblingPaneId]).toBeDefined()
   expect(getState().turnCompletion.attentionByPane[ownerPaneId]).toBeUndefined()
   expect(getState().turnCompletion.attentionByTab[strangerTabId]).toBeDefined()
 })
@@ -2847,23 +3045,40 @@ describe('rollback folds (kata 1wxv)', () => {
   })
 })
 
-// test/unit/client/components/fresh-agent/FreshAgentView.test.tsx — append (patterns from the file's own capability tests):
-// - '/undo sends freshAgent.undo when idle+capable; writes nothing and shows the busy UNDO notice mid-turn'
-// - '/redo mid-turn shows the busy REDO notice (direction-correct copy) and writes nothing'
-// - 'the freshcodex catalog MENU has no /redo entry (Task 1 capability filtering — menu absence), AND a
-//    TYPED /redo on a codex pane is intercepted by the reserved-name path: the pinned
-//    REDO_CODEX_UNSUPPORTED_NOTICE shows and onSend/sendFreshAgentMessage NEVER fires (the text never
-//    reaches the model). A typed /undo on a legacy/absent-caps pane likewise intercepts with
-//    rollbackUnsupportedNotice and no send.'
-// - 'a rollback-flagged error event renders the server's pinned message VERBATIM on the notice banner
-//    (a REDO_UNAVAILABLE carrying the claude moved-tip copy shows THAT text — never the destroyed notice)'
+`test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` — append (patterns from the file's own capability tests; written in Step 1 with the other suites so Step 2's failures are reachable pre-implementation):
+
+```ts
+describe('/undo + /redo dispatch (kata 1wxv)', () => {
+  it('/undo sends freshAgent.undo when idle+capable; writes nothing and shows the busy UNDO notice mid-turn', () => {
+    // select the catalog /undo (or type it on a capable pane): the ws-send spy receives the
+    // frozen frame; with isBusy true, NO frame is sent and the notice shows
+    // ROLLBACK_BUSY_UNDO_NOTICE verbatim.
+  })
+  it('/redo mid-turn shows the busy REDO notice (direction-correct copy) and writes nothing', () => {
+    // ROLLBACK_BUSY_REDO_NOTICE verbatim; the ws-send spy stays silent.
+  })
+  it('typed /redo on a freshcodex pane hits the composer RESERVED seam: pinned codex notice, NEVER a send (r3 correction 8)', () => {
+    // A freshcodex pane's catalog MENU has no /redo entry (Task 1 capability filtering —
+    // menu absence, pinned separately). TYPE '/redo' + Enter into the composer textbox:
+    // the pre-catalog-resolution seam intercepts it — the notice banner shows
+    // REDO_CODEX_UNSUPPORTED_NOTICE verbatim, and onSend/sendFreshAgentMessage NEVER fire
+    // (the text never reaches the model). A typed /undo on a legacy/absent-caps pane
+    // likewise intercepts with rollbackUnsupportedNotice(<providerLabel>) and no send.
+  })
+  it('a rollback-flagged error renders the server message VERBATIM on the notice banner', () => {
+    // feed freshAgent.event{freshAgent.error{code:'REDO_UNAVAILABLE', rollback:true, requestId}}
+    // carrying the claude moved-tip copy: the banner shows THAT text — never the destroyed
+    // notice or client-side guess copy.
+  })
+})
+```
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/lib/fresh-agent-rollback.test.ts test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/components/fresh-agent/FreshAgentTurnActions.test.tsx test/unit/client/store/turnCompletionAttention.test.ts test/unit/client/lib/fresh-agent-ws.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/lib/fresh-agent-rollback.test.ts test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/components/fresh-agent/FreshAgentTurnActions.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/store/turnCompletionAttention.test.ts test/unit/client/lib/fresh-agent-ws.test.ts`
 
-Expected: FAIL because `src/lib/fresh-agent-rollback.ts`, `replaceText`, the rollback action items/icon, `revokeFreshAgentAttention`, and the new folds don't exist (import/type errors), and the view has no undo/redo dispatch.
+Expected: FAIL because `src/lib/fresh-agent-rollback.ts`, `replaceText`, the rollback action items/icon, the rolled-back transcript section, `revokeFreshAgentAttention`, and the new folds don't exist (import/type errors), the view has no undo/redo dispatch, and the composer has no reserved-slash seam (the `FreshAgentTranscript.test.tsx` section tests and the `FreshAgentView.test.tsx` dispatch/reserved-seam tests fail HERE, pre-implementation — r3: they are never first run only after production code exists).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -2939,8 +3154,10 @@ export type TurnActionCallbacks = {
   <section aria-label="Rolled back turns" className="mx-2 mt-2 rounded-md border border-dashed border-border/60 bg-muted/30 p-2 opacity-80">
     <p className="px-1 pb-1 text-xs font-medium text-muted-foreground">
       Rolled back ({rolledBackTurns.filter((t) => t.role === 'user').length}) — gone from the conversation; kept in history.
-      {/* r2: the count is rollback STEPS (user-role marker groups), not raw marker rows —
-          one undone turn-step contributes a user row AND an assistant row. */}
+      {/* r2/r3: the count is rollback STEPS (user-role marker groups), not raw marker rows —
+          one undone turn-step contributes a user row AND an assistant row. This is exactly
+          the user-step count the server's rollback.undoneDepth computes (r3 correction 5):
+          same bucket, same rule, never entries.len(). */}
     </p>
     {rolledBackTurns.map((turn, index) => (
       <div key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`} className="flex items-start justify-between gap-2 rounded px-1 py-1">
@@ -3008,6 +3225,10 @@ and in the `freshAgent.error` case (:343-353):
 /**
  * kata 1wxv decision 10: rollback revokes the rolled-back turn's attention/green on
  * this device. sessionKey is the `provider:sessionId` turn-completion namespace.
+ * PANE-SCOPED (r3 correction 7): clears ONLY the owning pane's attention entry, then
+ * re-derives the TAB flag as the OR over the tab's REMAINING panes — a sibling pane's
+ * attention (an unrelated completion in the same tab) SURVIVES the rollback; the tab is
+ * blanket-cleared only when no remaining pane still holds attention.
  */
 export function revokeFreshAgentAttention(sessionKey: string) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
@@ -3016,10 +3237,15 @@ export function revokeFreshAgentAttention(sessionKey: string) {
     const { tabId, paneId } = hit
     const tc = getState().turnCompletion
     if (tc?.attentionByPane?.[paneId]) dispatch(clearPaneAttention({ paneId }))
-    if (tc?.attentionByTab?.[tabId]) dispatch(clearTabAttention({ tabId }))
+    const layout = getState().panes?.layouts?.[tabId]
+    const anyRemaining = layout
+      ? collectPaneEntries(layout).some((entry) => entry.paneId !== paneId && getState().turnCompletion.attentionByPane?.[entry.paneId])
+      : false
+    if (!anyRemaining && tc?.attentionByTab?.[tabId]) dispatch(clearTabAttention({ tabId }))
   }
 }
 ```
+(`collectPaneEntries` is the same layout walker `dismissTabGreen` uses — import it alongside the existing imports in this file.)
 
 `src/lib/pane-action-registry.ts` — append a fresh-agent section mirroring the terminal registry's Map+register/unregister-return shape:
 
@@ -3073,22 +3299,14 @@ const faActions = parsed.paneId ? getFreshAgentPaneActions(parsed.paneId) : unde
     }))
   }, [sendFreshAgentMessage])
 
-// runSlashCommand (:1096-1124): /undo and /redo are RESERVED NAMES for EVERY fresh-agent
-// provider (r2) — intercept them BEFORE the catalog lookup and BEFORE any
-// fallback-to-text/onSend path, whether or not the capability-filtered catalog resolved
-// the command. A TYPED '/redo' on a capability-false pane (freshcodex — whose catalog MENU
-// entry is hidden per Task 1/decision 5 — or any legacy/absent-caps provider) never
-// reaches the model as text: the intercept answers with the pinned notice
-// (REDO_CODEX_UNSUPPORTED_NOTICE for codex /redo; rollbackUnsupportedNotice(providerLabel)
-// otherwise) and nothing is sent. The server-side codex×redo refusal remains the wire
-// backstop; gateRollbackCommand's codex branch stays as defense for non-catalog callers.
-    const rollbackReserved = /^\/(undo|redo)\b/.exec(commandInput.trim())?.[1] as 'undo' | 'redo' | undefined
-    if (rollbackReserved && command.action !== rollbackReserved) {
-      setNotice(rollbackReserved === 'redo' && current.provider === 'codex'
-        ? REDO_CODEX_UNSUPPORTED_NOTICE
-        : rollbackUnsupportedNotice(descriptor.label))
-      return
-    }
+// runSlashCommand (:1096-1124) handles the CATALOG-RESOLVED undo/redo commands (the menu
+// pick and the typed name that resolves against the capability-filtered catalog both end
+// here). /undo and /redo are RESERVED NAMES for EVERY fresh-agent provider (r2), and the
+// RESERVED-NAME seam is the COMPOSER's submit path, NOT runSlashCommand (r3 correction 8 —
+// runSlashCommand only ever sees catalog-resolved commands, so a `/redo` the codex catalog
+// deliberately omits would never reach it and would fall through to onSend as model text;
+// the earlier in-runSlashCommand intercept referencing `commandInput` is void — it had no
+// such variable in scope and lived at the wrong seam):
     if (command.action === 'undo' || command.action === 'redo') {
       const direction = command.action
       if (!current.sessionId) return
@@ -3111,6 +3329,41 @@ const faActions = parsed.paneId ? getFreshAgentPaneActions(parsed.paneId) : unde
       return
     }
 // (introduce snapshotRef = useRef(snapshot) kept current alongside; isBusy computed above in the component.)
+
+// The RESERVED-NAME seam (r3 correction 8) — FreshAgentComposer sendText (:390-409), BEFORE
+// catalog resolution. `shared/fresh-agent-slash-commands.ts` exports
+// `RESERVED_ROLLBACK_SLASH_NAMES = ['undo', 'redo'] as const` (Task 1 adds it beside the
+// catalog). The composer's existing local parseSlashCommand (:97) parses the typed text;
+// when the parsed name is reserved but the capability-filtered catalog does NOT resolve it
+// (freshcodex /redo; any capability-false pane), the composer calls the new prop
+// `onReservedRollbackCommand(direction: 'undo' | 'redo')` and returns HANDLED — the text is
+// pushed to history and cleared exactly like a resolved command, and onSend is NEVER
+// reached (a TYPED '/redo' on a capability-false pane never reaches the model as text):
+//
+//   const sendText = useCallback(() => {
+//     const trimmed = text.trim()
+//     ... (shell/attachment gates unchanged) ...
+//     if (trimmed.startsWith('/')) {
+//       if (executeSlashText(trimmed)) return
+//       const parsed = parseSlashCommand(trimmed)
+//       if (parsed && (RESERVED_ROLLBACK_SLASH_NAMES as readonly string[]).includes(parsed.name) && !disabled) {
+//         onReservedRollbackCommand?.(parsed.name as 'undo' | 'redo')
+//         pushHistory(trimmed)
+//         setText('')
+//         closeMenu()
+//         return
+//       }
+//     }
+//     onSend?.(trimmed, readyAttachments.map((entry) => entry.path as string))
+//     ...
+//
+// The VIEW passes onReservedRollbackCommand so the notice copy stays view-owned:
+//   onReservedRollbackCommand={(direction) => setNotice(
+//     direction === 'redo' && current.provider === 'codex'
+//       ? REDO_CODEX_UNSUPPORTED_NOTICE
+//       : rollbackUnsupportedNotice(descriptor.label))}
+// The server-side codex×redo refusal remains the wire backstop; gateRollbackCommand's codex
+// branch stays as defense for the catalog-resolved and non-composer callers.
 
 // ws-subscribe effect (:1650-1717) — after the forked leg, add:
       if (message.type === 'freshAgent.event') {
