@@ -1296,21 +1296,33 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
         }
     }
     if let Err(err) = client.revert_thread(&thread_id, &before_turn_id).await {
-        // Compensating write FIRST (the ledger must not describe a rollback the provider rejected):
-        if let Some(sink) = self.identity_sink.clone() {
-            let restore = previous.unwrap_or_else(|| RollbackRecord::empty(now));
-            if let Err(e) = sink.record_rollback("codex", &thread_id, restore).await {
-                tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_compensate_failed");
+        // Compensate ONLY on explicit RPC-rejection legs (errorkind Rpc: the provider
+        // ANSWERED with a JSON-RPC error, so the revert provably did not apply);
+        // transport/unknown legs (Timeout/Closed/Transport — the provider may have
+        // applied) KEEP the post-op ledger + answer INTERNAL_ERROR (review M3).
+        if matches!(&err, CodexAppServerError::Rpc { .. }) {
+            // Compensating write FIRST (the ledger must not describe a rollback the provider rejected):
+            if let Some(sink) = self.identity_sink.clone() {
+                let restore = previous.unwrap_or_else(|| RollbackRecord::empty(now));
+                if let Err(e) = sink.record_rollback("codex", &thread_id, restore).await {
+                    tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_compensate_failed");
+                }
             }
-        }
-        let msg = err.to_string();
-        if msg.contains("-32600") && msg.contains("only supports paginated threads") {
-            reply_sink(rollback_error_frame(&op, "UNSUPPORTED_CAPABILITY", CODEX_LEGACY_THREAD_COPY));
-        } else if msg.contains("-32601") || msg.to_ascii_lowercase().contains("method not found") {
-            // unknown-method / missing `thread/revert` shape => the CLI predates the surface
-            reply_sink(rollback_error_frame(&op, "UNSUPPORTED_CAPABILITY", CODEX_OLD_CLI_COPY));
+            let msg = err.to_string();
+            if msg.contains("-32600") && msg.contains("only supports paginated threads") {
+                reply_sink(rollback_error_frame(&op, "UNSUPPORTED_CAPABILITY", CODEX_LEGACY_THREAD_COPY));
+            } else if msg.contains("-32601") || msg.to_ascii_lowercase().contains("method not found") {
+                // unknown-method / missing `thread/revert` shape => the CLI predates the surface
+                reply_sink(rollback_error_frame(&op, "UNSUPPORTED_CAPABILITY", CODEX_OLD_CLI_COPY));
+            } else {
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &msg));
+            }
         } else {
-            reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &msg));
+            // Possibly-applied mutation: the ledger is KEPT (never compensated) and the
+            // refusal answers INTERNAL_ERROR + CODEX_UNCERTAIN_ROLLBACK_COPY ("Undo state
+            // could not be confirmed — conversation and undo history may disagree until
+            // the next refresh.").
+            reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", CODEX_UNCERTAIN_ROLLBACK_COPY));
         }
         return;
     }
