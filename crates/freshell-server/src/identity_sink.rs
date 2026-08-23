@@ -67,6 +67,40 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
+                // kata 1wxv Task 4 (r1 discipline): on the CLAUDE fork-adoption
+                // leg (`supersedes` = the pre-rollback durable id) the rollback
+                // row re-keys old→new inside the SAME awaited batch as the
+                // binding write — so the record follows the pane atomically and
+                // the handler's pre-fork write stays the ONLY
+                // rollback-record-specific write. Scoped to provider "claude":
+                // codex's crash-respawn supersession must NOT move a marker
+                // bucket onto a memory-less mint-new thread.
+                if upsert.provider == "claude" {
+                    if let Some(old_id) = upsert.supersedes.as_deref() {
+                        if old_id != upsert.session_id {
+                            if let Some(payload) =
+                                ledger.load_rollback_row(&upsert.provider, old_id)
+                            {
+                                ledger.record_rollback_row(
+                                    &upsert.provider,
+                                    &upsert.session_id,
+                                    &payload,
+                                    now,
+                                )?;
+                                // Cosmetic on failure (a stale old-row is
+                                // unreachable through the new id) — warn, do not
+                                // fail the identity event (the delete_pending
+                                // precedent below).
+                                if let Err(e) =
+                                    ledger.delete_rollback_row(&upsert.provider, old_id)
+                                {
+                                    tracing::warn!(error = %e, session = %old_id, "pane_ledger.claude_adoption.rollback_old_row_delete_failed");
+                                }
+                            }
+                            // Missing old row: silent no-op.
+                        }
+                    }
+                }
                 if let Some(p) = upsert.resolves_pending.as_deref() {
                     // Cosmetic on failure: an orphaned marker is TTL-swept at 30d
                     // (V6/A15) — warn, do not fail the identity event over it.
@@ -220,6 +254,78 @@ mod tests {
         assert!(
             ledger2.load_rollback_row("codex", "thr-1").is_some(),
             "boot scan indexes rollback rows"
+        );
+    }
+
+    /// kata 1wxv Task 4 (r1 discipline): the claude fork-adoption's binding write
+    /// (`supersedes` = pre-rollback id) re-keys the rollback row old→new inside the
+    /// SAME awaited batch — the record follows the pane atomically and the old id
+    /// holds nothing. Scoped to provider "claude": a CODEX supersession (the
+    /// crash-respawn mint-new path) leaves the old thread's rollback row untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_supersession_binding_rekeys_the_rollback_row_codex_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let mut record = freshell_freshagent::RollbackRecord::empty(100);
+        record.original_session_id = Some("orig".into());
+        record.original_tip_uuid = Some("a2".into());
+        record.set_can_redo(true, 101);
+        sink.record_rollback("claude", "old-uuid", record.clone())
+            .await
+            .expect("seed write");
+        sink.record_rollback("codex", "old-thread", record.clone())
+            .await
+            .expect("seed write (codex)");
+
+        let settings = FreshAgentSettings {
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            cwd: Some("/w".into()),
+        };
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "fork-new-uuid".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: Some("old-uuid".into()),
+            settings: settings.clone(),
+        })
+        .await
+        .expect("claude adoption binding write");
+        assert_eq!(
+            sink.load_rollback("claude", "fork-new-uuid"),
+            Some(record.clone()),
+            "the record followed the pane (same awaited batch)"
+        );
+        assert!(
+            sink.load_rollback("claude", "old-uuid").is_none(),
+            "the re-key MOVED the row — the superseded id describes rollback state no longer"
+        );
+
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "new-thread".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: Some("old-thread".into()),
+            settings,
+        })
+        .await
+        .expect("codex crash-respawn binding write");
+        assert!(
+            sink.load_rollback("codex", "new-thread").is_none(),
+            "codex supersession NEVER moves markers onto a memory-less mint-new thread"
+        );
+        assert!(
+            sink.load_rollback("codex", "old-thread").is_some(),
+            "the codex old-thread row stays put"
         );
     }
 

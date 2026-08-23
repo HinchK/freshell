@@ -7,7 +7,15 @@
 // JSON to this process:
 //
 //   Rust → sidecar (stdin, one JSON per line):
-//     { type:'create',             requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
+//     { type:'create',             requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId?,
+//                                    resumeSessionAt?, forkSession?, resumeDropsTurn? }
+//                                  — kata 1wxv Task 4 fork-at-point keys ride the SDK query() options
+//                                    verbatim (resumeSessionAt keeps through-AND-including the named
+//                                    uuid over the raw parentUuid chain; forkSession mints a NEW
+//                                    durable session id and never rewrites the original's JSONL;
+//                                    resumeDropsTurn arms the fork-time discard-guard). Covered by
+//                                    crates/freshell-ws/tests/freshagent_claude_rollback.rs + the
+//                                    rust-chromium e2e rollback spec.
 //     { type:'send',               sessionId, text }
 //     { type:'interrupt',          sessionId }
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
@@ -238,6 +246,12 @@ function handleCreate(req) {
       options: {
         cwd: req.cwd || undefined,
         resume: req.resumeSessionId,
+        // kata 1wxv Task 4 (fork-at-point emulation): the ONLY sanctioned lane is
+        // the query() options triple — NEVER the standalone forkSession() fn (it
+        // remaps every uuid).
+        resumeSessionAt: req.resumeSessionAt || undefined,
+        forkSession: req.forkSession === true || undefined,
+        resumeDropsTurn: req.resumeDropsTurn || undefined,
         model: req.model,
         permissionMode: req.permissionMode,
         effort: req.effort,

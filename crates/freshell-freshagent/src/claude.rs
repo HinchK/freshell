@@ -58,7 +58,8 @@ use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
     FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond,
-    FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
+    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
+    SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
@@ -113,6 +114,11 @@ pub struct FreshClaudeState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// Rollback-vs-rollback single-flight (kata 1wxv Task 4), keyed by the
+    /// CURRENT durable id. [`Self::handle_rollback`] acquires it BEFORE the
+    /// session's `turn_lock` (lock order: rollback_in_flight FIRST, then the
+    /// turn lock — never the reverse); `handle_send` NEVER consults it.
+    rollback_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -182,6 +188,22 @@ struct PendingQuestionEntry {
     questions: Value,
 }
 
+/// kata 1wxv Task 4: the rollback-fork adoption wiring handed to the stdout
+/// consumer. The handler PREREAD the respawned sidecar's `sdk.session.init`
+/// line (the `--resume-drops-turn` refusal watch lives in that pre-read, before
+/// any durable state moves); the consumer runs the adoption for it EXACTLY like
+/// an in-stream init (cli_index insert + AWAITED binding carrying
+/// `supersedes` = the pre-rollback durable id + the rollback-row re-key old→new
+/// inside the SAME awaited batch), then resolves `adopted_tx` so the parked
+/// rollback handler proceeds with the new durable id.
+struct RollbackAdoption {
+    /// The pre-rollback durable id this create supersedes.
+    supersedes: String,
+    /// The preread `sdk.session.init` line (consumed by the handler's pre-read).
+    preseeded_init: Value,
+    adopted_tx: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
@@ -211,6 +233,23 @@ struct ClaudeSession {
     broadcast_id: Arc<std::sync::Mutex<String>>,
     /// The folded pending approval/question set (Task 2) — see [`ClaudePending`].
     pending: Arc<std::sync::Mutex<ClaudePending>>,
+    /// kata 1wxv Task 4: the busy truth for the rollback `BUSY_TURN` gate — set by
+    /// `handle_send` UNDER `turn_lock` BEFORE the sidecar write (the check-then-set
+    /// window against `handle_rollback`'s busy check is closed); cleared on EXACTLY
+    /// the four contract edges (`sdk.result` ANY subtype, `sdk.status` idle, sidecar
+    /// EOF/death, a completed `handle_interrupt`) — fail-closed otherwise (a missing
+    /// arm wedges BUSY_TURN refusals forever). Carried across the rollback's
+    /// kill+respawn into the replacing record (the fork continues the same logical
+    /// session lifetime).
+    in_turn: Arc<std::sync::atomic::AtomicBool>,
+    /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
+    /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
+    /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
+    /// `handle_send` waits on it, then proceeds and destroys redo — and NEVER
+    /// acquires/consults `rollback_in_flight` (no circular wait exists). Carried
+    /// across the rollback's kill+respawn so a send that resolved its handle
+    /// before/after the record swap serializes identically.
+    turn_lock: Arc<TokioMutex<()>>,
 }
 
 impl FreshClaudeState {
@@ -225,6 +264,7 @@ impl FreshClaudeState {
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
+            rollback_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -501,6 +541,7 @@ impl FreshClaudeState {
         // binding row at `sdk.session.init`.
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -509,6 +550,8 @@ impl FreshClaudeState {
             Some(settings),
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
+            Arc::clone(&in_turn),
+            None,
         );
 
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
@@ -533,6 +576,8 @@ impl FreshClaudeState {
                 cli_session_id: resume_sid.clone(),
                 broadcast_id,
                 pending,
+                in_turn,
+                turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
 
@@ -730,6 +775,14 @@ impl FreshClaudeState {
         if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
             drop(guard);
             self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
+        } else {
+            // kata 1wxv Task 4 busy-truth clear edge (d): a COMPLETED interrupt
+            // clears `in_turn` — interrupts yield NO `result` frame at all, so no
+            // in-stream edge can cover this. A FAILED write does NOT clear (the
+            // turn may still be running — fail-closed).
+            session
+                .in_turn
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         // Success: no broadcast (mirrors legacy's silent fire-and-forget interrupt).
     }
@@ -751,6 +804,55 @@ impl FreshClaudeState {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        // kata 1wxv Task 4 (r2 serialization discipline): read the handles, then
+        // hold the session turn lock across the busy-set AND the sidecar write —
+        // the check-then-set window vs `handle_rollback`'s busy gate is closed (a
+        // rollback holding this lock observes either no-send or a fully-marked
+        // in-flight turn). `handle_send` NEVER acquires/consults
+        // `rollback_in_flight`: while a rollback holds this lock the send waits,
+        // then proceeds and destroys redo («send waits, rollback wins, then
+        // destroys»).
+        let (turn_lock, in_turn, destroy_target) = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&map_key) {
+                Some(s) => (
+                    s.turn_lock.clone(),
+                    s.in_turn.clone(),
+                    // decision 5's destroy keys the rollback record by its DURABLE
+                    // id: the canonical wire id first, else the recorded cli id; a
+                    // bare pre-init placeholder can have no rollback record at all.
+                    if is_canonical_claude_uuid(&session_id) {
+                        Some(session_id.clone())
+                    } else {
+                        s.cli_session_id.clone()
+                    },
+                ),
+                None => {
+                    drop(guard);
+                    self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                    return;
+                }
+            }
+        };
+        let _turn = turn_lock.lock().await;
+        if let Some(durable) = destroy_target.as_deref() {
+            // Decision 5: any new submission permanently destroys redo (the
+            // redo-capable chain state only — the marker union is never touched).
+            // AWAITED before the turn goes out; a ledger failure is warn-only
+            // (never blocks the send).
+            if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+                &self.identity_sink(),
+                PROVIDER,
+                durable,
+                crate::rollback_record::now_ms(),
+            )
+            .await
+            {
+                tracing::warn!(error = %err, session = %durable, "freshagent.claude.destroy_redo_on_submit_failed");
+            }
+        }
+        // Set the busy truth UNDER the lock, BEFORE the sidecar write.
+        in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
@@ -763,6 +865,9 @@ impl FreshClaudeState {
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
+            // The write never went out — no turn is running (clear what we set,
+            // else the busy truth wedges).
+            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
             self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
             return;
         }
@@ -1007,6 +1112,830 @@ impl FreshClaudeState {
             return false;
         };
         self.sessions.lock().await.contains_key(&key)
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 4; fork-at-point) ────
+
+    /// Decision 6: pending cards inside undone turns are CANCELLED, never silently
+    /// resolved. Emits the exact `freshAgent.permission.cancelled` /
+    /// `freshAgent.question.cancelled` frames the fold consumes, one per parked
+    /// entry, then clears the pending map. Invoked BEFORE the old sidecar is
+    /// torn down.
+    async fn emit_pending_cancellations(
+        &self,
+        map_key: &str,
+        session_id: &str,
+        session_type: &str,
+    ) {
+        let pending = {
+            let guard = self.sessions.lock().await;
+            guard.get(map_key).map(|s| Arc::clone(&s.pending))
+        };
+        let Some(pending) = pending else { return };
+        let (permissions, questions) = {
+            let mut p = pending.lock().expect("pending lock");
+            (
+                std::mem::take(&mut p.permissions),
+                std::mem::take(&mut p.questions),
+            )
+        };
+        for entry in permissions {
+            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event: json!({
+                    "type": "freshAgent.permission.cancelled",
+                    "sessionId": session_id,
+                    "requestId": entry.request_id,
+                }),
+                provider: PROVIDER.to_string(),
+                session_id: session_id.to_string(),
+                session_type: session_type.to_string(),
+            }));
+        }
+        for entry in questions {
+            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event: json!({
+                    "type": "freshAgent.question.cancelled",
+                    "sessionId": session_id,
+                    "requestId": entry.request_id,
+                }),
+                provider: PROVIDER.to_string(),
+                session_id: session_id.to_string(),
+                session_type: session_type.to_string(),
+            }));
+        }
+    }
+
+    /// Task-4 compensation: a fork/create failure AFTER the rollback record's
+    /// successful pre-write REWRITES the pre-op record before the refusal is
+    /// answered — fork-at-point provably never mutates the ORIGINAL's history
+    /// (the Stage-2 hash-identical invariant), so the ledger must not describe a
+    /// rollback that never took effect. The provider-mutation triad (codex's
+    /// Rpc-vs-transport split) has no claude analog: EVERY claude failure leg is
+    /// provably-unmoved by construction.
+    async fn compensate_rollback_record(
+        &self,
+        durable_id: &str,
+        existing: Option<crate::rollback_record::RollbackRecord>,
+        now: i64,
+    ) {
+        use crate::rollback_record::RollbackRecord;
+        if let Some(sink) = self.identity_sink() {
+            let restore = existing.unwrap_or_else(|| RollbackRecord::empty(now));
+            if let Err(e) = sink.record_rollback(PROVIDER, durable_id, restore).await {
+                tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_compensate_failed");
+            }
+        }
+    }
+
+    /// The pane re-key ride (kata 1wxv Task 4): the existing
+    /// `freshAgent.session.materialized` broadcast shape (codex's mint-new respawn
+    /// precedent), old client-facing id → new adopted durable id.
+    fn broadcast_materialized(&self, old_id: &str, new_id: &str, session_type: &str) {
+        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
+            FreshAgentSessionMaterialized {
+                previous_session_id: old_id.to_string(),
+                provider: PROVIDER.to_string(),
+                session_id: new_id.to_string(),
+                session_type: session_type.to_string(),
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: PROVIDER.to_string(),
+                    session_id: new_id.to_string(),
+                }),
+            },
+        ));
+    }
+
+    /// Handle a `freshAgent.undo` / `freshAgent.redo` for claude/kilroy (kata 1wxv
+    /// Task 4) — conversation rollback emulated by FORK-AT-POINT through the
+    /// sidecar: pre-write the durable record, cancel parked cards, kill the old
+    /// sidecar, and recreate it with the SDK `query()` options lane (`{resume,
+    /// resumeSessionAt, forkSession: true, resumeDropsTurn: <guard>}` — the
+    /// standalone `forkSession()` fn is FORBIDDEN, it remaps every uuid), then
+    /// adopt the minted durable id through the existing sdk.session.init machinery
+    /// (cli_index insert + AWAITED binding WITH supersedes + rollback-row re-key
+    /// old→new inside the same awaited batch).
+    ///
+    /// Redo re-forks at a LATER point from the retained ORIGINAL session (the
+    /// chain root), gated by the tip+LCP validity contract: the original's raw
+    /// chain tip must still equal the recorded `original_tip_uuid` AND the current
+    /// chain must still be a strict prefix of it — else `REDO_UNAVAILABLE` +
+    /// `REDO_REMOVED_HISTORY_COPY` (compaction/snips legitimately move things).
+    ///
+    /// First-turn rollback is LEGAL (r2): `resume_at_uuid: None` means "before the
+    /// first message" — the handler creates a FRESH conversation (NO resume keys;
+    /// the empty fresh transcript IS the rollback target) and records the
+    /// discarded session as the redo source.
+    ///
+    /// Ordering (durable-BEFORE-mutation + r2 lock discipline): toTurn validation
+    /// → rollback_in_flight single-flight (FIRST) → per-session turn lock (held
+    /// across the WHOLE handler) → busy gate (`in_turn` ⇒ BUSY_TURN, the SOLE
+    /// mid-turn protection — no sidecar traffic at all on a refused attempt) →
+    /// create-resume lease claim on the OLD durable id (so a concurrent attach
+    /// cannot bind the pre-rollback id mid-fork) → transcript reads + resume math
+    /// → AWAITED record pre-write (a pre-write failure REFUSES with
+    /// `LEDGER_WRITE_REFUSAL_COPY`, provider never touched) → pending-cancel
+    /// frames → kill+recreate (one `resumeDropsTurn` guard retry: the refusal
+    /// prefix maps to the plain-resume recovery, never surfaced raw) → adoption
+    /// → `materialized` OLD→NEW broadcast + envelope-stamp flip → rolledBack
+    /// broadcast → requesting-sink ack. A fork/create/adoption failure AFTER the
+    /// successful pre-write COMPENSATES the record (rewrites the pre-op record)
+    /// before the refusal is answered — the ledger never describes a rollback
+    /// the provider provably rejected. A rollback NEVER chimes.
+    pub async fn handle_rollback(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: freshell_terminal::FrameSink,
+    ) {
+        use crate::claude_snapshot as snap;
+        use crate::rollback_record::*;
+
+        let Some(map_key) = self.resolve_session_key(&op.session_id).await else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_SESSION_ID",
+                "claude session not found",
+            ));
+            return;
+        };
+        // `turnId` absent on a toTurn frame is a SERVER-side validation error
+        // (never a zod refinement — the frozen contract keeps bare objects).
+        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_ROLLBACK_TARGET",
+                "rollback toTurn requires a turnId",
+            ));
+            return;
+        }
+        let (durable_id, in_turn, turn_lock, session_type) = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&map_key) {
+                Some(s) => (
+                    s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
+                    s.in_turn.clone(),
+                    s.turn_lock.clone(),
+                    session_type_str(op.session_type),
+                ),
+                None => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INVALID_SESSION_ID",
+                        "claude session not found",
+                    ));
+                    return;
+                }
+            }
+        };
+        // Rollback-vs-rollback single-flight (lock order: FIRST, before the turn
+        // lock — never the reverse). handle_send NEVER touches this registry.
+        let Some(_guard) = self.rollback_in_flight.try_acquire(&durable_id) else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                &format!("rollback already in progress for {durable_id}"),
+            ));
+            return;
+        };
+        // Held for the REST of this handler. in_turn is set by handle_send UNDER
+        // this same lock BEFORE the sidecar write (the check-then-set window is
+        // closed): observed false here means no send is in flight.
+        let _turn = turn_lock.lock().await;
+        if in_turn.load(std::sync::atomic::Ordering::SeqCst) {
+            reply_sink(rollback_error_frame(
+                &op,
+                "BUSY_TURN",
+                ROLLBACK_BUSY_MESSAGE,
+            ));
+            return;
+        }
+
+        // Lease discipline: claim the OLD durable id exactly like the
+        // create-resume path so a concurrent attach cannot bind the pre-rollback
+        // id mid-fork. A REFUSAL LEG — before any record write or teardown.
+        let rollback_lease_id = format!("rollback-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                &durable_id,
+                &rollback_lease_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        &durable_id,
+                        &rollback_lease_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
+                    if live_session_key == map_key {
+                        // We ARE the bound live owner of this exact id — proceed
+                        // WITHOUT a lease (the binding already names this map key,
+                        // which the fork keeps).
+                        break;
+                    }
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    ));
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    ));
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, &durable_id);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %durable_id,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    ));
+                    return;
+                }
+            }
+        }
+
+        let now = now_ms();
+        let existing = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, &durable_id));
+
+        let (
+            resume_from,
+            resume_at_uuid,
+            removed_turns,
+            prompt_text,
+            chain_root,
+            original_tip_uuid,
+            can_redo_after,
+            guard_uuid,
+        ) = match op.direction {
+            RollbackDirection::Undo => {
+                let Some(path) = snap::locate_transcript(&durable_id) else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "NOTHING_TO_UNDO",
+                        UNDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                };
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                        return;
+                    }
+                };
+                let target = match op.mode {
+                    RollbackModeReq::Step => snap::ResumeTarget::Step,
+                    RollbackModeReq::ToTurn => {
+                        snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
+                    }
+                };
+                let point = match snap::resolve_resume_point(&text, &durable_id, target) {
+                    Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
+                    Err(snap::ResumeResolveError::Empty) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "NOTHING_TO_UNDO",
+                            UNDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    }
+                    Err(_) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "INVALID_ROLLBACK_TARGET",
+                            &format!("turn {:?} is not in this conversation", op.turn_id),
+                        ));
+                        return;
+                    }
+                };
+                // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
+                // re-roots the chain to the CURRENT durable id — the retained old
+                // original describes a branch a resend already permanently
+                // replaced; O's redo stays permanently dead.
+                let chain_root = existing
+                    .as_ref()
+                    .filter(|r| !r.redo_destroyed)
+                    .and_then(|r| r.original_session_id.clone())
+                    .unwrap_or_else(|| durable_id.clone());
+                // Tip anchor at UNDO time = the last raw-chain uuid of the
+                // CHAIN-ROOT transcript (at the first undo the current file IS the root).
+                let root_text = if chain_root == durable_id {
+                    text.clone()
+                } else {
+                    match snap::locate_transcript(&chain_root)
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                    {
+                        Some(t) => t,
+                        None => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "INTERNAL_ERROR",
+                                "chain-root transcript unreadable",
+                            ));
+                            return;
+                        }
+                    }
+                };
+                let tip = snap::raw_chain_tip(&root_text);
+                // The resumeDropsTurn guard uuid = the removed step's anchor —
+                // the first removed display turn's uuid (brief/SDK semantics:
+                // the guard declares the discarded turn's prompt).
+                let guard = point
+                    .removed_turns
+                    .first()
+                    .and_then(|t| t.get("turnId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // can_redo after the undo: the removed content provably exists in
+                // the original beyond the resume point (on the r2 first-turn leg
+                // the fresh conversation's tip is NONE — strictly beyond holds
+                // whenever a tip exists).
+                (
+                    durable_id.clone(),
+                    point.resume_at_uuid,
+                    point.removed_turns,
+                    point.prompt_text,
+                    chain_root,
+                    tip,
+                    true,
+                    guard,
+                )
+            }
+            RollbackDirection::Redo => {
+                let Some(record) = existing.clone() else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                };
+                if record.redo_destroyed {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_DESTROYED_MESSAGE,
+                    ));
+                    return;
+                }
+                let Some(original) = record.original_session_id.clone() else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                };
+                let Some(original_path) = snap::locate_transcript(&original) else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_REMOVED_HISTORY_COPY,
+                    ));
+                    return;
+                };
+                let original_text = match std::fs::read_to_string(&original_path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                        return;
+                    }
+                };
+                let Some(current_path) = snap::locate_transcript(&durable_id) else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INTERNAL_ERROR",
+                        "current transcript missing",
+                    ));
+                    return;
+                };
+                let current_text = std::fs::read_to_string(&current_path).unwrap_or_default();
+                // Redo validity contract (wire design; LBC-9): the original must
+                // BE the history the undo observed — raw-chain tip == the
+                // recorded tip — AND the current chain must still be a strict
+                // prefix of it (the LCP resolves PAST the current tip). Any
+                // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
+                // never silently re-fork over moved history.
+                let original_tip = snap::raw_chain_tip(&original_text);
+                if original_tip != record.original_tip_uuid {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_REMOVED_HISTORY_COPY,
+                    ));
+                    return;
+                }
+                if snap::raw_lcp_end(&current_text, &original_text)
+                    != snap::raw_chain_tip(&current_text)
+                {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "REDO_UNAVAILABLE",
+                        REDO_REMOVED_HISTORY_COPY,
+                    ));
+                    return;
+                }
+                // The resume point = the LAST raw-chain uuid of the restored
+                // step's group — its assistant tail (r3 boundary rule).
+                let resume_at = match snap::redo_resume_target(&original_text, &current_text, &op) {
+                    Ok(Some(uuid)) => uuid,
+                    Ok(None) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    }
+                    Err(msg) => {
+                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &msg));
+                        return;
+                    }
+                };
+                // The ack payload for a redo = the RESTORED slice (display
+                // projection of the original's range just-after-the-prefix
+                // through the resume point).
+                let restored =
+                    snap::restored_slice_turns(&original_text, &current_text, &resume_at);
+                let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
+                // The guard = the first ORIGINAL chain entry strictly AFTER the
+                // resume point (`None` — redoing TO the tip — omits it: the
+                // discard range is vacuous, never fabricated).
+                let guard = snap::raw_chain_successor(&original_text, &resume_at);
+                (
+                    original,
+                    Some(resume_at),
+                    restored.turns,
+                    restored.prompt_text,
+                    record.original_session_id.clone().expect("checked above"),
+                    record.original_tip_uuid.clone(),
+                    can_redo_after_redo,
+                    guard,
+                )
+            }
+        };
+
+        // Durable record FIRST (durable-BEFORE-mutation): computed from the
+        // pre-mutation reads, keyed by the CURRENT durable id, AWAITED before
+        // anything is torn down. The sdk.session.init adoption leg re-keys the
+        // row old→new inside its awaited binding batch — exactly one
+        // rollback-record-specific write, always pre-mutation. r3 UNION rule:
+        // `entries` accumulates; a NEW epoch freezes every prior entry (they stay
+        // first) and NEVER clears the bucket.
+        let mut record = existing
+            .clone()
+            .unwrap_or_else(|| RollbackRecord::empty(now));
+        match op.direction {
+            RollbackDirection::Undo => {
+                // Epoch rule (r3): an undo landing while redo_destroyed was set
+                // (or whose chain root re-roots away from the prior record's) is
+                // a NEW epoch — the destroyed bit clears so the record's redo
+                // fields describe the NEW chain (the prior chain's redo stays
+                // permanently dead), `entries` is NEVER cleared.
+                let new_epoch = record.redo_destroyed
+                    || (existing
+                        .as_ref()
+                        .is_some_and(|r| r.original_session_id.is_some())
+                        && existing
+                            .as_ref()
+                            .and_then(|r| r.original_session_id.clone())
+                            .as_deref()
+                            != Some(chain_root.as_str()));
+                if record.redo_destroyed {
+                    record.redo_destroyed = false;
+                }
+                let prior: Vec<RollbackEntry> = std::mem::take(&mut record.entries);
+                let (frozen, current): (Vec<RollbackEntry>, Vec<RollbackEntry>) = if new_epoch {
+                    (prior, Vec::new())
+                } else {
+                    (Vec::new(), prior)
+                };
+                record.entries = frozen
+                    .into_iter()
+                    .chain(std::iter::once(RollbackEntry {
+                        removed_turns: removed_turns.clone(),
+                        prompt_text: prompt_text.clone(),
+                        at_ms: now,
+                    }))
+                    .chain(current)
+                    .collect();
+            }
+            RollbackDirection::Redo => {
+                // The restored turns leave the CURRENT-epoch marker portion (they
+                // are live again); frozen prior-epoch markers can never match a
+                // restorable id (the redo contract's LCP/tip validation can only
+                // restore from the current chain root).
+                let restored_id_set: std::collections::HashSet<&str> = removed_turns
+                    .iter()
+                    .filter_map(|t| {
+                        t.get("turnId")
+                            .or_else(|| t.get("id"))
+                            .and_then(Value::as_str)
+                    })
+                    .collect();
+                record.entries.retain_mut(|e| {
+                    e.removed_turns.retain(|t| {
+                        !t.get("turnId")
+                            .or_else(|| t.get("id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| restored_id_set.contains(id))
+                    });
+                    !e.removed_turns.is_empty()
+                });
+            }
+        }
+        record.original_session_id = Some(chain_root.clone());
+        record.original_tip_uuid = original_tip_uuid.clone();
+        record.last_op_at_ms = now;
+        record.set_can_redo(can_redo_after, now);
+        if let Some(sink) = self.identity_sink() {
+            if let Err(e) = sink
+                .record_rollback(PROVIDER, &durable_id, record.clone())
+                .await
+            {
+                tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_pre_write_failed");
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    LEDGER_WRITE_REFUSAL_COPY,
+                ));
+                return;
+            }
+        }
+
+        // Cancel pending cards BEFORE teardown (decision 6) — both spawn legs.
+        self.emit_pending_cancellations(&map_key, &op.session_id, session_type)
+            .await;
+
+        // Pre-compute the create-drive inputs: recovered settings + the resume
+        // value/cwd (ledger A15 slug scoping; the transcript-PATH escape hatch
+        // when the original cwd is gone). The fork READS: undo ⇒ the CURRENT
+        // session's file; redo ⇒ the chain-root ORIGINAL's file (`resume_from`).
+        let recovered = self
+            .identity_sink()
+            .and_then(|s| s.load_settings(PROVIDER, &durable_id));
+        let source_path = snap::locate_transcript(&resume_from);
+        let original_cwd = source_path
+            .as_deref()
+            .and_then(snap::transcript_cwd)
+            .filter(|c| std::path::Path::new(c).is_dir());
+        // resume value (the fork leg): the durable id under its ORIGINAL cwd's
+        // slug scope when that cwd survives; else the transcript PATH (the
+        // verified cli.js escape hatch bypassing slug scoping).
+        let resume_value = match &original_cwd {
+            Some(_) => resume_from.clone(),
+            None => source_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| resume_from.clone()),
+        };
+        let spawn_cwd = original_cwd
+            .clone()
+            .or_else(|| op.cwd.clone())
+            .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
+        // Tear down the old sidecar (handle_kill discipline): remove the record
+        // FIRST so its consumer's exit arm stays silent (evicted=false), then the
+        // graceful shutdown → SIGTERM → kill backstop → ownership sweep, and the
+        // create-dedup eviction so a replayed requestId genuinely re-spawns.
+        let old = self.sessions.lock().await.remove(&map_key);
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == map_key)
+            .await;
+        if let Some(session) = old {
+            session.consumer.abort();
+            let mut stdin = session.stdin;
+            let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
+            let _ = stdin.flush().await;
+            if let Some(pid) = session.child.id() {
+                terminate_pid(pid as i32);
+            }
+            let mut child = session.child;
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&session.ownership_id);
+        }
+
+        // Kill + recreate via `spawn_sidecar` with the computed options. The
+        // create payload is selected by `resume_at_uuid`:
+        //   * Some(uuid) — fork-at-point (resume + resumeSessionAt + forkSession);
+        //   * None (r2 first-turn rollback) — a FRESH conversation with NO resume
+        //     keys at all (the empty fresh transcript IS the rollback target).
+        // ONE guard retry: a create whose early output carries the
+        // `Resume rejected by --resume-drops-turn:` prefix is retried ONCE with
+        // resumeDropsTurn omitted (the plain-resume recovery per the SDK docs —
+        // the raw guard text is never surfaced).
+        let mut guard_retried = guard_uuid.is_none(); // no guard => nothing to retry
+        let spawned = loop {
+            let mut create_req = Map::new();
+            create_req.insert("type".to_string(), json!("create"));
+            create_req.insert(
+                "requestId".to_string(),
+                json!(format!("rollback-{}", uuid::Uuid::new_v4())),
+            );
+            if let Some(cwd) = &spawn_cwd {
+                create_req.insert("cwd".to_string(), json!(cwd));
+            }
+            if let Some(rec) = &recovered {
+                if let Some(model) = &rec.model {
+                    create_req.insert("model".to_string(), json!(model));
+                }
+                if let Some(permission_mode) = &rec.permission_mode {
+                    create_req.insert("permissionMode".to_string(), json!(permission_mode));
+                }
+                if let Some(effort) = &rec.effort {
+                    create_req.insert("effort".to_string(), json!(effort));
+                }
+            }
+            if let Some(resume_at) = &resume_at_uuid {
+                create_req.insert("resumeSessionId".to_string(), json!(resume_value));
+                create_req.insert("resumeSessionAt".to_string(), json!(resume_at));
+                create_req.insert("forkSession".to_string(), json!(true));
+                if let Some(guard) = &guard_uuid {
+                    // attempt 1 arms the guard; the retried recovery omits it.
+                    if !guard_retried {
+                        create_req.insert("resumeDropsTurn".to_string(), json!(guard));
+                    }
+                }
+            }
+            let create_req = Value::Object(create_req);
+            match self
+                .rollback_spawn_create(&create_req, lease_guard.as_mut())
+                .await
+            {
+                Ok(ok) => break Ok(ok),
+                Err(RollbackSpawnError::GuardRefusal) if !guard_retried => {
+                    tracing::warn!(session = %durable_id,
+                        "freshagent.claude.rollback_guard_refused_retrying_plain");
+                    guard_retried = true;
+                    continue;
+                }
+                Err(RollbackSpawnError::GuardRefusal) => {
+                    break Err("the --resume-drops-turn guard refusal persisted after the plain-resume recovery retry".to_string())
+                }
+                Err(RollbackSpawnError::Other(message)) => break Err(message),
+            }
+        };
+        let spawned = match spawned {
+            Ok(ok) => ok,
+            Err(err) => {
+                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                    .await;
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
+                return;
+            }
+        };
+        let RollbackSpawned {
+            child,
+            stdin,
+            reader,
+            ownership_id,
+            sidecar_session_id,
+            preseeded_init,
+            cli_id,
+        } = spawned;
+
+        // Register the replacement session under the SAME map key, INHERITING
+        // the turn lock + busy truth handles (a mid-rollback send serializes on
+        // the SAME lock regardless of when it resolved its handle).
+        let (adopted_tx, adopted_rx) = tokio::sync::oneshot::channel();
+        let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let consumer = self.spawn_consumer(
+            reader,
+            map_key.clone(),
+            session_type.to_string(),
+            sidecar_session_id.clone(),
+            recovered.clone(),
+            Arc::clone(&broadcast_id),
+            Arc::clone(&pending),
+            in_turn.clone(),
+            Some(RollbackAdoption {
+                supersedes: durable_id.clone(),
+                preseeded_init,
+                adopted_tx,
+            }),
+        );
+        self.sessions.lock().await.insert(
+            map_key.clone(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+                sidecar_session_id,
+                cli_session_id: Some(cli_id.clone()),
+                broadcast_id: Arc::clone(&broadcast_id),
+                pending,
+                in_turn: in_turn.clone(),
+                turn_lock: turn_lock.clone(),
+            },
+        );
+
+        // Adoption rides the EXISTING sdk.session.init consumer (preseeded):
+        // cli_index insert + AWAITED binding WITH supersedes + rollback-row
+        // re-key old→new inside the same awaited batch — then resolves this
+        // channel with the adopted durable id.
+        let adopted_id = match tokio::time::timeout(SIDECAR_CREATE_BUDGET, adopted_rx).await {
+            Ok(Ok(Some(id))) if !id.is_empty() => id,
+            _ => {
+                tracing::error!(target: "invariant", session = %durable_id,
+                    "freshagent.claude.rollback_adoption_failed: the consumer never resolved the init adoption");
+                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                    .await;
+                // Tear the fork down — an unadopted fork must never answer sends.
+                self.teardown_rollback_fork(&map_key).await;
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    "rollback adoption failed on the forked sidecar",
+                ));
+                return;
+            }
+        };
+
+        // Lease completion: bind the OLD durable id to the live map key and
+        // release the lease in one lock scope. A revoked lease means we must NOT
+        // keep the fork — tear down, compensate, refuse.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&map_key) {
+                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                    .await;
+                self.teardown_rollback_fork(&map_key).await;
+                g.fail(); // own tree torn down — reopen the key
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    "session lease revoked during rollback; torn down",
+                ));
+                return;
+            }
+        }
+
+        // Pane re-key: the existing materialized broadcast (old → new) goes out
+        // BEFORE any frame stamped with the new id; the envelope-stamp flip
+        // follows it so the re-key never outruns the pane.
+        self.broadcast_materialized(&op.session_id, &adopted_id, session_type);
+        *broadcast_id.lock().expect("broadcast id lock") = adopted_id.clone();
+
+        let removed_ids: Vec<String> = removed_turns
+            .iter()
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        // Re-stamp the op for the NEW live id so every outbound frame names the
+        // adopted session.
+        let switch = RollbackRequest {
+            session_id: adopted_id.clone(),
+            ..op
+        };
+        self.broadcast(&rollback_broadcast_frame(
+            &switch,
+            &adopted_id,
+            &removed_ids,
+            record.can_redo(),
+        ));
+        reply_sink(rollback_ack_frame(
+            &switch,
+            &adopted_id,
+            Some(&prompt_text),
+            &removed_ids,
+            record.can_redo(),
+            Some(&adopted_id),
+        ));
     }
 
     /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
@@ -1319,6 +2248,7 @@ impl FreshClaudeState {
         // records nothing (no laundered blank row under the new id, V7/A10).
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -1327,6 +2257,8 @@ impl FreshClaudeState {
             recovered,
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
+            Arc::clone(&in_turn),
+            None,
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
@@ -1339,6 +2271,8 @@ impl FreshClaudeState {
                 cli_session_id: Some(durable.to_string()),
                 broadcast_id,
                 pending,
+                in_turn,
+                turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
         self.cli_index
@@ -1390,6 +2324,62 @@ impl FreshClaudeState {
         }));
     }
 
+    /// The sdk.session.init adoption block (the consumer's in-stream arm AND the
+    /// rollback-fork preseeded lane share it): record the durable Claude UUID in
+    /// cli_index + the session record, then AWAIT-write the identity binding row
+    /// (V8/A11). On the rollback lane the row carries `supersedes: old durable
+    /// id`, and the rollback-row re-key old→new rides the SAME awaited batch
+    /// (server-side sink). A failed write is surfaced user-visibly, never
+    /// warn-and-drop, then the identity event proceeds. No-laundering guard
+    /// (V7/A10): never persist an all-blank snapshot UNLESS a supersession edge
+    /// is being written (a supersession write always goes through — it is the
+    /// only record of the old→new linkage, G3).
+    async fn adopt_session_init(
+        &self,
+        cli_id: &str,
+        session_id: &str,
+        session_type: &str,
+        settings: Option<&crate::identity_sink::FreshAgentSettings>,
+        supersedes: Option<&str>,
+        identity_sink: Option<SharedPaneIdentitySink>,
+    ) {
+        self.cli_index
+            .lock()
+            .await
+            .insert(cli_id.to_string(), session_id.to_string());
+        if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
+            session.cli_session_id = Some(cli_id.to_string());
+        }
+        let recordable = settings
+            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default())
+            .is_some()
+            || supersedes.is_some();
+        if !recordable {
+            return;
+        }
+        let Some(sink) = identity_sink else { return };
+        if let Err(e) = sink
+            .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: cli_id.to_string(),
+                mode: session_type.to_string(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: supersedes.map(str::to_string),
+                settings: settings.cloned().unwrap_or_default(),
+            })
+            .await
+        {
+            tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
+            self.emit_fresh_agent_error(
+                cli_id,
+                session_type,
+                "LEDGER_WRITE_FAILED",
+                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            );
+        }
+    }
+
     // ── stdout consumer (the completion edge normalization) ──────────────────────────
 
     /// Consume the sidecar's stdout event stream (one `sdk.*` JSON per line), normalize
@@ -1410,7 +2400,7 @@ impl FreshClaudeState {
     /// `pending` (Task 2): the shared pending approval/question handle the consumer
     /// folds `sdk.permission.*`/`sdk.question.*` lines into BEFORE the normalize/
     /// broadcast step (so a respond racing the event never sees stale membership).
-    #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
+    #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; three call sites.
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -1420,6 +2410,15 @@ impl FreshClaudeState {
         settings: Option<crate::identity_sink::FreshAgentSettings>,
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
+        // kata 1wxv Task 4: the session's shared busy truth — cleared by the
+        // EXACTLY-four contract edges (`sdk.result` any subtype, `sdk.status`
+        // idle, EOF/death below, completed handle_interrupt at the write site).
+        in_turn: Arc<std::sync::atomic::AtomicBool>,
+        // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
+        // handler PREREAD the sdk.session.init line, so the consumer runs the
+        // adoption for it FIRST (supersedes-aware), then resolves the parked
+        // rollback handler with the adopted durable id.
+        adoption: Option<RollbackAdoption>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
@@ -1427,6 +2426,37 @@ impl FreshClaudeState {
         let identity_sink = self.identity_sink();
         let state = self.clone();
         tokio::spawn(async move {
+            // Rollback-fork preseed (kata 1wxv Task 4): adoption via the EXISTING
+            // sdk.session.init adoption block (cli_index insert + AWAITED binding
+            // WITH supersedes — the rollback-row re-key old→new rides the SAME
+            // awaited batch server-side), then emit the mapped init frame, THEN
+            // resolve the parked rollback handler with the adopted durable id.
+            if let Some(adoption) = adoption {
+                let cli_id = adoption
+                    .preseeded_init
+                    .get("cliSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(cli_id) = cli_id.as_deref() {
+                    state
+                        .adopt_session_init(
+                            cli_id,
+                            &session_id,
+                            &session_type,
+                            settings.as_ref(),
+                            Some(&adoption.supersedes),
+                            identity_sink.clone(),
+                        )
+                        .await;
+                    let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                    if let Some(frame) =
+                        sdk_line_to_frame(&adoption.preseeded_init, &stamp, &session_type)
+                    {
+                        let _ = broadcast_tx.send(frame);
+                    }
+                }
+                let _ = adoption.adopted_tx.send(cli_id);
+            }
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -1435,59 +2465,42 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                // kata 1wxv Task 4 busy-truth clear edges — IN-STREAM arms (a) and
+                // (b): `sdk.result` with ANY subtype ends the turn (r2: the earlier
+                // success-only wording is void), and `sdk.status:idle`. NO other
+                // in-stream edge (sdk.error/compacting/assistant never clear —
+                // fail-closed; a missing arm wedges BUSY_TURN refusals forever).
+                match value.get("type").and_then(Value::as_str) {
+                    Some("sdk.result") => {
+                        in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Some("sdk.status")
+                        if value.get("status").and_then(Value::as_str) == Some("idle") =>
+                    {
+                        in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
                 // Task 2: fold the pending approval/question state BEFORE the
                 // normalize/broadcast step, so a respond racing the event never
                 // observes a stale membership check.
                 fold_pending_frame(&pending, &value);
-                // Restart-parity (plan §2.8 item 2): record the durable Claude UUID.
-                // The index insert is load-bearing; the session-field copy is
-                // best-effort (the map entry may not exist yet during create).
+                // Restart-parity (plan §2.8 item 2): record the durable Claude UUID
+                // through the shared adoption block (cli_index insert is
+                // load-bearing; the session-field copy is best-effort — the map
+                // entry may not exist yet during create).
                 if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
                     if let Some(cli_id) = value.get("cliSessionId").and_then(Value::as_str) {
-                        cli_index
-                            .lock()
-                            .await
-                            .insert(cli_id.to_string(), session_id.clone());
-                        if let Some(session) = sessions.lock().await.get_mut(&session_id) {
-                            session.cli_session_id = Some(cli_id.to_string());
-                        }
-                        // P1.13: binding row keyed by the DURABLE cliSessionId, with
-                        // the FULL create-settings snapshot — AWAITED here (this arm
-                        // runs on the async consumer task) so the row is durable
-                        // BEFORE the init-driven broadcast below proceeds (V8/A11).
-                        // A failed write is surfaced user-visibly, never
-                        // warn-and-drop, then the identity event proceeds.
-                        // No-laundering guard (V7/A10, parity with codex's
-                        // `record_codex_binding`): never persist an all-blank
-                        // snapshot — it would make `was_recorded` true while
-                        // `load_settings` returns None (the server sink's
-                        // blank-snapshot guard), arming a FALSE SETTINGS_RESET
-                        // for a legitimately-default create on a later resume.
-                        let recordable = settings
-                            .as_ref()
-                            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default());
-                        if let (Some(sink), Some(settings)) = (identity_sink.clone(), recordable) {
-                            if let Err(e) = sink
-                                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                                    provider: PROVIDER.into(),
-                                    session_id: cli_id.to_string(),
-                                    mode: session_type.clone(),
-                                    create_request_id: None,
-                                    resolves_pending: None,
-                                    supersedes: None,
-                                    settings: settings.clone(),
-                                })
-                                .await
-                            {
-                                tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
-                                state.emit_fresh_agent_error(
-                                    cli_id,
-                                    &session_type,
-                                    "LEDGER_WRITE_FAILED",
-                                    "Failed to persist this session's resume record - settings may not survive a server restart.",
-                                );
-                            }
-                        }
+                        state
+                            .adopt_session_init(
+                                cli_id,
+                                &session_id,
+                                &session_type,
+                                settings.as_ref(),
+                                None,
+                                identity_sink.clone(),
+                            )
+                            .await;
                     }
                 }
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
@@ -1497,6 +2510,10 @@ impl FreshClaudeState {
                     let _ = broadcast_tx.send(frame);
                 }
             }
+            // kata 1wxv Task 4 busy-truth clear edge (c): sidecar EOF/death clears
+            // the busy truth BEFORE the eviction verdict below (an unrequested
+            // death can never hold a rollback BUSY_TURN hostage).
+            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
             // Consumer exit == this sidecar's stdout closed == sidecar death
             // (ledger A9). Evict the dead session and its cli_index entries,
             // identity-guarded: a newer session re-registered under the same
@@ -1879,6 +2896,165 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
     })
 }
 
+/// The `resumeDropsTurn` refusal prefix (SDK-documented): an
+/// `error_during_execution` result whose message begins with this. NEVER
+/// surfaced raw — the consumer maps it to the plain-resume recovery (one retry
+/// with the guard omitted; the refusal is deterministic, so it is never retried
+/// twice).
+const RESUME_DROPS_TURN_REFUSAL_PREFIX: &str = "Resume rejected by --resume-drops-turn:";
+
+/// Why one rollback-respawn attempt failed.
+enum RollbackSpawnError {
+    /// The create's early output carried the `--resume-drops-turn` refusal
+    /// prefix — retry ONCE with the guard omitted.
+    GuardRefusal,
+    Other(String),
+}
+
+/// The pieces of a successful rollback respawn, ready for registration + the
+/// consumer's preseeded adoption.
+struct RollbackSpawned {
+    child: Child,
+    stdin: ChildStdin,
+    /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
+    reader: tokio::io::Lines<BufReader<ChildStdout>>,
+    ownership_id: String,
+    /// The sidecar-keyed id (`created.sessionId`).
+    sidecar_session_id: String,
+    /// The preread `sdk.session.init` line (the consumer adopts it preseeded).
+    preseeded_init: Value,
+    /// The new durable id (parsed from the preread init).
+    cli_id: String,
+}
+
+impl FreshClaudeState {
+    /// Rollback post-spawn failure teardown (kata 1wxv Task 4): drop the
+    /// freshly-registered fork's map record, kill its sidecar tree, and clear
+    /// this map key's cli_index aliases — used identically by the acceptance-
+    /// failure and lease-revoked legs (an unadopted/uncompleted fork must never
+    /// answer sends).
+    async fn teardown_rollback_fork(&self, map_key: &str) {
+        if let Some(session) = self.sessions.lock().await.remove(map_key) {
+            session.consumer.abort();
+            let mut child = session.child;
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&session.ownership_id);
+        }
+        self.cli_index
+            .lock()
+            .await
+            .retain(|_, mapped| mapped != map_key);
+    }
+
+    /// One rollback-respawn attempt (kata 1wxv Task 4): spawn the sidecar, arm
+    /// the lease kill handle, write the create request, and PREREAD its output
+    /// until the `sdk.session.init` line — the `--resume-drops-turn` refusal
+    /// watch lives in this pre-read, BEFORE any durable state moves (the refusal
+    /// is retried by the caller with the guard omitted; the pre-read ordering is
+    /// how a refused fork can never adopt).
+    async fn rollback_spawn_create(
+        &self,
+        create_req: &Value,
+        lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
+    ) -> Result<RollbackSpawned, RollbackSpawnError> {
+        let (mut child, mut stdin, stdout, ownership_id) =
+            spawn_sidecar().await.map_err(RollbackSpawnError::Other)?;
+        if let Some(g) = lease_guard {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
+        if let Err(err) = write_line(&mut stdin, create_req).await {
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&ownership_id);
+            return Err(RollbackSpawnError::Other(err));
+        }
+        let mut reader = BufReader::new(stdout).lines();
+        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
+            Ok(id) => id,
+            Err(err) => {
+                let _ = child.start_kill();
+                reap_owned_claude_sidecars(&ownership_id);
+                return Err(RollbackSpawnError::Other(err));
+            }
+        };
+        match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
+            Ok(init) => {
+                let cli_id = init
+                    .get("cliSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                Ok(RollbackSpawned {
+                    child,
+                    stdin,
+                    reader,
+                    ownership_id,
+                    sidecar_session_id,
+                    preseeded_init: init,
+                    cli_id,
+                })
+            }
+            Err(err) => {
+                let _ = child.start_kill();
+                reap_owned_claude_sidecars(&ownership_id);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Read the respawned sidecar's output until `sdk.session.init`, mapping each
+/// line to its outcome: the init line (returned verbatim for preseeded
+/// adoption), or — checked FIRST — any line carrying the
+/// `--resume-drops-turn` refusal prefix (never surfaced raw). Other early lines
+/// (e.g. a pre-init `sdk.status`) are dropped at this seam; the consumer resumes
+/// at the NEXT line after init.
+async fn read_session_init(
+    reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    budget: Duration,
+) -> Result<Value, RollbackSpawnError> {
+    let read = async {
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed.contains(RESUME_DROPS_TURN_REFUSAL_PREFIX) {
+                        return Err(RollbackSpawnError::GuardRefusal);
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                        continue;
+                    };
+                    if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
+                        return Ok(value);
+                    }
+                    // pre-init non-init line: tolerated, dropped.
+                }
+                Ok(None) => {
+                    return Err(RollbackSpawnError::Other(
+                        "sidecar stdout closed before sdk.session.init".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(RollbackSpawnError::Other(format!(
+                        "sidecar stdout read error: {e}"
+                    )))
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(budget, read).await {
+        Ok(result) => result,
+        Err(_) => Err(RollbackSpawnError::Other(format!(
+            "sidecar did not answer sdk.session.init within {}s",
+            budget.as_secs()
+        ))),
+    }
+}
+
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
 
 /// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
@@ -2140,6 +3316,8 @@ pub(crate) mod tests {
                 cli_session_id: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
+                in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
     }
@@ -2730,16 +3908,32 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
     // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
     // id when present (resume continuity), else a fixed fake uuid.
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    // Task 4 (kata 1wxv): a forkSession:true create mints a FRESH durable id,
+    // never an echo — fork-at-point adoption depends on the id changing.
+    const cliSessionId = msg.forkSession === true
+      ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
+      : (msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
     console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
     console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
   } else if (msg.type === 'send') {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
     if (msg.text === '__exit__') process.exit(0)
+    // Task 4 (kata 1wxv) in_turn edge hooks: each magic text emits ONE canned sdk.*
+    // line so the four-edge/fail-closed busy contract can drive every edge.
+    if (msg.text === '__emit_result_error__') {
+      console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' }))
+    } else if (msg.text === '__emit_idle__') {
+      console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }))
+    } else if (msg.text === '__emit_error__') {
+      console.log(JSON.stringify({ type: 'sdk.error', sessionId: msg.sessionId, message: 'boom' }))
+    } else if (msg.text === '__emit_compacting__') {
+      console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'compacting' }))
+    } else if (msg.text === '__emit_assistant__') {
+      console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
     // Task 2 test hook: raise a canned pending permission the approve/deny flow can
     // respond to. The fake parks nothing — Rust's pending fold is the state under test.
-    if (msg.text === '__raise_permission__') {
+    } else if (msg.text === '__raise_permission__') {
       process.stdout.write(JSON.stringify({
         type: 'sdk.permission.request',
         sessionId: msg.sessionId,
@@ -3219,6 +4413,8 @@ rl.on('line', (line) => {
                 cli_session_id: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
+                in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
     }
@@ -3654,6 +4850,8 @@ rl.on('line', (line) => {
             None,
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         );
 
         // The replace-resend is the LAST scripted line: observing its input proves the
@@ -4266,5 +5464,785 @@ rl.on('line', (line) => {
             !st.sessions.lock().await.contains_key(&session_id),
             "dead session must still be evicted from the sessions map"
         );
+    }
+
+    // ── kata 1wxv Task 4: claude/kilroy undo/redo (fork-at-point emulation) ──
+
+    use crate::identity_sink::PaneIdentitySink as _;
+    use crate::rollback_record::{
+        RollbackDirection, RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest,
+        LEDGER_WRITE_REFUSAL_COPY, REDO_EMPTY_MESSAGE, REDO_REMOVED_HISTORY_COPY,
+        ROLLBACK_BUSY_MESSAGE,
+    };
+
+    /// The FrameSink that records every delivered requesting-sink frame (codex.rs's
+    /// `capturing_sink` idiom — `conn_sink` in terminal.rs).
+    fn capturing_sink() -> (
+        freshell_terminal::FrameSink,
+        Arc<std::sync::Mutex<Vec<ServerMessage>>>,
+    ) {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: freshell_terminal::FrameSink = {
+            let captured = captured.clone();
+            Arc::new(move |msg| captured.lock().expect("captured mutex").push(msg))
+        };
+        (sink, captured)
+    }
+
+    fn captured_json(captured: &Arc<std::sync::Mutex<Vec<ServerMessage>>>) -> Vec<Value> {
+        captured
+            .lock()
+            .expect("captured mutex")
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("frame serializes"))
+            .collect()
+    }
+
+    fn rollback_op(
+        session_id: &str,
+        request_id: &str,
+        direction: RollbackDirection,
+    ) -> RollbackRequest {
+        RollbackRequest {
+            direction,
+            mode: RollbackModeReq::Step,
+            turn_id: None,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            provider: freshell_protocol::AgentProvider::Claude,
+            request_id: request_id.to_string(),
+            cwd: None,
+        }
+    }
+
+    /// u1/a1/u2/a2 chain (uuid + parentUuid linked): the rollback fixture corpus.
+    fn two_turn_transcript() -> String {
+        [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"prompt one"}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"t2","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"t3","message":{"role":"user","content":[{"type":"text","text":"prompt two"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","timestamp":"t4","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Write the durable transcript under `<home>/projects/-t/<durable>.jsonl`
+    /// (the layout `find_transcript` scans) — the rollback handler's disk truth.
+    /// Every parsed line gains `cwd: "/tmp"` (ledger A15: the CLI's resume lookup
+    /// is scoped to the transcript's ORIGINAL cwd, so the durable-id resume form
+    /// only survives when the recorded cwd exists on disk — `/tmp` always does).
+    fn write_rollback_transcript(home: &std::path::Path, durable: &str, text: &str) {
+        let dir = home.join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(line) {
+                Ok(mut v) => {
+                    if v.get("cwd").is_none() {
+                        v["cwd"] = json!("/tmp");
+                    }
+                    out.push(v.to_string());
+                }
+                Err(_) => out.push(line.to_string()),
+            }
+        }
+        std::fs::write(dir.join(format!("{durable}.jsonl")), out.join("\n")).unwrap();
+    }
+
+    /// A rollback-fixture live session: a `tee <stdin_log>` child stands in for the
+    /// sidecar — every byte the handler writes to its stdin lands in stdin_log (the
+    /// "no sidecar churn" oracle for the refusal legs) — registered with
+    /// `cli_session_id` = durable and the cli_index alias, exactly like a
+    /// fully-initialized live session.
+    async fn insert_rollback_fixture_session(
+        st: &FreshClaudeState,
+        map_key: &str,
+        durable: &str,
+    ) -> PathBuf {
+        let stdin_log = std::env::temp_dir().join(format!(
+            "freshell-claude-rollback-stdin-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut child = tokio::process::Command::new("tee")
+            .arg(&stdin_log)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn tee");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let consumer = tokio::spawn(async {});
+        st.sessions.lock().await.insert(
+            map_key.to_string(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id: format!("test-{map_key}"),
+                consumer,
+                sidecar_session_id: map_key.to_string(),
+                cli_session_id: Some(durable.to_string()),
+                broadcast_id: Arc::new(std::sync::Mutex::new(map_key.to_string())),
+                pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
+                in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turn_lock: Arc::new(TokioMutex::new(())),
+            },
+        );
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), map_key.to_string());
+        stdin_log
+    }
+
+    /// Poll until the session's `cli_session_id` differs from `prior` (the fork
+    /// adoption mints a NEW durable id mid-rollback) or the budget dies.
+    async fn await_adopted_durable(st: &FreshClaudeState, map_key: &str, prior: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let current = st
+                .sessions
+                .lock()
+                .await
+                .get(map_key)
+                .and_then(|s| s.cli_session_id.clone());
+            if let Some(current) = current {
+                if current != prior {
+                    return current;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session's cli_session_id never moved off {prior}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn in_turn_of(st: &FreshClaudeState, map_key: &str) -> bool {
+        st.sessions
+            .lock()
+            .await
+            .get(map_key)
+            .map(|s| s.in_turn.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    async fn await_in_turn(st: &FreshClaudeState, map_key: &str, want: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if in_turn_of(st, map_key).await == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "in_turn never became {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn interrupt_msg(session_id: &str) -> FreshAgentInterrupt {
+        FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_turn_clears_on_exactly_the_four_contract_edges_fail_closed_otherwise() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-in-turn-edges"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-in-turn-edges").await;
+        let sid = created["sessionId"].as_str().unwrap().to_string();
+
+        // (a) sdk.result clears with ANY subtype (r2: a result frame ends the turn —
+        // here an ERRORED result, the subtype the voided "success-only" wording excluded):
+        st.handle_send(send_msg(&sid, "turn one")).await;
+        assert!(in_turn_of(&st, &sid).await, "a send sets the busy truth");
+        st.handle_send(send_msg(&sid, "__emit_result_error__"))
+            .await;
+        await_in_turn(&st, &sid, false).await;
+
+        // Fail-closed: the NON-EDGES must NOT clear — sdk.error, sdk.status
+        // compacting, sdk.assistant frames all leave in_turn TRUE.
+        st.handle_send(send_msg(&sid, "turn two")).await;
+        st.handle_send(send_msg(&sid, "__emit_error__")).await;
+        st.handle_send(send_msg(&sid, "__emit_compacting__")).await;
+        st.handle_send(send_msg(&sid, "__emit_assistant__")).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &sid).await,
+            "sdk.error / sdk.status=compacting / sdk.assistant are NOT clear edges (fail-closed)"
+        );
+
+        // (b) sdk.status with status == "idle" clears:
+        st.handle_send(send_msg(&sid, "__emit_idle__")).await;
+        await_in_turn(&st, &sid, false).await;
+
+        // (d) a completed handle_interrupt clears — and an interrupt NEVER produces
+        // a result frame on the wire (assert none observed):
+        st.handle_send(send_msg(&sid, "turn three")).await;
+        assert!(in_turn_of(&st, &sid).await);
+        // Baseline: drop every frame the create/emit dance left on the bus.
+        while rx.try_recv().is_ok() {}
+        st.handle_interrupt(interrupt_msg(&sid)).await;
+        assert!(
+            !in_turn_of(&st, &sid).await,
+            "a completed handle_interrupt clears the busy truth (edge d)"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                frame["event"]["type"],
+                json!("freshAgent.result"),
+                "an interrupt yields NO result frame: {frame}"
+            );
+            assert_ne!(
+                frame["event"]["type"],
+                json!("freshAgent.turn.complete"),
+                "an interrupt NEVER chimes: {frame}"
+            );
+        }
+
+        // (c) sidecar EOF/death (the SIDECAR_EXITED arm) clears:
+        st.handle_send(send_msg(&sid, "turn four")).await;
+        assert!(in_turn_of(&st, &sid).await);
+        let in_turn_handle = {
+            st.sessions
+                .lock()
+                .await
+                .get(&sid)
+                .expect("still tracked")
+                .in_turn
+                .clone()
+        };
+        st.handle_send(send_msg(&sid, "__exit__")).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while in_turn_handle.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sidecar EOF/death never cleared the busy truth (edge c)"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_mid_turn_is_busy_and_never_touches_the_sidecar() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, _rx) = state_with_bus();
+        let stdin_log = insert_rollback_fixture_session(&st, "rb-busy", "dur-busy").await;
+        {
+            let guard = st.sessions.lock().await;
+            guard
+                .get("rb-busy")
+                .expect("fixture session")
+                .in_turn
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-busy", "rb-busy-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames.len(),
+            1,
+            "exactly one requesting-sink frame: {frames:?}"
+        );
+        let frame = &frames[0];
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "BUSY_TURN");
+        assert_eq!(frame["event"]["message"], ROLLBACK_BUSY_MESSAGE);
+        assert_eq!(frame["event"]["rollback"], json!(true));
+        assert_eq!(frame["event"]["requestId"], "rb-busy-1");
+        // THE SAFETY GATE: a refused attempt emits NO sidecar traffic — no stdin
+        // bytes, no sidecar spawn/kill, the session record never torn down.
+        assert_eq!(
+            std::fs::read_to_string(&stdin_log).unwrap_or_default(),
+            "",
+            "no line was written to the session's stdin"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            0,
+            "no sidecar was spawned/killed for a refused attempt"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key("rb-busy"),
+            "the session was never torn down"
+        );
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_without_a_record_is_redo_unavailable() {
+        let (st, _rx) = state_with_bus();
+        let stdin_log = insert_rollback_fixture_session(&st, "rb-redo-none", "dur-redo-none").await;
+        // No identity sink at all => no record can exist.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-redo-none", "rb-r-1", RollbackDirection::Redo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "REDO_UNAVAILABLE");
+        assert_eq!(frames[0]["event"]["message"], REDO_EMPTY_MESSAGE);
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], "rb-r-1");
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap_or_default(), "");
+        assert!(st.sessions.lock().await.contains_key("rb-redo-none"));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_record_write_failure_refuses_before_any_sidecar_churn() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-nowrite", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink_impl.set_fail_writes(true);
+        st.set_identity_sink(sink_impl.clone());
+        let stdin_log = insert_rollback_fixture_session(&st, "rb-nowrite", "dur-nowrite").await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-nowrite", "rb-nw-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(frames[0]["event"]["message"], LEDGER_WRITE_REFUSAL_COPY);
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], "rb-nw-1");
+        // Durable-BEFORE-mutation: a pre-write failure REFUSES — the provider history
+        // is NEVER mutated: no stdin bytes, no sidecar spawn/kill, session intact.
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap_or_default(), "");
+        assert_eq!(env.spawn_count(), 0);
+        assert!(st.sessions.lock().await.contains_key("rb-nowrite"));
+        assert!(
+            sink_impl.rollbacks.lock().unwrap().is_empty(),
+            "no durable row landed"
+        );
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_with_a_moved_original_tip_is_redo_unavailable() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        // The original MOVED since the undo: a third turn (u3 chaining off a2) now tips it.
+        let moved = format!(
+            "{}\n{}",
+            two_turn_transcript(),
+            json!({"type":"user","uuid":"u3","parentUuid":"a2","timestamp":"t5","message":{"role":"user","content":[{"type":"text","text":"prompt three"}]}})
+        );
+        write_rollback_transcript(home.path(), "orig-moved", &moved);
+        // The current (post-undo) transcript is the prefix only.
+        write_rollback_transcript(
+            home.path(),
+            "dur-moved-tip",
+            &two_turn_transcript()
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink_impl
+            .record_rollback("claude", "dur-moved-tip", {
+                let mut r = RollbackRecord::empty(100);
+                r.original_session_id = Some("orig-moved".to_string());
+                r.original_tip_uuid = Some("a2".to_string()); // the tip observed at undo time
+                r.set_can_redo(true, 100);
+                r
+            })
+            .await
+            .expect("seed write");
+        st.set_identity_sink(sink_impl.clone());
+        let stdin_log = insert_rollback_fixture_session(&st, "rb-moved", "dur-moved-tip").await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-moved-tip", "rb-mt-1", RollbackDirection::Redo),
+            sink,
+        )
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "REDO_UNAVAILABLE");
+        assert_eq!(frames[0]["event"]["message"], REDO_REMOVED_HISTORY_COPY);
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap_or_default(), "");
+        assert_eq!(
+            env.spawn_count(),
+            0,
+            "nothing is forked over a moved original"
+        );
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn emit_pending_cancellations_maps_every_parked_entry() {
+        let (st, mut rx) = state_with_bus();
+        insert_fake_claude_session_with_pending(
+            &st,
+            "rb-pending",
+            Some("dur-pending"),
+            &[
+                json!({"type":"sdk.permission.request","sessionId":"rb-pending","requestId":"req-1","tool":{"name":"Bash","input":{"command":"ls"}},"toolUseID":"toolu_1"}),
+                json!({"type":"sdk.question.request","sessionId":"rb-pending","requestId":"q-1","questions":[{"question":"Continue?"}]}),
+            ],
+        )
+        .await;
+        st.emit_pending_cancellations("rb-pending", "dur-pending", "freshclaude")
+            .await;
+        let perm = await_frame_of_inner_type(&mut rx, "freshAgent.permission.cancelled").await;
+        assert_eq!(perm["event"]["requestId"], json!("req-1"), "{perm}");
+        let question = await_frame_of_inner_type(&mut rx, "freshAgent.question.cancelled").await;
+        assert_eq!(question["event"]["requestId"], json!("q-1"), "{question}");
+        let (permissions, questions) = pending_request_ids(&st, "rb-pending").await;
+        assert!(
+            permissions.is_empty() && questions.is_empty(),
+            "decision 6: cancelled means cancelled — pending cards are never silently resolved"
+        );
+    }
+
+    /// The r3 epoch rule end-to-end on the claude lane (undo→send→undo↔redo): the
+    /// new undo re-roots the chain state to the CURRENT durable id while markers
+    /// accumulate as the UNION of both epochs.
+    #[tokio::test]
+    async fn handle_rollback_after_a_resend_re_roots_the_chain_and_redo_restores_the_new_epoch() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        // Original O: retained on disk, chain tip a2 — the OLD epoch's fork-chain root.
+        write_rollback_transcript(home.path(), "orig-epoch", &two_turn_transcript());
+        // S' (the CURRENT live session): a fork of O (u1/a1 prefix) whose user
+        // RESENT an edited prompt — its own u-prime/a-prime turn.
+        let s_prime_transcript = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"prompt one"}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"t2","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}]}}),
+            json!({"type":"user","uuid":"uq","parentUuid":"a1","timestamp":"t5","message":{"role":"user","content":[{"type":"text","text":"prompt two edited"}]}}),
+            json!({"type":"assistant","uuid":"aq","parentUuid":"uq","timestamp":"t6","message":{"role":"assistant","content":[{"type":"text","text":"answer two edited"}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        write_rollback_transcript(home.path(), "s-prime", &s_prime_transcript);
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The old-epoch record keyed by S': the resend already destroyed redo
+        // (redo_destroyed) while the u2/a2 marker entry survives (decision 6 union).
+        sink_impl
+            .record_rollback("claude", "s-prime", {
+                let mut r = RollbackRecord::empty(100);
+                r.original_session_id = Some("orig-epoch".to_string());
+                r.original_tip_uuid = Some("a2".to_string());
+                r.push_entry(
+                    RollbackEntry {
+                        removed_turns: vec![
+                            json!({"id":"u2","turnId":"u2","role":"user","summary":"prompt two","items":[]}),
+                            json!({"id":"a2","turnId":"a2","role":"assistant","summary":"answer two","items":[]}),
+                        ],
+                        prompt_text: "prompt two".to_string(),
+                        at_ms: 100,
+                    },
+                    100,
+                );
+                r.set_can_redo(true, 100);
+                r.destroy_redo(110); // the resend destroyed the old epoch's redo (markers survive)
+                r
+            })
+            .await
+            .expect("seed write");
+        st.set_identity_sink(sink_impl.clone());
+        insert_rollback_fixture_session(&st, "epoch-live", "s-prime").await;
+
+        // Undo the edited turn: lands while redo_destroyed == true ⇒ a NEW epoch.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("s-prime", "rb-epoch-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let adopted = await_adopted_durable(&st, "epoch-live", "s-prime").await;
+
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["type"], "freshAgent.rolledBack");
+        assert_eq!(
+            frames[0]["event"]["removedPromptText"],
+            json!("prompt two edited")
+        );
+        assert_eq!(frames[0]["event"]["canRedo"], json!(true));
+        assert_eq!(frames[0]["event"]["newSessionId"], json!(adopted));
+
+        // The fork-at-point create landed with the computed options: resume the
+        // CURRENT durable id (S'), keep through a1 (uq's raw parent), guard = the
+        // first-to-discard prompt uuid uq.
+        let creates: Vec<Value> = std::fs::read_to_string(env.spawn_log_path())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("spawn log line is JSON"))
+            .collect();
+        assert_eq!(
+            creates.len(),
+            1,
+            "exactly the rollback's fork create: {creates:?}"
+        );
+        assert_eq!(creates[0]["resumeSessionId"], json!("s-prime"));
+        assert_eq!(creates[0]["resumeSessionAt"], json!("a1"));
+        assert_eq!(creates[0]["forkSession"], json!(true));
+        assert_eq!(
+            creates[0]["resumeDropsTurn"],
+            json!("uq"),
+            "the guard is the first-to-discard turn's prompt uuid (brief/SDK semantics)"
+        );
+
+        // Re-rooted chain state on the record (re-keyed old→new by adoption):
+        let record = sink_impl
+            .load_rollback("claude", &adopted)
+            .expect("record re-keyed to the adopted id");
+        assert_eq!(
+            record.original_session_id.as_deref(),
+            Some("s-prime"),
+            "the new epoch re-roots to the CURRENT durable id — O's chain is never reused for redo"
+        );
+        assert_eq!(
+            record.original_tip_uuid.as_deref(),
+            Some("aq"),
+            "S' chain tip"
+        );
+        assert!(
+            !record.redo_destroyed,
+            "the new epoch's redo fields describe the NEW chain"
+        );
+        assert!(
+            record.can_redo(),
+            "redo source exists beyond the new live prefix"
+        );
+        assert_eq!(
+            record.entries.len(),
+            2,
+            "the marker bucket is the UNION of both epochs"
+        );
+        let first_entry_ids: Vec<&str> = record.entries[0]
+            .removed_turns
+            .iter()
+            .filter_map(|t| t.get("turnId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            first_entry_ids,
+            vec!["u2", "a2"],
+            "the frozen prior-epoch markers stay first (decision 6; r3)"
+        );
+        let second_entry_ids: Vec<&str> = record.entries[1]
+            .removed_turns
+            .iter()
+            .filter_map(|t| t.get("turnId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            second_entry_ids,
+            vec!["uq", "aq"],
+            "the newest epoch's removed slice"
+        );
+        assert!(
+            sink_impl.load_rollback("claude", "s-prime").is_none(),
+            "the rollback row MOVED old→new (never a stale duplicate)"
+        );
+
+        // Simulated SDK write: the forked child's transcript on disk is the kept prefix.
+        write_rollback_transcript(
+            home.path(),
+            &adopted,
+            &two_turn_transcript()
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // Now the redo re-forks from S' (the re-rooted chain root) restoring EXACTLY
+        // the newest epoch's removed tail — the frozen prior-epoch markers are not restorable.
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&adopted, "rb-epoch-2", RollbackDirection::Redo),
+            sink2,
+        )
+        .await;
+        let adopted2 = await_adopted_durable(&st, "epoch-live", &adopted).await;
+        let frames2 = captured_json(&captured2);
+        assert_eq!(frames2.len(), 1, "{frames2:?}");
+        assert_eq!(frames2[0]["event"]["type"], "freshAgent.redone");
+        assert_eq!(
+            frames2[0]["event"]["restoredThroughTurnId"],
+            json!("aq"),
+            "redone restores through the restored step's OWN last uuid (r3 boundary rule)"
+        );
+        assert_eq!(
+            frames2[0]["event"]["canRedo"],
+            json!(false),
+            "nothing lies beyond the re-rooted tip"
+        );
+        let creates: Vec<Value> = std::fs::read_to_string(env.spawn_log_path())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("spawn log line is JSON"))
+            .collect();
+        assert_eq!(creates.len(), 2, "{creates:?}");
+        assert_eq!(
+            creates[1]["resumeSessionId"],
+            json!("s-prime"),
+            "redo re-forks the re-rooted chain root"
+        );
+        assert_eq!(creates[1]["resumeSessionAt"], json!("aq"));
+        assert_eq!(creates[1]["forkSession"], json!(true));
+        assert!(
+            creates[1].get("resumeDropsTurn").is_none(),
+            "the guard is omitted when the discard range is empty (redo to the tip) — never fabricated"
+        );
+        let record2 = sink_impl
+            .load_rollback("claude", &adopted2)
+            .expect("record re-keyed again");
+        assert_eq!(
+            record2.entries.len(),
+            1,
+            "the restored turns left the CURRENT-epoch portion"
+        );
+        let remaining_ids: Vec<&str> = record2.entries[0]
+            .removed_turns
+            .iter()
+            .filter_map(|t| t.get("turnId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            remaining_ids,
+            vec!["u2", "a2"],
+            "only the frozen prior-epoch markers remain"
+        );
+        assert!(!record2.can_redo());
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        drop(env);
+    }
+
+    /// The r2 lock discipline on the claude lane: a send fired mid-rollback waits on
+    /// the per-session turn lock (handle_send NEVER consults rollback_in_flight),
+    /// then proceeds against the POST-rollback session and destroys redo.
+    #[tokio::test]
+    async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-serial", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        insert_rollback_fixture_session(&st, "serial-live", "dur-serial").await;
+
+        let rollback = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(
+                    rollback_op("dur-serial", "rb-serial-1", RollbackDirection::Undo),
+                    capturing_sink().0,
+                )
+                .await
+            })
+        };
+        // Wait until the rollback is parked INSIDE the respawn (its fork create
+        // request has landed at the fake sidecar) — the rollback already holds the
+        // session turn lock at this point.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while env.spawn_count() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the rollback never reached its fork create"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(send_msg("dur-serial", "edited followup"))
+                    .await
+            })
+        };
+        // Bounded completion == no deadlock between the two handlers' lock waits.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (r, s) = tokio::join!(rollback, send);
+            r.expect("rollback task");
+            s.expect("send task");
+        })
+        .await
+        .expect("send+rollback must serialize, never deadlock");
+
+        let adopted = await_adopted_durable(&st, "serial-live", "dur-serial").await;
+        // The send's sidecar write landed strictly AFTER the rollback's
+        // kill+spawn+adoption completed: it targeted the NEW sidecar's id, never
+        // the torn-down one.
+        let sends = env.respond_log_frames(1).await;
+        let send_frame = sends
+            .iter()
+            .find(|f| f["type"] == "send")
+            .expect("the send eventually writes to the sidecar");
+        assert_ne!(
+            send_frame["sessionId"],
+            json!("serial-live"),
+            "the send waited, then ran against the POST-rollback session: {send_frame}"
+        );
+        assert!(
+            send_frame["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("fake-claude-session-"),
+            "the send addressed the freshly-adopted sidecar: {send_frame}"
+        );
+        // And destroy_redo_on_submit ran against the post-rollback record
+        // ("send waits, rollback wins, then destroys").
+        let record = sink_impl
+            .load_rollback("claude", &adopted)
+            .expect("record under the adopted id");
+        assert!(
+            record.redo_destroyed,
+            "the trailing send destroyed redo (decision 5)"
+        );
+        assert!(!record.can_redo());
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "the marker bucket is NEVER touched by a destroy"
+        );
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        drop(env);
     }
 }

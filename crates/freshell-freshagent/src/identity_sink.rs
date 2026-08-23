@@ -157,6 +157,26 @@ impl PaneIdentitySink for FakeIdentitySink {
                 (upsert.provider.clone(), upsert.session_id.clone()),
                 upsert.settings.clone(),
             );
+            // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
+            // old→new rides the SAME awaited batch as the binding write — mirrors
+            // `freshell-server`'s LedgerIdentitySink (scoped to the claude fork
+            // adoption; codex's crash-respawn supersession must NOT move a marker
+            // bucket to a memory-less thread).
+            if upsert.provider == "claude" {
+                if let Some(old_id) = upsert.supersedes.as_deref() {
+                    if old_id != upsert.session_id {
+                        let mut rollbacks = self.rollbacks.lock().unwrap();
+                        if let Some(record) =
+                            rollbacks.remove(&(upsert.provider.clone(), old_id.to_string()))
+                        {
+                            rollbacks.insert(
+                                (upsert.provider.clone(), upsert.session_id.clone()),
+                                record,
+                            );
+                        }
+                    }
+                }
+            }
             self.bindings.lock().unwrap().push(upsert);
         }
         self.write_result()

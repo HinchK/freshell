@@ -1218,6 +1218,25 @@ async fn handle_client_text(
                     }
                     .instrument(tracing::Span::current()),
                 );
+            } else if m.provider == freshell_protocol::AgentProvider::Claude {
+                // Task 4: claude x undo is REAL DISPATCH — fork-at-point emulation
+                // in `FreshClaudeState::handle_rollback` (kill + recreate with
+                // resume+resumeSessionAt+forkSession, adopt through
+                // sdk.session.init). Covers BOTH freshclaude and kilroy session
+                // types (provider `claude`); same fork-arm shape.
+                let fresh_claude = state.fresh_claude.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_claude
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
             } else {
                 conn_sink(rollback_refusal_frame(
                     &freshell_freshagent::RollbackRequest::from_undo(m),
@@ -1227,9 +1246,10 @@ async fn handle_client_text(
             true
         }
         // Codex x redo stays refused PERMANENTLY (decision 5 — codex history
-        // revert is destructive; there is no redo primitive); Task 3 makes
-        // opencode x redo REAL DISPATCH (re-revert/unrevert); the claude redo
-        // leg lands in Task 4.
+        // revert is destructive; there is no redo primitive); Task 3 made
+        // opencode x redo REAL DISPATCH (re-revert/unrevert); Task 4 makes claude
+        // x redo REAL DISPATCH (re-fork at a later point from the retained
+        // original, tip+LCP validated).
         ClientMessage::FreshAgentRedo(m) => {
             if is_opencode_provider(m.provider) {
                 let fresh_opencode = state.fresh_opencode.clone();
@@ -1237,6 +1257,21 @@ async fn handle_client_text(
                 tokio::spawn(
                     async move {
                         fresh_opencode
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_redo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else if m.provider == freshell_protocol::AgentProvider::Claude {
+                // Task 4: claude x redo is REAL DISPATCH — see the undo arm above.
+                let fresh_claude = state.fresh_claude.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_claude
                             .handle_rollback(
                                 freshell_freshagent::RollbackRequest::from_redo(m),
                                 conn_sink,

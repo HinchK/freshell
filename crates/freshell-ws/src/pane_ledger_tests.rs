@@ -1106,3 +1106,49 @@ fn session_missing_serde_round_trips() {
     let deserialized: RetiredReason = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized, RetiredReason::SessionMissing);
 }
+
+/// kata 1wxv Task 4: the claude fork-adoption re-key MOVES the rollback row
+/// old→new — copy under the new id lands durably, and the old id's row is gone
+/// from BOTH the on-disk file and the write-through index (a surviving stale
+/// row would let the superseded id keep describing rollback state it no longer
+/// owns).
+#[test]
+fn rollback_row_rekey_move_drops_the_old_durably() {
+    let root = temp_root("rollback-rekey");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let payload_a = serde_json::json!({"version": 1, "entries": []});
+    ledger
+        .record_rollback_row("claude", "old-id", &payload_a, 1)
+        .expect("seed write");
+    let payload_old = ledger
+        .load_rollback_row("claude", "old-id")
+        .expect("seeded");
+    // The re-key move: copy under the new id, then delete the old.
+    ledger
+        .record_rollback_row("claude", "new-id", &payload_old, 2)
+        .expect("copy");
+    ledger
+        .delete_rollback_row("claude", "old-id")
+        .expect("delete old");
+    assert!(
+        ledger.load_rollback_row("claude", "old-id").is_none(),
+        "the old row is out of the write-through index"
+    );
+    assert_eq!(
+        ledger.load_rollback_row("claude", "new-id"),
+        Some(payload_a),
+        "the moved row reads identically under the new id"
+    );
+    // A FRESH ledger over the same root proves the delete is durable (not index-only).
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert!(
+        ledger2.load_rollback_row("claude", "old-id").is_none(),
+        "the old row's FILE is gone"
+    );
+    assert!(ledger2.load_rollback_row("claude", "new-id").is_some());
+    // A missing row/file is a silent no-op (never an error).
+    ledger
+        .delete_rollback_row("claude", "never-existed")
+        .expect("no-op delete");
+    std::fs::remove_dir_all(&root).ok();
+}

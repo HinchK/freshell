@@ -947,6 +947,29 @@ impl PaneLedger {
             .cloned()
     }
 
+    /// kata 1wxv Task 4: rollback-row delete — used ONLY by the claude fork
+    /// adoption's re-key (the row MOVES old→new inside the same awaited batch
+    /// as the binding write: copy under the new id, then drop the old so no
+    /// stale row can describe the superseded conversation). A missing
+    /// row/file is a silent no-op. File removal first, then the write-through
+    /// index — in the same locked section as every other ledger mutation.
+    pub fn delete_rollback_row(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let dest = Self::rollback_path(root, provider, session_id);
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        index
+            .rollback
+            .remove(&(provider.to_string(), session_id.to_string()));
+        Ok(())
+    }
+
     /// Rows quarantined by this process's boot scan — the Phase-3 verdict
     /// surfacing (`ledger_quarantined` breadcrumb) reads this.
     pub fn quarantined_rows(&self) -> Vec<QuarantinedRow> {
