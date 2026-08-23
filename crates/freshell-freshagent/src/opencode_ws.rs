@@ -1513,19 +1513,37 @@ impl FreshOpencodeState {
                     },
                     RollbackModeReq::ToTurn => {
                         let t = op.turn_id.clone().expect("validated above");
-                        // The boundary removes target-and-after regardless of role
-                        // (assistant ids normalize to their parent user message
-                        // serve-side; the icons only appear on user rows client-side,
-                        // and the server stays correct for either).
-                        if !(t.starts_with("msg")
-                            && active.iter().any(|m| {
-                                m.pointer("/info/id").and_then(Value::as_str) == Some(t.as_str())
-                            }))
-                        {
+                        let target_row = active.iter().find(|m| {
+                            m.pointer("/info/id").and_then(Value::as_str) == Some(t.as_str())
+                        });
+                        if !(t.starts_with("msg") && target_row.is_some()) {
                             reply_sink(rollback_error_frame(
                                 &op,
                                 "INVALID_ROLLBACK_TARGET",
                                 &format!("turn {t} is not in the active conversation"),
+                            ));
+                            return;
+                        }
+                        // r3 pre-flight role refusal: the serve normalizes an assistant
+                        // messageID to its parent USER message and GENUINELY applies the
+                        // revert — freshell's removed slice would then exclude the parent
+                        // turn, and the exact-pointer post-verify would read a MOVED
+                        // pointer at the parent id, mis-firing the silent-no-op
+                        // compensation leg after an APPLIED mutation. Only USER rows are
+                        // legal toTurn targets (the client renders the icon there alone);
+                        // refuse BEFORE any ledger write or mutation.
+                        if target_row
+                            .expect("membership checked")
+                            .pointer("/info/role")
+                            .and_then(Value::as_str)
+                            != Some("user")
+                        {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "INVALID_ROLLBACK_TARGET",
+                                &format!(
+                                    "turn {t} is not a user message; toTurn undo targets user turns only"
+                                ),
                             ));
                             return;
                         }
@@ -5988,6 +6006,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_rollback_to_turn_targeting_an_assistant_message_is_refused_preflight() {
+        // r3 pre-flight refusal (task-3 review Important-1): a hand-crafted toTurn frame
+        // naming an ASSISTANT message passes the membership check, but the serve
+        // normalizes the id to its parent USER message and GENUINELY applies the revert —
+        // freshell's removed slice would exclude that parent turn, and the exact-pointer
+        // post-verify would read a MOVED pointer at the parent id, tripping the (b)
+        // silent-no-op compensation leg after an APPLIED mutation (the ledger would stop
+        // describing a rollback the provider genuinely performed). Refuse
+        // INVALID_ROLLBACK_TARGET BEFORE any ledger write or mutation: ZERO revert/
+        // unrevert POSTs and the record untouched.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-2a");
+        op.mode = RollbackModeReq::ToTurn;
+        op.turn_id = Some("msg_a2".into());
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one refusal: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("INVALID_ROLLBACK_TARGET"));
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a user message"),
+            "the refusal names the role violation: {frames:?}"
+        );
+        assert!(
+            http.recorded()
+                .iter()
+                .all(|r| !(r.method == "POST" && r.url.contains("revert"))),
+            "a refused toTurn NEVER mutates provider history"
+        );
+        assert!(
+            st_sink.load_rollback(PROVIDER, "ses_real").is_none(),
+            "the ledger is never written on the pre-flight refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_rollback_redo_step_moves_the_boundary_forward_by_one_user_step() {
         // Pointer at msg_u2 (msg_u2..msg_a3 rolled back); one redo step restores
         // msg_u2+msg_a2 and re-points the boundary at msg_u3.
@@ -6377,9 +6434,22 @@ mod tests {
             .iter()
             .position(|r| r.method == "POST" && r.url.contains("/prompt_async"))
             .expect("prompt happened");
+        // The r3 post-verify GET /session/<id> (the fake records it) also sits strictly
+        // between them: a send interleaving between the revert POST and its verification
+        // read is a serialization violation too. The bare `/session/ses_real` GETs are
+        // the rollback's initial read and its post-verify read (`/message` and
+        // `/session/status` traffic is filtered out); the LAST such is the post-verify.
+        let postverify_get_pos = recorded
+            .iter()
+            .rposition(|r| {
+                r.method == "GET"
+                    && r.url.contains("/session/ses_real")
+                    && !r.url.contains("/message")
+            })
+            .expect("the post-verify read happened");
         assert!(
-            revert_pos < prompt_pos,
-            "the send strictly follows the rollback — never concurrent"
+            revert_pos < postverify_get_pos && postverify_get_pos < prompt_pos,
+            "the revert POST AND its post-verify read strictly precede the prompt POST — never concurrent"
         );
         assert!(
             st_sink

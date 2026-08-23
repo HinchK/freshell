@@ -1851,8 +1851,19 @@ pub async fn handle_rollback(&self, op: crate::rollback_record::RollbackRequest,
                 RollbackModeReq::Step => match user_id_at(active, true) { Some(id) => id, None => { reply_sink(rollback_error_frame(&op, "NOTHING_TO_UNDO", UNDO_EMPTY_MESSAGE)); return; } },
                 RollbackModeReq::ToTurn => {
                     let t = op.turn_id.clone().expect("validated above");
-                    if !(t.starts_with("msg") && active.iter().any(|m| m["info"]["id"].as_str() == Some(t.as_str()))) {
+                    let target_row = active.iter().find(|m| m["info"]["id"].as_str() == Some(t.as_str()));
+                    if !(t.starts_with("msg") && target_row.is_some()) {
                         reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &format!("turn {t} is not in the active conversation")));
+                        return;
+                    }
+                    // r3 pre-flight role refusal: the serve normalizes an assistant id to its
+                    // parent USER message and GENUINELY applies the revert — freshell's removed
+                    // slice would then exclude the parent turn, and the exact-pointer post-verify
+                    // would read a MOVED pointer at the parent id, mis-firing the (b) silent-no-op
+                    // compensation leg after an APPLIED mutation. USER rows only, refused BEFORE
+                    // any ledger write or mutation.
+                    if target_row.expect("membership checked")["info"]["role"].as_str() != Some("user") {
+                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &format!("turn {t} is not a user message; toTurn undo targets user turns only")));
                         return;
                     }
                     t
@@ -2086,7 +2097,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-Deduplicate the redo branch's record-write/broadcast tail against the undo branch's (both legs share the pre-write → mutate → post-verify → broadcast sequence — factor a small `persist_record_and_warn` helper on the state if the closures stay readable). Verify the `user_id_at` helper handles assistant-targeted toTurn ids sanely (revert removes target-and-after regardless of role; icons only appear on user rows client-side, but the server stays correct for either). No behavior change.
+Deduplicate the redo branch's record-write/broadcast tail against the undo branch's (both legs share the pre-write → mutate → post-verify → broadcast sequence — factor a small `persist_record_and_warn` helper on the state if the closures stay readable). Verify the toTurn target validation refuses assistant ids pre-flight (INVALID_ROLLBACK_TARGET before any ledger write or mutation — the serve normalizes an assistant id to its parent user message and genuinely applies, so accepting one would compute the wrong removed slice and mis-fire the r3 post-verify compensation leg; icons appear only on user rows client-side, and the server refuses anything else). No behavior change.
 
 - [ ] **Step 6: Run impacted-test verification**
 
