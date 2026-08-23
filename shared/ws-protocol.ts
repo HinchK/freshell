@@ -601,6 +601,27 @@ export const FreshAgentForkSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
 })
 
+const freshAgentRollbackShape = {
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
+  mode: z.enum(['step', 'toTurn']).optional(),
+  turnId: z.string().min(1).optional(),
+} as const
+
+/** kata 1wxv: conversation rollback. mode absent => 'step'. turnId required by the SERVER for 'toTurn'. */
+export const FreshAgentUndoSchema = z.object({
+  type: z.literal('freshAgent.undo'),
+  ...freshAgentRollbackShape,
+})
+
+export const FreshAgentRedoSchema = z.object({
+  type: z.literal('freshAgent.redo'),
+  ...freshAgentRollbackShape,
+})
+
 export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
@@ -611,6 +632,8 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
+  FreshAgentUndoSchema,
+  FreshAgentRedoSchema,
 ])
 
 export type FreshAgentClientMessage = z.infer<typeof FreshAgentClientMessageSchema>
@@ -729,6 +752,8 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
+  FreshAgentUndoSchema,
+  FreshAgentRedoSchema,
 ])
 
 export type ClientMessage = z.infer<typeof ClientMessageSchema>

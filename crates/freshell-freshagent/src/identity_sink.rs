@@ -2,8 +2,17 @@
 //! crate through this trait; `freshell-server` implements it over the pane
 //! ledger (this crate must not depend on `freshell-ws`, where the ledger
 //! lives — the dependency edge runs the other way).
+//!
+//! Kata 1wxv: the bridge also carries the durable rollback record
+//! (`record_rollback`/`load_rollback`) — the provider handlers AWAIT the write
+//! BEFORE mutating provider history (durable-BEFORE-mutation; a pre-write
+//! failure refuses the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
 
 use std::sync::Arc;
+
+use crate::rollback_record::RollbackRecord;
+#[cfg(test)]
+use crate::rollback_record::ROLLBACK_RECORD_VERSION;
 
 /// Resume-invocation record (campaign plan §4.2): exactly what the
 /// provider-native resume command needs.
@@ -51,6 +60,21 @@ pub trait PaneIdentitySink: Send + Sync {
     /// the SETTINGS_RESET alarm gate (V7/A10): alarm only when the ledger
     /// proves prior recording; never for never-recorded sessions.
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
+    /// kata 1wxv decision 10's durable record: the post-op rollback record,
+    /// computed from pre-mutation reads and AWAITED BEFORE the provider
+    /// mutation runs (durable-BEFORE-mutation). Same awaited-write
+    /// discipline as `record_binding`.
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite;
+    /// The stored rollback record. Memory-fast + sync (the write-through
+    /// index). A row stored with a `version` other than
+    /// [`ROLLBACK_RECORD_VERSION`] answers `None` — never silently
+    /// reinterpreted (the pane-ledger LEDGER_VERSION discipline).
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord>;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -66,6 +90,8 @@ pub(crate) struct FakeIdentitySink {
     pub settings: std::sync::Mutex<std::collections::HashMap<(String, String), FreshAgentSettings>>,
     /// Keys ever recorded (or seeded) — backs `was_recorded`.
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// (provider, sessionId) -> stored rollback record (kata 1wxv).
+    pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
 }
@@ -91,6 +117,12 @@ impl FakeIdentitySink {
             .lock()
             .unwrap()
             .insert((provider.into(), session_id.into()));
+    }
+    /// Arm the write-failure knob (kata 1wxv refusal-path tests).
+    #[allow(dead_code)] // used by the kata 1wxv provider-leg failure tests (Tasks 2-4)
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
     fn write_result(&self) -> SinkWrite {
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
@@ -141,6 +173,28 @@ impl PaneIdentitySink for FakeIdentitySink {
             .lock()
             .unwrap()
             .contains(&(provider.into(), session_id.into()))
+    }
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rollbacks
+                .lock()
+                .unwrap()
+                .insert((provider.into(), session_id.into()), record);
+        }
+        self.write_result()
+    }
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
+        self.rollbacks
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            .cloned()
+            .filter(|record| record.version == ROLLBACK_RECORD_VERSION)
     }
 }
 
@@ -193,5 +247,24 @@ mod tests {
                 .is_err(),
             "failure must surface as Err, never be swallowed"
         );
+    }
+
+    #[tokio::test]
+    async fn fake_sink_records_and_loads_rollback() {
+        let fake = std::sync::Arc::new(FakeIdentitySink::default());
+        let mut record = crate::rollback_record::RollbackRecord::empty(10);
+        record.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![serde_json::json!({"id": "t1"})],
+                prompt_text: "p1".into(),
+                at_ms: 11,
+            },
+            12,
+        );
+        fake.record_rollback("opencode", "ses_1", record.clone())
+            .await
+            .expect("write ok");
+        assert_eq!(fake.load_rollback("opencode", "ses_1"), Some(record));
+        assert!(fake.load_rollback("opencode", "nope").is_none());
     }
 }

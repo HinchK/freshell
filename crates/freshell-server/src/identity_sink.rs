@@ -3,7 +3,8 @@
 //! injects this adapter at wiring time.
 
 use freshell_freshagent::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SinkWrite,
+    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
+    ROLLBACK_RECORD_VERSION,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -111,6 +112,41 @@ impl PaneIdentitySink for LedgerIdentitySink {
             .map(|r| r.pane_kind.as_deref() == Some("fresh-agent"))
             .unwrap_or(false)
     }
+
+    /// kata 1wxv: await the rollback-record row write BEFORE the provider
+    /// mutation runs (durable-BEFORE-mutation; a pre-write failure refuses
+    /// the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
+                ledger.record_rollback_row(&p, &s, &payload, now)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
+        // Reads are memory-only against the write-through index — safe inline.
+        // The ledger is payload-opaque; the schema (and its version gate: a
+        // mismatched version reads as None, never reinterpreted) lives here.
+        let payload = self.ledger.load_rollback_row(provider, session_id)?;
+        let record: RollbackRecord = serde_json::from_value(payload).ok()?;
+        if record.version == ROLLBACK_RECORD_VERSION {
+            Some(record)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -153,5 +189,37 @@ mod tests {
         assert!(!sink.was_recorded("codex", "nope"));
         let row = ledger.load_binding("codex", "t1").unwrap();
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollback_record_writes_through_and_reads_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger);
+        let mut record = freshell_freshagent::RollbackRecord::empty(100);
+        record.push_entry(
+            freshell_freshagent::RollbackEntry {
+                removed_turns: vec![serde_json::json!({"id": "t1", "turnId": "t1"})],
+                prompt_text: "second prompt".into(),
+                at_ms: 101,
+            },
+            102,
+        );
+        sink.record_rollback("codex", "thr-1", record.clone())
+            .await
+            .expect("awaited write");
+        assert_eq!(
+            sink.load_rollback("codex", "thr-1"),
+            Some(record),
+            "awaited write => readable immediately"
+        );
+        // A fresh ledger over the same root sees the row (durable, not just memory):
+        let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert!(
+            ledger2.load_rollback_row("codex", "thr-1").is_some(),
+            "boot scan indexes rollback rows"
+        );
     }
 }

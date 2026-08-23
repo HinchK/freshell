@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 68,
+  "schemaCount": 70,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -549,7 +549,7 @@
               "type": "object"
             },
             "protocolVersion": {
-              "const": 7,
+              "const": 8,
               "type": "number"
             },
             "sessions": {
@@ -2085,6 +2085,118 @@
             "provider"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.undo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.redo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3240,6 +3352,118 @@
             "provider"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.undo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.redo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3613,6 +3837,63 @@
       ],
       "type": "object"
     },
+    "FreshAgentRedoSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "step",
+            "toTurn"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.redo",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider"
+      ],
+      "type": "object"
+    },
     "FreshAgentSendSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3712,6 +3993,63 @@
       ],
       "type": "object"
     },
+    "FreshAgentUndoSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "step",
+            "toTurn"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.undo",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider"
+      ],
+      "type": "object"
+    },
     "HelloSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3746,7 +4084,7 @@
           "type": "object"
         },
         "protocolVersion": {
-          "const": 7,
+          "const": 8,
           "type": "number"
         },
         "sessions": {
@@ -5538,5 +5876,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket wire protocol — frozen contract",
-  "wsProtocolVersion": 7
+  "wsProtocolVersion": 8
 }

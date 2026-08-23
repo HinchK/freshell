@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 31 discriminants).
+//! Client → server messages (`ClientMessage`, 33 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -79,13 +79,17 @@ pub enum ClientMessage {
     FreshAgentKill(FreshAgentKill),
     #[serde(rename = "freshAgent.fork")]
     FreshAgentFork(FreshAgentFork),
+    #[serde(rename = "freshAgent.undo")]
+    FreshAgentUndo(FreshAgentUndo),
+    #[serde(rename = "freshAgent.redo")]
+    FreshAgentRedo(FreshAgentRedo),
     #[serde(rename = "pane.reconcile.request")]
     PaneReconcileRequest(PaneReconcileRequest),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 33] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -101,7 +105,9 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
     "freshAgent.interrupt",
     "freshAgent.kill",
     "freshAgent.question.respond",
+    "freshAgent.redo",
     "freshAgent.send",
+    "freshAgent.undo",
     "hello",
     "opencode.activity.list",
     "pane.reconcile.request",
@@ -160,7 +166,7 @@ pub struct HelloSessions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hello {
-    /// const `7`.
+    /// const `8`.
     pub protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -679,6 +685,45 @@ pub struct FreshAgentFork {
     pub input: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// kata 1wxv: rollback `mode` field (`absent => step` on the server side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RollbackMode {
+    Step,
+    ToTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentUndo {
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    pub request_id: String,
+    /// absent => step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RollbackMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentRedo {
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RollbackMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }

@@ -47,6 +47,7 @@ pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
 pub mod rename_persistence;
+pub mod rollback_record;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
@@ -70,6 +71,12 @@ pub use identity_sink::{
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
+pub use rollback_record::{
+    now_ms, rollback_ack_frame, rollback_broadcast_frame, rollback_error_frame, RollbackDirection,
+    RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest, CODEX_OLD_CLI_COPY,
+    LEDGER_WRITE_REFUSAL_COPY, OPENCODE_OLD_CLI_COPY, REDO_DESTROYED_MESSAGE, REDO_EMPTY_MESSAGE,
+    REDO_REMOVED_HISTORY_COPY, ROLLBACK_BUSY_MESSAGE, ROLLBACK_RECORD_VERSION, UNDO_EMPTY_MESSAGE,
+};
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
 

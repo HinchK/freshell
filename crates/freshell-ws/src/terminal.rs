@@ -1178,6 +1178,26 @@ async fn handle_client_text(
             }
             true
         }
+        // kata 1wxv Task 1: `freshAgent.undo`/`freshAgent.redo` land contract-first —
+        // until each provider leg (Tasks 2-4) replaces its cell with a real
+        // dispatch (which answers on the requesting connection via `conn_sink`,
+        // same shape as the fork arms), EVERY provider x op cell is answered
+        // with the pinned refusal text here. Codex x redo stays refused
+        // PERMANENTLY (decision 5 — codex has no redo primitive).
+        ClientMessage::FreshAgentUndo(m) => {
+            conn_sink(rollback_refusal_frame(
+                &freshell_freshagent::RollbackRequest::from_undo(m),
+                "Undo is",
+            ));
+            true
+        }
+        ClientMessage::FreshAgentRedo(m) => {
+            conn_sink(rollback_refusal_frame(
+                &freshell_freshagent::RollbackRequest::from_redo(m),
+                "Redo is",
+            ));
+            true
+        }
         // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
         // `screenshot.capture` command. Route it to the broker, waking the awaiting
         // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
@@ -4887,6 +4907,33 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
     }))
+}
+
+/// kata 1wxv Task 1 refusal: every provider x op rollback cell is answered ON
+/// THE REQUESTING CONNECTION until the provider legs (Tasks 2-4) replace the
+/// cells with real dispatch; codex x redo and amplifier x op stay refused
+/// forever. Stamped `rollback:true` + `requestId` so the client shows the
+/// notice channel, not the pane error surface. Wording is the refusal-table
+/// parity text (`"Undo is not supported for <sessionType>"`, same
+/// `"<Op> is not supported for <sessionType>"` shape as the fork/compact cells).
+fn rollback_refusal_frame(
+    op: &freshell_freshagent::RollbackRequest,
+    wording: &str,
+) -> ServerMessage {
+    tracing::warn!(
+        provider = agent_provider_wire(op.provider),
+        session_id = %op.session_id,
+        session_type = session_type_wire(op.session_type),
+        "fresh-agent rollback frame hits an unsupported provider x op cell; answering freshAgent.error UNSUPPORTED_CAPABILITY"
+    );
+    freshell_freshagent::rollback_error_frame(
+        op,
+        "UNSUPPORTED_CAPABILITY",
+        &format!(
+            "{wording} not supported for {}",
+            session_type_wire(op.session_type)
+        ),
+    )
 }
 
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
