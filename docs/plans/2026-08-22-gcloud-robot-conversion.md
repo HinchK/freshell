@@ -1582,4 +1582,3 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
   one note and run exactly as before (including, today, the culled-credential
   failure mode). That is the contract: adoption is non-breaking; provisioning
   is the fix.
-
