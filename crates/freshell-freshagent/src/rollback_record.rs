@@ -172,8 +172,9 @@ impl RollbackRecord {
         }
     }
 
-    /// The STORED bit only — never entries-derived (claude keeps entries
-    /// empty by design).
+    /// The STORED bit only — never entries-derived (written at op time by the
+    /// provider handler; claude entries carry the union marker slices, so only
+    /// the stored bit is consulted).
     pub fn can_redo(&self) -> bool {
         self.can_redo
     }

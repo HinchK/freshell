@@ -136,8 +136,8 @@ pub struct RollbackRecord {
     /// Redo availability STAMPED AT WRITE TIME by the provider handler — never derived at read:
     /// codex always false; opencode `!redo_destroyed && rebuilt tail non-empty`; claude
     /// `original tip strictly beyond the new current tip` (verified against the original JSONL
-    /// at write time). Claude keeps `entries` empty by design, so an entries-derived bit can
-    /// never work for it.
+    /// at write time). Claude `entries` carry the union marker slices (r3) — an entries-derived bit can
+    /// never work for it regardless (its redo validity is tip-vs-tip over the original).
     pub can_redo: bool,
     /// Claude fork-chain root (the session retaining full history). None for codex/opencode.
     pub original_session_id: Option<String>,
@@ -2688,7 +2688,7 @@ git commit -m "feat(fresh-claude): undo/redo via resume+resumeSessionAt+forkSess
 **Stage-2 binding amendments (from "## Load-bearing corrections", items 1 & 4):**
 - Codex capability stamp is session-scoped by history mode: `{undo:true, redo:false}` ⟺ `CodexSession.history_mode == Some(Paginated)`; `{undo:false, redo:false}` for legacy threads AND for `None` — where `None` now means ONLY "the durable read found no parseable mode" (r3: resumed/adopted threads get their mode from the rollout's persisted `session_meta.history_mode` — validator-C proved persistence; freshell-codex already reads rollouts for durability — so a paginated thread keeps undo after normal rehydration; capability still never over-advertised). Never probed live per snapshot (the app-server exposes no mode read-back; the durable rollout meta is the source of truth, cached on the session record).
 - Claude/kilroy: `{undo:true, redo:true}` statically (no SDK capability query exists); old-CLI runtime failure classifies to `UNSUPPORTED_CAPABILITY` refusal at op time (never `INTERNAL_ERROR`).
-- Spawn-time version recording for all three providers (codex/OPENCODE/CLAUDE `--version` captured once per spawn into the structured log line and stashed on the session record for refusal classification).
+- ~~Spawn-time version recording for all three providers~~ — SUPERSEDED (Task-5 review Minor-1, explicitly dispositioned): refusal classification is error-shape-driven on all three lanes (codex -32600/-32601-or-unknown-method ⇒ legacy/old-CLI copies; opencode 404 ⇒ OPENCODE_OLD_CLI_COPY; claude explicit failure fold), and no pinned refusal copy consumes a detected version. Capturing `--version` costs one extra process spawn per session spawn and duplicates diagnostics already present at the provider error site; not required by the request. Follow-up recording lives in the progress ledger.
 
 **Files:**
 - Modify: `crates/freshell-freshagent/src/codex.rs:3620-3663` (`build_codex_snapshot_json` gains a `rollback: Option<&RollbackRecord>` param; `get_snapshot` call sites load the record)
