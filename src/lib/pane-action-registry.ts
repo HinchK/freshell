@@ -36,13 +36,17 @@ const editorRegistry = new Map<string, EditorActions>()
 const browserRegistry = new Map<string, BrowserActions>()
 
 /** kata 1wxv: fresh-agent pane rollback actions (undo/redo last turn), consumed
- * by the pane context menu. canUndo/canRedo are stamped per registration from the
- * owning view's snapshot capability + busy state. */
+ * by the pane context menu. undoSupported/redoSupported stamp the provider's
+ * snapshot capabilities (codex is undo-only) and decide ROW PRESENCE; canUndo/
+ * canRedo are stamped per registration from the owning view's busy state and
+ * decide ENABLED state on shown rows. */
 export type FreshAgentPaneActions = {
   undo: () => void
   redo: () => void
   canUndo: boolean
   canRedo: boolean
+  undoSupported: boolean
+  redoSupported: boolean
 }
 
 const freshAgentActionsRegistry = new Map<string, FreshAgentPaneActions>()

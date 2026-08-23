@@ -21,6 +21,7 @@ import {
   UNDO_REFILL_NOTICE,
   rollbackUnsupportedNotice,
 } from '@/lib/fresh-agent-rollback'
+import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -6641,5 +6642,132 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
     })
 
     expect(screen.getByText(serverCopy)).toBeInTheDocument()
+  })
+
+  it('a re-delivered rolledBack ack with the SAME requestId NEVER re-refills the composer (consume-once per requestId)', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The SAME ack frame delivered twice (ws redundancy / reconnect replays can
+    // re-deliver); the pending-rollback dedupe list consumes exactly once per
+    // requestId, so the refill effect fires exactly once.
+    const ackFrame = {
+      type: 'freshAgent.event',
+      sessionId: 'ses_rollback',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.rolledBack',
+        requestId: String(frame?.requestId),
+        sessionId: 'ses_rollback',
+        direction: 'undo',
+        mode: 'step',
+        removedPromptText: 'the removed prompt',
+        removedTurnIds: ['u1', 'a1'],
+        canRedo: true,
+      },
+    }
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+    await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
+
+    // A user edit after the refill must survive the replayed ack — a second
+    // refill would clobber it with 'the removed prompt' again.
+    fireEvent.change(getComposer(), { target: { value: 'post-refill edit' } })
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+
+    expect(getComposer().value).toBe('post-refill edit')
+  })
+
+  it('a freshcodex pane stamps undo-only rollback capabilities on the pane-action registry (NEVER redo)', async () => {
+    // The server stamps undo:true / redo:false for freshcodex — the registry must
+    // never carry a redo capability for the context menu to offer.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex rollback caps',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      rollback: { canRedo: false, undoneDepth: 0 },
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-caps-codex',
+        sessionId: 'thread-caps-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(false)
+      expect(actions?.canUndo).toBe(true)
+    })
+  })
+
+  it('a freshclaude pane with canRedo stamps both rollback capabilities on the pane-action registry (the menu row is offered, enabled)', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Claude rollback caps',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-caps-claude',
+        sessionId: CLAUDE_THREAD_ID,
+        status: 'connected',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(true)
+      expect(actions?.canRedo).toBe(true)
+    })
   })
 })

@@ -2200,7 +2200,11 @@ export function FreshAgentView({
     redo: () => sendRollback('redo', 'step'),
     canUndo: canRollback && !isBusy && Boolean(snapshot?.sessionId ?? paneContent.sessionId),
     canRedo: canRedoNow && !isBusy,
-  }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, paneContent.sessionId])
+    // Capability stamps drive menu ROW PRESENCE: codex stamps redo:false
+    // server-side, so its menu never offers a dead "Redo last turn" row.
+    undoSupported: canRollback,
+    redoSupported: snapshot?.capabilities?.redo === true,
+  }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
   // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
   // through -- never surfaced as a pane-level error banner.
   const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'
