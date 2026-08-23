@@ -200,7 +200,367 @@ check "explicit account pin wins BEFORE the ladder (no probe, no exports, silent
   ' _ "$(field "$OUT" rc)" "$(field "$OUT" pin)" "$(field "$OUT" account)" \
       "$SELECTOR_MARKER" "$LADDER_STDERR"
 
-# WRAPPER-LEVEL-CHECKS-ANCHOR (Task 2 appends here)
+# ---------------------------------------------------------------------------
+# Wrapper-level: the ladder drives --account on REAL wrapper cloud runs
+# (stubbed gcloud/docker; green-run shape mirrors cloud-exec-id-parse.test.sh).
+# ---------------------------------------------------------------------------
+echo "--- Wrapper-level identity checks ---"
+
+GTDIR="$TDIR/gcloud-stub"
+mkdir -p "$GTDIR"
+# Exported: the fake gcloud/docker run as wrapper CHILD processes and read it.
+export GREEN_LOG="$TDIR/green-gcloud.log"
+
+# Green-run fake gcloud. images describe reports the image MISSING (exit 1)
+# so every run also crosses the build lane (builds submit stubbed); the job
+# lifecycle succeeds for any --shards value. Records every argv in $GREEN_LOG
+# and every --account token (one per line) in $GREEN_LOG.accounts — an ABSENT
+# accounts file is the proof that every call omitted --account.
+cat > "$GTDIR/gcloud" <<'GREEN_FAKE'
+#!/usr/bin/env bash
+echo "GCLOUD_ARGS: $*" >> "${GREEN_LOG:?set GREEN_LOG}"
+# Shell redirection creates its target eagerly, so `grep ... >> FILE` would
+# materialize an EMPTY accounts file even when no --account token exists —
+# breaking every "--account was omitted" assertion. Capture, write only when
+# non-empty: an ABSENT accounts file therefore proves omission.
+ACCT_TOKENS="$(grep -oP -- '--account=\S+' <<< "$*" 2>/dev/null || true)"
+if [ -n "$ACCT_TOKENS" ]; then printf '%s\n' "$ACCT_TOKENS" >> "${GREEN_LOG}.accounts"; fi
+if [[ "$*" == *"info"* ]]; then echo "/nonexistent-sdk-root"; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 1; fi
+if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
+if [[ "$*" == *"artifacts repositories create"* ]]; then exit 0; fi
+if [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
+# Substring-match order matters: "run jobs executions list|logs read" CONTAINS
+# "run jobs execute" as a substring, so the specific execution subcommands are
+# matched BEFORE the bare execute branch. (Nested-suite fakes use the same
+# discipline.)
+if [[ "$*" == *"executions list"* ]]; then echo "green-exec-1"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
+if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"succeededCount"* ]]; then
+    N=$(grep -oP -- '--tasks=\K[0-9]+' "${GREEN_LOG}" | tail -1)
+    echo "${N:-1}"
+  else
+    echo "0"
+  fi
+  exit 0
+fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution [green-exec-1] has successfully completed."; exit 0; fi
+if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
+exit 0
+GREEN_FAKE
+cat > "$GTDIR/docker" <<'GREEN_DOCKER'
+#!/usr/bin/env bash
+if [ ! -t 0 ]; then cat >/dev/null 2>&1 || true; fi
+exit 0
+GREEN_DOCKER
+chmod +x "$GTDIR/gcloud" "$GTDIR/docker"
+
+# Distinctive values per rung and pin source so the accounts log proves
+# WHICH token won, never just that some token appeared.
+RUNG2_IDENT="rung2-bypass@example.invalid"
+RUNG3_ROBOT="rung3-robot@example.invalid"
+FLAG_ACCOUNT="flag-wins@example.invalid"
+ENV_ACCOUNT="env-wins@example.invalid"
+
+reset_green() {
+  rm -f "$GREEN_LOG" "$GREEN_LOG.accounts" "$SELECTOR_MARKER" "$SELECTOR_MARKER.env"
+  touch "$GREEN_LOG"
+}
+
+# Every gcloud invocation that COULD pin an account DID pin this exact one:
+# the accounts log must contain one token per logged gcloud call (the bare
+# `gcloud info` PATH-probe call takes no flags and is excluded), all equal to
+# the expected value, and non-empty — an omit/present mix or an empty log
+# both fail.
+accounts_all_equal() {
+  [ -s "$GREEN_LOG.accounts" ] || return 1
+  local calls tokens
+  calls=$(grep '^GCLOUD_ARGS:' "$GREEN_LOG" | grep -vc '^GCLOUD_ARGS: info ')
+  tokens=$(wc -l < "$GREEN_LOG.accounts")
+  [ "$calls" -gt 0 ] && [ "$calls" -eq "$tokens" ] && \
+    [ "$(sort -u "$GREEN_LOG.accounts" | wc -l)" = "1" ] && \
+    [ "$(sort -u "$GREEN_LOG.accounts" | head -1)" = "--account=$1" ]
+}
+
+# --- W1: e2e rung 2 — GCLOUD_IDENT drives every pinned call ----------------
+reset_green
+W1_ERR="$TDIR/w1.err"
+W1_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+         "$WRAPPER_E2E" run --cloud --shards=1 2>"$W1_ERR") && W1_RC=0 || W1_RC=$?
+check "W1 e2e rung-2: run succeeds with GCLOUD_IDENT pinned on every call, selector untouched, silent" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "All tasks completed successfully" <<<"$2" &&
+    [ ! -s "$3" ]
+  ' _ "$W1_RC" "$W1_OUT" "$W1_ERR"
+check "W1 e2e rung-2: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+check "W1 e2e rung-2: selector never ran and no hardcoded human account appeared" \
+  bash -c '[ ! -e "$1" ] && ! grep -q "dan@danshapiro" "$2"' _ "$SELECTOR_MARKER" "$GREEN_LOG"
+
+# --- W2: e2e rung 1 — a flag pin wins BEFORE the ladder runs --------------
+reset_green
+W2_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+         "$WRAPPER_E2E" run --cloud --shards=1 --account="$FLAG_ACCOUNT" 2>/dev/null) && W2_RC=0 || W2_RC=$?
+check "W2 e2e rung-1: --account= flag wins over env and ladder" \
+  bash -c '[ "$1" = "0" ]' _ "$W2_RC"
+check "W2 e2e rung-1: every gcloud call pinned to the flag value" \
+  accounts_all_equal "$FLAG_ACCOUNT"
+check "W2 e2e rung-1: the ladder never ran for a pinned call (no probe, even with HOME set)" \
+  bash -c '[ ! -e "$1" ]' _ "$SELECTOR_MARKER"
+
+# --- W3: e2e rung 1b — FRESHELL_GCP_ACCOUNT wins BEFORE the ladder --------
+reset_green
+W3_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+         "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null) && W3_RC=0 || W3_RC=$?
+check "W3 e2e env-pin: FRESHELL_GCP_ACCOUNT wins over the ladder" \
+  bash -c '[ "$1" = "0" ]' _ "$W3_RC"
+check "W3 e2e env-pin: every gcloud call pinned to the env value" \
+  accounts_all_equal "$ENV_ACCOUNT"
+check "W3 e2e env-pin: the ladder never ran for a pinned call" \
+  bash -c '[ ! -e "$1" ]' _ "$SELECTOR_MARKER"
+
+# --- W4: e2e rung 3 — the probe result takes the pinned slot ---------------
+reset_green
+W4_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+         "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null) && W4_RC=0 || W4_RC=$?
+check "W4 e2e rung-3: probed identity pins every call; selector ran once w/ lane probe" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ "$(wc -l < "$2")" = "1" ] &&
+    grep -q "project=misc-puttering-project probe=run.jobs.run" "$2.env"
+  ' _ "$W4_RC" "$SELECTOR_MARKER"
+check "W4 e2e rung-3: every gcloud call pinned to the probed robot" \
+  accounts_all_equal "$RUNG3_ROBOT"
+
+# --- W5: e2e rung 4 — nothing resolves: --account omitted, one note ---------
+reset_green
+W5_ERR="$TDIR/w5.err"
+W5_OUT=$(env "${SCRUB[@]}" \
+         PATH="$GTDIR:$PATH" "$WRAPPER_E2E" run --cloud --shards=1 2>"$W5_ERR") && W5_RC=0 || W5_RC=$?
+check "W5 e2e ambient: run succeeds, --account omitted everywhere, one ambient note" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "All tasks completed successfully" <<<"$2" &&
+    [ ! -e "$3" ] &&
+    [ "$(wc -l < "$4")" = "1" ] &&
+    grep -q "skill not found .* using ambient gcloud" "$4"
+  ' _ "$W5_RC" "$W5_OUT" "$GREEN_LOG.accounts" "$W5_ERR"
+
+# --- W6: vitest parity — rung-2 pin and rung-4 omission -------------------
+reset_green
+W6A_ERR="$TDIR/w6a.err"
+W6A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+          GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+          "$WRAPPER_VITEST" run --cloud --config=default --shards=2 2>"$W6A_ERR") && W6A_RC=0 || W6A_RC=$?
+check "W6a vitest rung-2: succeeds, every call pinned to GCLOUD_IDENT, selector untouched" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "All tasks completed successfully" <<<"$2" &&
+    [ ! -e "$3" ] && [ ! -s "$4" ]
+  ' _ "$W6A_RC" "$W6A_OUT" "$SELECTOR_MARKER" "$W6A_ERR"
+check "W6a vitest rung-2: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+reset_green
+W6B_ERR="$TDIR/w6b.err"
+W6B_OUT=$(env "${SCRUB[@]}" \
+          PATH="$GTDIR:$PATH" "$WRAPPER_VITEST" run --cloud --config=default --shards=2 2>"$W6B_ERR") && W6B_RC=0 || W6B_RC=$?
+check "W6b vitest ambient: run succeeds, --account omitted everywhere, one ambient note" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "All tasks completed successfully" <<<"$2" &&
+    [ ! -e "$3" ] &&
+    [ "$(wc -l < "$4")" = "1" ] &&
+    grep -q "skill not found .* using ambient gcloud" "$4"
+  ' _ "$W6B_RC" "$W6B_OUT" "$GREEN_LOG.accounts" "$W6B_ERR"
+
+# --- W7: the four pre-existing stubbed suites are probe-proof (trap 11) ----
+# Each pins GCLOUD_IDENT, so running them under a marker-trap
+# GCLOUD_ROBOT_HOME whose selector would FAIL must leave the marker untouched
+# AND the suites green: no nested wrapper invocation may reach the probe.
+# The scrub keeps any harness-level ladder knobs from leaking in and
+# invalidating the pin experiment.
+for nested in scripts/test/cloud-build.test.sh \
+              scripts/test/cloud-exec-id-parse.test.sh \
+              scripts/test/cloud-vitest-wrapper.test.sh \
+              scripts/test/cloud-run-wrapper.test.sh; do
+  rm -f "$SELECTOR_MARKER"
+  env "${SCRUB[@]}" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_FAIL=1 \
+    bash "$nested" >"$TDIR/nested.log" 2>&1 && NESTED_RC=0 || NESTED_RC=$?
+  check "W7 trap-11: $nested green and probe-free under hostile GCLOUD_ROBOT_HOME" \
+    bash -c '[ "$1" = "0" ] && [ ! -e "$2" ]' _ "$NESTED_RC" "$SELECTOR_MARKER"
+done
+
+# --- W8: help works with no gcloud, no account, fake HOME — and silently ---
+# The silence assertion matches ONLY the ladder's runtime diagnostic prefixes
+# ("gcloud-robot: skill not found", "gcloud-robot: no probed identity") — the
+# help text itself legitimately documents the ladder by name (E11), so a bare
+# "gcloud-robot" match would forbid the docs and break the suite by design.
+CLEAN_PATH="$PATH"
+if GCLOUD_PATH_RESOLVED=$(command -v gcloud 2>/dev/null); then
+  GCLOUD_DIRNAME="$(cd "$(dirname "$GCLOUD_PATH_RESOLVED")" && pwd)"
+  CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -vx "$GCLOUD_DIRNAME" | paste -sd:)"
+  if [ "$CLEAN_PATH" = "$PATH" ]; then
+    echo "FAIL: could not construct a gcloud-free PATH (gcloud dir not on PATH?)"
+    FAILURES=$((FAILURES + 1))
+    CLEAN_PATH=""
+  fi
+fi
+if [ -n "$CLEAN_PATH" ]; then
+  # NOTE: `command -v` is a shell builtin; it must run INSIDE a shell (`env
+  # PATH=... bash -c ...`) — `env PATH=... command -v gcloud` tries to exec
+  # a program named "command", returns 127 unconditionally, and would
+  # certify a non-clean PATH. (The same latent bug exists in
+  # cloud-run-wrapper.test.sh check 12 — pre-existing, out of scope here.)
+  if env PATH="$CLEAN_PATH" bash -c 'command -v gcloud >/dev/null 2>&1'; then
+    echo "FAIL: gcloud still resolvable on the filtered PATH"
+    FAILURES=$((FAILURES + 1))
+  else
+    for wrapper_pair in "E2E:$WRAPPER_E2E" "VITEST:$WRAPPER_VITEST"; do
+      lane="${wrapper_pair%%:*}"
+      wrapper="${wrapper_pair#*:}"
+      rm -f "$SELECTOR_MARKER"
+      HELP_OUT=$(env "${SCRUB[@]}" PATH="$CLEAN_PATH" \
+        GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+        "$wrapper" help 2>&1) && HELP_RC=0 || HELP_RC=$?
+      check "W8 $lane help: exit 0, prints usage, no identity activity, silent" \
+        bash -c '
+          [ "$1" = "0" ] && grep -qi "usage" <<<"$2" &&
+          ! grep -qE "gcloud-robot: (skill not found|no probed identity)" <<<"$2" && [ ! -e "$3" ]
+        ' _ "$HELP_RC" "$HELP_OUT" "$SELECTOR_MARKER"
+    done
+  fi
+fi
+
+# --- W9: the vitest local lane never wakes the ladder ----------------------
+rm -f "$SELECTOR_MARKER"
+W9_OUT=$(env "${SCRUB[@]}" \
+         GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+         "$WRAPPER_VITEST" run --local --config=default test/unit/lib/pane-utils.test.ts 2>&1) \
+  && W9_RC=0 || W9_RC=$?
+check "W9 vitest --local: runs real local vitest, no selector, no ladder output" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -qE "Test Files|passed" <<<"$2" &&
+    ! grep -qE "gcloud-robot: (skill not found|no probed identity)" <<<"$2" && [ ! -e "$3" ]
+  ' _ "$W9_RC" "$W9_OUT" "$SELECTOR_MARKER"
+
+# --- W12: e2e standalone lanes (build / push / logs) run their OWN ladder ---
+# cmd_run populates GCP_ACCOUNT before delegating to cmd_build/cmd_push, so
+# run-based checks can NEVER catch a missing resolver or a missing pin-parse
+# loop on the standalone lanes. These exercise them directly.
+
+# W12a: standalone build — probe selects, with the BUILD-lane probe permission.
+reset_green
+W12A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+  GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+  "$WRAPPER_E2E" build 2>/dev/null) && W12A_RC=0 || W12A_RC=$?
+check "W12a e2e standalone build: probe identity selected once, build-lane probe permission" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ "$(wc -l < "$2")" = "1" ] &&
+    grep -q "project=misc-puttering-project probe=cloudbuild.builds.create" "$2.env"
+  ' _ "$W12A_RC" "$SELECTOR_MARKER"
+check "W12a e2e standalone build: every gcloud call pinned to the probed robot" \
+  accounts_all_equal "$RUNG3_ROBOT"
+
+# W12b: strict mode + absent skill must NOT fail an explicitly pinned
+# standalone build (rung-1 immunity — guards the short-circuit itself).
+reset_green
+W12B_ERR="$TDIR/w12b.err"
+W12B_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_ROBOT_REQUIRE=1 \
+  "$WRAPPER_E2E" build --account="$FLAG_ACCOUNT" 2>"$W12B_ERR") && W12B_RC=0 || W12B_RC=$?
+check "W12b e2e standalone build: --account pin wins, strict mode cannot fail it, silent" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "Cloud Build complete" <<<"$2" &&
+    [ ! -e "$3" ] && [ ! -s "$4" ]
+  ' _ "$W12B_RC" "$W12B_OUT" "$SELECTOR_MARKER" "$W12B_ERR"
+check "W12b e2e standalone build: every gcloud call pinned to the flag value" \
+  accounts_all_equal "$FLAG_ACCOUNT"
+
+# W12c: standalone push — rung-2 pin must reach describe/print-access-token.
+reset_green
+W12C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" push 2>/dev/null) && W12C_RC=0 || W12C_RC=$?
+check "W12c e2e standalone push: succeeds under rung-2 pin" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W12C_RC" "$W12C_OUT" "$SELECTOR_MARKER"
+check "W12c e2e standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W12d: standalone logs — rung-2 pin on BOTH calls, non-pin args passed through.
+reset_green
+W12D_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" logs --limit=3 --freshness=1d 2>/dev/null) && W12D_RC=0 || W12D_RC=$?
+check "W12d e2e standalone logs: list+read share the pinned identity, pass-through args preserved" \
+  bash -c '
+    [ "$1" = "0" ] && [ ! -e "$4" ] &&
+    grep "logs read" "$2" | grep -q -- "--limit=3" &&
+    grep "logs read" "$2" | grep -q -- "--freshness=1d"
+  ' _ "$W12D_RC" "$GREEN_LOG" "$W12D_OUT" "$SELECTOR_MARKER"
+check "W12d e2e standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W12e: standalone logs — flag pin wins on the logs lane (rung 1 there too).
+reset_green
+W12E_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_ROBOT_REQUIRE=1 \
+  "$WRAPPER_E2E" logs --account="$FLAG_ACCOUNT" 2>/dev/null) && W12E_RC=0 || W12E_RC=$?
+check "W12e e2e standalone logs: --account pin honored (rung 1), strict-mode immune" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W12E_RC" "$W12E_OUT" "$SELECTOR_MARKER"
+check "W12e e2e standalone logs: every gcloud call pinned to the flag value" \
+  accounts_all_equal "$FLAG_ACCOUNT"
+
+# --- W13: vitest standalone lanes (build / push / logs) — parity pins -------
+# W13a: standalone build via probe.
+reset_green
+W13A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+  GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+  "$WRAPPER_VITEST" build 2>/dev/null) && W13A_RC=0 || W13A_RC=$?
+check "W13a vitest standalone build: probe identity selected once, build-lane probe permission" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ "$(wc -l < "$2")" = "1" ] &&
+    grep -q "project=misc-puttering-project probe=cloudbuild.builds.create" "$2.env"
+  ' _ "$W13A_RC" "$SELECTOR_MARKER"
+check "W13a vitest standalone build: every gcloud call pinned to the probed robot" \
+  accounts_all_equal "$RUNG3_ROBOT"
+
+# W13b: standalone push under rung-2 pin.
+reset_green
+W13B_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_VITEST" push 2>/dev/null) && W13B_RC=0 || W13B_RC=$?
+check "W13b vitest standalone push: succeeds, every gcloud call pinned to GCLOUD_IDENT" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W13B_RC" "$W13B_OUT" "$SELECTOR_MARKER"
+check "W13b vitest standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W13c: standalone logs under rung-2 pin, pass-through preserved.
+reset_green
+W13C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_VITEST" logs --limit=2 2>/dev/null) && W13C_RC=0 || W13C_RC=$?
+check "W13c vitest standalone logs: pinned identity on both calls, pass-through preserved" \
+  bash -c '
+    [ "$1" = "0" ] && [ ! -e "$4" ] &&
+    grep "logs read" "$2" | grep -q -- "--limit=2"
+  ' _ "$W13C_RC" "$GREEN_LOG" "$W13C_OUT" "$SELECTOR_MARKER"
+check "W13c vitest standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# --- W10/W11: help documents every identity knob, no human default ---------
+E2E_HELP=$("$WRAPPER_E2E" help 2>&1)
+VITEST_HELP=$("$WRAPPER_VITEST" help 2>&1)
+for knob in GCLOUD_IDENT GCLOUD_ROBOT_HOME GCLOUD_ROBOT_REQUIRE FRESHELL_GCP_ACCOUNT; do
+  check "W10 e2e help mentions $knob" bash -c 'grep -q "$1" <<<"$2"' _ "$knob" "$E2E_HELP"
+  check "W11 vitest help mentions $knob" bash -c 'grep -q "$1" <<<"$2"' _ "$knob" "$VITEST_HELP"
+done
+check "W10 e2e help carries no hardcoded human account" \
+  bash -c '! grep -q "dan@danshapiro" <<<"$1"' _ "$E2E_HELP"
+check "W11 vitest help carries no hardcoded human account" \
+  bash -c '! grep -q "dan@danshapiro" <<<"$1"' _ "$VITEST_HELP"
+
+# DOC-CHECKS-ANCHOR (Task 3 appends here)
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
