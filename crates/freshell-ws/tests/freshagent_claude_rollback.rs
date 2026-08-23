@@ -291,6 +291,15 @@ impl PaneIdentitySink for TestLedgerSink {
             .ok()
             .filter(|r: &RollbackRecord| r.version == freshell_freshagent::ROLLBACK_RECORD_VERSION)
     }
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_rollback_row(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
 }
 
 fn test_settings_value() -> Value {

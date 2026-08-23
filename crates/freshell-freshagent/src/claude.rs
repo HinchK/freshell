@@ -71,6 +71,11 @@ const PROVIDER: &str = "claude";
 const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_CLAUDE_SIDECAR_ID";
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
 const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
+/// kata 1wxv task 4 review (C1): `handle_send`'s re-resolve cadence while a
+/// rollback holds the session's teardown→respawn window open. The loop is
+/// bounded by the rollback's own lifetime (`rollback_in_flight` membership
+/// clears when the handler ends, on EVERY terminal path).
+const MID_ROLLBACK_PARK_TICK: Duration = Duration::from_millis(10);
 
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -117,7 +122,9 @@ pub struct FreshClaudeState {
     /// Rollback-vs-rollback single-flight (kata 1wxv Task 4), keyed by the
     /// CURRENT durable id. [`Self::handle_rollback`] acquires it BEFORE the
     /// session's `turn_lock` (lock order: rollback_in_flight FIRST, then the
-    /// turn lock — never the reverse); `handle_send` NEVER consults it.
+    /// turn lock — never the reverse); `handle_send` never ACQUIRES it but
+    /// polls its membership (task 4 review C1) to PARK a send that resolves
+    /// inside the rollback's teardown→respawn window rather than refuse it.
     rollback_in_flight: crate::InFlightRegistry,
 }
 
@@ -245,10 +252,11 @@ struct ClaudeSession {
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
-    /// `handle_send` waits on it, then proceeds and destroys redo — and NEVER
-    /// acquires/consults `rollback_in_flight` (no circular wait exists). Carried
-    /// across the rollback's kill+respawn so a send that resolved its handle
-    /// before/after the record swap serializes identically.
+    /// `handle_send` waits on it, then proceeds and destroys redo — and never
+    /// ACQUIRES `rollback_in_flight` (task 4 review C1: it only polls membership
+    /// to park through the teardown→respawn window — no circular wait exists).
+    /// Carried across the rollback's kill+respawn so a send that resolved its
+    /// handle (or parked through the window) serializes identically.
     turn_lock: Arc<TokioMutex<()>>,
 }
 
@@ -800,33 +808,64 @@ impl FreshClaudeState {
 
         // Task 10b: a durable claude UUID resolves through `cli_index` to the live
         // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
-        let Some(map_key) = self.resolve_session_key(&session_id).await else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
-            return;
+        //
+        // kata 1wxv task 4 review (C1): a resolve/handles MISS while
+        // `rollback_in_flight` names this id means the rollback's teardown→respawn
+        // window swallowed the map entry (removed at teardown, re-inserted
+        // post-spawn under the SAME key with the turn lock carried across). PARK
+        // on the registry's membership and re-resolve instead of dying with
+        // SESSION_NOT_FOUND — the send then serializes BEHIND the rollback on the
+        // carried-over turn lock and lands on the POST-rollback (adopted) session
+        // («send waits, rollback wins, then destroys»). `handle_send` still never
+        // ACQUIRES `rollback_in_flight` (no circular wait exists): it only polls
+        // membership. A miss persisting after the rollback exits means the session
+        // is genuinely gone (a provably-rejected fork is torn down) — the honest
+        // SESSION_NOT_FOUND leg.
+        let (map_key, turn_lock, in_turn) = loop {
+            let handles = match self.resolve_session_key(&session_id).await {
+                Some(key) => {
+                    let guard = self.sessions.lock().await;
+                    guard
+                        .get(&key)
+                        .map(|s| (key, s.turn_lock.clone(), s.in_turn.clone()))
+                }
+                None => None,
+            };
+            if let Some(handles) = handles {
+                break handles;
+            }
+            if !self.rollback_in_flight.contains(&session_id) {
+                self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                return;
+            }
+            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
         };
-        // kata 1wxv Task 4 (r2 serialization discipline): read the handles, then
-        // hold the session turn lock across the busy-set AND the sidecar write —
-        // the check-then-set window vs `handle_rollback`'s busy gate is closed (a
-        // rollback holding this lock observes either no-send or a fully-marked
-        // in-flight turn). `handle_send` NEVER acquires/consults
-        // `rollback_in_flight`: while a rollback holds this lock the send waits,
-        // then proceeds and destroys redo («send waits, rollback wins, then
-        // destroys»).
-        let (turn_lock, in_turn, destroy_target) = {
+        // r2 serialization discipline: hold the session turn lock across the
+        // busy-set AND the sidecar write — the check-then-set window vs
+        // `handle_rollback`'s busy gate is closed (a rollback holding this lock
+        // observes either no-send or a fully-marked in-flight turn). The lock
+        // handle is carried across the rollback's kill+respawn, so a send that
+        // resolved before the teardown window serializes identically to one that
+        // parked through it.
+        let _turn = turn_lock.lock().await;
+        // Task 4 review (C1b): the destroy target comes from POST-lock session
+        // state — a rollback holding this lock may have RE-KEYED the durable id
+        // (the rollback-row MOVE old→new) while we parked. Keying the destroy by
+        // the pre-MOVE id would no-op `destroy_redo_on_submit` and leak redo
+        // (decision 5): `destroy_redo_on_submit` keys the record by its CURRENT
+        // durable id, i.e. the session record's `cli_session_id` after the
+        // adoption re-key. A bare pre-init placeholder can have no rollback
+        // record — the addressed canonical id is its only possible key then.
+        let destroy_target = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
-                Some(s) => (
-                    s.turn_lock.clone(),
-                    s.in_turn.clone(),
-                    // decision 5's destroy keys the rollback record by its DURABLE
-                    // id: the canonical wire id first, else the recorded cli id; a
-                    // bare pre-init placeholder can have no rollback record at all.
+                Some(s) => s.cli_session_id.clone().or_else(|| {
                     if is_canonical_claude_uuid(&session_id) {
                         Some(session_id.clone())
                     } else {
-                        s.cli_session_id.clone()
-                    },
-                ),
+                        None
+                    }
+                }),
                 None => {
                     drop(guard);
                     self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
@@ -834,7 +873,6 @@ impl FreshClaudeState {
                 }
             }
         };
-        let _turn = turn_lock.lock().await;
         if let Some(durable) = destroy_target.as_deref() {
             // Decision 5: any new submission permanently destroys redo (the
             // redo-capable chain state only — the marker union is never touched).
@@ -1166,24 +1204,28 @@ impl FreshClaudeState {
     }
 
     /// Task-4 compensation: a fork/create failure AFTER the rollback record's
-    /// successful pre-write REWRITES the pre-op record before the refusal is
+    /// successful pre-write UNDOES that pre-write before the refusal is
     /// answered — fork-at-point provably never mutates the ORIGINAL's history
     /// (the Stage-2 hash-identical invariant), so the ledger must not describe a
     /// rollback that never took effect. The provider-mutation triad (codex's
     /// Rpc-vs-transport split) has no claude analog: EVERY claude failure leg is
-    /// provably-unmoved by construction.
+    /// provably-unmoved by construction. Task 4 review (Minor-3): when the
+    /// pre-op record was ABSENT, the faithful restore of "nothing was here" is
+    /// a DELETE of the just-created row — never a fabricated empty record.
     async fn compensate_rollback_record(
         &self,
         durable_id: &str,
         existing: Option<crate::rollback_record::RollbackRecord>,
-        now: i64,
     ) {
-        use crate::rollback_record::RollbackRecord;
-        if let Some(sink) = self.identity_sink() {
-            let restore = existing.unwrap_or_else(|| RollbackRecord::empty(now));
-            if let Err(e) = sink.record_rollback(PROVIDER, durable_id, restore).await {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_compensate_failed");
-            }
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        let result = match existing {
+            Some(restore) => sink.record_rollback(PROVIDER, durable_id, restore).await,
+            None => sink.delete_rollback(PROVIDER, durable_id).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_compensate_failed");
         }
     }
 
@@ -1287,7 +1329,9 @@ impl FreshClaudeState {
             }
         };
         // Rollback-vs-rollback single-flight (lock order: FIRST, before the turn
-        // lock — never the reverse). handle_send NEVER touches this registry.
+        // lock — never the reverse). handle_send never acquires this registry —
+        // it only POLLS membership to park through the teardown→respawn window
+        // (task 4 review C1).
         let Some(_guard) = self.rollback_in_flight.try_acquire(&durable_id) else {
             reply_sink(rollback_error_frame(
                 &op,
@@ -1462,15 +1506,11 @@ impl FreshClaudeState {
                     }
                 };
                 let tip = snap::raw_chain_tip(&root_text);
-                // The resumeDropsTurn guard uuid = the removed step's anchor —
-                // the first removed display turn's uuid (brief/SDK semantics:
+                // The resumeDropsTurn guard uuid = the RAW chain entry at the
+                // removed step's first position (task 4 review nit 4 — SDK-exact
+                // + cheaper than the display projection; brief/SDK semantics:
                 // the guard declares the discarded turn's prompt).
-                let guard = point
-                    .removed_turns
-                    .first()
-                    .and_then(|t| t.get("turnId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                let guard = point.guard_uuid.clone();
                 // can_redo after the undo: the removed content provably exists in
                 // the original beyond the resume point (on the r2 first-turn leg
                 // the fresh conversation's tip is NONE — strictly beyond holds
@@ -1534,7 +1574,21 @@ impl FreshClaudeState {
                     ));
                     return;
                 };
-                let current_text = std::fs::read_to_string(&current_path).unwrap_or_default();
+                // Task 4 review (Minor-2): classify the read OUTCOME — a missing
+                // file (or a raced deletion) is the DELIBERATE vacuous-empty leg
+                // (the post-first-turn-undo empty transcript; LCP admits the
+                // first group end), but any REAL read error on this
+                // existing-expected path is a loud INTERNAL_ERROR, exactly like
+                // the original's read leg above — never a silent empty-chain
+                // degradation yielding a false `redone` ack plus a pointless fork.
+                let current_text = match std::fs::read_to_string(&current_path) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                        return;
+                    }
+                };
                 // Redo validity contract (wire design; LBC-9): the original must
                 // BE the history the undo observed — raw-chain tip == the
                 // recorded tip — AND the current chain must still be a strict
@@ -1802,7 +1856,7 @@ impl FreshClaudeState {
         let spawned = match spawned {
             Ok(ok) => ok,
             Err(err) => {
-                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                self.compensate_rollback_record(&durable_id, existing.clone())
                     .await;
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -1867,7 +1921,7 @@ impl FreshClaudeState {
             _ => {
                 tracing::error!(target: "invariant", session = %durable_id,
                     "freshagent.claude.rollback_adoption_failed: the consumer never resolved the init adoption");
-                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                self.compensate_rollback_record(&durable_id, existing.clone())
                     .await;
                 // Tear the fork down — an unadopted fork must never answer sends.
                 self.teardown_rollback_fork(&map_key).await;
@@ -1888,7 +1942,7 @@ impl FreshClaudeState {
         // keep the fork — tear down, compensate, refuse.
         if let Some(mut g) = lease_guard.take() {
             if !g.complete(&map_key) {
-                self.compensate_rollback_record(&durable_id, existing.clone(), now)
+                self.compensate_rollback_record(&durable_id, existing.clone())
                     .await;
                 self.teardown_rollback_fork(&map_key).await;
                 g.fail(); // own tree torn down — reopen the key
@@ -3885,6 +3939,15 @@ import readline from 'node:readline'
 
 const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
 const respondLog = process.env.FRESHELL_TEST_CLAUDE_RESPOND_LOG
+// Task 4 review (C1) determinism knob: DEFER every create ANSWER by N ms. The
+// create request is still logged IMMEDIATELY (the spawn-log gate observes the
+// rollback parked inside its respawn), so a test can fire a send while the
+// rollback deterministically waits on `created` — the mid-rollback send
+// interleaving is guaranteed, never luck.
+const deferCreateMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS || '0', 10)
+// Task 4 review (M3) provable-rejection knob: die on create like a spawn-time
+// provider rejection (EOF before `created`).
+const failCreate = process.env.FRESHELL_TEST_CLAUDE_FAIL_CREATE === '1'
 
 let counter = 0
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
@@ -3903,18 +3966,23 @@ rl.on('line', (line) => {
     if (spawnLog) {
       fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
     }
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
-    // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
-    // id when present (resume continuity), else a fixed fake uuid.
-    // Task 4 (kata 1wxv): a forkSession:true create mints a FRESH durable id,
-    // never an echo — fork-at-point adoption depends on the id changing.
-    const cliSessionId = msg.forkSession === true
-      ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
-      : (msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
-    console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
-    console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
+    if (failCreate) process.exit(1)
+    const answer = () => {
+      counter += 1
+      const sessionId = `fake-claude-session-${process.pid}-${counter}`
+      process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
+      // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
+      // id when present (resume continuity), else a fixed fake uuid.
+      // Task 4 (kata 1wxv): a forkSession:true create mints a FRESH durable id,
+      // never an echo — fork-at-point adoption depends on the id changing.
+      const cliSessionId = msg.forkSession === true
+        ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
+        : (msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+      console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
+      console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
+    }
+    if (deferCreateMs > 0) setTimeout(answer, deferCreateMs)
+    else answer()
   } else if (msg.type === 'send') {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
@@ -3972,6 +4040,14 @@ rl.on('line', (line) => {
     }
     impl FakeClaudeSidecarEnv {
         fn install() -> Self {
+            Self::install_with_knobs(None, false)
+        }
+
+        /// `install` + the fake sidecar's scripted knobs (see the source header):
+        /// `defer_create_ms` delays every create ANSWER (the request is logged
+        /// immediately — a test can park the rollback inside its respawn);
+        /// `fail_create` makes every create a spawn-time provider rejection.
+        fn install_with_knobs(defer_create_ms: Option<u64>, fail_create: bool) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "freshell-fake-claude-sidecar-{}",
                 uuid::Uuid::new_v4()
@@ -3990,6 +4066,17 @@ rl.on('line', (line) => {
             std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
             std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
             std::env::set_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG", &respond_log);
+            match defer_create_ms {
+                Some(ms) => {
+                    std::env::set_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS", ms.to_string())
+                }
+                None => std::env::remove_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS"),
+            }
+            if fail_create {
+                std::env::set_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE", "1");
+            } else {
+                std::env::remove_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE");
+            }
             Self {
                 dir,
                 spawn_log,
@@ -4049,6 +4136,8 @@ rl.on('line', (line) => {
             std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
             std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG");
             std::env::remove_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG");
+            std::env::remove_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS");
+            std::env::remove_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE");
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -6155,16 +6244,25 @@ rl.on('line', (line) => {
     }
 
     /// The r2 lock discipline on the claude lane: a send fired mid-rollback waits on
-    /// the per-session turn lock (handle_send NEVER consults rollback_in_flight),
-    /// then proceeds against the POST-rollback session and destroys redo.
+    /// the per-session turn lock (handle_send NEVER acquires rollback_in_flight — it
+    /// only PARKS on the registry's membership while the rollback's teardown→respawn
+    /// window hides the map entry), then proceeds against the POST-rollback session
+    /// and destroys redo.
+    ///
+    /// DETERMINISM (task 4 review C1): the fake sidecar's create ANSWER is deferred
+    /// 750ms — the spawn-log gate observes the create request receipt while the
+    /// rollback is PARKED inside `read_created`, so the send provably arrives in the
+    /// teardown→respawn window (the map entry is already removed). Pre-fix the send
+    /// died with SESSION_NOT_FOUND on a resolve-before-lock; post-fix it parks,
+    /// serializes behind the rollback, and lands on the adopted session.
     #[tokio::test]
     async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
+        let env = FakeClaudeSidecarEnv::install_with_knobs(Some(750), false);
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         write_rollback_transcript(home.path(), "dur-serial", &two_turn_transcript());
-        let (st, _rx) = state_with_bus();
+        let (st, mut rx) = state_with_bus();
         let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(sink_impl.clone());
         insert_rollback_fixture_session(&st, "serial-live", "dur-serial").await;
@@ -6179,9 +6277,11 @@ rl.on('line', (line) => {
                 .await
             })
         };
-        // Wait until the rollback is parked INSIDE the respawn (its fork create
-        // request has landed at the fake sidecar) — the rollback already holds the
-        // session turn lock at this point.
+        // Wait until the rollback is parked INSIDE the respawn: the fork create
+        // request has landed at the fake sidecar (spawn-log receipt) AND its answer
+        // stays deferred for 750ms — the rollback already holds the session turn
+        // lock and the map entry is already removed. The send fired below provably
+        // arrives in the mid-rollback window.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while env.spawn_count() < 1 {
             assert!(
@@ -6227,8 +6327,17 @@ rl.on('line', (line) => {
                 .starts_with("fake-claude-session-"),
             "the send addressed the freshly-adopted sidecar: {send_frame}"
         );
-        // And destroy_redo_on_submit ran against the post-rollback record
-        // ("send waits, rollback wins, then destroys").
+        // SESSION_NOT_FOUND is structurally impossible on this lane: the send
+        // parked while the rollback was in flight, never resolved-before-lock.
+        while let Ok(raw) = rx.try_recv() {
+            assert!(
+                !raw.contains("SESSION_NOT_FOUND"),
+                "no SESSION_NOT_FOUND frame may ever surface for a mid-rollback send: {raw}"
+            );
+        }
+        // And destroy_redo_on_submit ran against the POST-rollback record —
+        // keyed by the adopted durable id (the post-lock session state), never
+        // the pre-MOVE id ("send waits, rollback wins, then destroys").
         let record = sink_impl
             .load_rollback("claude", &adopted)
             .expect("record under the adopted id");
@@ -6242,7 +6351,141 @@ rl.on('line', (line) => {
             1,
             "the marker bucket is NEVER touched by a destroy"
         );
+        assert!(
+            sink_impl.load_rollback("claude", "dur-serial").is_none(),
+            "the rollback row MOVED old→new; nothing remains under the pre-rollback id"
+        );
         std::env::remove_var("CLAUDE_CONFIG_DIR");
+        drop(env);
+    }
+
+    /// Task 4 review (Minor-2): a READ FAILURE on the redo's current transcript
+    /// (locate succeeded, bytes unreadable) is a loud INTERNAL_ERROR — never the
+    /// vacuous-empty leg (a silent false `redone` ack plus a pointless fork).
+    #[tokio::test]
+    async fn redo_current_transcript_read_failure_is_internal_error_with_no_fork_traffic() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        // Original: the recorded chain root (tip a2). Current (post-undo): the
+        // u1/a1 prefix — located, then made UNREADABLE.
+        write_rollback_transcript(home.path(), "dur-rf-orig", &two_turn_transcript());
+        write_rollback_transcript(
+            home.path(),
+            "dur-rf",
+            &two_turn_transcript()
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let current_path = home.path().join("projects/-t").join("dur-rf.jsonl");
+        std::fs::set_permissions(
+            &current_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
+        )
+        .unwrap();
+        if std::fs::read_to_string(&current_path).is_ok() {
+            // Root / CAP_DAC_OVERRIDE bypasses mode bits — restore + vacate.
+            std::fs::set_permissions(
+                &current_path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+            )
+            .unwrap();
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            eprintln!("skipping: euid bypasses permission checks");
+            return;
+        }
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink_impl
+            .record_rollback("claude", "dur-rf", {
+                let mut r = RollbackRecord::empty(100);
+                r.original_session_id = Some("dur-rf-orig".to_string());
+                r.original_tip_uuid = Some("a2".to_string());
+                r.set_can_redo(true, 100);
+                r
+            })
+            .await
+            .expect("seed write");
+        st.set_identity_sink(sink_impl.clone());
+        let stdin_log = insert_rollback_fixture_session(&st, "rb-rf", "dur-rf").await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-rf", "rb-rf-1", RollbackDirection::Redo),
+            sink,
+        )
+        .await;
+
+        std::fs::set_permissions(
+            &current_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .unwrap();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], "rb-rf-1");
+        // NO fork traffic: the read failure refused BEFORE any spawn, pending
+        // cancellation, or teardown.
+        assert_eq!(env.spawn_count(), 0, "a read failure forks nothing");
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap_or_default(), "");
+        assert!(
+            st.sessions.lock().await.contains_key("rb-rf"),
+            "the session was never torn down"
+        );
+        drop(env);
+    }
+
+    /// Task 4 review (Minor-3): a provably-rejected rollback (the fork create
+    /// dies before `created`) on a session with NO pre-op record compensates by
+    /// DELETING the pre-write row — never by fabricating an empty record.
+    #[tokio::test]
+    async fn rollback_spawn_rejection_compensates_by_deleting_a_fabricated_record_never_written() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install_with_knobs(None, true);
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-nocomp", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        insert_rollback_fixture_session(&st, "rb-nocomp", "dur-nocomp").await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-nocomp", "rb-nocomp-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], "rb-nocomp-1");
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "the fork create WAS attempted — the provable-rejection leg ran"
+        );
+        assert!(
+            sink_impl.load_rollback("claude", "dur-nocomp").is_none(),
+            "compensation deleted the pre-write row"
+        );
+        assert!(
+            !sink_impl
+                .rollbacks
+                .lock()
+                .unwrap()
+                .contains_key(&("claude".to_string(), "dur-nocomp".to_string())),
+            "the ledger holds NO row at all afterward — not even an empty record"
+        );
         drop(env);
     }
 }

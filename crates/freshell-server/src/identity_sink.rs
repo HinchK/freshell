@@ -181,6 +181,19 @@ impl PaneIdentitySink for LedgerIdentitySink {
             None
         }
     }
+
+    /// kata 1wxv task 4 review (M3): compensate-by-delete when the pre-op state
+    /// was ABSENT — the ledger row is deleted outright (never a fabricated
+    /// empty record). Same awaited-write discipline as `record_rollback`.
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_rollback_row(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
 }
 
 #[cfg(test)]

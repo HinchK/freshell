@@ -773,10 +773,15 @@ pub(crate) enum ResumeTarget {
 /// "before the first message" — LEGAL per r2: the handler takes the
 /// fresh-conversation leg, never a refusal), the removed display-turn slice
 /// (the marker bucket + ack payload), and the composer-refill prompt.
+/// `guard_uuid` is the `resumeDropsTurn` guard sourced from the RAW chain entry
+/// at the first removed position (SDK-exact + cheaper than the display
+/// projection — task 4 review nit 4); `None` on the first-turn leg (no fork →
+/// no guard is ever armed).
 pub(crate) struct ResumePoint {
     pub resume_at_uuid: Option<String>,
     pub removed_turns: Vec<Value>,
     pub prompt_text: String,
+    pub guard_uuid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -847,10 +852,19 @@ pub(crate) fn resolve_resume_point(
         })
         .collect();
     let prompt_text = user_prompt_text(&chain[first_remove_pos].obj);
+    // The resumeDropsTurn guard = the RAW chain entry at the first removed
+    // position (task 4 review nit 4: SDK-exact + cheaper than re-deriving it
+    // from the first removed DISPLAY turn — the projection filters carriers).
+    // Omitted on the first-turn leg (`resume_at_uuid: None` = the fresh
+    // conversation — no fork, so no guard is ever armed).
+    let guard_uuid = resume_at_uuid
+        .as_ref()
+        .map(|_| chain[first_remove_pos].uuid.clone());
     Ok(ResumePoint {
         resume_at_uuid,
         removed_turns,
         prompt_text,
+        guard_uuid,
     })
 }
 

@@ -75,6 +75,11 @@ pub trait PaneIdentitySink: Send + Sync {
     /// [`ROLLBACK_RECORD_VERSION`] answers `None` — never silently
     /// reinterpreted (the pane-ledger LEDGER_VERSION discipline).
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord>;
+    /// Delete the rollback row (kata 1wxv task 4 review M3): a compensation
+    /// whose pre-op state was ABSENT restores "nothing was here" by DELETE —
+    /// never by writing a fabricated empty record. Idempotent: deleting an
+    /// absent row succeeds (the ledger's `delete_rollback_row` discipline).
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -215,6 +220,15 @@ impl PaneIdentitySink for FakeIdentitySink {
             .get(&(provider.into(), session_id.into()))
             .cloned()
             .filter(|record| record.version == ROLLBACK_RECORD_VERSION)
+    }
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rollbacks
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
+        }
+        self.write_result()
     }
 }
 

@@ -2369,6 +2369,17 @@ impl InFlightRegistry {
             held,
         })
     }
+
+    /// Snapshot membership check — never an acquisition. Claude's `handle_send`
+    /// parks while a rollback names this durable id (kata 1wxv task 4 review C1):
+    /// a session-map resolve miss inside the rollback's teardown→respawn window
+    /// must WAIT for the re-insert, never refuse with SESSION_NOT_FOUND.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.keys
+            .lock()
+            .expect("in-flight registry lock")
+            .contains(key)
+    }
 }
 
 /// RAII release for an [`InFlightRegistry`] acquisition: removes its held key(s)
@@ -2384,6 +2395,25 @@ impl Drop for InFlightGuard {
         for key in &self.held {
             keys.remove(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod in_flight_registry_tests {
+    use super::*;
+
+    #[test]
+    fn contains_tracks_acquire_and_drop_without_acquiring() {
+        let registry = InFlightRegistry::new();
+        assert!(!registry.contains("dur-1"));
+        let guard = registry.try_acquire("dur-1").expect("first acquire");
+        assert!(registry.contains("dur-1"));
+        // contains is a snapshot, NOT an acquisition: a second try_acquire still
+        // refuses (single-flight) while contains never blocks.
+        assert!(registry.try_acquire("dur-1").is_none());
+        assert!(registry.contains("dur-1"));
+        drop(guard);
+        assert!(!registry.contains("dur-1"));
     }
 }
 
