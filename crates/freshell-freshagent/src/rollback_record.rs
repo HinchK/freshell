@@ -34,6 +34,11 @@ pub const CODEX_OLD_CLI_COPY: &str = "Rollback requires a newer Codex CLI (codex
 /// Server `UNSUPPORTED_CAPABILITY` copy when the opencode serve pre-dates the
 /// revert/unrevert routes (404/unknown route).
 pub const OPENCODE_OLD_CLI_COPY: &str = "Rollback requires a newer OpenCode CLI (opencode ≥1.18). Check the serve logs for the exact error.";
+/// Server `UNSUPPORTED_CAPABILITY` copy when the codex thread predates this
+/// feature (LBC-1): `thread/revert` refuses legacy threads
+/// (`-32600 "only supports paginated threads"`).
+pub const CODEX_LEGACY_THREAD_COPY: &str =
+    "Undo is unavailable for this session — it was started before conversation rollback support (codex threads created earlier use the legacy history format). Start a new session to undo.";
 /// Server `REDO_UNAVAILABLE` copy when the claude chain-root original's
 /// transcript moved since the undo (tip/LCP validity contract).
 pub const REDO_REMOVED_HISTORY_COPY: &str =
@@ -331,9 +336,35 @@ pub fn rollback_broadcast_frame(
     rollback_envelope(op, live_session_id, event)
 }
 
+/// Decision 5: any new submission (send/steer/queue firing) permanently
+/// destroys redo — the redo-capable CHAIN STATE only; `entries` (the r3 marker
+/// union) is NEVER touched and survives with the "rolled back" marker per
+/// decision 6. AWAITED before the prompt goes out. A write failure is
+/// returned — callers `tracing::warn!` it but never block the send and never
+/// emit a user-facing event (providers degrade gracefully: opencode natively
+/// deletes the reverted tail on send; claude's redo path re-validates the
+/// recorded tip). No-op returns when there is no record, nothing redo-capable
+/// to destroy, or redo is already destroyed.
+pub async fn destroy_redo_on_submit(
+    sink: &Option<crate::identity_sink::SharedPaneIdentitySink>,
+    provider: &str,
+    live_id: &str,
+    now_ms: i64,
+) -> Option<std::io::Error> {
+    let sink = sink.as_ref()?;
+    let mut record = sink.load_rollback(provider, live_id)?;
+    if record.redo_destroyed || (record.entries.is_empty() && record.original_session_id.is_none())
+    {
+        return None;
+    }
+    record.destroy_redo(now_ms); // sets redo_destroyed + clears can_redo; entries untouched (r3)
+    sink.record_rollback(provider, live_id, record).await.err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity_sink::PaneIdentitySink;
 
     fn entry(id_suffix: &str) -> RollbackEntry {
         RollbackEntry {
@@ -373,5 +404,93 @@ mod tests {
         let v = serde_json::to_value(&record).expect("serialize");
         let back: RollbackRecord = serde_json::from_value(v).expect("deserialize");
         assert_eq!(record, back);
+    }
+
+    // ── destroy_redo_on_submit (kata 1wxv decision 5) ───────────────────────
+
+    fn fake_sink_with(
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> std::sync::Arc<crate::identity_sink::FakeIdentitySink> {
+        let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink.rollbacks
+            .lock()
+            .unwrap()
+            .insert((provider.to_string(), session_id.to_string()), record);
+        sink
+    }
+
+    #[tokio::test]
+    async fn destroy_redo_on_submit_marks_redo_destroyed_and_keeps_the_markers() {
+        let sink = fake_sink_with("codex", "s1", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.set_can_redo(true, 61);
+            r
+        });
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = destroy_redo_on_submit(&Some(shared), "codex", "s1", 100).await;
+        assert!(
+            outcome.is_none(),
+            "a live write answers no error: {outcome:?}"
+        );
+        let record = sink.load_rollback("codex", "s1").expect("record survives");
+        assert!(
+            record.redo_destroyed,
+            "decision 5: the submission killed redo"
+        );
+        assert!(
+            !record.can_redo(),
+            "destroy also clears the stored can_redo bit"
+        );
+        assert_eq!(
+            record.last_op_at_ms, 100,
+            "the destroy lifts the revision floor"
+        );
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "decision 6: the r3 marker union is NEVER touched by a destroy"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_redo_on_submit_is_a_no_op_without_a_record_or_with_nothing_to_destroy() {
+        let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = destroy_redo_on_submit(&Some(shared), "codex", "s-absent", 100).await;
+        assert!(outcome.is_none());
+        assert!(
+            sink.rollbacks.lock().unwrap().is_empty(),
+            "no phantom rollback row is written for a session that never rolled back"
+        );
+
+        // An empty FRESH record (e.g. claude pre-first-undo shape) is also a no-op.
+        let sink = fake_sink_with("codex", "s-empty", RollbackRecord::empty(50));
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = destroy_redo_on_submit(&Some(shared), "codex", "s-empty", 100).await;
+        assert!(outcome.is_none());
+        let record = sink.load_rollback("codex", "s-empty").expect("record");
+        assert!(!record.redo_destroyed, "nothing to destroy — untouched");
+        assert_eq!(record.last_op_at_ms, 50, "a no-op lifts nothing");
+    }
+
+    #[tokio::test]
+    async fn destroy_redo_on_submit_is_idempotent_once_destroyed() {
+        let sink = fake_sink_with("codex", "s2", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.destroy_redo(70);
+            r
+        });
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = destroy_redo_on_submit(&Some(shared), "codex", "s2", 100).await;
+        assert!(outcome.is_none());
+        let record = sink.load_rollback("codex", "s2").expect("record");
+        assert!(
+            record.redo_destroyed && record.last_op_at_ms == 70,
+            "a second destroy is a true no-op (no rewrite, no restamp)"
+        );
     }
 }

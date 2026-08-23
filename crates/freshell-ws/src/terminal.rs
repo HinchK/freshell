@@ -1179,18 +1179,40 @@ async fn handle_client_text(
             true
         }
         // kata 1wxv Task 1: `freshAgent.undo`/`freshAgent.redo` land contract-first —
-        // until each provider leg (Tasks 2-4) replaces its cell with a real
+        // each provider leg (Tasks 2-4) replaces its refusal cell with a real
         // dispatch (which answers on the requesting connection via `conn_sink`,
-        // same shape as the fork arms), EVERY provider x op cell is answered
-        // with the pinned refusal text here. Codex x redo stays refused
-        // PERMANENTLY (decision 5 — codex has no redo primitive).
+        // same shape as the fork arms).
         ClientMessage::FreshAgentUndo(m) => {
-            conn_sink(rollback_refusal_frame(
-                &freshell_freshagent::RollbackRequest::from_undo(m),
-                "Undo is",
-            ));
+            // Task 2: the codex x undo cell is REAL DISPATCH now — the codex
+            // undo leg (`thread/revert`) answers the ack/error on the
+            // requesting connection and broadcasts `session.rolledBack`.
+            // Detached task, same shape as the fork arms (the rollback RPC
+            // chain never blocks the select loop).
+            if is_codex_provider(m.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_codex
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else {
+                conn_sink(rollback_refusal_frame(
+                    &freshell_freshagent::RollbackRequest::from_undo(m),
+                    "Undo is",
+                ));
+            }
             true
         }
+        // Codex x redo stays refused PERMANENTLY (decision 5 — codex history
+        // revert is destructive; there is no redo primitive); the claude/
+        // opencode redo legs land in Tasks 3/4.
         ClientMessage::FreshAgentRedo(m) => {
             conn_sink(rollback_refusal_frame(
                 &freshell_freshagent::RollbackRequest::from_redo(m),
