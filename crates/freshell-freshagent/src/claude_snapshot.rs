@@ -992,13 +992,39 @@ pub(crate) fn redo_resume_target(
     }
 }
 
+/// The canRedo chain-root RECHECK (kata 1wxv Task 5): the stored bit is a
+/// necessary but NOT sufficient condition — the CURRENT-epoch redo state comes
+/// from the chain root, so when `original_session_id` resolves, the original's
+/// raw-chain tip is RE-READ at snapshot time and must equal the recorded tip;
+/// a moved tip (or a compacted/GC'd/unreadable original, or a mismatching
+/// recorded tip) forces `canRedo:false` so no device shows a redo that Task 4
+/// would refuse with `REDO_UNAVAILABLE` + `REDO_REMOVED_HISTORY_COPY`. A record
+/// without an `original_session_id` keeps the stored bit as-is.
+fn claude_can_redo_now(record: &crate::rollback_record::RollbackRecord) -> bool {
+    if !record.can_redo() {
+        return false;
+    }
+    let Some(original) = record.original_session_id.as_deref() else {
+        return true;
+    };
+    let tip = locate_transcript(original)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| raw_chain_tip(&text));
+    tip == record.original_tip_uuid
+}
+
 /// Build the `FreshAgentSnapshotSchema`-exact JSON (`shared/fresh-agent-contract.ts:230-246`,
-/// zod `.strict()` -- every key here is either required or schema-known; NOTHING extra).
+/// zod `.strict()` -- every key here is either required or schema-known; NOTHING extra —
+/// the kata 1wxv keys (`undo`/`redo`/`rolledBackTurns`/`rollback`/`rolledBack`) are
+/// the schema's OPTIONAL additions).
 pub(crate) fn build_claude_snapshot_json(
     session_type: &str,
     thread_id: &str,
     transcript: &str,
     revision: i64,
+    // Kata 1wxv Task 5: the durable rollback record (None when the session never
+    // rolled back through this server's ledger).
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Value {
     let turns = parse_transcript_turns(thread_id, transcript);
     let latest_turn_id = turns
@@ -1006,7 +1032,7 @@ pub(crate) fn build_claude_snapshot_json(
         .and_then(|t| t.get("turnId"))
         .cloned()
         .unwrap_or(Value::Null);
-    json!({
+    let mut snapshot = json!({
         "sessionType": session_type,
         "provider": "claude",
         "threadId": thread_id,
@@ -1024,6 +1050,11 @@ pub(crate) fn build_claude_snapshot_json(
             "approvals": false,
             "questions": false,
             "fork": false,
+            // Kata 1wxv Task 5: STATIC stamps (freshclaude AND kilroy — no SDK
+            // capability query exists); an old-CLI runtime failure classifies to
+            // UNSUPPORTED_CAPABILITY refusal at op time, never at stamp time.
+            "undo": true,
+            "redo": true,
         },
         "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
         "pendingApprovals": [],
@@ -1033,14 +1064,33 @@ pub(crate) fn build_claude_snapshot_json(
         "childThreads": [],
         "turns": turns,
         "extensions": {},
-    })
+    });
+    if let Some(record) = rollback {
+        // The marker bucket is LEDGER-SOURCED (r3): the record's entries union —
+        // frozen prior epochs first, then the current epoch's recorded slice —
+        // durable even if an old original's JSONL is later compacted/GC'd
+        // (decision 6's "persist marked"). `canRedo` is provider-adjudicated:
+        // the stored bit AND the chain-root tip recheck. The record also doubles
+        // as the revision floor: a stale transcript basis never lets the client's
+        // monotonic watermark drop the post-rollback snapshot.
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            revision.max(0),
+            record,
+            claude_can_redo_now(record),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    snapshot
 }
 
 /// Locate + read + build. `revision` = transcript mtime in ms (monotonic as the file
-/// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count.
+/// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count;
+/// kata 1wxv Task 5 floors it at the rollback record's `lastOpAtMs`.
 pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
     // Cannot check => must not deny (the attach arm in claude.rs treats this exact
     // state as Transient): with NO resolvable store root we cannot assert the
@@ -1060,12 +1110,17 @@ pub(crate) async fn get_claude_snapshot(
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
-    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0);
+    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0, rollback);
     let turn_count = snapshot["turns"]
         .as_array()
         .map(|a| a.len() as i64)
         .unwrap_or(0);
-    snapshot["revision"] = json!(mtime_ms.unwrap_or(turn_count).max(0));
+    let basis = mtime_ms.unwrap_or(turn_count).max(0);
+    let floored = match rollback {
+        Some(record) => basis.max(record.last_op_at_ms),
+        None => basis,
+    };
+    snapshot["revision"] = json!(floored);
     Ok(snapshot)
 }
 
@@ -1375,6 +1430,7 @@ mod tests {
             "44444444-4444-4444-8444-444444444444",
             SAMPLE_TRANSCRIPT,
             1753437600000,
+            None,
         );
         let golden: serde_json::Value =
             serde_json::from_str(GOLDEN_SNAPSHOT).expect("golden parses");
@@ -1391,6 +1447,7 @@ mod tests {
             "44444444-4444-4444-8444-444444444444",
             SAMPLE_TRANSCRIPT,
             1753437600000,
+            None,
         );
         let mut overlaid = built.clone();
         apply_pending_overlay(&mut overlaid, Vec::new(), Vec::new());
@@ -1401,7 +1458,7 @@ mod tests {
     /// flips the presence-of-pending gates; untouched capabilities/fields stay put.
     #[test]
     fn pending_overlay_populates_entries_and_flips_the_presence_gates() {
-        let mut built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 7);
+        let mut built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 7, None);
         let approvals = vec![json!({
             "requestId": "req-1", "toolName": "Bash", "toolUseID": "toolu_1",
             "input": { "command": "ls" },
@@ -1426,7 +1483,7 @@ mod tests {
     /// pending with NO questions leaves `capabilities.questions` false.
     #[test]
     fn pending_overlay_gates_track_each_pending_kind_independently() {
-        let mut built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0);
+        let mut built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0, None);
         apply_pending_overlay(&mut built, vec![json!({ "requestId": "r-2" })], Vec::new());
         assert_eq!(built["pendingApprovals"], json!([{ "requestId": "r-2" }]));
         assert!(built["pendingQuestions"].as_array().unwrap().is_empty());
@@ -1439,7 +1496,7 @@ mod tests {
         // Load-bearing for the frozen client's local-echo clearing: claude's
         // send.accepted has no submittedTurnId, so the client matches prompt text
         // against role:'user' turns (freshAgentSlice fold).
-        let built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 0);
+        let built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 0, None);
         let turns = built["turns"].as_array().unwrap();
         let first = &turns[0];
         assert_eq!(first["role"], "user");
@@ -1449,7 +1506,7 @@ mod tests {
 
     #[test]
     fn turn_ids_are_unique_and_ordering_is_transcript_order() {
-        let built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0);
+        let built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0, None);
         assert_eq!(built["sessionType"], "kilroy");
         let turns = built["turns"].as_array().unwrap();
         let mut ids: Vec<&str> = turns
@@ -1511,7 +1568,7 @@ mod tests {
         let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
         assert!(claude_home_candidates().is_empty());
         let result =
-            get_claude_snapshot("freshclaude", "55555555-5555-4555-8555-555555555555").await;
+            get_claude_snapshot("freshclaude", "55555555-5555-4555-8555-555555555555", None).await;
         match result {
             Err(ClaudeSnapshotError::Io(msg)) => {
                 assert!(msg.contains("no claude store root resolvable"), "{msg}");
@@ -1865,5 +1922,266 @@ mod tests {
         );
         assert_eq!(raw_chain_successor(&two_step_original(), "a2"), None);
         assert_eq!(raw_chain_successor(&two_step_original(), "gone"), None);
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (claude/kilroy) ─────────
+    //
+    // Stamps are STATIC `{undo:true, redo:true}` (runtime failure classifies at
+    // op time, never at stamp time). The marker bucket is LEDGER-SOURCED (r3 —
+    // the record's entries union, durable even if the original's JSONL is
+    // later compacted/GC'd; the read-time LCP projection stays out of the
+    // bucket path). `canRedo` is the stored bit AND the chain-root recheck:
+    // when `original_session_id` resolves, the ORIGINAL's tip is re-read at
+    // snapshot time — a moved tip forces `canRedo:false` so no device shows a
+    // redo Task 4 would refuse with REDO_REMOVED_HISTORY_COPY.
+
+    use crate::rollback_record::{RollbackEntry, RollbackRecord};
+
+    /// The display projection of `ids` out of the canonical uuid transcript —
+    /// the verbatim turn JSON a Task 4 undo records into the ledger.
+    fn removed_slice_for(ids: &[&str]) -> Vec<Value> {
+        parse_transcript_turns("x", &uuid_transcript())
+            .into_iter()
+            .filter(|t| {
+                t.get("turnId")
+                    .and_then(Value::as_str)
+                    .map(|id| ids.contains(&id))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// The canonical two-op record: original `orig-id` (tip `a2`), can_redo
+    /// stored true, one entry over [u2, a2] (last op at ms 100).
+    fn claude_rollback_record(orig_id: &str, removed_turns: Vec<Value>) -> RollbackRecord {
+        let mut record = RollbackRecord::empty(50);
+        record.original_session_id = Some(orig_id.to_string());
+        record.original_tip_uuid = Some("a2".to_string());
+        record.push_entry(
+            RollbackEntry {
+                removed_turns,
+                prompt_text: "prompt two".into(),
+                at_ms: 90,
+            },
+            100,
+        );
+        record.set_can_redo(true, 100);
+        record
+    }
+
+    /// Stage `<tmp>/projects/-p/{orig,cur}.jsonl` under CLAUDE_CONFIG_DIR and
+    /// return (home guard, original id, current id) — env restored by the caller.
+    fn stage_rollback_home(
+        original_text: &str,
+        current_text: &str,
+    ) -> (tempfile::TempDir, String, String) {
+        let home = temp_home();
+        let dir = home.path().join("projects").join("-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let orig = "orig-rb-1";
+        let cur = "cur-rb-1";
+        std::fs::write(dir.join(format!("{orig}.jsonl")), original_text).unwrap();
+        std::fs::write(dir.join(format!("{cur}.jsonl")), current_text).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        (home, orig.to_string(), cur.to_string())
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_surfaces_the_ledger_bucket_and_rechecks_the_original_tip() {
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), &prefix_after_undo());
+        let record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        let snap =
+            build_claude_snapshot_json("freshclaude", &cur, &prefix_after_undo(), 7, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(true));
+        let prefix: Vec<&str> = snap["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            prefix,
+            vec!["u1", "a1"],
+            "turns[] is exactly what the model sees next"
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["u2", "a2"],
+            "the marker bucket is the ledger entries union"
+        );
+        assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 }),
+            "undoneDepth is the USER-role step count of the bucket"
+        );
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 7 loses)"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_a_moved_original_tip_forces_can_redo_false() {
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        // The original transcript was EXTENDED past the recorded tip (a new turn
+        // landed on the chain root after the undo).
+        let extended = format!(
+            "{}\n{}",
+            uuid_transcript(),
+            json!({"type":"user","uuid":"u3","parentUuid":"a2","timestamp":"t5","message":{"role":"user","content":[{"type":"text","text":"prompt three"}]}})
+        );
+        let (_home, orig, cur) = stage_rollback_home(&extended, &prefix_after_undo());
+        let record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        let snap =
+            build_claude_snapshot_json("freshclaude", &cur, &prefix_after_undo(), 7, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1 }),
+            "the chain-root tip is re-READ at snapshot time — no device shows a redo Task 4 would refuse"
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_first_turn_undo_keeps_the_whole_bucket_and_can_redo() {
+        // r2 first-turn leg: the current chain is EMPTY (fresh conversation);
+        // entries carry ALL of [u1, a1, u2, a2] (recorded when the first-turn
+        // undo ran).
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), "");
+        let record = claude_rollback_record(&orig, removed_slice_for(&["u1", "a1", "u2", "a2"]));
+        let snap = build_claude_snapshot_json("freshclaude", &cur, "", 0, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(ids, vec!["u1", "a1", "u2", "a2"]);
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 2 }),
+            "live tip none ⇒ the recorded original tip counts as strictly beyond (two user steps in the bucket)"
+        );
+        assert!(snap["turns"].as_array().expect("turns").is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_the_bucket_is_the_entries_union_across_epochs() {
+        // r3: frozen PRIOR-epoch markers precede the current epoch's, both in
+        // conversation order; markers persist marked (the original transcript is
+        // NOT needed to keep them).
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), &prefix_after_undo());
+        let prior_epoch = vec![
+            json!({ "id": "o1", "turnId": "o1", "ordinal": 0, "source": "durable", "role": "user", "summary": "old prompt", "items": [{ "id": "o1-i0", "kind": "text", "text": "old prompt" }] }),
+            json!({ "id": "o2", "turnId": "o2", "ordinal": 1, "source": "durable", "role": "assistant", "summary": "old answer", "items": [{ "id": "o2-i0", "kind": "text", "text": "old answer" }] }),
+        ];
+        let mut record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        record.entries.insert(
+            0,
+            RollbackEntry {
+                removed_turns: prior_epoch,
+                prompt_text: "old prompt".into(),
+                at_ms: 40,
+            },
+        );
+        let snap =
+            build_claude_snapshot_json("freshclaude", &cur, &prefix_after_undo(), 7, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["o1", "o2", "u2", "a2"],
+            "frozen prior-epoch markers first (conversation order), then the current epoch's"
+        );
+        assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 2 }),
+            "undoneDepth counts USER turns across the whole union (o1, u2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_destroyed_redo_keeps_the_marked_bucket() {
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), &prefix_after_undo());
+        let mut record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        record.destroy_redo(120); // decision 5: kills redo, NEVER the markers (decision 6)
+        let snap =
+            build_claude_snapshot_json("freshclaude", &cur, &prefix_after_undo(), 7, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1 })
+        );
+        assert_eq!(
+            snap["revision"],
+            json!(120),
+            "the destroy also lifts the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn kilroy_snapshot_stamps_identically_to_freshclaude() {
+        // One assertion leg re-runs the whole fixture with session_type "kilroy"
+        // (identical stamps — the SAME overlay/builder lane serves both).
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), &prefix_after_undo());
+        let record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        let snap =
+            build_claude_snapshot_json("kilroy", &cur, &prefix_after_undo(), 7, Some(&record));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(snap["sessionType"], json!("kilroy"));
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 })
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+    }
+
+    #[test]
+    fn claude_snapshot_without_a_record_stamps_static_caps_but_hides_the_rollback_keys() {
+        let snap = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 7, None);
+        // Stamps are static and presence-independent (rollback refusal is at op
+        // time, never at stamp time).
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(true));
+        assert!(snap.get("rolledBackTurns").is_none());
+        assert!(snap.get("rollback").is_none());
+        assert_eq!(snap["revision"], json!(7), "no floor without a record");
+    }
+
+    #[tokio::test]
+    async fn get_claude_snapshot_floors_the_revision_at_the_record() {
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let (_home, orig, cur) = stage_rollback_home(&uuid_transcript(), &prefix_after_undo());
+        // Re-key the record to the CURRENT id (the adoption leg's ledger move):
+        // ops stamped an hour in the future, so the transcript's fresh mtime
+        // ALWAYS loses — the floor is asserted deterministically end-to-end.
+        let mut record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        let far_future = crate::rollback_record::now_ms() + 3_600_000;
+        record.set_can_redo(true, far_future);
+        let snap = get_claude_snapshot("freshclaude", &cur, Some(&record))
+            .await
+            .expect("snapshot builds");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(snap["revision"], json!(far_future));
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 })
+        );
     }
 }

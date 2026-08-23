@@ -813,6 +813,9 @@ impl FreshAgentState {
                 thread_id,
                 &json!({}),
                 &json!([]),
+                // A placeholder id never has a rollback record (rollback needs a
+                // materialized session).
+                None,
             ));
         }
 
@@ -832,7 +835,19 @@ impl FreshAgentState {
             .await
             .map_err(OpencodeSnapshotError::Serve)?;
 
-        Ok(build_opencode_snapshot_json(thread_id, &info, &messages))
+        // Kata 1wxv Task 5: the DURABLE rollback record (memory-fast sync read
+        // over the ledger's write-through index) sources the marker bucket,
+        // `canRedo`, `undoneDepth`, and the revision floor — durable even after
+        // a native send deletes the reverted tail (decision 6).
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        Ok(build_opencode_snapshot_json(
+            thread_id,
+            &info,
+            &messages,
+            rollback.as_ref(),
+        ))
     }
 }
 
@@ -1449,16 +1464,25 @@ pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Opt
 /// session's in-memory turn task, not the serve's own session record) -- an honest
 /// approximation the task report calls out; the client's WS-driven busy chrome already
 /// covers the live case, this endpoint's job is the committed transcript.
-fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value) -> Value {
+fn build_opencode_snapshot_json(
+    thread_id: &str,
+    info: &Value,
+    messages: &Value,
+    // Kata 1wxv Task 5: the durable rollback record (None when the session never
+    // rolled back through this server's ledger).
+    rollback: Option<&RollbackRecord>,
+) -> Value {
     let messages = messages.as_array().cloned().unwrap_or_default();
     // kata 1wxv Task 3 (VERIFIED wire shape, load-bearing correction item 2): the
     // serve returns the reverted tail rows UNFLAGGED in the message list; the
     // boundary is TOP-LEVEL `session.revert.messageID` (omitted when inactive —
     // there is no `info.revert` anywhere). `turns[]` is EXACTLY what the model sees
-    // next (messages strictly before the pointer); the tail rows at-or-after the
-    // pointer are projected as `rolledBackTurns` markers in conversation order,
-    // each stamped `rolledBack:true` (decision 6). A stale/unknown pointer keeps
+    // next (messages strictly before the pointer); a stale/unknown pointer keeps
     // the whole list in `turns[]` (never silently empties the transcript).
+    // Task 5 (r3): with a ledger record the marker bucket is the record's
+    // entries UNION (frozen prior epochs ++ the recorded current tail) — the
+    // provider-tail projection below remains ONLY as the record-less fallback
+    // (an out-of-band revert this ledger never observed).
     let boundary = info
         .get("revert")
         .and_then(|r| r.get("messageID"))
@@ -1521,6 +1545,11 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
             "worktrees": false,
             "diffs": true,
             "childThreads": false,
+            // Kata 1wxv Task 5: static stamps (LBC-2 verified the revert/unrevert
+            // routes); an old-CLI runtime failure classifies at OP time to
+            // UNSUPPORTED_CAPABILITY (Task 1's pinned copy), never at stamp time.
+            "undo": true,
+            "redo": true,
         }),
     );
     snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));
@@ -1530,13 +1559,30 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
     snapshot.insert("diffs".to_string(), json!([]));
     snapshot.insert("childThreads".to_string(), json!([]));
     snapshot.insert("turns".to_string(), json!(turns));
-    // The marker bucket is omitted entirely when nothing is rolled back (the strict
-    // contract key is optional; a legacy-server payload simply never carries it).
-    if !rolled_back.is_empty() {
+    if rollback.is_none() && !rolled_back.is_empty() {
+        // Record-less fallback ONLY: the provider-tail projection covers an
+        // out-of-band revert this ledger never observed. The strict contract key
+        // is optional — a legacy-server payload simply never carries it.
         snapshot.insert("rolledBackTurns".to_string(), json!(rolled_back));
     }
     snapshot.insert("extensions".to_string(), json!({ "opencode": {} }));
-    Value::Object(snapshot)
+    let mut snapshot = Value::Object(snapshot);
+    if let Some(record) = rollback {
+        // LEDGER-SOURCED bucket (r3): the entries union (frozen prior epochs ++
+        // the recorded current tail) — durable even after a native send deletes
+        // the reverted tail (decision 6). `canRedo` is the STORED bit (the only
+        // source); the record doubles as the revision floor so a stale serve
+        // timestamp never lets the client's monotonic watermark drop the
+        // post-rollback snapshot.
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            revision,
+            record,
+            record.can_redo(),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    snapshot
 }
 
 /// The fresh-agent sub-router, pre-bound to its state. Merges in
@@ -3461,7 +3507,10 @@ mod tests {
         // Top-LEVEL session.revert.messageID = the middle USER message; the message
         // list is served in FULL (tail unflagged, exactly like the real provider).
         let info = json!({ "id": "ses_x", "title": "t", "revert": { "messageID": "msg_u2" } });
-        let snap = build_opencode_snapshot_json("ses_x", &info, &three_turn_opencode_messages());
+        // No ledger record (kata 1wxv Task 5): the provider tail is the marker
+        // projection source ONLY in the record-less (out-of-band revert) case.
+        let snap =
+            build_opencode_snapshot_json("ses_x", &info, &three_turn_opencode_messages(), None);
 
         let turns = snap["turns"].as_array().expect("turns array");
         let ids: Vec<&str> = turns.iter().filter_map(|t| t["turnId"].as_str()).collect();
@@ -3499,6 +3548,7 @@ mod tests {
             "ses_x",
             &json!({ "id": "ses_x", "revert": { "messageID": "msg_u3" } }),
             &three_turn_opencode_messages(),
+            None,
         );
         let first_ids: Vec<&str> = first["rolledBackTurns"]
             .as_array()
@@ -3512,6 +3562,7 @@ mod tests {
             "ses_x",
             &json!({ "id": "ses_x", "revert": { "messageID": "msg_u2" } }),
             &three_turn_opencode_messages(),
+            None,
         );
         let second_ids: Vec<&str> = second["rolledBackTurns"]
             .as_array()
@@ -3529,6 +3580,7 @@ mod tests {
             "ses_x",
             &json!({ "id": "ses_x" }),
             &three_turn_opencode_messages(),
+            None,
         );
         assert_eq!(
             plain["turns"].as_array().expect("turns").len(),
@@ -3538,6 +3590,172 @@ mod tests {
         assert!(
             plain.get("rolledBackTurns").is_none(),
             "the marker bucket is omitted entirely when nothing is rolled back"
+        );
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (opencode) ──────────────
+    //
+    // Stamps are static `{undo:true, redo:true}` (LBC-2 verified the
+    // revert/unrevert routes). The marker bucket IS the ledger record's
+    // entries union (r3 — frozen prior epochs ++ the current serve-revert
+    // tail, recorded at write time); `turns[]` still comes from the
+    // provider's active prefix. `canRedo` is the STORED bit (the only source);
+    // `undoneDepth` is the USER-role step count of the bucket (r3 finding 5 —
+    // the same step count the client's `Rolled back (N)` label shows), never
+    // `entries.len()`.
+
+    /// Build a ledger entry's removed-turns from fixture messages (the verbatim
+    /// FreshAgentTurn JSON the Task 3 handler records at write time).
+    fn opencode_record_entry(
+        msgs: &[Value],
+        prompt: &str,
+    ) -> crate::rollback_record::RollbackEntry {
+        let removed_turns = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| opencode_message_turn_json(m, i).expect("marker turn"))
+            .collect();
+        crate::rollback_record::RollbackEntry {
+            removed_turns,
+            prompt_text: prompt.into(),
+            at_ms: 90,
+        }
+    }
+
+    #[test]
+    fn opencode_snapshot_stamps_capabilities_and_the_ledger_marker_bucket() {
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(opencode_record_entry(&[msgs[2].clone()], "prompt two"), 100);
+        record.set_can_redo(true, 100);
+        // The serve carries NO revert pointer: the bucket is PROVABLY
+        // ledger-sourced (a provider-tail projection would show nothing).
+        let info = json!({ "id": "ses_x", "title": "t", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 })
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0]["turnId"], json!("msg_u2"));
+        assert!(
+            bucket.iter().all(|t| t["rolledBack"] == json!(true)),
+            "every marker is stamped rolledBack:true (decision 6)"
+        );
+        assert_eq!(
+            snap["turns"].as_array().expect("turns").len(),
+            6,
+            "turns[] still comes from the provider state (no pointer ⇒ the full list)"
+        );
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 5 loses)"
+        );
+    }
+
+    #[test]
+    fn opencode_snapshot_undone_depth_counts_user_steps_not_entries() {
+        // r3 finding 5: a REBUILT single entry carrying the two-step tail
+        // ([u2, a2, u3, a3] — Task 3's union rebuild over a two-step undo).
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(
+            opencode_record_entry(
+                &[
+                    msgs[2].clone(),
+                    msgs[3].clone(),
+                    msgs[4].clone(),
+                    msgs[5].clone(),
+                ],
+                "prompt two",
+            ),
+            100,
+        );
+        record.set_can_redo(true, 100);
+        let info = json!({ "id": "ses_x", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 2 }),
+            "two undone USER steps — never entries.len() (1)"
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 4);
+    }
+
+    #[test]
+    fn opencode_snapshot_destroyed_redo_keeps_the_marked_bucket_alive() {
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(opencode_record_entry(&[msgs[2].clone()], "prompt two"), 100);
+        record.set_can_redo(true, 100);
+        record.destroy_redo(120); // decision 5: kills redo, NEVER the markers (decision 6)
+        let info = json!({ "id": "ses_x", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1 }),
+            "the stored bit cleared; the bucket's user-step count is untouched"
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+        assert_eq!(
+            snap["revision"],
+            json!(120),
+            "the destroy also lifts the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_surfaces_the_durable_rollback_record() {
+        let session_body = json!({
+            "id": "ses_rb",
+            "title": "rolled back session",
+            "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+        });
+        // The serve knows NOTHING about a revert pointer — the marker bucket
+        // must still surface from the ledger.
+        let messages_body = json!([
+            { "info": { "id": "msg-1", "role": "user" }, "parts": [{ "type": "text", "text": "hi" }] },
+            { "info": { "id": "msg-2", "role": "assistant" }, "parts": [{ "type": "text", "text": "hello" }] },
+        ]);
+        let st = state_with_fixed_session_http(session_body, messages_body).await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let marker_source = json!({ "info": { "id": "msg-9", "role": "user" }, "parts": [{ "type": "text", "text": "later" }] });
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(
+            opencode_record_entry(&[marker_source], "later"),
+            1_702_000_000_000,
+        );
+        record.set_can_redo(true, 1_702_000_000_000);
+        crate::identity_sink::PaneIdentitySink::record_rollback(
+            fake.as_ref(),
+            "opencode",
+            "ses_rb",
+            record,
+        )
+        .await
+        .expect("record write");
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_rb", None)
+            .await
+            .expect("snapshot builds");
+        assert_eq!(snapshot["capabilities"]["undo"], json!(true));
+        assert_eq!(snapshot["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 })
+        );
+        assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("msg-9"));
+        assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["revision"],
+            json!(1_702_000_000_000i64),
+            "a stale serve timestamp never beats the record floor"
         );
     }
 }

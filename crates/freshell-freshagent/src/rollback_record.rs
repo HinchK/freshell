@@ -336,6 +336,52 @@ pub fn rollback_broadcast_frame(
     rollback_envelope(op, live_session_id, event)
 }
 
+/// Kata 1wxv Task 5 snapshot surfacing — the shared half every provider's
+/// snapshot builder stamps identically:
+///
+/// - the marker bucket (the r3 `entries` UNION — frozen prior-epoch markers
+///   first, then the current epoch's recorded slice — each turn stamped
+///   `rolledBack:true` at READ time, never stored; durable even after native
+///   provider deletion, satisfying decision 6's "persist marked"),
+/// - the `rollback{canRedo, undoneDepth}` block — `undoneDepth` is the
+///   USER-role step count of the bucket (r3 finding 5: the same step count the
+///   client's `Rolled back (N)` label shows), NEVER `entries.len()`,
+/// - the revision floor: the returned value is
+///   `max(existing_basis, record.last_op_at_ms)` so the client's monotonic
+///   watermark can never drop the post-rollback snapshot.
+///
+/// `can_redo` arrives provider-ADJUDICATED: codex/opencode pass
+/// [`RollbackRecord::can_redo`] verbatim (the stored bit is the only source);
+/// claude rechecks the chain root's tip first (`claude_snapshot`). The
+/// strict-contract keys stay OPTIONAL: an EMPTY bucket inserts nothing (and
+/// yields no phantom rollback block).
+pub(crate) fn stamp_rollback_snapshot(
+    snapshot: &mut Value,
+    revision_basis: i64,
+    record: &RollbackRecord,
+    can_redo: bool,
+) -> i64 {
+    let bucket: Vec<Value> = record
+        .entries
+        .iter()
+        .flat_map(|e| e.removed_turns.iter())
+        .map(|t| {
+            let mut t = t.clone();
+            t["rolledBack"] = json!(true);
+            t
+        })
+        .collect();
+    if !bucket.is_empty() {
+        let undone_depth = bucket
+            .iter()
+            .filter(|t| t.get("role").and_then(Value::as_str) == Some("user"))
+            .count();
+        snapshot["rolledBackTurns"] = json!(bucket);
+        snapshot["rollback"] = json!({ "canRedo": can_redo, "undoneDepth": undone_depth });
+    }
+    revision_basis.max(record.last_op_at_ms)
+}
+
 /// Decision 5: any new submission (send/steer/queue firing) permanently
 /// destroys redo — the redo-capable CHAIN STATE only; `entries` (the r3 marker
 /// union) is NEVER touched and survives with the "rolled back" marker per
@@ -419,6 +465,67 @@ mod tests {
             .unwrap()
             .insert((provider.to_string(), session_id.to_string()), record);
         sink
+    }
+
+    // ── stamp_rollback_snapshot (kata 1wxv Task 5) ──────────────────────────
+
+    fn marker_turn(id: &str, role: &str) -> Value {
+        json!({
+            "id": id,
+            "turnId": id,
+            "ordinal": 0,
+            "source": "durable",
+            "role": role,
+            "summary": format!("{id} summary"),
+            "items": [{ "id": format!("{id}-i0"), "kind": "text", "text": id }],
+        })
+    }
+
+    #[test]
+    fn stamp_rollback_snapshot_stamps_markers_at_read_time_and_counts_user_steps() {
+        let mut record = RollbackRecord::empty(50);
+        record.push_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("u2", "user"), marker_turn("a2", "assistant")],
+                prompt_text: "prompt two".into(),
+                at_ms: 90,
+            },
+            100,
+        );
+        let mut snapshot = json!({ "revision": 7 });
+        let floored = stamp_rollback_snapshot(&mut snapshot, 7, &record, true);
+        assert_eq!(
+            floored, 100,
+            "the record's lastOpAtMs is the revision floor"
+        );
+        let bucket = snapshot["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 2);
+        assert!(
+            bucket.iter().all(|t| t["rolledBack"] == json!(true)),
+            "`rolledBack:true` is stamped AT READ — the stored verbatim turn JSON is untouched"
+        );
+        // The STORED entry JSON must not have been mutated by the read stamp.
+        assert!(record.entries[0].removed_turns[0]
+            .get("rolledBack")
+            .is_none());
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1 }),
+            "undoneDepth is the USER-role step count of the bucket (u2), never rows.len()"
+        );
+    }
+
+    #[test]
+    fn stamp_rollback_snapshot_omits_the_keys_for_an_empty_union_but_still_floors() {
+        let record = RollbackRecord::empty(50);
+        let mut snapshot = json!({ "revision": 7 });
+        let floored = stamp_rollback_snapshot(&mut snapshot, 7, &record, false);
+        assert_eq!(floored, 50, "the floor applies with or without markers");
+        assert!(
+            snapshot.get("rolledBackTurns").is_none(),
+            "the strict-contract key stays OPTIONAL — an empty union inserts nothing"
+        );
+        assert!(snapshot.get("rollback").is_none());
     }
 
     #[tokio::test]

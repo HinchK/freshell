@@ -1141,6 +1141,31 @@ impl FreshClaudeState {
         (approvals, questions)
     }
 
+    /// Kata 1wxv Task 5: the DURABLE rollback record for the snapshot route.
+    /// The Task 4 handler keys the ledger row by the CURRENT durable id and
+    /// re-keys it old→new inside the adoption write batch, so the record always
+    /// lives under the live durable id. `any_id` resolves like every handler
+    /// here (map key or durable UUID via `cli_index`); an UNTRACKED id (e.g. a
+    /// disk-only read after a server restart) falls back to the raw id so a
+    /// rolled-back session keeps its marked bucket without a live session.
+    pub(crate) async fn load_rollback_record(
+        &self,
+        any_id: &str,
+    ) -> Option<crate::rollback_record::RollbackRecord> {
+        let durable = match self.resolve_session_key(any_id).await {
+            Some(map_key) => self
+                .sessions
+                .lock()
+                .await
+                .get(&map_key)
+                .and_then(|s| s.cli_session_id.clone())
+                .unwrap_or(map_key),
+            None => any_id.to_string(),
+        };
+        self.identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, &durable))
+    }
+
     /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
     /// claude UUID through [`Self::cli_index`] to its sessions-map key, then
     /// check the map. The sessions map is read UNFILTERED — no session_type

@@ -219,9 +219,8 @@ struct CodexSession {
     /// carries no mode param, so the durable meta is the only source of truth;
     /// the app-server has no live read-back). `None` only when that durable
     /// meta is missing/unparseable ⇒ legacy ⇒ capability stamps `undo:false`.
-    /// Held unread on the non-test build until Task 5's capability stamps
-    /// consume it (`build_codex_snapshot_json`).
-    #[allow(dead_code)]
+    /// Kata 1wxv Task 5 consumes it (`build_codex_snapshot_json`'s
+    /// `capabilities.undo` stamp, read by [`FreshCodexState::get_snapshot`]).
     history_mode: Option<HistoryMode>,
     /// The per-session async turn lock (kata 1wxv Task 2, r2 serialization
     /// discipline): [`FreshCodexState::handle_rollback`] holds it across the
@@ -3113,8 +3112,28 @@ impl FreshCodexState {
                 .map_err(CodexSnapshotError::AppServer)?,
             Err(err) => return Err(CodexSnapshotError::AppServer(err)),
         };
-        build_codex_snapshot_json(thread_id, &raw, active_turn_present)
-            .map_err(CodexSnapshotError::Protocol)
+        // Kata 1wxv Task 5: the capability stamp is SESSION-SCOPED by the
+        // recorded DURABLE history mode (correction item 1, r3 — never live-probed
+        // per snapshot; the app-server exposes no mode read-back). A session the
+        // sessions map can't name (TOCTOU kill between resume and this read)
+        // reads as legacy: `undo:false`, never over-advertised.
+        let history_mode = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .and_then(|s| s.history_mode);
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        build_codex_snapshot_json(
+            thread_id,
+            &raw,
+            active_turn_present,
+            history_mode,
+            rollback.as_ref(),
+        )
+        .map_err(CodexSnapshotError::Protocol)
     }
 
     /// Resolve the live client + active-turn bit for `thread_id`, via
@@ -4051,6 +4070,11 @@ fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
     _active_turn_present: bool,
+    // Kata 1wxv Task 5: the session's DURABLE history mode (the capability stamp
+    // source) and the durable rollback record (the marker bucket + redo bit +
+    // revision floor; `None` when the session never rolled back).
+    history_mode: Option<HistoryMode>,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
@@ -4102,7 +4126,8 @@ fn build_codex_snapshot_json(
         })
         .collect();
 
-    Ok(json!({
+    let undo_capable = history_mode == Some(HistoryMode::Paginated);
+    let mut snapshot = json!({
         "sessionType": SESSION_TYPE,
         "provider": PROVIDER,
         "threadId": thread_id,
@@ -4118,6 +4143,14 @@ fn build_codex_snapshot_json(
             "worktrees": false,
             "diffs": false,
             "childThreads": false,
+            // Kata 1wxv Task 5: SESSION-SCOPED stamps (correction item 1, r3) —
+            // undo iff the thread's durable history mode is paginated; codex
+            // redo is permanently unavailable (revert is destructive; there is
+            // no redo primitive). Absent updatable older servers emit neither
+            // key; a legacy/unknown mode stamps undo:false here — never a
+            // hard-coded true.
+            "undo": undo_capable,
+            "redo": false,
         },
         "tokenUsage": {
             "inputTokens": 0,
@@ -4132,7 +4165,25 @@ fn build_codex_snapshot_json(
         "childThreads": [],
         "turns": turns,
         "extensions": { "codex": {} },
-    }))
+    });
+    if let Some(record) = rollback {
+        // The marker bucket is LEDGER-SOURCED: `thread/revert` destroys the
+        // provider tail, so only the r3 entries union can satisfy decision 6's
+        // "persist marked". The stored `can_redo` bit is the only source (codex
+        // stamps it false at every write). The record also doubles as the
+        // revision floor: a stale `updatedAt` (or the include-turns-fallback
+        // read) never lets the client's monotonic watermark drop the
+        // post-rollback snapshot.
+        let basis = snapshot["revision"].as_i64().unwrap_or(0);
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            basis,
+            record,
+            record.can_redo(),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    Ok(snapshot)
 }
 
 /// One raw codex turn's items, grouped into contiguous same-role rows -- the intermediate
@@ -11717,6 +11768,186 @@ pub(crate) mod tests {
         assert_eq!(
             turns[1]["items"][0]["text"],
             json!("Codex completed this turn without recording an assistant response.")
+        );
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (codex) ─────────────────
+    //
+    // The capability stamp is SESSION-SCOPED by the DURABLE history mode
+    // (correction item 1, r3): `undo` ⟺ `Some(Paginated)`; legacy AND unknown
+    // (`None` — a missing/unparseable durable mode) stamp `undo:false`. `redo`
+    // is permanently false (codex revert is destructive; there is no redo
+    // primitive). The marker bucket comes from the LEDGER record (the r3
+    // entries union) — `thread/revert` destroys the tail, so there is no
+    // provider-side projection to recompute marker content from.
+
+    fn codex_raw_thread_updated_at_7() -> Value {
+        json!({
+            "thread": {
+                "id": "thread-9",
+                "preview": "",
+                "updatedAt": 7,
+                "status": { "type": "idle" },
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "userMessage",
+                        "id": "u-1",
+                        "content": [{ "type": "text", "text": "earlier" }],
+                    }],
+                }],
+            }
+        })
+    }
+
+    /// One ledger record whose entries union is a single op over the USER-role
+    /// display turn `turn-9` (last op at ms 100 — the revision floor).
+    fn codex_rollback_record_with_turn_9() -> crate::rollback_record::RollbackRecord {
+        use crate::rollback_record::*;
+        let mut record = RollbackRecord::empty(50);
+        record.push_entry(
+            RollbackEntry {
+                removed_turns: vec![json!({
+                    "id": "turn-9",
+                    "turnId": "turn-9",
+                    "ordinal": 1,
+                    "source": "durable",
+                    "role": "user",
+                    "summary": "later",
+                    "items": [{ "id": "turn-9:item-0", "kind": "text", "text": "later" }],
+                })],
+                prompt_text: "later".into(),
+                at_ms: 90,
+            },
+            100,
+        );
+        record
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor() {
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            Some(&record),
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1 }),
+            "undoneDepth is the USER-role step count of the bucket (never entries.len())"
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0]["rolledBack"], json!(true));
+        assert_eq!(bucket[0]["turnId"], json!("turn-9"));
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 7 loses)"
+        );
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_legacy_and_unknown_history_undo_false() {
+        // `None` == a legacy thread OR an unparseable durable mode — the stamp is
+        // session-scoped and NEVER hard-coded true.
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            None,
+            Some(&record),
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(false));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        // A record's markers still surface (the capability gate is client-side).
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+    }
+
+    #[test]
+    fn codex_snapshot_without_a_record_hides_the_rollback_keys() {
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            None,
+        )
+        .expect("snapshot builds");
+        assert!(
+            snap.get("rolledBackTurns").is_none(),
+            "the marker bucket is omitted entirely when nothing was rolled back"
+        );
+        assert!(snap.get("rollback").is_none());
+        assert_eq!(snap["revision"], json!(7), "no floor without a record");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx, fake) = state_with_sink();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-rollback",
+        )
+        .await;
+        fake.record_rollback("codex", "thread-1", codex_rollback_record_with_turn_9())
+            .await
+            .expect("record write");
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        // A STALE provider basis (3) — the rollback op (ms 100) is newer.
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "idle" }, "updatedAt": 3, "turns": [] } }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(
+            snapshot["capabilities"]["undo"],
+            json!(true),
+            "the paginated fixture session stamps undo (session-scoped, from the durable history mode record)"
+        );
+        assert_eq!(snapshot["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1 })
+        );
+        assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("turn-9"));
+        assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["revision"],
+            json!(100),
+            "a stale provider basis never beats the record floor (the client monotonic watermark holds)"
         );
     }
 }
