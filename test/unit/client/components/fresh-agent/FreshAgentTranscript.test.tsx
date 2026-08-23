@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
+import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
 // in React.lazy + Suspense; mocking it to render MarkdownRenderer directly removes
@@ -1481,5 +1482,79 @@ describe('FreshAgentTranscript', () => {
       const item = screen.getByRole('menuitem', { name: 'Rewind code to here' })
       expect(item).toBeDisabled()
     })
+  })
+})
+
+describe('rolled-back section (kata 1wxv decision 6)', () => {
+  afterEach(() => cleanup())
+
+  function markerTurns(): FreshAgentTurn[] {
+    // Two undone STEPS = four marker ROWS (a user row and an assistant row each).
+    return [
+      { id: 'u2', turnId: 'u2', role: 'user', summary: 'second prompt', items: [{ id: 'u2-i1', kind: 'text', text: 'second prompt' }], rolledBack: true },
+      { id: 'a2', turnId: 'a2', role: 'assistant', summary: 'second answer', items: [{ id: 'a2-i1', kind: 'text', text: 'second answer' }], rolledBack: true },
+      { id: 'u3', turnId: 'u3', role: 'user', summary: 'third prompt', items: [{ id: 'u3-i1', kind: 'text', text: 'third prompt' }], rolledBack: true },
+      { id: 'a3', turnId: 'a3', role: 'assistant', summary: 'third answer', items: [{ id: 'a3-i1', kind: 'text', text: 'third answer' }], rolledBack: true },
+    ]
+  }
+
+  it('renders nothing when rolledBackTurns is empty', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[{ id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i1', kind: 'text', text: 'first prompt' }] }]}
+        rolledBackTurns={[]}
+      />,
+    )
+
+    expect(screen.getByText('first prompt')).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Rolled back turns' })).toBeNull()
+  })
+
+  it('renders the marker rows with the USER-STEP count label (r3 correction 5)', () => {
+    // The label matches the server's rollback.undoneDepth: steps (user-role marker
+    // groups), never the raw marker-row count (4) and never entries.len().
+    render(<FreshAgentTranscript turns={[]} rolledBackTurns={markerTurns()} />)
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(section).toHaveTextContent('Rolled back (2)')
+    expect(section).not.toHaveTextContent('Rolled back (4)')
+    expect(section).toHaveTextContent('second prompt')
+    expect(section).toHaveTextContent('second answer')
+    expect(section).toHaveTextContent('third prompt')
+    expect(section).toHaveTextContent('third answer')
+  })
+
+  it('per-row Redo to here fires onRedoToTurn only on user rows when canRedo', () => {
+    const onRedoToTurn = vi.fn()
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        onRedoToTurn={onRedoToTurn}
+      />,
+    )
+
+    // Only the two USER rows expose the button; assistant rows never do.
+    const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
+    expect(redoButtons).toHaveLength(2)
+    fireEvent.click(redoButtons[0])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u2')
+    fireEvent.click(redoButtons[1])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u3')
+  })
+
+  it('exposes no Redo to here affordance when canRedo is false', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo={false}
+        onRedoToTurn={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
   })
 })

@@ -16,6 +16,7 @@ import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
+import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import {
   resolveReopenPaneSessionTarget,
@@ -812,6 +813,19 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       const layout = paneLayouts[target.tabId]
       const paneContent = layout ? findPaneContent(layout, target.paneId) : null
       items.push(...buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx))
+    }
+
+    // kata 1wxv: conversation rollback entry point (alongside the /undo /redo slash
+    // commands and the per-turn undo-to-here icon). Items stay visible but disabled
+    // when the owning view hasn't registered rollback actions (no live session,
+    // capability-false provider, or mid-turn).
+    if (target.paneId) {
+      const freshAgentActions = getFreshAgentPaneActions(target.paneId)
+      items.push(
+        { type: 'separator', id: 'fc-rollback-sep' },
+        { type: 'item', id: 'fresh-agent-undo', label: 'Undo last turn', disabled: !freshAgentActions?.canUndo, onSelect: () => freshAgentActions?.undo() },
+        { type: 'item', id: 'fresh-agent-redo', label: 'Redo last turn', disabled: !freshAgentActions?.canRedo, onSelect: () => freshAgentActions?.redo() },
+      )
     }
 
     const sessionId = target.sessionId
