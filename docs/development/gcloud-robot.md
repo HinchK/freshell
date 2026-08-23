@@ -87,14 +87,18 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor run.developer logging.viewer serviceusage.serviceUsageConsumer" \
+   GCLOUD_ROBOT_ROLES="roles/cloudbuild.builds.editor roles/run.developer roles/logging.viewer roles/serviceusage.serviceUsageConsumer roles/containeranalysis.occurrences.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --name gcloud-robot --activate
    ```
 
    This creates the SA, binds the project roles, mints a JSON key under
    `~/.local/share/gcloud-robot/` (mode 600, never inside
-   `~/.config/gcloud`), prints the key path, and activates it. Record the
+   `~/.config/gcloud`), prints the key path, and activates it. Role notes:
+   names need the `roles/` prefix (bootstrap rejects bare names);
+   `containeranalysis.occurrences.viewer` exists because Artifact Registry's
+   `docker images describe` reads scan metadata and 403s without it — the
+   wrappers' image-exists probe depends on that call. Record the
    key location for yourself as
    `key-path: <printed at provisioning>` (until then this runbook says:
    not yet minted — operator step).
@@ -222,7 +226,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor run.developer logging.viewer serviceusage.serviceUsageConsumer" \
+   GCLOUD_ROBOT_ROLES="roles/cloudbuild.builds.editor roles/run.developer roles/logging.viewer roles/serviceusage.serviceUsageConsumer roles/containeranalysis.occurrences.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --rekey --activate
    ```
@@ -294,7 +298,23 @@ for immediacy.)
   this mode does not stream during submit. Builds complete normally; read
   logs with `gcloud builds log <build-id> --project=misc-puttering-project`.
 - A grant that definitely exists 403s for the first minutes → IAM
-  propagation lag; the verifier's retries (12 × 30s default) absorb it.
+  propagation lag; the verifier's retries (12 × 30s default) absorb it. For
+  bucket-scoped grants the observed lag ran to ~5 minutes once (don't retry
+  instantly — wait minutes, not seconds).
+- `bootstrap-robot.sh --activate` fails with `Properties in configuration
+  [NONE] cannot be set.` → machines running an explicit-context gcloud
+  wrapper delegate with `--configuration=NONE`, which cannot accept the
+  config write. The credential IS registered before that failure: verify
+  with `gcloud auth list` (robot row appears) and
+  `gcloud auth print-access-token --account=<robot> --project=misc-puttering-project`
+  (mints). Do not re-run bootstrap for this.
+- The identity probe (`rung 3`) fails silently on machines behind a
+  credential-broker proxy that lacks a credential for
+  cloudresourcemanager.googleapis.com (e.g. a OneCLI gateway) → the lane
+  falls to ambient with the one-line note. Either unset `https_proxy` /
+  `HTTPS_PROXY` for the lane process (probe then reaches Google directly) or
+  pin `GCLOUD_IDENT=<robot>` for the lane (this is why the operator machine's
+  pin exists).
 - A lane prints the ambient-fallback note and then gcloud's
   "Reauthentication failed" → the lane fell back to ambient gcloud: the
   robot is not provisioned (or not activated) on this machine. Provision
