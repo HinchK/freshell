@@ -112,19 +112,26 @@ Exact project-wide constraints every task must honor:
   developer). The wrapper's create-if-missing Artifact Registry path
   (`artifacts repositories create`) is NOT granted
   (`artifactregistry.repositories.create` would need repoAdmin): the operator
-  checklist ensures the repository exists instead.
+  checklist ensures the repository exists instead. Build-log access comes
+  from routing Cloud Build logs to Cloud Logging
+  (`options.logging: CLOUD_LOGGING_ONLY` in cloudbuild.yaml — Task 2 edit
+  E12), which `roles/logging.viewer` covers; the legacy default GCS
+  log-bucket path is documented upstream as requiring project-wide
+  `roles/viewer` for manual builds reading its logs and is deliberately not
+  granted.
 - **Files explicitly out of scope (untouched, with reason):**
   `scripts/run-standard-tests.ts` (it `execFileSync`s `vitest-cloud.sh` with
   inherited env; identity resolution lives inside the wrapper so the
   coordinator and base-gate paths inherit it for free);
-  `docker/cloud-run/{Dockerfile,entrypoint.sh,cloudbuild.yaml}` (no gcloud
-  identity inside the container; jobs/builds run as default identities — the
-  actAs grant is documented in the runbook); `.gcloudignore` (no relation to
-  identity); `.github/workflows/*` (zero GCP surface; CI stays keyless);
+  `docker/cloud-run/{Dockerfile,entrypoint.sh}` (no gcloud identity inside
+  the container; jobs/builds run as default identities — the actAs grant is
+  documented in the runbook); `.gcloudignore` (no relation to identity);
+  `.github/workflows/*` (zero GCP surface; CI stays keyless);
   `.env.example` (server-runtime configuration only — the cloud wrappers are
   operator shell tooling, so their knobs are documented in `--help`,
   AGENTS.md, and the runbook instead); historical `docs/plans/*` (historical
-  records).
+  records). (`docker/cloud-run/cloudbuild.yaml` IS touched — one
+  `options.logging` line, see Task 2 E12 and Global Constraints.)
 
 ## Stage-2 load-bearing assumptions (validate before execution)
 
@@ -161,6 +168,16 @@ Exact project-wide constraints every task must honor:
   only (plus the build/AR roles). Also verified: `artifactregistry.writer`
   cannot create repositories (`repositories.create` absent) — the operator
   checklist ensures the AR repo exists instead of granting repoAdmin.
+- **A7** (raised by plan-review round 2; RESOLVED against the upstream docs
+  the reviewer cited — Cloud Build troubleshooting + build-log storage
+  behavior): with `logging` unspecified, Cloud Build writes build logs to the
+  legacy default GCS bucket, and reading them as the submitting identity
+  requires project-wide `roles/viewer` — refused as too wide. Fix instead:
+  `options.logging: CLOUD_LOGGING_ONLY` in
+  `docker/cloud-run/cloudbuild.yaml` (Task 2 E12), which puts build logs in
+  Cloud Logging where the already-granted `roles/logging.viewer` suffices.
+  Human workflows' `builds submit` log streaming is unchanged; the Console
+  log link target changes (native bucket viewer → Logs Explorer).
 
 These are properties of external contracts; the plan's tasks do not depend on
 any other unproven claim. If A1/A2 invalidate a probe permission, swap the
@@ -610,15 +627,20 @@ and mirrored (every hunk is still spelled out per file below).
 - Modify: `scripts/test/cloud-vitest-wrapper.test.sh` (pin after line 8)
 - Modify: `scripts/test/cloud-gcp-identity.test.sh` (append the wrapper-level
   block at the `WRAPPER-LEVEL-CHECKS-ANCHOR`)
+- Modify: `docker/cloud-run/cloudbuild.yaml` (E12 — one `options.logging`
+  line)
 
 **Interfaces:**
 - Consumes: `freshell_resolve_cloud_identity` and `resolve_gcp_identity` from
   Task 1's `scripts/lib/gcp-identity.sh` (sourced via `$SCRIPT_DIR/lib/`).
 - Produces: wrapper-local `account_flag()`, the conditional `gcloud_flags()` /
-  `gcloud_artifacts_flags()`, and the no-human-default `GCP_ACCOUNT`
-  lifecycle (`--account=` > `FRESHELL_GCP_ACCOUNT` > ladder > omitted).
+  `gcloud_artifacts_flags()`, the no-human-default `GCP_ACCOUNT` lifecycle
+  (`--account=` > `FRESHELL_GCP_ACCOUNT` > ladder > omitted), and pin-flag
+  parsing on the standalone `build` (already had it), `push`, and `logs`
+  lanes so the precedence contract holds on every cloud subcommand — with
+  non-pin `logs` arguments still passed through to `logs read` verbatim.
 
-#### Wrapper edit reference (apply E1–E11 to e2e-cloud.sh; V1–V11 mirror to vitest-cloud.sh)
+#### Wrapper edit reference (apply E1–E11 to e2e-cloud.sh; V1–V11 mirror to vitest-cloud.sh; E12 touches only cloudbuild.yaml)
 
 **E1 / V1 — remove the hardcoded default.** e2e-cloud.sh:45
 `GCP_ACCOUNT="${FRESHELL_GCP_ACCOUNT:-dan@danshapiro.com}"` /
@@ -693,16 +715,47 @@ vitest-cloud.sh:187), after the flag-parse loop:
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 ```
 
-**E5 / V5 — resolve in `cmd_push`.** As the first statement after the
-"Building"/"Pushing" banner (e2e-cloud.sh after :220 `echo "[e2e-cloud]
-Pushing to Artifact Registry..."` / vitest-cloud.sh after :216
-`echo "[vitest-cloud] Pushing to Artifact Registry..."`):
+**E5 / V5 — flag parsing + resolve in `cmd_push`.** Today `cmd_push` parses
+NO arguments, so `push --account=EMAIL` would silently ignore the pin and
+violate rung-1 precedence. Give `cmd_push` (e2e-cloud.sh:219-248 /
+vitest-cloud.sh:215-243) its own parse loop first, then resolve. The whole
+function head becomes:
 
 ```bash
+cmd_push() {
+  echo "[WRAPPER-TAG] Pushing to Artifact Registry..."
+
+  # The standalone push lane honors the same pin flags as build/run;
+  # parse FIRST so an explicit --account= wins without touching the ladder.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
   # A standalone `push` reaches gcloud without passing through cmd_build;
   # resolve idempotently (free when cmd_build already did).
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 ```
+
+(`[WRAPPER-TAG]` = `e2e-cloud` / `vitest-cloud`; the function's remaining
+body is unchanged. Callers pass arguments the same way: `cmd_push` from
+`cmd_build --local-build` passes nothing today and the dispatch passes
+`"$@"`.)
 
 **E6 / V6 — resolve in `cmd_run`'s cloud branch.** After the local branch
 closes (e2e-cloud.sh: the `fi` after the `exec npx playwright test` block at
@@ -759,15 +812,74 @@ vitest-cloud.sh:376-377:
 
 (The `elif`/`if` difference is the wrappers' existing structure; keep it.)
 
-**E10 / V10 — resolve in `cmd_logs`.** First statement of `cmd_logs`
-(e2e-cloud.sh before :575 `local execution_id` / vitest-cloud.sh before
-:544):
+**E10 / V10 — flag parsing + resolve in `cmd_logs`.** Today `cmd_logs`
+(e2e-cloud.sh:569-586 / vitest-cloud.sh:539-551) parses no pin flags and
+forwards its whole `$@` to `logs read`, so `logs --account=EMAIL` would list
+executions as one identity and read them as another. Add a parse loop that
+peels the three pin flags and collects everything else for passthrough; the
+function head becomes:
 
 ```bash
-  # logs is a cloud-only lane (executions list + logs read); resolve before
-  # the first gcloud call.
+cmd_logs() {
+  # Parse the pin flags FIRST (same contract as build/run); the rest passes
+  # through to `logs read` verbatim, preserving the existing behavior.
+  local -a logs_passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
+      *)
+        logs_passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # logs is a cloud-only lane (executions list + logs read); resolve after
+  # parsing so an explicit pin short-circuits the ladder.
   freshell_resolve_cloud_identity "run.jobs.run"
 ```
+
+and its final call passes the collected passthrough args instead of raw `$@`
+(e2e-cloud.sh:585 / vitest-cloud.sh:550):
+
+```bash
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" \
+    "${logs_passthrough[@]+"${logs_passthrough[@]}"}"
+```
+
+(The `"${arr[@]+...}"` form is the repo's `set -u`-safe empty-array idiom,
+mirroring vitest-cloud.sh's vt_args expansion.)
+
+**E12 — Cloud Build logs route to Cloud Logging.** In
+`docker/cloud-run/cloudbuild.yaml`, add one line under the top-level
+`options:` mapping (which already carries `machineType: E2_HIGHCPU_32` and
+`diskSizeGb: 200`):
+
+```yaml
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+```
+
+(One edit, one wrapper-neutral file — no V-mirror.) Rationale: the default
+(legacy GCS log bucket) requires project-wide `roles/viewer` for the
+submitting identity to read/stream build logs; Cloud Logging needs only the
+already-granted `roles/logging.viewer`. This changes where build logs land
+for humans too (streamed `builds submit` output is identical; only the
+Console link target moves from the bucket viewer to Logs Explorer) — called
+out in the Risk notes.
 
 **E11 / V11 — help + header text.** e2e-cloud.sh:29 header line and
 e2e-cloud.sh usage(); vitest-cloud.sh:28 header line and
@@ -847,8 +959,12 @@ if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
 if [[ "$*" == *"artifacts repositories create"* ]]; then exit 0; fi
 if [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
-if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution [green-exec-1] has successfully completed."; exit 0; fi
+# Substring-match order matters: "run jobs executions list|logs read" CONTAINS
+# "run jobs execute" as a substring, so the specific execution subcommands are
+# matched BEFORE the bare execute branch. (Nested-suite fakes use the same
+# discipline.)
 if [[ "$*" == *"executions list"* ]]; then echo "green-exec-1"; exit 0; fi
+if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
 if [[ "$*" == *"executions describe"* ]]; then
   if [[ "$*" == *"succeededCount"* ]]; then
     N=$(grep -oP -- '--tasks=\K[0-9]+' "${GREEN_LOG}" | tail -1)
@@ -858,7 +974,7 @@ if [[ "$*" == *"executions describe"* ]]; then
   fi
   exit 0
 fi
-if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
+if [[ "$*" == *"run jobs execute"* ]]; then echo "Execution [green-exec-1] has successfully completed."; exit 0; fi
 if [[ "$*" == *"run jobs"* ]]; then exit 0; fi
 exit 0
 GREEN_FAKE
@@ -1018,7 +1134,12 @@ if GCLOUD_PATH_RESOLVED=$(command -v gcloud 2>/dev/null); then
   fi
 fi
 if [ -n "$CLEAN_PATH" ]; then
-  if env PATH="$CLEAN_PATH" command -v gcloud >/dev/null 2>&1; then
+  # NOTE: `command -v` is a shell builtin; it must run INSIDE a shell (`env
+  # PATH=... bash -c ...`) — `env PATH=... command -v gcloud` tries to exec
+  # a program named "command", returns 127 unconditionally, and would
+  # certify a non-clean PATH. (The same latent bug exists in
+  # cloud-run-wrapper.test.sh check 12 — pre-existing, out of scope here.)
+  if env PATH="$CLEAN_PATH" bash -c 'command -v gcloud >/dev/null 2>&1'; then
     echo "FAIL: gcloud still resolvable on the filtered PATH"
     FAILURES=$((FAILURES + 1))
   else
@@ -1050,6 +1171,106 @@ check "W9 vitest --local: runs real local vitest, no selector, no ladder output"
     grep -qE "Test Files|passed" <<<"$2" &&
     ! grep -q "gcloud-robot" <<<"$2" && [ ! -e "$3" ]
   ' _ "$W9_RC" "$W9_OUT" "$SELECTOR_MARKER"
+
+# --- W12: e2e standalone lanes (build / push / logs) run their OWN ladder ---
+# cmd_run populates GCP_ACCOUNT before delegating to cmd_build/cmd_push, so
+# run-based checks can NEVER catch a missing resolver or a missing pin-parse
+# loop on the standalone lanes. These exercise them directly.
+
+# W12a: standalone build — probe selects, with the BUILD-lane probe permission.
+reset_green
+W12A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+  GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+  "$WRAPPER_E2E" build 2>/dev/null) && W12A_RC=0 || W12A_RC=$?
+check "W12a e2e standalone build: probe identity selected once, build-lane probe permission" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ "$(wc -l < "$2")" = "1" ] &&
+    grep -q "project=misc-puttering-project probe=cloudbuild.builds.create" "$2.env"
+  ' _ "$W12A_RC" "$SELECTOR_MARKER"
+check "W12a e2e standalone build: every gcloud call pinned to the probed robot" \
+  accounts_all_equal "$RUNG3_ROBOT"
+
+# W12b: strict mode + absent skill must NOT fail an explicitly pinned
+# standalone build (rung-1 immunity — guards the short-circuit itself).
+reset_green
+W12B_ERR="$TDIR/w12b.err"
+W12B_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_ROBOT_REQUIRE=1 \
+  "$WRAPPER_E2E" build --account="$FLAG_ACCOUNT" 2>"$W12B_ERR") && W12B_RC=0 || W12B_RC=$?
+check "W12b e2e standalone build: --account pin wins, strict mode cannot fail it, silent" \
+  bash -c '
+    [ "$1" = "0" ] && grep -q "Cloud Build complete" <<<"$2" &&
+    [ ! -e "$3" ] && [ ! -s "$4" ]
+  ' _ "$W12B_RC" "$W12B_OUT" "$SELECTOR_MARKER" "$W12B_ERR"
+check "W12b e2e standalone build: every gcloud call pinned to the flag value" \
+  accounts_all_equal "$FLAG_ACCOUNT"
+
+# W12c: standalone push — rung-2 pin must reach describe/print-access-token.
+reset_green
+W12C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" push 2>/dev/null) && W12C_RC=0 || W12C_RC=$?
+check "W12c e2e standalone push: succeeds under rung-2 pin" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W12C_RC" "$W12C_OUT" "$SELECTOR_MARKER"
+check "W12c e2e standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W12d: standalone logs — rung-2 pin on BOTH calls, non-pin args passed through.
+reset_green
+W12D_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" logs --limit=3 --freshness=1d 2>/dev/null) && W12D_RC=0 || W12D_RC=$?
+check "W12d e2e standalone logs: list+read share the pinned identity, pass-through args preserved" \
+  bash -c '
+    [ "$1" = "0" ] && [ ! -e "$4" ] &&
+    grep "logs read" "$2" | grep -q -- "--limit=3" &&
+    grep "logs read" "$2" | grep -q -- "--freshness=1d"
+  ' _ "$W12D_RC" "$GREEN_LOG" "$W12D_OUT" "$SELECTOR_MARKER"
+check "W12d e2e standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W12e: standalone logs — flag pin wins on the logs lane (rung 1 there too).
+reset_green
+W12E_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_ROBOT_REQUIRE=1 \
+  "$WRAPPER_E2E" logs --account="$FLAG_ACCOUNT" 2>/dev/null) && W12E_RC=0 || W12E_RC=$?
+check "W12e e2e standalone logs: --account pin honored (rung 1), strict-mode immune" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W12E_RC" "$W12E_OUT" "$SELECTOR_MARKER"
+check "W12e e2e standalone logs: every gcloud call pinned to the flag value" \
+  accounts_all_equal "$FLAG_ACCOUNT"
+
+# --- W13: vitest standalone lanes (build / push / logs) — parity pins -------
+# W13a: standalone build via probe.
+reset_green
+W13A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+  GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+  "$WRAPPER_VITEST" build 2>/dev/null) && W13A_RC=0 || W13A_RC=$?
+check "W13a vitest standalone build: probe identity selected once, build-lane probe permission" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ "$(wc -l < "$2")" = "1" ] &&
+    grep -q "project=misc-puttering-project probe=cloudbuild.builds.create" "$2.env"
+  ' _ "$W13A_RC" "$SELECTOR_MARKER"
+check "W13a vitest standalone build: every gcloud call pinned to the probed robot" \
+  accounts_all_equal "$RUNG3_ROBOT"
+
+# W13b: standalone push under rung-2 pin.
+reset_green
+W13B_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_VITEST" push 2>/dev/null) && W13B_RC=0 || W13B_RC=$?
+check "W13b vitest standalone push: succeeds, every gcloud call pinned to GCLOUD_IDENT" \
+  bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W13B_RC" "$W13B_OUT" "$SELECTOR_MARKER"
+check "W13b vitest standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# W13c: standalone logs under rung-2 pin, pass-through preserved.
+reset_green
+W13C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_VITEST" logs --limit=2 2>/dev/null) && W13C_RC=0 || W13C_RC=$?
+check "W13c vitest standalone logs: pinned identity on both calls, pass-through preserved" \
+  bash -c '
+    [ "$1" = "0" ] && [ ! -e "$4" ] &&
+    grep "logs read" "$2" | grep -q -- "--limit=2"
+  ' _ "$W13C_RC" "$GREEN_LOG" "$W13C_OUT" "$SELECTOR_MARKER"
+check "W13c vitest standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
+  accounts_all_equal "$RUNG2_IDENT"
 
 # --- W10/W11: help documents every identity knob, no human default ---------
 E2E_HELP=$("$WRAPPER_E2E" help 2>&1)
@@ -1095,18 +1316,30 @@ of `dan@danshapiro.com`, never empty):
   refactor preserves that; their new "the ladder never ran for a pinned
   call" assertions pass vacuously pre-wiring and become live after wiring,
   where they guard the rung-1 short-circuit).
+- W12a/W13a fail (no ladder pre-wiring: the marker never runs, so the
+  probe-permission assertion fails; and the accounts mismatch, dan@ versus
+  the probed robot).
+- W12c/W12d/W12e/W13b/W13c fail via accounts mismatch pre-wiring — the
+  standalone push/logs lanes parse NO pin flags today, so they pin the
+  hardcoded human no matter what GCLOUD_IDENT/--account says (this is the
+  round-2 Major: `push --account=EMAIL` ignored; `logs --account=EMAIL`
+  split-identity).
+- W12b PASSES pre-wiring (the current `cmd_build` already parses
+  `--account`); it is the rung-1 strict-mode immunity guard and becomes live
+  the moment wiring lands — without the short-circuit it fails (strict note
+  + nonzero exit).
 - W7 and W8/W9's silence assertions pass vacuously pre-wiring (no ladder
   exists to trigger the trap); W7's red proof is the step-3 interim run
   below.
 
 - [ ] **Step 3: Add the minimal production implementation — wrapper wiring only**
 
-Apply hunks E1–E11 to `scripts/e2e-cloud.sh` and V1–V11 to
-`scripts/vitest-cloud.sh` per the edit reference above. Do NOT yet add the
-four trap-11 pins.
+Apply hunks E1–E11 to `scripts/e2e-cloud.sh`, V1–V11 to
+`scripts/vitest-cloud.sh`, and E12 to `docker/cloud-run/cloudbuild.yaml` per
+the edit reference above. Do NOT yet add the four trap-11 pins.
 
 Interim verification (the pins' red proof): run
-`bash scripts/test/cloud-gcp-identity.test.sh` and confirm W1–W6, W8–W11 are
+`bash scripts/test/cloud-gcp-identity.test.sh` and confirm W1–W6 and W8–W13 are
 now GREEN while **W7 is RED with `$SELECTOR_MARKER` written** — the nested
 suites invoked the wired wrappers, the ladder reached rung 3, and the
 marker-trap selector ran: exactly the trap-11 network-reachability hazard,
@@ -1137,7 +1370,8 @@ hunks mirror each other apart from names/line placement.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Both wrappers changed and all six suites exercise them; the impacted set is
+Both wrappers changed and all five suites exercise them (the identity suite
+plus the four pre-existing cloud suites); the impacted set is
 the full cloud-suite loop:
 
 Run:
@@ -1161,8 +1395,9 @@ arrives via the workflow's coordinated suite at the stage gate.)
 git add scripts/e2e-cloud.sh scripts/vitest-cloud.sh \
         scripts/test/cloud-build.test.sh scripts/test/cloud-exec-id-parse.test.sh \
         scripts/test/cloud-run-wrapper.test.sh scripts/test/cloud-vitest-wrapper.test.sh \
-        scripts/test/cloud-gcp-identity.test.sh
-git commit -m "feat(cloud): wire gcloud-robot identity ladder into e2e/vitest cloud wrappers"
+        scripts/test/cloud-gcp-identity.test.sh \
+        docker/cloud-run/cloudbuild.yaml
+git commit -m "feat(cloud): wire gcloud-robot identity ladder into e2e/vitest cloud wrappers + route build logs to Cloud Logging"
 ```
 
 ---
@@ -1473,6 +1708,10 @@ for immediacy.)
 - Push 403s or the run logs "Creating Artifact Registry repository" then
   fails → step 1's repo-exists check was skipped: writer cannot create
   repositories. Run the describe/create block from provisioning.
+- "Where did build logs go?" → build logs now land in Cloud Logging by
+  design (`options.logging: CLOUD_LOGGING_ONLY`), so the
+  robot's `logging.viewer` covers them and no project-wide viewer grant is
+  needed. Streamed `builds submit` output is unchanged.
 - A grant that definitely exists 403s for the first minutes → IAM
   propagation lag; the verifier's retries (12 × 30s default) absorb it.
 - A lane prints the ambient-fallback note and then gcloud's
@@ -1563,6 +1802,10 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
 | help/local lanes need zero GCP tooling and stay silent | Task 2 W8/W9; pre-existing cloud-run-wrapper check 12 |
 | Trap-11: stubbed suites never reach the probe | Task 2 W7 (four nested suites under a hostile marker-trap home) |
 | Hardcoded-default removal documented in help | Task 2 W10/W11 |
+| Standalone build lane resolves with the BUILD probe permission | Task 2 W12a/W13a |
+| Standalone push/logs lanes honor pins + ladder (rung-1 and rung-2), logs passthrough preserved | Task 2 W12b–W12e, W13b/W13c |
+| Rung-1 short-circuit immunity to strict mode (pinned lanes never touch the ladder) | Task 1 check J; Task 2 W12b/W12e |
+| Build logs readable with least privilege | Task 2 E12 (`logging: CLOUD_LOGGING_ONLY`) — covered by `roles/logging.viewer`; end-to-end shape proven by the runbook's operator lane smoke |
 | Runbook + AGENTS.md docs | Task 3 — docs-only task; repo TDD doc exemption applies; verified by read-through + suite regression sweep |
 | Provisioning/rotation/revocation correctness | Documented only — human-executed; skill-mandated exclusion (no agent runs GCP mutations); surface completeness hardened by verify probes + one real lane smoke |
 | Whole-repo regression | Workflow stage gate (coordinated suite), outside task scope |
@@ -1582,3 +1825,12 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
   one note and run exactly as before (including, today, the culled-credential
   failure mode). That is the contract: adoption is non-breaking; provisioning
   is the fix.
+- **Build-log location changes for everyone.** `options.logging:
+  CLOUD_LOGGING_ONLY` moves build logs from the legacy GCS bucket to Cloud
+  Logging for human lanes too. The streamed `gcloud builds submit` output is
+  unchanged; only the Console link target moves (bucket viewer → Logs
+  Explorer). The alternative (granting the robot project-wide
+  `roles/viewer`) was refused as over-broad.
+- **Standalone lanes gain flag parsing.** `push`/`logs` now parse
+  `--account=`/`--project-id=`/`--region=`; unknown args keep their old
+  behavior (push ignores them; logs passes them through to `logs read`).
