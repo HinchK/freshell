@@ -559,9 +559,6 @@ check "W10 e2e help carries no hardcoded human account" \
   bash -c '! grep -q "dan@danshapiro" <<<"$1"' _ "$E2E_HELP"
 check "W11 vitest help carries no hardcoded human account" \
   bash -c '! grep -q "dan@danshapiro" <<<"$1"' _ "$VITEST_HELP"
-
-# DOC-CHECKS-ANCHOR (Task 3 appends here)
-
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
   echo "=== All checks passed ==="
