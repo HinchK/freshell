@@ -1583,4 +1583,3 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
   failure mode). That is the contract: adoption is non-breaking; provisioning
   is the fix.
 
-
