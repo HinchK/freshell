@@ -87,13 +87,20 @@ Exact project-wide constraints every task must honor:
 - **Role set (documented, human-applied)** for project
   `misc-puttering-project`, robot `gcloud-robot`: project-level
   `roles/cloudbuild.builds.editor`, `roles/artifactregistry.writer`,
-  `roles/run.developer`, `roles/run.invoker`, `roles/run.viewer`,
+  `roles/run.developer`, `roles/run.jobsExecutor`, `roles/run.viewer`,
   `roles/logging.viewer`; bucket-scoped `roles/storage.objectAdmin` +
   `roles/storage.legacyBucketReader` on the Cloud Build staging bucket
   (default `misc-puttering-project_cloudbuild`, operator confirms);
   `roles/iam.serviceAccountUser` (actAs) on the project's default compute
-  service account and default Cloud Build service account. NO
-  `roles/serviceusage.serviceUsageConsumer` (not justified by the surface).
+  service account (`<projectNumber>-compute@developer.gserviceaccount.com`),
+  plus — ONLY IF the project's Cloud Build default service account
+  (`gcloud builds get-default-service-account`) is an identity the project
+  controls — actAs on that identity too (the LEGACY Cloud Build SA
+  `<projectNumber>@cloudbuild.gserviceaccount.com` is Google-owned and
+  accepts no bindings, and `service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com`
+  is the service AGENT, never a build-execution identity — grant nothing on
+  either). NO `roles/serviceusage.serviceUsageConsumer` (not justified by the
+  surface).
 - **Files explicitly out of scope (untouched, with reason):**
   `scripts/run-standard-tests.ts` (it `execFileSync`s `vitest-cloud.sh` with
   inherited env; identity resolution lives inside the wrapper so the
@@ -123,11 +130,17 @@ Exact project-wide constraints every task must honor:
   `GCLOUD_ROBOT_ROLES`, `GCLOUD_ROBOT_ADMIN_ACCOUNT`, `--name`, `--activate`
   (runbook command correctness). Validate by reading the operator-installed
   script's usage.
-- **A5** The default actAs identities for `misc-puttering-project` are the
-  default compute SA (`<projectNumber>-compute@developer.gserviceaccount.com`)
-  and default Cloud Build SA
-  (`service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com`).
-  Validate against official docs documenting both default SA names.
+- **A5** RESOLVED (stage 2, validator reports
+  `reports/load-bearing-validator-a5.md`): the compute default SA form
+  `<projectNumber>-compute@developer.gserviceaccount.com` is CONFIRMED; the
+  claimed Cloud Build form `service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com`
+  is FALSIFIED — that address is the Google-managed Cloud Build service
+  AGENT (builds never run as it; no IAM bindings possible). The real Cloud
+  Build default is either the legacy `PROJECT_NUMBER@cloudbuild.gserviceaccount.com`
+  (Google-owned, accepts no bindings) or, on newer setups, the compute default
+  SA; the runbook discovers it via `gcloud builds get-default-service-account`
+  rather than assuming. Plan content updated accordingly (role-set Global
+  Constraint, Task 3 runbook step 2).
 
 These are properties of external contracts; the plan's tasks do not depend on
 any other unproven claim. If A1/A2 invalidate a probe permission, swap the
@@ -1211,6 +1224,11 @@ A resolved identity pins every `--account` the wrappers emit and exports
 
 - The `gcloud-robot` skill installed for your agent platform (whatever
   directory holds its `scripts/` — the repo never records that path).
+- The Cloud Resource Manager API enabled on the project (the identity probe's
+  `testIamPermissions` call needs it; any project that has ever touched IAM
+  already has it — `gcloud services enable cloudresourcemanager.googleapis.com
+  --project=misc-puttering-project --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT"`
+  is the one-time, idempotent enable).
 - Point the lanes at it once, e.g. in `~/.bashrc`:
 
   ```bash
@@ -1229,7 +1247,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.invoker run.viewer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.jobsExecutor run.viewer logging.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --name gcloud-robot --activate
    ```
@@ -1256,12 +1274,21 @@ account (export it). All skill scripts are invoked via
        --project=misc-puttering-project --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --condition=None
    done
 
-   # actAs on the default build/run identities (jobs and Cloud Build run as
-   # these, and submitting identities must be allowed to act as them):
+   # actAs on the default build/run identities. Cloud Run jobs execute as the
+   # project default compute SA, so creating jobs requires actAs on it. Cloud
+   # Build's default execution identity is DISCOVERED, not assumed: on older
+   # projects it is the legacy <number>@cloudbuild.gserviceaccount.com
+   # (Google-owned, accepts NO bindings — skip it), on newer ones the compute
+   # default SA. (actAs beyond this is only needed when a build config pins
+   # serviceAccount: — docker/cloud-run/cloudbuild.yaml pins none.)
    PROJECT_NUMBER=$(gcloud projects describe misc-puttering-project \
      --format='value(projectNumber)' --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT")
-   for sa in "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-             "service-${PROJECT_NUMBER}@gcp-sa-cloudbuild.iam.gserviceaccount.com"; do
+   BUILD_SA="$(gcloud builds get-default-service-account --project=misc-puttering-project \
+     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" | grep -oE '[A-Za-z0-9._-]+@[A-Za-z0-9.-]+' | head -1)"
+   for sa in "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" ${BUILD_SA:+"$BUILD_SA"}; do
+     case "$sa" in
+       *@cloudbuild.gserviceaccount.com) echo "skipping $sa (legacy Cloud Build SA accepts no IAM bindings)"; continue ;;
+     esac
      gcloud iam service-accounts add-iam-policy-binding "$sa" \
        --member="serviceAccount:gcloud-robot@misc-puttering-project.iam.gserviceaccount.com" \
        --role=roles/iam.serviceAccountUser \
@@ -1303,7 +1330,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.invoker run.viewer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.jobsExecutor run.viewer logging.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --rekey --activate
    ```
