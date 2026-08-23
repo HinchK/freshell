@@ -87,20 +87,32 @@ Exact project-wide constraints every task must honor:
 - **Role set (documented, human-applied)** for project
   `misc-puttering-project`, robot `gcloud-robot`: project-level
   `roles/cloudbuild.builds.editor`, `roles/artifactregistry.writer`,
-  `roles/run.developer`, `roles/run.jobsExecutor`, `roles/run.viewer`,
-  `roles/logging.viewer`; bucket-scoped `roles/storage.objectAdmin` +
-  `roles/storage.legacyBucketReader` on the Cloud Build staging bucket
-  (default `misc-puttering-project_cloudbuild`, operator confirms);
-  `roles/iam.serviceAccountUser` (actAs) on the project's default compute
-  service account (`<projectNumber>-compute@developer.gserviceaccount.com`),
-  plus — ONLY IF the project's Cloud Build default service account
-  (`gcloud builds get-default-service-account`) is an identity the project
-  controls — actAs on that identity too (the LEGACY Cloud Build SA
+  `roles/run.developer`, `roles/logging.viewer`; bucket-scoped
+  `roles/storage.objectAdmin` + `roles/storage.legacyBucketReader` on the
+  Cloud Build staging bucket (default `misc-puttering-project_cloudbuild`,
+  operator confirms); `roles/iam.serviceAccountUser` (actAs) on the project's
+  default compute service account
+  (`<projectNumber>-compute@developer.gserviceaccount.com`), plus — ONLY IF
+  the project's Cloud Build default service account (`gcloud builds
+  get-default-service-account`) is an identity the project controls — actAs
+  on that identity too (the LEGACY Cloud Build SA
   `<projectNumber>@cloudbuild.gserviceaccount.com` is Google-owned and
-  accepts no bindings, and `service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com`
-  is the service AGENT, never a build-execution identity — grant nothing on
-  either). NO `roles/serviceusage.serviceUsageConsumer` (not justified by the
-  surface).
+  accepts no bindings, and
+  `service-<projectNumber>@gcp-sa-cloudbuild.iam.gserviceaccount.com` is the
+  service AGENT, never a build-execution identity — grant nothing on either).
+  NO `roles/serviceusage.serviceUsageConsumer` (not justified by the surface).
+  Role-set reasoning, verified against the official role permission lists
+  (review round-1 remediation): `roles/run.developer` subsumes
+  `run.invoker`/`run.jobsExecutor`/`run.viewer` for job lanes and is the
+  tightest built-in that also carries `run.jobs.runWithOverrides` — REQUIRED
+  because the vitest wrapper's `run jobs execute --tasks/--task-timeout/
+  --update-env-vars` supplies per-execution overrides. `run.jobsExecutor`,
+  `run.jobsExecutorWithOverrides`, `run.invoker`, and `run.viewer` are
+  deliberately NOT in the list (each is either too narrow or redundant under
+  developer). The wrapper's create-if-missing Artifact Registry path
+  (`artifacts repositories create`) is NOT granted
+  (`artifactregistry.repositories.create` would need repoAdmin): the operator
+  checklist ensures the repository exists instead.
 - **Files explicitly out of scope (untouched, with reason):**
   `scripts/run-standard-tests.ts` (it `execFileSync`s `vitest-cloud.sh` with
   inherited env; identity resolution lives inside the wrapper so the
@@ -139,8 +151,16 @@ Exact project-wide constraints every task must honor:
   Build default is either the legacy `PROJECT_NUMBER@cloudbuild.gserviceaccount.com`
   (Google-owned, accepts no bindings) or, on newer setups, the compute default
   SA; the runbook discovers it via `gcloud builds get-default-service-account`
-  rather than assuming. Plan content updated accordingly (role-set Global
-  Constraint, Task 3 runbook step 2).
+  rather than assuming. Plan content updated accordingly.
+- **A6** (raised by plan-review round 1; RESOLVED against the official Cloud
+  Run IAM role permission lists): the vitest lane's per-execution overrides
+  (`run jobs execute --tasks/--task-timeout/--update-env-vars`) require
+  `run.jobs.runWithOverrides`; `roles/run.developer` carries it and subsumes
+  `run.invoker`/`run.jobsExecutor`/`run.jobsExecutorWithOverrides`/
+  `run.viewer` for these lanes, so the role set is developer + logging.viewer
+  only (plus the build/AR roles). Also verified: `artifactregistry.writer`
+  cannot create repositories (`repositories.create` absent) — the operator
+  checklist ensures the AR repo exists instead of granting repoAdmin.
 
 These are properties of external contracts; the plan's tasks do not depend on
 any other unproven claim. If A1/A2 invalidate a probe permission, swap the
@@ -183,11 +203,13 @@ wrapper-level block arrives in Task 2.
   `GCLOUD_ROBOT_HOME`, `GCLOUD_ROBOT_REQUIRE`, `GCLOUD_ROBOT_PROJECT`,
   `GCLOUD_ROBOT_PROBE_PERMISSION`).
 - Produces: `resolve_gcp_identity` (verbatim skill block) and
-  `freshell_resolve_cloud_identity <probe-permission>` — bridges the caller's
+  `freshell_resolve_cloud_identity <probe-permission>` — returns 0 untouched
+  when the caller's `GCP_ACCOUNT` is already pinned (rung 1 never touches the
+  network or strict-mode failure paths); otherwise bridges the caller's
   `GCP_PROJECT` into `GCLOUD_ROBOT_PROJECT`, defaults
-  `GCLOUD_ROBOT_PROBE_PERMISSION` from `$1`, then applies a resolved
-  `GCLOUD_IDENT` into the caller's `GCP_ACCOUNT` pin var when it is empty.
-  Used by both wrappers in Task 2.
+  `GCLOUD_ROBOT_PROBE_PERMISSION` from `$1`, resolves, applies a resulting
+  `GCLOUD_IDENT` into `GCP_ACCOUNT`, and PROPAGATES the ladder's failure
+  status. Used by both wrappers in Task 2.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -249,7 +271,7 @@ printf '%s\n' "${SELECTOR_ACCOUNT:-}"
 FAKE_SELECTOR
 chmod +x "$FAKE_HOME/scripts/select-gcloud-identity.sh"
 
-SELECTOR_MARKER="$TDIR/selector-ran"
+export SELECTOR_MARKER="$TDIR/selector-ran"
 LADDER_STDERR="$TDIR/stderr"
 
 # Reads one "key=value" outcome line out of a run_ladder transcript.
@@ -257,15 +279,28 @@ field() {
   grep "^$2=" <<< "$1" | head -1 | cut -d= -f2-
 }
 
-# Runs the identity ladder in a FRESH bash process with exactly the env the
-# caller exported. Stdout: rc/ident/account/pin outcome lines. Stderr from
-# the ladder lands in $LADDER_STDERR. Resets the selector markers per run.
-# Always returns 0: the ladder's own rc is reported as the rc= outcome line,
-# so a crash in the subshell shows up as missing lines, not a set -e abort.
+# Identity/ladder knobs scrubbed out of the harness environment before every
+# ladder/wrapper invocation — an operator machine may legitimately export any
+# of these (FRESHELL_GCP_ACCOUNT, GCLOUD_ROBOT_REQUIRE=1, a real
+# GCLOUD_ROBOT_HOME, ...), and any leak would silently change which rung a
+# check exercises. Every ladder/wrapper call below applies this list, then
+# layers only the knobs the check intends.
+SCRUB=(-u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE
+       -u GCLOUD_ROBOT_PROJECT -u GCLOUD_ROBOT_PROBE_PERMISSION
+       -u FRESHELL_GCP_ACCOUNT -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT
+       -u SELECTOR_ACCOUNT -u SELECTOR_FAIL)
+
+# Runs the identity ladder in a FRESH bash process over the scrubbed env;
+# extra KEY=VALUE arguments are the check's intended knobs, forwarded to env.
+# Stdout: rc/ident/account/pin outcome lines. Stderr from the ladder lands in
+# $LADDER_STDERR. Resets the selector markers per run. Always returns 0: the
+# ladder's own rc is reported as the rc= outcome line, so a subshell crash
+# shows up as missing lines, not a set -e abort.
 run_ladder() {
-  # $1 = probe-permission argument handed to freshell_resolve_cloud_identity
+  local probe="$1"
+  shift
   rm -f "$LADDER_STDERR" "$SELECTOR_MARKER" "$SELECTOR_MARKER.env"
-  env bash -c '
+  env "${SCRUB[@]}" "$@" bash -c '
     set -u
     . "$1"
     GCP_PROJECT="misc-puttering-project"
@@ -275,21 +310,20 @@ run_ladder() {
     printf "ident=%s\n" "${GCLOUD_IDENT:-}"
     printf "account=%s\n" "${CLOUDSDK_CORE_ACCOUNT:-}"
     printf "pin=%s\n" "$GCP_ACCOUNT"
-  ' _ "$HELPER" "$1" 2>"$LADDER_STDERR" || true
+  ' _ "$HELPER" "$probe" 2>"$LADDER_STDERR" || true
 }
 
 # --- Check A: sourcing is silent and side-effect-free ---------------------
 # help/local lanes source the helper unconditionally, so the source itself
 # must never print, resolve, or require any env.
-SRC_OUT=$(env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME bash -c \
+SRC_OUT=$(env "${SCRUB[@]}" bash -c \
   'set -u; . "$1" && declare -F resolve_gcp_identity >/dev/null && declare -F freshell_resolve_cloud_identity >/dev/null && echo sourced-ok' \
   _ "$HELPER" 2>&1 || true)
 check "sourcing the helper defines both functions with zero output" \
   bash -c '[ "$1" = "sourced-ok" ]' _ "$SRC_OUT"
 
 # --- Check B: rung 2 — explicit GCLOUD_IDENT bypass, no network -----------
-OUT=$(export GCLOUD_IDENT="fake-bypass@example.invalid" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_IDENT="fake-bypass@example.invalid" GCLOUD_ROBOT_HOME="$FAKE_HOME")
 check "rung-2 bypass: GCLOUD_IDENT flows to pin + exports, selector never runs, silent" \
   bash -c '
     [ "$1" = "0" ] && [ "$2" = "fake-bypass@example.invalid" ] &&
@@ -299,9 +333,7 @@ check "rung-2 bypass: GCLOUD_IDENT flows to pin + exports, selector never runs, 
       "$SELECTOR_MARKER" "$LADDER_STDERR"
 
 # --- Check C: rung 3 — probe selects an account, env contract forwarded ---
-OUT=$(unset GCLOUD_IDENT; \
-      export GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER SELECTOR_ACCOUNT="gcloud-robot@example.invalid"; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="gcloud-robot@example.invalid")
 check "rung-3 probe: selector account adopted, project+probe env forwarded, silent" \
   bash -c '
     [ "$1" = "0" ] && [ "$2" = "gcloud-robot@example.invalid" ] &&
@@ -312,9 +344,7 @@ check "rung-3 probe: selector account adopted, project+probe env forwarded, sile
       "$SELECTOR_MARKER" "$LADDER_STDERR"
 
 # --- Check D: probe finds nothing — quiet ambient note, exit 0 ------------
-OUT=$(unset GCLOUD_IDENT; \
-      export GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER SELECTOR_FAIL=1; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_FAIL=1)
 check "probe-empty: one ambient-fallback stderr note, no identity, exit 0" \
   bash -c '
     [ "$1" = "0" ] && [ -z "$2" ] && [ -z "$3" ] && [ -z "$4" ] &&
@@ -325,8 +355,7 @@ check "probe-empty: one ambient-fallback stderr note, no identity, exit 0" \
       "$LADDER_STDERR" "$SELECTOR_MARKER"
 
 # --- Check E: skill absent — single quiet ambient note, exit 0 ------------
-OUT=$(unset GCLOUD_IDENT GCLOUD_ROBOT_HOME; export SELECTOR_MARKER; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run")
 check "skill-absent: exactly one ambient-fallback stderr note, exit 0" \
   bash -c '
     [ "$1" = "0" ] &&
@@ -336,17 +365,14 @@ check "skill-absent: exactly one ambient-fallback stderr note, exit 0" \
   ' _ "$(field "$OUT" rc)" "$LADDER_STDERR" "$SELECTOR_MARKER"
 
 # --- Check F: strict mode fails closed when the skill is absent -----------
-OUT=$(unset GCLOUD_IDENT GCLOUD_ROBOT_HOME; export GCLOUD_ROBOT_REQUIRE=1; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_ROBOT_REQUIRE=1)
 check "GCLOUD_ROBOT_REQUIRE=1, skill absent: nonzero rc + strict-mode guidance" \
   bash -c '
     [ "$1" != "0" ] && grep -q "strict mode" "$2" && [ -z "$3" ]
   ' _ "$(field "$OUT" rc)" "$LADDER_STDERR" "$(field "$OUT" account)"
 
 # --- Check G: strict mode fails closed when the probe finds nothing -------
-OUT=$(unset GCLOUD_IDENT; \
-      export GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER SELECTOR_FAIL=1 GCLOUD_ROBOT_REQUIRE=1; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_FAIL=1 GCLOUD_ROBOT_REQUIRE=1)
 check "GCLOUD_ROBOT_REQUIRE=1, probe empty: nonzero rc + probe failure named" \
   bash -c '
     [ "$1" != "0" ] && grep -q "no identity passes the probe" "$2"
@@ -354,8 +380,7 @@ check "GCLOUD_ROBOT_REQUIRE=1, probe empty: nonzero rc + probe failure named" \
 
 # --- Check H: idempotent — a second resolve never re-runs the selector ----
 rm -f "$SELECTOR_MARKER"
-OUT=$(unset GCLOUD_IDENT; \
-      export GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER SELECTOR_ACCOUNT="once@example.invalid"; \
+OUT=$(env "${SCRUB[@]}" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="once@example.invalid" \
       bash -c '
         set -u
         . "$1"
@@ -371,24 +396,28 @@ check "two resolves in one process run the selector exactly once" \
   ' _ "$(field "$OUT" ident)" "$SELECTOR_MARKER"
 
 # --- Check I: operator-pinned GCLOUD_ROBOT_PROJECT survives the bridge ----
-OUT=$(unset GCLOUD_IDENT; \
-      export GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER SELECTOR_ACCOUNT="robot@example.invalid" \
-             GCLOUD_ROBOT_PROJECT="other-project" GCLOUD_ROBOT_PROBE_PERMISSION="custom.perm.check"; \
-      run_ladder "run.jobs.run")
+OUT=$(run_ladder "run.jobs.run" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="robot@example.invalid" \
+      GCLOUD_ROBOT_PROJECT="other-project" GCLOUD_ROBOT_PROBE_PERMISSION="custom.perm.check")
 check "operator overrides: project + probe pass through to the selector verbatim" \
   bash -c '
     grep -q "project=other-project probe=custom.perm.check" "$2.env" &&
     [ "$1" = "robot@example.invalid" ]
   ' _ "$(field "$OUT" ident)" "$SELECTOR_MARKER"
 
-# --- Check J: rung 1 — a pinned GCP_ACCOUNT is never overwritten ----------
-OUT=$(unset GCLOUD_ROBOT_HOME; \
-      export GCLOUD_IDENT="ident@example.invalid" FRESHELL_GCP_ACCOUNT="pinned@example.invalid"; \
-      run_ladder "run.jobs.run")
-check "explicit account pin wins over the ladder result (rung 1)" \
+# --- Check J: rung 1 — a pinned GCP_ACCOUNT short-circuits the ladder -----
+# A pin must win BEFORE any ladder work: no selector run (even with
+# GCLOUD_ROBOT_HOME + GCLOUD_IDENT present), no CLOUDSDK exports, no stderr,
+# and strict mode may not fail a pinned call. The ident transcript line still
+# echoes the inherited env value — it is simply never consulted.
+OUT=$(run_ladder "run.jobs.run" GCLOUD_IDENT="ident@example.invalid" \
+      FRESHELL_GCP_ACCOUNT="pinned@example.invalid" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+      GCLOUD_ROBOT_REQUIRE=1)
+check "explicit account pin wins BEFORE the ladder (no probe, no exports, silent)" \
   bash -c '
-    [ "$1" = "pinned@example.invalid" ] && [ "$2" = "ident@example.invalid" ] && [ ! -s "$3" ]
-  ' _ "$(field "$OUT" pin)" "$(field "$OUT" ident)" "$LADDER_STDERR"
+    [ "$1" = "0" ] && [ "$2" = "pinned@example.invalid" ] && [ -z "$3" ] &&
+    [ ! -e "$4" ] && [ ! -s "$5" ]
+  ' _ "$(field "$OUT" rc)" "$(field "$OUT" pin)" "$(field "$OUT" account)" \
+      "$SELECTOR_MARKER" "$LADDER_STDERR"
 
 # WRAPPER-LEVEL-CHECKS-ANCHOR (Task 2 appends here)
 
@@ -417,11 +446,12 @@ marker never appears.)
 - [ ] **Step 3: Add the minimal production implementation**
 
 Create `scripts/lib/gcp-identity.sh` with exactly this content. The drop-in
-block between the BEGIN/END markers is the skill's verbatim text — the
-implementation shown here was composed against
-`~/.claude/skills/gcloud-robot/SKILL.md` §"The identity ladder is fixed"; if
-any drift is suspected at execution time, re-copy the block from that source
-(diff them if uncertain) and keep the repo copy byte-identical:
+block between the BEGIN/END markers is the skill's verbatim text — composed
+against the "identity ladder" section of the operator's installed
+gcloud-robot skill's SKILL.md (located wherever the operator's platform
+keeps installed skills, or via `GCLOUD_ROBOT_HOME` once set — never recorded
+in-commit). If any drift is suspected at execution time, re-copy the block
+from that source and keep the repo copy byte-identical:
 
 ```bash
 #!/usr/bin/env bash
@@ -492,15 +522,23 @@ resolve_gcp_identity() {
 # Requires the caller to provide GCP_PROJECT and GCP_ACCOUNT (possibly
 # empty), matching both cloud wrappers' top-of-file defaults.
 freshell_resolve_cloud_identity() {
+  # rung 1: an existing pin (the wrapper's --account= flag or
+  # FRESHELL_GCP_ACCOUNT) wins outright — skip the ladder ENTIRELY: no
+  # selector, no network, no stderr note, and GCLOUD_ROBOT_REQUIRE=1 must not
+  # fail a deliberately pinned call.
+  if [ -n "${GCP_ACCOUNT:-}" ]; then return 0; fi
   export GCLOUD_ROBOT_PROJECT="${GCLOUD_ROBOT_PROJECT:-${GCP_PROJECT:?GCP_PROJECT must be set before identity resolution}}"
   export GCLOUD_ROBOT_PROBE_PERMISSION="${GCLOUD_ROBOT_PROBE_PERMISSION:-${1:?probe permission argument required}}"
-  resolve_gcp_identity
+  # Propagate the ladder's status: under GCLOUD_ROBOT_REQUIRE=1 a failed
+  # resolve must fail the lane (both wrappers run set -e; the ladder already
+  # printed its guidance).
+  if ! resolve_gcp_identity; then return 1; fi
   # Pinned-call adoption (gcloud-robot skill): a probed identity takes the
-  # pinned --account slot ONLY when nothing pinned one — an operator's
-  # --account= / FRESHELL_GCP_ACCOUNT (rung 1) always wins. With nothing
-  # resolved the pin stays empty and the wrappers omit --account entirely,
-  # letting ambient gcloud apply (the ladder already noted that on stderr).
-  GCP_ACCOUNT="${GCP_ACCOUNT:-${GCLOUD_IDENT:-}}"
+  # pinned --account slot (the pin was empty, per the rung-1 branch above).
+  # With nothing resolved the pin stays empty and the wrappers omit
+  # --account entirely, letting ambient gcloud apply (the ladder already
+  # noted that on stderr).
+  GCP_ACCOUNT="${GCLOUD_IDENT:-}"
 }
 ```
 
@@ -843,10 +881,17 @@ reset_green() {
   touch "$GREEN_LOG"
 }
 
-# Every --account token observed across a run equals the expected one, and at
-# least one pinned call exists (an empty log proves nothing).
+# Every gcloud invocation that COULD pin an account DID pin this exact one:
+# the accounts log must contain one token per logged gcloud call (the bare
+# `gcloud info` PATH-probe call takes no flags and is excluded), all equal to
+# the expected value, and non-empty — an omit/present mix or an empty log
+# both fail.
 accounts_all_equal() {
-  [ -s "$GREEN_LOG.accounts" ] && \
+  [ -s "$GREEN_LOG.accounts" ] || return 1
+  local calls tokens
+  calls=$(grep '^GCLOUD_ARGS:' "$GREEN_LOG" | grep -vc '^GCLOUD_ARGS: info ')
+  tokens=$(wc -l < "$GREEN_LOG.accounts")
+  [ "$calls" -gt 0 ] && [ "$calls" -eq "$tokens" ] && \
     [ "$(sort -u "$GREEN_LOG.accounts" | wc -l)" = "1" ] && \
     [ "$(sort -u "$GREEN_LOG.accounts" | head -1)" = "--account=$1" ]
 }
@@ -854,8 +899,8 @@ accounts_all_equal() {
 # --- W1: e2e rung 2 — GCLOUD_IDENT drives every pinned call ----------------
 reset_green
 W1_ERR="$TDIR/w1.err"
-W1_OUT=$(env PATH="$GTDIR:$PATH" \
-         GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" \
+W1_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
          "$WRAPPER_E2E" run --cloud --shards=1 2>"$W1_ERR") && W1_RC=0 || W1_RC=$?
 check "W1 e2e rung-2: run succeeds with GCLOUD_IDENT pinned on every call, selector untouched, silent" \
   bash -c '
@@ -867,30 +912,34 @@ check "W1 e2e rung-2: every gcloud call pinned to the GCLOUD_IDENT value" \
 check "W1 e2e rung-2: selector never ran and no hardcoded human account appeared" \
   bash -c '[ ! -e "$1" ] && ! grep -q "dan@danshapiro" "$2"' _ "$SELECTOR_MARKER" "$GREEN_LOG"
 
-# --- W2: e2e rung 1 — --account= beats FRESHELL_GCP_ACCOUNT > GCLOUD_IDENT -
+# --- W2: e2e rung 1 — a flag pin wins BEFORE the ladder runs --------------
 reset_green
-W2_OUT=$(env PATH="$GTDIR:$PATH" \
-         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" \
+W2_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
          "$WRAPPER_E2E" run --cloud --shards=1 --account="$FLAG_ACCOUNT" 2>/dev/null) && W2_RC=0 || W2_RC=$?
 check "W2 e2e rung-1: --account= flag wins over env and ladder" \
   bash -c '[ "$1" = "0" ]' _ "$W2_RC"
 check "W2 e2e rung-1: every gcloud call pinned to the flag value" \
   accounts_all_equal "$FLAG_ACCOUNT"
+check "W2 e2e rung-1: the ladder never ran for a pinned call (no probe, even with HOME set)" \
+  bash -c '[ ! -e "$1" ]' _ "$SELECTOR_MARKER"
 
-# --- W3: e2e rung 1b — FRESHELL_GCP_ACCOUNT beats GCLOUD_IDENT -------------
+# --- W3: e2e rung 1b — FRESHELL_GCP_ACCOUNT wins BEFORE the ladder --------
 reset_green
-W3_OUT=$(env PATH="$GTDIR:$PATH" \
-         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" \
+W3_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_IDENT="$RUNG2_IDENT" FRESHELL_GCP_ACCOUNT="$ENV_ACCOUNT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
          "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null) && W3_RC=0 || W3_RC=$?
 check "W3 e2e env-pin: FRESHELL_GCP_ACCOUNT wins over the ladder" \
   bash -c '[ "$1" = "0" ]' _ "$W3_RC"
 check "W3 e2e env-pin: every gcloud call pinned to the env value" \
   accounts_all_equal "$ENV_ACCOUNT"
+check "W3 e2e env-pin: the ladder never ran for a pinned call" \
+  bash -c '[ ! -e "$1" ]' _ "$SELECTOR_MARKER"
 
 # --- W4: e2e rung 3 — the probe result takes the pinned slot ---------------
 reset_green
-W4_OUT=$(env -u GCLOUD_IDENT -u FRESHELL_GCP_ACCOUNT PATH="$GTDIR:$PATH" \
-         GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
+W4_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+         GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_ACCOUNT="$RUNG3_ROBOT" \
          "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null) && W4_RC=0 || W4_RC=$?
 check "W4 e2e rung-3: probed identity pins every call; selector ran once w/ lane probe" \
   bash -c '
@@ -904,7 +953,7 @@ check "W4 e2e rung-3: every gcloud call pinned to the probed robot" \
 # --- W5: e2e rung 4 — nothing resolves: --account omitted, one note ---------
 reset_green
 W5_ERR="$TDIR/w5.err"
-W5_OUT=$(env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u FRESHELL_GCP_ACCOUNT \
+W5_OUT=$(env "${SCRUB[@]}" \
          PATH="$GTDIR:$PATH" "$WRAPPER_E2E" run --cloud --shards=1 2>"$W5_ERR") && W5_RC=0 || W5_RC=$?
 check "W5 e2e ambient: run succeeds, --account omitted everywhere, one ambient note" \
   bash -c '
@@ -917,8 +966,8 @@ check "W5 e2e ambient: run succeeds, --account omitted everywhere, one ambient n
 # --- W6: vitest parity — rung-2 pin and rung-4 omission -------------------
 reset_green
 W6A_ERR="$TDIR/w6a.err"
-W6A_OUT=$(env PATH="$GTDIR:$PATH" \
-          GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" \
+W6A_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" \
+          GCLOUD_IDENT="$RUNG2_IDENT" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
           "$WRAPPER_VITEST" run --cloud --config=default --shards=2 2>"$W6A_ERR") && W6A_RC=0 || W6A_RC=$?
 check "W6a vitest rung-2: succeeds, every call pinned to GCLOUD_IDENT, selector untouched" \
   bash -c '
@@ -930,7 +979,7 @@ check "W6a vitest rung-2: every gcloud call pinned to the GCLOUD_IDENT value" \
 
 reset_green
 W6B_ERR="$TDIR/w6b.err"
-W6B_OUT=$(env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u FRESHELL_GCP_ACCOUNT \
+W6B_OUT=$(env "${SCRUB[@]}" \
           PATH="$GTDIR:$PATH" "$WRAPPER_VITEST" run --cloud --config=default --shards=2 2>"$W6B_ERR") && W6B_RC=0 || W6B_RC=$?
 check "W6b vitest ambient: run succeeds, --account omitted everywhere, one ambient note" \
   bash -c '
@@ -944,12 +993,14 @@ check "W6b vitest ambient: run succeeds, --account omitted everywhere, one ambie
 # Each pins GCLOUD_IDENT, so running them under a marker-trap
 # GCLOUD_ROBOT_HOME whose selector would FAIL must leave the marker untouched
 # AND the suites green: no nested wrapper invocation may reach the probe.
+# The scrub keeps any harness-level ladder knobs from leaking in and
+# invalidating the pin experiment.
 for nested in scripts/test/cloud-build.test.sh \
               scripts/test/cloud-exec-id-parse.test.sh \
               scripts/test/cloud-vitest-wrapper.test.sh \
               scripts/test/cloud-run-wrapper.test.sh; do
   rm -f "$SELECTOR_MARKER"
-  env GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" SELECTOR_FAIL=1 \
+  env "${SCRUB[@]}" GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_FAIL=1 \
     bash "$nested" >"$TDIR/nested.log" 2>&1 && NESTED_RC=0 || NESTED_RC=$?
   check "W7 trap-11: $nested green and probe-free under hostile GCLOUD_ROBOT_HOME" \
     bash -c '[ "$1" = "0" ] && [ ! -e "$2" ]' _ "$NESTED_RC" "$SELECTOR_MARKER"
@@ -975,8 +1026,8 @@ if [ -n "$CLEAN_PATH" ]; then
       lane="${wrapper_pair%%:*}"
       wrapper="${wrapper_pair#*:}"
       rm -f "$SELECTOR_MARKER"
-      HELP_OUT=$(env -u GCLOUD_IDENT -u FRESHELL_GCP_ACCOUNT PATH="$CLEAN_PATH" \
-        GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" \
+      HELP_OUT=$(env "${SCRUB[@]}" PATH="$CLEAN_PATH" \
+        GCLOUD_ROBOT_HOME="$FAKE_HOME" \
         "$wrapper" help 2>&1) && HELP_RC=0 || HELP_RC=$?
       check "W8 $lane help: exit 0, prints usage, no identity activity, silent" \
         bash -c '
@@ -989,8 +1040,8 @@ fi
 
 # --- W9: the vitest local lane never wakes the ladder ----------------------
 rm -f "$SELECTOR_MARKER"
-W9_OUT=$(env -u GCLOUD_IDENT -u FRESHELL_GCP_ACCOUNT \
-         GCLOUD_ROBOT_HOME="$FAKE_HOME" SELECTOR_MARKER="$SELECTOR_MARKER" \
+W9_OUT=$(env "${SCRUB[@]}" \
+         GCLOUD_ROBOT_HOME="$FAKE_HOME" \
          "$WRAPPER_VITEST" run --local --config=default test/unit/lib/pane-utils.test.ts 2>&1) \
   && W9_RC=0 || W9_RC=$?
 check "W9 vitest --local: runs real local vitest, no selector, no ladder output" \
@@ -1025,13 +1076,28 @@ replacing the `# WRAPPER-LEVEL-CHECKS-ANCHOR (Task 2 appends here)` line.
 Run: `bash scripts/test/cloud-gcp-identity.test.sh`
 
 Expected: FAIL against the not-yet-wired wrappers, with exactly this failure
-profile: W1–W4 and W6a fail because `accounts_all_equal` sees an empty or
-absent accounts log (nothing pins `--account` from `GCLOUD_IDENT`/probe yet);
-W5 and W6b fail because the single `skill not found ... using ambient gcloud`
-stderr note does not exist yet; W10/W11 fail because help documents none of
-the knobs. W7 and W8/W9's silence assertions pass vacuously pre-wiring (no
-ladder exists to trigger the trap); W7's red proof comes in the step-3
-interim run below.
+profile (derived from the wrappers' pre-wiring behavior — they pin the
+hardcoded human account on every flagged call, so the accounts log is FULL
+of `dan@danshapiro.com`, never empty):
+
+- W1 fails its pin assertions (every call is pinned — to the hardcoded
+  human, not the `GCLOUD_IDENT` value; and the no-hardcoded-human grep
+  fires). Its run-success sub-check passes (the green stub run worked
+  before, too).
+- W4 fails (the marker-trap selector never runs pre-wiring — no ladder
+  exists; and the accounts mismatch).
+- W5 and W6b fail (accounts log is NOT absent — calls pin the human — and
+  the ambient-fallback note does not exist).
+- W6a fails (accounts mismatch, as W1).
+- W10/W11 fail (help documents none of the knobs and still names the
+  hardcoded default).
+- W2/W3 PASS pre-wiring and must stay green (flag/env already win — the
+  refactor preserves that; their new "the ladder never ran for a pinned
+  call" assertions pass vacuously pre-wiring and become live after wiring,
+  where they guard the rung-1 short-circuit).
+- W7 and W8/W9's silence assertions pass vacuously pre-wiring (no ladder
+  exists to trigger the trap); W7's red proof is the step-3 interim run
+  below.
 
 - [ ] **Step 3: Add the minimal production implementation — wrapper wiring only**
 
@@ -1104,58 +1170,38 @@ git commit -m "feat(cloud): wire gcloud-robot identity ladder into e2e/vitest cl
 ### Task 3: Operator runbook + AGENTS.md identity sections
 
 Deliverable: `docs/development/gcloud-robot.md` — the operator runbook
-(robot identity, provisioning checklist, verify-as-domain step, rotation,
-revocation, monitoring, both adoption states) — plus the mandatory AGENTS.md
-updates in the two cloud-backend sections.
+(robot identity, provisioning checklist, verification, rotation, revocation,
+monitoring, both adoption states) — plus the mandatory AGENTS.md updates in
+the two cloud-backend sections.
+
+TDD shape: this is a docs-only task and the repo's TDD rule explicitly
+exempts doc changes ("all changes but the most trivial (e.g. doc changes)").
+Round-1 plan review reinforced this: the originally-planned D1–D5 checks
+greped docs for expected phrases/links, which the repo's own test-quality
+bar rules out as behavioral protection, so they were REMOVED — Task 3
+carries no new suite content, and its verification is the review-through
+checklist plus the existing-suite regression sweep below. The identity
+suite's trailing `# DOC-CHECKS-ANCHOR (Task 3 appends here)` line from
+Task 2 is deleted by this task (nothing ever appended).
 
 **Files:**
 - Create: `docs/development/gcloud-robot.md`
 - Modify: `AGENTS.md` (one Identity paragraph appended to each of
   `### Vitest Test Backend (Cloud Run Jobs)` and `### E2E Test Backend
   (Cloud Run Jobs)`)
-- Modify: `scripts/test/cloud-gcp-identity.test.sh` (append the doc-wiring
-  checks at `DOC-CHECKS-ANCHOR`)
+- Modify: `scripts/test/cloud-gcp-identity.test.sh` (delete the now-dead
+  `# DOC-CHECKS-ANCHOR (Task 3 appends here)` line only)
 
 **Interfaces:**
 - Consumes: provisioning content from the gcloud-robot skill's
   `references/provisioning.md` (role choice, scoped-grant command shapes,
-  rotation/revocation/monitoring contracts).
+  rotation/revocation/monitoring contracts) and the corrected role set from
+  Global Constraints (verified during review remediation).
 - Produces: the runbook the wrappers' `--help` text and AGENTS.md point at.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Author the docs**
 
-Append to `scripts/test/cloud-gcp-identity.test.sh`, replacing the
-`# DOC-CHECKS-ANCHOR (Task 3 appends here)` line:
-
-```bash
-# --- D1-D5: doc wiring -----------------------------------------------------
-# Pins the wiring between code and docs (existence, the two-state contract
-# agents must not debug away, the discovery knob, and the AGENTS.md link) —
-# the same content-pin style cloud-build.test.sh uses for help surfaces. It
-# deliberately does not gate prose.
-RUNBOOK="$ROOT/docs/development/gcloud-robot.md"
-check "D1 operator runbook exists" test -f "$RUNBOOK"
-check "D2 runbook names the wired-not-provisioned adoption state" \
-  bash -c 'grep -q "wired but not yet provisioned" "$1"' _ "$RUNBOOK"
-check "D3 runbook names the provisioned-and-verified adoption state" \
-  bash -c 'grep -q "provisioned and verified" "$1"' _ "$RUNBOOK"
-check "D4 runbook documents the GCLOUD_ROBOT_HOME discovery knob" \
-  bash -c 'grep -q "GCLOUD_ROBOT_HOME" "$1"' _ "$RUNBOOK"
-check "D5 AGENTS.md links the runbook" \
-  bash -c 'grep -q "docs/development/gcloud-robot.md" "$1"' _ "$ROOT/AGENTS.md"
-```
-
-- [ ] **Step 2: Run the test and verify the intended failure**
-
-Run: `bash scripts/test/cloud-gcp-identity.test.sh`
-
-Expected: FAIL — D1 (`docs/development/gcloud-robot.md` missing), D2–D4
-(grep against a missing file), and D5 (AGENTS.md has no such link yet). All
-pre-existing checks stay green.
-
-- [ ] **Step 3: Add the minimal production implementation**
-
-**3a.** Create `docs/development/gcloud-robot.md` with exactly this content:
+**1a.** Create `docs/development/gcloud-robot.md` with exactly this content:
 
 ````markdown
 # gcloud-robot identity for cloud test lanes
@@ -1247,7 +1293,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.jobsExecutor run.viewer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer logging.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --name gcloud-robot --activate
    ```
@@ -1258,6 +1304,20 @@ account (export it). All skill scripts are invoked via
    key location for yourself as
    `key-path: <printed at provisioning>` (until then this runbook says:
    not yet minted — operator step).
+
+   Also ensure the Artifact Registry repository exists. The robot holds
+   `artifactregistry.writer` (push) but writer CANNOT create repositories,
+   and the wrappers' create-if-missing path is `|| true`-masked — a missing
+   repo would surface only as a push failure mid-run:
+
+   ```bash
+   gcloud artifacts repositories describe freshell-e2e \
+     --location=us-west1 --project=misc-puttering-project \
+     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" || \
+   gcloud artifacts repositories create freshell-e2e \
+     --repository-format=docker --location=us-west1 --project=misc-puttering-project \
+     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT"
+   ```
 
 2. Scoped grants (bootstrap does NOT do these; skipping them is the classic
    "probe passes, build 403s" failure):
@@ -1318,6 +1378,23 @@ account (export it). All skill scripts are invoked via
    When an execution exists, list a real log read as an explicit probe too:
    `--probe "gcloud beta run jobs executions logs read <execution-name> --project=misc-puttering-project --region=us-west1"`.
 
+   Read probes alone do NOT prove the lane: they skip the scoped bucket
+   grants, job create/delete, actAs, and the per-execution overrides the
+   vitest lane uses. Finish verification with ONE REAL LANE SMOKE as the
+   robot (~$0.02; small test file):
+
+   ```bash
+   GCLOUD_IDENT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com \
+     bash scripts/vitest-cloud.sh run --cloud --config=default --shards=1 \
+       test/unit/lib/pane-utils.test.ts
+   ```
+
+   Expected on success: `All tasks completed successfully.` A 403 names the
+   missing grant in its error message — add the smallest covering grant
+   (`bootstrap-robot.sh --no-key` updates roles without touching keys), then
+   re-verify and re-smoke. Only after the probes AND the smoke pass is the
+   repo "provisioned and verified".
+
 4. Done. `npm run test:cloud` / `npm run test:e2e:cloud` now select the robot
    automatically wherever its key is activated; no `.env` or repo config
    exists for this (`.env.example` is server-runtime config and deliberately
@@ -1330,7 +1407,7 @@ account (export it). All skill scripts are invoked via
 
    ```bash
    GCLOUD_ROBOT_PROJECT=misc-puttering-project \
-   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer run.jobsExecutor run.viewer logging.viewer" \
+   GCLOUD_ROBOT_ROLES="cloudbuild.builds.editor artifactregistry.writer run.developer logging.viewer" \
    GCLOUD_ROBOT_ADMIN_ACCOUNT="$GCLOUD_ROBOT_ADMIN_ACCOUNT" \
    bash "$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh" --rekey --activate
    ```
@@ -1393,6 +1470,9 @@ for immediacy.)
 - Cloud Build dies resolving source/logs (`storage.buckets.get` 403) → the
   bucket-scoped `roles/storage.legacyBucketReader` (step 2); object roles
   alone never carry bucket metadata reads.
+- Push 403s or the run logs "Creating Artifact Registry repository" then
+  fails → step 1's repo-exists check was skipped: writer cannot create
+  repositories. Run the describe/create block from provisioning.
 - A grant that definitely exists 403s for the first minutes → IAM
   propagation lag; the verifier's retries (12 × 30s default) absorb it.
 - A lane prints the ambient-fallback note and then gcloud's
@@ -1408,7 +1488,7 @@ way. If CI ever needs GCP, use Workload Identity Federation (keyless) —
 never a JSON key in CI.
 ````
 
-**3b.** Edit `AGENTS.md` — append this paragraph at the end of the
+**1b.** Edit `AGENTS.md` — append this paragraph at the end of the
 `### Vitest Test Backend (Cloud Run Jobs)` section (immediately after the
 "**Note:** The electron suite always runs locally even in cloud mode ..."
 paragraph, before the `### E2E Test Backend (Cloud Run Jobs)` heading):
@@ -1423,35 +1503,28 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 `GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 ```
 
-**3c.** Edit `AGENTS.md` — append this paragraph at the end of the
+**1c.** Edit `AGENTS.md` — append this paragraph at the end of the
 `### E2E Test Backend (Cloud Run Jobs)` section (immediately after the
 "**Before filing any PR, ensure the affected e2e specs actually pass on the
 configured `FRESHELL_E2E_BACKEND` backend** ..." paragraph, before the
-`## Architecture` heading): the identical Identity paragraph from 3b
+`## Architecture` heading): the identical Identity paragraph from 1b
 (verbatim — both sections name the same contract).
 
-- [ ] **Step 4: Run the focused test**
+**1d.** Delete the `# DOC-CHECKS-ANCHOR (Task 3 appends here)` line from
+`scripts/test/cloud-gcp-identity.test.sh` (the doc checks were cut per the
+repo's test-quality bar; the anchor is dead).
 
-Run: `bash scripts/test/cloud-gcp-identity.test.sh`
+- [ ] **Step 2: Verify**
 
-Expected: PASS — D1–D5 (and everything else) green, footer
-`=== All checks passed ===`, exit 0.
+2a. Read-through of the rendered runbook for command accuracy against the
+skill references (provisioning.md shapes: scoped grants carry
+`--condition=None`, skill scripts invoked as `bash
+"$GCLOUD_ROBOT_HOME/scripts/<name>.sh"`, key outside `~/.config/gcloud`) and
+confirm the AGENTS.md links resolve to the new file's path.
 
-- [ ] **Step 5: Refactor while green**
-
-Docs-only task; no code refactor. Do a read-through of the rendered runbook
-for command accuracy against the skill references (provisioning.md shapes:
-scoped grants carry `--condition=None`, budget of `bash <path>` invocation,
-key outside `~/.config/gcloud`).
-
-- [ ] **Step 6: Run impacted-test verification**
-
-AGENTS.md is included in the cloud image by `.gcloudignore`'s `!AGENTS.md`
-exception and read by server-side tests; the runbook is new documentation.
-The impacted set is again the full cloud-suite loop (the doc checks live in
-the identity suite), plus a typecheck-free confirmation that AGENTS.md still
-parses as plumbing-neutral markdown (no tooling consumes it programmatically
-beyond inclusion):
+2b. Regression sweep — AGENTS.md ships inside the cloud image and the identity
+suite lost only a comment line, so the impacted set is the full cloud-suite
+loop:
 
 Run:
 ```bash
@@ -1466,7 +1539,7 @@ done
 
 Expected: PASS — every suite exits 0.
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 3: Commit the task**
 
 ```bash
 git add docs/development/gcloud-robot.md AGENTS.md scripts/test/cloud-gcp-identity.test.sh
@@ -1490,8 +1563,8 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
 | help/local lanes need zero GCP tooling and stay silent | Task 2 W8/W9; pre-existing cloud-run-wrapper check 12 |
 | Trap-11: stubbed suites never reach the probe | Task 2 W7 (four nested suites under a hostile marker-trap home) |
 | Hardcoded-default removal documented in help | Task 2 W10/W11 |
-| Runbook + AGENTS.md wiring | Task 3 D1–D5 |
-| Provisioning/rotation/revocation correctness | Documented only — human-executed; skill-mandated exclusion (no agent runs GCP mutations) |
+| Runbook + AGENTS.md docs | Task 3 — docs-only task; repo TDD doc exemption applies; verified by read-through + suite regression sweep |
+| Provisioning/rotation/revocation correctness | Documented only — human-executed; skill-mandated exclusion (no agent runs GCP mutations); surface completeness hardened by verify probes + one real lane smoke |
 | Whole-repo regression | Workflow stage gate (coordinated suite), outside task scope |
 
 ## Risk notes
@@ -1509,6 +1582,5 @@ git commit -m "docs(cloud): add gcloud-robot operator runbook + AGENTS.md identi
   one note and run exactly as before (including, today, the culled-credential
   failure mode). That is the contract: adoption is non-breaking; provisioning
   is the fix.
-
 
 
