@@ -742,9 +742,9 @@ test.describe('reconnect revive (rust)', () => {
       const sendsBeforeDrop = await sidecarSendCount(requestLogPath)
       expect(sendsBeforeDrop).toBe(1)
 
-      const sessionIdBefore: string = findFreshAgentLeaf(
+      const contentBeforeDrop = findFreshAgentLeaf(
         await harness.getPaneLayout(freshTabId),
-      )!.content!.sessionId
+      )!.content!
 
       // Bare socket drop; the server-side sidecar session stays live.
       await harness.forceDisconnect()
@@ -752,11 +752,21 @@ test.describe('reconnect revive (rust)', () => {
       await waitReady(page)
 
       // Same session identity after reconnect -- an in-place reattach, never
-      // a re-created session.
+      // a re-created session. Assert the DURABLE identity: the pane content's
+      // bridge-domain `sessionId` may re-key to the durable id during
+      // reconnect reconcile (legitimate cosmetics; ordering-dependent), while
+      // the durable id domain (`resumeSessionId` / `sessionRef.sessionId`) is
+      // the user-meaningful invariant that a reconnect must preserve.
       const contentAfterReconnect = findFreshAgentLeaf(
         await harness.getPaneLayout(freshTabId),
       )!.content!
-      expect(contentAfterReconnect.sessionId).toBe(sessionIdBefore)
+      expect(contentBeforeDrop.sessionRef?.sessionId).toBeTruthy()
+      expect(contentAfterReconnect.sessionRef?.sessionId).toBe(
+        contentBeforeDrop.sessionRef?.sessionId,
+      )
+      expect(contentAfterReconnect.resumeSessionId).toBe(
+        contentBeforeDrop.resumeSessionId,
+      )
 
       // Discriminating round trip (see this file's FIXTURE LIMITATION note):
       // (a) the pane renders strictly MORE replies than survived the drop...
