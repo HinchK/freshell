@@ -174,13 +174,42 @@ impl ServeHttpResponse {
     }
 }
 
-/// The HTTP transport seam (`fetchFn`). One request/response round-trip. `Err(String)`
-/// is a transport/connection failure (e.g. connection refused before the serve is up).
+/// The transport-local failure classes for one HTTP exchange (ep1-r3 F2): the
+/// ONLY distinction that matters downstream is whether the request provably
+/// NEVER reached the server. OpenCode ≥1.18.21's summarize handler runs
+/// `revertSvc.cleanup` FIRST and its later stages atomically, so once the POST
+/// may have left the client, ANY failure is possibly-mutated — while a
+/// connect-phase refusal (DNS/connect failed before a byte was written) proves
+/// the server never saw the request, so none of its side effects ran.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServeHttpError {
+    /// The request provably never reached the server: the transport's connect
+    /// phase failed BEFORE any byte left the client (connect refused / DNS).
+    Undelivered(String),
+    /// Every other exchange failure: mid-flight reset, post-headers body loss,
+    /// in-handler failure surfaces — the request MAY have reached the server.
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for ServeHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServeHttpError::Undelivered(s) | ServeHttpError::Ambiguous(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for ServeHttpError {}
+
+/// The HTTP transport seam (`fetchFn`). One request/response round-trip. The
+/// `Err` side is a [`ServeHttpError`]: `Undelivered` ONLY for a provable
+/// connect-phase refusal (never a byte sent), `Ambiguous` for everything else
+/// (e.g. connection reset mid-exchange — the serve may have received it).
 pub trait ServeHttp: Send + Sync {
     fn request<'a>(
         &'a self,
         req: ServeHttpRequest,
-    ) -> BoxFuture<'a, Result<ServeHttpResponse, String>>;
+    ) -> BoxFuture<'a, Result<ServeHttpResponse, ServeHttpError>>;
 }
 
 /// An endpoint the sidecar should bind (`allocateLocalhostPort`,
@@ -279,6 +308,11 @@ pub enum ServeError {
         timeout_ms: u64,
     },
     Transport(String),
+    /// The transport's connect phase refused BEFORE a byte left the client
+    /// ([`ServeHttpError::Undelivered`]) — the serve provably never saw the
+    /// request (ep1-r3 F2: the ONLY failure class downstream may treat as
+    /// "no side effects ran").
+    Undelivered(String),
     Decode(String),
     IdleTimeout {
         session_id: String,
@@ -308,6 +342,9 @@ impl std::fmt::Display for ServeError {
                 write!(f, "opencode serve {method} {url} timed out after {timeout_ms}ms")
             }
             ServeError::Transport(s) => write!(f, "opencode serve transport error: {s}"),
+            ServeError::Undelivered(s) => {
+                write!(f, "opencode serve request never reached the server: {s}")
+            }
             ServeError::Decode(s) => write!(f, "opencode serve response decode error: {s}"),
             ServeError::IdleTimeout { session_id, timeout_ms } => write!(
                 f,
@@ -640,7 +677,14 @@ impl OpencodeServeManager {
                     timeout_ms: timeout.as_millis() as u64,
                 });
             }
-            Ok(Err(transport)) => return Err(ServeError::Transport(transport)),
+            Ok(Err(transport)) => {
+                return Err(match transport {
+                    // ep1-r3 F2: keep the delivery truth lossless — a provable
+                    // connect-phase refusal is NOT a generic transport error.
+                    ServeHttpError::Undelivered(s) => ServeError::Undelivered(s),
+                    ServeHttpError::Ambiguous(s) => ServeError::Transport(s),
+                });
+            }
             Ok(Ok(resp)) => resp,
         };
 
@@ -1295,7 +1339,8 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a>>
+        {
             let method = format!("{:?}", req.method).to_uppercase();
             self.requests.lock().expect("requests mutex").push((
                 method,

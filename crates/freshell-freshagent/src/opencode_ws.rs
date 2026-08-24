@@ -1013,20 +1013,26 @@ impl FreshOpencodeState {
     ///     and the interrupt's `turn_aborted` flag would gate even a raced settle —
     ///     killing mid-compact yields NO false `freshAgent.turn.complete`.
     ///
-    /// REDO DISCIPLINE (delta-r1 F5; focused ep1-r2 F4 — the destroy is now
-    /// PRE-DRIVE): opencode summarizes natively delete the reverted tail exactly
-    /// like a new submission — so the ledger's redo state retires via
+    /// REDO DISCIPLINE (delta-r1 F5; focused ep1-r2 F4 — the destroy is
+    /// PRE-DRIVE; focused ep1-r3 F2 — the destroy is FINAL once the POST may
+    /// have left): opencode summarizes natively delete the reverted tail
+    /// exactly like a new submission — and OpenCode ≥1.18.21's summarize
+    /// handler runs `revertSvc.cleanup` FIRST (its error-able stages come
+    /// after), so ANY failure timed at/after the send is a possibly-destroyed
+    /// tail. The ledger's redo state therefore retires via
     /// `destroy_redo_before_compact_drive` once the preflight has fully
     /// succeeded (model pair resolved), synchronously under the session lock
-    /// and BEFORE the summarize drive/task exists (durable-BEFORE-mutation — an
-    /// aborted drive over an accepted POST can never leave `canRedo` true
-    /// across a tail the provider may have deleted). On every refusal /
-    /// preflight / no-POST path the provider tail survives, so redo stays
-    /// valid (never a permanently-destroyed redo over a live tail); a
-    /// DEFINITIVE summarize rejection (`ServeError::Http` — the serve ANSWERED)
-    /// compensates the pre-record back (`restore_redo_on_rejected_compact`);
-    /// ambiguous failures and aborts let the destroy stand. Markers survive
-    /// regardless (decision 6).
+    /// and BEFORE the summarize drive/task exists (durable-BEFORE-mutation —
+    /// an aborted drive over an accepted POST can never leave `canRedo` true
+    /// across a tail the provider may have deleted). The ONLY failure that
+    /// compensates the pre-record back (`restore_redo_on_undelivered_compact`)
+    /// is a PROVABLY-UNDELIVERED dispatch (`ServeError::Undelivered` — the
+    /// transport's connect phase refused before a byte left, so the serve
+    /// never saw the POST); the refusal/preflight no-POST paths likewise leave
+    /// redo valid. EVERY in-flight / HTTP-response outcome after the POST may
+    /// have arrived — a non-2xx ANSWER, a timeout, a mid-flight reset, an
+    /// abort — keeps the destroy forever (error-after-send ≠ tail survived).
+    /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_arc = {
@@ -1128,10 +1134,13 @@ impl FreshOpencodeState {
         // advertising redo over a tail the provider may have deleted. The
         // preflight legs above (untracked session, unmaterialized placeholder,
         // busy refusal, the no-model failure) and ONLY those still skip the
-        // destroy (ep1-r1 F2 unchanged). A DEFINITIVE summarize rejection (the
-        // serve ANSWERED a non-2xx — the tail provably survived) compensates the
-        // pre-record back inside the drive (restore_redo_on_rejected_compact);
-        // ambiguous failures and aborts let the destroy stand.
+        // destroy (ep1-r1 F2 unchanged). ep1-r3 F2: the destroy is FINAL once
+        // the drive is engaged — the ONLY compensation is a PROVABLY-UNDELIVERED
+        // dispatch (`ServeError::Undelivered`: connect-phase refusal before a
+        // byte left ⇒ the serve never saw the POST ⇒ the tail provably
+        // survives); every post-send failure class (incl. ANY answered non-2xx —
+        // OpenCode ≥1.18.21's summarize runs revertSvc.cleanup FIRST) lets the
+        // destroy stand.
         let destroy_now = crate::rollback_record::now_ms();
         let pre_drive_record = match crate::rollback_record::destroy_redo_before_compact_drive(
             &self.identity_sink(),
@@ -1174,15 +1183,20 @@ impl FreshOpencodeState {
                         .await
                 }
                 Err(err) => {
-                    // F4 compensation: ONLY a DEFINITIVE rejection (the serve
-                    // ANSWERED a status — ServeError::Http) proves the reverted
-                    // tail survived, so the pre-drive record is restored. Every
-                    // ambiguous failure (transport, timeout) and EVERY abort
-                    // lets the destroy stand (the provider may have applied).
-                    if let freshell_opencode::ServeError::Http { .. } = &err {
+                    // ep1-r3 F2 compensation: ONLY a PROVABLY-UNDELIVERED
+                    // dispatch (ServeError::Undelivered — the connect phase
+                    // refused before a byte left, so the serve never saw the
+                    // POST) proves the reverted tail survived; restoring the
+                    // pre-drive record is honest exactly there. EVERY failure
+                    // timed at/after the send — a non-2xx ANSWER (OpenCode
+                    // ≥1.18.21 summarize runs revertSvc.cleanup FIRST — the
+                    // tail may already be gone), RequestTimeout, mid-flight
+                    // Transport, Decode, and EVERY abort — lets the destroy
+                    // stand forever (error-after-send ≠ tail survived).
+                    if let freshell_opencode::ServeError::Undelivered(_) = &err {
                         if let Some(pre) = pre_drive_record {
                             if let Some(e) =
-                                crate::rollback_record::restore_redo_on_rejected_compact(
+                                crate::rollback_record::restore_redo_on_undelivered_compact(
                                     &identity_sink.get().cloned(),
                                     PROVIDER,
                                     &compact_id,
@@ -1192,7 +1206,7 @@ impl FreshOpencodeState {
                                 )
                                 .await
                             {
-                                tracing::warn!(error = %e, session = %compact_id, "freshagent.opencode.redo_restore_on_rejected_compact_failed");
+                                tracing::warn!(error = %e, session = %compact_id, "freshagent.opencode.redo_restore_on_undelivered_compact_failed");
                             }
                         }
                     }
@@ -2538,8 +2552,8 @@ mod tests {
 
     use freshell_opencode::serve::{
         Endpoint, EventSink, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
-        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
-        ServeProcess, SpawnRequest,
+        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpError, ServeHttpRequest,
+        ServeHttpResponse, ServeProcess, SpawnRequest,
     };
     use freshell_protocol::{AgentProvider, SessionType};
     use serde_json::json;
@@ -2556,7 +2570,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let is_create = req.url.contains("/session")
                 && !req.url.contains("/message")
@@ -2647,7 +2665,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let is_status = req.url.contains("/session/status");
             // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
@@ -2708,7 +2730,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                 && (req.url.ends_with("/session") || req.url.contains("/session?"));
@@ -2806,7 +2832,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             if req.url.contains("/global/health") {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
@@ -4116,8 +4146,25 @@ mod tests {
         body: Option<Value>,
     }
 
-    /// The compact-suite serve fake: records EVERY request, scripts `/config`, fails
-    /// summarize on demand, and re-arms a per-session busy budget (two polls) on every
+    /// How the fake answers `POST /session/:id/summarize` (ep1-r3 F2's
+    /// delivery-truth distinction).
+    #[derive(Clone, Copy, PartialEq)]
+    enum SummarizeOutcome {
+        /// The POST is received (recorded + order-pinned), then answered 200.
+        OkAnswered,
+        /// The POST is received (recorded), then answered 500 — an
+        /// error-after-send outcome: OpenCode ≥1.18.21's summarize runs
+        /// `revertSvc.cleanup` FIRST, so this is a POSSIBLY-destroyed tail.
+        Answered500,
+        /// The POST never exists server-side: the refusal is answered WITHOUT
+        /// recording the request — modeling a connect-phase refusal before a
+        /// byte left (the provably-undelivered leg).
+        Undelivered,
+    }
+
+    /// The compact-suite serve fake: records EVERY request, scripts `/config`, scripts
+    /// summarize per [`SummarizeOutcome`], and re-arms a per-session busy budget (two
+    /// polls) on every
     /// `prompt_async`/`summarize` POST so `await_idle`'s status-poll fallback resolves
     /// deterministically. `summarize` additionally pins the reviewed lifecycle ORDER:
     /// drained synchronously from its own bus probe, the LAST session snapshot before
@@ -4127,7 +4174,7 @@ mod tests {
         next_session: AtomicUsize,
         requests: StdMutex<Vec<RecordedRequest>>,
         busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
-        summarize_fails: bool,
+        summarize_outcome: SummarizeOutcome,
         config_body: Vec<u8>,
         bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
         /// D1-F1: when set, the summarize POST parks on `notified()` AFTER
@@ -4139,7 +4186,7 @@ mod tests {
     impl CompactFakeHttp {
         fn new(
             config_body: Vec<u8>,
-            summarize_fails: bool,
+            summarize_outcome: SummarizeOutcome,
             bus_probe: tokio::sync::broadcast::Receiver<String>,
             summarize_gate: Option<Arc<tokio::sync::Notify>>,
         ) -> Self {
@@ -4147,7 +4194,7 @@ mod tests {
                 next_session: AtomicUsize::new(0),
                 requests: StdMutex::new(Vec::new()),
                 busy_budget: StdMutex::new(std::collections::HashMap::new()),
-                summarize_fails,
+                summarize_outcome,
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
                 summarize_gate,
@@ -4197,13 +4244,31 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let method = format!("{:?}", req.method).to_uppercase();
             let body_value = req
                 .body
                 .as_ref()
                 .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            // ep1-r3 F2: the provably-UNDELIVERED leg answers BEFORE any
+            // recording — `requests` IS the "the POST was received" witness,
+            // and this refusal models a connect-phase refusal where the bytes
+            // never left the client.
+            if method == "POST"
+                && req.url.contains("/summarize")
+                && self.summarize_outcome == SummarizeOutcome::Undelivered
+            {
+                return Box::pin(async {
+                    Err(ServeHttpError::Undelivered(
+                        "connect refused before a byte left".to_string(),
+                    ))
+                });
+            }
             self.requests
                 .lock()
                 .expect("requests mutex")
@@ -4240,7 +4305,7 @@ mod tests {
                     Some("running"),
                     "the busy `running` snapshot must precede the summarize POST"
                 );
-                if self.summarize_fails {
+                if self.summarize_outcome == SummarizeOutcome::Answered500 {
                     return Box::pin(async {
                         Ok(ServeHttpResponse::new(500, b"summarize exploded".to_vec()))
                     });
@@ -4296,20 +4361,20 @@ mod tests {
     /// runs.
     async fn compact_state(
         config_body: &str,
-        summarize_fails: bool,
+        summarize_outcome: SummarizeOutcome,
     ) -> (
         FreshOpencodeState,
         Arc<CompactFakeHttp>,
         tokio::sync::broadcast::Receiver<String>,
     ) {
-        compact_state_gated(config_body, summarize_fails, None).await
+        compact_state_gated(config_body, summarize_outcome, None).await
     }
 
     /// [`compact_state`] with an optional summarize gate (D1-F1: a deterministic
     /// in-flight-compact window for the kill/interrupt lifecycle tests).
     async fn compact_state_gated(
         config_body: &str,
-        summarize_fails: bool,
+        summarize_outcome: SummarizeOutcome,
         summarize_gate: Option<Arc<tokio::sync::Notify>>,
     ) -> (
         FreshOpencodeState,
@@ -4320,7 +4385,7 @@ mod tests {
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
         let http = Arc::new(CompactFakeHttp::new(
             config_body.as_bytes().to_vec(),
-            summarize_fails,
+            summarize_outcome,
             tx.subscribe(),
             summarize_gate,
         ));
@@ -4409,7 +4474,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_posts_summarize_with_the_session_model_then_busy_idle_and_one_chime() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
 
         // The pane's Compact click carries instructions, but opencode's summarize
@@ -4509,8 +4575,12 @@ mod tests {
     #[tokio::test]
     async fn compact_retires_redo_before_the_summarize_drive_and_the_snapshot_reflects_it() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) =
-            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(gate.clone()),
+        )
+        .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let sink = seed_redoable_record(&st, "ses_1").await;
 
@@ -4569,7 +4639,8 @@ mod tests {
     /// stays valid.
     #[tokio::test]
     async fn compact_with_no_resolvable_model_never_destroys_redo() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
         // An unsplittable session model forces the /config fallback, which is null.
         insert_compact_session(&st, "ses_1", Some("noslash")).await;
         let sink = seed_redoable_record(&st, "ses_1").await;
@@ -4595,14 +4666,19 @@ mod tests {
         );
     }
 
-    /// F2 (provider-error path) / F4's compensation: the summarize POST was
-    /// ENGAGED but the serve answered 5xx — a DEFINITIVE rejection (the serve
-    /// answered), so the compact provably did not happen, the provider tail
-    /// survives, and the pre-drive destroy is compensated back: redo stays
-    /// valid.
+    /// ep1-r3 F2, the REAL provider ordering (OpenCode v1.18.21): summarize
+    /// runs `revertSvc.cleanup` FIRST and its error-able stages AFTER — so a
+    /// 5xx observed AFTER the serve received the POST is an error-AFTER-send,
+    /// a possibly-destroyed tail, NEVER a proven-survived one. The pre-drive
+    /// destroy is FINAL: the record reads redoDestroyed/canRedo:false, the
+    /// refresh/cross-device snapshot advertises no redo, and the markers
+    /// survive (decision 6). (The frozen/destroy classification of a LATER
+    /// undo across this vanished tail is covered by the RollbackFakeHttp
+    /// bundle below.)
     #[tokio::test]
-    async fn compact_summarize_provider_error_never_destroys_redo() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, true).await;
+    async fn compact_summarize_answered_500_after_receipt_destroys_redo_forever() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let sink = seed_redoable_record(&st, "ses_1").await;
 
@@ -4617,14 +4693,91 @@ mod tests {
         assert_eq!(
             http.summarize_requests().len(),
             1,
-            "the summarize POST was genuinely engaged (and failed)"
+            "the summarize POST was genuinely RECEIVED, THEN answered 5xx (the real ordering)"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "F2: error-after-send ⇒ redo destroyed FOREVER (the tail is possibly gone): {record:?}"
+        );
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u2", "msg_a2"],
+            "decision 6: the marker bucket survives the destroy"
+        );
+        // The refresh/cross-device truth: no device keeps advertising a redo
+        // the provider may be unable to perform.
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_1",
+            &json!({ "id": "ses_1", "time": { "updated": 5 } }),
+            &json!([]),
+            Some(&record),
+        );
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "canRedo:false + no redoable marker rows after the answered-500 compact"
+        );
+    }
+
+    /// ep1-r3 F2's OTHER leg — the provably-UNDELIVERED dispatch: the
+    /// summarize POST's connect phase refused BEFORE a byte left the client
+    /// (the fake reject models "no POST was ever received"), so the serve
+    /// provably never ran cleanup — the reverted tail SURVIVED, the pre-drive
+    /// destroy is compensated back, and redo stays valid.
+    #[tokio::test]
+    async fn compact_summarize_undelivered_dispatch_preserves_redo() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::Undelivered).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD");
+        assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        assert!(
+            error_frame["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("connect refused"),
+            "the undelivered diagnostic crosses the wire: {error_frame}"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the dispatch provably never reached the serve (no POST was ever received)"
+        );
+        // The settle tail still returns the pane to idle (adapter.ts:386-393
+        // parity — idle precedes the error inside the settle tail).
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane returns to idle even on a never-delivered compact: {frames:?}"
         );
         let record = sink
             .load_rollback(PROVIDER, "ses_1")
             .expect("the record survives");
         assert!(
             !record.redo_destroyed && record.can_redo(),
-            "a provider-error compact never retires redo — the tail survives: {record:?}"
+            "undelivered ⇒ the pre-drive destroy is compensated back — redo stays valid: {record:?}"
+        );
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_1",
+            &json!({ "id": "ses_1", "time": { "updated": 5 } }),
+            &json!([]),
+            Some(&record),
+        );
+        assert_eq!(
+            snap["rollback"]["canRedo"],
+            json!(true),
+            "the snapshot truth keeps advertising the still-valid redo"
         );
     }
 
@@ -4740,10 +4893,108 @@ mod tests {
         );
     }
 
+    /// ep1-r3 F2's full bundle for the ANSWERED-error shape: the summarize POST
+    /// was RECEIVED and THEN answered 500 (the real OpenCode v1.18.21
+    /// cleanup-FIRST ordering — a possibly-vanished tail, never a
+    /// proven-survived one). The pre-drive destroy stands FOREVER through the
+    /// error; the refresh/cross-device snapshot advertises no redo; and a
+    /// LATER undo classifies the vanished old tail via the frozen/destroy
+    /// bookkeeping (the destroyed bit at load opens a NEW epoch, the old
+    /// markers freeze, the fresh entry lands above them).
+    #[tokio::test]
+    async fn compact_summarize_answered_error_keeps_redo_destroyed_and_a_later_undo_freezes_the_old_markers(
+    ) {
+        // Seeded: a prior undo at msg_u2 (tail [u2,a2,u3,a3] is redoable) and the
+        // revert pointer at msg_u2; the active prefix is [u1,a1].
+        let (st, mut rx, sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_real")
+            .cloned()
+            .expect("registered session");
+        session_arc.lock().await.model = Some("prov-a/mdl-x".to_string());
+        // The POST is RECEIVED, then answered 500 (cleanup first — the tail is
+        // possibly gone even though the serve errored).
+        *http.summarize_status.lock().expect("status mutex") = 500;
+
+        st.handle_compact(compact_msg("ses_real")).await;
+
+        // The answered error settles loudly; the pane returns to idle.
+        frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        assert_eq!(
+            http.summarize_requests().len(),
+            1,
+            "the summarize POST was genuinely RECEIVED, THEN answered 5xx"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the record survives");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "F2: error-after-send ⇒ the destroy stands forever: {record:?}"
+        );
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_real",
+            &json!({ "id": "ses_real", "time": { "updated": 5 } }),
+            &json!([]),
+            Some(&record),
+        );
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 2, "redoableTurnIds": [] }),
+            "the snapshot truth advertises NO redo across the possibly-vanished tail (2 frozen turn-pairs)"
+        );
+
+        // A LATER undo classifies the old markers via the frozen/destroy path:
+        // the destroyed bit at load opens a NEW epoch; the old tail freezes;
+        // the fresh undo's entry lands above it.
+        let (reply_sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-500"), reply_sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames[0]["event"]["type"],
+            json!("freshAgent.rolledBack"),
+            "the undo lands on the active prefix [u1,a1]: {frames:?}"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the record survives");
+        assert_eq!(
+            record.current_epoch, 1,
+            "the destroyed-at-load bit opened a fresh epoch: {record:?}"
+        );
+        assert_eq!(record.entries.len(), 2, "frozen + fresh: {record:?}");
+        assert_eq!(
+            record.entries[0].epoch, 0,
+            "the pre-compact markers FROZE (never current-epoch history): {record:?}"
+        );
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "the frozen union keeps the possibly-vanished old tail"
+        );
+        assert_eq!(record.entries[1].epoch, 1);
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[1].removed_turns),
+            vec!["msg_u1", "msg_a1"],
+            "the fresh undo's entry sits in the new epoch"
+        );
+        assert!(
+            record.can_redo() && !record.redo_destroyed,
+            "the NEW chain is redoable; the old chain's redo stays permanently dead"
+        );
+    }
+
     #[tokio::test]
     async fn compact_falls_back_to_the_serve_config_model_when_the_session_has_none() {
-        let (st, http, mut rx) =
-            compact_state(r#"{"model":"conf-prov/conf-mdl","theme":"dark"}"#, false).await;
+        let (st, http, mut rx) = compact_state(
+            r#"{"model":"conf-prov/conf-mdl","theme":"dark"}"#,
+            SummarizeOutcome::OkAnswered,
+        )
+        .await;
         // A resumed session never touched by a send can carry NO model.
         insert_compact_session(&st, "ses_1", None).await;
 
@@ -4769,7 +5020,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_no_resolvable_model_errors_loudly_and_never_posts() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
         // An unsplittable session model forces the /config fallback, which is null.
         insert_compact_session(&st, "ses_1", Some("noslash")).await;
 
@@ -4821,7 +5073,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_on_a_not_yet_materialized_session_is_a_silent_noop() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
 
         st.handle_create(create_msg("req-noop")).await;
         let placeholder = "freshopencode-req-noop";
@@ -4844,7 +5097,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_after_an_interrupted_or_errored_turn_resets_the_stale_flags_and_chimes() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         {
             let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
@@ -4869,7 +5123,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, true).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
 
         st.handle_compact(compact_msg("ses_1")).await;
@@ -4941,7 +5196,8 @@ mod tests {
     /// refuse loudly instead of queueing.
     #[tokio::test]
     async fn compact_while_a_turn_is_in_flight_is_refused_and_never_posts() {
-        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
         // A genuinely in-flight turn (never resolves) parked as the session's
@@ -5002,8 +5258,12 @@ mod tests {
     #[tokio::test]
     async fn kill_during_an_in_flight_compact_aborts_it_without_a_false_completion() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) =
-            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(gate.clone()),
+        )
+        .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
 
@@ -5072,8 +5332,12 @@ mod tests {
     #[tokio::test]
     async fn interrupt_during_an_in_flight_compact_aborts_it_and_emits_idle_without_a_chime() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) =
-            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(gate.clone()),
+        )
+        .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
 
@@ -5135,8 +5399,12 @@ mod tests {
     #[tokio::test]
     async fn send_during_an_in_flight_compact_is_refused_and_leaves_the_compact_owned() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) =
-            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(gate.clone()),
+        )
+        .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
         let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
 
@@ -5297,7 +5565,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let method = format!("{:?}", req.method).to_uppercase();
             let body_value = req
@@ -5903,6 +6175,10 @@ mod tests {
         /// `notified()` — the deterministic "compact drive in flight" window
         /// (the abort-mid-drive test's lever).
         summarize_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// ep1-r3 F2: the status every summarize POST answers (200 default) —
+        /// a non-200 is the REAL v1.18.21 ordering: the POST was RECEIVED
+        /// (recorded) and THEN answered with an error (cleanup already ran).
+        summarize_status: StdMutex<u16>,
         /// `prompt_async` re-arms one busy status poll so `run_turn` resolves via the
         /// status-fallback path (observed activity → two absent polls → idle).
         busy_budget: StdMutex<u32>,
@@ -5922,6 +6198,7 @@ mod tests {
                 get_session_calls: StdMutex::new(0),
                 revert_gate: StdMutex::new(None),
                 summarize_gate: StdMutex::new(None),
+                summarize_status: StdMutex::new(200),
                 busy_budget: StdMutex::new(0),
                 next_appended: AtomicUsize::new(3),
             }
@@ -5994,7 +6271,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let method = format!("{:?}", req.method).to_uppercase();
             let body_value = req
@@ -6027,9 +6308,19 @@ mod tests {
                 // F4: the record-then-park gate mirrors the revert gate — the
                 // abort-mid-drive test parks the compact's POST mid-flight.
                 let gate = self.summarize_gate.lock().expect("gate mutex").clone();
+                // ep1-r3 F2: the scripted status — ALWAYS answered AFTER the
+                // POST was received (recorded above), the real v1.18.21
+                // cleanup-first ordering.
+                let status = *self.summarize_status.lock().expect("status mutex");
                 return Box::pin(async move {
                     if let Some(gate) = gate {
                         gate.notified().await;
+                    }
+                    if status != 200 {
+                        return Ok(ServeHttpResponse::new(
+                            status,
+                            b"summarize exploded".to_vec(),
+                        ));
                     }
                     Ok(ServeHttpResponse::new(200, b"true".to_vec()))
                 });

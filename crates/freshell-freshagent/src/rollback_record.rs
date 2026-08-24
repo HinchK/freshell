@@ -540,9 +540,13 @@ pub async fn destroy_redo_on_submit(
 /// over a provider tail the cancelled summarize may still have deleted.
 ///
 /// `Ok(Some(pre_record))` means THIS call genuinely retired redo and returns
-/// the pre-destroy row: the drive's DEFINITIVE-rejection leg restores it via
-/// [`restore_redo_on_rejected_compact`] (a clean provider answer proves the
-/// reverted tail survived). `Ok(None)` is a no-op destroy (no sink/record,
+/// the pre-destroy row: the drive's provably-UNDELIVERED leg restores it via
+/// [`restore_redo_on_undelivered_compact`] (ep1-r3 F2: ONLY a connect-phase
+/// refusal before a byte left proves the reverted tail survived — every
+/// post-send failure, an answered non-2xx included, keeps the destroy: OpenCode
+/// ≥1.18.21's summarize runs revertSvc.cleanup FIRST, so an error answer is a
+/// possibly-destroyed tail, never a proven-survived one). `Ok(None)` is a
+/// no-op destroy (no sink/record,
 /// already destroyed, or nothing redo-capable); `Err` is a ledger write
 /// failure (warn-only, never blocks the compact — [`destroy_redo_on_submit`]'s
 /// degrade policy).
@@ -569,11 +573,15 @@ pub async fn destroy_redo_before_compact_drive(
     Ok(Some(pre))
 }
 
-/// Focused-review ep1-r2 F4's compensation: a DEFINITIVE summarize rejection
-/// (the serve ANSWERED a non-2xx — the provider provably never deleted the
-/// reverted tail) undoes the pre-drive destroy by restoring its pre-record.
-/// Ambiguous outcomes (task abort, timeout, transport) NEVER call this —
-/// their tails may be genuinely gone, so the destroy stands.
+/// Focused-review ep1-r2 F4's compensation, re-keyed by ep1-r3 F2: a
+/// PROVABLY-UNDELIVERED summarize dispatch — the transport's connect phase
+/// refused BEFORE a byte left the client (`ServeError::Undelivered`), so the
+/// serve never saw the POST and provably never deleted the reverted tail —
+/// undoes the pre-drive destroy by restoring its pre-record. Everything timed
+/// at/after the send NEVER calls this: OpenCode ≥1.18.21's summarize handler
+/// runs `revertSvc.cleanup` FIRST and answers later-stage failures AFTER it,
+/// so an answered non-2xx, a timeout, a mid-flight transport error, or a task
+/// abort is a possibly-destroyed tail — the destroy stands forever.
 ///
 /// Restored only when the ledger still holds EXACTLY the row the destroy
 /// wrote (`pre_record` + the destroy stamp): any post-destroy write (a later
@@ -582,7 +590,7 @@ pub async fn destroy_redo_before_compact_drive(
 /// never regresses below the destroy's stamp. Best-effort: a restore failure
 /// is returned for warn-logging, degrading to "redo stays destroyed" (the
 /// conservative side of the ambiguity).
-pub async fn restore_redo_on_rejected_compact(
+pub async fn restore_redo_on_undelivered_compact(
     sink: &Option<crate::identity_sink::SharedPaneIdentitySink>,
     provider: &str,
     live_id: &str,
@@ -1215,7 +1223,7 @@ mod tests {
         );
     }
 
-    // ── destroy_redo_before_compact_drive + restore_redo_on_rejected_compact (F4) ──
+    // ── destroy_redo_before_compact_drive + restore_redo_on_undelivered_compact (F4, ep1-r3 F2) ──
 
     #[tokio::test]
     async fn destroy_redo_before_compact_drive_retires_redo_and_hands_back_the_pre_record() {
@@ -1291,7 +1299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_redo_on_rejected_compact_restores_only_the_row_this_destroy_wrote() {
+    async fn restore_redo_on_undelivered_compact_restores_only_the_row_this_destroy_wrote() {
         let sink = fake_sink_with("opencode", "s1", {
             let mut r = RollbackRecord::empty(50);
             r.push_entry(entry("1"), 60);
@@ -1304,11 +1312,11 @@ mod tests {
             .expect("ok")
             .expect("pre-record");
 
-        // The row stands EXACTLY as our destroy left it: the definitive
-        // rejection restores the pre-record (redo lives again) without letting
-        // the revision floor regress below the destroy stamp.
+        // The row stands EXACTLY as our destroy left it: the ep1-r3 F2
+        // provably-undelivered leg restores the pre-record (redo lives again)
+        // without letting the revision floor regress below the destroy stamp.
         let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
-        let outcome = restore_redo_on_rejected_compact(
+        let outcome = restore_redo_on_undelivered_compact(
             &Some(shared),
             "opencode",
             "s1",
@@ -1321,7 +1329,7 @@ mod tests {
         let record = sink.load_rollback("opencode", "s1").expect("record");
         assert!(
             !record.redo_destroyed && record.can_redo(),
-            "the restored row revives redo — the provider provably kept the tail: {record:?}"
+            "the restored row revives redo — the POST provably never reached the serve: {record:?}"
         );
         assert_eq!(
             record.last_op_at_ms, 110,
@@ -1356,7 +1364,7 @@ mod tests {
             .expect("write ok");
         }
         let shared2c: crate::identity_sink::SharedPaneIdentitySink = sink2.clone();
-        let outcome = restore_redo_on_rejected_compact(
+        let outcome = restore_redo_on_undelivered_compact(
             &Some(shared2c),
             "opencode",
             "s2",
@@ -1381,7 +1389,7 @@ mod tests {
             .expect("delete ok");
         let shared2d: crate::identity_sink::SharedPaneIdentitySink = sink2.clone();
         let outcome =
-            restore_redo_on_rejected_compact(&Some(shared2d), "opencode", "s2", pre2, 100, 110)
+            restore_redo_on_undelivered_compact(&Some(shared2d), "opencode", "s2", pre2, 100, 110)
                 .await;
         assert!(outcome.is_none());
         assert!(

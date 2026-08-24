@@ -1699,6 +1699,7 @@ fn serve_error_status(err: &ServeError) -> StatusCode {
     match err {
         ServeError::NotHealthy { .. }
         | ServeError::Transport(_)
+        | ServeError::Undelivered(_)
         | ServeError::ProcessExited { .. }
         | ServeError::Spawn(_)
         | ServeError::StartupFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -2980,7 +2981,7 @@ mod tests {
 
     use freshell_opencode::{
         Endpoint, EventSource, EventStreamHandle, PortAllocator, ServeDeps, ServeHttp,
-        ServeHttpRequest, ServeHttpResponse,
+        ServeHttpError, ServeHttpRequest, ServeHttpResponse,
     };
 
     /// Fakes `GET /session/:id` (session info) and `GET /session/:id/message` (the page)
@@ -2994,7 +2995,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()
@@ -3015,7 +3020,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             Box::pin(async move {
                 if req.url.contains("/global/health") {
@@ -3196,7 +3205,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                 && (req.url.ends_with("/session") || req.url.contains("/session?"));

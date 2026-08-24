@@ -235,8 +235,8 @@ mod tests {
     use freshell_codex::CodexAppServerClient;
     use freshell_opencode::{
         Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
-        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
-        ServeProcess, SpawnRequest,
+        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpError, ServeHttpRequest,
+        ServeHttpResponse, ServeProcess, SpawnRequest,
     };
 
     #[test]
@@ -872,7 +872,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()

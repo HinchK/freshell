@@ -222,6 +222,19 @@ struct CodexSession {
     /// `active_turn.is_some() || compact_in_flight` so a post-RPC/pre-turn-started
     /// rollback can never force-interrupt the compact.
     compact_in_flight: Arc<AtomicBool>,
+    /// Focused-review ep1-r3 F4 (compact completion-id OWNERSHIP): the compact
+    /// turn's id, captured from its `turn/started` — i.e. the FIRST `turn/started`
+    /// observed while [`Self::compact_in_flight`] is armed with no id captured yet
+    /// (provider FIFO: the compact was submitted before any later send, so its
+    /// start surfaces first). [`reduce_notification`] clears `compact_in_flight`
+    /// ONLY at the `turn/completed` whose params turn id MATCHES this id; a
+    /// completion carrying a DIFFERENT id (the documented probed sequence lands a
+    /// DELAYED PRIOR-turn completion inside the armed-clear-pending window, before
+    /// the compact's own `turn/started`) never clears it. `None` while armed ==
+    /// armed-clear-pending (the compact's start hasn't surfaced). Reset to `None`
+    /// by `handle_compact` at every arm and by the (submit-call-owned) RPC-failure
+    /// clear path, so ownership belongs to exactly one compact operation.
+    compact_turn_id: Arc<StdMutex<Option<String>>>,
     /// Kata 1wxv Task 2 (LBC-1, r3): the thread's DURABLE history mode.
     /// `Some(Paginated)` for threads freshell STARTED (we SET
     /// `historyMode:"paginated"` on `thread/start`); resumed/adopted/forked
@@ -951,12 +964,14 @@ impl FreshCodexState {
         // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
         // only its delivery to the consumer is deferred.
         let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             thread_id.clone(),
             active_turn.clone(),
             compact_in_flight.clone(),
+            compact_turn_id.clone(),
             Some(created_rx),
         );
 
@@ -986,6 +1001,7 @@ impl FreshCodexState {
                 permission_mode: permission_mode.clone(),
                 active_turn,
                 compact_in_flight,
+                compact_turn_id,
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
@@ -1445,10 +1461,12 @@ impl FreshCodexState {
                     s.active_turn.clone(),
                     s.turn_lock.clone(),
                     s.compact_in_flight.clone(),
+                    s.compact_turn_id.clone(),
                 )
             })
         };
-        let Some((client, active_turn, turn_lock, compact_in_flight)) = looked_up else {
+        let Some((client, active_turn, turn_lock, compact_in_flight, compact_turn_id)) = looked_up
+        else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
             // lost-session leg, never silence.
             self.broadcast(&lost_session_frame(&session_id));
@@ -1499,12 +1517,18 @@ impl FreshCodexState {
         // BEFORE the RPC — the `thread/compact/start` answer arrives BEFORE any
         // `turn/started` notification (the probed 0.147.0 order), and
         // `active_turn` alone leaves that post-RPC window uncovered. The bit
-        // clears when the compact turn's `turn/completed` (any status) flows
-        // through `reduce_notification`; a FAILED RPC means no compact turn ever
-        // starts — clear what we set (fail-closed, never wedges the busy gate).
+        // clears when the compact turn's OWN `turn/completed` (any status) flows
+        // through `reduce_notification` — ep1-r3 F4: ID-MATCHED against
+        // `compact_turn_id` (captured at the compact's `turn/started`), so a
+        // delayed PRIOR-turn completion can never clear another compact's window.
+        // The ownership id resets HERE (armed-clear-pending) at every arm, and a
+        // FAILED RPC means no compact turn ever starts — clear what we set (the
+        // submit call owns the failure path; fail-closed, never wedges the gate).
+        *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
         compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
             compact_in_flight.store(false, Ordering::SeqCst);
+            *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
     }
@@ -2740,12 +2764,14 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             session_id.to_string(),
             active_turn.clone(),
             compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -2777,6 +2803,7 @@ impl FreshCodexState {
                     permission_mode: permission_mode.clone(),
                     active_turn,
                     compact_in_flight,
+                    compact_turn_id,
                     // Kata 1wxv Task 2 (r3): the durable rollout meta is the SoT
                     // for the mode across crash-recovery resume (undo capability
                     // survives rehydration for a paginated thread; only a
@@ -2893,12 +2920,14 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             new_thread_id.clone(),
             active_turn.clone(),
             compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -2925,6 +2954,7 @@ impl FreshCodexState {
                     permission_mode: permission_mode.clone(),
                     active_turn,
                     compact_in_flight,
+                    compact_turn_id,
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
@@ -3130,8 +3160,16 @@ impl FreshCodexState {
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, compact_in_flight, None)
+        self.spawn_consumer_after(
+            notifs,
+            thread_id,
+            active_turn,
+            compact_in_flight,
+            compact_turn_id,
+            None,
+        )
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -3149,6 +3187,7 @@ impl FreshCodexState {
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
@@ -3163,6 +3202,7 @@ impl FreshCodexState {
                     notification,
                     &active_turn,
                     &compact_in_flight,
+                    &compact_turn_id,
                 );
                 for event in events {
                     // DIAG-01: the positive turn-complete chime only -- session_id
@@ -3633,12 +3673,14 @@ impl FreshCodexState {
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             thread_id.to_string(),
             active_turn.clone(),
             compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3661,6 +3703,7 @@ impl FreshCodexState {
                 permission_mode,
                 active_turn: active_turn.clone(),
                 compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
@@ -3723,6 +3766,7 @@ impl FreshCodexState {
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
                 compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
                 // This fixture models a thread freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -4504,13 +4548,23 @@ fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
 /// the legacy `activeTurnByThread` clear points onto `active_turn` (adapter.ts:901,913,1101-1103
 /// — leaving running/starting, a turn completing, or the thread closing all clear it;
 /// `turn/started` SETS it too, as a fallback alongside `handle_send`'s direct set).
-/// Delta-r1 F2: the turn/completed arm ALSO clears the session's compact-window
+/// Delta-r1 F2: a turn/completed arm ALSO clears the session's compact-window
 /// busy truth (`compact_in_flight`) — the compact turn ends there (any status).
+/// Focused-review ep1-r3 F4 (completion-id OWNERSHIP): the clear is KEYED —
+/// `compact_in_flight` clears ONLY at the `turn/completed` whose params turn id
+/// matches `compact_turn_id` (captured at the compact's own `turn/started`:
+/// the FIRST start observed while armed-clear-pending — provider FIFO puts the
+/// compact's start before any later send's). A `turn/completed` carrying a
+/// DIFFERENT id (a DELAYED PRIOR-turn completion can land inside the
+/// armed-clear-pending window — the probed sequence emits `thread/status:idle`
+/// BEFORE that stale completion) NEVER clears the window, and neither does a
+/// completion arriving with no id captured yet.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
     active_turn: &Arc<StdMutex<Option<String>>>,
     compact_in_flight: &Arc<AtomicBool>,
+    compact_turn_id: &Arc<StdMutex<Option<String>>>,
 ) -> Vec<CodexAdapterEvent> {
     match notification {
         CodexNotification::ThreadStarted { thread } => {
@@ -4543,10 +4597,24 @@ fn reduce_notification(
             // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
             if event.thread_id == subscription.session_id() {
                 clear_active_turn(active_turn);
-                // Delta-r1 F2: the compact turn ends HERE (any status — a failed
-                // compact completes the same way); the post-RPC/pre-turn-started
-                // rollback window closes.
-                compact_in_flight.store(false, Ordering::SeqCst);
+                // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
+                // window ends HERE — but ONLY on the `turn/completed` whose params
+                // turn id MATCHES the captured `compact_turn_id` (any status — a
+                // failed compact completes the same way). A completion carrying a
+                // DIFFERENT id inside the armed window (a delayed PRIOR-turn
+                // completion — the probed sequence lands one between
+                // `thread/status:idle` and the compact's own `turn/started`) and a
+                // completion while no id is captured yet BOTH leave the window
+                // armed: the compact's own completion never landed, so the
+                // pre-start/post-RPC rollback window stays closed.
+                let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                if compact_in_flight.load(Ordering::SeqCst)
+                    && owned_turn_id.is_some()
+                    && event.turn_id.as_deref() == owned_turn_id.as_deref()
+                {
+                    compact_in_flight.store(false, Ordering::SeqCst);
+                    *owned_turn_id = None;
+                }
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -4555,6 +4623,16 @@ fn reduce_notification(
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
                     *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                    // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
+                    // turn/started observed while the compact window is armed with
+                    // no id captured (provider FIFO: the compact was submitted
+                    // before any later send, so its start surfaces first).
+                    if compact_in_flight.load(Ordering::SeqCst) {
+                        let mut owned = compact_turn_id.lock().expect("compact_turn_id mutex");
+                        if owned.is_none() {
+                            *owned = Some(turn_id.clone());
+                        }
+                    }
                 }
             }
             Vec::new()
@@ -5465,6 +5543,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 active_turn,
                 compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -5502,11 +5581,13 @@ pub(crate) mod tests {
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let consumer = state.spawn_consumer(
             notifs,
             thread_id.to_string(),
             active_turn.clone(),
             compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -5530,6 +5611,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 active_turn,
                 compact_in_flight,
+                compact_turn_id,
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -5810,6 +5892,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Drain every buffered bus frame (ep1-r3 F4 test-sync discipline: sync
+    /// points must wait on the NEXT frame the consumer produces for the event
+    /// just emitted, never a RESIDUAL one — earlier notifications keep their
+    /// snapshots/chimes in the receiver until read).
+    fn drain_wire(wire: &mut tokio::sync::broadcast::Receiver<String>) {
+        loop {
+            match wire.try_recv() {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Await the session's NEXT idle `freshAgent.session.snapshot` on the bus —
+    /// the deterministic "the consumer ran the notification just emitted" edge.
+    async fn await_next_idle_snapshot(
+        wire: &mut tokio::sync::broadcast::Receiver<String>,
+        thread_id: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "the expected completion never flowed");
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == thread_id
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break;
+            }
+        }
+    }
+
     /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
     /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
     /// the channel plus a fresh bus receiver.
@@ -6017,6 +6136,158 @@ pub(crate) mod tests {
         );
         peer.respond(&compact3_id, json!({}));
         compact_3.await.expect("compact-3 task");
+    }
+
+    /// Focused-review ep1-r3 F4 (codex completion-id OWNERSHIP): the compact
+    /// window (`compact_in_flight`) may be cleared ONLY by the `turn/completed`
+    /// whose params turn id MATCHES the compact's own ownership id (captured
+    /// at the compact's `turn/started`). The probed real sequence interleaves
+    /// a DELAYED PRIOR turn completion inside the armed-clear-pending window:
+    ///
+    ///   thread/status:idle → compact armed (RPC answered, no turn/started yet)
+    ///   → turn/completed{prior id} (stale) → turn/started{compact id}
+    ///   → turn/completed{compact id}.
+    ///
+    /// The stale completion must never clear the window (a rollback admitted
+    /// there would force-interrupt the still-unstarted compaction — the exact
+    /// pre-start window delta-r1 F2 armed the bit for); a rollback attempt
+    /// between the stale and the matching completion stays BUSY_TURN; the gate
+    /// releases EXACTLY at the id-matched completion.
+    #[tokio::test]
+    async fn a_stale_prior_completion_never_clears_the_compact_window_and_only_the_matching_completion_does(
+    ) {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cstale").await;
+
+        // The prior turn's lifecycle ended provider-side: thread/status:idle is
+        // observed BEFORE its delayed completion (the documented probe).
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cstale", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: its RPC answers immediately; the notification stream
+        // stays SILENT (no turn/started yet) — the armed-clear-pending window.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cstale")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // The STALE prior-turn completion lands mid-window (drain first: the
+        // test-start `thread/status:idle` snapshot and every earlier frame are
+        // RESIDUAL — then emit, then await THIS emission's consumer edge).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-prior-9", "status": "completed" } }),
+        );
+        // ... and provably flows through the consumer BEFORE the probe (the
+        // NEXT idle session.snapshot is the deterministic consumer sync idiom).
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+
+        // A rollback attempt inside the armed-clear-pending window stays
+        // BUSY_TURN (answer any RPC the drive issues so the shape is
+        // deterministic either way: the red shape reaches thread/read and
+        // lands NOTHING_TO_UNDO — the defect).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 1");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "F4: a completion with a DIFFERENT id inside the armed-clear-pending window never clears it"
+        );
+
+        // The compact's OWN lifecycle begins (captures the ownership turn id);
+        // a mid-window rollback STILL refuses (the window holds through the
+        // started edge — its own completion hasn't landed).
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1" } }),
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the armed-but-incomplete compact window still refuses after turn/started"
+        );
+
+        // The id-MATCHED completion releases the gate (same drain discipline:
+        // the earlier completions' chime/snapshot leftovers are residual).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-3", None), sink2)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver2.await.expect("rollback task 3");
+        assert!(
+            saw_read,
+            "the busy gate reopened at the id-matched completion"
+        );
+        assert_eq!(
+            captured_frames(&captured2)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the matching completion released the gate"
+        );
     }
 
     #[tokio::test]
