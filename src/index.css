@@ -350,7 +350,7 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-turn-header {
   color: var(--fresh-agent-soft-text);
-  font-size: 0.58rem;
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0.12em;
   line-height: 1.25;
@@ -875,7 +875,7 @@ html {
 
 .fresh-agent-style-mono .fresh-agent-turn-header {
   color: var(--fresh-agent-soft-text);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0;
   line-height: 1.25;
@@ -899,6 +899,15 @@ html {
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-turn-header {
   color: var(--fresh-agent-accent);
   margin-bottom: 0.25rem;
+}
+
+/* Turn-header legibility floor on narrow panes: 13px. Placement is
+   load-bearing — this block must follow the serif/mono turn-header rules so
+   equal-specificity ties resolve here by source order (no !important). */
+@container (max-width: 520px) {
+  .fresh-agent-turn-header,
+  .fresh-agent-style-serif .fresh-agent-turn-header,
+  .fresh-agent-style-mono .fresh-agent-turn-header { font-size: 13px; }
 }
 
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-transcript-copy {

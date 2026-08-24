@@ -498,7 +498,12 @@ describe('FreshAgentView', () => {
     })
     expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
     expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument()
-    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
+    // Local time h:mm AM/PM — no seconds, never UTC.
+    const expectedTimecode = new Date('2026-06-15T12:34:56.000Z')
+      .toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true })
+    const timecodeEl = screen.getByText(expectedTimecode)
+    expect(timecodeEl.tagName).toBe('TIME')
+    expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
   })
 
   it('does not pin the provider snapshot summary above the transcript', async () => {

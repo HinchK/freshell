@@ -313,7 +313,34 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(screen.getByText('gpt-5.4-flash')).toBeInTheDocument()
-    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
+    // Local time h:mm AM/PM — no seconds, never UTC.
+    const expectedTimecode = new Date('2026-06-15T12:34:56.000Z')
+      .toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true })
+    const timecodeEl = screen.getByText(expectedTimecode)
+    expect(timecodeEl.tagName).toBe('TIME')
+    expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
+  })
+
+  it('renders no timecode for a malformed timestamp', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        showTimecodes
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            timestamp: 'not-a-date',
+            summary: 'malformed timestamp turn',
+            items: [{ id: 'item-1', kind: 'text', text: 'No clock here.' }],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('Assistant')).toBeInTheDocument()
+    expect(screen.getByText('No clock here.')).toBeInTheDocument()
+    expect(container.querySelector('time')).toBeNull()
+    expect(screen.queryByText('not-a-date')).toBeNull()
   })
 
   it('shows a live reel while a tool is running', () => {
