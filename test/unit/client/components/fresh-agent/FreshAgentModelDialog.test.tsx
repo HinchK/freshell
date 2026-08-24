@@ -634,6 +634,9 @@ describe('FreshAgentModelDialog (freshclaude)', () => {
     // effort normalization clamps against THESE levels, never the static
     // table's default-model fallback
     expect(content.modelEffortLevels).toEqual(['low', 'medium', 'high'])
+    // the pick-time display label for the status-strip chip (catalog-only ids
+    // would otherwise render their raw id until a probe resolves)
+    expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {

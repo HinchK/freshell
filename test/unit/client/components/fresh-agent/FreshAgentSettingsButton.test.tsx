@@ -427,6 +427,9 @@ describe('FreshAgentSettingsButton', () => {
     // normalization (select value, send/create payloads) clamps against them
     // without re-deriving from the static table
     expect(content.modelEffortLevels).toEqual(['alpha', 'beta'])
+    // the picked row's display label goes to the status-strip chip via the
+    // id-paired stamp (catalog-only ids would otherwise flash their raw id)
+    expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
   })
 
   it('clears the pane effort when switching to a probed claude row that declares no effort levels', async () => {

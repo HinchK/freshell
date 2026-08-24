@@ -6573,6 +6573,145 @@ describe('FreshAgentView session status strip', () => {
     expect(screen.queryByText('context —')).toBeNull()
   })
 
+  it('shows the pick-time display label for a catalog-only model immediately, with no probe', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-stamp',
+            sessionId: 'ses_strip_stamp',
+            status: 'connected',
+            model: 'claude-ish/sonnet-future',
+            modelLabel: { modelId: 'claude-ish/sonnet-future', label: 'Sonnet Future' },
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeInTheDocument()
+    // Raw id never appears, and the stamp answers before (and instead of) the
+    // catalog probe.
+    expect(screen.queryByRole('button', { name: 'Model: claude-ish/sonnet-future — change model' })).toBeNull()
+    await act(async () => { await Promise.resolve() })
+    expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
+  })
+
+  it('ignores a stamp that no longer matches the effective model and falls back to the probe', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-ish/opus-future',
+        displayName: 'Opus Future',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-stamp-stale',
+            sessionId: 'ses_strip_stamp_stale',
+            status: 'connected',
+            model: 'claude-ish/opus-future',
+            modelLabel: { modelId: 'claude-ish/sonnet-future', label: 'Sonnet Future' },
+          }}
+        />
+      </Provider>,
+    )
+
+    // Mismatched stamp must not render (a model change that skipped restamping
+    // can never mislabel the chip).
+    expect(screen.queryByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeNull()
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
+      expect(screen.getByRole('button', { name: 'Model: Opus Future — change model' })).toBeInTheDocument()
+    })
+  })
+
+  it('clears a cached meter reading to unknown after the staleness bound while the window stays empty', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      store.dispatch(applySessionsPatch({
+        removeProjectPaths: [],
+        upsertProjects: [{
+          projectPath: '/repo/strip',
+          sessions: [{
+            provider: 'claude' as const,
+            sessionType: 'freshclaude',
+            sessionId: 'claude-strip-usage',
+            projectPath: '/repo/strip',
+            cwd: '/repo/strip',
+            lastActivityAt: 1,
+            tokenUsage: {
+              inputTokens: 1,
+              outputTokens: 1,
+              totalTokens: 2,
+              contextTokens: 96000,
+              compactPercent: 47,
+              compactThresholdTokens: 200000,
+            },
+          }],
+        }],
+      }))
+
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-strip-expiry',
+              sessionId: CLAUDE_THREAD_ID,
+              resumeSessionId: 'claude-strip-usage',
+              status: 'connected',
+            }}
+          />
+        </Provider>,
+      )
+
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      act(() => {
+        store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
+      })
+      // Still serving the just-reported reading (window churn must not blank).
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // Past the staleness bound with the row still excluded, the meter clears
+      // to the honest unknown state rather than lying across thresholds.
+      act(() => {
+        vi.advanceTimersByTime(61_000)
+      })
+      expect(screen.queryByRole('meter')).toBeNull()
+      expect(screen.getByText('context —')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it.each([
     ['freshclaude', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
     ['kilroy', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],

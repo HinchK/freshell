@@ -341,6 +341,10 @@ export function FreshAgentModelDialog({
       updates: {
         model: model.id,
         modelSelection: { kind: 'exact', modelId: model.id },
+        // Stamp the display name known at pick time so the status-strip chip
+        // shows the label even for catalog-only ids — never a raw id while a
+        // history window restore or a probe is still settling.
+        modelLabel: { modelId: model.id, label: model.displayName },
         effort: level,
         // Claude providers stamp the switched-to row's known levels (static
         // or probed) so post-commit effort normalization clamps against THEM

@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type CSSProperties,
@@ -96,6 +97,10 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
+// A cached context reading may serve only this long while the sidebar window
+// excludes its session row — bounded so a permanently excluded window can't
+// keep showing a pre-threshold reading into a live compaction risk.
+const CONTEXT_USAGE_STALE_MS = 60_000
 // Fallback for stores that do not register the sessions slice (keep the strip's
 // context lookup cheap and null instead of crashing).
 const EMPTY_PROJECTS: ProjectGroup[] = []
@@ -710,6 +715,12 @@ export function FreshAgentView({
   // renders immediately and survives a catalog failure — never blank, never
   // "Loading". Cancelled-flag guard matches the sibling probe effects
   // (FreshAgentModelDialog/FreshAgentSettingsButton).
+  // Id-paired pick-time stamp from the dialog/popover: authoritative for
+  // catalog-only ids — the chip shows the picked label immediately, with no
+  // probe window and no raw-id flash, and survives probe failure.
+  const stripStampedModelLabel = paneContent.modelLabel != null && paneContent.modelLabel.modelId === stripModelId
+    ? paneContent.modelLabel.label
+    : undefined
   const stripProbeSessionType = paneContent.sessionType === 'freshopencode'
     || paneContent.sessionType === 'freshclaude'
     || paneContent.sessionType === 'kilroy'
@@ -717,7 +728,7 @@ export function FreshAgentView({
     : null
   useEffect(() => {
     setStripProbedModelLabel(null)
-    if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel) return
+    if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel || stripStampedModelLabel) return
     let cancelled = false
     void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
       .then((result) => {
@@ -732,8 +743,9 @@ export function FreshAgentView({
         if (!cancelled) setStripProbedModelLabel(null)
       })
     return () => { cancelled = true }
-  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel])
+  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel])
   const stripModelLabel = stripStaticModelLabel
+    ?? stripStampedModelLabel
     ?? stripProbedModelLabel
     ?? stripModelId
     ?? descriptor?.label
@@ -751,14 +763,32 @@ export function FreshAgentView({
   // already reported usage. Keep the last known reading per durable session id
   // while this view is mounted; the meter self-heals the moment the row
   // re-enters the window.
-  const lastKnownUsageRef = useRef(new Map<string, FreshAgentContextUsage>())
+  //
+  // The cache is STALENESS-BOUNDED: a cached reading expires after
+  // CONTEXT_USAGE_STALE_MS, so when the session stays excluded from the window
+  // a materially stuck reading self-clears to "context —" instead of hiding a
+  // severity-threshold crossing (fresh delta review round 1, Major).
+  const lastKnownUsageRef = useRef(new Map<string, { usage: FreshAgentContextUsage; at: number }>())
+  const [, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
   useEffect(() => {
     if (liveContextUsage && contextSessionId) {
-      lastKnownUsageRef.current.set(contextSessionId, liveContextUsage)
+      lastKnownUsageRef.current.set(contextSessionId, { usage: liveContextUsage, at: Date.now() })
     }
   }, [liveContextUsage, contextSessionId])
-  const contextUsage = liveContextUsage
-    ?? (contextSessionId ? lastKnownUsageRef.current.get(contextSessionId) ?? null : null)
+  const cachedUsageEntry = contextSessionId ? lastKnownUsageRef.current.get(contextSessionId) : undefined
+  const cachedUsageFresh = cachedUsageEntry && Date.now() - cachedUsageEntry.at <= CONTEXT_USAGE_STALE_MS
+    ? cachedUsageEntry.usage
+    : null
+  const contextUsage = liveContextUsage ?? cachedUsageFresh
+  // Serving a bounded-staleness reading: re-render exactly at the expiry
+  // boundary so expiry is honored even in a completely quiet pane.
+  useEffect(() => {
+    if (liveContextUsage || !cachedUsageEntry) return
+    const remaining = CONTEXT_USAGE_STALE_MS - (Date.now() - cachedUsageEntry.at)
+    if (remaining <= 0) return
+    const timer = window.setTimeout(forceUsageTick, remaining)
+    return () => window.clearTimeout(timer)
+  }, [liveContextUsage, cachedUsageEntry])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (

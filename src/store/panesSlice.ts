@@ -128,6 +128,15 @@ function normalizePaneContent(
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
+    const rawModelLabel = rawFreshAgent.modelLabel
+    const modelLabel =
+      rawModelLabel && typeof rawModelLabel === 'object'
+      && typeof (rawModelLabel as { modelId?: unknown }).modelId === 'string'
+      && (rawModelLabel as { modelId: string }).modelId.length > 0
+      && typeof (rawModelLabel as { label?: unknown }).label === 'string'
+      && (rawModelLabel as { label: string }).label.length > 0
+        ? { modelId: (rawModelLabel as { modelId: string }).modelId, label: (rawModelLabel as { label: string }).label }
+        : undefined
     const status = input.status || (pendingLocalEcho ? 'running' : 'creating')
     if (existingRestoreError) {
       return {
@@ -151,6 +160,7 @@ function normalizePaneContent(
           (input as { model?: unknown }).model,
         ),
         model: input.model,
+        ...(modelLabel ? { modelLabel } : {}),
         permissionMode: input.permissionMode,
         sandbox: input.sandbox,
         effort: normalizeFreshAgentEffortOverride(input.effort),
@@ -201,6 +211,7 @@ function normalizePaneContent(
         (input as { model?: unknown }).model,
       ),
       model: input.model,
+      ...(modelLabel ? { modelLabel } : {}),
       permissionMode: input.permissionMode,
       sandbox: input.sandbox,
       effort: normalizeFreshAgentEffortOverride(input.effort),

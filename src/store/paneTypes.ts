@@ -214,6 +214,12 @@ export type FreshAgentPaneContent = {
    * Absent for panes created outside the selector (REST/MCP/restored) —
    * those fall back to static-table normalization, unchanged. */
   modelEffortLevels?: string[]
+  /** Display label for the pane's model as known at pick time (static-table or
+   * probed catalog label), stamped by the selectors together with the model id.
+   * Id-paired: readers apply it only while the pane's effective model id still
+   * equals `modelId`, so a writer that changes the model without restamping can
+   * never mislabel the chip. */
+  modelLabel?: { modelId: string; label: string }
   plugins?: string[]
   /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
   style?: FreshAgentStyle
