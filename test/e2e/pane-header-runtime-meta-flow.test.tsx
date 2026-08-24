@@ -651,7 +651,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('renders and updates the same percent-used header indicator for a FreshClaude pane from indexed Claude metadata', async () => {
+  it('renders and updates FreshClaude context usage in the status strip (never the header meta) from indexed Claude metadata', async () => {
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [
         {
@@ -781,41 +781,14 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
-    })
-
-    act(() => {
-      store.dispatch(setProjects([
-        {
-          projectPath: '/home/user/code/freshell',
-          sessions: [
-            {
-              provider: 'claude',
-              sessionType: 'freshclaude',
-              sessionId: 'claude-session-1',
-              projectPath: '/home/user/code/freshell',
-              cwd: '/home/user/code/freshell/.worktrees/issue-163',
-              gitBranch: 'main',
-              isDirty: true,
-              lastActivityAt: 2,
-              tokenUsage: {
-                inputTokens: 10,
-                outputTokens: 5,
-                cachedTokens: 0,
-                totalTokens: 15,
-                contextTokens: 15,
-                compactThresholdTokens: 60,
-                compactPercent: 50,
-              },
-            },
-          ],
-        },
-      ] as any))
-    })
-
-    await waitFor(() => {
-      expect(screen.getByText('freshclaude')).toBeInTheDocument()
-      expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
+      // Fresh-agent header meta is dir+branch only — usage % lives in the
+      // status strip between transcript and composer, which is covered where
+      // the real FreshAgentView renders (unit: fresh-agent-context-usage lib +
+      // status-strip tests; e2e: fresh-agent.spec.ts seeded-meter test). This
+      // harness stubs FreshAgentView, so the strip asserts itself never land.
+      expect(screen.getByText('freshell (main*)')).toBeInTheDocument()
+      expect(screen.getByTitle('Claude (freshclaude pane)')).toBeInTheDocument()
+      expect(screen.queryByText(/freshell \(main\*\).*25%/)).not.toBeInTheDocument()
     })
   })
 
@@ -928,8 +901,9 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+      expect(screen.getByText('freshell (main*)')).toBeInTheDocument()
     })
-    expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/freshell \(main\*\).*25%/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/other \(stale\)/)).not.toBeInTheDocument()
   })
 })
