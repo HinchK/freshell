@@ -265,7 +265,7 @@ describe('PaneHeader', () => {
 
       const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
       const repoIcon = screen.getByTitle('Repo: freshell')
-      const agentIcon = screen.getByTitle('Freshcodex (freshcodex pane)')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const metadata = screen.getByText('freshell (main)')
 
       expect(banner).toContainElement(repoIcon)
@@ -311,7 +311,7 @@ describe('PaneHeader', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: Ops desk' })
-      const agentIcon = screen.getByTitle('Freshcodex (freshcodex pane)')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const customTitle = screen.getByText('Ops desk')
       const metadata = screen.getByText('freshell (main)')
 
@@ -353,7 +353,7 @@ describe('PaneHeader', () => {
       expect(screen.getByText('freshell (main)')).toBeInTheDocument()
       expect(screen.queryByText('freshell')).toBeNull()
       expect(banner.textContent ?? '').not.toContain('freshcodex')
-      expect(screen.getByTitle('Freshcodex (freshcodex pane)')).toBeInTheDocument()
+      expect(screen.getByTitle('Codex (freshcodex pane)')).toBeInTheDocument()
     })
 
     it('omits the redundant default label when a fresh-agent pane has no cwd metadata yet', () => {
@@ -380,17 +380,17 @@ describe('PaneHeader', () => {
       const banner = screen.getByRole('banner', { name: 'Pane: Freshcodex' })
       // The agent icon carries the identity via tooltip; no session-type text,
       // no default title, and (no cwd) no repo icon.
-      expect(screen.getByTitle('Freshcodex (freshcodex pane)')).toBeInTheDocument()
+      expect(screen.getByTitle('Codex (freshcodex pane)')).toBeInTheDocument()
       expect(banner.textContent ?? '').not.toContain('Freshcodex')
       expect(banner.textContent ?? '').not.toContain('freshcodex')
       expect(screen.queryByTestId('repo-icon')).toBeNull()
     })
 
     it.each([
-      ['freshclaude', 'Freshclaude', 'claude'],
-      ['freshcodex', 'Freshcodex', 'codex'],
-      ['freshopencode', 'Freshopencode', 'opencode'],
-      ['kilroy', 'Kilroy', 'claude'],
+      ['freshclaude', 'Claude', 'claude'],
+      ['freshcodex', 'Codex', 'codex'],
+      ['freshopencode', 'OpenCode', 'opencode'],
+      ['kilroy', 'Claude', 'claude'],
     ] as const)('identifies a %s pane only by its agent icon tooltip', (sessionType, label, provider) => {
       render(
         <Provider store={makeFreshAgentStore()}>
@@ -749,7 +749,7 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      const agentIcon = screen.getByTitle('Freshcodex (freshcodex pane)')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const agentIconSvg = agentIcon.querySelector('[data-testid="pane-icon"]')
       expect(agentIconSvg).not.toBeNull()
       expect(agentIconSvg?.getAttribute('class')).toContain('text-blue-500')

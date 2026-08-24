@@ -2458,7 +2458,7 @@ describe('PaneContainer', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: Ops desk' })
-      const agentIcon = screen.getByTitle('Freshclaude (freshclaude pane)')
+      const agentIcon = screen.getByTitle('Claude (freshclaude pane)')
       const customTitle = screen.getByText('Ops desk')
       const meta = screen.getByText('freshell (main)')
 
@@ -2503,7 +2503,7 @@ describe('PaneContainer', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
-      const agentIcon = screen.getByTitle('Freshcodex (freshcodex pane)')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const meta = screen.getByText('freshell')
 
       expect(banner.textContent ?? '').not.toContain('freshcodex')
@@ -2925,7 +2925,7 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByTitle('Kilroy (kilroy pane)')).toBeInTheDocument()
+      expect(screen.getByTitle('Claude (kilroy pane)')).toBeInTheDocument()
       const kilroyBanner = screen.getByRole('banner')
       expect(kilroyBanner.textContent ?? '').not.toContain('kilroy')
       expect(screen.getByText('freshell (main)')).toBeInTheDocument()

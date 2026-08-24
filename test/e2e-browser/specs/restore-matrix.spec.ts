@@ -1269,7 +1269,7 @@ test.describe('Restore Matrix', () => {
         // `PaneIcon` treatment terminal panes get.
         const freshAgentIcon = page
           .locator(`[data-pane-shell="true"][data-pane-id="${freshAgentPaneId}"]`)
-          .getByTitle('Freshcodex (freshcodex pane)')
+          .getByTitle('Codex (freshcodex pane)')
           .locator('svg')
         await expect(freshAgentIcon).toHaveClass(/text-blue-500/, { timeout: 15_000 })
 

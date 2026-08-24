@@ -12,7 +12,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
 import { fetchRepoIconMeta, type RepoIconEntry } from '@/store/repoIconsSlice'
-import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { FRESH_AGENT_RUNTIME_PROVIDER_LABELS, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 
 const EMPTY_REPO_ICONS: Record<string, RepoIconEntry> = {}
@@ -99,8 +99,13 @@ export default function PaneHeader({
             : undefined,
         }
       : undefined
+  // The tooltip names the coding agent (preview wording: "Claude (freshclaude
+  // pane)"), i.e. the runtime provider's display name — never the pane-type
+  // label ("Freshclaude") that the picker surfaces.
   const freshAgentLabel = isFreshAgentPane
-    ? resolveFreshAgentType(content.sessionType)?.label ?? content.sessionType
+    ? FRESH_AGENT_RUNTIME_PROVIDER_LABELS[content.provider]
+      ?? resolveFreshAgentType(content.sessionType)?.label
+      ?? content.sessionType
     : undefined
 
   // TabBar is not mounted on every surface (e.g. initial mobile-landscape

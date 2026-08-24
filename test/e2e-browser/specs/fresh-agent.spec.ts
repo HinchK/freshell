@@ -43,12 +43,13 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
   })
 }
 
-async function openFreshAgentSettings(page: any, providerName: string) {
+async function openFreshAgentSettings(page: any, sessionType: 'freshclaude' | 'freshcodex') {
   // The pane header identifies a fresh-agent pane by its agent-icon tooltip
-  // ("<Label> (<sessionType> pane)") — there is no session-type text label.
-  const sessionType = providerName.toLowerCase()
+  // ("<AgentLabel> (<sessionType> pane)", the preview's agent display name) —
+  // there is no session-type text label.
+  const agentLabel = sessionType === 'freshclaude' ? 'Claude' : 'Codex'
   const pane = page.getByRole('group').filter({
-    has: page.getByTitle(`${providerName} (${sessionType} pane)`),
+    has: page.getByTitle(`${agentLabel} (${sessionType} pane)`),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -196,7 +197,7 @@ test.describe('Fresh Agent', () => {
     const header = freshcodexPane.getByRole('banner', { name: 'Pane: freshell' })
     await expect(header).toBeVisible()
 
-    await expect(header.getByTitle('Freshcodex (freshcodex pane)')).toBeVisible()
+    await expect(header.getByTitle('Codex (freshcodex pane)')).toBeVisible()
     await expect(header.getByText('freshell', { exact: true })).toBeVisible()
   })
 
@@ -210,7 +211,7 @@ test.describe('Fresh Agent', () => {
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
-    const dialog = await openFreshAgentSettings(page, 'Freshclaude')
+    const dialog = await openFreshAgentSettings(page, 'freshclaude')
     await expect(dialog.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
 
     const thinking = dialog.getByRole('combobox', { name: /^Thinking level$/i })
@@ -242,7 +243,7 @@ test.describe('Fresh Agent', () => {
     await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
-    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    let dialog = await openFreshAgentSettings(page, 'freshcodex')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
 
@@ -475,7 +476,7 @@ test.describe('Fresh Agent', () => {
     })
     await expect(page.locator('[data-context="fresh-agent"][data-style="sans"]').last()).toBeVisible({ timeout: 10_000 })
 
-    dialog = await openFreshAgentSettings(page, 'Freshclaude')
+    dialog = await openFreshAgentSettings(page, 'freshclaude')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
 
     await page.keyboard.press('Escape')
@@ -521,7 +522,7 @@ test.describe('Fresh Agent', () => {
     })
     await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
 
-    dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    dialog = await openFreshAgentSettings(page, 'freshcodex')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('serif')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('mono')
     const monoRoot = page.locator('[data-context="fresh-agent"][data-style="mono"]').last()
@@ -541,7 +542,7 @@ test.describe('Fresh Agent', () => {
 
     // Start in serif: it has an explicit [data-markdown-body] paragraph-color
     // override, which is the hardest case for muted thinking text.
-    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    let dialog = await openFreshAgentSettings(page, 'freshcodex')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
     await page.keyboard.press('Escape')
     await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
@@ -663,7 +664,7 @@ test.describe('Fresh Agent', () => {
 
     for (const style of ['serif', 'sans', 'mono'] as const) {
       if (style !== 'serif') {
-        dialog = await openFreshAgentSettings(page, 'Freshcodex')
+        dialog = await openFreshAgentSettings(page, 'freshcodex')
         await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption(style)
         await page.keyboard.press('Escape')
       }
@@ -972,7 +973,7 @@ test.describe('Fresh Agent', () => {
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
     await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
-    await expect(page.getByTitle('Freshcodex (freshcodex pane)')).toBeVisible()
+    await expect(page.getByTitle('Codex (freshcodex pane)')).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
