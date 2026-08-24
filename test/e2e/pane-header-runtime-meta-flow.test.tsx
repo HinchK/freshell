@@ -651,7 +651,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('renders and updates FreshClaude context usage in the status strip (never the header meta) from indexed Claude metadata', async () => {
+  it('renders FreshClaude pane header meta as dir+branch (no usage %) from indexed Claude metadata', async () => {
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [
         {
