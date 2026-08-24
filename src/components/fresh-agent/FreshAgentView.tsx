@@ -46,6 +46,7 @@ import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-m
 import {
   freshAgentContextSessionId,
   resolveFreshAgentContextUsage,
+  guardContextUsageTokenSummary,
   type FreshAgentContextUsage,
 } from '@/lib/fresh-agent-context-usage'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
@@ -744,18 +745,36 @@ export function FreshAgentView({
       })
     return () => { cancelled = true }
   }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel])
-  const stripModelLabel = stripStaticModelLabel
-    ?? stripStampedModelLabel
-    ?? stripProbedModelLabel
-    ?? stripModelId
-    ?? descriptor?.label
-    ?? 'Fresh Agent'
+  // The chip NEVER renders a raw model id (user directive, review-loop round
+  // delta-1/focused-ep1: raw ids are tooltip-only). With a model set, the chip
+  // exists only once a display name resolves (static table → pick-time stamp →
+  // catalog probe); with no model set at all, the pane-type label remains as
+  // the strip's left content.
+  const stripModelLabel = stripModelId
+    ? (stripStaticModelLabel ?? stripStampedModelLabel ?? stripProbedModelLabel)
+    : (descriptor?.label ?? 'Fresh Agent')
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
-  const stripModelLabelShort = stripModelLabel.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
+  const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
   const stripModelTooltip = `${stripModelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
-  const liveContextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
+  const windowContextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
+  // STATUS-STRIP extras: out-of-band usage for this pane's session from the
+  // `includeKeys` side-channel (state.sessions.contextUsageByKey). Refresh
+  // arrives on every window/search fetch; bound it by the same staleness
+  // window as the last-known cache so a dead fetch cadence cannot freeze the
+  // meter mid-threshold.
+  const contextUsageExtraEntry = useAppSelector((state) => (
+    contextSessionId
+      ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
+      : undefined
+  ))
+  const extrasContextUsage = guardContextUsageTokenSummary(
+    contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt <= CONTEXT_USAGE_STALE_MS
+      ? contextUsageExtraEntry.tokenUsage
+      : undefined,
+  )
+  const liveContextUsage = windowContextUsage ?? extrasContextUsage
   // Sidebar-window churn guard: `projects` is the sidebar's search/pagination
   // window, replaced wholesale by each sidebar fetch — when this pane's row
   // drops out (search results, the 50-session cap), the live lookup goes null
@@ -2640,8 +2659,8 @@ export function FreshAgentView({
                 the model chip opens the shared model dialog and the strip owns
                 the bottom-chrome divider (the composer draws no border-top). */}
             <FreshAgentStatusStrip
-              modelLabel={stripModelLabel}
-              modelLabelShort={stripModelLabelShort}
+              modelLabel={stripModelLabel ?? null}
+              modelLabelShort={stripModelLabelShort ?? undefined}
               modelTooltip={stripModelTooltip}
               contextUsage={contextUsage}
               onOpenModelDialog={openModelDialog}

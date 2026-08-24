@@ -4,7 +4,9 @@ import {
   searchSessions,
   type SearchOptions,
   type SearchResult,
+  type SearchResponse,
 } from '@/lib/api'
+import { collectFreshAgentContextUsageKeys } from '@/lib/fresh-agent-context-usage'
 import { createLogger } from '@/lib/client-logger'
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
@@ -14,6 +16,7 @@ const log = createLogger('SessionsThunks')
 import {
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,
+  applyContextUsageExtras,
   setActiveSessionSurface,
   setSessionWindowError,
   setSessionWindowLoading,
@@ -100,6 +103,8 @@ function searchResultsToProjects(
       isRunning: result.isRunning,
       runningTerminalId: result.runningTerminalId,
       liveTerminalOnly: result.liveTerminalOnly,
+      // STATUS-STRIP: search-result rows carry live usage for the strip meter.
+      ...(result.tokenUsage ? { tokenUsage: result.tokenUsage } : {}),
     })
 
     grouped.set(result.projectPath, existing)
@@ -360,6 +365,28 @@ function getSidebarVisibilityOptions(state: RootState) {
   }
 }
 
+/**
+ * STATUS-STRIP: fresh-agent panes' context sessions, passed as `includeKeys`
+ * on every window/search fetch so the server returns their usage out-of-band
+ * (contextUsageExtras) regardless of the sidebar's search/pagination window.
+ */
+function getContextUsageOpts(state: RootState): { includeKeys?: string[] } {
+  const includeKeys = collectFreshAgentContextUsageKeys({
+    layouts: state.panes?.layouts,
+    freshAgentSessions: state.freshAgent?.sessions,
+  })
+  return includeKeys.length > 0 ? { includeKeys } : {}
+}
+
+function commitContextUsageExtras(
+  dispatch: AppDispatch,
+  extras: SearchResponse['contextUsageExtras'],
+): void {
+  if (extras && extras.length > 0) {
+    dispatch(applyContextUsageExtras(extras))
+  }
+}
+
 function canCommitVisibleRefresh(args: {
   generation: number
   getState: () => RootState
@@ -436,6 +463,7 @@ async function refreshVisibleSessionWindowSilently(args: {
           tier: 'title',
           signal: controller.signal,
           ...visibilityOpts,
+          ...getContextUsageOpts(getState()),
         })
         if (!commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, true, {
           projectColors: titleResponse.projectColors,
@@ -445,6 +473,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         }))) {
           return
         }
+        commitContextUsageExtras(dispatch, titleResponse.contextUsageExtras)
 
         try {
           const deepResponse = await searchSessions({
@@ -452,6 +481,7 @@ async function refreshVisibleSessionWindowSilently(args: {
             tier: identity.searchTier,
             signal: controller.signal,
             ...visibilityOpts,
+            ...getContextUsageOpts(getState()),
           })
           const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
           commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
@@ -460,6 +490,7 @@ async function refreshVisibleSessionWindowSilently(args: {
             integrityError: deepResponse.integrityError ?? titleResponse.integrityError,
             projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
           }))
+          commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
         } catch {
           commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
             projectColors: titleResponse.projectColors,
@@ -476,6 +507,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         tier: identity.searchTier,
         signal: controller.signal,
         ...visibilityOpts,
+        ...getContextUsageOpts(getState()),
       })
       commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
         partial: response.partial,
@@ -483,6 +515,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         integrityError: response.integrityError,
         projectColors: response.projectColors,
       }))
+      commitContextUsageExtras(dispatch, response.contextUsageExtras)
       return
     }
 
@@ -490,6 +523,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       limit: 50,
       signal: controller.signal,
       ...visibilityOpts,
+      ...getContextUsageOpts(getState()),
     })
     const nextProjects = Array.isArray(response) ? response : (response?.projects ?? [])
     // A silent refresh must never shrink the loaded window. The sidebar may
@@ -534,6 +568,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       partialReason: response?.partialReason,
       integrityError: response?.integrityError,
     })
+    commitContextUsageExtras(dispatch, response?.contextUsageExtras)
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
     if (canCommit()) {
@@ -616,6 +651,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               cursor: searchCursor,
               signal: controller.signal,
               ...visibilityOpts,
+              ...getContextUsageOpts(getState()),
             })
             if (controller.signal.aborted) return
 
@@ -633,6 +669,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               projects: mergedProjects,
               totalSessions: countSessions(mergedProjects),
             }))
+            commitContextUsageExtras(dispatch, response.contextUsageExtras)
             return
           }
 
@@ -643,9 +680,11 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               tier: 'title',
               signal: controller.signal,
               ...visibilityOpts,
+              ...getContextUsageOpts(getState()),
             })
             if (controller.signal.aborted) return
 
+            commitContextUsageExtras(dispatch, titleResponse.contextUsageExtras)
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true, {
               projectColors: titleResponse.projectColors,
               partial: titleResponse.partial,
@@ -660,9 +699,11 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
                 tier: searchTier,
                 signal: controller.signal,
                 ...visibilityOpts,
+                ...getContextUsageOpts(getState()),
               })
               if (controller.signal.aborted) return
 
+              commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
@@ -692,8 +733,11 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               tier: searchTier,
               signal: controller.signal,
               ...visibilityOpts,
+              ...getContextUsageOpts(getState()),
             })
             if (controller.signal.aborted) return
+
+            commitContextUsageExtras(dispatch, response.contextUsageExtras)
 
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
@@ -715,6 +759,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
           } : {}),
           signal: controller.signal,
           ...visibilityOpts,
+          ...getContextUsageOpts(getState()),
         })
         if (controller.signal.aborted) return
 
@@ -723,6 +768,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
           ? mergeProjects(windowState?.projects ?? [], nextProjects)
           : nextProjects
 
+        commitContextUsageExtras(dispatch, response?.contextUsageExtras)
         dispatch(commitSessionWindowReplacement({
           surface,
           projects,

@@ -105,6 +105,11 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       includeSubagents: req.query.includeSubagents,
       includeNonInteractive: req.query.includeNonInteractive,
       includeEmpty: req.query.includeEmpty,
+      // STATUS-STRIP: comma-separated `provider:sessionId` keys the client
+      // needs usage for regardless of the sidebar window (context meter).
+      includeKeys: typeof req.query.includeKeys === 'string' && req.query.includeKeys.length > 0
+        ? req.query.includeKeys.split(',').filter(Boolean)
+        : undefined,
     })
 
     if (!parsed.success) {

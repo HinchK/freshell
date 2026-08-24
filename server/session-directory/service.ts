@@ -197,6 +197,10 @@ function buildLiveTerminalSessionItem(meta: TerminalMeta): SessionDirectoryItem 
     isRunning: true,
     runningTerminalId: meta.terminalId,
     liveTerminalOnly: !meta.sessionId,
+    // STATUS-STRIP: live terminal rows carry the terminal's own usage so an
+    // active fresh-agent session's meter has data even before/without the
+    // indexer's persisted-record parse.
+    tokenUsage: meta.tokenUsage,
     // Bug-1 (sidebar rail): mirror the Rust projection
     // (session_directory.rs build_live_terminal_session_item) — a terminal
     // whose opencode resume target is a SUBAGENT (child) session must carry
@@ -344,6 +348,13 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items = items.filter((item) => item.isRunning || !!item.title?.trim())
   }
 
+  // STATUS-STRIP: snapshot the post-visibility candidate list BEFORE cursor +
+  // query filtering. Fresh-agent panes need usage for their own session even
+  // when the sidebar search/pagination window excludes it; those sessions are
+  // returned out-of-band as `contextUsageExtras` (they are never merged into
+  // `items`, so sidebar rendering is untouched).
+  const extrasCandidateItems = items
+
   if (cursor) {
     items = items.filter((item) => (
       item.lastActivityAt < cursor.lastActivityAt ||
@@ -384,6 +395,22 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items: pageItems,
     nextCursor,
     revision,
+  }
+
+  const includeKeys = input.query.includeKeys
+  if (includeKeys && includeKeys.length > 0) {
+    const wanted = new Set(includeKeys)
+    const pageKeys = new Set(pageItems.map(buildSessionKey))
+    const extras = extrasCandidateItems
+      .filter((item) => wanted.has(buildSessionKey(item)) && !pageKeys.has(buildSessionKey(item)))
+      .map((item) => ({
+        provider: item.provider,
+        sessionId: item.sessionId,
+        ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+      }))
+    if (extras.length > 0) {
+      page.contextUsageExtras = extras
+    }
   }
 
   // SESSION-05: embed the resolved project colors. They come from the

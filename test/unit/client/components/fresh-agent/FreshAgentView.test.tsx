@@ -4,7 +4,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
-import sessionsReducer, { applySessionsPatch } from '@/store/sessionsSlice'
+import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -6367,7 +6367,7 @@ describe('FreshAgentView session status strip', () => {
     expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
   })
 
-  it('shows the raw model id when it matches no static option — never the default option label', () => {
+  it('hides the chip when the model matches no static option and no probe matches it — raw ids never render, and never the default option label', async () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -6387,11 +6387,36 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    expect(screen.getByRole('button', { name: 'Model: custom-blend-x — change model' })).toBeInTheDocument()
+    // No chip at all while the label is unresolved (raw ids are tooltip-only,
+    // and the default option label is a mislabel — neither may render).
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // Probe resolved without a match: still no raw id on the chip.
+    expect(screen.queryByRole('button', { name: /custom-blend-x/ })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
   })
 
-  it('shows the live session model ahead of the staged pane model on the chip', () => {
+  it('shows the live session model ahead of the staged pane model on the chip', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
     const store = createStore()
     store.dispatch(sessionInit({
       sessionId: CLAUDE_THREAD_ID,
@@ -6417,8 +6442,14 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    expect(screen.getByRole('button', { name: 'Model: claude-live-99 — change model' })).toBeInTheDocument()
+    // The live raw id never renders; once the probe matches it, its display
+    // name wins over the staged pane model's static label.
+    expect(screen.queryByRole('button', { name: /claude-live-99/ })).toBeNull()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
     expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
   })
 
   it('renders the context meter with the exact-token tooltip from the indexed session usage', () => {
@@ -6571,6 +6602,50 @@ describe('FreshAgentView session status strip', () => {
 
     expect(meter).toHaveAttribute('aria-valuenow', '47')
     expect(screen.queryByText('context —')).toBeNull()
+  })
+
+  it('keeps the meter live from includeKeys extras while the sessions window excludes the row', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-extras',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    // The pane's session is NOT in the sidebar window (search excludes it) —
+    // but the every-refresh includeKeys side-channel still delivers usage.
+    // The meter must move with each extras refresh, never freezing at a
+    // previously-safe reading as the session climbs past the thresholds.
+    act(() => {
+      store.dispatch(applyContextUsageExtras([{
+        provider: 'claude',
+        sessionId: 'claude-strip-usage',
+        tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
+      }]))
+    })
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+
+    act(() => {
+      store.dispatch(applyContextUsageExtras([{
+        provider: 'claude',
+        sessionId: 'claude-strip-usage',
+        tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
+      }]))
+    })
+    expect(meter).toHaveAttribute('aria-valuenow', '70')
   })
 
   it('shows the pick-time display label for a catalog-only model immediately, with no probe', async () => {
@@ -6750,8 +6825,9 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    // Raw id renders immediately — never blank, never "Loading".
-    expect(screen.getByRole('button', { name: `Model: ${modelId} — change model` })).toBeInTheDocument()
+    // Raw model ids never render on the chip (user directive): a restored
+    // pane with an unresolvable id shows NO chip until the probe resolves.
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: `Model: ${displayName} — change model` })).toBeInTheDocument()
@@ -6795,8 +6871,8 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    // Raw id renders immediately — never blank, never "Loading".
-    expect(screen.getByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeInTheDocument()
+    // No chip at all while the label is unresolved (raw ids are tooltip-only).
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' })).toBeInTheDocument()
@@ -6804,7 +6880,7 @@ describe('FreshAgentView session status strip', () => {
     expect(screen.queryByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeNull()
   })
 
-  it('keeps the raw model id on the chip when the freshopencode catalog probe fails', async () => {
+  it('keeps the chip hidden when the freshopencode catalog probe fails — raw ids never render', async () => {
     apiMock.getFreshAgentModelCapabilities.mockRejectedValue(new Error('catalog down'))
     const store = createStore()
     render(
@@ -6825,7 +6901,7 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    expect(screen.getByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
     await waitFor(() => {
       expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
     })
@@ -6833,7 +6909,7 @@ describe('FreshAgentView session status strip', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /opencode-go\/glm-5\.2/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /GLM 5\.2/ })).toBeNull()
   })
 })

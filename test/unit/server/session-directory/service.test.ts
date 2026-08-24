@@ -1400,4 +1400,70 @@ describe('querySessionDirectory file-based search', () => {
       })
     })
   })
+
+  describe('STATUS-STRIP includeKeys / contextUsageExtras', () => {
+    const usage = { inputTokens: 10, outputTokens: 5, cachedTokens: 0, totalTokens: 15, contextTokens: 900, compactThresholdTokens: 1000, compactPercent: 90 }
+    const usageProjects: ProjectGroup[] = [
+      makeProject('/repo/meter', [
+        makeSession({ sessionId: 'meter-hit', projectPath: '/repo/meter', lastActivityAt: 500, title: 'Metered session', tokenUsage: usage }),
+        makeSession({ sessionId: 'meter-other', projectPath: '/repo/meter', lastActivityAt: 400, title: 'Something else entirely' }),
+      ]),
+    ]
+
+    it('returns usage for a session excluded by the search query without touching items', async () => {
+      const page = await querySessionDirectory({
+        projects: usageProjects,
+        terminalMeta: [],
+        query: { priority: 'visible', query: 'Something else', includeKeys: ['claude:meter-hit'] },
+      })
+      expect(page.items.map((item) => item.sessionId)).toEqual(['meter-other'])
+      expect(page.contextUsageExtras).toEqual([{ provider: 'claude', sessionId: 'meter-hit', tokenUsage: usage }])
+    })
+
+    it('returns usage for a session cut by the pagination window', async () => {
+      const page = await querySessionDirectory({
+        projects: usageProjects,
+        terminalMeta: [],
+        query: { priority: 'visible', limit: 1, includeKeys: ['claude:meter-hit'] },
+      })
+      expect(page.items).toHaveLength(1)
+      expect(page.items[0]!.sessionId).toBe('meter-hit')
+      // In-window key: carried as a normal item (with tokenUsage), not duplicated as an extra
+      expect(page.items[0]!.tokenUsage).toEqual(usage)
+      expect(page.contextUsageExtras).toBeUndefined()
+
+      // And when the wanted session itself is the one paged out:
+      const second = await querySessionDirectory({
+        projects: usageProjects,
+        terminalMeta: [],
+        query: { priority: 'visible', limit: 1, cursor: page.nextCursor ?? undefined, includeKeys: ['claude:meter-hit'] },
+      })
+      expect(second.items.map((item) => item.sessionId)).toEqual(['meter-other'])
+      expect(second.contextUsageExtras).toEqual([{ provider: 'claude', sessionId: 'meter-hit', tokenUsage: usage }])
+    })
+
+    it('emits no extras field when no key matches', async () => {
+      const page = await querySessionDirectory({
+        projects: usageProjects,
+        terminalMeta: [],
+        query: { priority: 'visible', includeKeys: ['claude:no-such-session'] },
+      })
+      expect(page.items).toHaveLength(2)
+      expect(page.contextUsageExtras).toBeUndefined()
+    })
+
+    it('carries terminal-meta tokenUsage on live-terminal-only rows', async () => {
+      const page = await querySessionDirectory({
+        projects: [],
+        terminalMeta: [makeTerminalMeta({
+          terminalId: 'term-live', updatedAt: 100, provider: 'opencode',
+          tokenUsage: usage,
+        })],
+        query: { priority: 'visible' },
+      })
+      const live = page.items[0]!
+      expect(live.isRunning).toBe(true)
+      expect(live.tokenUsage).toEqual(usage)
+    })
+  })
 })

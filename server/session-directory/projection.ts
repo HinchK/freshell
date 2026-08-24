@@ -25,7 +25,11 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
     a.sessionType === b.sessionType &&
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
-    a.firstUserMessage === b.firstUserMessage
+    a.firstUserMessage === b.firstUserMessage &&
+    // STATUS-STRIP: usage ticks must count as a change so `sessions.changed`
+    // fires and the strip's context meter refetches — otherwise the meter
+    // would only move when some other field happened to change too.
+    JSON.stringify(a.tokenUsage ?? null) === JSON.stringify(b.tokenUsage ?? null)
   )
 }
 
@@ -45,6 +49,7 @@ export function toSessionDirectoryComparableItem(session: CodingCliSession): Ses
     isSubagent: session.isSubagent,
     isNonInteractive: session.isNonInteractive,
     firstUserMessage: session.firstUserMessage,
+    tokenUsage: session.tokenUsage,
   }
 }
 

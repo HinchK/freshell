@@ -462,6 +462,42 @@ describe('visible-first read-model helpers', () => {
     ])
   })
 
+  it('STATUS-STRIP: forwards includeKeys and maps tokenUsage onto window sessions + extras', async () => {
+    const usage = {
+      inputTokens: 1,
+      outputTokens: 1,
+      cachedTokens: 0,
+      totalTokens: 2,
+      contextTokens: 96000,
+      compactPercent: 47,
+      compactThresholdTokens: 200000,
+    }
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-windowed',
+        provider: 'claude',
+        projectPath: '/tmp/project-alpha',
+        isRunning: false,
+        lastActivityAt: 1_000,
+        tokenUsage: usage,
+      }],
+      nextCursor: null,
+      revision: 1,
+      contextUsageExtras: [
+        { provider: 'claude', sessionId: 'session-excluded', tokenUsage: usage },
+      ],
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot({ includeKeys: ['claude:session-excluded'] })
+
+    const url = mockFetch.mock.calls[0][0] as string
+    expect(url).toContain('includeKeys=claude%3Asession-excluded')
+    expect(response.projects[0]?.sessions[0]?.tokenUsage).toEqual(usage)
+    expect(response.contextUsageExtras).toEqual([
+      { provider: 'claude', sessionId: 'session-excluded', tokenUsage: usage },
+    ])
+  })
+
   it('preserves a quarantined identity-collision state in sidebar snapshots', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],

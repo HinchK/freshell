@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest'
 import type { CodingCliSession, ProjectGroup } from '@/store/types'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
-import { resolveFreshAgentContextUsage } from '@/lib/fresh-agent-context-usage'
+import {
+  resolveFreshAgentContextUsage,
+  guardContextUsageTokenSummary,
+  collectFreshAgentContextUsageKeys,
+} from '@/lib/fresh-agent-context-usage'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 // Fixture style mirrors PaneContainer.test.tsx's makeSession/makeContent
 // builders: minimal objects carrying only the fields under test, cast to the
@@ -117,5 +122,71 @@ describe('resolveFreshAgentContextUsage', () => {
 
     const under = projectsWith((base) => ({ ...base, compactPercent: -3 }))
     expect(resolveFreshAgentContextUsage(makeContent({ resumeSessionId: 'abc' }), undefined, under)?.percent).toBe(0)
+  })
+})
+
+describe('guardContextUsageTokenSummary', () => {
+  it('nulls undefined and partial records, resolves complete ones', () => {
+    expect(guardContextUsageTokenSummary(undefined)).toBeNull()
+    expect(guardContextUsageTokenSummary({ inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2 })).toBeNull()
+    expect(guardContextUsageTokenSummary({
+      inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+      contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000,
+    })).toEqual({ percent: 47, contextTokens: 96000, thresholdTokens: 200000 })
+  })
+})
+
+describe('collectFreshAgentContextUsageKeys', () => {
+  const layout = {
+    type: 'leaf' as const,
+    content: makeContent({ resumeSessionId: 'abc' }),
+  }
+
+  it('collects provider:sessionId keys for fresh-agent panes only', () => {
+    const keys = collectFreshAgentContextUsageKeys({
+      layouts: {
+        'tab-1': layout as never,
+        'tab-2': {
+          type: 'leaf',
+          content: { kind: 'terminal', mode: 'shell', createRequestId: 'r', status: 'running' } as never,
+        },
+        'tab-3': {
+          type: 'leaf',
+          // fresh-agent pane with no resolvable durable id → no key
+          content: makeContent({ resumeSessionId: undefined }) as never,
+        } as never,
+      },
+      freshAgentSessions: {},
+    })
+    expect(keys).toEqual(['claude:abc'])
+  })
+
+  it('prefers the live session record (preferred resume id) over the pane content chain when the pane is session-bound', () => {
+    const liveDurableId = '5f4e3d2c-1b0a-4f5e-8d7c-6b5a4f3e2d1c'
+    const boundLayout = {
+      type: 'leaf' as const,
+      content: makeContent({ resumeSessionId: 'abc', sessionId: 'abc' }),
+    }
+    const sessionKey = makeFreshAgentSessionKey({
+      sessionId: 'abc',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })
+    const keys = collectFreshAgentContextUsageKeys({
+      layouts: { 'tab-1': boundLayout as never },
+      freshAgentSessions: {
+        [sessionKey]: {
+          sessionId: 'abc',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          cliSessionId: liveDurableId,
+        } as never,
+      },
+    })
+    expect(keys).toEqual([`claude:${liveDurableId}`])
+  })
+
+  it('returns an empty list with no panes', () => {
+    expect(collectFreshAgentContextUsageKeys({ layouts: undefined, freshAgentSessions: undefined })).toEqual([])
   })
 })

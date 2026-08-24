@@ -150,6 +150,12 @@ struct DirItem {
     /// `sourceFiles.get(key)` (`session-directory/service.ts:164-173`), which
     /// is looked up server-side and never sent to the client either.
     source_file: Option<PathBuf>,
+    /// STATUS-STRIP: live token usage (`SessionDirectoryItem.tokenUsage`,
+    /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
+    /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
+    /// meter (`compactPercent` etc.). `None` when the source carries none
+    /// (opencode direct rows, live-terminal synthesized items).
+    token_usage: Option<freshell_sessions::meta::TokenSummary>,
 }
 
 impl DirItem {
@@ -216,8 +222,36 @@ impl DirItem {
         if let Some(v) = &self.session_type {
             o.insert("sessionType".into(), json!(v));
         }
+        if let Some(u) = &self.token_usage {
+            o.insert("tokenUsage".into(), token_usage_value(u));
+        }
         Value::Object(o)
     }
+}
+
+/// Serialize a [`freshell_sessions::meta::TokenSummary`] to the
+/// `TokenSummarySchema` wire shape (`shared/ws-protocol.ts:61-72`): required
+/// numeric fields always present, the context/compact optionals omitted when
+/// absent (matching the zod `.optional()`s).
+fn token_usage_value(u: &freshell_sessions::meta::TokenSummary) -> Value {
+    let mut o = Map::new();
+    o.insert("inputTokens".into(), json!(u.input_tokens));
+    o.insert("outputTokens".into(), json!(u.output_tokens));
+    o.insert("cachedTokens".into(), json!(u.cached_tokens));
+    o.insert("totalTokens".into(), json!(u.total_tokens));
+    if let Some(v) = u.context_tokens {
+        o.insert("contextTokens".into(), json!(v));
+    }
+    if let Some(v) = u.model_context_window {
+        o.insert("modelContextWindow".into(), json!(v));
+    }
+    if let Some(v) = u.compact_threshold_tokens {
+        o.insert("compactThresholdTokens".into(), json!(v));
+    }
+    if let Some(v) = u.compact_percent {
+        o.insert("compactPercent".into(), json!(v));
+    }
+    Value::Object(o)
 }
 
 /// `SessionDirectoryQuerySchema.tier` (`shared/read-models.ts:30`,
@@ -246,6 +280,11 @@ struct DirQuery {
     include_subagents: bool,
     include_non_interactive: bool,
     include_empty: bool,
+    /// STATUS-STRIP: `includeKeys` (`shared/read-models.ts`) — comma-separated
+    /// `provider:sessionId` keys whose usage the client needs regardless of
+    /// the sidebar search/pagination window. Matching sessions are returned
+    /// out-of-band as `contextUsageExtras` (never merged into `items`).
+    include_keys: Vec<String>,
 }
 
 /// R9: `SessionDirectoryQuerySchema` (`shared/read-models.ts:28-38`) makes
@@ -303,6 +342,28 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         }
     };
 
+    // STATUS-STRIP: `includeKeys` (comma-separated; `shared/read-models.ts`
+    // `z.array(z.string().min(1)).max(50)`). Issues join the SAME details
+    // array as the fields above (zod collects issues across every violated
+    // field into one response). The client self-enforces ≤50 via its own
+    // schema parse (`getSessionDirectoryPage`), so the over-limit issue text
+    // is not wire-probed byte-for-byte — a hand-rolled request beyond the cap
+    // gets a 400 with a zod-flavored issue, enough for a 400 contract check
+    // without pretending to byte-parity.
+    let mut include_keys: Vec<String> = raw
+        .get("includeKeys")
+        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    if include_keys.len() > 50 {
+        details.push(json!({
+            "code": "too_big",
+            "maximum": 50,
+            "path": ["includeKeys"],
+            "message": "Too big: expected array to have <=50 items",
+        }));
+        include_keys.truncate(50);
+    }
+
     if !details.is_empty() {
         return Err(json!(details));
     }
@@ -316,6 +377,7 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         include_subagents: flag("includeSubagents"),
         include_non_interactive: flag("includeNonInteractive"),
         include_empty: flag("includeEmpty"),
+        include_keys,
     })
 }
 
@@ -776,6 +838,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         session_type: None,
         title_source: idx.title_source.clone(),
         source_file: idx.source_file.clone(),
+        token_usage: idx.token_usage.clone(),
     }
 }
 
@@ -936,6 +999,7 @@ fn item_from_meta(
         session_type: None,
         title_source: meta.title_source.clone(),
         source_file,
+        token_usage: None,
     }
 }
 
@@ -1133,6 +1197,12 @@ fn build_live_terminal_session_item(
         // `titleSource` either, `service.ts:110-130`).
         title_source: None,
         source_file: None,
+        // PARITY NOTE: Rust's `TerminalIdentity` carries no token usage, so a
+        // live-terminal-only row reports none here — unlike Node, whose
+        // `TerminalMeta` carries `tokenUsage`. Fresh-agent pane sessions are
+        // indexed from transcripts (their usage arrives via that path), so
+        // this gap only covers pre-adoption transient rows.
+        token_usage: None,
     })
 }
 
@@ -1193,6 +1263,7 @@ mod join_tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         }
     }
 
@@ -1456,6 +1527,17 @@ fn apply_query(
         });
     }
 
+    // STATUS-STRIP: snapshot the post-visibility candidate list BEFORE cursor
+    // + query filtering (service.ts) — fresh-agent panes need their own
+    // session's usage even when the sidebar search/pagination window excludes
+    // it. Those sessions are returned out-of-band as `contextUsageExtras`,
+    // never merged into `items`.
+    let extras_candidates: Option<Vec<DirItem>> = if q.include_keys.is_empty() {
+        None
+    } else {
+        Some(items.clone())
+    };
+
     // Cursor filter (service.ts:254-259).
     if let Some((c_last, c_key)) = &cursor {
         items.retain(|i| {
@@ -1517,6 +1599,33 @@ fn apply_query(
         page["partial"] = json!(true);
         if let Some(reason) = partial_reason {
             page["partialReason"] = json!(reason);
+        }
+    }
+
+    // STATUS-STRIP: out-of-band usage for `includeKeys` sessions that fell
+    // outside this page's `items` (search-filtered or paged out). Omitted
+    // entirely when nothing matched (zod `.optional()` shape — the original
+    // only sets the key when there is at least one extra).
+    if let Some(candidates) = extras_candidates {
+        let page_keys: std::collections::HashSet<String> =
+            items.iter().take(limit).map(DirItem::key).collect();
+        let wanted: std::collections::HashSet<&str> =
+            q.include_keys.iter().map(String::as_str).collect();
+        let extras: Vec<Value> = candidates
+            .iter()
+            .filter(|item| wanted.contains(item.key().as_str()) && !page_keys.contains(&item.key()))
+            .map(|item| {
+                let mut o = Map::new();
+                o.insert("provider".into(), json!(item.provider));
+                o.insert("sessionId".into(), json!(item.session_id));
+                if let Some(u) = &item.token_usage {
+                    o.insert("tokenUsage".into(), token_usage_value(u));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        if !extras.is_empty() {
+            page["contextUsageExtras"] = json!(extras);
         }
     }
     Ok(page)
@@ -2014,6 +2123,125 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// STATUS-STRIP: a DirItem carrying usage (mirrors `service.test.ts`'s
+    /// `meter-hit` rows).
+    fn usage_dir_item(session_id: &str, last_activity_at: i64, title: &str) -> DirItem {
+        DirItem {
+            session_id: session_id.to_string(),
+            legacy_session_id: None,
+            provider: "claude".to_string(),
+            project_path: "/repo/meter".to_string(),
+            title: Some(title.to_string()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at,
+            created_at: Some(last_activity_at),
+            cwd: Some("/repo/meter".to_string()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+            token_usage: Some(freshell_sessions::meta::TokenSummary {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                total_tokens: 15,
+                context_tokens: Some(900),
+                model_context_window: None,
+                compact_threshold_tokens: Some(1000),
+                compact_percent: Some(90),
+            }),
+        }
+    }
+
+    #[test]
+    fn token_usage_serializes_on_items() {
+        let items = vec![usage_dir_item("meter-hit", 500, "Metered session")];
+        let page = apply_query(items, &default_query(), &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["tokenUsage"]["compactPercent"], json!(90));
+        assert_eq!(arr[0]["tokenUsage"]["contextTokens"], json!(900));
+        assert_eq!(arr[0]["tokenUsage"]["compactThresholdTokens"], json!(1000));
+        assert_eq!(arr[0]["tokenUsage"]["inputTokens"], json!(10));
+    }
+
+    #[test]
+    fn include_keys_returns_usage_for_session_excluded_by_search_query() {
+        let items = vec![
+            usage_dir_item("meter-hit", 500, "Metered session"),
+            DirItem {
+                token_usage: None,
+                ..usage_dir_item("meter-other", 400, "Something else entirely")
+            },
+        ];
+        let q = DirQuery {
+            query: Some("Something else".to_string()),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["sessionId"], json!("meter-other"));
+        let extras = page["contextUsageExtras"].as_array().unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0]["provider"], json!("claude"));
+        assert_eq!(extras[0]["sessionId"], json!("meter-hit"));
+        assert_eq!(extras[0]["tokenUsage"]["compactPercent"], json!(90));
+    }
+
+    #[test]
+    fn include_keys_returns_usage_for_session_paged_out_of_the_window() {
+        // Page 1 (limit 1) contains meter-hit as a normal item → NOT duplicated
+        // as an extra.
+        let q1 = DirQuery {
+            limit: Some(1),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let items = vec![
+            usage_dir_item("meter-hit", 500, "Metered session"),
+            usage_dir_item("meter-other", 400, "Other"),
+        ];
+        let page = apply_query(items.clone(), &q1, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap()[0]["sessionId"], json!("meter-hit"));
+        assert!(page.get("contextUsageExtras").is_none());
+        // Page 2 paged it out → arrives as an extra instead.
+        let cursor = page["nextCursor"].as_str().unwrap().to_string();
+        let q2 = DirQuery {
+            limit: Some(1),
+            cursor: Some(cursor),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let page2 = apply_query(items, &q2, &[]).unwrap();
+        assert_eq!(page2["items"].as_array().unwrap()[0]["sessionId"], json!("meter-other"));
+        assert_eq!(
+            page2["contextUsageExtras"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-hit")
+        );
+    }
+
+    #[test]
+    fn include_keys_without_match_emits_no_extras_key() {
+        let items = vec![usage_dir_item("meter-hit", 500, "Metered session")];
+        let q = DirQuery {
+            include_keys: vec!["claude:no-such-session".to_string()],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert!(page.get("contextUsageExtras").is_none());
+    }
+
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
         // Byte-matched against a live probe of the ORIGINAL: seeding
@@ -2103,6 +2331,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
         let q = DirQuery {
@@ -2318,6 +2547,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let items = vec![mk("keep"), mk("gone")];
 
@@ -2363,6 +2593,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(
@@ -2423,6 +2654,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let copied = DirItem {
             session_id: "copied-transcript".into(),
@@ -2485,6 +2717,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
         let v = overlaid[0].to_value();
@@ -2528,6 +2761,7 @@ mod tests {
             session_type: None,
             title_source: title_source.map(str::to_string),
             source_file: None,
+            token_usage: None,
         }
     }
 
@@ -2701,6 +2935,7 @@ mod tests {
             is_subagent: false,
             is_non_interactive: false,
             source_file: Some(PathBuf::from(source_file)),
+            token_usage: None,
         }
     }
 
@@ -4112,6 +4347,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(

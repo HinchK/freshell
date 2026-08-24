@@ -1,8 +1,12 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
-import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent, PaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
 import type { CodingCliSession, ProjectGroup } from '@/store/types'
+import type { TokenSummary } from '@shared/ws-protocol'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { collectPaneEntries } from '@/lib/pane-utils'
+import type { PaneNode } from '@/store/paneTypes'
 
 export type FreshAgentContextUsage = {
   percent: number
@@ -53,20 +57,56 @@ export function resolveFreshAgentContextUsage(
   const sessionId = freshAgentContextSessionId(content, session)
   if (!sessionId) return null
   const indexed = findIndexedSessionById(projects, content.provider, sessionId)
-  const usage = indexed?.tokenUsage
-  if (!usage) return null
+  return guardContextUsageTokenSummary(indexed?.tokenUsage)
+}
 
+/**
+ * Same finite-number guard as resolveFreshAgentContextUsage, applied directly
+ * to a TokenSummary from any source (window row or out-of-band extras).
+ */
+export function guardContextUsageTokenSummary(usage: TokenSummary | undefined): FreshAgentContextUsage | null {
+  if (!usage) return null
   const raw = usage.compactPercent
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return null
   const contextTokens = usage.contextTokens
   if (typeof contextTokens !== 'number' || !Number.isFinite(contextTokens)) return null
   const thresholdTokens = usage.compactThresholdTokens
   if (typeof thresholdTokens !== 'number' || !Number.isFinite(thresholdTokens)) return null
-
-  const percent = Math.max(0, Math.min(100, Math.round(raw)))
   return {
-    percent,
+    percent: Math.max(0, Math.min(100, Math.round(raw))),
     contextTokens: Math.round(contextTokens),
     thresholdTokens: Math.round(thresholdTokens),
   }
+}
+
+/**
+ * STATUS-STRIP: the composite `provider:sessionId` keys of every fresh-agent
+ * pane's durable context session. Passed as `includeKeys` on sidebar window /
+ * search fetches so the server returns their usage out-of-band
+ * (`contextUsageExtras`) even when the active search or pagination window
+ * excludes the row — the meter must stay live regardless of the sidebar.
+ */
+export function collectFreshAgentContextUsageKeys(args: {
+  layouts: Record<string, PaneNode | null> | undefined
+  freshAgentSessions: Record<string, FreshAgentSessionState> | undefined
+}): string[] {
+  const keys = new Set<string>()
+  for (const layout of Object.values(args.layouts ?? {})) {
+    if (!layout) continue
+    for (const { content } of collectPaneEntries(layout)) {
+      if ((content as PaneContent).kind !== 'fresh-agent') continue
+      const fresh = content as FreshAgentPaneContent
+      const session = fresh.sessionId
+        ? args.freshAgentSessions?.[makeFreshAgentSessionKey({
+            sessionId: fresh.sessionId,
+            sessionType: fresh.sessionType,
+            provider: fresh.provider,
+          })]
+        : undefined
+      const sessionId = freshAgentContextSessionId(fresh, session)
+      if (!sessionId) continue
+      keys.add(`${fresh.provider}:${sessionId}`)
+    }
+  }
+  return [...keys]
 }

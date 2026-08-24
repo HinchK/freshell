@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { SessionDirectoryIntegrityError } from '@shared/read-models'
+import type { SessionDirectoryContextUsageExtra, SessionDirectoryIntegrityError } from '@shared/read-models'
+import type { TokenSummary } from '@shared/ws-protocol'
 import type { ProjectGroup } from './types'
 import type { TerminalMetaRecord } from './terminalMetaSlice'
 
@@ -153,6 +154,12 @@ export interface SessionsState {
   loadingKind?: SessionWindowLoadingKind
   activeSurface?: string
   windows: Record<string, SessionWindowState>
+  /**
+   * STATUS-STRIP: out-of-band usage for fresh-agent pane sessions requested
+   * via `includeKeys`. Keyed `provider:sessionId`. Deliberately NOT merged
+   * into `projects`/windows so sidebar rendering is untouched.
+   */
+  contextUsageByKey: Record<string, { tokenUsage: TokenSummary; fetchedAt: number }>
 }
 
 const initialState: SessionsState = {
@@ -160,6 +167,7 @@ const initialState: SessionsState = {
   expandedProjects: new Set<string>(),
   wsSnapshotReceived: false,
   windows: {},
+  contextUsageByKey: {},
 }
 
 function ensureWindow(state: SessionsState, surface: string): SessionWindowState {
@@ -589,12 +597,32 @@ export const sessionsSlice = createSlice({
         }
       }
     },
+    /**
+     * STATUS-STRIP: store out-of-band usage extras (`includeKeys` responses)
+     * in the side map. Never touch window/projects — sidebar rows must not
+     * gain entries the active query/window excludes.
+     */
+    applyContextUsageExtras: (
+      state,
+      action: PayloadAction<SessionDirectoryContextUsageExtra[]>,
+    ) => {
+      const fetchedAt = Date.now()
+      if (!state.contextUsageByKey) state.contextUsageByKey = {}
+      for (const extra of action.payload) {
+        if (!extra.tokenUsage) continue
+        state.contextUsageByKey[`${extra.provider}:${extra.sessionId}`] = {
+          tokenUsage: extra.tokenUsage as TokenSummary,
+          fetchedAt,
+        }
+      }
+    },
   },
 })
 
 export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
+  applyContextUsageExtras,
   setSessionWindowError,
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,

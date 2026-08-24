@@ -124,6 +124,14 @@ pub struct IndexedSession {
     /// (`server/session-directory/service.ts`'s `sourceFiles` lookup map,
     /// `service.ts:164-173`).
     pub source_file: Option<PathBuf>,
+    /// STATUS-STRIP: the parsed token-usage aggregate (`ParsedSessionMeta::
+    /// token_usage`, `meta.rs`; Node `CodingCliSession.tokenUsage`,
+    /// `coding-cli/types.ts:190`). Surfaced on the session-directory page so
+    /// the fresh-agent strip's context meter can read `compactPercent` &
+    /// friends. `#[serde(default)]` so a parse-cache written before this
+    /// field existed still deserializes (as `None`, the pre-existing view).
+    #[serde(default)]
+    pub token_usage: Option<crate::meta::TokenSummary>,
 }
 
 impl IndexedSession {
@@ -478,6 +486,7 @@ fn item_from_meta(
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         source_file,
+        token_usage: meta.token_usage.clone(),
     }
 }
 
@@ -768,6 +777,9 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         // provider is un-searchable at the `userMessages`/`fullText` tiers
         // (title-tier metadata search is unaffected).
         source_file: None,
+        // opencode's direct lister surfaces no usage (faithful to Node's
+        // opencode provider, which never sets `tokenUsage` either).
+        token_usage: None,
     }
 }
 
@@ -2544,6 +2556,7 @@ pub(crate) mod tests {
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
+            token_usage: None,
         }
     }
 

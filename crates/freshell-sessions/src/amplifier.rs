@@ -425,6 +425,7 @@ fn indexed_from_meta(
         // `None` makes it un-searchable at the `userMessages`/`fullText`
         // tiers (title-tier metadata search is unaffected).
         source_file: None,
+        token_usage: None,
     }
 }
 

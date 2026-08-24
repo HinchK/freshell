@@ -2532,5 +2532,72 @@ describe('sessionsThunks', () => {
 
       await request.catch(() => {})
     })
+
+    it('passes fresh-agent pane includeKeys and stores returned contextUsageExtras', async () => {
+      const panesReducer = (await import('@/store/panesSlice')).default
+      const freshAgentReducer = (await import('@/store/freshAgentSlice')).default
+      const store = configureStore({
+        reducer: {
+          sessions: sessionsReducer,
+          panes: panesReducer,
+          freshAgent: freshAgentReducer,
+        },
+        preloadedState: {
+          panes: {
+            layouts: {
+              'tab-9': {
+                type: 'leaf',
+                id: 'pane-9',
+                content: {
+                  kind: 'fresh-agent',
+                  sessionType: 'freshclaude',
+                  provider: 'claude',
+                  createRequestId: 'req-9',
+                  status: 'connected',
+                  resumeSessionId: 'claude-live-uuid',
+                },
+              },
+            },
+          },
+        } as any,
+        middleware: (getDefaultMiddleware) =>
+          getDefaultMiddleware({
+            serializableCheck: false,
+          }),
+      })
+
+      fetchSidebarSessionsSnapshot.mockResolvedValue({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+        contextUsageExtras: [{
+          provider: 'claude',
+          sessionId: 'claude-live-uuid',
+          tokenUsage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cachedTokens: 0,
+            totalTokens: 2,
+            contextTokens: 96000,
+            compactPercent: 47,
+            compactThresholdTokens: 200000,
+          },
+        }],
+      })
+
+      store.dispatch(setActiveSessionSurface('sidebar'))
+      await store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+      }) as any)
+
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({ includeKeys: ['claude:claude-live-uuid'] }),
+      )
+      const extras = (store.getState() as any).sessions.contextUsageByKey
+      expect(extras['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(47)
+    })
   })
 })

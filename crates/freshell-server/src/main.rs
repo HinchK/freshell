@@ -2754,6 +2754,7 @@ mod sessions_sweep_tests {
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
+        token_usage: None,
         }
     }
 
