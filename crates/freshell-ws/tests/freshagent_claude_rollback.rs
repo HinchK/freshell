@@ -286,10 +286,11 @@ impl PaneIdentitySink for TestLedgerSink {
         })
     }
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
+        // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
+        // reader owns the version gate + the legacy epochless/destroyed
+        // migration (focused ep1-r1 F3).
         let payload = self.ledger.load_rollback_row(provider, session_id)?;
-        serde_json::from_value(payload)
-            .ok()
-            .filter(|r: &RollbackRecord| r.version == freshell_freshagent::ROLLBACK_RECORD_VERSION)
+        RollbackRecord::from_stored_payload(payload)
     }
     fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();

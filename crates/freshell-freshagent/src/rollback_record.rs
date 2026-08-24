@@ -189,6 +189,49 @@ impl RollbackRecord {
         }
     }
 
+    /// The ONE reader of a STORED rollback payload (focused-review ep1-r1 F3):
+    /// parse the ledger's opaque JSON → version-gate (a mismatched version
+    /// reads as `None`, never silently reinterpreted — the pane-ledger
+    /// LEDGER_VERSION discipline) → apply the pre-F8 LEGACY migration IN
+    /// MEMORY. Every load path (`PaneIdentitySink::load_rollback`
+    /// implementations over stored bytes) routes through here so handlers see
+    /// a uniform already-migrated record.
+    ///
+    /// The migration: a row written BEFORE the epoch fields existed has NO
+    /// `epoch` on any entry; when such a row ALSO carries the `redoDestroyed`
+    /// bit, a destroy provably fired mid-history (the legacy undo → … → send
+    /// durable shapes — the union holds entries from MORE than one epoch).
+    /// Serde-defaulting every entry to epoch 0 aliases the frozen prefix onto
+    /// `currentEpoch` (also defaulting to 0): frozen markers would regain
+    /// "Redo to here" and a subsequent same-epoch undo would splice BEFORE the
+    /// frozen prefix. So the load freezes every existing entry (epochs stay
+    /// 0 — the frozen boundary IS `entries.len()`) and bumps `current_epoch`
+    /// beyond; the destroyed bit is honored AS-IS (the next undo's
+    /// destroyed-at-load leg still opens a fresh epoch on top). The disk row
+    /// is NEVER lazily rewritten — the migration persists with the next op's
+    /// write. Post-F8 rows (every entry carries `epoch` EXPLICITLY) and
+    /// single-epoch legacy rows (the destroy bit never set) load UNMIGRATED.
+    pub fn from_stored_payload(payload: Value) -> Option<Self> {
+        let legacy_destroyed_union = payload
+            .get("entries")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                !entries.is_empty() && entries.iter().all(|e| e.get("epoch").is_none())
+            })
+            && payload.get("redoDestroyed").and_then(Value::as_bool) == Some(true);
+        let record: Self = serde_json::from_value(payload).ok()?;
+        if record.version != ROLLBACK_RECORD_VERSION {
+            return None;
+        }
+        let mut record = record;
+        if legacy_destroyed_union {
+            record.current_epoch = record
+                .current_epoch
+                .max(record.entries.iter().map(|e| e.epoch).max().unwrap_or(0) + 1);
+        }
+        Some(record)
+    }
+
     /// The STORED bit only — never entries-derived (written at op time by the
     /// provider handler; claude entries carry the union marker slices, so only
     /// the stored bit is consulted).
@@ -585,6 +628,130 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, "p4"), (1, "pn1"), (1, "pn2")],
             "frozen prior-epoch prefix first (untouched epochs), then the new epoch ascending"
+        );
+    }
+
+    /// Focused-review ep1-r1 F3: the persisted pre-F8 multi-op shape — every
+    /// entry epoch-free and the destroy bit set (the durable record left by a
+    /// legacy undo → … → send history) — provably holds a MULTI-epoch union:
+    /// serde-defaulting every entry to epoch 0 would alias the frozen prefix
+    /// onto `current_epoch` (also 0), reviving "Redo to here" on frozen
+    /// markers and splicing a subsequent same-epoch undo BEFORE the frozen
+    /// prefix. The load-time reader migrates IN MEMORY: every existing entry
+    /// freezes (its epoch stays 0; the frozen boundary IS `entries.len()`),
+    /// `current_epoch` bumps beyond, and the destroyed bit is honored as-is.
+    #[test]
+    fn legacy_destroyed_epochless_record_loads_as_an_all_frozen_prefix() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            "redoDestroyed": true,
+            "canRedo": false,
+            "entries": [
+                { "removedTurns": [marker_turn("t1", "user")], "promptText": "p1", "atMs": 40 },
+                { "removedTurns": [marker_turn("t2", "user")], "promptText": "p2", "atMs": 50 },
+            ],
+        });
+        let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
+        assert!(record.redo_destroyed, "the destroyed bit is honored as-is");
+        assert!(
+            !record.entries.is_empty()
+                && record
+                    .entries
+                    .iter()
+                    .all(|e| e.epoch < record.current_epoch),
+            "every legacy entry FROZEN (the frozen boundary is entries.len()): {record:?}"
+        );
+        assert_eq!(
+            record.current_epoch, 1,
+            "the counter bumped beyond every existing entry's epoch"
+        );
+        assert!(
+            redoable_turn_ids(&record, true).is_empty(),
+            "no 'Redo to here' affordances — even a hypothetical can_redo:true \
+             adjudication sees a frozen-only bucket"
+        );
+
+        // A subsequent undo (the handler's destroy-at-load epoch-opening leg)
+        // begins a fresh epoch APPENDED AFTER the frozen legacy prefix — the
+        // bucket stays in conversation order.
+        let mut record = record;
+        record.redo_destroyed = false; // the undo handler clears only the redo chain state
+        record.begin_new_epoch();
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t3", "user")],
+                prompt_text: "p3".into(),
+                at_ms: 80,
+                epoch: record.current_epoch,
+            },
+            80,
+        );
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| (e.epoch, e.prompt_text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "p1"), (0, "p2"), (2, "p3")],
+            "the new epoch is appended AFTER the frozen legacy prefix, never spliced before it"
+        );
+        assert_eq!(
+            redoable_turn_ids(&record, true),
+            vec!["t3".to_string()],
+            "only the fresh epoch's markers are redoable"
+        );
+    }
+
+    /// F3 companion: a post-F8 record whose entries carry the `epoch` field
+    /// EXPLICITLY (every op stamps it since delta-r1) is never mistaken for a
+    /// legacy row — a destroy mid-history bumps nothing at load, and the
+    /// handler's own destroyed-at-load leg opens the next epoch exactly once.
+    #[test]
+    fn explicit_epoch_fields_never_trigger_the_legacy_migration() {
+        let modern = json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            "redoDestroyed": true,
+            "canRedo": false,
+            "currentEpoch": 3,
+            "entries": [
+                { "removedTurns": [marker_turn("t1", "user")], "promptText": "p1", "atMs": 40, "epoch": 0 },
+                { "removedTurns": [marker_turn("t2", "user")], "promptText": "p2", "atMs": 50, "epoch": 3 },
+            ],
+        });
+        let record = RollbackRecord::from_stored_payload(modern).expect("modern payload parses");
+        assert_eq!(record.current_epoch, 3, "untouched by the migrator");
+        assert_eq!(
+            record.entries.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+            vec![0, 3],
+            "entry epochs verbatim — no freeze beyond their own stamps"
+        );
+    }
+
+    /// F3 companion: the legacy migration keys on the DESTROYED bit — a single
+    /// -epoch legacy record (the destroy bit never set; the current epoch only)
+    /// loads as one current epoch with no affordance regression.
+    #[test]
+    fn single_epoch_legacy_record_loads_as_one_current_epoch() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 50,
+            "redoDestroyed": false,
+            "canRedo": true,
+            "entries": [{
+                "removedTurns": [marker_turn("t1", "user")],
+                "promptText": "p1",
+                "atMs": 40,
+            }],
+        });
+        let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
+        assert_eq!(record.current_epoch, 0, "no migration — one current epoch");
+        assert!(record.entries.iter().all(|e| e.epoch == 0));
+        assert_eq!(
+            redoable_turn_ids(&record, true),
+            vec!["t1".to_string()],
+            "the single current epoch keeps its redo affordances"
         );
     }
 

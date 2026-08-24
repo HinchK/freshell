@@ -1013,11 +1013,14 @@ impl FreshOpencodeState {
     ///     and the interrupt's `turn_aborted` flag would gate even a raced settle —
     ///     killing mid-compact yields NO false `freshAgent.turn.complete`.
     ///
-    /// REDO DISCIPLINE (delta-r1 F5): opencode summarizes natively delete the
-    /// reverted tail exactly like a new submission, so the ledger's redo state
-    /// retires via `destroy_redo_on_submit` under the same session lock BEFORE
-    /// the drive posts — markers survive (decision 6), `canRedo`/`redoableTurnIds`
-    /// collapse immediately.
+    /// REDO DISCIPLINE (delta-r1 F5, post-engagement per focused-review ep1-r1
+    /// F2): opencode summarizes natively delete the reverted tail exactly like a
+    /// new submission — so the ledger's redo state retires via
+    /// `destroy_redo_on_submit` ONLY after the provider ACCEPTED the summarize
+    /// write (post-2xx, inside the registered drive). On every refusal /
+    /// preflight / no-POST / provider-error path the provider tail survives, so
+    /// redo stays valid (never a permanently-destroyed redo over a live tail).
+    /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_arc = {
@@ -1066,24 +1069,12 @@ impl FreshOpencodeState {
             return;
         }
 
-        // Decision 5 (delta-r1 F5): the provider natively DELETES the reverted
-        // tail on summarize/compact too — exactly like a send — so the ledger's
-        // redo state retires HERE, under the same session lock the
-        // refusal/flag-reset/site of the destroy all share, BEFORE the drive
-        // posts (a natural compact is a submission-leg for redo purposes:
-        // afterwards only the decision-6 marker union remains). AWAITED; a
-        // write failure is warn-only (never blocks the compact), the same
-        // degrade policy as [`Self::handle_send`]'s destroy site.
-        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
-            &self.identity_sink(),
-            PROVIDER,
-            &real_id,
-            crate::rollback_record::now_ms(),
-        )
-        .await
-        {
-            tracing::warn!(error = %err, session = %real_id, "freshagent.opencode.redo_destroy_on_compact_failed");
-        }
+        // Focused-review ep1-r1 F2: NO redo destroy here. The preflight legs
+        // (untracked session, unmaterialized placeholder, busy refusal, the
+        // no-model failure below) and a provider-error summarize all leave the
+        // provider's reverted tail INTACT — retiring redo now would permanently
+        // refuse `/redo` over a tail that survives. The destroy rides the drive,
+        // strictly AFTER the summarize 2xx (below).
 
         // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
         session.turn_aborted.store(false, Ordering::SeqCst);
@@ -1132,6 +1123,7 @@ impl FreshOpencodeState {
         // session's DETACHED, REGISTERED turn task — mirroring handle_send so
         // kill/interrupt abort it (aborted mid-await ⇒ no settle ⇒ no chime).
         let fresh_agent = self.fresh_agent.clone();
+        let identity_sink = std::sync::Arc::clone(&self.identity_sink);
         let compact_id = real_id.clone();
         let compact_task = tokio::spawn(async move {
             let result = match manager
@@ -1144,6 +1136,23 @@ impl FreshOpencodeState {
                 .await
             {
                 Ok(()) => {
+                    // Decision 5 (delta-r1 F5), focused-review ep1-r1 F2: the
+                    // provider ACCEPTED the summarize write (post-2xx) — the
+                    // reverted tail is genuinely deleted NOW, so the ledger's
+                    // redo state retires here (markers survive, decision 6).
+                    // AWAITED before the idle wait; a ledger failure is warn-only
+                    // (never blocks the compact — the same degrade policy as
+                    // [`Self::handle_send`]'s destroy site).
+                    if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+                        &identity_sink.get().cloned(),
+                        PROVIDER,
+                        &compact_id,
+                        crate::rollback_record::now_ms(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, session = %compact_id, "freshagent.opencode.redo_destroy_on_compact_failed");
+                    }
                     manager
                         .await_idle(&compact_id, rx, DEFAULT_TURN_TIMEOUT, route)
                         .await
@@ -4414,23 +4423,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn compact_retires_redo_before_the_summarize_post_and_the_snapshot_reflects_it() {
-        // Delta-r1 F5: the provider natively DELETES the reverted tail on
-        // summarize/compact exactly like a send (the verified 1.18.21 semantics),
-        // so the compact path runs `destroy_redo_on_submit` UNDER the same session
-        // lock before the drive posts. After undo (redo-capable record) → compact,
-        // the ledger says redo_destroyed (markers survive, decision 6 — entries
-        // and per-entry epochs are untouched), and the snapshot's canRedo +
-        // redoableTurnIds reflect the retirement.
-        let (st, _http, _rx) = compact_state(r#"{"model":null}"#, false).await;
-        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+    /// Seed a redo-capable rollback record for `session_id` (one user+assistant
+    /// step undid at t2; redo live) and return the fake sink.
+    async fn seed_redoable_record(
+        st: &FreshOpencodeState,
+        session_id: &str,
+    ) -> std::sync::Arc<crate::identity_sink::FakeIdentitySink> {
         let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(sink.clone());
         crate::identity_sink::PaneIdentitySink::record_rollback(
             sink.as_ref(),
             PROVIDER,
-            "ses_1",
+            session_id,
             {
                 let mut record = RollbackRecord::empty(1);
                 record.splice_undo_entry(
@@ -4451,17 +4455,52 @@ mod tests {
         )
         .await
         .expect("seed a redo-capable record (undo at t2)");
+        sink
+    }
+
+    /// Focused-review ep1-r1 F2: the redo destroy rides the compact ONLY after
+    /// the provider ACCEPTED the summarize write (post-2xx — the compact
+    /// genuinely deleted the reverted tail, the verified 1.18.21 semantics).
+    /// While the summarize POST is parked (engaged, unanswered) redo is still
+    /// live; once the 2xx lands, the ledger says redo_destroyed (markers
+    /// survive, decision 6 — entries and per-entry epochs are untouched) and
+    /// the snapshot's canRedo + redoableTurnIds reflect the retirement.
+    #[tokio::test]
+    async fn compact_retires_redo_only_after_the_accepted_summarize_post_and_the_snapshot_reflects_it(
+    ) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) =
+            compact_state_gated(r#"{"model":null}"#, false, Some(gate.clone())).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
 
         st.handle_compact(compact_msg("ses_1")).await;
 
-        // The destroy is AWAITED under the session lock BEFORE the compact drive
-        // posts summarize — no settle wait is needed (and certainly no second op).
+        // The summarize POST is ENGAGED (recorded) but the provider has NOT
+        // answered yet — a pre-acceptance destroy would retire a redo whose
+        // provider tail still provably survives.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while http.summarize_requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the summarize POST is engaged");
+        let record = sink.load_rollback(PROVIDER, "ses_1").expect("record");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "redo survives UNTIL the provider accepts the summarize write: {record:?}"
+        );
+
+        // The 2xx lands: the compact's tail deletion is real, so redo retires.
+        gate.notify_one();
+        frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
         let record = sink
             .load_rollback(PROVIDER, "ses_1")
             .expect("the record survives");
         assert!(
             record.redo_destroyed && !record.can_redo(),
-            "the compact retired redo BEFORE the summarize posted: {record:?}"
+            "the accepted compact retired redo (post-2xx): {record:?}"
         );
         assert_eq!(
             RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
@@ -4480,6 +4519,68 @@ mod tests {
             snap["rollback"],
             json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
             "canRedo:false + no redoable marker rows after the compact"
+        );
+    }
+
+    /// F2 (no-POST preflight failure): a compact with no resolvable model pair
+    /// errors LOUDLY and NEVER posts — the provider tail survives, so redo
+    /// stays valid.
+    #[tokio::test]
+    async fn compact_with_no_resolvable_model_never_destroys_redo() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, false).await;
+        // An unsplittable session model forces the /config fallback, which is null.
+        insert_compact_session(&st, "ses_1", Some("noslash")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD");
+        assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the preflight failure never posts"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "no-POST ⇒ redo stays valid (the provider tail survives): {record:?}"
+        );
+    }
+
+    /// F2 (provider-error path): the summarize POST was ENGAGED but the serve
+    /// answered 5xx — the compact did not happen, the provider tail survives,
+    /// and redo stays valid.
+    #[tokio::test]
+    async fn compact_summarize_provider_error_never_destroys_redo() {
+        let (st, http, mut rx) = compact_state(r#"{"model":null}"#, true).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD");
+        assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        assert_eq!(
+            http.summarize_requests().len(),
+            1,
+            "the summarize POST was genuinely engaged (and failed)"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "a provider-error compact never retires redo — the tail survives: {record:?}"
         );
     }
 

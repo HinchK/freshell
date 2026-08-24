@@ -4,7 +4,6 @@
 
 use freshell_freshagent::{
     FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
-    ROLLBACK_RECORD_VERSION,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -171,15 +170,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
 
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Reads are memory-only against the write-through index — safe inline.
-        // The ledger is payload-opaque; the schema (and its version gate: a
-        // mismatched version reads as None, never reinterpreted) lives here.
+        // The ledger is payload-opaque; `RollbackRecord::from_stored_payload`
+        // owns the schema-side concerns (the version gate AND the focused
+        // ep1-r1 F3 legacy epochless/destroyed migration — handlers always see
+        // the already-migrated record; the disk row is never lazily rewritten).
         let payload = self.ledger.load_rollback_row(provider, session_id)?;
-        let record: RollbackRecord = serde_json::from_value(payload).ok()?;
-        if record.version == ROLLBACK_RECORD_VERSION {
-            Some(record)
-        } else {
-            None
-        }
+        RollbackRecord::from_stored_payload(payload)
     }
 
     /// kata 1wxv task 4 review (M3): compensate-by-delete when the pre-op state
@@ -385,6 +381,90 @@ mod tests {
         assert!(
             sink.load_rollback("codex", "old-thread").is_some(),
             "the codex old-thread row stays put"
+        );
+    }
+
+    /// Focused-review ep1-r1 F3: a PERSISTED pre-F8 record whose entries lack
+    /// the epoch fields and whose `redoDestroyed` bit is set (a legacy record
+    /// with a destroy mid-history — the undo → … → send durable shapes the
+    /// reviewed base wrote) loads through the sink ALREADY migrated in memory:
+    /// every legacy entry frozen, `current_epoch` bumped beyond (the frozen
+    /// boundary is `entries.len()`), the destroyed bit honored as-is. The disk
+    /// row is NEVER lazily rewritten — only the next op's write persists the
+    /// migrated shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_destroyed_epochless_record_loads_migrated_and_the_row_stays_lazy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        // The exact bytes a pre-F8 server wrote (no epoch fields anywhere).
+        let legacy_payload = serde_json::json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            "redoDestroyed": true,
+            "canRedo": false,
+            "entries": [
+                { "removedTurns": [{ "id": "t1", "turnId": "t1", "role": "user" }], "promptText": "p1", "atMs": 40 },
+                { "removedTurns": [{ "id": "t2", "turnId": "t2", "role": "user" }], "promptText": "p2", "atMs": 50 },
+            ],
+        });
+        ledger
+            .record_rollback_row("codex", "thr-legacy", &legacy_payload, 70)
+            .expect("row write ok");
+
+        let loaded = sink
+            .load_rollback("codex", "thr-legacy")
+            .expect("the row parses at the current version");
+        assert!(loaded.redo_destroyed, "the destroyed bit is honored as-is");
+        assert!(
+            loaded
+                .entries
+                .iter()
+                .all(|e| e.epoch < loaded.current_epoch),
+            "every legacy entry FROZEN — frozen markers must never regain \
+             'Redo to here' from the epoch-0 alias: {loaded:?}"
+        );
+        assert!(
+            loaded.current_epoch > 0,
+            "the counter bumped beyond the frozen prefix: {loaded:?}"
+        );
+
+        // Never lazily rewritten: the STORED row stays byte-shape legacy.
+        let stored = ledger
+            .load_rollback_row("codex", "thr-legacy")
+            .expect("row still stored");
+        assert_eq!(stored, legacy_payload, "no lazy rewrite on load");
+        assert!(stored.get("currentEpoch").is_none());
+        assert!(
+            stored["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .all(|e| e.get("epoch").is_none()),
+            "the on-disk row keeps its epoch-free legacy shape until an op writes"
+        );
+
+        // The next op's write persists the migrated shape (handler discipline:
+        // record the record the handler ACTUALLY evolved).
+        let mut next = loaded.clone();
+        next.redo_destroyed = false;
+        next.begin_new_epoch();
+        sink.record_rollback("codex", "thr-legacy", next)
+            .await
+            .expect("op write ok");
+        let stored = ledger
+            .load_rollback_row("codex", "thr-legacy")
+            .expect("row still stored");
+        assert!(
+            stored.get("currentEpoch").is_some()
+                && stored["entries"]
+                    .as_array()
+                    .expect("entries")
+                    .iter()
+                    .all(|e| e.get("epoch").is_some()),
+            "the next op's write persists the epoch-stamped shape"
         );
     }
 

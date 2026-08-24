@@ -249,6 +249,22 @@ struct ClaudeSession {
     /// kill+respawn into the replacing record (the fork continues the same logical
     /// session lifetime).
     in_turn: Arc<std::sync::atomic::AtomicBool>,
+    /// Focused-review ep1-r1 F1: the QUEUED-compact tracker, delta-distinct from
+    /// `in_turn`. A `/compact` written to the sidecar WHILE a turn is active
+    /// queues BEHIND it (`in_turn` already reads true, so the compact arms
+    /// nothing there); only the compact's OWN terminal edge may end the busy
+    /// truth — while this bit reads set, an in-stream terminal edge is the
+    /// PRIOR turn's and `in_turn` REMAINS true (the rollback gate reads
+    /// `in_turn || compact_pending`). Armed by `handle_compact` ONLY on an
+    /// ACCEPTED sidecar write (never on a no-write failure, never from idle —
+    /// an idle-armed compact IS the turn and `in_turn` alone covers it).
+    /// Disarmed by ANY of the four terminal edges (the swap CONSUMES the bit
+    /// in lieu of clearing `in_turn`), by any in-stream `sdk.error` frame (the
+    /// queued compact provably never arrives as its own turn), and by the NEXT
+    /// freshCode-side send's set edge (the belt: the queue provably drained
+    /// without the compact firing). Carried across the rollback's kill+respawn
+    /// exactly like `in_turn`.
+    compact_pending: Arc<std::sync::atomic::AtomicBool>,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
@@ -550,6 +566,7 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let compact_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -559,6 +576,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&in_turn),
+            Arc::clone(&compact_pending),
             None,
         );
 
@@ -585,6 +603,7 @@ impl FreshClaudeState {
                 broadcast_id,
                 pending,
                 in_turn,
+                compact_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -787,9 +806,14 @@ impl FreshClaudeState {
             // kata 1wxv Task 4 busy-truth clear edge (d): a COMPLETED interrupt
             // clears `in_turn` — interrupts yield NO `result` frame at all, so no
             // in-stream edge can cover this. A FAILED write does NOT clear (the
-            // turn may still be running — fail-closed).
+            // turn may still be running — fail-closed). Focused ep1-r1 F1: the
+            // interrupt also disarms a queued compact (an interrupted turn can
+            // never yield the compact's own terminal edge).
             session
                 .in_turn
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            session
+                .compact_pending
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         // Success: no broadcast (mirrors legacy's silent fire-and-forget interrupt).
@@ -821,13 +845,18 @@ impl FreshClaudeState {
         // membership. A miss persisting after the rollback exits means the session
         // is genuinely gone (a provably-rejected fork is torn down) — the honest
         // SESSION_NOT_FOUND leg.
-        let (map_key, turn_lock, in_turn) = loop {
+        let (map_key, turn_lock, in_turn, compact_pending) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
-                    guard
-                        .get(&key)
-                        .map(|s| (key, s.turn_lock.clone(), s.in_turn.clone()))
+                    guard.get(&key).map(|s| {
+                        (
+                            key,
+                            s.turn_lock.clone(),
+                            s.in_turn.clone(),
+                            s.compact_pending.clone(),
+                        )
+                    })
                 }
                 None => None,
             };
@@ -889,8 +918,13 @@ impl FreshClaudeState {
                 tracing::warn!(error = %err, session = %durable, "freshagent.claude.destroy_redo_on_submit_failed");
             }
         }
-        // Set the busy truth UNDER the lock, BEFORE the sidecar write.
+        // Set the busy truth UNDER the lock, BEFORE the sidecar write. Focused
+        // ep1-r1 F1 (belt): a freshCode-side user turn's SET edge proves any
+        // queued compact drained without firing (the provider moved past the
+        // compact's queue slot) — disarm a stale `compact_pending` so it can
+        // never wedge the rollback gate.
         in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+        compact_pending.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
@@ -1099,6 +1133,15 @@ impl FreshClaudeState {
     /// the SDK's `sdk.result` frame (any subtype) — the existing four-edge clear
     /// set terminates it (plus `sdk.status:idle`, sidecar EOF, or a completed
     /// interrupt); a FAILED write clears what we set (nothing was submitted).
+    ///
+    /// Focused-review ep1-r1 F1 (queued-compact busy truth): a compact submitted
+    /// WHILE a turn is active queues BEHIND it on the provider — `in_turn`
+    /// already reads true, so on an ACCEPTED write the handler arms the session's
+    /// [`ClaudeSession::compact_pending`] bit, and an in-stream terminal edge
+    /// (the PRIOR turn's) then CONSUMES the bit instead of clearing `in_turn`:
+    /// the pane stays busy until the compact's own terminal edge lands. A
+    /// no-write failure NEVER arms (and clears `in_turn` only when this compact
+    /// transitioned it — a prior turn's busy truth survives our failed no-op).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
@@ -1109,13 +1152,18 @@ impl FreshClaudeState {
         // membership and re-resolve (the compact then serializes BEHIND the rollback
         // on the carried-over turn lock). This handler never ACQUIRES
         // `rollback_in_flight` (no circular wait exists): it only polls membership.
-        let (map_key, turn_lock, in_turn) = loop {
+        let (map_key, turn_lock, in_turn, compact_pending) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
-                    guard
-                        .get(&key)
-                        .map(|s| (key, s.turn_lock.clone(), s.in_turn.clone()))
+                    guard.get(&key).map(|s| {
+                        (
+                            key,
+                            s.turn_lock.clone(),
+                            s.in_turn.clone(),
+                            s.compact_pending.clone(),
+                        )
+                    })
                 }
                 None => None,
             };
@@ -1132,14 +1180,19 @@ impl FreshClaudeState {
         // serialization discipline) — a rollback holding this lock observes either
         // no-compact or a fully-marked in-flight compact turn.
         let _turn = turn_lock.lock().await;
-        // Set the busy truth UNDER the lock, BEFORE the sidecar write.
-        in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Set the busy truth UNDER the lock, BEFORE the sidecar write. `was_busy`
+        // distinguishes the QUEUED compact (a turn already active) from a compact
+        // that IS the turn — only the former arms `compact_pending`, and only on
+        // an accepted write.
+        let was_busy = in_turn.swap(true, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
-            // Nothing was submitted — clear what we set (the busy truth must
-            // never wedge).
-            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Nothing was submitted — clear ONLY what we set (the busy truth must
+            // never wedge; a prior turn's truth is not ours to clear).
+            if !was_busy {
+                in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             self.broadcast(&lost_session_frame(&session_id, msg.session_type));
             return;
         };
@@ -1155,10 +1208,21 @@ impl FreshClaudeState {
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
-            // The write never went out — no turn is running (clear what we set,
-            // else the busy truth wedges; the handle_send fail-closed leg).
-            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            // The write never went out — no turn was submitted (clear what we set,
+            // else the busy truth wedges; the handle_send fail-closed leg). NEVER
+            // arm the pending bit on a no-write failure.
+            if !was_busy {
+                in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
+            return;
+        }
+        // The compact write was ACCEPTED. If a turn was already active this compact
+        // is QUEUED behind it: arm the tracker so the prior turn's terminal edge
+        // cannot clear the busy truth out from under the queued compact — only the
+        // compact's own terminal edge (or an explicit disarm) ends it.
+        if was_busy {
+            compact_pending.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1344,8 +1408,10 @@ impl FreshClaudeState {
     ///
     /// Ordering (durable-BEFORE-mutation + r2 lock discipline): toTurn validation
     /// → rollback_in_flight single-flight (FIRST) → per-session turn lock (held
-    /// across the WHOLE handler) → busy gate (`in_turn` ⇒ BUSY_TURN, the SOLE
-    /// mid-turn protection — no sidecar traffic at all on a refused attempt) →
+    /// across the WHOLE handler) → busy gate (`in_turn || compact_pending` ⇒
+    /// BUSY_TURN, the SOLE mid-turn protection — no sidecar traffic at all on a
+    /// refused attempt; `compact_pending` is the queued-compact tracker, focused
+    /// ep1-r1 F1) →
     /// create-resume lease claim on the OLD durable id (so a concurrent attach
     /// cannot bind the pre-rollback id mid-fork) → transcript reads + resume math
     /// → AWAITED record pre-write (a pre-write failure REFUSES with
@@ -1383,12 +1449,13 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (durable_id, in_turn, turn_lock, session_type) = {
+        let (durable_id, in_turn, compact_pending, turn_lock, session_type) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
                     s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
                     s.in_turn.clone(),
+                    s.compact_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
                 ),
@@ -1416,9 +1483,15 @@ impl FreshClaudeState {
         };
         // Held for the REST of this handler. in_turn is set by handle_send UNDER
         // this same lock BEFORE the sidecar write (the check-then-set window is
-        // closed): observed false here means no send is in flight.
+        // closed): observed false here means no send is in flight. Focused ep1-r1
+        // F1: the gate reads `in_turn || compact_pending` — a queued compact
+        // (armed on an accepted write while a turn was active) keeps the pane
+        // busy until the compact's OWN terminal edge, even though the prior
+        // turn's terminal edge already fired.
         let _turn = turn_lock.lock().await;
-        if in_turn.load(std::sync::atomic::Ordering::SeqCst) {
+        if in_turn.load(std::sync::atomic::Ordering::SeqCst)
+            || compact_pending.load(std::sync::atomic::Ordering::SeqCst)
+        {
             reply_sink(rollback_error_frame(
                 &op,
                 "BUSY_TURN",
@@ -1964,6 +2037,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             in_turn.clone(),
+            compact_pending.clone(),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
                 preseeded_init,
@@ -1982,6 +2056,7 @@ impl FreshClaudeState {
                 broadcast_id: Arc::clone(&broadcast_id),
                 pending,
                 in_turn: in_turn.clone(),
+                compact_pending: compact_pending.clone(),
                 turn_lock: turn_lock.clone(),
             },
         );
@@ -2377,6 +2452,7 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let compact_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -2386,6 +2462,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&in_turn),
+            Arc::clone(&compact_pending),
             None,
         );
         self.sessions.lock().await.insert(
@@ -2400,6 +2477,7 @@ impl FreshClaudeState {
                 broadcast_id,
                 pending,
                 in_turn,
+                compact_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -2542,6 +2620,14 @@ impl FreshClaudeState {
         // EXACTLY-four contract edges (`sdk.result` any subtype, `sdk.status`
         // idle, EOF/death below, completed handle_interrupt at the write site).
         in_turn: Arc<std::sync::atomic::AtomicBool>,
+        // Focused-review ep1-r1 F1: the session's queued-compact tracker. An
+        // armed bit CONVERTS the next in-stream terminal edge (`sdk.result` /
+        // `sdk.status:idle`) into the PRIOR turn's — the busy truth REMAINS
+        // (the queued compact is still coming; only the compact's OWN terminal
+        // edge, a sidecar EOF, or a completed interrupt ends it). Any
+        // `sdk.error` frame disarms the bit outright (the queued compact
+        // provably never arrives as its own turn); EOF clears both.
+        compact_pending: Arc<std::sync::atomic::AtomicBool>,
         // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
         // handler PREREAD the sdk.session.init line, so the consumer runs the
         // adoption for it FIRST (supersedes-aware), then resolves the parked
@@ -2598,14 +2684,27 @@ impl FreshClaudeState {
                 // success-only wording is void), and `sdk.status:idle`. NO other
                 // in-stream edge (sdk.error/compacting/assistant never clear —
                 // fail-closed; a missing arm wedges BUSY_TURN refusals forever).
+                // Focused ep1-r1 F1: an ARMED `compact_pending` converts a
+                // terminal edge into the PRIOR turn's — the swap CONSUMES the bit
+                // and `in_turn` REMAINS set (the queued compact is still coming;
+                // its own terminal edge ends the busy truth). Any `sdk.error`
+                // frame disarms the bit outright (the queued compact provably
+                // never arrives) while leaving `in_turn` fail-closed untouched.
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.result") => {
-                        in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if !compact_pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
                     {
-                        in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if !compact_pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Some("sdk.error") => {
+                        compact_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -2640,8 +2739,10 @@ impl FreshClaudeState {
             }
             // kata 1wxv Task 4 busy-truth clear edge (c): sidecar EOF/death clears
             // the busy truth BEFORE the eviction verdict below (an unrequested
-            // death can never hold a rollback BUSY_TURN hostage).
+            // death can never hold a rollback BUSY_TURN hostage). Focused ep1-r1
+            // F1: the dead sidecar's queued compact dies with it — disarm.
             in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            compact_pending.store(false, std::sync::atomic::Ordering::SeqCst);
             // Consumer exit == this sidecar's stdout closed == sidecar death
             // (ledger A9). Evict the dead session and its cli_index entries,
             // identity-guarded: a newer session re-registered under the same
@@ -3445,6 +3546,7 @@ pub(crate) mod tests {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                compact_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -4577,6 +4679,7 @@ rl.on('line', (line) => {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                compact_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -5013,6 +5116,7 @@ rl.on('line', (line) => {
             None,
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         );
@@ -5752,6 +5856,7 @@ rl.on('line', (line) => {
                 broadcast_id: Arc::new(std::sync::Mutex::new(map_key.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                compact_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -5815,6 +5920,54 @@ rl.on('line', (line) => {
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,
             cwd: None,
+        }
+    }
+
+    /// Focused ep1-r1 F1 test rig: write a `send` frame to the session's
+    /// sidecar stdin DIRECTLY (bypassing `handle_send`) — the fake sidecar's
+    /// magic texts then emit their canned sdk.* frame IN-STREAM with NO
+    /// freshCode-side set edge, emulating the provider's asynchronous
+    /// turn-terminal frames (the busy flag was set when the turn was
+    /// SUBMITTED, not when its result arrives).
+    async fn inject_raw_send(st: &FreshClaudeState, map_key: &str, text: &str) {
+        let mut guard = st.sessions.lock().await;
+        let session = guard.get_mut(map_key).expect("tracked session");
+        let frame =
+            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
+        write_line(&mut session.stdin, &frame)
+            .await
+            .expect("raw stdin write");
+    }
+
+    /// Drain bus frames until the session's `freshAgent.status` carries
+    /// `status` — used post-create so the fake's CREATE-TIME `sdk.status:idle`
+    /// (printed with the `created` answer) provably folds BEFORE the test's
+    /// first turn sets the busy truth: otherwise that stale idle can land
+    /// mid-test and spoof a clear edge.
+    async fn await_status_frame(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        session_id: &str,
+        status: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            while let Ok(raw) = rx.try_recv() {
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                if v["type"] == "freshAgent.event"
+                    && v["sessionId"] == session_id
+                    && v["event"]["type"] == "freshAgent.status"
+                    && v["event"]["status"] == status
+                {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no freshAgent.status:{status} frame for {session_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -6014,6 +6167,150 @@ rl.on('line', (line) => {
         assert_eq!(
             frames2[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the busy gate reopened once the compact turn's sdk.result landed: {frames2:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep1-r1 F1 — the review's queued-/compact repro: with a
+    /// turn ACTIVE, the accepted `/compact` write arms the session's
+    /// `compact_pending` bit (the busy truth already reads `true`, so the
+    /// compact alone cannot be the bit's terminal-edge attribution). The PRIOR
+    /// turn's `sdk.result` then fires IN-STREAM — and the rollback busy gate
+    /// must STILL refuse BUSY_TURN: the queued compact is still coming, so the
+    /// pane stays busy until the compact's OWN terminal edge lands. Zero
+    /// teardown traffic on the refused attempt; the gate reopens only for the
+    /// compact's own result.
+    #[tokio::test]
+    async fn queued_compact_keeps_the_busy_gate_closed_through_the_prior_turns_result() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qcompact")).await;
+        let created = await_claude_created(&mut rx, "req-qcompact").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        // Fold the create-time idle BEFORE any turn starts (no stale clear edge).
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        // Turn A starts (busy); the compact queues BEHIND it.
+        st.handle_send(send_msg(&session_id, "turn one")).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "turn A marks the busy truth"
+        );
+        st.handle_compact(compact_msg(&session_id, None)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "the queued compact keeps the busy truth set"
+        );
+
+        // The PRIOR turn's terminal edge arrives in-stream (no freshCode-side
+        // set edge — A's flag was set at submission).
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        // Let the consumer fold the edge.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Mid-queued-compact: STILL refused — BUSY_TURN, zero teardown traffic.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qcompact-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"], "BUSY_TURN",
+            "the queued compact survives the PRIOR turn's result — the busy gate stays closed (F1): {frames:?}"
+        );
+        assert_eq!(frames[0]["event"]["message"], ROLLBACK_BUSY_MESSAGE);
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "only the original create spawned — the refused rollback produced zero teardown/spawn traffic"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key(&session_id),
+            "no teardown"
+        );
+
+        // The compact's OWN terminal edge ends the compact turn — the gate reopens.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qcompact-2", RollbackDirection::Undo),
+            sink2,
+        )
+        .await;
+        let frames2 = captured_json(&captured2);
+        assert_eq!(
+            frames2[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the busy gate reopened once the compact's OWN result landed: {frames2:?}"
+        );
+        drop(env);
+    }
+
+    /// F1 disarm breadth: an in-stream `sdk.error` frame disarms the pending
+    /// compact (the provider errored — the queued compact will provably never
+    /// arrive as its own turn), and the NEXT freshCode-side user send's SET
+    /// edge disarms it too (the belt: the queue provably drained without the
+    /// compact firing). In both cases the very next terminal edge ends the
+    /// busy truth — `sdk.error` itself never clears `in_turn` (fail-closed).
+    #[tokio::test]
+    async fn queued_compact_pending_disarms_on_sdk_error_and_on_the_next_freshcode_send() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qdisarm")).await;
+        let created = await_claude_created(&mut rx, "req-qdisarm").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        // Fold the create-time idle BEFORE any turn starts (no stale clear edge).
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        // (a) sdk.error disarm: queued compact → sdk.error in-stream → the
+        // NEXT terminal edge ends the busy truth.
+        st.handle_send(send_msg(&session_id, "turn one")).await;
+        assert!(in_turn_of(&st, &session_id).await);
+        st.handle_compact(compact_msg(&session_id, None)).await;
+        inject_raw_send(&st, &session_id, "__emit_error__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "sdk.error is NOT itself an in_turn clear edge (fail-closed)"
+        );
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qdisarm-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the sdk.error disarmed the pending compact — the next terminal edge reopened the gate"
+        );
+
+        // (b) the belt: queued compact → a freshCode-side send's SET edge
+        // disarms the pending bit (the queue provably drained without the
+        // compact firing) → the next terminal edge ends the busy truth.
+        st.handle_send(send_msg(&session_id, "turn two")).await;
+        assert!(in_turn_of(&st, &session_id).await);
+        st.handle_compact(compact_msg(&session_id, None)).await;
+        st.handle_send(send_msg(&session_id, "turn three")).await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qdisarm-2", RollbackDirection::Undo),
+            sink2,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured2)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the next send's set edge disarmed the pending compact — the next terminal edge reopened the gate"
         );
         drop(env);
     }
