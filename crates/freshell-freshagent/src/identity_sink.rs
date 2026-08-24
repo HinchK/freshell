@@ -63,7 +63,10 @@ pub trait PaneIdentitySink: Send + Sync {
     /// kata 1wxv decision 10's durable record: the post-op rollback record,
     /// computed from pre-mutation reads and AWAITED BEFORE the provider
     /// mutation runs (durable-BEFORE-mutation). Same awaited-write
-    /// discipline as `record_binding`.
+    /// discipline as `record_binding`. Delta-r1 F4: a DISABLED ledger answers
+    /// `Err` here (never a false durable `Ok`), which the provider lanes map
+    /// to the rollback refusal — the rollback never mutates provider history on
+    /// this leg.
     fn record_rollback(
         &self,
         provider: &str,
@@ -292,6 +295,7 @@ mod tests {
                 removed_turns: vec![serde_json::json!({"id": "t1"})],
                 prompt_text: "p1".into(),
                 at_ms: 11,
+                epoch: 0,
             },
             12,
         );

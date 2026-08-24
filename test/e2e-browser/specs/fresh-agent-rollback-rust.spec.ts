@@ -635,7 +635,13 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(reverted).toHaveLength(1)
       expect(reverted[0].messageID).toMatch(/^msg/)
       const undone = await snap()
-      expect(undone.rollback).toEqual({ canRedo: true, undoneDepth: 1 })
+      // Delta-r1 F6: the rollback block carries the server-authored per-marker redo
+      // gate — exactly the current-epoch marker's user id.
+      const undoneUserMarkerIds = (undone.rolledBackTurns ?? [])
+        .filter((t: any) => t.role === 'user')
+        .map((t: any) => t.turnId)
+      expect(undone.rollback).toEqual({ canRedo: true, undoneDepth: 1, redoableTurnIds: undoneUserMarkerIds })
+      expect(undoneUserMarkerIds).toHaveLength(1)
       expect(undone.rolledBackTurns).toHaveLength(2) // msg_u2 + msg_a2
       expect(undone.rolledBackTurns.every((t: any) => t.rolledBack === true)).toBe(true)
       // The client snapshot caught up: the marker section renders.
@@ -683,6 +689,61 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       expect((await snap())?.rollback?.canRedo).toBe(false)
       expect(((await snap())?.rolledBackTurns ?? []).length).toBeGreaterThan(0)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('opencode: multi-epoch markers — frozen prior-epoch rows lose "Redo to here" while the current epoch keeps it (delta-r1 F6)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootOpencodeLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendOpencodeTurn(page, lane.harness, lane.tabId, 'prompt one', 1, lane.auditLogPath)
+      await sendOpencodeTurn(page, lane.harness, lane.tabId, 'prompt two', 2, lane.auditLogPath)
+      const sessionId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'prompt three', 3, lane.auditLogPath)
+      const snap = (): Promise<any | null> => fetchSnapshot(lane.info, 'freshopencode', 'opencode', sessionId)
+      expect(userRows(await snap())).toBe(3)
+      await waitForRollbackCapability(page)
+
+      // Epoch 0: /undo removes the prompt-three step — the marker IS redoable.
+      await typeSlash(page, '/undo')
+      await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(2)
+      const epoch0 = await snap()
+      expect(epoch0.rollback.canRedo).toBe(true)
+      expect(epoch0.rollback.redoableTurnIds).toHaveLength(1)
+      const epoch0MarkerId = epoch0.rollback.redoableTurnIds[0]
+      const section = () => page.getByRole('region', { name: 'Rolled back turns' })
+      await expect(section().getByRole('button', { name: 'Redo to here' })).toHaveCount(1, { timeout: 15_000 })
+
+      // A new submission destroys redo AND (natively, in the fake) deletes the
+      // epoch-0 tail — epoch 0's markers are now frozen forever.
+      await sendComposerText(page, 'prompt three edited')
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await expect.poll(async () => (await snap())?.rollback?.canRedo, { timeout: 15_000 }).toBe(false)
+
+      // Epoch 1: /undo removes the RESENT step only — the bucket's union is the
+      // frozen epoch-0 pair ++ the new epoch's pair, in conversation order.
+      await typeSlash(page, '/undo')
+      await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(2)
+      const epoch1 = await snap()
+      expect(epoch1.rollback.canRedo).toBe(true)
+      expect(epoch1.rollback.undoneDepth).toBe(2)
+      // The server-authored gate: exactly the CURRENT epoch's user marker id.
+      expect(epoch1.rollback.redoableTurnIds).toHaveLength(1)
+      const epoch1MarkerId = epoch1.rollback.redoableTurnIds[0]
+      expect(epoch1MarkerId).not.toBe(epoch0MarkerId)
+      const bucketIds = (epoch1.rolledBackTurns ?? []).map((t: any) => t.turnId)
+      expect(bucketIds.indexOf(epoch0MarkerId)).toBeGreaterThanOrEqual(0)
+      expect(bucketIds.indexOf(epoch1MarkerId)).toBeGreaterThan(bucketIds.indexOf(epoch0MarkerId))
+
+      // UI: the frozen marker row offers NO affordance; the current-epoch one does.
+      const frozenRow = section().locator('div.flex.items-start', { has: page.getByText('prompt three', { exact: true }) })
+      const currentRow = section().locator('div.flex.items-start', { has: page.getByText('prompt three edited', { exact: true }) })
+      await expect(currentRow.getByRole('button', { name: 'Redo to here' })).toHaveCount(1, { timeout: 15_000 })
+      await expect(frozenRow.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+      await expect(section().getByRole('button', { name: 'Redo to here' })).toHaveCount(1)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -954,7 +1015,11 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         // REST (another client's truth) reads identically to the driving pane.
         await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(1)
         const viaRest = await snap()
-        expect(viaRest.rollback).toEqual({ canRedo: true, undoneDepth: 1 })
+        const restUserMarkerIds = ((viaRest.rolledBackTurns ?? []) as any[])
+          .filter((t) => t.role === 'user')
+          .map((t) => t.turnId)
+        expect(viaRest.rollback).toEqual({ canRedo: true, undoneDepth: 1, redoableTurnIds: restUserMarkerIds })
+        expect(restUserMarkerIds).toHaveLength(1)
         expect(viaRest.rolledBackTurns).toHaveLength(2)
       } finally {
         sibling.close()
@@ -971,7 +1036,10 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await expect(page.getByText(/Rolled back \(1\)/)).toBeVisible({ timeout: 15_000 })
       const afterReload = await snap()
       expect(userRows(afterReload)).toBe(1)
-      expect(afterReload.rollback).toEqual({ canRedo: true, undoneDepth: 1 })
+      const reloadedUserMarkerIds = ((afterReload.rolledBackTurns ?? []) as any[])
+        .filter((t) => t.role === 'user')
+        .map((t) => t.turnId)
+      expect(afterReload.rollback).toEqual({ canRedo: true, undoneDepth: 1, redoableTurnIds: reloadedUserMarkerIds })
       expect(afterReload.rolledBackTurns).toHaveLength(2)
     } finally {
       await lane.server.stop().catch(() => {})

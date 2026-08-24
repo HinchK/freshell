@@ -1962,6 +1962,7 @@ mod tests {
                 removed_turns,
                 prompt_text: "prompt two".into(),
                 at_ms: 90,
+                epoch: 0,
             },
             100,
         );
@@ -2018,7 +2019,7 @@ mod tests {
         assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 }),
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] }),
             "undoneDepth is the USER-role step count of the bucket"
         );
         assert_eq!(
@@ -2045,7 +2046,7 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": false, "undoneDepth": 1 }),
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
             "the chain-root tip is re-READ at snapshot time — no device shows a redo Task 4 would refuse"
         );
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
@@ -2066,7 +2067,7 @@ mod tests {
         assert_eq!(ids, vec!["u1", "a1", "u2", "a2"]);
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 2 }),
+            json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["u1", "u2"] }),
             "live tip none ⇒ the recorded original tip counts as strictly beyond (two user steps in the bucket)"
         );
         assert!(snap["turns"].as_array().expect("turns").is_empty());
@@ -2084,12 +2085,17 @@ mod tests {
             json!({ "id": "o2", "turnId": "o2", "ordinal": 1, "source": "durable", "role": "assistant", "summary": "old answer", "items": [{ "id": "o2-i0", "kind": "text", "text": "old answer" }] }),
         ];
         let mut record = claude_rollback_record(&orig, removed_slice_for(&["u2", "a2"]));
+        // F8 layout for a two-epoch record: the current-epoch entry carries the
+        // bumped counter; the frozen prefix keeps its older epoch.
+        record.current_epoch = 1;
+        record.entries[0].epoch = 1;
         record.entries.insert(
             0,
             RollbackEntry {
                 removed_turns: prior_epoch,
                 prompt_text: "old prompt".into(),
                 at_ms: 40,
+                epoch: 0,
             },
         );
         let snap =
@@ -2105,8 +2111,9 @@ mod tests {
         assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 2 }),
-            "undoneDepth counts USER turns across the whole union (o1, u2)"
+            json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["u2"] }),
+            "undoneDepth counts USER turns across the whole union (o1, u2); F6: the frozen \
+             prior-epoch user marker (o1) is NOT redoable — only the current epoch's tail is"
         );
     }
 
@@ -2122,7 +2129,7 @@ mod tests {
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": false, "undoneDepth": 1 })
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] })
         );
         assert_eq!(
             snap["revision"],
@@ -2146,7 +2153,7 @@ mod tests {
         assert_eq!(snap["capabilities"]["redo"], json!(true));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 })
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] })
         );
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
     }
@@ -2181,7 +2188,7 @@ mod tests {
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 })
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] })
         );
     }
 }

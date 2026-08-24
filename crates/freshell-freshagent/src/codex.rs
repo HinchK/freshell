@@ -211,6 +211,17 @@ struct CodexSession {
     /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
     /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
+    /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
+    /// `turn/started` — a posting window exists where `active_turn` is still
+    /// notification-driven NONE while the compact turn is already running
+    /// provider-side. `handle_compact` SETS this under the session `turn_lock`
+    /// (the handle_send busy-truth discipline) and the notification consumer
+    /// CLEARS it at the compact turn's `turn/completed` (any status — a failed
+    /// compact ends the turn too). `handle_rollback`'s busy gate reads
+    /// `active_turn.is_some() || compact_in_flight` so a post-RPC/pre-turn-started
+    /// rollback can never force-interrupt the compact.
+    compact_in_flight: Arc<AtomicBool>,
     /// Kata 1wxv Task 2 (LBC-1, r3): the thread's DURABLE history mode.
     /// `Some(Paginated)` for threads freshell STARTED (we SET
     /// `historyMode:"paginated"` on `thread/start`); resumed/adopted/forked
@@ -939,11 +950,13 @@ impl FreshCodexState {
         // cannot possibly observe an event that fired before it existed). The unbounded
         // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
         // only its delivery to the consumer is deferred.
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             thread_id.clone(),
             active_turn.clone(),
+            compact_in_flight.clone(),
             Some(created_rx),
         );
 
@@ -972,6 +985,7 @@ impl FreshCodexState {
                 sandbox: sandbox.clone(),
                 permission_mode: permission_mode.clone(),
                 active_turn,
+                compact_in_flight,
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
@@ -1359,9 +1373,12 @@ impl FreshCodexState {
     /// `thread/revert` can never land inside the compact RPC's check-then-set
     /// window (the provider revert would force-interrupt a compact turn the
     /// busy gate never saw). `thread/compact/start`'s `Record<string, never>`
-    /// answer carries no turn id, so compact's busy TRUTH is still
-    /// notification-written (`turn/started` → [`reduce_notification`]); what
-    /// the lock closes is the RPC-in-flight window against rollback/send. The
+    /// answer carries no turn id, and the probed 0.147.0 order returns the RPC
+    /// BEFORE `turn/started` — so compact's busy TRUTH pairs the notification-
+    /// written `active_turn` with the explicit `compact_in_flight` bit SET under
+    /// the turn lock below and cleared at the compact turn's `turn/completed`
+    /// ([`reduce_notification`]) — delta-r1 F2; the rollback busy gate reads
+    /// both. The
     /// active-turn refusal remains, and the app-server's rejection stays the
     /// backstop for a rapid second Compact click (surfaced as
     /// `CODEX_COMPACT_FAILED`). Every failure path is LOUD
@@ -1419,11 +1436,16 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone(), s.turn_lock.clone()))
+            guard.get(&session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                )
+            })
         };
-        let Some((client, active_turn, turn_lock)) = looked_up else {
+        let Some((client, active_turn, turn_lock, compact_in_flight)) = looked_up else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
             // lost-session leg, never silence.
             self.broadcast(&lost_session_frame(&session_id));
@@ -1451,7 +1473,16 @@ impl FreshCodexState {
             return;
         }
 
+        // Delta-r1 F2: mark the compact-window busy truth UNDER the turn lock,
+        // BEFORE the RPC — the `thread/compact/start` answer arrives BEFORE any
+        // `turn/started` notification (the probed 0.147.0 order), and
+        // `active_turn` alone leaves that post-RPC window uncovered. The bit
+        // clears when the compact turn's `turn/completed` (any status) flows
+        // through `reduce_notification`; a FAILED RPC means no compact turn ever
+        // starts — clear what we set (fail-closed, never wedges the busy gate).
+        compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
+            compact_in_flight.store(false, Ordering::SeqCst);
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
     }
@@ -1572,10 +1603,15 @@ impl FreshCodexState {
             return;
         };
 
-        let (client, active_turn, turn_lock) = {
+        let (client, active_turn, turn_lock, compact_in_flight) = {
             let guard = self.sessions.lock().await;
             match guard.get(&thread_id) {
-                Some(s) => (s.client.clone(), s.active_turn.clone(), s.turn_lock.clone()),
+                Some(s) => (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                ),
                 None => {
                     // TOCTOU: a kill can land between ensure-alive and this lookup.
                     reply_sink(rollback_error_frame(
@@ -1592,7 +1628,13 @@ impl FreshCodexState {
         // check-then-set window is closed): observed idle here means no send is
         // in flight, and no send can start until this handler releases.
         let _turn = turn_lock.lock().await;
-        if active_turn.lock().expect("active_turn mutex").is_some() {
+        // Delta-r1 F2: the busy gate ALSO reads the compact-window truth — a
+        // `thread/compact/start` whose RPC answered but whose turn/started
+        // notification has not surfaced is mid-turn provider-side; a rollback
+        // here would force-interrupt the compact.
+        if active_turn.lock().expect("active_turn mutex").is_some()
+            || compact_in_flight.load(Ordering::SeqCst)
+        {
             // Zero RPCs leave this handler on the refused path — the busy gate
             // is the SOLE mid-turn protection (the provider revert would
             // force-interrupt).
@@ -1683,55 +1725,37 @@ impl FreshCodexState {
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, &thread_id));
         // The epoch state AT LOAD (before the bit clears) selects the marker
-        // splice point below.
+        // splice semantics below.
         let starts_new_epoch = previous.as_ref().map(|p| p.redo_destroyed).unwrap_or(false);
         let mut record = match previous.clone() {
-            Some(mut p) => {
-                // Epoch rule (r3): an undo landing while redo_destroyed is set
-                // starts a NEW epoch — ONLY the redo-capable chain state resets
-                // (the bit clears so the redo fields describe the new chain);
-                // `entries` is NEVER cleared (the union accumulates).
-                if p.redo_destroyed {
-                    p.redo_destroyed = false;
-                }
-                p
-            }
+            Some(p) => p,
             None => RollbackRecord::empty(now),
         };
-        // Review Minor-3: the marker bucket is CONVERSATION order on every
-        // lane (the plan :165 union rule wins over the :166 codex append
-        // bullet). Within the CURRENT epoch a new undo removes an
-        // EARLIER-in-conversation turn, so the new entry is spliced BEFORE the
-        // existing same-epoch entries (sequential undos read t1..tn
-        // ascending — the opencode rebuild / claude splice shape). The
-        // frozen/current split point:
-        // - a NEW epoch (redo_destroyed was set at load) freezes EVERY prior
-        //   entry — append behind them;
-        // - otherwise the split is unambiguous ONLY when every prior entry is
-        //   provably current-epoch: this lane keeps the current-epoch suffix
-        //   in strictly DESCENDING at_ms (each splice puts the newest op
-        //   ahead) and any intervening submission would have set
-        //   redo_destroyed — so a strictly-descending prior list is exactly an
-        //   all-current-epoch list and the new entry goes first;
-        // - any at_ms rise/tie (a stacked frozen+current stack whose boundary
-        //   is no longer recorded, or a legacy append-ordered record) means NO
-        //   unambiguous split — APPEND, never reorder past an unknown
-        //   boundary.
-        // The revision floor is restamped by the set_can_redo below.
-        let insert_at = if starts_new_epoch {
-            record.entries.len()
-        } else if record.entries.windows(2).all(|w| w[0].at_ms > w[1].at_ms) {
-            0
-        } else {
-            record.entries.len()
-        };
-        record.entries.insert(
-            insert_at,
+        // Review Minor-3 + delta-r1 F8: the marker bucket is CONVERSATION order
+        // on every lane (the plan :165 union rule wins over the :166 codex
+        // append bullet), ordered by LITERAL epoch bookkeeping — positions never
+        // read timestamps:
+        // - a NEW epoch (redo_destroyed was set at load) bumps `current_epoch`
+        //   FIRST — every existing entry freezes with its own epoch value —
+        //   then the new entry lands behind them;
+        // - otherwise (same epoch) the new entry splices BEFORE the existing
+        //   same-epoch entries (each undo removes an EARLIER-in-conversation
+        //   step, so the current-epoch block reads t1..tn ascending).
+        // Only the redo-capable chain state resets across the boundary —
+        // `entries` is NEVER cleared (the r3 union accumulates); the revision
+        // floor is restamped by the set_can_redo below.
+        if starts_new_epoch {
+            record.redo_destroyed = false;
+            record.begin_new_epoch();
+        }
+        record.splice_undo_entry(
             RollbackEntry {
                 removed_turns: removed,
                 prompt_text: prompt.clone(),
                 at_ms: now,
+                epoch: record.current_epoch,
             },
+            now,
         );
         record.set_can_redo(false, now); // codex is undo-only (decision 5)
         if let Some(sink) = self.identity_sink() {
@@ -2693,8 +2717,14 @@ impl FreshCodexState {
         }
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            session_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2724,6 +2754,7 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
                     // Kata 1wxv Task 2 (r3): the durable rollout meta is the SoT
                     // for the mode across crash-recovery resume (undo capability
                     // survives rehydration for a paginated thread; only a
@@ -2839,8 +2870,14 @@ impl FreshCodexState {
         };
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, new_thread_id.clone(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            new_thread_id.clone(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2865,6 +2902,7 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
@@ -3069,8 +3107,9 @@ impl FreshCodexState {
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        compact_in_flight: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+        self.spawn_consumer_after(notifs, thread_id, active_turn, compact_in_flight, None)
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -3087,6 +3126,7 @@ impl FreshCodexState {
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        compact_in_flight: Arc<AtomicBool>,
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
@@ -3096,7 +3136,12 @@ impl FreshCodexState {
             }
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
-                let events = reduce_notification(&mut subscription, notification, &active_turn);
+                let events = reduce_notification(
+                    &mut subscription,
+                    notification,
+                    &active_turn,
+                    &compact_in_flight,
+                );
                 for event in events {
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
@@ -3565,8 +3610,14 @@ impl FreshCodexState {
         history_mode: Option<HistoryMode>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -3587,6 +3638,7 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 active_turn: active_turn.clone(),
+                compact_in_flight: compact_in_flight.clone(),
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
@@ -3648,6 +3700,7 @@ impl FreshCodexState {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
                 // This fixture models a thread freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -4429,10 +4482,13 @@ fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
 /// the legacy `activeTurnByThread` clear points onto `active_turn` (adapter.ts:901,913,1101-1103
 /// — leaving running/starting, a turn completing, or the thread closing all clear it;
 /// `turn/started` SETS it too, as a fallback alongside `handle_send`'s direct set).
+/// Delta-r1 F2: the turn/completed arm ALSO clears the session's compact-window
+/// busy truth (`compact_in_flight`) — the compact turn ends there (any status).
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
     active_turn: &Arc<StdMutex<Option<String>>>,
+    compact_in_flight: &Arc<AtomicBool>,
 ) -> Vec<CodexAdapterEvent> {
     match notification {
         CodexNotification::ThreadStarted { thread } => {
@@ -4465,6 +4521,10 @@ fn reduce_notification(
             // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
             if event.thread_id == subscription.session_id() {
                 clear_active_turn(active_turn);
+                // Delta-r1 F2: the compact turn ends HERE (any status — a failed
+                // compact completes the same way); the post-RPC/pre-turn-started
+                // rollback window closes.
+                compact_in_flight.store(false, Ordering::SeqCst);
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -5382,6 +5442,7 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -5418,7 +5479,13 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
-        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let consumer = state.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let watcher = spawn_exit_watcher(
@@ -5440,6 +5507,7 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight,
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
@@ -5793,6 +5861,121 @@ pub(crate) mod tests {
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_in_the_compact_answered_but_turn_unstarted_window_is_refused_busy_turn() {
+        // Delta-r1 F2: `thread/compact/start` answers BEFORE the compact turn's
+        // notification lifecycle (`turn/started`) surfaces — the REAL 0.147.0
+        // sequence has the RPC return first. In that post-RPC/pre-turn-started
+        // window `active_turn` is still notification-driven EMPTY, so the busy
+        // gate needs the session's `compact_in_flight` bit (SET under the turn
+        // lock at compact start, cleared by the compact's turn/completed).
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cwin").await;
+
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cwin")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers the RPC IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact probed window.
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // A rollback in the window must refuse BUSY_TURN — answer any RPC it DOES
+        // issue so the drive is deterministic in both shapes (a red run shows the
+        // rollback reaching thread/read and landing NOTHING_TO_UNDO; a green run
+        // shows no RPC at all — the refusal leg issues ZERO provider traffic).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the post-RPC/pre-turn-started window must still refuse: {frames:?}"
+        );
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE)
+        );
+
+        // The window CLOSES at the compact's own turn/completed: after the probed
+        // notification sequence, a follow-up rollback is NOT busy-refused (it
+        // reaches thread/read and lands its true verdict on the empty thread).
+        // The `wire` receiver is the session's bus: waiting for the completion
+        // frames here proves the consumer already ran the clear edge (the FIX-1
+        // test's deterministic sync idiom).
+        emit_compact_notification_sequence(&peer, "thread-cwin", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cwin"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot frame proves the clear edge ran"
+        );
+
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin-2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/read", "the busy gate reopened");
+        peer.respond(
+            &read_id,
+            json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+        );
+        rollback_driver2.await.expect("rollback task 2");
+        let frames2 = captured_frames(&captured2);
+        assert_eq!(
+            frames2[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "after turn/completed the gate reopened: {frames2:?}"
         );
     }
 
@@ -7349,6 +7532,7 @@ pub(crate) mod tests {
                     removed_turns: vec![json!({ "id": "t0" })],
                     prompt_text: "prior".into(),
                     at_ms: 11,
+                    epoch: 0,
                 },
                 12,
             );
@@ -7482,6 +7666,7 @@ pub(crate) mod tests {
                     removed_turns: vec![json!({ "id": "t0" })],
                     prompt_text: "prior".into(),
                     at_ms: 11,
+                    epoch: 0,
                 },
                 12,
             );
@@ -7553,6 +7738,7 @@ pub(crate) mod tests {
                     removed_turns: vec![json!({ "id": "t0" })],
                     prompt_text: "prior".into(),
                     at_ms: 11,
+                    epoch: 0,
                 },
                 12,
             );
@@ -7632,6 +7818,7 @@ pub(crate) mod tests {
                     removed_turns: vec![json!({ "id": "t9" })],
                     prompt_text: "p".into(),
                     at_ms: 2,
+                    epoch: 0,
                 },
                 3,
             );
@@ -7714,6 +7901,7 @@ pub(crate) mod tests {
                     removed_turns: vec![json!({ "id": "old-epoch" })],
                     prompt_text: "old".into(),
                     at_ms: 2,
+                    epoch: 0,
                 },
                 3,
             );
@@ -7752,6 +7940,18 @@ pub(crate) mod tests {
         );
         assert_eq!(record.entries[0].prompt_text, "old");
         assert_eq!(record.entries[1].prompt_text, "second prompt");
+        // Delta-r1 F8 case (a): the load-time destroy bit opened a NEW epoch —
+        // the frozen prior entry KEEPS its own epoch (0), the new op pushed with
+        // the bumped counter (1).
+        assert_eq!(record.current_epoch, 1);
+        assert_eq!(
+            record.entries[0].epoch, 0,
+            "frozen entries keep their epochs"
+        );
+        assert_eq!(
+            record.entries[1].epoch, 1,
+            "the new op records the bumped (current) epoch"
+        );
     }
 
     /// One remaining completed turn — the post-revert read shape after the
@@ -7866,76 +8066,195 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_rollback_without_an_unambiguous_frozen_split_appends_never_reorders() {
-        // Minor-3 guardrail: a bit-false record whose prior entries are NOT in
-        // strictly-descending at_ms (a stacked frozen+current stack whose epoch
-        // boundary is no longer recorded, or a legacy append-ordered record)
-        // has NO unambiguous frozen/current split — the new entry is APPENDED:
-        // frozen prior-epoch markers keep preceding and nothing reorders past
-        // an unknown boundary.
-        let (st, _rx, fake) = state_with_sink();
-        let (transport, peer) = freshell_codex::new_channel_transport();
-        let (client, _notifs) = CodexAppServerClient::connect(transport);
-        insert_fake_session(
-            &st,
-            "thr-ambiguous",
-            Arc::new(client),
-            Arc::new(StdMutex::new(None)),
-            spawn_sleeper(),
-            "codex-sidecar-test-ambiguous",
-        )
-        .await;
-        let frozen_entry = crate::rollback_record::RollbackEntry {
-            removed_turns: vec![json!({ "id": "frozen-u", "turnId": "frozen-u" })],
-            prompt_text: "frozen prompt".into(),
-            at_ms: 2,
-        };
-        let stacked_entry = crate::rollback_record::RollbackEntry {
-            removed_turns: vec![json!({ "id": "stacked-u", "turnId": "stacked-u" })],
-            prompt_text: "stacked prompt".into(),
-            // An at_ms RISE over the frozen entry — where the frozen prefix
-            // ends is unknowable from this record alone.
-            at_ms: 5,
-        };
-        fake.record_rollback("codex", "thr-ambiguous", {
-            let mut r = crate::rollback_record::RollbackRecord::empty(1);
-            r.push_entry(frozen_entry.clone(), 2);
-            r.push_entry(stacked_entry.clone(), 5);
-            r
-        })
-        .await
-        .expect("seed");
+    /// An N-raw-turn `thread/read` body: turn ids `turn-{i}` for i in
+    /// [first, first+count), each a user+agent pair with text `prompt {i}` /
+    /// `answer {i}`.
+    fn codex_thread_read_span(thread_id: &str, first: usize, count: usize) -> Value {
+        let turns: Vec<Value> = (first..first + count)
+            .map(|i| {
+                json!({ "id": format!("turn-{i}"), "status": "completed", "items": [
+                    { "type": "userMessage", "id": format!("t{i}-u"), "content": [{ "type": "text", "text": format!("prompt {i}") }] },
+                    { "type": "agentMessage", "id": format!("t{i}-a"), "text": format!("answer {i}") },
+                ]})
+            })
+            .collect();
+        json!({ "thread": { "id": thread_id, "turns": turns } })
+    }
+
+    /// The next REAL request on the scripted peer, answering the client's
+    /// lazy initialize/initialized handshake transparently (the first RPC any
+    /// drive issues triggers it; `client.ts:777-778`).
+    async fn expect_codex_request_handshake_aware(
+        peer: &freshell_codex::ChannelPeer,
+    ) -> (freshell_codex::RequestId, String, serde_json::Value) {
+        loop {
+            let (id, method, params) = peer.expect_request().await;
+            if method == "initialize" {
+                peer.respond(
+                    &id,
+                    json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+                );
+                let _ = peer.expect_notification().await; // initialized
+                continue;
+            }
+            return (id, method, params);
+        }
+    }
+
+    /// Drive one step-undo op: handle_rollback → thread/read (answered with
+    /// `read_body`) → thread/revert (answered ok).
+    async fn drive_codex_undo(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        thread_id: &str,
+        request_id: &str,
+        read_body: Value,
+    ) {
         let (sink, _captured) = capturing_sink();
         let driver = {
             let st = st.clone();
+            let thread_id = thread_id.to_string();
+            let request_id = request_id.to_string();
             tokio::spawn(async move {
-                st.handle_rollback(undo_msg("thr-ambiguous", "rb-amb", None), sink)
+                st.handle_rollback(undo_msg(&thread_id, &request_id, None), sink)
                     .await;
             })
         };
-        answer_initialize(&peer).await;
-        let (read_id, _m, _p) = peer.expect_request().await;
-        peer.respond(&read_id, two_turn_thread_read("thr-ambiguous"));
-        let (revert_id, _m2, _p2) = peer.expect_request().await;
+        let (read_id, method, _p) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method, "thread/read");
+        peer.respond(&read_id, read_body);
+        let (revert_id, method2, _p2) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method2, "thread/revert");
         peer.respond(&revert_id, json!({}));
         driver.await.expect("rollback task");
+    }
 
-        let record = fake
-            .load_rollback("codex", "thr-ambiguous")
-            .expect("record");
-        assert_eq!(record.entries.len(), 3, "the union still accumulates");
-        assert_eq!(
-            record.entries[0], frozen_entry,
-            "frozen prior-epoch markers keep preceding, untouched at the front"
+    /// Wait until the session's active-turn tracker CLEARS (the real
+    /// consumer's turn/completed clear edge), bounded.
+    async fn await_codex_active_turn_clear(st: &FreshCodexState, thread_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let active_turn = {
+                let guard = st.sessions.lock().await;
+                guard.get(thread_id).expect("session").active_turn.clone()
+            };
+            let clear = active_turn.lock().expect("active_turn mutex").is_none();
+            if clear {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "active_turn never cleared (the turn/completed consumer edge did not land)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending(
+    ) {
+        // Delta-r1 F8's codified multi-epoch case: undo → send (decision 5
+        // destroy) → undo → undo ⇒ the marker bucket is the FIRST epoch's
+        // frozen prefix, then the NEW epoch's entries in conversation order
+        // ascending — literal bookkeeping only, positions never read at_ms.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thr-f8",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-f8",
+        )
+        .await;
+
+        // Undo #1 (epoch 0): the four-turn thread loses turn-4.
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-1",
+            codex_thread_read_span("thr-f8", 1, 4),
+        )
+        .await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert_eq!(record.current_epoch, 0);
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].epoch, 0);
+        assert_eq!(record.entries[0].prompt_text, "prompt 4");
+
+        // A submission in between destroys redo (decision 5) — the epoch
+        // boundary marker. The send is driven start→completed through the REAL
+        // consumer so the active-turn tracker clears before the next undo.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-f8-send".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-f8".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "prompt 5".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_start_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_start_id, json!({ "turn": { "id": "turn-5" } }));
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thr-f8", "turn": { "id": "turn-5", "status": "completed" } }),
         );
-        assert_eq!(
-            record.entries[1], stacked_entry,
-            "no reorder past an unknown frozen/current boundary"
+        send_driver.await.expect("send task");
+        await_codex_active_turn_clear(&st, "thr-f8").await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert!(
+            record.redo_destroyed,
+            "submitting after the undo retired redo (decision 5)"
         );
+
+        // Undo #2: the destroy bit at load opens EPOCH 1 (turn-3 rolls back).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-2",
+            codex_thread_read_span("thr-f8", 1, 3),
+        )
+        .await;
+        // Undo #3, SAME epoch: turn-2 rolls back and splices BEFORE the
+        // epoch-1 prior entry (conversation order ascending).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-3",
+            codex_thread_read_span("thr-f8", 1, 2),
+        )
+        .await;
+
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        let shape: Vec<(u32, &str)> = record
+            .entries
+            .iter()
+            .map(|e| (e.epoch, e.prompt_text.as_str()))
+            .collect();
         assert_eq!(
-            record.entries[2].prompt_text, "second prompt",
-            "the new entry is APPENDED when no unambiguous split exists"
+            shape,
+            vec![(0, "prompt 4"), (1, "prompt 2"), (1, "prompt 3")],
+            "first epoch's frozen prefix, then the new epoch ascending — literal epoch bookkeeping, never timestamps"
+        );
+        assert_eq!(record.current_epoch, 1);
+        assert!(
+            !record.redo_destroyed,
+            "the new epoch cleared only the redo chain state"
         );
     }
 
@@ -12042,6 +12361,7 @@ pub(crate) mod tests {
                 })],
                 prompt_text: "later".into(),
                 at_ms: 90,
+                epoch: 0,
             },
             100,
         );
@@ -12063,8 +12383,8 @@ pub(crate) mod tests {
         assert_eq!(snap["capabilities"]["redo"], json!(false));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": false, "undoneDepth": 1 }),
-            "undoneDepth is the USER-role step count of the bucket (never entries.len())"
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "undoneDepth is the USER-role step count of the bucket (never entries.len()); F6: codex is undo-only ⇒ NO marker is ever redoable"
         );
         let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
         assert_eq!(bucket.len(), 1);
@@ -12163,7 +12483,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot["capabilities"]["redo"], json!(false));
         assert_eq!(
             snapshot["rollback"],
-            json!({ "canRedo": false, "undoneDepth": 1 })
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] })
         );
         assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("turn-9"));
         assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));

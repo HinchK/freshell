@@ -87,7 +87,7 @@ function ensureSchema(db) {
         time_updated integer NOT NULL,
         data text NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS part (
+    CREATE TABLE IF NOT EXISTS part (
         id text PRIMARY KEY,
         message_id text NOT NULL,
         session_id text NOT NULL,
@@ -95,7 +95,29 @@ function ensureSchema(db) {
         time_updated integer NOT NULL,
         data text NOT NULL
       );
+      -- kata 1wxv delta-r1 F6: message ids must NEVER repeat within a session,
+      -- even after a native revert-tail deletion (real opencode mints a fresh id
+      -- per message; a countMessages+1 scheme re-mints a deleted id when a
+      -- resend lands behind it, which collides frozen marker rows with the new
+      -- epoch's rows in the rollback ledger). Persistent per-session counter.
+      CREATE TABLE IF NOT EXISTS message_seq (
+        session_id text PRIMARY KEY,
+        next integer NOT NULL
+      );
     `)
+}
+
+/** Mint the next message sequence for a session — persistent across revert-tail
+ * deletions (unlike COUNT(*)+1). */
+function nextMessageSequence(db, sessionId) {
+  const row = db.prepare('SELECT next FROM message_seq WHERE session_id = ?').get(sessionId)
+  if (!row) {
+    db.prepare('INSERT INTO message_seq (session_id, next) VALUES (?, ?)').run(sessionId, 3)
+    return 1
+  }
+  const next = Number(row.next)
+  db.prepare('UPDATE message_seq SET next = ? WHERE session_id = ?').run(next + 2, sessionId)
+  return next
 }
 
 function sessionModel() {
@@ -128,11 +150,6 @@ function insertSession(db, input) {
       input.createdAt,
       input.updatedAt,
     )
-}
-
-function countMessages(db, sessionId) {
-  const row = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(sessionId)
-  return Number(row?.count ?? 0)
 }
 
 function sessionRow(db, sessionId) {
@@ -214,7 +231,7 @@ function seedRunDatabase(input) {
   try {
     ensureSchema(db)
     const existing = db.prepare('SELECT time_created FROM session WHERE id = ?').get(input.sessionId)
-    const sequence = countMessages(db, input.sessionId) + 1
+    const sequence = nextMessageSequence(db, input.sessionId)
     const userTime = Date.now()
     const assistantTime = userTime + 1
     insertSession(db, {
@@ -618,7 +635,7 @@ function appendPromptMessages(input) {
     ensureSchema(db)
     const existing = sessionRow(db, input.sessionId)
     if (!existing) return undefined
-    const sequence = countMessages(db, input.sessionId) + 1
+    const sequence = nextMessageSequence(db, input.sessionId)
     const userTime = Date.now()
     const assistantTime = userTime + 1
     const promptText = input.parts

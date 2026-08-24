@@ -53,6 +53,37 @@ pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 /// the behavioral arbiter).
 pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
 
+/// Delta-r1 F3: the effective snapshots-disabled `OPENCODE_CONFIG_CONTENT` value.
+/// A user could legitimately populate this env var with inline config (the repo
+/// documents server plugins flowing through it), so the managed launch MERGES the
+/// snapshots pin INTO an inherited JSON document instead of replacing it:
+/// - `None`/absent → exactly [`OPENCODE_SNAPSHOTS_DISABLED_CONFIG`];
+/// - a JSON OBJECT → the same document with top-level `"snapshot": false` forced
+///   (a user-supplied `snapshot` key is overwritten — conversation rollback must
+///   never re-apply file state; that pin is the entire point of the decision);
+/// - MALFORMED (non-JSON, or JSON that isn't an object — a document with no
+///   top-level key space can't take the pin) → replaced by the bare pin document,
+///   with a structured warning naming the replaced value's first 24 chars.
+pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
+    match inherited.filter(|raw| !raw.is_empty()) {
+        None => OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
+        Some(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Object(mut map)) => {
+                map.insert("snapshot".to_string(), Value::Bool(false));
+                Value::Object(map).to_string()
+            }
+            _ => {
+                let preview: String = raw.chars().take(24).collect();
+                tracing::warn!(
+                    replaced_value_first_24_chars = %preview,
+                    "freshell_opencode.config_content.malformed_inline_config_replaced"
+                );
+                OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string()
+            }
+        },
+    }
+}
+
 /// A boxed, `Send` future — the object-safe async return used by the injected IO
 /// traits (keeps them `dyn`-compatible without an `async-trait` dependency).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -443,12 +474,25 @@ impl OpencodeServeManager {
             ownership_id.clone(),
         ));
         // kata 1wxv Task 3 (decision 1): the MANAGED fresh-agent serve ALWAYS carries
-        // opencode snapshots disabled — layered AFTER any caller-supplied env so the
-        // command-line env map's duplicate-key semantics make it win. Conversation
-        // rollback (revert/unrevert) must never re-apply file state.
+        // opencode snapshots disabled. Delta-r1 F3: MERGE the pin into any inherited
+        // inline config instead of replacing it (a user-supplied `snapshot` key is
+        // overwritten — conversation rollback (revert/unrevert) must never re-apply
+        // file state, but sibling keys — e.g. the server plugins this repo documents
+        // under this var — must survive). The inherited value is the LAST
+        // config-supplied entry if present, else the process env's; the spawn env
+        // ends with EXACTLY ONE entry (the merged value).
+        let inherited = {
+            let from_config = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+                .map(|(_, v)| v.clone());
+            env.retain(|(key, _)| key != OPENCODE_CONFIG_CONTENT_ENV);
+            from_config.or_else(|| std::env::var(OPENCODE_CONFIG_CONTENT_ENV).ok())
+        };
         env.push((
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
-            OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
+            merged_opencode_config_content(inherited.as_deref()),
         ));
         let process = self
             .inner
@@ -1597,8 +1641,14 @@ mod tests {
     /// (the vendored CLI's verified config key; merged config, highest-precedence
     /// env lane). The Task 7 byte-identical-working-tree e2e is the behavioral
     /// arbiter; this pins the launch config itself.
+    ///
+    /// Env-hermetic (delta-r1 F3): the launch now MERGES an inherited value,
+    /// so this default-path pin scrubs a possibly-hostile host var first.
     #[tokio::test]
     async fn the_managed_serve_launches_with_opencode_snapshots_disabled() {
+        let _env_guard = config_env_lock().await;
+        let scrubbed = scrub_config_env();
+
         let spawner = Arc::new(CapturingSpawner {
             requests: Mutex::new(Vec::new()),
         });
@@ -1627,5 +1677,267 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(&entry.1).expect("the managed config is valid JSON");
         assert_eq!(parsed, serde_json::json!({ "snapshot": false }));
+        drop(scrubbed);
+    }
+
+    // ── delta-r1 F3: the managed config MERGE (never destroys inherited values) ──
+
+    /// Serialize env mutation for the config-env probes (parallel tests share the
+    /// process env; the scrubbers below mutate it). A TOKIO mutex: the guard is
+    /// held across the spawn-level tests' `.await points.
+    async fn config_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    /// Remove the process-inherited `OPENCODE_CONFIG_CONTENT` for the duration of
+    /// a default-path test; restore on drop.
+    fn scrub_config_env() -> impl Drop {
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(OPENCODE_CONFIG_CONTENT_ENV, v),
+                    None => std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV),
+                }
+            }
+        }
+        let prior = std::env::var(OPENCODE_CONFIG_CONTENT_ENV).ok();
+        std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV);
+        Restore(prior)
+    }
+
+    #[test]
+    fn merged_config_absent_writes_the_bare_pin_document() {
+        assert_eq!(
+            merged_opencode_config_content(None),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+        // An empty inherited value merges as absent, never a malformed warning.
+        assert_eq!(
+            merged_opencode_config_content(Some("")),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+    }
+
+    #[test]
+    fn merged_config_merges_into_an_inherited_object_and_forces_the_pin() {
+        let user =
+            r#"{"plugin":["file:///home/me/plugin.ts"],"model":"openai/gpt-5","theme":"dark"}"#;
+        let parsed: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
+            .expect("merged is valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "plugin": ["file:///home/me/plugin.ts"],
+                "model": "openai/gpt-5",
+                "theme": "dark",
+                "snapshot": false,
+            }),
+            "sibling keys preserved; the snapshots pin is forced in"
+        );
+        // A user-supplied top-level `snapshot` NEVER wins — the rollback decision
+        // pins it (that is the point of the managed lane).
+        let overridden: Value = serde_json::from_str(&merged_opencode_config_content(Some(
+            r#"{"snapshot":true,"autoupdate":false}"#,
+        )))
+        .expect("merged is valid JSON");
+        assert_eq!(
+            overridden,
+            serde_json::json!({ "snapshot": false, "autoupdate": false })
+        );
+    }
+
+    /// tracing capture facility (the freshell-freshagent DIAG-01 idiom):
+    /// thread-local, for the synchronous warn inside the merge helper.
+    mod config_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        struct Visitor {
+            fields: BTreeMap<String, String>,
+        }
+        impl Visit for Visitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        /// The capture target: one `BTreeMap<field, value>` per traced event.
+        type CapturedEvents = Arc<Mutex<Vec<BTreeMap<String, String>>>>;
+
+        struct CaptureLayer {
+            events: CapturedEvents,
+        }
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = Visitor {
+                    fields: BTreeMap::new(),
+                };
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(visitor.fields);
+            }
+        }
+
+        /// Thread-local capture (the helper under test emits synchronously on
+        /// the calling thread — no spawned tasks cross here).
+        pub fn capture() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            (events, tracing::subscriber::set_default(subscriber))
+        }
+    }
+
+    #[test]
+    fn merged_config_malformed_is_replaced_with_a_warning_naming_the_first_24_chars() {
+        let (events, _guard) = config_capture::capture();
+        let malformed = "not-json-at-all{ this is longer than twenty four chars }";
+        let replaced = merged_opencode_config_content(Some(malformed));
+        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            })
+            .expect("a malformed inline config warns loudly");
+        assert_eq!(
+            warn.get("replaced_value_first_24_chars")
+                .map(String::as_str),
+            Some("not-json-at-all{ this is"),
+            "the warning names the replaced value's first 24 chars: {warn:?}"
+        );
+    }
+
+    /// A non-object JSON value can't take a top-level pin either — same replace+warn.
+    #[test]
+    fn merged_config_json_scalars_and_arrays_are_replaced_with_the_warning() {
+        let (events, _guard) = config_capture::capture();
+        assert_eq!(
+            merged_opencode_config_content(Some(r#"["plugin-x"]"#)),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+        let events = events.lock().expect("capture lock");
+        assert_eq!(events.len(), 1, "one warn per replaced malformed value");
+        assert_eq!(
+            events[0]
+                .get("replaced_value_first_24_chars")
+                .map(String::as_str),
+            Some(r#"["plugin-x"]"#),
+        );
+    }
+
+    /// Spawn-level: a config-supplied inline document is MERGED into the launch
+    /// (sibling keys survive, snapshot pinned), never replaced — and the spawn env
+    /// carries EXACTLY ONE occurrence (the merged value).
+    #[tokio::test]
+    async fn the_managed_serve_merges_a_config_supplied_inline_document() {
+        let _env_guard = config_env_lock().await;
+        let scrubbed = scrub_config_env();
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            env: vec![(
+                OPENCODE_CONFIG_CONTENT_ENV.to_string(),
+                r#"{"plugin":["file:///p.ts"],"provider":{"x":{"models":{}}}}"#.to_string(),
+            )],
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        drop(scrubbed);
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        assert_eq!(requests.len(), 1, "exactly one sidecar spawn");
+        let occurrences: Vec<&String> = requests[0]
+            .env
+            .iter()
+            .filter(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "exactly one OPENCODE_CONFIG_CONTENT entry — the MERGED value"
+        );
+        let parsed: Value = serde_json::from_str(occurrences[0]).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "plugin": ["file:///p.ts"],
+                "provider": { "x": { "models": {} } },
+                "snapshot": false,
+            })
+        );
+    }
+
+    /// Spawn-level: the PROCESS-inherited value merges the same way (the launch
+    /// environment is the lane the finding names — a freshell server running
+    /// WITH OPENCODE_CONFIG_CONTENT exports it to the managed serve).
+    #[tokio::test]
+    async fn the_managed_serve_merges_the_process_inherited_inline_document() {
+        let _env_guard = config_env_lock().await;
+        std::env::set_var(OPENCODE_CONFIG_CONTENT_ENV, r#"{"share":"disabled"}"#);
+        let _scrubbed = DeferUnset;
+        struct DeferUnset;
+        impl Drop for DeferUnset {
+            fn drop(&mut self) {
+                std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV);
+            }
+        }
+
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        OpencodeServeManager::new(deps, ServeConfig::default())
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        let entry = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .expect("the managed serve carries OPENCODE_CONFIG_CONTENT");
+        let parsed: Value = serde_json::from_str(&entry.1).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "share": "disabled", "snapshot": false }),
+            "the inherited document survives; the pin merges in"
+        );
     }
 }

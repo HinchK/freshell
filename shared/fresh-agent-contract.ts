@@ -256,6 +256,12 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   rollback: z.object({
     canRedo: z.boolean(),
     undoneDepth: z.number().int().nonnegative(),
+    // Delta-r1 F6: the SERVER-AUTHORED per-marker "Redo to here" gate — the exact
+    // turn ids at the ends of the redoable steps of the CURRENT epoch (the tail of
+    // the marker bucket; frozen prior-epoch markers are never listed). Optional:
+    // legacy servers emit neither this nor the block — absent ⇒ no marker offers
+    // the affordance.
+    redoableTurnIds: z.array(z.string()).optional(),
   }).strict().optional(),
   extensions: FreshAgentExtensionsSchema.default({}),
 }).strict()

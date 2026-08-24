@@ -1012,6 +1012,12 @@ impl FreshOpencodeState {
     ///     mid-flight compact: dropped mid-await it never reaches the settle tail,
     ///     and the interrupt's `turn_aborted` flag would gate even a raced settle —
     ///     killing mid-compact yields NO false `freshAgent.turn.complete`.
+    ///
+    /// REDO DISCIPLINE (delta-r1 F5): opencode summarizes natively delete the
+    /// reverted tail exactly like a new submission, so the ledger's redo state
+    /// retires via `destroy_redo_on_submit` under the same session lock BEFORE
+    /// the drive posts — markers survive (decision 6), `canRedo`/`redoableTurnIds`
+    /// collapse immediately.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_arc = {
@@ -1058,6 +1064,25 @@ impl FreshOpencodeState {
                 ),
             );
             return;
+        }
+
+        // Decision 5 (delta-r1 F5): the provider natively DELETES the reverted
+        // tail on summarize/compact too — exactly like a send — so the ledger's
+        // redo state retires HERE, under the same session lock the
+        // refusal/flag-reset/site of the destroy all share, BEFORE the drive
+        // posts (a natural compact is a submission-leg for redo purposes:
+        // afterwards only the decision-6 marker union remains). AWAITED; a
+        // write failure is warn-only (never blocks the compact), the same
+        // degrade policy as [`Self::handle_send`]'s destroy site.
+        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+            &self.identity_sink(),
+            PROVIDER,
+            &real_id,
+            crate::rollback_record::now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, session = %real_id, "freshagent.opencode.redo_destroy_on_compact_failed");
         }
 
         // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
@@ -1574,51 +1599,38 @@ impl FreshOpencodeState {
                 // message.
                 let prompt = first_user_prompt_text(removed_msgs);
                 // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket is
-                // the UNION — frozen prior-epoch markers PRECEDE this op's removed
-                // slice ++ the still-served prior tail (undo 3 then undo 2 ⇒ markers
-                // [2, 3] in the tail's conversation order).
+                // the r3 UNION under delta-r1 F8's literal epoch bookkeeping — frozen
+                // prior-epoch entries PRECEDE the current epoch (which reads
+                // conversation-order ascending: a second same-epoch undo removes an
+                // EARLIER step, so its entry splices ahead of the prior one; undo 3
+                // then undo 2 ⇒ markers [2, 3]).
                 let now = crate::rollback_record::now_ms();
                 let previous = self
                     .identity_sink()
                     .and_then(|s| s.load_rollback(PROVIDER, &real_id));
                 let mut record = match previous.clone() {
-                    Some(mut p) => {
-                        // Epoch rule (r3): an undo landing while redo_destroyed is set
-                        // starts a NEW epoch that clears ONLY the redo-capable chain
-                        // state — `entries` (the marker union) is NEVER cleared.
-                        if p.redo_destroyed {
-                            p.redo_destroyed = false;
-                        }
-                        p
-                    }
+                    Some(p) => p,
                     None => RollbackRecord::empty(now),
                 };
-                let served_ids: std::collections::HashSet<&str> = messages
-                    .iter()
-                    .filter_map(|m| m.pointer("/info/id").and_then(Value::as_str))
-                    .collect();
-                let old_turns: Vec<Value> = record
-                    .entries
-                    .drain(..)
-                    .flat_map(|e| e.removed_turns)
-                    .collect();
-                let (frozen, current): (Vec<Value>, Vec<Value>) =
-                    old_turns.into_iter().partition(|t| {
-                        marker_turn_id(t)
-                            .map(|id| !served_ids.contains(id))
-                            .unwrap_or(true)
-                    });
-                let combined: Vec<Value> = frozen
-                    .into_iter()
-                    .chain(removed_turns)
-                    .chain(current)
-                    .collect();
-                record.entries = vec![RollbackEntry {
-                    removed_turns: combined,
-                    prompt_text: prompt.clone(),
-                    at_ms: now,
-                }];
-                record.last_op_at_ms = now;
+                // Epoch rule (r3): an undo landing while redo_destroyed is set (a
+                // submission — OR, delta-r1 F5, a compact/summarize — natively
+                // deleted the reverted tail) starts a NEW epoch: bump
+                // `current_epoch` so every existing entry freezes with its own
+                // epoch; ONLY the redo-capable chain state clears — `entries`
+                // (the marker union) is NEVER dropped.
+                if record.redo_destroyed {
+                    record.redo_destroyed = false;
+                    record.begin_new_epoch();
+                }
+                record.splice_undo_entry(
+                    RollbackEntry {
+                        removed_turns,
+                        prompt_text: prompt.clone(),
+                        at_ms: now,
+                        epoch: record.current_epoch,
+                    },
+                    now,
+                );
                 // The new tail is provably non-empty (it contains the target), so the
                 // fresh chain is redoable.
                 record.set_can_redo(true, now);
@@ -1753,45 +1765,30 @@ impl FreshOpencodeState {
                         .to_string()
                 });
                 let restored_slice = &messages[boundary_idx..kept_end.unwrap_or(messages.len())];
-                // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket
-                // rebuilds to the remaining current-epoch tail BEFORE the
-                // revert/unrevert POST goes out — frozen prior-epoch markers PRECEDE
-                // the remaining tail and are never dropped by a redo (r3).
-                let remaining_start = kept_end.unwrap_or(messages.len());
-                let remaining_turns: Vec<Value> = messages[remaining_start..]
+                // Post-op record FIRST (durable-BEFORE-mutation): the restored turns
+                // leave the CURRENT-epoch marker entries BEFORE the revert/unrevert
+                // POST goes out — frozen prior-epoch markers can never match a
+                // restorable id (the served tail is the current epoch only, r3) and
+                // are never dropped by a redo.
+                let restored_id_set: std::collections::HashSet<&str> = restored_slice
                     .iter()
-                    .enumerate()
-                    .filter_map(|(i, m)| crate::opencode_message_turn_json(m, remaining_start + i))
+                    .filter_map(|m| m.pointer("/info/id").and_then(Value::as_str))
                     .collect();
                 let now = crate::rollback_record::now_ms();
                 let previous = existing.clone();
                 let mut record = existing.unwrap_or_else(|| RollbackRecord::empty(now));
-                let served_ids: std::collections::HashSet<&str> = messages
-                    .iter()
-                    .filter_map(|m| m.pointer("/info/id").and_then(Value::as_str))
-                    .collect();
-                let frozen: Vec<Value> = record
-                    .entries
-                    .drain(..)
-                    .flat_map(|e| e.removed_turns)
-                    .filter(|t| {
-                        marker_turn_id(t)
-                            .map(|id| !served_ids.contains(id))
-                            .unwrap_or(true)
-                    })
-                    .collect();
-                let current_tail_non_empty = !remaining_turns.is_empty();
-                record.entries = if !current_tail_non_empty && frozen.is_empty() {
-                    vec![]
-                } else {
-                    vec![RollbackEntry {
-                        removed_turns: frozen.into_iter().chain(remaining_turns).collect(),
-                        prompt_text: first_user_prompt_text(&messages[remaining_start..]),
-                        at_ms: now,
-                    }]
-                };
+                record.entries.retain_mut(|e| {
+                    e.removed_turns.retain(|t| {
+                        !marker_turn_id(t).is_some_and(|id| restored_id_set.contains(id))
+                    });
+                    !e.removed_turns.is_empty()
+                });
                 record.last_op_at_ms = now;
-                // can_redo gates ONLY on the current chain's remaining tail (r3).
+                // can_redo gates ONLY on the current epoch's remaining tail (r3).
+                let current_tail_non_empty = record
+                    .entries
+                    .iter()
+                    .any(|e| e.epoch == record.current_epoch && !e.removed_turns.is_empty());
                 record.set_can_redo(!record.redo_destroyed && current_tail_non_empty, now);
                 if !self
                     .persist_record_or_refuse(&op, &real_id, record.clone(), &reply_sink)
@@ -4418,6 +4415,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_retires_redo_before_the_summarize_post_and_the_snapshot_reflects_it() {
+        // Delta-r1 F5: the provider natively DELETES the reverted tail on
+        // summarize/compact exactly like a send (the verified 1.18.21 semantics),
+        // so the compact path runs `destroy_redo_on_submit` UNDER the same session
+        // lock before the drive posts. After undo (redo-capable record) → compact,
+        // the ledger says redo_destroyed (markers survive, decision 6 — entries
+        // and per-entry epochs are untouched), and the snapshot's canRedo +
+        // redoableTurnIds reflect the retirement.
+        let (st, _http, _rx) = compact_state(r#"{"model":null}"#, false).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        crate::identity_sink::PaneIdentitySink::record_rollback(
+            sink.as_ref(),
+            PROVIDER,
+            "ses_1",
+            {
+                let mut record = RollbackRecord::empty(1);
+                record.splice_undo_entry(
+                    RollbackEntry {
+                        removed_turns: vec![
+                            RollbackFakeHttp::marker_turn("msg_u2", "user", "prompt two"),
+                            RollbackFakeHttp::marker_turn("msg_a2", "assistant", "answer two"),
+                        ],
+                        prompt_text: "prompt two".to_string(),
+                        at_ms: 1,
+                        epoch: 0,
+                    },
+                    1,
+                );
+                record.set_can_redo(true, 1);
+                record
+            },
+        )
+        .await
+        .expect("seed a redo-capable record (undo at t2)");
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        // The destroy is AWAITED under the session lock BEFORE the compact drive
+        // posts summarize — no settle wait is needed (and certainly no second op).
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "the compact retired redo BEFORE the summarize posted: {record:?}"
+        );
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u2", "msg_a2"],
+            "decision 6: the marker bucket survives a compact-driven destroy"
+        );
+
+        // The snapshot truth: no device keeps advertising a redo that can only fail.
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_1",
+            &json!({ "id": "ses_1", "time": { "updated": 5 } }),
+            &json!([]),
+            Some(&record),
+        );
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "canRedo:false + no redoable marker rows after the compact"
+        );
+    }
+
+    #[tokio::test]
     async fn compact_falls_back_to_the_serve_config_model_when_the_session_has_none() {
         let (st, http, mut rx) =
             compact_state(r#"{"model":"conf-prov/conf-mdl","theme":"dark"}"#, false).await;
@@ -5851,6 +5917,7 @@ mod tests {
                     removed_turns: tail_turns,
                     prompt_text,
                     at_ms: 1,
+                    epoch: 0,
                 },
                 1,
             );
@@ -6199,12 +6266,26 @@ mod tests {
         st.handle_rollback(undo_op("ses_real", "rb-8b"), sink2)
             .await;
         let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        // Delta-r1 F8: entry-granular epochs (the bucket's READ shape is
+        // unchanged) — the second same-epoch undo splices BEFORE the first's
+        // entry, so the current epoch reads conversation-order ascending.
         assert_eq!(
             record.entries.len(),
-            1,
-            "the current-epoch tail is rebuilt as one entry: {record:?}"
+            2,
+            "one entry per undo op, both in the current epoch: {record:?}"
         );
-        let ids = RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns);
+        assert!(
+            record
+                .entries
+                .iter()
+                .all(|e| e.epoch == record.current_epoch),
+            "no epoch boundary without a destroy: {record:?}"
+        );
+        let ids: Vec<&str> = record
+            .entries
+            .iter()
+            .flat_map(|e| RollbackFakeHttp::turn_ids(&e.removed_turns))
+            .collect();
         assert_eq!(
             ids,
             vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
@@ -6497,10 +6578,23 @@ mod tests {
             "the composer refill is the RESENT prompt"
         );
         let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        let bucket: Vec<&str> = record
+            .entries
+            .iter()
+            .flat_map(|e| RollbackFakeHttp::turn_ids(&e.removed_turns))
+            .collect();
         assert_eq!(
-            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            bucket,
             vec!["msg_u3", "msg_a3", "msg_u4", "msg_a4"],
             "UNION markers: frozen prior-epoch rows PRECEDE the new epoch's (conversation order)"
+        );
+        // Delta-r1 F8 case (a): the destroy at load opened epoch 1 — the frozen
+        // prior-epoch entry KEEPS epoch 0; the new op records epoch 1.
+        assert_eq!(record.current_epoch, 1);
+        assert_eq!(
+            record.entries.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+            vec![0, 1],
+            "literal epoch marks, never timestamp reads"
         );
         assert!(
             record.can_redo() && !record.redo_destroyed,

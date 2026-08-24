@@ -7,8 +7,14 @@ export type FreshAgentSlashCommand = {
   description: string
   action: FreshAgentSlashCommandAction
   aliases?: readonly string[]
-  /** Requires the matching capability flag in the thread snapshot to be true. */
-  requiresCapability?: 'fork'
+  /**
+   * Requires the matching capability flag in the thread snapshot to be true.
+   * Absent/unknown-to-the-menu capability ⇒ the menu entry is HIDDEN (the client
+   * rule that absent ⇔ false) — never "show then reject". Delta-r1 F7 added
+   * `undo`/`redo`: before capability discovery (no snapshot) and on
+   * capability-false panes, /undo and /redo leave the menu.
+   */
+  requiresCapability?: 'fork' | 'undo' | 'redo'
 }
 
 const BASE_COMMANDS = [
@@ -35,11 +41,13 @@ const BASE_COMMANDS = [
     name: 'undo',
     description: 'Roll back the last turn (conversation only — files stay as they are)',
     action: 'undo',
+    requiresCapability: 'undo',
   },
   {
     name: 'redo',
     description: 'Restore the last rolled-back turn',
     action: 'redo',
+    requiresCapability: 'redo',
   },
 ] as const satisfies readonly FreshAgentSlashCommand[]
 

@@ -1089,14 +1089,58 @@ impl FreshClaudeState {
     /// trimmed>` when instructions are present. NO ack frame (compact does not reuse
     /// `handle_send`'s send.accepted broadcast; the turn is observable through the
     /// normal `sdk.*` stream).
+    ///
+    /// Delta-r1 F1 (busy discipline): a compact IS a turn — the handler mirrors
+    /// [`Self::handle_send`] exactly: park through a mid-rollback teardown window
+    /// (poll `rollback_in_flight` membership; never acquire it), take the session
+    /// `turn_lock` (carried across the rollback kill+respawn, so the check-then-set
+    /// window against the rollback busy gate is closed), and set the busy truth
+    /// (`in_turn`) UNDER the lock BEFORE the sidecar write. A compact turn ends at
+    /// the SDK's `sdk.result` frame (any subtype) — the existing four-edge clear
+    /// set terminates it (plus `sdk.status:idle`, sidecar EOF, or a completed
+    /// interrupt); a FAILED write clears what we set (nothing was submitted).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        let Some(mut session) = self
-            .respond_session_guard(&session_id, msg.session_type)
-            .await
-        else {
+        // The `handle_send` resolve discipline (task 4 review C1): a resolve/handles
+        // MISS while `rollback_in_flight` names this id means the rollback's
+        // teardown→respawn window swallowed the map entry — PARK on the registry's
+        // membership and re-resolve (the compact then serializes BEHIND the rollback
+        // on the carried-over turn lock). This handler never ACQUIRES
+        // `rollback_in_flight` (no circular wait exists): it only polls membership.
+        let (map_key, turn_lock, in_turn) = loop {
+            let handles = match self.resolve_session_key(&session_id).await {
+                Some(key) => {
+                    let guard = self.sessions.lock().await;
+                    guard
+                        .get(&key)
+                        .map(|s| (key, s.turn_lock.clone(), s.in_turn.clone()))
+                }
+                None => None,
+            };
+            if let Some(handles) = handles {
+                break handles;
+            }
+            if !self.rollback_in_flight.contains(&session_id) {
+                self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+                return;
+            }
+            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
+        };
+        // Held across the busy-set AND the sidecar write (the handle_send r2
+        // serialization discipline) — a rollback holding this lock observes either
+        // no-compact or a fully-marked in-flight compact turn.
+        let _turn = turn_lock.lock().await;
+        // Set the busy truth UNDER the lock, BEFORE the sidecar write.
+        in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.sessions.lock().await;
+        let Some(session) = guard.get_mut(&map_key) else {
+            drop(guard);
+            // Nothing was submitted — clear what we set (the busy truth must
+            // never wedge).
+            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
             return;
         };
         let text = match msg.instructions.as_deref().map(str::trim) {
@@ -1105,10 +1149,15 @@ impl FreshClaudeState {
             }
             _ => "/compact".to_string(),
         };
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
         let send_req =
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
-            drop(session);
+            drop(guard);
+            // The write never went out — no turn is running (clear what we set,
+            // else the busy truth wedges; the handle_send fail-closed leg).
+            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
         }
     }
@@ -1691,11 +1740,16 @@ impl FreshClaudeState {
             .unwrap_or_else(|| RollbackRecord::empty(now));
         match op.direction {
             RollbackDirection::Undo => {
-                // Epoch rule (r3): an undo landing while redo_destroyed was set
-                // (or whose chain root re-roots away from the prior record's) is
-                // a NEW epoch — the destroyed bit clears so the record's redo
-                // fields describe the NEW chain (the prior chain's redo stays
-                // permanently dead), `entries` is NEVER cleared.
+                // Epoch rule (r3 + delta-r1 F8's literal bookkeeping): an undo
+                // landing while redo_destroyed was set (or whose chain root
+                // re-roots away from the prior record's) is a NEW epoch — bump
+                // `current_epoch` (every existing entry freezes with its own
+                // epoch), the destroyed bit clears so the record's redo fields
+                // describe the NEW chain (the prior chain's redo stays
+                // permanently dead), `entries` is NEVER cleared. Same-epoch
+                // undos splice the new (earlier-in-conversation) entry BEFORE
+                // the existing current-epoch block — positions never read
+                // timestamps.
                 let new_epoch = record.redo_destroyed
                     || (existing
                         .as_ref()
@@ -1705,24 +1759,19 @@ impl FreshClaudeState {
                             .and_then(|r| r.original_session_id.clone())
                             .as_deref()
                             != Some(chain_root.as_str()));
-                if record.redo_destroyed {
+                if new_epoch {
                     record.redo_destroyed = false;
+                    record.begin_new_epoch();
                 }
-                let prior: Vec<RollbackEntry> = std::mem::take(&mut record.entries);
-                let (frozen, current): (Vec<RollbackEntry>, Vec<RollbackEntry>) = if new_epoch {
-                    (prior, Vec::new())
-                } else {
-                    (Vec::new(), prior)
-                };
-                record.entries = frozen
-                    .into_iter()
-                    .chain(std::iter::once(RollbackEntry {
+                record.splice_undo_entry(
+                    RollbackEntry {
                         removed_turns: removed_turns.clone(),
                         prompt_text: prompt_text.clone(),
                         at_ms: now,
-                    }))
-                    .chain(current)
-                    .collect();
+                        epoch: record.current_epoch,
+                    },
+                    now,
+                );
             }
             RollbackDirection::Redo => {
                 // The restored turns leave the CURRENT-epoch marker portion (they
@@ -5906,6 +5955,70 @@ rl.on('line', (line) => {
     }
 
     #[tokio::test]
+    async fn rollback_during_a_compact_turn_is_refused_busy_turn_with_zero_teardown_traffic() {
+        // Delta-r1 F1: handle_compact marks the claude busy truth (`in_turn`) UNDER
+        // the session turn lock BEFORE writing the /compact send to the sidecar —
+        // the check-then-set window against handle_rollback's busy gate is closed.
+        // A claude compact turn ends at the SDK's `sdk.result` frame (any subtype —
+        // the existing four-edge clear set, no new clear edge): WHILE it runs, a
+        // rollback refuses BUSY_TURN with zero teardown/spawn traffic; AFTER it,
+        // the gate reopens.
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-compact-rb")).await;
+        let created = await_claude_created(&mut rx, "req-compact-rb").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_compact(compact_msg(&session_id, None)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "a compact marks in_turn BEFORE the sidecar write (F1)"
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-compact-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["code"], "BUSY_TURN");
+        assert_eq!(frames[0]["event"]["message"], ROLLBACK_BUSY_MESSAGE);
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "only the original create spawned — the refused rollback produced zero teardown/spawn traffic"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key(&session_id),
+            "no teardown"
+        );
+
+        // The compact turn ends at the SDK's result frame (any subtype — here an
+        // ERRORED one); the four-edge clear set already covers it, and the busy
+        // gate reopens (a follow-up rollback leaves the window for its true
+        // verdict — NOTHING_TO_UNDO on this transcript-less session).
+        st.handle_send(send_msg(&session_id, "__emit_result_error__"))
+            .await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink2, captured2) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-compact-2", RollbackDirection::Undo),
+            sink2,
+        )
+        .await;
+        let frames2 = captured_json(&captured2);
+        assert_eq!(
+            frames2[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the busy gate reopened once the compact turn's sdk.result landed: {frames2:?}"
+        );
+        drop(env);
+    }
+
+    #[tokio::test]
     async fn handle_rollback_redo_without_a_record_is_redo_unavailable() {
         let (st, _rx) = state_with_bus();
         let stdin_log = insert_rollback_fixture_session(&st, "rb-redo-none", "dur-redo-none").await;
@@ -6088,6 +6201,7 @@ rl.on('line', (line) => {
                         ],
                         prompt_text: "prompt two".to_string(),
                         at_ms: 100,
+                        epoch: 0,
                     },
                     100,
                 );
@@ -6189,6 +6303,12 @@ rl.on('line', (line) => {
             vec!["uq", "aq"],
             "the newest epoch's removed slice"
         );
+        // Delta-r1 F8 case (a): the destroy bit at load opened a NEW epoch — the
+        // frozen prior-epoch entry KEEPS its epoch (0), the new op records the
+        // bumped counter (1); positions never read timestamps.
+        assert_eq!(record.current_epoch, 1);
+        assert_eq!(record.entries[0].epoch, 0);
+        assert_eq!(record.entries[1].epoch, 1);
         assert!(
             sink_impl.load_rollback("claude", "s-prime").is_none(),
             "the rollback row MOVED old→new (never a stale duplicate)"

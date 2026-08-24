@@ -917,6 +917,15 @@ impl PaneLedger {
     /// index-ahead-of-disk (the `write_binding` discipline). Callers AWAIT
     /// this BEFORE mutating provider history (durable-BEFORE-mutation; a
     /// pre-write failure refuses the rollback and the provider is untouched).
+    ///
+    /// DELTA-R1 F4 (disabled-mode honesty): a DISABLED ledger must NOT answer
+    /// `Ok(())` here — production enters disabled mode when home resolution
+    /// fails or another server holds the store lock, and a false "durable"
+    /// answer would let providers destructively mutate conversation history
+    /// with NO surviving rollback markers. This is the ONE lane that refuses
+    /// loudly (the provider handlers map `Err` to `INTERNAL_ERROR` +
+    /// `LEDGER_WRITE_REFUSAL_COPY` with zero provider traffic; the
+    /// binding/pending identity lanes keep their silent no-op policy).
     pub fn record_rollback_row(
         &self,
         provider: &str,
@@ -925,7 +934,10 @@ impl PaneLedger {
         _now_ms: i64,
     ) -> std::io::Result<()> {
         let Some(root) = &self.root else {
-            return Ok(());
+            return Err(std::io::Error::other(format!(
+                "pane ledger DISABLED (no durable root) — refusing to record the rollback row \
+                 for ({provider}, {session_id}): durable-BEFORE-mutation cannot be satisfied"
+            )));
         };
         let mut index = self.guard();
         let dest = Self::rollback_path(root, provider, session_id);

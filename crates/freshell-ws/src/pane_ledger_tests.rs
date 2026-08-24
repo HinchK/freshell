@@ -92,6 +92,52 @@ fn disabled_ledger_is_a_silent_noop() {
     assert!(ledger.list_bindings().is_empty());
 }
 
+/// kata 1wxv delta-r1 F4 (disabled-mode honesty, durable-BEFORE-mutation): the
+/// ONE write the disabled ledger must REFUSE is the rollback-record row — a
+/// false "durable" answer would let providers destructively mutate history with
+/// no surviving markers. Every OTHER write keeps its silent no-op policy (the
+/// binding/pending identity lanes degrade gracefully).
+#[test]
+fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
+    let ledger = PaneLedger::disabled();
+    let payload = serde_json::json!({"version": 1, "entries": []});
+    let err = ledger
+        .record_rollback_row("claude", "sid", &payload, 1)
+        .expect_err("a disabled ledger must never report a rollback 'durable' write as Ok");
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(
+        err.to_string().contains("ledger DISABLED"),
+        "the error names the disabled mode: {err}"
+    );
+    // Nothing was insta-indexed either.
+    assert!(
+        ledger.load_rollback_row("claude", "sid").is_none(),
+        "a refused write lands nowhere"
+    );
+    // The other lanes keep their existing disabled policy (silent no-op).
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "claude",
+            session_id: "sid",
+            mode: "freshclaude",
+            cwd: None,
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            now_ms: 1,
+        })
+        .expect("binding writes keep their silent-no-op policy on a disabled ledger");
+    ledger
+        .record_pending("ph", "freshclaude", None, 1)
+        .expect("pending writes keep their silent-no-op policy on a disabled ledger");
+    ledger
+        .delete_rollback_row("claude", "sid")
+        .expect("a delete of a row that cannot exist stays a no-op");
+}
+
 #[test]
 fn writes_are_atomic_sibling_temp_plus_rename() {
     // After a successful write no *.tmp-* residue remains, and the row file

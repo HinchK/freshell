@@ -6444,6 +6444,13 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
 
   it('the freshcodex slash menu offers /undo but NEVER a /redo entry (codex is undo-only)', async () => {
     const store = createStore()
+    // The freshcodex server shape: undo stamped (paginated thread), redo never.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+    })
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -6462,11 +6469,98 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
       </Provider>,
     )
     await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
-
+    // The snapshot's turn text rendering IS the proof the capability stamps landed
+    // (the transcript reads the committed snapshot state), so the menu consult is
+    // deterministic without retries.
     fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
 
     expect(screen.getByRole('menuitem', { name: /\/undo/ })).toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: the slash menu hides /undo and /redo on a capability-false (legacy) snapshot, keeping only capability-free rows', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'legacy caps',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{ id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] }],
+    })
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first prompt')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    // Capability-free rows stay (the menu itself is alive).
+    expect(screen.getByRole('menuitem', { name: /\/compact/ })).toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: before capability discovery (no snapshot yet), the slash menu offers neither /undo nor /redo', async () => {
+    const store = createStore()
+    // The snapshot promise never resolves during this check — the pre-discovery state.
+    let resolveSnapshot: ((value: unknown) => void) | undefined
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => new Promise((resolve) => { resolveSnapshot = resolve }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    resolveSnapshot?.(rollbackCapableSnapshot())
+  })
+
+  it('delta-r1 F6: the view passes the snapshot redoableTurnIds through to the marker section (frozen markers hidden, current-epoch marker enabled)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rolledBackTurns: [
+        { id: 'u8', turnId: 'u8', role: 'user', summary: 'frozen marker', items: [{ id: 'u8-i', kind: 'text', text: 'frozen marker' }], rolledBack: true },
+        { id: 'a8', turnId: 'a8', role: 'assistant', summary: 'frozen answer', items: [{ id: 'a8-i', kind: 'text', text: 'frozen answer' }], rolledBack: true },
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'current marker', items: [{ id: 'u9-i', kind: 'text', text: 'current marker' }], rolledBack: true },
+      ],
+      rollback: { canRedo: true, undoneDepth: 2, redoableTurnIds: ['u9'] },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('frozen marker')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const buttons = Array.from(section.querySelectorAll('button[aria-label="Redo to here"]'))
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0].closest('div.flex.items-start')?.textContent).toContain('current marker')
+  })
+
+  it('delta-r1 F6 legacy: a rollback block WITHOUT redoableTurnIds offers no per-marker redo', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rollback: { canRedo: true, undoneDepth: 1 },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('rolled prompt')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(section.querySelectorAll('button[aria-label="Redo to here"]')).toHaveLength(0)
   })
 
   it('typed /redo on a freshcodex pane hits the composer RESERVED seam: pinned codex notice, NEVER a send (r3 correction 8)', async () => {

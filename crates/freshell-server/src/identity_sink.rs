@@ -251,6 +251,7 @@ mod tests {
                 removed_turns: vec![serde_json::json!({"id": "t1", "turnId": "t1"})],
                 prompt_text: "second prompt".into(),
                 at_ms: 101,
+                epoch: 0,
             },
             102,
         );
@@ -268,6 +269,51 @@ mod tests {
             ledger2.load_rollback_row("codex", "thr-1").is_some(),
             "boot scan indexes rollback rows"
         );
+    }
+
+    /// kata 1wxv delta-r1 F4 (disabled-mode honesty): over a DISABLED ledger the
+    /// rollback write propagates Err — never a false "durable" `Ok` that would
+    /// authorize a destructive provider rollback with no surviving record. Every
+    /// OTHER write lane keeps its existing silent-degrade policy (identity events
+    /// must never hard-fail a disabled store).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollback_record_write_over_a_disabled_ledger_reports_the_failure() {
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled());
+        let sink = LedgerIdentitySink::new(ledger);
+        let mut record = freshell_freshagent::RollbackRecord::empty(100);
+        record.push_entry(
+            freshell_freshagent::RollbackEntry {
+                removed_turns: vec![serde_json::json!({"id": "t1", "turnId": "t1"})],
+                prompt_text: "p".into(),
+                at_ms: 101,
+                epoch: 0,
+            },
+            102,
+        );
+        let err = sink
+            .record_rollback("codex", "thr-x", record)
+            .await
+            .expect_err("a disabled ledger propagates the rollback-write failure");
+        assert!(
+            err.to_string().contains("DISABLED"),
+            "the propagated error names the disabled mode: {err}"
+        );
+        assert!(
+            sink.load_rollback("codex", "thr-x").is_none(),
+            "nothing was recorded anywhere"
+        );
+        // The identity lanes keep their silent-degrade policy on a disabled store.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "s".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("binding writes keep their existing disabled-ledger policy");
     }
 
     /// kata 1wxv Task 4 (r1 discipline): the claude fork-adoption's binding write

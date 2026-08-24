@@ -3619,6 +3619,7 @@ mod tests {
             removed_turns,
             prompt_text: prompt.into(),
             at_ms: 90,
+            epoch: 0,
         }
     }
 
@@ -3636,7 +3637,7 @@ mod tests {
         assert_eq!(snap["capabilities"]["redo"], json!(true));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 })
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["msg_u2"] })
         );
         let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
         assert_eq!(bucket.len(), 1);
@@ -3680,8 +3681,8 @@ mod tests {
         let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 2 }),
-            "two undone USER steps — never entries.len() (1)"
+            json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["msg_u2", "msg_u3"] }),
+            "two undone USER steps — never entries.len(); every current-epoch user row is redoable"
         );
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 4);
     }
@@ -3697,8 +3698,8 @@ mod tests {
         let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
         assert_eq!(
             snap["rollback"],
-            json!({ "canRedo": false, "undoneDepth": 1 }),
-            "the stored bit cleared; the bucket's user-step count is untouched"
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "the stored bit cleared; the bucket's user-step count is untouched; no marker is redoable"
         );
         assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
         assert_eq!(
@@ -3748,7 +3749,7 @@ mod tests {
         assert_eq!(snapshot["capabilities"]["redo"], json!(true));
         assert_eq!(
             snapshot["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 })
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["msg-9"] })
         );
         assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("msg-9"));
         assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));

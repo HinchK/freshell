@@ -675,6 +675,7 @@ mod tests {
                 ],
                 prompt_text: "prompt two".into(),
                 at_ms: 90,
+                epoch: 0,
             },
             100,
         );
@@ -696,7 +697,7 @@ mod tests {
         assert_eq!(value["capabilities"]["redo"], json!(true));
         assert_eq!(
             value["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 })
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] })
         );
         let bucket = value["rolledBackTurns"].as_array().expect("bucket");
         let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();

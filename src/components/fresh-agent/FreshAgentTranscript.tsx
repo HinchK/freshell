@@ -619,6 +619,12 @@ export type FreshAgentTranscriptProps = {
   rolledBackTurns?: FreshAgentTurn[]
   canRedo?: boolean
   onRedoToTurn?: (turnId: string) => void
+  /** Delta-r1 F6: the SERVER-AUTHORED per-marker redo gate (`rollback.redoableTurnIds`
+   * from the snapshot — the exact turn ids at the ends of the redoable steps of the
+   * CURRENT epoch). Absent (a legacy server surface) or canRedo:false ⇒ no marker
+   * offers the affordance: frozen prior-epoch markers are NOT redoable (providers
+   * only restore the current epoch's tail). */
+  redoableTurnIds?: readonly string[]
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -638,6 +644,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   rolledBackTurns = [],
   canRedo = false,
   onRedoToTurn,
+  redoableTurnIds,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
@@ -646,6 +653,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
+  // F6: the per-marker redo gate set — membership-tested per user marker row.
+  const redoableTurnIdSet = useMemo(
+    () => (redoableTurnIds ? new Set(redoableTurnIds) : null),
+    [redoableTurnIds],
+  )
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
     showThinking,
@@ -817,7 +829,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
                   <span className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">rolled back</span>
                   <span className="text-sm text-muted-foreground">{turn.summary || turnPlainText(turn)}</span>
                 </div>
-                {canRedo && onRedoToTurn && turn.role === 'user' ? (
+                {canRedo && onRedoToTurn && turn.role === 'user' && redoableTurnIdSet?.has(turn.turnId ?? turn.id) ? (
                   <button
                     type="button"
                     onClick={() => onRedoToTurn(turn.turnId ?? turn.id)}

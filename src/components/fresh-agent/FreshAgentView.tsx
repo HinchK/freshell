@@ -2630,6 +2630,7 @@ export function FreshAgentView({
               rollbackBusy={isBusy}
               rolledBackTurns={snapshot?.rolledBackTurns ?? []}
               canRedo={canRedoNow}
+              redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
               agentLabel={descriptor?.label}
               showThinking={effectiveShowThinking}
               showTools={effectiveShowTools}

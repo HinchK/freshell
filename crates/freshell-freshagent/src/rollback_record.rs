@@ -128,6 +128,14 @@ pub struct RollbackEntry {
     /// Plain text of the first removed USER turn — the composer-refill payload.
     pub prompt_text: String,
     pub at_ms: i64,
+    /// Delta-r1 F8: the epoch this op ran in (its [`RollbackRecord`]'s
+    /// `current_epoch` at write time). Entries with `epoch ==
+    /// record.current_epoch` are the REDOABLE tail; anything older is a frozen
+    /// prior-epoch marker. `#[serde(default)]` maps pre-F8 disk rows to epoch 0
+    /// (the record's `current_epoch` also defaults to 0, so a pre-F8 bucket
+    /// reads as one epoch — the delay-compat rule).
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 /// The durable record (decision 10's record), keyed `(provider, sessionId)`.
@@ -155,6 +163,14 @@ pub struct RollbackRecord {
     /// fresh record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_tip_uuid: Option<String>,
+    /// Delta-r1 F8: the CURRENT epoch counter. A new undo landing on a record
+    /// whose `redo_destroyed` bit was set at load (or, claude-lane, whose chain
+    /// root re-rooted) bumps this FIRST — every existing entry freezes with its
+    /// own epoch — then the new entry is spliced under the bumped value. The
+    /// redoable tail (F6) is exactly `entries[*].epoch == current_epoch`.
+    /// `#[serde(default)]`: pre-F8 disk rows parse to 0 (version stays 1).
+    #[serde(default)]
+    pub current_epoch: u32,
     /// Removed display turns as verbatim FreshAgentTurn JSON.
     pub entries: Vec<RollbackEntry>,
 }
@@ -168,6 +184,7 @@ impl RollbackRecord {
             can_redo: false,
             original_session_id: None,
             original_tip_uuid: None,
+            current_epoch: 0,
             entries: Vec::new(),
         }
     }
@@ -199,6 +216,30 @@ impl RollbackRecord {
     /// order) + lifts last_op_at_ms.
     pub fn push_entry(&mut self, entry: RollbackEntry, now_ms: i64) {
         self.entries.push(entry);
+        self.last_op_at_ms = now_ms;
+    }
+
+    /// Delta-r1 F8 — open a NEW epoch: bump `current_epoch`. Every existing
+    /// entry freezes with its own epoch value (untouched — the frozen prefix is
+    /// exactly `epoch < current_epoch`). The caller clears `redo_destroyed`
+    /// itself (the redo fields then describe the new chain). Position never
+    /// reads timestamps.
+    pub fn begin_new_epoch(&mut self) {
+        self.current_epoch = self.current_epoch.saturating_add(1);
+    }
+
+    /// Delta-r1 F8 — splice a new UNDO entry under literal epoch bookkeeping:
+    /// AFTER every frozen (older-epoch) entry, BEFORE the existing same-epoch
+    /// entries (sequential undos within one epoch each remove an
+    /// earlier-in-conversation step, so the current-epoch block reads
+    /// conversation-order ascending). Entry positions never consult `at_ms`.
+    pub fn splice_undo_entry(&mut self, entry: RollbackEntry, now_ms: i64) {
+        let insert_at = self
+            .entries
+            .iter()
+            .take_while(|e| e.epoch < self.current_epoch)
+            .count();
+        self.entries.insert(insert_at, entry);
         self.last_op_at_ms = now_ms;
     }
 }
@@ -377,10 +418,42 @@ pub(crate) fn stamp_rollback_snapshot(
             .iter()
             .filter(|t| t.get("role").and_then(Value::as_str) == Some("user"))
             .count();
+        // Delta-r1 F6: the per-marker "Redo to here" gate set — server-AUTHORED
+        // (the single source): the exact USER-role turn ids at the ends of the
+        // redoable steps of the CURRENT epoch (`epoch == current_epoch` — F8).
+        // Frozen prior-epoch markers are never redoable (providers only restore
+        // the current epoch's tail), and codex (undo-only) + any can_redo:false
+        // record get the empty set.
         snapshot["rolledBackTurns"] = json!(bucket);
-        snapshot["rollback"] = json!({ "canRedo": can_redo, "undoneDepth": undone_depth });
+        snapshot["rollback"] = json!({
+            "canRedo": can_redo,
+            "undoneDepth": undone_depth,
+            "redoableTurnIds": redoable_turn_ids(record, can_redo),
+        });
     }
     revision_basis.max(record.last_op_at_ms)
+}
+
+/// Delta-r1 F6: the USER-role turn ids of the current epoch's entries — the
+/// per-marker redo gate set. Empty whenever redo is unavailable (`can_redo`
+/// false, e.g. codex's permanent undo-only bit or a destroy-survived bucket).
+pub(crate) fn redoable_turn_ids(record: &RollbackRecord, can_redo: bool) -> Vec<String> {
+    if !can_redo {
+        return Vec::new();
+    }
+    record
+        .entries
+        .iter()
+        .filter(|e| e.epoch == record.current_epoch)
+        .flat_map(|e| e.removed_turns.iter())
+        .filter(|t| t.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|t| {
+            t.get("turnId")
+                .or_else(|| t.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Decision 5: any new submission (send/steer/queue firing) permanently
@@ -420,7 +493,184 @@ mod tests {
             ],
             prompt_text: format!("prompt{id_suffix}"),
             at_ms: 100,
+            epoch: 0,
         }
+    }
+
+    /// F8 (delta-r1): literal epoch bookkeeping replaces the timestamp-heuristic
+    /// split — `splice_undo_entry` inserts AFTER every frozen (older-epoch) entry
+    /// and BEFORE the existing same-epoch entries, so sequential undos within one
+    /// epoch read in conversation order ascending.
+    #[test]
+    fn splice_undo_entry_orders_same_epoch_undos_conversation_ascending() {
+        let mut record = RollbackRecord::empty(50);
+        // undo #1 removed the LAST turn-step (t4); undo #2 removed the EARLIER
+        // t3 step — the bucket must read t3 then t4.
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t4", "user")],
+                prompt_text: "p4".into(),
+                at_ms: 60,
+                epoch: record.current_epoch,
+            },
+            60,
+        );
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t3", "user")],
+                prompt_text: "p3".into(),
+                at_ms: 70,
+                epoch: record.current_epoch,
+            },
+            70,
+        );
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| e.prompt_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p3", "p4"],
+            "the second undo's entry splices BEFORE the first's within one epoch"
+        );
+        assert!(record.entries.iter().all(|e| e.epoch == 0));
+    }
+
+    /// F8 (delta-r1) case (a): a record whose destroy bit was set at load starts
+    /// a NEW epoch — bump `current_epoch`, entries KEEP their own epochs (all
+    /// freeze), and the next undo pushes behind them; a further same-epoch undo
+    /// splices ahead of that new-epoch block.
+    #[test]
+    fn splice_undo_entry_after_destroy_freezes_the_prior_epoch_then_orders_the_new_epoch() {
+        let mut record = RollbackRecord::empty(50);
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t4", "user")],
+                prompt_text: "p4".into(),
+                at_ms: 60,
+                epoch: record.current_epoch,
+            },
+            60,
+        );
+        // A submission destroyed redo; the NEXT undo sees the bit at load.
+        record.destroy_redo(61);
+        // …the undo handler's epoch-opening leg:
+        assert!(record.redo_destroyed, "destroyed bit set at load");
+        record.redo_destroyed = false; // the new epoch clears only the redo chain state
+        record.begin_new_epoch();
+        assert_eq!(record.current_epoch, 1);
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("n2", "user")],
+                prompt_text: "pn2".into(),
+                at_ms: 70,
+                epoch: record.current_epoch,
+            },
+            70,
+        );
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("n1", "user")],
+                prompt_text: "pn1".into(),
+                at_ms: 80,
+                epoch: record.current_epoch,
+            },
+            80,
+        );
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| (e.epoch, e.prompt_text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "p4"), (1, "pn1"), (1, "pn2")],
+            "frozen prior-epoch prefix first (untouched epochs), then the new epoch ascending"
+        );
+    }
+
+    /// F8 delay-compat (delta-r1): a record written BEFORE the epoch fields
+    /// existed parses with `epoch: 0` / `currentEpoch: 0` (serde defaults — the
+    /// schema version stays 1).
+    #[test]
+    fn pre_epoch_records_parse_to_epoch_zero() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 50,
+            "redoDestroyed": false,
+            "canRedo": true,
+            "entries": [{
+                "removedTurns": [{ "id": "t1", "turnId": "t1", "role": "user" }],
+                "promptText": "p1",
+                "atMs": 40,
+            }],
+        });
+        let record: RollbackRecord = serde_json::from_value(legacy).expect("pre-epoch JSON parses");
+        assert_eq!(record.current_epoch, 0);
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].epoch, 0);
+    }
+
+    /// F6 (delta-r1): the snapshot's rollback block lists the redoable per-marker
+    /// gate — the EXACT user-role turn ids of the CURRENT epoch's entries (the
+    /// tail of the marker bucket), never frozen prior-epoch ids.
+    #[test]
+    fn stamp_rollback_snapshot_lists_only_current_epoch_user_ids_as_redoable() {
+        let mut record = RollbackRecord::empty(50);
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t4", "user"), marker_turn("a4", "assistant")],
+                prompt_text: "p4".into(),
+                at_ms: 60,
+                epoch: 0,
+            },
+            60,
+        );
+        record.destroy_redo(61);
+        record.redo_destroyed = false;
+        record.begin_new_epoch();
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("n1", "user"), marker_turn("b1", "assistant")],
+                prompt_text: "pn1".into(),
+                at_ms: 70,
+                epoch: 1,
+            },
+            70,
+        );
+        record.set_can_redo(true, 71);
+        let mut snapshot = json!({ "revision": 7 });
+        stamp_rollback_snapshot(&mut snapshot, 7, &record, true);
+        assert_eq!(
+            snapshot["rollback"]["redoableTurnIds"],
+            json!(["n1"]),
+            "only the CURRENT epoch's user-row ids gate the per-marker redo affordance \
+             (the assistant row of a step is never a click target; the frozen epoch is not)"
+        );
+    }
+
+    /// F6 (delta-r1): when redo is unavailable the redoable set is EMPTY (a
+    /// frozen-only bucket — or codex's undo-only false bit — renders no per-marker
+    /// redo affordance).
+    #[test]
+    fn stamp_rollback_snapshot_redoable_ids_are_empty_when_redo_is_unavailable() {
+        let mut record = RollbackRecord::empty(50);
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("t4", "user")],
+                prompt_text: "p4".into(),
+                at_ms: 60,
+                epoch: 0,
+            },
+            60,
+        );
+        record.set_can_redo(false, 61);
+        let mut snapshot = json!({ "revision": 7 });
+        stamp_rollback_snapshot(&mut snapshot, 7, &record, false);
+        assert_eq!(
+            snapshot["rollback"]["redoableTurnIds"],
+            json!([]),
+            "canRedo:false ⇒ no marker is redoable, even in the current epoch"
+        );
     }
 
     #[test]
@@ -490,6 +740,7 @@ mod tests {
                 removed_turns: vec![marker_turn("u2", "user"), marker_turn("a2", "assistant")],
                 prompt_text: "prompt two".into(),
                 at_ms: 90,
+                epoch: 0,
             },
             100,
         );
@@ -511,8 +762,9 @@ mod tests {
             .is_none());
         assert_eq!(
             snapshot["rollback"],
-            json!({ "canRedo": true, "undoneDepth": 1 }),
-            "undoneDepth is the USER-role step count of the bucket (u2), never rows.len()"
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] }),
+            "undoneDepth is the USER-role step count of the bucket (u2), never rows.len(); \
+             F6: the redoable set lists the current epoch's user-row ids"
         );
     }
 

@@ -1524,18 +1524,19 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     expect(section).toHaveTextContent('third answer')
   })
 
-  it('per-row Redo to here fires onRedoToTurn only on user rows when canRedo', () => {
+  it('per-row Redo to here fires onRedoToTurn only on redoable user rows when canRedo', () => {
     const onRedoToTurn = vi.fn()
     render(
       <FreshAgentTranscript
         turns={[]}
         rolledBackTurns={markerTurns()}
         canRedo
+        redoableTurnIds={['u2', 'u3']}
         onRedoToTurn={onRedoToTurn}
       />,
     )
 
-    // Only the two USER rows expose the button; assistant rows never do.
+    // Only the two redoable USER rows expose the button; assistant rows never do.
     const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
     expect(redoButtons).toHaveLength(2)
     fireEvent.click(redoButtons[0])
@@ -1544,12 +1545,50 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     expect(onRedoToTurn).toHaveBeenCalledWith('u3')
   })
 
+  it('delta-r1 F6: frozen prior-epoch markers (absent from redoableTurnIds) expose NO Redo to here', () => {
+    // undo → send destroys redo → a NEW epoch's undos land behind the frozen ones:
+    // the marker union is [frozen u2/a2 rows, current u3/a3 rows] — only the current
+    // epoch's tail is restorable, so only ITS user rows carry the affordance.
+    const onRedoToTurn = vi.fn()
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        redoableTurnIds={['u3']}
+        onRedoToTurn={onRedoToTurn}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
+    expect(redoButtons).toHaveLength(1)
+    fireEvent.click(redoButtons[0])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u3')
+    expect(onRedoToTurn).toHaveBeenCalledTimes(1)
+  })
+
+  it('delta-r1 F6 legacy harmlessness: an absent redoableTurnIds (legacy server surface) exposes NO per-marker redo, even with canRedo', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        onRedoToTurn={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+  })
+
   it('exposes no Redo to here affordance when canRedo is false', () => {
     render(
       <FreshAgentTranscript
         turns={[]}
         rolledBackTurns={markerTurns()}
         canRedo={false}
+        redoableTurnIds={['u2', 'u3']}
         onRedoToTurn={vi.fn()}
       />,
     )

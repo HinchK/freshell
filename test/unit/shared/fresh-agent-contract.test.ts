@@ -104,6 +104,29 @@ describe('rollback surface (kata 1wxv)', () => {
     })
     expect(parsed.success).toBe(true)
   })
+  it('delta-r1 F6: the rollback block accepts the optional redoableTurnIds gate set, and the block stays strict', () => {
+    const base = {
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle' as const,
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true, undo: true, redo: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [] as unknown[], extensions: {},
+    }
+    // The pre-F6 surface (no key) still parses — legacy harmlessness.
+    expect(FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1 },
+    }).success).toBe(true)
+    // The F6 server shape parses; the set is exactly a string array.
+    const withGate = FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1, redoableTurnIds: ['t2'] },
+    })
+    expect(withGate.success).toBe(true)
+    expect(withGate.data?.rollback?.redoableTurnIds).toEqual(['t2'])
+    // Strictness holds inside the block: undeclared keys reject.
+    expect(FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1, redoableTurnIdsTypo: ['t2'] },
+    }).success).toBe(false)
+  })
   it('snapshot remains strict against undeclared keys', () => {
     const parsed = FreshAgentSnapshotSchema.safeParse({
       sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
