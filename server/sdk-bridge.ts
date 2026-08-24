@@ -107,29 +107,56 @@ export function createClaudeSdkOptions(input: ClaudeSdkOptionsInput): SdkOptions
 }
 
 /**
- * Normalize raw SDK slash-command rows (create-time probe result or a
- * commands_changed push) through the shared contract schema at the state
- * boundary. Push-level tolerance: if ANY row is invalid, the whole payload is
- * rejected (returns null) so a malformed push cannot partially clobber the
- * prior catalog. Field coercion before validation: description absent/non-string
- * becomes ''; aliases is dropped unless it is an array (the SDK has been observed
- * emitting explicit null); name passes through so schema min(1) can reject it.
+ * Normalize ONE raw SDK slash-command row through the shared contract schema.
+ * Field coercion before validation: description absent/non-string becomes '';
+ * aliases is dropped unless it is an array (the SDK has been observed emitting
+ * explicit null); name passes through so schema min(1) can reject it. Returns
+ * null when the row cannot be repaired.
+ */
+function normalizeSlashCommandRow(row: unknown): FreshAgentSessionCommand | null {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return null
+  const raw = row as { name?: unknown; description?: unknown; argumentHint?: unknown; aliases?: unknown }
+  const candidate: Record<string, unknown> = {
+    name: raw.name,
+    description: typeof raw.description === 'string' ? raw.description : '',
+  }
+  if (typeof raw.argumentHint === 'string') candidate.argumentHint = raw.argumentHint
+  if (Array.isArray(raw.aliases)) candidate.aliases = raw.aliases
+  const parsed = FreshAgentSessionCommandSchema.safeParse(candidate)
+  return parsed.success ? parsed.data : null
+}
+
+/**
+ * Normalize raw SDK slash-command rows from a commands_changed push through the
+ * shared contract schema at the state boundary. Push-level tolerance: if ANY row
+ * is invalid, the whole payload is rejected (returns null) so a malformed push
+ * cannot partially clobber the prior catalog.
  */
 function normalizeSlashCommandRows(rows: unknown): FreshAgentSessionCommand[] | null {
   if (!Array.isArray(rows)) return null
   const normalized: FreshAgentSessionCommand[] = []
   for (const row of rows) {
-    if (!row || typeof row !== 'object' || Array.isArray(row)) return null
-    const raw = row as { name?: unknown; description?: unknown; argumentHint?: unknown; aliases?: unknown }
-    const candidate: Record<string, unknown> = {
-      name: raw.name,
-      description: typeof raw.description === 'string' ? raw.description : '',
-    }
-    if (typeof raw.argumentHint === 'string') candidate.argumentHint = raw.argumentHint
-    if (Array.isArray(raw.aliases)) candidate.aliases = raw.aliases
-    const parsed = FreshAgentSessionCommandSchema.safeParse(candidate)
-    if (!parsed.success) return null
-    normalized.push(parsed.data)
+    const parsed = normalizeSlashCommandRow(row)
+    if (parsed === null) return null
+    normalized.push(parsed)
+  }
+  return normalized
+}
+
+/**
+ * Create-time probe variant: invalid rows are DROPPED individually, keeping their
+ * valid siblings — a probe has no prior catalog a partial payload could clobber,
+ * and one malformed SDK row must not leave the pane with no command menu until a
+ * mid-session push happens to arrive (the per-row-drop convention of the opencode
+ * catalog's normalizeOpencodeCommandCatalog). Returns null only when the payload
+ * is not an array at all; an empty listing is a real, publishable catalog.
+ */
+function normalizeSlashCommandProbeRows(rows: unknown): FreshAgentSessionCommand[] | null {
+  if (!Array.isArray(rows)) return null
+  const normalized: FreshAgentSessionCommand[] = []
+  for (const row of rows) {
+    const parsed = normalizeSlashCommandRow(row)
+    if (parsed !== null) normalized.push(parsed)
   }
   return normalized
 }
@@ -267,17 +294,21 @@ export class SdkBridge extends EventEmitter {
     // Fire-and-forget slash-command catalog probe (VAL-B: resolves in ~1.2–1.5s over
     // the control channel, independent of the lazy streamed init frame). NEVER awaited —
     // an await here would hold the create path on a low-single-digit-second round-trip.
-    // Rejection or an invalid payload = catalog absent; the session is unaffected.
+    // Rejection or a non-array payload = catalog absent; individually malformed rows
+    // are dropped, keeping their valid siblings. The session is unaffected either way.
     void sdkQuery.supportedCommands().then((rows) => {
       const current = this.sessions.get(sessionId)
       if (!current) return
       // Stale-probe rule: a commands_changed push incorporated since the probe was
       // fired carries the fresher catalog; the late probe result must not clobber it.
       if (current.commandsChangedSeen) return
-      const normalized = normalizeSlashCommandRows(rows)
+      const normalized = normalizeSlashCommandProbeRows(rows)
       if (normalized === null) {
         log.debug({ sessionId }, 'Ignoring invalid supportedCommands probe payload')
         return
+      }
+      if (normalized.length < rows.length) {
+        log.debug({ sessionId, dropped: rows.length - normalized.length }, 'Dropped invalid rows from supportedCommands probe payload')
       }
       current.commandCatalog = normalized
       this.maybePublishSessionCommands(sessionId, current)

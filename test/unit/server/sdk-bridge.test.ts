@@ -1953,6 +1953,36 @@ describe('SdkBridge', () => {
       expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
     })
 
+    it('drops individually-invalid rows from the create-time probe and still publishes the valid siblings', async () => {
+      mockKeepStreamOpen = true
+      mockSupportedCommandsError = null
+      const deferred = makeSupportedCommandsDeferred()
+      mockSupportedCommandsDeferred = deferred
+      mockMessages.push(initFrame())
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // There is no prior catalog a partial probe could clobber, so one malformed
+      // row (empty name — the one field coercion cannot repair) or a non-object row
+      // is dropped individually, never nuking the valid siblings (the per-row-drop
+      // convention of the opencode catalog). Push paths stay all-or-nothing.
+      deferred.resolve([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+        { name: '', description: 'invalid: no name', argumentHint: '' },
+        'not-an-object-row',
+        { name: 'doctor', description: 'Health-check the setup', argumentHint: '' },
+      ])
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)?.commands).toEqual([
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+      ])
+      expect(received.filter((m) => m.type === 'sdk.session.changed')).toHaveLength(1)
+    })
+
     it('tolerates a rejected supportedCommands probe (session unaffected, commands absent)', async () => {
       mockKeepStreamOpen = true
       mockSupportedCommandsError = new Error('probe blew up')
