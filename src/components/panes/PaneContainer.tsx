@@ -46,12 +46,13 @@ import { cancelCreate } from '@/lib/create-cancellation'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
-import type { ProjectGroup, CodingCliSession } from '@/store/types'
+import type { ProjectGroup } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
+import { findIndexedSessionById } from '@/lib/fresh-agent-context-usage'
 import type { SessionLocator } from '@shared/ws-protocol'
 
 // Stable empty object to avoid selector memoization issues
@@ -124,20 +125,6 @@ function resolvePaneRuntimeMeta(
     if (providerMatches.length === 1) return providerMatches[0]
   }
 
-  return undefined
-}
-
-function findIndexedSessionById(
-  projects: ProjectGroup[],
-  provider: CodingCliProviderName,
-  sessionId: string,
-): CodingCliSession | undefined {
-  for (const project of projects) {
-    const match = project.sessions.find((session) => (
-      session.provider === provider && session.sessionId === sessionId
-    ))
-    if (match) return match
-  }
   return undefined
 }
 
