@@ -207,9 +207,9 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
 
 async function openFreshAgentSettings(page: Page) {
   const pane = page.getByRole('group').filter({
-    // The pane banner badge renders the provider lowercase ("freshopencode");
-    // fresh-agent.spec.ts's identical helper filters on providerName.toLowerCase().
-    has: page.getByText('freshopencode', { exact: true }),
+    // The pane header identifies a fresh-agent pane by its agent-icon tooltip
+    // ("<Label> (<sessionType> pane)") — there is no session-type text label.
+    has: page.getByTitle('Freshopencode (freshopencode pane)'),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 

@@ -44,9 +44,11 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
 }
 
 async function openFreshAgentSettings(page: any, providerName: string) {
-  const headerIdentity = providerName.toLowerCase()
+  // The pane header identifies a fresh-agent pane by its agent-icon tooltip
+  // ("<Label> (<sessionType> pane)") — there is no session-type text label.
+  const sessionType = providerName.toLowerCase()
   const pane = page.getByRole('group').filter({
-    has: page.getByText(headerIdentity, { exact: true }),
+    has: page.getByTitle(`${providerName} (${sessionType} pane)`),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -194,7 +196,7 @@ test.describe('Fresh Agent', () => {
     const header = freshcodexPane.getByRole('banner', { name: 'Pane: freshell' })
     await expect(header).toBeVisible()
 
-    await expect(header.getByText('freshcodex', { exact: true })).toBeVisible()
+    await expect(header.getByTitle('Freshcodex (freshcodex pane)')).toBeVisible()
     await expect(header.getByText('freshell', { exact: true })).toBeVisible()
   })
 
@@ -387,6 +389,16 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
     await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
+    // The status strip shrank the transcript viewport by one row, so the
+    // "Jump to your message" glom chip overlays the strip-adjacent top band
+    // where the Thinking toggle lands. Dismiss it via its real affordance
+    // immediately before the toggle click — the activity-toggle scroll above
+    // is what brings the user turn's clip (and thus the chip) back.
+    const glomChip = freshcodexRoot.getByRole('button', { name: /Jump to your message/ })
+    if (await glomChip.isVisible()) {
+      await glomChip.click()
+      await expect(glomChip).toHaveCount(0, { timeout: 5_000 })
+    }
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).click()
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
@@ -960,7 +972,7 @@ test.describe('Fresh Agent', () => {
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
     await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
-    await expect(page.getByText('freshcodex', { exact: true })).toBeVisible()
+    await expect(page.getByTitle('Freshcodex (freshcodex pane)')).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({

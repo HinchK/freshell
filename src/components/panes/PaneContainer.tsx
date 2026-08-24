@@ -139,13 +139,14 @@ function resolveFreshAgentRuntimeMeta(
   if (provider && sessionId) {
     const indexed = findIndexedSessionById(indexedProjects, provider, sessionId)
     if (indexed) {
+      // Fresh-agent pane headers carry dir+branch only — context usage lives
+      // in the session status strip between transcript and composer.
       return {
         cwd: indexed.cwd,
         checkoutRoot: indexed.projectPath,
         repoRoot: indexed.projectPath,
         branch: indexed.gitBranch,
         isDirty: indexed.isDirty,
-        tokenUsage: indexed.tokenUsage,
       }
     }
   }
@@ -164,20 +165,11 @@ function resolveFreshAgentRuntimeMeta(
     branch = session.snapshot.worktrees[0].branch
   }
 
-  const snapshotTokenUsage = session.snapshot?.tokenUsage
   const cwd = session.cwd ?? content.initialCwd
   return {
     cwd,
     checkoutRoot: cwd,
     branch,
-    tokenUsage: snapshotTokenUsage && {
-      inputTokens: snapshotTokenUsage.inputTokens,
-      outputTokens: snapshotTokenUsage.outputTokens,
-      cachedTokens: snapshotTokenUsage.cachedTokens ?? 0,
-      totalTokens: snapshotTokenUsage.totalTokens,
-      ...(snapshotTokenUsage.contextTokens !== undefined && { contextTokens: snapshotTokenUsage.contextTokens }),
-      ...(snapshotTokenUsage.compactPercent !== undefined && { compactPercent: snapshotTokenUsage.compactPercent }),
-    },
   }
 }
 
