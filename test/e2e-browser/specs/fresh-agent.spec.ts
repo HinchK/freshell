@@ -273,6 +273,10 @@ test.describe('Fresh Agent', () => {
     const tooltip = await meter.getAttribute('title')
     expect(tooltip).toContain('96,000 / 200,000 tokens (47% full)')
     expect(tooltip).toContain('compacts at 100%')
+    // Wide-pane (≥520px) counterpart to the mobile collapse proof: the word
+    // "context" is displayed here, closing the mobile test's hidden-only
+    // asymmetry (the word is display:none'd on mobile, never removed).
+    await expect(paneRoot.getByText('context', { exact: true })).toBeVisible()
 
     // Desktop reference width for the mobile collapse proof (the cluster is the
     // role-bearing span: label + track + numeral). Recorded in the run log.
