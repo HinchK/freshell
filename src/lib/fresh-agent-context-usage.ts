@@ -28,8 +28,9 @@ export function findIndexedSessionById(
  * tail. sessionRef is the canonical durable identity — normalization flows can
  * strip resumeSessionId while retaining sessionRef, so a restored pane may
  * present sessionRef-only. The sessionRef tail only applies when its provider
- * matches the pane's provider. */
-function durableSessionId(
+ * matches the pane's provider. Exported for the view's last-known-usage cache
+ * key so both read the exact same identity chain. */
+export function freshAgentContextSessionId(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): string | undefined {
@@ -49,7 +50,7 @@ export function resolveFreshAgentContextUsage(
   session: FreshAgentSessionState | undefined,
   projects: ProjectGroup[],
 ): FreshAgentContextUsage | null {
-  const sessionId = durableSessionId(content, session)
+  const sessionId = freshAgentContextSessionId(content, session)
   if (!sessionId) return null
   const indexed = findIndexedSessionById(projects, content.provider, sessionId)
   const usage = indexed?.tokenUsage

@@ -6517,6 +6517,110 @@ describe('FreshAgentView session status strip', () => {
     expect(within(dialog).getByText('Claude Opus 5 (1M context)')).toBeInTheDocument()
   })
 
+  it('keeps the last known meter when the sessions window drops the row (window churn never blanks a reported meter)', async () => {
+    const store = createStore()
+    store.dispatch(applySessionsPatch({
+      removeProjectPaths: [],
+      upsertProjects: [{
+        projectPath: '/repo/strip',
+        sessions: [{
+          provider: 'claude' as const,
+          sessionType: 'freshclaude',
+          sessionId: 'claude-strip-usage',
+          projectPath: '/repo/strip',
+          cwd: '/repo/strip',
+          lastActivityAt: 1,
+          tokenUsage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            totalTokens: 2,
+            contextTokens: 96000,
+            compactPercent: 47,
+            compactThresholdTokens: 200000,
+          },
+        }],
+      }],
+    }))
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-churn',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+
+    // Sidebar search returns / the 50-session cap eviction REPLACE the projects
+    // window wholesale; the already-reported meter must not revert to unknown.
+    act(() => {
+      store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
+    })
+
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+    expect(screen.queryByText('context —')).toBeNull()
+  })
+
+  it.each([
+    ['freshclaude', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
+    ['kilroy', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
+  ] as const)('upgrades a catalog-only %s model on the chip once the probe resolves (its display name wins over the raw id)', async (sessionType, modelId, displayName, provider) => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType,
+      runtimeProvider: provider,
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: modelId,
+        displayName,
+        provider,
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType,
+            provider,
+            createRequestId: `req-strip-catalog-${sessionType}`,
+            sessionId: `ses_strip_catalog_${sessionType}`,
+            status: 'connected',
+            model: modelId,
+          }}
+        />
+      </Provider>,
+    )
+
+    // Raw id renders immediately — never blank, never "Loading".
+    expect(screen.getByRole('button', { name: `Model: ${modelId} — change model` })).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: `Model: ${displayName} — change model` })).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: `Model: ${modelId} — change model` })).toBeNull()
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith(sessionType, expect.anything())
+  })
+
   it('upgrades a catalog-only freshopencode model to its catalog display name once the probe resolves', async () => {
     apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
       ok: true,

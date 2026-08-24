@@ -42,7 +42,11 @@ import {
 } from '@shared/fresh-agent-turns'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
-import { resolveFreshAgentContextUsage } from '@/lib/fresh-agent-context-usage'
+import {
+  freshAgentContextSessionId,
+  resolveFreshAgentContextUsage,
+  type FreshAgentContextUsage,
+} from '@/lib/fresh-agent-context-usage'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -697,18 +701,25 @@ export function FreshAgentView({
   const stripStaticModelLabel = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType]
     ?.find((option) => option.value === stripModelId)?.label
   const [stripProbedModelLabel, setStripProbedModelLabel] = useState<string | null>(null)
-  // freshopencode display-name upgrade: its static table is empty ("live
-  // catalog only"), so without this probe the chip would permanently show raw
-  // ids. Same endpoint the settings popover calls (5-min server cache +
+  // Catalog display-name upgrade: freshopencode's static table is empty
+  // ("live catalog only"), and freshclaude/kilroy users can now pick
+  // catalog-only models in the shared dialog — without this probe both would
+  // permanently render raw ids on the chip ("raw id is tooltip-only" is the
+  // contract). Same endpoint the settings popover calls (5-min server cache +
   // in-flight dedupe). Re-probes when the active model changes; the raw id
   // renders immediately and survives a catalog failure — never blank, never
   // "Loading". Cancelled-flag guard matches the sibling probe effects
   // (FreshAgentModelDialog/FreshAgentSettingsButton).
+  const stripProbeSessionType = paneContent.sessionType === 'freshopencode'
+    || paneContent.sessionType === 'freshclaude'
+    || paneContent.sessionType === 'kilroy'
+    ? paneContent.sessionType
+    : null
   useEffect(() => {
     setStripProbedModelLabel(null)
-    if (paneContent.sessionType !== 'freshopencode' || !stripModelId || stripStaticModelLabel) return
+    if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel) return
     let cancelled = false
-    void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
+    void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
       .then((result) => {
         if (cancelled) return
         setStripProbedModelLabel(
@@ -721,7 +732,7 @@ export function FreshAgentView({
         if (!cancelled) setStripProbedModelLabel(null)
       })
     return () => { cancelled = true }
-  }, [paneContent.sessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel])
+  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel])
   const stripModelLabel = stripStaticModelLabel
     ?? stripProbedModelLabel
     ?? stripModelId
@@ -731,7 +742,23 @@ export function FreshAgentView({
   // parenthetical (raw ids carry none and pass through unchanged).
   const stripModelLabelShort = stripModelLabel.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
   const stripModelTooltip = `${stripModelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
-  const contextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
+  const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
+  const liveContextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
+  // Sidebar-window churn guard: `projects` is the sidebar's search/pagination
+  // window, replaced wholesale by each sidebar fetch — when this pane's row
+  // drops out (search results, the 50-session cap), the live lookup goes null
+  // and the meter would falsely revert to "context —" even though the provider
+  // already reported usage. Keep the last known reading per durable session id
+  // while this view is mounted; the meter self-heals the moment the row
+  // re-enters the window.
+  const lastKnownUsageRef = useRef(new Map<string, FreshAgentContextUsage>())
+  useEffect(() => {
+    if (liveContextUsage && contextSessionId) {
+      lastKnownUsageRef.current.set(contextSessionId, liveContextUsage)
+    }
+  }, [liveContextUsage, contextSessionId])
+  const contextUsage = liveContextUsage
+    ?? (contextSessionId ? lastKnownUsageRef.current.get(contextSessionId) ?? null : null)
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (
