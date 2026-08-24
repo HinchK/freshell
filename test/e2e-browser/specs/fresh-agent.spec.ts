@@ -594,7 +594,10 @@ test.describe('Fresh Agent', () => {
     await expect(header).toBeVisible()
 
     await expect(header.getByTitle('Codex (freshcodex pane)')).toBeVisible()
-    await expect(header.getByText('freshell', { exact: true })).toBeVisible()
+    // ~160px pane: the dir/branch meta hides entirely at ≤480px (approved
+    // preview: "in narrow mobile panes the meta hides entirely"); identity
+    // persists via the icon tooltips.
+    await expect(header.getByText('freshell', { exact: true })).toHaveCount(0)
   })
 
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {

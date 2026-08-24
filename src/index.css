@@ -36,6 +36,14 @@ html {
   min-width: min-content;
 }
 
+/* Narrow mobile panes (approved preview): the dir/branch meta hides entirely —
+   the icons + title carry the header; the strip below still shows context. */
+@container (max-width: 480px) {
+  .pane-header--fresh-agent .pane-header-fresh-agent-meta {
+    display: none;
+  }
+}
+
 @container (max-width: 280px) {
   .pane-header--fresh-agent .pane-header-actions {
     gap: 0.25rem;
