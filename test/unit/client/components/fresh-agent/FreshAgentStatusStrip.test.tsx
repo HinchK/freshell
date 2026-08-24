@@ -103,7 +103,7 @@ describe('FreshAgentStatusStrip', () => {
     [89, 'warn'],
     [90, 'hot'],
     [91, 'hot'],
-  ])('applies severity tier %s at %i% (boundaries pinned: 69/70, 89/90)', (percent, tier) => {
+  ])('severity tier at %i visible percent should be %s (boundaries pinned: 69/70, 89/90)', (percent, tier) => {
     const { container } = render(
       <FreshAgentStatusStrip
         modelLabel={MODEL_LABEL}
