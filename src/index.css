@@ -692,8 +692,12 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-composer {
   background: var(--fresh-agent-surface);
-  border-top-color: var(--fresh-agent-border);
   padding: 0.95rem 1.4rem max(env(safe-area-inset-bottom), 0.95rem);
+}
+
+.fresh-agent-style-serif .fresh-agent-status-strip {
+  border-top-color: var(--fresh-agent-border);
+  padding: 0 1.4rem;
 }
 
 .fresh-agent-style-serif .fresh-agent-composer-input {
@@ -1204,8 +1208,12 @@ html {
 
 .fresh-agent-style-mono .fresh-agent-composer {
   background: var(--fresh-agent-surface);
-  border-top: 1px solid var(--fresh-agent-border);
   padding: 0.75rem 1rem max(env(safe-area-inset-bottom), 0.75rem);
+}
+
+.fresh-agent-style-mono .fresh-agent-status-strip {
+  border-top: 1px solid var(--fresh-agent-border);
+  padding: 0 1rem;
 }
 
 .fresh-agent-style-mono .fresh-agent-composer-input {

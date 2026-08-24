@@ -14,7 +14,7 @@ import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
-import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
+import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
@@ -41,6 +41,8 @@ import {
   getFreshAgentDisplayTurnKey,
 } from '@shared/fresh-agent-turns'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
+import { resolveFreshAgentContextUsage } from '@/lib/fresh-agent-context-usage'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -59,6 +61,8 @@ import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAg
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
+import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
+import type { ProjectGroup } from '@/store/types'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
@@ -88,6 +92,9 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
+// Fallback for stores that do not register the sessions slice (keep the strip's
+// context lookup cheap and null instead of crashing).
+const EMPTY_PROJECTS: ProjectGroup[] = []
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
@@ -604,6 +611,11 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
+  // Status-strip context meter source: the session indexer's tokenUsage from
+  // the sidebar's session window (same lookup PaneContainer's pane meta uses).
+  // Deliberately NOT the fresh-agent snapshot tokenUsage — it never carries
+  // compactPercent, so reading it would be a silent "always unknown" bug.
+  const projects = useAppSelector((state) => state.sessions?.projects ?? EMPTY_PROJECTS)
   const hasUnresolvedLocalEchoForSession = useAppSelector((state) => {
     if (!paneContent.sessionId) return false
     return Object.values(state.panes.layouts).some((layout) => {
@@ -660,6 +672,7 @@ export function FreshAgentView({
   const [notice, setNotice] = useState<string | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
+  const openModelDialog = useCallback(() => setModelDialogOpen(true), [])
   // /model with a dead catalog opens the shared notice, not an empty dialog.
   const handleModelCatalogUnavailable = useCallback(() => setNotice(FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE), [])
   // Optimistic echo of the just-sent user message: the transcript renders
@@ -674,6 +687,51 @@ export function FreshAgentView({
   // so a resend can happen at most once per failed request (loop-proof).
   const lostSessionRetryRef = useRef<Set<string>>(new Set())
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
+  // Status-strip model display: the chip mirrors the LIVE session model when
+  // the runtime reports one, else the staged/effective pane model. Label
+  // resolution maps the id through the static table by exact match only —
+  // never the default-substituting resolveFreshAgentModelOption helper, so a
+  // catalog-only id renders its raw id instead of masquerading as the default
+  // (it upgrades to the catalog displayName via the probe below).
+  const stripModelId = agentSession?.model ?? resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
+  const stripStaticModelLabel = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType]
+    ?.find((option) => option.value === stripModelId)?.label
+  const [stripProbedModelLabel, setStripProbedModelLabel] = useState<string | null>(null)
+  // freshopencode display-name upgrade: its static table is empty ("live
+  // catalog only"), so without this probe the chip would permanently show raw
+  // ids. Same endpoint the settings popover calls (5-min server cache +
+  // in-flight dedupe). Re-probes when the active model changes; the raw id
+  // renders immediately and survives a catalog failure — never blank, never
+  // "Loading". Cancelled-flag guard matches the sibling probe effects
+  // (FreshAgentModelDialog/FreshAgentSettingsButton).
+  useEffect(() => {
+    setStripProbedModelLabel(null)
+    if (paneContent.sessionType !== 'freshopencode' || !stripModelId || stripStaticModelLabel) return
+    let cancelled = false
+    void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
+      .then((result) => {
+        if (cancelled) return
+        setStripProbedModelLabel(
+          result.ok
+            ? result.models.find((model) => model.id === stripModelId)?.displayName ?? null
+            : null,
+        )
+      })
+      .catch(() => {
+        if (!cancelled) setStripProbedModelLabel(null)
+      })
+    return () => { cancelled = true }
+  }, [paneContent.sessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel])
+  const stripModelLabel = stripStaticModelLabel
+    ?? stripProbedModelLabel
+    ?? stripModelId
+    ?? descriptor?.label
+    ?? 'Fresh Agent'
+  // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
+  // parenthetical (raw ids carry none and pass through unchanged).
+  const stripModelLabelShort = stripModelLabel.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
+  const stripModelTooltip = `${stripModelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
+  const contextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (
@@ -2521,6 +2579,16 @@ export function FreshAgentView({
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
             />
+            {/* Every fresh-agent pane gets the strip (unknown state included):
+                the model chip opens the shared model dialog and the strip owns
+                the bottom-chrome divider (the composer draws no border-top). */}
+            <FreshAgentStatusStrip
+              modelLabel={stripModelLabel}
+              modelLabelShort={stripModelLabelShort}
+              modelTooltip={stripModelTooltip}
+              contextUsage={contextUsage}
+              onOpenModelDialog={openModelDialog}
+            />
             <FreshAgentComposer
               ref={composerRef}
               disabled={composerDisabled}
@@ -2585,6 +2653,7 @@ export function FreshAgentView({
     claudeSession?.restoreFailureMessage,
     activeStyle,
     composerDisabled,
+    contextUsage,
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
@@ -2597,6 +2666,10 @@ export function FreshAgentView({
     localEcho,
     modelDialogOpen,
     closeModelDialog,
+    openModelDialog,
+    stripModelLabel,
+    stripModelLabelShort,
+    stripModelTooltip,
     handleModelCatalogUnavailable,
     notice,
     paneContent,
