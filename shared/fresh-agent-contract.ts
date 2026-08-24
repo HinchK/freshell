@@ -227,6 +227,18 @@ export const FreshAgentExtensionsSchema = z.object({
   opencode: z.record(z.string(), z.unknown()).optional(),
 }).strict()
 
+/**
+ * A provider-advertised session command (the SDK SlashCommand shape with
+ * argumentHint made optional so providers without hints can advertise rows).
+ * Description may be '' for providers that do not supply one.
+ */
+export const FreshAgentSessionCommandSchema = z.object({
+  name: z.string().min(1),
+  description: z.string(),
+  argumentHint: z.string().optional(),
+  aliases: z.array(z.string()).optional(),
+}).strict()
+
 export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   sessionId: z.string().min(1).optional(),
   revision: z.number().int().nonnegative(),
@@ -243,6 +255,10 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   childThreads: z.array(FreshAgentChildThreadSchema).default([]),
   turns: z.array(FreshAgentTurnSchema).default([]),
   extensions: FreshAgentExtensionsSchema.default({}),
+  // Provider-advertised session commands. Optional on purpose: absence means
+  // the provider has nothing to advertise (freshcodex, Rust port, offline),
+  // and old servers/clients keep parsing unchanged (graceful absence).
+  commands: z.array(FreshAgentSessionCommandSchema).readonly().optional(),
 }).strict()
 
 export const FreshAgentTurnPageSchema = FreshAgentThreadLocatorSchema.extend({
@@ -296,6 +312,7 @@ export const FRESH_AGENT_CONTRACT_SCHEMA_NAMES = [
   'FreshAgentDiffSummarySchema',
   'FreshAgentChildThreadSchema',
   'FreshAgentExtensionsSchema',
+  'FreshAgentSessionCommandSchema',
   'FreshAgentSnapshotSchema',
   'FreshAgentTurnPageSchema',
   'FreshAgentTurnBodySchema',
@@ -309,6 +326,7 @@ export type FreshAgentTranscriptItem = z.infer<typeof FreshAgentTranscriptItemSc
 export type FreshAgentTurn = z.infer<typeof FreshAgentTurnSchema>
 export type FreshAgentPendingApproval = z.infer<typeof FreshAgentPendingApprovalSchema>
 export type FreshAgentPendingQuestion = z.infer<typeof FreshAgentPendingQuestionSchema>
+export type FreshAgentSessionCommand = z.infer<typeof FreshAgentSessionCommandSchema>
 export type FreshAgentSnapshot = z.infer<typeof FreshAgentSnapshotSchema>
 export type FreshAgentTurnPage = z.infer<typeof FreshAgentTurnPageSchema>
 export type FreshAgentTurnBody = z.infer<typeof FreshAgentTurnBodySchema>

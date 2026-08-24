@@ -1,3 +1,4 @@
+import type { FreshAgentSessionCommand } from './fresh-agent-contract.js'
 import type { FreshAgentSessionType } from './fresh-agent.js'
 
 export type FreshAgentSlashCommandAction = 'new' | 'compact' | 'fork' | 'model'
@@ -64,4 +65,47 @@ export function resolveFreshAgentSlashCommand(
   return getFreshAgentSlashCommands(sessionType).find((command) => (
     command.name === normalized || command.aliases?.includes(normalized)
   ))
+}
+
+/**
+ * A provider-advertised session command as a menu row. `kind: 'session'`
+ * lets the composer dispatch switch: action rows dispatch, session rows
+ * insert verbatim `/name ` text (never auto-send).
+ */
+export type FreshAgentSessionMenuRow = {
+  kind: 'session'
+  name: string
+  description: string
+  argumentHint?: string
+  aliases?: readonly string[]
+}
+
+/**
+ * Groups the static pane-action commands and a provider-advertised session
+ * catalog into one menu. Statics are returned verbatim; session rows are
+ * deduped within their kind by case-insensitive canonical name (first wins).
+ * Cross-kind name collisions are allowed on purpose: a session row named
+ * 'compact' survives alongside the static action 'compact' (typed-Enter
+ * dispatch consults action rows only, and that dispatch lives elsewhere).
+ */
+export function buildFreshAgentSlashCommandMenu(
+  statics: readonly FreshAgentSlashCommand[],
+  catalog: readonly FreshAgentSessionCommand[] | undefined,
+): { action: readonly FreshAgentSlashCommand[]; session: readonly FreshAgentSessionMenuRow[] } {
+  const session: FreshAgentSessionMenuRow[] = []
+  const seen = new Set<string>()
+  for (const command of catalog ?? []) {
+    const key = command.name.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    const row: FreshAgentSessionMenuRow = {
+      kind: 'session',
+      name: command.name,
+      description: command.description,
+    }
+    if (command.argumentHint !== undefined) row.argumentHint = command.argumentHint
+    if (command.aliases !== undefined) row.aliases = command.aliases
+    session.push(row)
+  }
+  return { action: statics, session }
 }

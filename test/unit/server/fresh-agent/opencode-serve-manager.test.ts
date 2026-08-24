@@ -519,6 +519,8 @@ describe('OpencodeServeManager HTTP client', () => {
     const fetchFn = vi.fn(async (url: string, init: any) => {
       calls.push({ url, init })
       if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url.includes('/session/ses_a/command')) return jsonResponse({ info: { id: 'msg_cmd' }, parts: [] })
+      if (url.endsWith('/command')) return jsonResponse([{ name: 'review', description: 'r' }])
       if (url.includes('/message/msg_1')) return jsonResponse({ info: { id: 'msg_1' }, parts: [] })
       if (url.includes('/message')) return jsonResponse([], { headers: { 'x-next-cursor': 'CUR2' } })
       if (url.includes('/fork')) return jsonResponse({ id: 'ses_child', directory: '/project-a' })
@@ -534,6 +536,8 @@ describe('OpencodeServeManager HTTP client', () => {
     await manager.abort('ses_a', { cwd: '/project-a' })
     await manager.compact('ses_a', { instructions: 'short' }, { cwd: '/project-a' })
     await manager.fork('ses_a', { cwd: '/project-a' })
+    await manager.listCommands({ cwd: '/project-a' })
+    await manager.runCommand('ses_a', { command: 'review', arguments: 'the diff' }, { cwd: '/project-a' })
 
     const urls = calls.map((call) => call.url)
     expect(urls).toContain('http://127.0.0.1:47999/session/ses_a?directory=%2Fproject-a')
@@ -543,6 +547,88 @@ describe('OpencodeServeManager HTTP client', () => {
     expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/abort?directory=%2Fproject-a')
     expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/summarize?directory=%2Fproject-a')
     expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/fork?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/command?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/command?directory=%2Fproject-a')
+  })
+})
+
+describe('OpencodeServeManager command catalog + command dispatch', () => {
+  it('fetches the /command listing bare when no route is supplied', async () => {
+    const rows = [{ name: 'review', description: 'r' }]
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/command') return jsonResponse(rows)
+      return jsonResponse({}, { status: 404 })
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    await expect(manager.listCommands()).resolves.toEqual(rows)
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/command', expect.anything())
+  })
+
+  it('surfaces a 5xx catalog listing as an error so the caller can degrade to absent', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/command')) return jsonResponse({ error: 'boom' }, { status: 500 })
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    await expect(manager.listCommands()).rejects.toThrow(/opencode serve GET \/command → 500/)
+  })
+
+  it('posts the canonical command + verbatim arguments and resolves the completed assistant message', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const completed = {
+      info: { id: 'msg_cmd_1', role: 'assistant', time: { created: 1, completed: 2 }, finish: 'stop' },
+      parts: [{ id: 'prt_1', type: 'text', text: 'expanded command turn done' }],
+    }
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_x/command?directory=%2Frepo' && init?.method === 'POST') {
+        return jsonResponse(completed)
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    // VAL-A LB-04b receipt shape: the response IS the completed {info, parts} turn.
+    await expect(manager.runCommand('ses_x', { command: 'Review', arguments: 'a  b ' }, { cwd: '/repo' }))
+      .resolves.toEqual(completed)
+    const post = calls.find((call) => call.url.includes('/command'))!
+    expect(post.url).toBe('http://127.0.0.1:47999/session/ses_x/command?directory=%2Frepo')
+    expect(JSON.parse(post.init.body)).toEqual({ command: 'Review', arguments: 'a  b ' })
+  })
+
+  it('honors a turn-scale timeout override for the synchronous command route, rejects the send, and leaves the shared sidecar alive', async () => {
+    let commandSignal: AbortSignal | undefined
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.includes('/session/ses_x/command')) {
+        commandSignal = init.signal
+        return await new Promise((_, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
+      return jsonResponse({})
+    })
+    // The default request timeout is generous; the override bounds this turn at 5ms.
+    const { manager, child, spawnFn } = makeManager({ fetchFn: fetchFn as any, requestTimeoutMs: 60_000 })
+
+    // The send error still surfaces: the caller's turn fails with the timeout error.
+    await expect(manager.runCommand('ses_x', { command: 'review', arguments: '' }, {}, 5))
+      .rejects.toThrow('opencode serve POST /session/ses_x/command timed out after 5ms')
+    expect(commandSignal?.aborted).toBe(true)
+    // …but the command route is SYNCHRONOUS AT TURN SCALE: a timeout here is one
+    // long-running turn overrunning, not evidence of a wedged sidecar. Killing the
+    // shared sidecar would rob every other freshopencode pane, so this route must
+    // reject WITHOUT discarding (the prompt path's own turn timeout behaves the same).
+    expect(child.kill).not.toHaveBeenCalled()
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    // The same sidecar keeps serving subsequent requests (no discard-and-respawn).
+    await expect(manager.getSession('ses_x')).resolves.toEqual({})
+    expect(spawnFn).toHaveBeenCalledTimes(1)
   })
 })
 
