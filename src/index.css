@@ -187,6 +187,10 @@ html {
 
 .fresh-agent-turn-header {
   font-family: var(--fresh-agent-meta-font-family);
+  /* 12px desktop floor: the project's custom `text-xs` utility is 11px
+     (0.6875rem); the serif/mono overrides below already pin 0.75rem and the
+     ≤520px container bump (further below, source-order load-bearing) pins 13px. */
+  font-size: 0.75rem;
   letter-spacing: 0;
 }
 
