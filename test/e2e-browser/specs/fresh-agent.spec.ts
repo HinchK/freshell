@@ -391,16 +391,14 @@ test.describe('Fresh Agent', () => {
     await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     // The status strip shrank the transcript viewport by one row, so the
-    // "Jump to your message" glom chip overlays the strip-adjacent top band
-    // where the Thinking toggle lands. Dismiss it via its real affordance
-    // immediately before the toggle click — the activity-toggle scroll above
-    // is what brings the user turn's clip (and thus the chip) back.
-    const glomChip = freshcodexRoot.getByRole('button', { name: /Jump to your message/ })
-    if (await glomChip.isVisible()) {
-      await glomChip.click()
-      await expect(glomChip).toHaveCount(0, { timeout: 5_000 })
-    }
-    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).click()
+    // "Jump to your message" glom chip overlays the top band where the
+    // Thinking toggle's click point lands. The chip re-derives from scroll
+    // position on every scroll-into-view, so mouse dismissing it is racy
+    // (Playwright re-scrolls to the toggle and the chip returns on top of the
+    // click point). Activate the toggle by keyboard Enter instead: focus +
+    // keypress targets the element, not the point, so the overlay cannot
+    // intercept the activation.
+    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
