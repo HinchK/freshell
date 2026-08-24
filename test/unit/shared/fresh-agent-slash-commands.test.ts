@@ -6,15 +6,14 @@ import {
 } from '@shared/fresh-agent-slash-commands'
 
 describe('fresh-agent slash commands: /model', () => {
-  it('registers /model for freshopencode and freshcodex only', () => {
+  it('registers /model for all four fresh-agent session types', () => {
     expect(getFreshAgentSlashCommands('freshopencode').map((command) => command.name)).toContain('model')
     expect(getFreshAgentSlashCommands('freshcodex').map((command) => command.name)).toContain('model')
-    // freshclaude/kilroy keep the simple settings-popover model list
-    expect(getFreshAgentSlashCommands('freshclaude').map((command) => command.name)).not.toContain('model')
-    expect(getFreshAgentSlashCommands('kilroy').map((command) => command.name)).not.toContain('model')
+    expect(getFreshAgentSlashCommands('freshclaude').map((command) => command.name)).toContain('model')
+    expect(getFreshAgentSlashCommands('kilroy').map((command) => command.name)).toContain('model')
   })
 
-  it('resolves /model to the model action', () => {
+  it('resolves /model to the model action for every session type', () => {
     expect(resolveFreshAgentSlashCommand('freshopencode', '/model')).toMatchObject({
       name: 'model',
       action: 'model',
@@ -23,6 +22,13 @@ describe('fresh-agent slash commands: /model', () => {
       name: 'model',
       action: 'model',
     })
-    expect(resolveFreshAgentSlashCommand('freshclaude', '/model')).toBeUndefined()
+    expect(resolveFreshAgentSlashCommand('freshclaude', '/model')).toMatchObject({
+      name: 'model',
+      action: 'model',
+    })
+    expect(resolveFreshAgentSlashCommand('kilroy', '/model')).toMatchObject({
+      name: 'model',
+      action: 'model',
+    })
   })
 })

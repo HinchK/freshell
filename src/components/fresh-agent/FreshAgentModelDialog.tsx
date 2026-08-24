@@ -11,6 +11,7 @@ import {
   filterFreshAgentModelCapabilitiesByQuery,
   getFreshAgentStaticModelCapabilities,
   groupFreshAgentModelCapabilitiesBySource,
+  mergeClaudeModelCapabilities,
   type FreshAgentModelSourceGroup,
 } from '@/lib/fresh-agent-model-capabilities'
 import {
@@ -37,8 +38,10 @@ import { highestThinkingLevelId, orderThinkingLevelIds } from '@shared/fresh-age
 
 const MAX_RENDERED_MODEL_ROWS = 250
 
-/** The model selector is only meaningful for providers with a real catalog:
- * the probed opencode catalog, or freshcodex's baked-in static table. */
+/** Recent-model (MRU) bookkeeping is scoped to providers with a cwd-keyed
+ * catalog history: freshopencode and freshcodex. Claude providers
+ * (freshclaude/kilroy) get no MRU — the dialog still renders for them and
+ * serves their statics merged with the probed claude catalog. */
 function mruProviderForSession(sessionType: FreshAgentPaneContent['sessionType']): FreshAgentModelMruProvider | undefined {
   return sessionType === 'freshopencode' || sessionType === 'freshcodex' ? sessionType : undefined
 }
@@ -114,10 +117,12 @@ export function FreshAgentModelDialog({
   const [highlightedLevelIndex, setHighlightedLevelIndex] = useState(0)
   const [recentModels, setRecentModels] = useState<FreshAgentModelCapability[]>([])
 
-  // freshopencode: probe the cwd-scoped live catalog each time the dialog
-  // opens. freshcodex never probes — its static table is synchronously known.
+  // freshopencode + the claude providers (freshclaude/kilroy): probe the
+  // cwd-scoped live catalog each time the dialog opens (the settings popover
+  // makes the same call; the server caches it for 5 minutes). freshcodex
+  // never probes — its static table is synchronously known.
   useEffect(() => {
-    if (!open || sessionType !== 'freshopencode') return
+    if (!open || sessionType === 'freshcodex') return
     let cancelled = false
     setProbe(undefined)
     setProbing(true)
@@ -129,8 +134,8 @@ export function FreshAgentModelDialog({
         if (cancelled) return
         setProbe({
           ok: false,
-          sessionType: 'freshopencode',
-          runtimeProvider: 'opencode',
+          sessionType,
+          runtimeProvider: paneContent.provider,
           status: 'unavailable',
           fetchedAt: Date.now(),
           models: [],
@@ -141,12 +146,17 @@ export function FreshAgentModelDialog({
         if (!cancelled) setProbing(false)
       })
     return () => { cancelled = true }
-  }, [open, sessionType, paneContent.initialCwd])
+  }, [open, sessionType, paneContent.provider, paneContent.initialCwd])
 
   const staticCapabilities = useMemo(() => getFreshAgentStaticModelCapabilities(sessionType), [sessionType])
   const capabilities: FreshAgentModelCapabilities | undefined = sessionType === 'freshopencode'
     ? (probe?.ok ? probe : undefined)
-    : staticCapabilities
+    : paneContent.provider === 'claude' && staticCapabilities
+      ? mergeClaudeModelCapabilities(staticCapabilities, probe?.ok === true ? probe : undefined)
+      : staticCapabilities
+  // Catalog-unavailable stays opencode-only: claude panes degrade to their
+  // static rows (the same fallback the settings popover uses) instead of
+  // closing with the unavailable notice.
   const catalogUnavailable = sessionType === 'freshopencode' && !probing && probe?.ok === false
 
   // Catalog-unavailable: never open an empty dialog — close and let the
@@ -175,15 +185,17 @@ export function FreshAgentModelDialog({
 
   // One init per dialog session: MRU upkeep (record the effective current
   // model so Recent can show it; drop catalog-removed ids) and cache the
-  // Recent list. Highlight state is deliberately NOT set here — the initial
-  // highlight is derived at render time so it cannot race the row set.
+  // Recent list. MRU bookkeeping only runs where a provider mapping exists —
+  // claude providers get the query reset with no Recent group. Highlight
+  // state is deliberately NOT set here — the initial highlight is derived at
+  // render time so it cannot race the row set.
   const initKeyRef = useRef<string | null>(null)
   useEffect(() => {
     if (!open) {
       initKeyRef.current = null
       return
     }
-    if (!capabilities || !mruProvider) return
+    if (!capabilities) return
     const initKey = `${paneId}:${capabilities.models.map((model) => model.id).join('|')}`
     if (initKeyRef.current === initKey) return
     initKeyRef.current = initKey
@@ -191,7 +203,7 @@ export function FreshAgentModelDialog({
     setQuery('')
     setActiveColumn('models')
     let recent: FreshAgentModelCapability[] = []
-    if (cwdKey) {
+    if (mruProvider && cwdKey) {
       const current = capabilities.models.find((model) => model.id === effectiveModelId)
       if (current) recordFreshAgentModelUse(mruProvider, current, cwdKey)
       pruneFreshAgentModelMru(mruProvider, capabilities, cwdKey)
@@ -316,7 +328,7 @@ export function FreshAgentModelDialog({
   }, [levelRows.length, highlightedRow, highlightedIsUserStaged, resolvedLevelIndex])
 
   const commit = useCallback(() => {
-    if (!capabilities || !highlightedModel || !highlightedLevelRow || !mruProvider) return
+    if (!capabilities || !highlightedModel || !highlightedLevelRow) return
     const model = highlightedModel
     // The Default row stages NO level: pane effort clears, and the provider
     // default effort clears (patch normalization maps it to a server-side
@@ -330,6 +342,13 @@ export function FreshAgentModelDialog({
         model: model.id,
         modelSelection: { kind: 'exact', modelId: model.id },
         effort: level,
+        // Claude providers stamp the switched-to row's known levels (static
+        // or probed) so post-commit effort normalization clamps against THEM
+        // — the same idiom the settings popover's radio commit uses. An
+        // empty stamp is deliberate: the selected model declares no levels.
+        ...(paneContent.provider === 'claude'
+          ? { modelEffortLevels: model.supportsEffort ? [...model.supportedEffortLevels] : [] }
+          : {}),
       },
     }))
     void dispatch(saveServerSettingsPatch({
@@ -342,12 +361,12 @@ export function FreshAgentModelDialog({
         },
       },
     }))
-    if (cwdKey) {
+    if (mruProvider && cwdKey) {
       recordFreshAgentModelUse(mruProvider, model, cwdKey)
       if (level) recordFreshAgentModelLevelUse(mruProvider, { modelId: model.id, level, cwdKey })
     }
     onClose()
-  }, [capabilities, highlightedModel, highlightedLevelRow, mruProvider, dispatch, tabId, paneId, sessionType, cwdKey, onClose])
+  }, [capabilities, highlightedModel, highlightedLevelRow, mruProvider, dispatch, tabId, paneId, sessionType, cwdKey, paneContent.provider, onClose])
 
   const canCommit = Boolean(capabilities && highlightedModel && highlightedLevelRow)
 
@@ -384,7 +403,7 @@ export function FreshAgentModelDialog({
     }
   }
 
-  if (!open || !mruProvider) return null
+  if (!open) return null
   if (catalogUnavailable) return null
 
   return createPortal(

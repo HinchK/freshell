@@ -34,9 +34,10 @@ const BASE_COMMANDS = [
 ] as const satisfies readonly FreshAgentSlashCommand[]
 
 /**
- * Opens the model + thinking selector dialog. Only providers with a real
- * per-model catalog get it: freshopencode (probed) and freshcodex (static
- * table). freshclaude/kilroy keep the simple settings-popover model list.
+ * Opens the model + thinking selector dialog. Every fresh-agent session type
+ * gets it: freshopencode (probed catalog), freshcodex (static table), and
+ * freshclaude/kilroy (statics merged static-wins with the probed claude
+ * catalog) — the shared FreshAgentModelDialog now renders for all four.
  */
 const MODEL_COMMAND = {
   name: 'model',
@@ -44,11 +45,13 @@ const MODEL_COMMAND = {
   action: 'model',
 } as const satisfies FreshAgentSlashCommand
 
+const COMMANDS_WITH_MODEL: readonly FreshAgentSlashCommand[] = [...BASE_COMMANDS, MODEL_COMMAND]
+
 export const FRESH_AGENT_SLASH_COMMANDS_BY_SESSION_TYPE = {
-  freshclaude: BASE_COMMANDS,
-  kilroy: BASE_COMMANDS,
-  freshcodex: [...BASE_COMMANDS, MODEL_COMMAND],
-  freshopencode: [...BASE_COMMANDS, MODEL_COMMAND],
+  freshclaude: COMMANDS_WITH_MODEL,
+  kilroy: COMMANDS_WITH_MODEL,
+  freshcodex: COMMANDS_WITH_MODEL,
+  freshopencode: COMMANDS_WITH_MODEL,
 } as const satisfies Record<FreshAgentSessionType, readonly FreshAgentSlashCommand[]>
 
 export function getFreshAgentSlashCommands(sessionType: FreshAgentSessionType): readonly FreshAgentSlashCommand[] {
