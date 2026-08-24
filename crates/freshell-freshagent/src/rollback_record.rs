@@ -198,33 +198,40 @@ impl RollbackRecord {
     /// a uniform already-migrated record.
     ///
     /// The migration: a row written BEFORE the epoch fields existed has NO
-    /// `epoch` on any entry; when such a row ALSO carries the `redoDestroyed`
-    /// bit, a destroy provably fired mid-history (the legacy undo → … → send
-    /// durable shapes — the union holds entries from MORE than one epoch).
-    /// Serde-defaulting every entry to epoch 0 aliases the frozen prefix onto
-    /// `currentEpoch` (also defaulting to 0): frozen markers would regain
-    /// "Redo to here" and a subsequent same-epoch undo would splice BEFORE the
-    /// frozen prefix. So the load freezes every existing entry (epochs stay
-    /// 0 — the frozen boundary IS `entries.len()`) and bumps `current_epoch`
-    /// beyond; the destroyed bit is honored AS-IS (the next undo's
-    /// destroyed-at-load leg still opens a fresh epoch on top). The disk row
-    /// is NEVER lazily rewritten — the migration persists with the next op's
-    /// write. Post-F8 rows (every entry carries `epoch` EXPLICITLY) and
-    /// single-epoch legacy rows (the destroy bit never set) load UNMIGRATED.
+    /// `epoch` on any entry and NO `currentEpoch` on the record — the detect
+    /// keys on the ABSENCE of ALL epoch keys (focused ep1-r2 F1), INDIFFERENT
+    /// to `redoDestroyed`: the pre-repair handlers cleared that bit when the
+    /// first undo of a new epoch was recorded, so the real persisted
+    /// undo → send → undo shape reads `redoDestroyed:false` over a MULTI-epoch
+    /// union, and the bit cannot key anything. Serde-defaulting every entry to
+    /// epoch 0 aliases the frozen prefix onto `currentEpoch` (also defaulting
+    /// to 0): frozen markers would regain "Redo to here" and a subsequent
+    /// same-epoch undo would splice BEFORE the frozen prefix. So the load
+    /// freezes EVERY existing entry (epochs stay 0 — the frozen boundary IS
+    /// `entries.len()`) and bumps `current_epoch` beyond; the destroyed bit is
+    /// honored LITERALLY (clear ⇒ the next undo appends under the current
+    /// epoch; set ⇒ the destroyed-at-load leg opens a fresh epoch on top).
+    /// Freezing an actually-single-epoch legacy record too is the accepted
+    /// conservatism (an epochless row cannot prove it is single-epoch; a
+    /// wrongly-redoable frozen marker is the failure under repair). The disk
+    /// row is NEVER lazily rewritten — the migration persists with the next
+    /// op's write. Post-F8 rows (every entry carries `epoch` EXPLICITLY and the
+    /// record carries `currentEpoch`) load UNMIGRATED — an explicit `epoch: 0`
+    /// therefore never misfires as legacy.
     pub fn from_stored_payload(payload: Value) -> Option<Self> {
-        let legacy_destroyed_union = payload
+        let legacy_epochless_union = payload
             .get("entries")
             .and_then(Value::as_array)
             .is_some_and(|entries| {
                 !entries.is_empty() && entries.iter().all(|e| e.get("epoch").is_none())
             })
-            && payload.get("redoDestroyed").and_then(Value::as_bool) == Some(true);
+            && payload.get("currentEpoch").is_none();
         let record: Self = serde_json::from_value(payload).ok()?;
         if record.version != ROLLBACK_RECORD_VERSION {
             return None;
         }
         let mut record = record;
-        if legacy_destroyed_union {
+        if legacy_epochless_union {
             record.current_epoch = record
                 .current_epoch
                 .max(record.entries.iter().map(|e| e.epoch).max().unwrap_or(0) + 1);
@@ -524,6 +531,81 @@ pub async fn destroy_redo_on_submit(
     sink.record_rollback(provider, live_id, record).await.err()
 }
 
+/// Focused-review ep1-r2 F4: the opencode compact's PRE-DRIVE redo destroy.
+/// Runs synchronously (the caller holds the session lock) AFTER the compact
+/// preflight succeeds and BEFORE the summarize drive/task exists —
+/// durable-BEFORE-mutation: from this point `canRedo` is already false in
+/// memory + persisted, so an ABORTED drive (interrupt/kill mid-summarize, a
+/// cancelled response observation) can never leave the record advertising redo
+/// over a provider tail the cancelled summarize may still have deleted.
+///
+/// `Ok(Some(pre_record))` means THIS call genuinely retired redo and returns
+/// the pre-destroy row: the drive's DEFINITIVE-rejection leg restores it via
+/// [`restore_redo_on_rejected_compact`] (a clean provider answer proves the
+/// reverted tail survived). `Ok(None)` is a no-op destroy (no sink/record,
+/// already destroyed, or nothing redo-capable); `Err` is a ledger write
+/// failure (warn-only, never blocks the compact — [`destroy_redo_on_submit`]'s
+/// degrade policy).
+pub async fn destroy_redo_before_compact_drive(
+    sink: &Option<crate::identity_sink::SharedPaneIdentitySink>,
+    provider: &str,
+    live_id: &str,
+    now_ms: i64,
+) -> Result<Option<RollbackRecord>, std::io::Error> {
+    let Some(sink) = sink.as_ref() else {
+        return Ok(None);
+    };
+    let Some(record) = sink.load_rollback(provider, live_id) else {
+        return Ok(None);
+    };
+    if record.redo_destroyed || (record.entries.is_empty() && record.original_session_id.is_none())
+    {
+        return Ok(None);
+    }
+    let pre = record.clone();
+    let mut destroyed = record;
+    destroyed.destroy_redo(now_ms);
+    sink.record_rollback(provider, live_id, destroyed).await?;
+    Ok(Some(pre))
+}
+
+/// Focused-review ep1-r2 F4's compensation: a DEFINITIVE summarize rejection
+/// (the serve ANSWERED a non-2xx — the provider provably never deleted the
+/// reverted tail) undoes the pre-drive destroy by restoring its pre-record.
+/// Ambiguous outcomes (task abort, timeout, transport) NEVER call this —
+/// their tails may be genuinely gone, so the destroy stands.
+///
+/// Restored only when the ledger still holds EXACTLY the row the destroy
+/// wrote (`pre_record` + the destroy stamp): any post-destroy write (a later
+/// op — unreachable under today's busy gates, guarded regardless) or a deleted
+/// row leaves the newer truth standing. The restored row's revision floor
+/// never regresses below the destroy's stamp. Best-effort: a restore failure
+/// is returned for warn-logging, degrading to "redo stays destroyed" (the
+/// conservative side of the ambiguity).
+pub async fn restore_redo_on_rejected_compact(
+    sink: &Option<crate::identity_sink::SharedPaneIdentitySink>,
+    provider: &str,
+    live_id: &str,
+    mut pre_record: RollbackRecord,
+    destroyed_at_ms: i64,
+    restore_now_ms: i64,
+) -> Option<std::io::Error> {
+    let sink = sink.as_ref()?;
+    let current = sink.load_rollback(provider, live_id)?;
+    let mut expected = pre_record.clone();
+    expected.destroy_redo(destroyed_at_ms);
+    if current != expected {
+        return None;
+    }
+    pre_record.last_op_at_ms = pre_record
+        .last_op_at_ms
+        .max(destroyed_at_ms)
+        .max(restore_now_ms);
+    sink.record_rollback(provider, live_id, pre_record)
+        .await
+        .err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,11 +811,16 @@ mod tests {
         );
     }
 
-    /// F3 companion: the legacy migration keys on the DESTROYED bit — a single
-    /// -epoch legacy record (the destroy bit never set; the current epoch only)
-    /// loads as one current epoch with no affordance regression.
+    /// Focused-review ep1-r2 F1: the migration detect is INDIFFERENT to the
+    /// destroyed bit — pre-repair handlers cleared `redoDestroyed` when the
+    /// second undo opened its (untracked) new epoch, so the bit provably cannot
+    /// key anything. A legacy epochless record whose bit reads FALSE still
+    /// loads all-frozen: `currentEpoch` becomes 1, every entry keeps its
+    /// absent-epoch serde default (0 — the frozen prefix), and NO marker is
+    /// redoable (conservatism: affording "Redo to here" on a possibly-frozen
+    /// marker is the failure under repair).
     #[test]
-    fn single_epoch_legacy_record_loads_as_one_current_epoch() {
+    fn legacy_epochless_record_with_a_clear_destroyed_bit_still_loads_all_frozen() {
         let legacy = json!({
             "version": 1,
             "lastOpAtMs": 50,
@@ -746,12 +833,119 @@ mod tests {
             }],
         });
         let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
-        assert_eq!(record.current_epoch, 0, "no migration — one current epoch");
+        assert!(!record.redo_destroyed, "the bit is honored literally");
+        assert_eq!(
+            record.current_epoch, 1,
+            "F1: the detect ignores the destroyed bit — the epochless union freezes"
+        );
         assert!(record.entries.iter().all(|e| e.epoch == 0));
+        assert!(
+            redoable_turn_ids(&record, record.can_redo()).is_empty(),
+            "no per-marker redo affordance survives the freeze, even with canRedo stored true"
+        );
+    }
+
+    /// Focused-review ep1-r2 F1 — the review's REAL pre-repair persisted shape:
+    /// undo → send → undo. The send destroyed redo; the SECOND undo (opening its
+    /// untracked new epoch) cleared `redoDestroyed` again at write time, so the
+    /// durable row reads `redoDestroyed:false` with FROZEN (epoch 0) + "current"
+    /// entries all epoch-free. Loaded naively (serde defaults), that is ONE
+    /// epoch: frozen markers regain "Redo to here" and the NEXT undo splices
+    /// AHEAD of the frozen prefix. The migration (keyed on the absence of ALL
+    /// epoch keys, indifferent to the destroyed bit) freezes the whole prefix,
+    /// sets `current_epoch` to 1, and the next undo appends AFTER the frozen
+    /// prefix — and its write persists EXPLICIT epochs so a reload never
+    /// re-migrates.
+    #[test]
+    fn legacy_undo_send_undo_shape_loads_frozen_appends_after_the_prefix_and_persists_epochs() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            // The pre-repair second undo cleared the destroy bit: the bit was
+            // true mid-history (the send destroyed) yet reads false here.
+            "redoDestroyed": false,
+            "canRedo": true,
+            "entries": [
+                // epoch 0's frozen marker …
+                { "removedTurns": [marker_turn("t1", "user")], "promptText": "p1", "atMs": 40 },
+                // … then the send destroyed (bit cycled) …
+                // … then the epoch-1 undo's entries — all epoch-free on disk.
+                { "removedTurns": [marker_turn("t2", "user")], "promptText": "p2", "atMs": 50 },
+                { "removedTurns": [marker_turn("t3", "user")], "promptText": "p3", "atMs": 60 },
+            ],
+        });
+        let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
+        assert!(
+            !record.redo_destroyed,
+            "the destroyed bit is honored literally (clear, as the row says)"
+        );
+        assert!(
+            !record.entries.is_empty()
+                && record
+                    .entries
+                    .iter()
+                    .all(|e| e.epoch < record.current_epoch),
+            "the ALL-FROZEN prefix: every entry older than the current epoch: {record:?}"
+        );
+        assert_eq!(
+            record.current_epoch, 1,
+            "the counter sits just past the frozen prefix"
+        );
+        assert!(
+            redoable_turn_ids(&record, true).is_empty(),
+            "rollback.redoableTurnIds = [] — frozen markers never regain 'Redo to here'"
+        );
+
+        // The NEXT undo lands with the destroyed bit clear at load ⇒ NO epoch
+        // opening: it splices under the CURRENT epoch (1), appended AFTER the
+        // frozen prefix (never ahead of it).
+        let mut record = record;
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("n1", "user")],
+                prompt_text: "pn1".into(),
+                at_ms: 80,
+                epoch: record.current_epoch,
+            },
+            80,
+        );
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| (e.epoch, e.prompt_text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "p1"), (0, "p2"), (0, "p3"), (1, "pn1")],
+            "the new undo appends AFTER the all-frozen legacy prefix under epoch 1"
+        );
         assert_eq!(
             redoable_turn_ids(&record, true),
-            vec!["t1".to_string()],
-            "the single current epoch keeps its redo affordances"
+            vec!["n1".to_string()],
+            "only the fresh epoch-1 marker is redoable"
+        );
+
+        // The periodic/op write PERSISTS explicit epochs (serde defaulting only
+        // fills ABSENT keys; the written row stamps `epoch` per entry AND
+        // `currentEpoch`), so the reloaded row never matches the
+        // absence-keyed detect — an explicit epoch:0 can never misfire.
+        let persisted = serde_json::to_value(&record).expect("serialize");
+        assert!(
+            persisted["entries"]
+                .as_array()
+                .expect("entries array")
+                .iter()
+                .all(|e| e.get("epoch").is_some()),
+            "every persisted entry carries an explicit epoch key: {persisted}"
+        );
+        assert!(
+            persisted.get("currentEpoch").is_some(),
+            "the persisted record carries currentEpoch explicitly"
+        );
+        let reloaded =
+            RollbackRecord::from_stored_payload(persisted).expect("the written row reparses");
+        assert_eq!(
+            reloaded, record,
+            "a post-migration write round-trips byte-identical — no re-migration"
         );
     }
 
@@ -1018,6 +1212,181 @@ mod tests {
         assert!(
             record.redo_destroyed && record.last_op_at_ms == 70,
             "a second destroy is a true no-op (no rewrite, no restamp)"
+        );
+    }
+
+    // ── destroy_redo_before_compact_drive + restore_redo_on_rejected_compact (F4) ──
+
+    #[tokio::test]
+    async fn destroy_redo_before_compact_drive_retires_redo_and_hands_back_the_pre_record() {
+        let sink = fake_sink_with("opencode", "s1", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.set_can_redo(true, 61);
+            r
+        });
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let pre = destroy_redo_before_compact_drive(&Some(shared), "opencode", "s1", 100)
+            .await
+            .expect("a live write answers Ok")
+            .expect("a redo-capable row yields its pre-record");
+        assert!(
+            !pre.redo_destroyed && pre.can_redo(),
+            "the pre-record was live"
+        );
+        assert_eq!(pre.last_op_at_ms, 61);
+        let record = sink.load_rollback("opencode", "s1").expect("record");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "the drive now exists with canRedo already false in memory + persisted: {record:?}"
+        );
+        assert_eq!(record.entries.len(), 1, "decision 6: markers untouched");
+
+        // Idempotence/no-op legs: already-destroyed, absent, unsinked, empty.
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        assert!(
+            destroy_redo_before_compact_drive(&Some(shared), "opencode", "s1", 101)
+                .await
+                .expect("ok")
+                .is_none(),
+            "an already-destroyed row is a no-op (no pre-record to restore)"
+        );
+        assert!(destroy_redo_before_compact_drive(
+            &Some(sink.clone()),
+            "opencode",
+            "s-absent",
+            101
+        )
+        .await
+        .expect("ok")
+        .is_none());
+        assert!(
+            destroy_redo_before_compact_drive(&None, "opencode", "s1", 101)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_redo_before_compact_drive_surfaces_a_ledger_failure_and_writes_nothing() {
+        let sink = fake_sink_with("opencode", "s1", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.set_can_redo(true, 61);
+            r
+        });
+        sink.set_fail_writes(true);
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = destroy_redo_before_compact_drive(&Some(shared), "opencode", "s1", 100).await;
+        assert!(
+            outcome.is_err(),
+            "the write failure surfaces to the warn-log"
+        );
+        let record = sink.load_rollback("opencode", "s1").expect("record");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "a failed destroy never touches the row — redo stays live (degrade policy)"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_redo_on_rejected_compact_restores_only_the_row_this_destroy_wrote() {
+        let sink = fake_sink_with("opencode", "s1", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.set_can_redo(true, 61);
+            r
+        });
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let pre = destroy_redo_before_compact_drive(&Some(shared), "opencode", "s1", 100)
+            .await
+            .expect("ok")
+            .expect("pre-record");
+
+        // The row stands EXACTLY as our destroy left it: the definitive
+        // rejection restores the pre-record (redo lives again) without letting
+        // the revision floor regress below the destroy stamp.
+        let shared: crate::identity_sink::SharedPaneIdentitySink = sink.clone();
+        let outcome = restore_redo_on_rejected_compact(
+            &Some(shared),
+            "opencode",
+            "s1",
+            pre.clone(),
+            100,
+            110,
+        )
+        .await;
+        assert!(outcome.is_none(), "a live restore answers no error");
+        let record = sink.load_rollback("opencode", "s1").expect("record");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "the restored row revives redo — the provider provably kept the tail: {record:?}"
+        );
+        assert_eq!(
+            record.last_op_at_ms, 110,
+            "the floor never regresses below the restore's stamp"
+        );
+
+        // A row touched SINCE our destroy (here: a later op re-destroyed at a
+        // newer stamp — equality is exact, so ANY rewrite counts) survives
+        // untouched: the newer truth stands, redo is never revived over it.
+        let sink2 = fake_sink_with("opencode", "s2", {
+            let mut r = RollbackRecord::empty(50);
+            r.push_entry(entry("1"), 60);
+            r.set_can_redo(true, 61);
+            r
+        });
+        let shared2: crate::identity_sink::SharedPaneIdentitySink = sink2.clone();
+        let pre2 = destroy_redo_before_compact_drive(&Some(shared2), "opencode", "s2", 100)
+            .await
+            .expect("ok")
+            .expect("pre-record");
+        {
+            // The post-destroy op writes its own row (the exact-equality guard's target).
+            let mut later = sink2.load_rollback("opencode", "s2").expect("row");
+            later.destroy_redo(105);
+            crate::identity_sink::PaneIdentitySink::record_rollback(
+                sink2.as_ref(),
+                "opencode",
+                "s2",
+                later,
+            )
+            .await
+            .expect("write ok");
+        }
+        let shared2c: crate::identity_sink::SharedPaneIdentitySink = sink2.clone();
+        let outcome = restore_redo_on_rejected_compact(
+            &Some(shared2c),
+            "opencode",
+            "s2",
+            pre2.clone(),
+            100,
+            110,
+        )
+        .await;
+        assert!(
+            outcome.is_none(),
+            "a skipped restore is silent, never an error"
+        );
+        let record = sink2.load_rollback("opencode", "s2").expect("record");
+        assert!(
+            record.redo_destroyed && record.last_op_at_ms == 105,
+            "the later op's row is never rewound — the restore skipped: {record:?}"
+        );
+
+        // A DELETED row is also "changed" (never re-created by a restore).
+        crate::identity_sink::PaneIdentitySink::delete_rollback(sink2.as_ref(), "opencode", "s2")
+            .await
+            .expect("delete ok");
+        let shared2d: crate::identity_sink::SharedPaneIdentitySink = sink2.clone();
+        let outcome =
+            restore_redo_on_rejected_compact(&Some(shared2d), "opencode", "s2", pre2, 100, 110)
+                .await;
+        assert!(outcome.is_none());
+        assert!(
+            sink2.load_rollback("opencode", "s2").is_none(),
+            "a deleted row is never resurrected by a restore"
         );
     }
 }

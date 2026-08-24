@@ -1379,8 +1379,11 @@ impl FreshCodexState {
     /// the turn lock below and cleared at the compact turn's `turn/completed`
     /// ([`reduce_notification`]) — delta-r1 F2; the rollback busy gate reads
     /// both. The
-    /// active-turn refusal remains, and the app-server's rejection stays the
-    /// backstop for a rapid second Compact click (surfaced as
+    /// active-turn refusal remains, and a rapid second Compact click is refused
+    /// server-side with the rollback `BUSY_TURN` copy while the first compact's
+    /// window marker is armed (focused ep1-r2 F3 — the failure-clear of that
+    /// marker then belongs to the call that armed it alone); the app-server's
+    /// rejection stays the backstop for a genuinely failed RPC (surfaced as
     /// `CODEX_COMPACT_FAILED`). Every failure path is LOUD
     /// via the nested `freshAgent.error` banner envelope (a request-less top-level
     /// `error` frame never reaches the frozen client's pane surface).
@@ -1469,6 +1472,25 @@ impl FreshCodexState {
                 &format!(
                     "Codex session {session_id} has an active turn; compact it after the turn completes."
                 ),
+            );
+            return;
+        }
+
+        // Focused-review ep1-r2 F3 (compact ownership): a SECOND compact
+        // landing while compact-1's window marker is armed (its RPC answered,
+        // its `turn/started` not yet surfaced) is REFUSED with the rollback
+        // `BUSY_TURN` copy. The precheck MUST read the window bit: the pre-F3
+        // gate examined only `active_turn`, so the rapid second compact entered
+        // the RPC — and a REJECTED second RPC's failure-clear below then wiped
+        // the FIRST compact's busy truth, letting a queued rollback land
+        // `thread/revert` mid-compact. Refusal BEFORE arming restores
+        // ownership: the failure-clear can now only ever run for the call that
+        // armed the bit.
+        if compact_in_flight.load(Ordering::SeqCst) {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "BUSY_TURN",
+                crate::rollback_record::ROLLBACK_BUSY_MESSAGE,
             );
             return;
         }
@@ -5862,6 +5884,139 @@ pub(crate) mod tests {
             "turn/completed",
             json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
         );
+    }
+
+    /// Focused-review ep1-r2 F3: `compact_in_flight` has OPERATION OWNERSHIP.
+    /// Compact-1's `thread/compact/start` answers BEFORE any `turn/started`
+    /// surfaces (the probed 0.147.0 order), leaving the busy truth carried by
+    /// the explicit window bit. A rapid SECOND compact in that window must be
+    /// REFUSED with the rollback `BUSY_TURN` copy (the refusal copy the viewer
+    /// mirrors) — BEFORE any RPC: it never arms, so no failure path of the
+    /// second call can clear compact-1's marker (the pre-F3 precheck ignored
+    /// the bit; a rejected second RPC's failure-clear wiped the FIRST compact's
+    /// busy truth, and a queued rollback could then `thread/revert` mid-compact).
+    #[tokio::test]
+    async fn a_second_compact_in_the_answered_but_unstarted_window_is_refused_busy_turn() {
+        let (st, mut rx) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cdbl").await;
+
+        let compact_1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact post-RPC/pre-turn-started
+        // window, with the busy truth carried by compact-1's window bit alone.
+        peer.respond(&compact_id, json!({}));
+        compact_1.await.expect("compact-1 task");
+
+        // Compact-2 in the window: REFUSED BUSY_TURN with ZERO RPCs reaching
+        // the app-server (the red shape instead issues a second
+        // thread/compact/start — surface it for a loud failure).
+        let compact_2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        tokio::select! {
+            raw = rx.recv() => {
+                let frame: Value = serde_json::from_str(&raw.expect("a refusal frame")).unwrap();
+                assert_eq!(frame["event"]["type"], json!("freshAgent.error"), "{frame}");
+                assert_eq!(
+                    frame["event"]["code"],
+                    json!("BUSY_TURN"),
+                    "the second compact mirrors the rollback refusal code: {frame}"
+                );
+                assert_eq!(
+                    frame["event"]["message"],
+                    json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE),
+                    "the viewer sees the rollback refusal copy: {frame}"
+                );
+            }
+            req = peer.expect_request() => {
+                panic!("the refused compact must issue NO RPC — it never reaches a failure path that could clear compact-1's marker (got {req:?})")
+            }
+        }
+        compact_2.await.expect("compact-2 task settles");
+
+        // Exactly ONE revert-capable busy tracker remains (compact-1's window
+        // bit, unreverted): a rollback through the window still refuses
+        // BUSY_TURN with zero provider traffic.
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cdbl", "rb-cdbl", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cdbl", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "compact-1's marker survived compact-2 — the window still refuses: {frames:?}"
+        );
+
+        // The marker ends ONLY at compact-1's own turn/completed: after the
+        // probed notification sequence a third compact is accepted (the tracker
+        // cleared legitimately and re-arms).
+        emit_compact_notification_sequence(&peer, "thread-cdbl", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cdbl"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot proves the clear edge ran"
+        );
+
+        let compact_3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        let (compact3_id, method, _p) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/compact/start",
+            "the tracker lifecycle is intact — a post-completion compact runs"
+        );
+        peer.respond(&compact3_id, json!({}));
+        compact_3.await.expect("compact-3 task");
     }
 
     #[tokio::test]

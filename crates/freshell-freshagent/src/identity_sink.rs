@@ -79,8 +79,9 @@ pub trait PaneIdentitySink: Send + Sync {
     /// reinterpreted (the pane-ledger LEDGER_VERSION discipline). Focused
     /// ep1-r1 F3: implementations reading STORED BYTES route through
     /// [`RollbackRecord::from_stored_payload`], so handlers see the uniform
-    /// already-migrated record (the legacy epochless/destroyed union freezes;
-    /// the disk row is never lazily rewritten).
+    /// already-migrated record (the legacy epochless union freezes — keyed on
+    /// the absence of epoch keys, indifferent to the destroy bit; the disk row
+    /// is never lazily rewritten).
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord>;
     /// Delete the rollback row (kata 1wxv task 4 review M3): a compensation
     /// whose pre-op state was ABSENT restores "nothing was here" by DELETE —

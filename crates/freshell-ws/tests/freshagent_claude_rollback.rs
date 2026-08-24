@@ -287,8 +287,8 @@ impl PaneIdentitySink for TestLedgerSink {
     }
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
-        // reader owns the version gate + the legacy epochless/destroyed
-        // migration (focused ep1-r1 F3).
+        // reader owns the version gate + the legacy epochless-union migration
+        // (focused ep1-r1 F3, absence-keyed per ep1-r2 F1).
         let payload = self.ledger.load_rollback_row(provider, session_id)?;
         RollbackRecord::from_stored_payload(payload)
     }

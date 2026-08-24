@@ -171,9 +171,11 @@ impl PaneIdentitySink for LedgerIdentitySink {
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Reads are memory-only against the write-through index — safe inline.
         // The ledger is payload-opaque; `RollbackRecord::from_stored_payload`
-        // owns the schema-side concerns (the version gate AND the focused
-        // ep1-r1 F3 legacy epochless/destroyed migration — handlers always see
-        // the already-migrated record; the disk row is never lazily rewritten).
+        // owns the schema-side concerns (the version gate AND the legacy
+        // epochless-union migration — absence-keyed, indifferent to the
+        // destroy bit (focused ep1-r1 F3, tightened ep1-r2 F1) — handlers
+        // always see the already-migrated record; the disk row is never
+        // lazily rewritten).
         let payload = self.ledger.load_rollback_row(provider, session_id)?;
         RollbackRecord::from_stored_payload(payload)
     }

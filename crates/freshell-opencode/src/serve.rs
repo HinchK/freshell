@@ -63,7 +63,10 @@ pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
 ///   never re-apply file state; that pin is the entire point of the decision);
 /// - MALFORMED (non-JSON, or JSON that isn't an object — a document with no
 ///   top-level key space can't take the pin) → replaced by the bare pin document,
-///   with a structured warning naming the replaced value's first 24 chars.
+///   with a structured warning naming ONLY the replaced value's byte length.
+///   Focused ep1-r2 F5: inline config can carry credential-shaped fields (API
+///   keys, authorization headers), so the warning NEVER logs any content
+///   substring.
 pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
     match inherited.filter(|raw| !raw.is_empty()) {
         None => OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
@@ -73,9 +76,8 @@ pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
                 Value::Object(map).to_string()
             }
             _ => {
-                let preview: String = raw.chars().take(24).collect();
                 tracing::warn!(
-                    replaced_value_first_24_chars = %preview,
+                    replaced_value_bytes_len = raw.len(),
                     "freshell_opencode.config_content.malformed_inline_config_replaced"
                 );
                 OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string()
@@ -1805,8 +1807,14 @@ mod tests {
         }
     }
 
+    /// Focused-review ep1-r2 F5 (log hygiene): the malformed-inline-config
+    /// warning must never copy user config into persistent logs — an inline
+    /// OpenCode document can carry credential-shaped fields (API keys,
+    /// authorization headers), and a truncated/malformed secret-bearing value
+    /// would otherwise leak. The warn names ONLY the replaced value's byte
+    /// length; NO substring of the content appears in any traced field.
     #[test]
-    fn merged_config_malformed_is_replaced_with_a_warning_naming_the_first_24_chars() {
+    fn merged_config_malformed_is_replaced_with_a_content_free_length_only_warning() {
         let (events, _guard) = config_capture::capture();
         let malformed = "not-json-at-all{ this is longer than twenty four chars }";
         let replaced = merged_opencode_config_content(Some(malformed));
@@ -1820,28 +1828,46 @@ mod tests {
             })
             .expect("a malformed inline config warns loudly");
         assert_eq!(
-            warn.get("replaced_value_first_24_chars")
-                .map(String::as_str),
-            Some("not-json-at-all{ this is"),
-            "the warning names the replaced value's first 24 chars: {warn:?}"
+            warn.get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            malformed.len().to_string(),
+            "the warning names ONLY the replaced value's byte length: {warn:?}"
         );
+        for (field, value) in warn.iter() {
+            for n in [8usize, 16, 24, malformed.len()] {
+                let needle = &malformed[..n.min(malformed.len())];
+                assert!(
+                    !value.contains(needle),
+                    "no content substring ({needle:?}) may appear in any traced field ({field}={value:?})"
+                );
+            }
+        }
     }
 
-    /// A non-object JSON value can't take a top-level pin either — same replace+warn.
+    /// A non-object JSON value can't take a top-level pin either — same
+    /// replace+warn, content-free (F5).
     #[test]
     fn merged_config_json_scalars_and_arrays_are_replaced_with_the_warning() {
         let (events, _guard) = config_capture::capture();
+        let scalar = r#"["plugin-x"]"#;
         assert_eq!(
-            merged_opencode_config_content(Some(r#"["plugin-x"]"#)),
+            merged_opencode_config_content(Some(scalar)),
             OPENCODE_SNAPSHOTS_DISABLED_CONFIG
         );
         let events = events.lock().expect("capture lock");
         assert_eq!(events.len(), 1, "one warn per replaced malformed value");
         assert_eq!(
             events[0]
-                .get("replaced_value_first_24_chars")
-                .map(String::as_str),
-            Some(r#"["plugin-x"]"#),
+                .get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            scalar.len().to_string(),
+        );
+        assert!(
+            events[0].values().all(|v| !v.contains("plugin-x")),
+            "no content substring survives into the warning: {:?}",
+            events[0]
         );
     }
 
