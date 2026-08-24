@@ -1,0 +1,469 @@
+# Fresh-agent Status Strip Implementation Plan
+
+> **For agentic workers:** Execute this plan task by task with a fresh
+> implementer and a specification-plus-quality review after every task. Track
+> progress with the checkbox steps below.
+
+## User Request
+
+### Requested result
+Implement the approved fresh-agent pane redesign (approved flat-HTML preview v3; local file /tmp/opencode/fresh-agent-status-strip-preview.html) in the Freshell codebase:
+
+1. New "session status strip" between the transcript and the composer in every fresh-agent pane (desktop and mobile):
+   - Left: a model chip showing the effective active model's display name, with no indication of where the model choice is sourced from; clicking it opens the existing model selector dialog; its hover tooltip carries the raw model id + effort (e.g. "opus[1m] · effort high").
+   - Right: a context meter showing the % of the model's context window currently used, live from session snapshots, with an exact-token tooltip ("96,000 / 200,000 tokens (47% full) — compacts at 100%"). Fill is muted below 70%, amber at 70–89%, red (fill and numeral) at ≥90%. When no data exists yet (no snapshot / provider never reports) the strip shows a muted "context —" with no meter — never a fake 0%.
+   - The strip owns the bottom-chrome divider (the composer no longer draws its own border-top).
+   - Collapse behavior: below 520px pane width the word "context" drops and the meter shrinks to 64px; below ~280px the meter hides and only the numeral remains, with the chip truncating on ellipsis.
+   - Pane-header meta keeps directory + branch but no longer duplicates the context %.
+2. Pane header: remove the session-type text label (e.g. "freshclaude"); the header opens with the repo icon (tooltip names the repo) and the coding-agent icon (tooltip names the agent/pane type). Desktop tabs keep their repo icons; the mobile tab strip gets no icons.
+3. Turn-header timecodes: local time h:mm AM/PM with no seconds (never UTC); the timecode font follows the pane's selected style (sans in the default style, mono in the mono style) — not hard-coded monospace.
+4. Legibility type scale for the new/changed UI: nothing below 13px on the phone, nothing below 12px in the desktop pane, hierarchy transcript body > pane/tab headers > strip/turn meta.
+
+### Explicit constraints
+- Work in the dedicated worktree .worktrees/fresh-agent-status-strip on branch the-usual/fresh-agent-status-strip; never commit to main; do not open a PR without explicit user approval.
+- Red/green/refactor TDD for all production changes; failing-test-first evidence per task; unit and e2e coverage per repo norms.
+- Match the approved preview for layout, wording, and behavior; when in doubt the preview wins.
+- Do not restart the production self-hosted server (port 3001); no production deploys.
+- Keep the repo's accessibility requirements (semantic buttons, aria-labels) and update docs/index.html for this significant UI change.
+
+### Accepted tradeoffs and residuals
+- Severity thresholds fixed at 70% (amber) / 90% (red) as approved.
+- Unknown context state renders muted "context —" with no meter (deliberate, not a placeholder).
+- Effort and raw model id are tooltip-only by design (chip shows only the effective model display name).
+
+**Goal:** Every fresh-agent pane shows a slim status strip (effective model + context-window %) between its transcript and composer, pane headers carry repo + agent icons instead of the session-type label, and turn timecodes read "h:mm AM/PM" in local time.
+
+**Architecture:** One new presentational component (`FreshAgentStatusStrip`) fed by the session-indexer tokenUsage (`compactPercent` — the same data that already powers the pane-header meta %) — no server or protocol changes. `FreshAgentView` wires model display (existing registry helpers + static model table) and context usage (new pure helper over the sessions/projects slice) and renders the strip between the transcript and composer. `PaneHeader` un-gates its existing repo/agent icon JSX for fresh-agent panes and drops the identity text. The timecode formatter drops seconds; type floors land via container queries in `src/index.css`.
+
+**Tech Stack:** React 18, Redux Toolkit, Tailwind + bespoke fresh-agent CSS (container queries on `.fresh-agent-pane`), Vitest + Testing Library, Playwright (cloud lane).
+
+## Global Constraints
+
+- Workspace: worktree `/home/dan/code/freshell/.worktrees/fresh-agent-status-strip`, branch `the-usual/fresh-agent-status-strip`, base `0910d8b05801636fe7480cfb0b8a8513cc0c7cdc` (green gate receipt: base-gate re-run 2026-08-24). Never commit to main; never push without instruction; no PR creation.
+- The worktree has **no node_modules** — run `npm ci` in the worktree before any test command (Task 1, step 0).
+- Test backends are cloud (`FRESHELL_VITEST_BACKEND=cloud`, `FRESHELL_E2E_BACKEND=cloud`). Focused unit runs from the worktree: `npm run test:vitest -- run <files> --config config/vitest/vitest.default.config.ts`. E2e cloud lane: `npm run test:e2e -- test/e2e-browser/specs/<spec>.spec.ts` (positional spec filter supported by scripts/e2e-cloud.sh).
+- Server uses NodeNext/ESM — relative imports include `.js` extensions (client `@/` alias imports do not).
+- Commit identity is the repo default; never write `dan@danshapiro.com` into git config.
+- Never restart the production server (port 3001). No production deploys.
+- Repo a11y rules: semantic buttons, aria-labels on icon-only controls; the e2e a11y gate forbids CSS-class-only locators in specs (use role+name).
+- The meter data source is the session-indexer `tokenUsage` (see Task 1); the fresh-agent snapshot `tokenUsage` never carries `compactPercent` today — reading it would be a silent "always unknown" bug. Do not add server workarounds.
+
+---
+
+### Task 1: FreshAgentContextUsage helper + FreshAgentStatusStrip component (presentational) + unit tests
+
+**Files:**
+- Create: `src/lib/fresh-agent-context-usage.ts`
+- Create: `src/components/fresh-agent/FreshAgentStatusStrip.tsx`
+- Create: `test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx`
+- Create: `test/unit/client/lib/fresh-agent-context-usage.test.ts`
+- Modify: `src/index.css` (add `.fresh-agent-status-strip` block + severity + container queries)
+- Modify: `src/components/panes/PaneContainer.tsx` (move `findIndexedSessionById` to the new lib and import it back — no behavior change)
+
+**Interfaces:**
+- Consumes: `ProjectGroup[]` / `CodingCliSession` from `@/store/types` (sessions slice shape), `FreshAgentPaneContent` from `@/store/paneTypes`, `FreshAgentSessionState` from `@/store/freshAgentTypes`.
+- Produces:
+  - `resolveFreshAgentContextUsage(content: FreshAgentPaneContent, session: FreshAgentSessionState | undefined, projects: ProjectGroup[]): { percent: number; contextTokens: number; thresholdTokens: number } | null` — durable session id chain: `session`-preferred resume id → `content.resumeSessionId` → `content.sessionRef` (matching provider) → `content.sessionId`; then `findIndexedSessionById(projects, content.provider, sessionId)`; reads `indexed.tokenUsage.compactPercent` (+ `contextTokens` + `compactThresholdTokens` for the tooltip). Returns null when any input is missing (unknown state).
+  - `findIndexedSessionById(projects, provider, sessionId)` (moved from PaneContainer, exported).
+  - `<FreshAgentStatusStrip modelLabel modelTooltip contextUsage onOpenModelDialog />` — `contextUsage` is the helper result or `null`.
+
+- [ ] **Step 0: Workspace setup** — `cd /home/dan/code/freshell/.worktrees/fresh-agent-status-strip && npm ci`. Expected: completes; `node_modules` present.
+
+- [ ] **Step 1: Write the failing behavioral tests**
+
+`test/unit/client/lib/fresh-agent-context-usage.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { resolveFreshAgentContextUsage } from '@/lib/fresh-agent-context-usage'
+// fixture: projects: [{ repoRoot?, projectPath, sessions: [{ provider: 'claude', sessionId: 'abc', cwd, projectPath, tokenUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 } }] }]
+// content fixtures: FreshAgentPaneContent minimal ({ kind: 'fresh-agent', provider: 'claude', sessionType: 'freshclaude', createRequestId: 'req', status: 'connected', sessionId: 'abc', ... } — cast via helper if the full type is heavy; mirror PaneContainer.test.tsx's makeSession/makeContent patterns)
+
+describe('resolveFreshAgentContextUsage', () => {
+  it('resolves percent + tokens from the indexed session via content.sessionId', () => {
+    const usage = resolveFreshAgentContextUsage(content({ sessionId: 'abc' }), undefined, projects)
+    expect(usage).toEqual({ percent: 47, contextTokens: 96000, thresholdTokens: 200000 })
+  })
+  it('prefers sessionRef over resumeSessionId over sessionId', () => { /* build candidates where each chain wins */ })
+  it('returns null when the session is not indexed', () => {
+    expect(resolveFreshAgentContextUsage(content({ sessionId: 'nope' }), undefined, projects)).toBeNull()
+  })
+  it('returns null when the indexed session has no compactPercent', () => { /* tokenUsage without compactPercent */ })
+  it('clamps percent into 0–100 and rounds', () => { /* compactPercent: 100.7 → 100; -3 → 0 */ })
+})
+```
+
+`test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx` (component-level; no store needed — pure props):
+
+```tsx
+import { render, screen } from '@testing-library/react'
+// ...
+describe('FreshAgentStatusStrip', () => {
+  it('renders the model chip with the display label and id+effort tooltip', () => {
+    render(<FreshAgentStatusStrip modelLabel="Claude Opus 5 (1M context)" modelTooltip="opus[1m] · effort high" contextUsage={null} onOpenModelDialog={() => {}} />)
+    const chip = screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
+  })
+  it('clicking the chip opens the model dialog', async () => { /* fireEvent.click → spy called */ })
+  it('renders the context meter at 47% with exact-token tooltip', () => {
+    render(<FreshAgentStatusStrip modelLabel="Claude Opus 5 (1M context)" modelTooltip="t" contextUsage={{ percent: 47, contextTokens: 96000, thresholdTokens: 200000 }} onOpenModelDialog={() => {}} />)
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+    expect(screen.getByTitle('96,000 / 200,000 tokens (47% full) — compacts at 100%')).toBeInTheDocument()
+  })
+  it('shows muted "context —" with no meter when usage is unknown (never a fake 0%)', () => {
+    render(<FreshAgentStatusStrip modelLabel="Claude Opus 5 (1M context)" modelTooltip="t" contextUsage={null} onOpenModelDialog={() => {}} />)
+    expect(screen.queryByRole('meter')).toBeNull()
+    expect(screen.getByText('context —')).toBeInTheDocument()
+  })
+  it.each([
+    [47, 'ok'],
+    [74, 'warn'],
+    [91, 'hot'],
+  ])('applies severity tier %s at %i%', (percent, tier) => {
+    const { container } = render(
+      <FreshAgentStatusStrip modelLabel="Claude Opus 5 (1M context)" modelTooltip="t"
+        contextUsage={{ percent, contextTokens: percent * 2000, thresholdTokens: 200000 }}
+        onOpenModelDialog={() => {}} />,
+    )
+    expect(container.querySelector('.fresh-agent-status-strip')).toHaveAttribute('data-severity', tier)
+  })
+})
+```
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `npm run test:vitest -- run test/unit/client/lib/fresh-agent-context-usage.test.ts test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx --config config/vitest/vitest.default.config.ts`
+
+Expected: FAIL — module `@/lib/fresh-agent-context-usage` / `@/components/fresh-agent/FreshAgentStatusStrip` do not exist.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+`src/lib/fresh-agent-context-usage.ts`:
+
+```ts
+import type { CodingCliSession, ProjectGroup } from '@/store/types'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
+import { getPreferredResumeSessionId } from '@/store/persistControl'
+import type { CodingCliProviderName } from '@shared/...' // match existing imports in PaneContainer
+
+export type FreshAgentContextUsage = { percent: number; contextTokens: number; thresholdTokens: number }
+
+export function findIndexedSessionById(projects: ProjectGroup[], provider: CodingCliProviderName, sessionId: string): CodingCliSession | undefined {
+  for (const project of projects) {
+    const match = project.sessions.find((s) => s.provider === provider && s.sessionId === sessionId)
+    if (match) return match
+  }
+  return undefined
+}
+
+/** Durable session id chain — same precedence as PaneContainer.resolveFreshAgentRuntimeMeta. */
+function durableSessionId(content: FreshAgentPaneContent, session: FreshAgentSessionState | undefined): string | undefined {
+  return getPreferredResumeSessionId(session)
+    ?? content.resumeSessionId
+    ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined)
+    ?? content.sessionId
+}
+
+export function resolveFreshAgentContextUsage(content, session, projects): FreshAgentContextUsage | null {
+  const sessionId = durableSessionId(content, session)
+  if (!sessionId) return null
+  const indexed = findIndexedSessionById(projects, content.provider, sessionId)
+  const usage = indexed?.tokenUsage
+  const raw = usage?.compactPercent
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null
+  const percent = Math.max(0, Math.min(100, Math.round(raw)))
+  const contextTokens = Math.round(usage.contextTokens ?? NaN)
+  const thresholdTokens = Math.round((usage as { compactThresholdTokens?: number }).compactThresholdTokens ?? NaN)
+  return { percent, contextTokens, thresholdTokens }
+}
+```
+
+(Verify the exact `TokenSummary` field names against `shared/ws-protocol.ts` TokenSummarySchema — the tooltip needs threshold tokens; the existing `formatPaneRuntimeTooltip` already reads `compactThresholdTokens`.)
+
+`src/components/fresh-agent/FreshAgentStatusStrip.tsx`:
+
+```tsx
+import { ChevronDown } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import type { FreshAgentContextUsage } from '@/lib/fresh-agent-context-usage'
+
+const tokenNumber = new Intl.NumberFormat('en-US')
+
+export type FreshAgentStatusStripProps = {
+  modelLabel: string
+  modelTooltip: string
+  contextUsage: FreshAgentContextUsage | null
+  onOpenModelDialog: () => void
+}
+
+export function FreshAgentStatusStrip({ modelLabel, modelTooltip, contextUsage, onOpenModelDialog }: FreshAgentStatusStripProps) {
+  const severity = contextUsage === null ? 'unknown'
+    : contextUsage.percent >= 90 ? 'hot'
+    : contextUsage.percent >= 70 ? 'warn'
+    : 'ok'
+  return (
+    <div className="fresh-agent-status-strip" data-severity={severity}>
+      <button
+        type="button"
+        className="fresh-agent-status-chip"
+        title={modelTooltip}
+        aria-label={`Model: ${modelLabel} — change model`}
+        onClick={onOpenModelDialog}
+      >
+        <span className="fresh-agent-status-chip-label">{modelLabel}</span>
+        <ChevronDown className="h-2.5 w-2.5" aria-hidden="true" />
+      </button>
+      {contextUsage ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span
+              className="fresh-agent-status-context"
+              role="meter"
+              aria-label="Context window used"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={contextUsage.percent}
+              title={`${tokenNumber.format(contextUsage.contextTokens)} / ${tokenNumber.format(contextUsage.thresholdTokens)} tokens (${contextUsage.percent}% full) — compacts at 100%`}
+            >
+              <span className="fresh-agent-status-context-label">context</span>
+              <span className="fresh-agent-status-meter" aria-hidden="true"><i style={{ width: `${contextUsage.percent}%` }} /></span>
+              <span className="fresh-agent-status-pct">{contextUsage.percent}%</span>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top" align="end">
+            {`${tokenNumber.format(contextUsage.contextTokens)} / ${tokenNumber.format(contextUsage.thresholdTokens)} tokens (${contextUsage.percent}% full)`}
+          </TooltipContent>
+        </Tooltip>
+      ) : (
+        <span className="fresh-agent-status-context fresh-agent-status-context-unknown" title="No token data reported yet">context —</span>
+      )}
+    </div>
+  )
+}
+
+export default FreshAgentStatusStrip
+```
+
+`src/index.css` — append after the composer block (~line 1290), before the panel-mobile container block; honor the existing conventions:
+
+```css
+/* ---------- fresh-agent session status strip ---------- */
+.fresh-agent-status-strip {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  height: 26px; padding: 0 8px;
+  border-top: 1px solid hsl(var(--border) / 0.6);
+  font-family: var(--fresh-agent-meta-font-family);
+  font-size: 12px; color: var(--fresh-agent-muted-text);
+}
+.fresh-agent-status-chip {
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0;
+  background: transparent; border: 0; padding: 3px 6px; border-radius: 4px;
+  font: inherit; font-weight: 500; color: inherit; cursor: pointer; white-space: nowrap; line-height: 1.3;
+}
+.fresh-agent-status-chip:hover { background: var(--fresh-agent-subtle-surface); }
+.fresh-agent-status-chip-label { overflow: hidden; text-overflow: ellipsis; }
+.fresh-agent-status-context { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+.fresh-agent-status-meter { width: 96px; height: 4px; border-radius: 999px; background: var(--muted); overflow: hidden; display: block; }
+.fresh-agent-status-meter > i { display: block; height: 100%; border-radius: 999px; background: var(--fresh-agent-muted-text); }
+.fresh-agent-status-pct { font-variant-numeric: tabular-nums; }
+.fresh-agent-status-strip[data-severity="warn"] .fresh-agent-status-meter > i { background: hsl(var(--warning)); }
+.fresh-agent-status-strip[data-severity="warn"] .fresh-agent-status-pct { color: hsl(var(--warning)); }
+.fresh-agent-status-strip[data-severity="hot"] .fresh-agent-status-meter > i { background: hsl(var(--destructive)); }
+.fresh-agent-status-strip[data-severity="hot"] .fresh-agent-status-pct { color: hsl(var(--destructive)); }
+.fresh-agent-status-context-unknown { color: var(--fresh-agent-muted-text); }
+
+@container (max-width: 520px) {
+  .fresh-agent-status-strip { height: 32px; font-size: 13px; }
+  .fresh-agent-status-chip { padding: 8px; }
+  .fresh-agent-status-context-label { display: none; }
+  .fresh-agent-status-meter { width: 64px; height: 5px; }
+}
+@container (max-width: 280px) {
+  .fresh-agent-status-meter { display: none; }
+}
+```
+
+(Refactor pass only: serif/mono overrides for the strip's border color live in Task 2 with the divider move.)
+
+`src/components/panes/PaneContainer.tsx`: delete local `findIndexedSessionById` (lines 130–142) and import the moved function from `@/lib/fresh-agent-context-usage`.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: `npm run test:vitest -- run test/unit/client/lib/fresh-agent-context-usage.test.ts test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx --config config/vitest/vitest.default.config.ts`
+
+Expected: PASS (PaneContainer suite proves the function move is behavior-preserving).
+
+- [ ] **Step 5: Refactor while green**
+
+Tidy imports; confirm the shared helper is the single home for the session-id precedence chain (PaneContainer keeps its own call sites — dedupe only where it's a pure swap).
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: anything importing PaneContainer's pane-meta path → the whole `test/unit/client/components/panes/` dir.
+
+Run: `npm run test:vitest -- run test/unit/client/components/panes --config config/vitest/vitest.default.config.ts`
+
+Expected: PASS
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add src/lib/fresh-agent-context-usage.ts src/components/fresh-agent/FreshAgentStatusStrip.tsx test/unit/client/lib/fresh-agent-context-usage.test.ts test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx src/index.css src/components/panes/PaneContainer.tsx
+git commit -m "feat(fresh-agent): add session status strip component (model chip + context meter)"
+```
+
+---
+### Task 2: Wire the strip into FreshAgentView + move the bottom divider from composer to strip
+
+**Files:**
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx`
+- Modify: `src/components/fresh-agent/FreshAgentComposer.tsx` (root form class list: drop `border-t border-border/60`)
+- Modify: `src/index.css` (serif `.fresh-agent-style-serif .fresh-agent-status-strip` + mono `.fresh-agent-style-mono .fresh-agent-status-strip` border/padding overrides migrate from the composer overrides; serif `.fresh-agent-style-serif .fresh-agent-composer` and mono `.fresh-agent-style-mono .fresh-agent-composer` lose their border-top declarations)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (seed indexed sessions into the store; assert strip renders model label + meter with %, unknown state otherwise; assert chip click opens the dialog)
+
+**Interfaces:**
+- Consumes: `resolveFreshAgentContextUsage` + `FreshAgentStatusStrip` (Task 1); `resolveFreshAgentModelOption` from `@shared/fresh-agent-models`; `resolveEffectiveFreshAgentModel` / `getEffectiveFreshAgentEffort` (already imported in the View).
+- Produces: none new; the View renders `<FreshAgentStatusStrip ... />` between transcript and composer.
+
+Key wiring rules:
+- Compute `stripModel = resolveFreshAgentModelOption(paneContent.sessionType, resolveEffectiveFreshAgentModel(paneContent, providerDefaults))`; `stripModelLabel = stripModel?.label ?? resolveEffectiveFreshAgentModel(...) ?? descriptor?.label ?? 'Fresh Agent'`; `stripModelTooltip = \`${modelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(...) ?? 'Default'}\``. Compute these OUTSIDE the giant render `useMemo` (dep discipline — `providerDefaults` is not currently a dep of that memo), and add the computed values (plus `contextUsage`) to the memo's dep array.
+- `contextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)` where `projects` comes from `useAppSelector((s) => s.sessions.projects)` (mirror the EMPTY_PROJECTS pattern in PaneContainer) — outside the memo; memo deps gain `contextUsage`.
+- The strip renders unconditionally in every fresh-agent pane (even unknown state).
+- Composer `className` becomes `fresh-agent-composer relative p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] sm:pb-3` (border-t dropped).
+- CSS: serif block gets `.fresh-agent-style-serif .fresh-agent-status-strip { border-top-color: var(--fresh-agent-border); padding: 0 1.4rem; }` matching the composer's old border color; remove `border-top-color` from serif composer override (keep background/padding); mono block moves `border-top: 1px solid var(--fresh-agent-border)` from `.fresh-agent-style-mono .fresh-agent-composer` onto `.fresh-agent-style-mono .fresh-agent-status-strip` (with `padding: 0 1rem`).
+
+- [ ] **Step 1: Write the failing behavioral tests** — extend `FreshAgentView.test.tsx` with: (a) strip renders with chip label "Claude Opus 5 (1M context)" for a freshclaude pane with no model override; (b) seeded indexed session (sessions slice `projects` containing a claude session with matching id + tokenUsage compactPercent 47) → meter present with aria-valuenow 47; (c) no indexed session → `screen.getByText('context —')`, no meter; (d) chip click → model dialog opens (assert dialog content appears).
+- [ ] **Step 2:** Run the four new assertions; FAIL because the render path has no strip.
+- [ ] **Step 3:** Implement the wiring + composer border removal + CSS migration as specified above.
+- [ ] **Step 4:** `npm run test:vitest -- run test/unit/client/components/fresh-agent --config config/vitest/vitest.default.config.ts` → PASS (whole fresh-agent component dir: catches composer-theme suites).
+- [ ] **Step 5: Refactor while green** — keep computed strip props grouped above the memo; no other reshaping.
+- [ ] **Step 6:** Impacted set = `test/unit/client/components/fresh-agent/` + `test/unit/client/components/panes/` + `test/unit/client/components/tabs/`? No — tabs untouched. Run the two dirs; Expected: PASS.
+- [ ] **Step 7:**
+
+```bash
+git add src/components/fresh-agent/FreshAgentView.tsx src/components/fresh-agent/FreshAgentComposer.tsx src/index.css test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git commit -m "feat(fresh-agent): wire status strip into pane; strip owns bottom divider"
+```
+
+---
+
+### Task 3: Pane header — repo + agent icons, identity label removed, meta % dropped for fresh-agent panes
+
+**Files:**
+- Modify: `src/components/panes/PaneHeader.tsx`
+- Modify: `src/components/panes/PaneContainer.tsx` (`resolveFreshAgentRuntimeMeta`: stop passing `tokenUsage` in BOTH the indexed and session.snapshot branches for fresh-agent panes)
+- Modify: `src/index.css` (delete `.pane-header-fresh-agent-identity` block lines 31–36 and the identity selector inside the 180px container block lines 65–68; keep title-gap rules)
+- Modify: `test/unit/client/components/panes/PaneHeader.test.tsx` (identity suite rewrite; icon presence tests)
+- Modify: `test/unit/client/components/panes/PaneContainer.test.tsx` (fresh-agent %-meta assertions → no %)
+- Modify: `test/e2e-browser/specs/fresh-agent.spec.ts` (selector fixes listed in Step 6 — production-visible change; fold into this task so e2e stays green with it)
+- Modify: `test/e2e-browser/specs/restore-matrix.spec.ts` (busy-blue locator retarget)
+
+**Interfaces:**
+- Consumes: `RepoIcon` (`src/components/icons/RepoIcon.tsx`), `PaneIcon` (`src/components/icons/PaneIcon.tsx`), existing `repoIconInfo`/`busy` props already computed in PaneHeader.
+- Produces: none (internal). Terminal/non-fresh-agent panes byte-identical; the codex/claude header parity test (PaneHeader.test.tsx:479–508) stays untouched and MUST pass.
+
+Header layout (fresh-agent): `[repo icon (title=repoName or "Repository")][agent icon (PaneIcon, title=\`${content.sessionType} session\`)][title?][meta?][actions…]`. Wrap each icon in `<span title={...}>` (PaneIcon/RepoIcon ship no own tooltips). Remove the `pane-header-fresh-agent-identity` span and its `title={`${content.sessionType} session`}`: the tooltip moves to the agent-icon wrapper. Busy-blue: the agent icon takes over the `busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground'` treatment the identity span had. Removal of `!isFreshAgentPane &&` gates on repo icon + PaneIcon JSX (adapting className sizes: `h-3.5 w-3.5` desktop, with the repo icon wrapper for fresh-agent).
+
+- [ ] **Step 1: Write the failing tests** — PaneHeader.test.tsx: fresh-agent pane shows repo icon + agent icon (query by the wrapper spans' title attributes) and NO `freshclaude`/`freshcodex` text anywhere in the header; busy/running fresh-agent pane's agent icon carries text-blue-500. PaneContainer.test.tsx: fresh-agent meta label = "freshell (main)" (no "· 47%"-style suffix) even with compactPercent present; terminal-mode pane meta still shows the % (parity guard).
+- [ ] **Step 2:** Run both; FAIL (identity text still rendered; % still in meta).
+- [ ] **Step 3:** Implement PaneHeader/PaneContainer/index.css changes above.
+- [ ] **Step 4:** `npm run test:vitest -- run test/unit/client/components/panes --config config/vitest/vitest.default.config.ts` → PASS.
+- [ ] **Step 5: Refactor** — the now-dead freshAgentTitleMatchesMeta/isFreshAgentDefaultTitle heuristics only existed to keep title and identity/meta from duplicating; re-read PaneHeader's fresh-agent branch after the identity removal and delete any heuristic that no longer has a consumer (keep behavior identical for the title/meta display: title shows custom titles, meta shows dir+branch — never both-empty).
+- [ ] **Step 6: e2e locator repair (failing-test-first evidence is the existing specs failing against the new header)** — `fresh-agent.spec.ts`: replace `getByText('freshcodex', { exact: true })` style lookups (lines ~197, ~963) and the `openFreshAgentSettings` helper (~46–50) that finds panes via lowercased sessionType text — retarget to the pane header's agent-icon wrapper title (e.g. `page.getByTitle('freshcodex session')`) or the pane container's `data-session-type` attribute. `restore-matrix.spec.ts` (~1263–1273): the busy-blue assertion targets `.pane-header-fresh-agent-identity`; retarget to the agent icon wrapper. Confirm both specs are NOT in CLOUD_SKIP_SPECS (test/e2e-browser/playwright.cloud.config.ts) — fresh-agent.spec.ts is not skipped per the exploration report; verify restore-matrix.spec.ts similarly. Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts` → PASS.
+- [ ] **Step 7:**
+
+```bash
+git add src/components/panes/PaneHeader.tsx src/components/panes/PaneContainer.tsx src/index.css test/unit/client/components/panes/PaneHeader.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts
+git commit -m "feat(fresh-agent): pane header shows repo + agent icons, drops session-type label and meta %"
+```
+
+---
+
+### Task 4: Turn-header timecodes — local h:mm AM/PM, no seconds; legibility floor for turn-header type
+
+**Files:**
+- Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (`formatTurnTimecode`, lines 41–46; turn-header class)
+- Modify: `src/index.css` (turn-header font-size floors; serif 0.58rem and mono 0.62rem overrides; a ≤520px container-query bump to 13px)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` (timecode expectation, ~line 298–316)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (timecode expectation, ~line 484)
+
+**Interfaces:** Consumes/Produces: none (internal format change).
+
+- [ ] **Step 1: Write the failing tests** — for a fixed timestamp (e.g. `2026-08-23T17:41:18Z`), assert the rendered timecode equals `new Date(ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })` AND matches `/^\d{1,2}:\d{2}\s?(AM|PM)$/i` (no seconds, meridiem). Update the two existing assertions (they currently compute `toLocaleTimeString()` bare — they must fail first against the seconds-producing code).
+- [ ] **Step 2:** Run; FAIL (seconds still shown).
+- [ ] **Step 3:** `formatTurnTimecode` → `return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })`. Keep the NaN fallback. Do NOT add a font-family — the time element inherits `--fresh-agent-meta-font-family` via `.fresh-agent-turn-header` (already style-following; no mono hard-coding). Type floor: change the header class `text-[11px]` → `text-xs` (0.75rem = 12px); set serif override font-size 0.75rem and mono 0.75rem; add after the composer block:
+
+```css
+@container (max-width: 520px) {
+  .fresh-agent-turn-header,
+  .fresh-agent-style-serif .fresh-agent-turn-header,
+  .fresh-agent-style-mono .fresh-agent-turn-header { font-size: 13px; }
+}
+```
+
+(The turn header lives inside `.fresh-agent-pane` (container-type inline-size); the compound selectors inside the block beat the serif/mono single-class overrides by specificity — no `!important`.)
+
+- [ ] **Step 4:** `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.default.config.ts` → PASS.
+- [ ] **Step 5: Refactor** — none expected; the style-override notes are deliberate.
+- [ ] **Step 6:** Impacted = the whole fresh-agent client dir (timecodes render in view tests): `npm run test:vitest -- run test/unit/client/components/fresh-agent --config config/vitest/vitest.default.config.ts` → PASS.
+- [ ] **Step 7:**
+
+```bash
+git add src/components/fresh-agent/FreshAgentTranscript.tsx src/index.css test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git commit -m "feat(fresh-agent): timecodes as local h:mm AM/PM; turn-header legibility floor"
+```
+
+---
+### Task 5: E2e coverage — strip presence, chip, unknown state, mobile collapse
+
+**Files:**
+- Modify: `test/e2e-browser/specs/fresh-agent.spec.ts`
+- Modify: `test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
+
+**Interfaces:** existing spec helpers (`openFreshAgentSettings` repaired in Task 3, `data-context="fresh-agent"` pane roots, route-seeded snapshots where the pattern exists).
+
+- [ ] **Step 1: Write the failing e2e assertions** —
+  - `fresh-agent.spec.ts` (desktop): new test "shows the session status strip": open a freshclaude pane via the existing harness; assert `page.getByRole('button', { name: /Model: Claude Opus 5 \(1M context\) — change model/ })` visible inside the pane; assert `page.getByText('context —')` visible (the e2e harness cannot seed a session-indexed % — the unknown state is the honest e2e-observable outcome); assert no `role="meter"` inside the pane. Chip click → the model dialog opens.
+  - `fresh-agent-mobile.spec.ts` (390px viewport, already <520px): assert the strip's chip is visible, the word `context` is NOT visible (`getByText('context', { exact: true })` absent/hidden while `context —` renders — use the unknown row's full text to avoid ambiguity), and the pane composer buttons sit in the 4-up grid (existing assertion style).
+- [ ] **Step 2 (red evidence):** Author the specs, temporarily comment out the `<FreshAgentStatusStrip … />` render in FreshAgentView.tsx (working tree only, never committed), run the two specs and confirm the new assertions FAIL, then restore the render.
+- [ ] **Step 3:** (no production change beyond the locator repairs from Task 3 if not already landed).
+- [ ] **Step 4:** `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/fresh-agent-mobile.spec.ts` → PASS on the cloud lane (both specs are excluded from CLOUD_SKIP_SPECS — verify in test/e2e-browser/playwright.cloud.config.ts before running).
+- [ ] **Step 5: Refactor** — share any repeated assertions in one spec-local helper only if duplication appears.
+- [ ] **Step 6:** Impacted e2e = the three fresh-agent specs touched overall: run `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/fresh-agent-mobile.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts` → PASS.
+- [ ] **Step 7:**
+
+```bash
+git add test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/fresh-agent-mobile.spec.ts
+git commit -m "test(fresh-agent): e2e coverage for status strip (desktop + mobile collapse)"
+```
+
+---
+
+### Task 6: docs/index.html mock update + lint/typecheck + full verification
+
+**Files:**
+- Modify: `docs/index.html`
+
+**Interfaces:** none.
+
+- [ ] **Step 1** — Update the mock's fresh-agent panel (`panel-start` ~lines 831–856): header gains repo + agent icon glyphs where the session-type label was (the mock's current header text per the region), add a status strip before the composer mirroring the approved preview (model chip + meter at ~47%, "context" word + tooltip semantics as title), timecodes (if rendered there) → "h:mm AM/PM". CSS region ~430–466: move the composer's border-top onto the new strip class and add the strip rules (scaled to the mock's own token names — the mock has its own local class names; do not import app CSS).
+- [ ] **Step 2:** Open the file headless (e.g. render check) or eyeball the diff; verify no markup errors.
+- [ ] **Step 3:** `npm run lint` and `npm run typecheck` (client + server) → clean.
+- [ ] **Step 4:** Full coordinated suite from the worktree: `FRESHELL_TEST_SUMMARY="the-usual/fresh-agent-status-strip final gate" npm test` → PASS (the one known flake from the baseline ledger — ws-terminal-idle 1ms race — if it fires, replay that single file and record the receipt).
+- [ ] **Step 5:**
+
+```bash
+git add docs/index.html
+git commit -m "docs: refresh index.html mock for fresh-agent status strip"
+```
+
+---
+
+## Risk/rollback notes
+
+- All changes are client-side plus test/docs; rollback = revert the branch commits in reverse order.
+- No protocol, server, or Rust changes; the live self-hosted server is never touched.
+- pre-existing flake ledger: `test/server/ws-terminal-idle.test.ts` grace-window 1ms race (baseline evidence in run logs); never "fix" as part of this run — only replay and record if it fires.
