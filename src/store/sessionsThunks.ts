@@ -379,41 +379,46 @@ function getContextUsageOpts(state: RootState): { includeKeys?: string[] } {
   return includeKeys.length > 0 ? { includeKeys } : {}
 }
 
-function commitContextUsageExtras(
-  dispatch: AppDispatch,
-  extras: SearchResponse['contextUsageExtras'],
-): void {
-  if (extras && extras.length > 0) {
-    dispatch(applyContextUsageExtras(extras))
-  }
-}
-
 type UsageBearingRow = {
   provider: string
   sessionId: string
   tokenUsage?: TokenSummary
 }
 
+type UsageStampResponse = {
+  revision?: number
+  contextUsageExtras?: SearchResponse['contextUsageExtras']
+}
+
 /**
  * STATUS-STRIP: stamp the unified usage map from ONLY this response's fresh
  * rows (never merged windows — retained row data must never be re-marked
  * fresh). Extras are server-filtered off the page, so no overlap exists
- * between the two upsert sources.
+ * between the two upsert sources. The stamp is bounded to the CURRENT
+ * includeKeys (`paneKeys` — dropped-pane entries are pruned) and ordered by
+ * the response's session-directory revision (`sourceRevision`) so a late
+ * older response can never regress a newer entry.
  */
 function commitContextUsageFromRows(
   dispatch: AppDispatch,
+  getState: () => RootState,
+  response: UsageStampResponse,
   rows: UsageBearingRow[],
-  extras?: SearchResponse['contextUsageExtras'],
 ): void {
-  const upserts: SessionDirectoryContextUsageExtra[] = []
+  const entries: SessionDirectoryContextUsageExtra[] = []
 
   for (const row of rows) {
     if (!row.tokenUsage) continue
-    upserts.push({ provider: row.provider, sessionId: row.sessionId, tokenUsage: row.tokenUsage })
+    entries.push({ provider: row.provider, sessionId: row.sessionId, tokenUsage: row.tokenUsage })
   }
-  if (upserts.length > 0 || (extras && extras.length > 0)) {
-    dispatch(applyContextUsageExtras([...upserts, ...(extras ?? [])]))
+  for (const extra of response.contextUsageExtras ?? []) {
+    entries.push(extra)
   }
+  dispatch(applyContextUsageExtras({
+    entries,
+    sourceRevision: response.revision ?? 0,
+    paneKeys: getContextUsageOpts(getState()).includeKeys ?? [],
+  }))
 }
 
 function canCommitVisibleRefresh(args: {
@@ -502,7 +507,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         }))) {
           return
         }
-        commitContextUsageFromRows(dispatch, titleResponse.results, titleResponse.contextUsageExtras)
+        commitContextUsageFromRows(dispatch, getState, titleResponse, titleResponse.results)
 
         try {
           const deepResponse = await searchSessions({
@@ -522,7 +527,7 @@ async function refreshVisibleSessionWindowSilently(args: {
           // A rejected (stale-generation / mismatched-identity) window commit
           // must not still stamp its extras as fresh — old percentage would
           // ride the 60s staleness window on top of newer data.
-          if (committed) commitContextUsageFromRows(dispatch, deepResponse.results, deepResponse.contextUsageExtras)
+          if (committed) commitContextUsageFromRows(dispatch, getState, deepResponse, deepResponse.results)
         } catch {
           commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
             projectColors: titleResponse.projectColors,
@@ -547,7 +552,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         integrityError: response.integrityError,
         projectColors: response.projectColors,
       }))
-      if (committed) commitContextUsageFromRows(dispatch, response.results, response.contextUsageExtras)
+      if (committed) commitContextUsageFromRows(dispatch, getState, response, response.results)
       return
     }
 
@@ -602,11 +607,7 @@ async function refreshVisibleSessionWindowSilently(args: {
     })
     // Fresh-page rows ONLY (nextProjects is exactly the page the server just
     // returned) — never the merged window with its retained deeper rows.
-    if (committed) commitContextUsageFromRows(
-      dispatch,
-      nextProjects.flatMap((p: { sessions?: UsageBearingRow[] }) => p.sessions ?? []),
-      response?.contextUsageExtras,
-    )
+    if (committed) commitContextUsageFromRows(dispatch, getState, response, nextProjects.flatMap((p: { sessions?: UsageBearingRow[] }) => p.sessions ?? []))
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
     if (canCommit()) {
@@ -707,7 +708,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               projects: mergedProjects,
               totalSessions: countSessions(mergedProjects),
             }))
-            commitContextUsageFromRows(dispatch, response.results, response.contextUsageExtras)
+            commitContextUsageFromRows(dispatch, getState, response, response.results)
             return
           }
 
@@ -722,7 +723,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            commitContextUsageFromRows(dispatch, titleResponse.results, titleResponse.contextUsageExtras)
+            commitContextUsageFromRows(dispatch, getState, titleResponse, titleResponse.results)
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true, {
               projectColors: titleResponse.projectColors,
               partial: titleResponse.partial,
@@ -741,7 +742,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               })
               if (controller.signal.aborted) return
 
-              commitContextUsageFromRows(dispatch, deepResponse.results, deepResponse.contextUsageExtras)
+              commitContextUsageFromRows(dispatch, getState, deepResponse, deepResponse.results)
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
@@ -783,7 +784,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               searchCursor: response.nextCursor,
               projectColors: response.projectColors,
             })))
-            commitContextUsageFromRows(dispatch, response.results, response.contextUsageExtras)
+            commitContextUsageFromRows(dispatch, getState, response, response.results)
           }
           return
         }
@@ -820,7 +821,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
         }))
         // Fresh-page rows only (nextProjects is the server's page, before the
         // append merge stapled retained rows onto it).
-        commitContextUsageFromRows(dispatch, nextProjects.flatMap((p: { sessions?: UsageBearingRow[] }) => p.sessions ?? []), response?.contextUsageExtras)
+        commitContextUsageFromRows(dispatch, getState, response, nextProjects.flatMap((p: { sessions?: UsageBearingRow[] }) => p.sessions ?? []))
       } catch (error) {
         if (controller.signal.aborted) return
         dispatch(setSessionWindowError({

@@ -206,16 +206,11 @@ async function seedIndexedClaudeContextUsage(
 ) {
   await page.evaluate((o) => {
     window.__FRESHELL_TEST_HARNESS__?.dispatch({
-      type: 'sessions/setProjects',
-      payload: [{
-        projectPath: '/home/user/code/freshell',
-        sessions: [{
+      type: 'sessions/applyContextUsageExtras',
+      payload: {
+        entries: [{
           provider: 'claude',
-          sessionType: 'freshclaude',
           sessionId: o.sessionId,
-          projectPath: '/home/user/code/freshell',
-          cwd: '/home/user/code/freshell',
-          lastActivityAt: 1,
           tokenUsage: {
             inputTokens: 1,
             outputTokens: 1,
@@ -226,7 +221,9 @@ async function seedIndexedClaudeContextUsage(
             compactPercent: o.percent,
           },
         }],
-      }],
+        sourceRevision: Date.now(),
+        paneKeys: [`claude:${o.sessionId}`],
+      },
     })
   }, usage)
 }

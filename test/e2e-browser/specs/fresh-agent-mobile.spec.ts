@@ -185,16 +185,11 @@ test.describe('Fresh Agent Mobile', () => {
     await expect.poll(async () => {
       await page.evaluate((currentSessionId) => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({
-          type: 'sessions/setProjects',
-          payload: [{
-            projectPath: '/home/user/code/freshell',
-            sessions: [{
+          type: 'sessions/applyContextUsageExtras',
+          payload: {
+            entries: [{
               provider: 'claude',
-              sessionType: 'freshclaude',
               sessionId: currentSessionId,
-              projectPath: '/home/user/code/freshell',
-              cwd: '/home/user/code/freshell',
-              lastActivityAt: 1,
               tokenUsage: {
                 inputTokens: 1,
                 outputTokens: 1,
@@ -205,7 +200,9 @@ test.describe('Fresh Agent Mobile', () => {
                 compactPercent: 47,
               },
             }],
-          }],
+            sourceRevision: Date.now(),
+            paneKeys: [`claude:${currentSessionId}`],
+          },
         })
       }, sessionId)
       return meter.isVisible().catch(() => false)

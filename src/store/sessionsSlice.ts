@@ -155,11 +155,12 @@ export interface SessionsState {
   activeSurface?: string
   windows: Record<string, SessionWindowState>
   /**
-   * STATUS-STRIP: out-of-band usage for fresh-agent pane sessions requested
-   * via `includeKeys`. Keyed `provider:sessionId`. Deliberately NOT merged
-   * into `projects`/windows so sidebar rendering is untouched.
+   * STATUS-STRIP: usage for open fresh-agent pane sessions. Keyed
+   * `provider:sessionId`. Never merged into `projects`/windows; bounded to
+   * the current `includeKeys` set on every commit; `sourceRevision` orders
+   * competing writes (higher wins, ties first-come).
    */
-  contextUsageByKey: Record<string, { tokenUsage: TokenSummary; fetchedAt: number }>
+  contextUsageByKey: Record<string, { tokenUsage: TokenSummary; sourceRevision: number }>
 }
 
 const initialState: SessionsState = {
@@ -211,25 +212,10 @@ type SessionWindowCommitPayload = {
   integrityError?: SessionDirectoryIntegrityError
 }
 
-// STATUS-STRIP: unified usage map. Rows in a FRESH commit supersede any older
-// entry (retained/deep-window rows never enter — they are not in the freshly
-// committed payload), and no row is ever deleted here: with no fresher data
-// arriving, the reader's 60s staleness bound clears the meter to "context —"
-// instead of re-serving an old reading.
-function upsertUsageIntoContextMap(state: SessionsState, projects: ProjectGroup[]) {
-  if (!state.contextUsageByKey) state.contextUsageByKey = {}
-  const fetchedAt = Date.now()
-  for (const project of projects) {
-    for (const session of project.sessions ?? []) {
-      if (!session.tokenUsage) continue
-      state.contextUsageByKey[`${session.provider}:${session.sessionId}`] = {
-        tokenUsage: session.tokenUsage,
-        fetchedAt,
-      }
-    }
-  }
-}
-
+// Usage for the fresh-agent strip feeds the unified map ONLY through thunk-side
+// stamping (applyContextUsageExtras) — never from this commit path: committed
+// windows may contain merged/retained rows whose usage is not fresh and must
+// never be re-served as current.
 function commitWindowPayload(
   window: SessionWindowState,
   payload: SessionWindowCommitPayload,
@@ -439,8 +425,6 @@ export const sessionsSlice = createSlice({
     setProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
       state.projects = normalizeProjects(action.payload)
       state.lastLoadedAt = Date.now()
-      // setProjects is also the e2e seeding channel for fresh-window data.
-      upsertUsageIntoContextMap(state, state.projects)
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
       syncAllWindowsFromTopLevel(state)
@@ -619,21 +603,37 @@ export const sessionsSlice = createSlice({
       }
     },
     /**
-     * STATUS-STRIP: store out-of-band usage extras (`includeKeys` responses)
-     * in the side map. Never touch window/projects — sidebar rows must not
-     * gain entries the active query/window excludes.
+     * STATUS-STRIP: upsert usage into the unified map. `paneKeys` bounds the
+     * map to the pane-relevant keys currently requested — retention stays at
+     * most one entry per open fresh-agent pane. `sourceRevision` is the
+     * session-directory revision of the response the entries came from; a
+     * newer entry is never overwritten by an older one (cross-surface
+     * completion inversion can't regress an entry).
      */
     applyContextUsageExtras: (
       state,
-      action: PayloadAction<SessionDirectoryContextUsageExtra[]>,
+      action: PayloadAction<{
+        entries: SessionDirectoryContextUsageExtra[]
+        sourceRevision: number
+        paneKeys: string[]
+      }>,
     ) => {
-      const fetchedAt = Date.now()
-      if (!state.contextUsageByKey) state.contextUsageByKey = {}
-      for (const extra of action.payload) {
+      const { entries, sourceRevision, paneKeys } = action.payload
+      const keep = new Set(paneKeys)
+      const next: SessionsState['contextUsageByKey'] = {}
+      for (const key of Object.keys(state.contextUsageByKey ?? {})) {
+        if (keep.has(key)) next[key] = state.contextUsageByKey[key]
+      }
+      state.contextUsageByKey = next
+      for (const extra of entries) {
         if (!extra.tokenUsage) continue
-        state.contextUsageByKey[`${extra.provider}:${extra.sessionId}`] = {
+        const key = `${extra.provider}:${extra.sessionId}`
+        if (!keep.has(key)) continue
+        const existing = state.contextUsageByKey[key]
+        if (existing && existing.sourceRevision > sourceRevision) continue
+        state.contextUsageByKey[key] = {
           tokenUsage: extra.tokenUsage as TokenSummary,
-          fetchedAt,
+          sourceRevision,
         }
       }
     },

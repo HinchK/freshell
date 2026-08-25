@@ -29,14 +29,18 @@ function seedStripUsage(
   contextTokens = 96_000,
   sessionId = 'claude-strip-usage',
 ) {
-  store.dispatch(applyContextUsageExtras([{
-    provider: 'claude',
-    sessionId,
-    tokenUsage: {
-      inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
-      contextTokens, compactPercent, compactThresholdTokens: 200_000,
-    },
-  }]))
+  store.dispatch(applyContextUsageExtras({
+    entries: [{
+      provider: 'claude',
+      sessionId,
+      tokenUsage: {
+        inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+        contextTokens, compactPercent, compactThresholdTokens: 200_000,
+      },
+    }],
+    sourceRevision: 1,
+    paneKeys: [`claude:${sessionId}`],
+  }))
 }
 const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 
@@ -6686,21 +6690,29 @@ describe('FreshAgentView session status strip', () => {
     // The meter must move with each extras refresh, never freezing at a
     // previously-safe reading as the session climbs past the thresholds.
     act(() => {
-      store.dispatch(applyContextUsageExtras([{
-        provider: 'claude',
-        sessionId: 'claude-strip-usage',
-        tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
-      }]))
+      store.dispatch(applyContextUsageExtras({
+        entries: [{
+          provider: 'claude',
+          sessionId: 'claude-strip-usage',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
+        }],
+        sourceRevision: 1,
+        paneKeys: ['claude:claude-strip-usage'],
+      }))
     })
     const meter = screen.getByRole('meter', { name: 'Context window used' })
     expect(meter).toHaveAttribute('aria-valuenow', '47')
 
     act(() => {
-      store.dispatch(applyContextUsageExtras([{
-        provider: 'claude',
-        sessionId: 'claude-strip-usage',
-        tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
-      }]))
+      store.dispatch(applyContextUsageExtras({
+        entries: [{
+          provider: 'claude',
+          sessionId: 'claude-strip-usage',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
+        }],
+        sourceRevision: 2,
+        paneKeys: ['claude:claude-strip-usage'],
+      }))
     })
     expect(meter).toHaveAttribute('aria-valuenow', '70')
   })
@@ -6809,136 +6821,6 @@ describe('FreshAgentView session status strip', () => {
       expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
       expect(screen.getByRole('button', { name: 'Model: Opus Future — change model' })).toBeInTheDocument()
     })
-  })
-
-  it('clears a cached meter reading to unknown after the staleness bound while the window stays empty', () => {
-    vi.useFakeTimers()
-    try {
-      const store = createStore()
-      seedStripUsage(store, 47)
-
-      render(
-        <Provider store={store}>
-          <FreshAgentView
-            tabId="tab-1"
-            paneId="pane-1"
-            paneContent={{
-              kind: 'fresh-agent',
-              sessionType: 'freshclaude',
-              provider: 'claude',
-              createRequestId: 'req-strip-expiry',
-              sessionId: CLAUDE_THREAD_ID,
-              resumeSessionId: 'claude-strip-usage',
-              status: 'connected',
-            }}
-          />
-        </Provider>,
-      )
-
-      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
-
-      act(() => {
-        store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
-      })
-      // Still serving the just-committed reading (window churn must not blank).
-      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
-
-      // Past the staleness bound with the row still excluded, the meter clears
-      // to the honest unknown state rather than lying across thresholds.
-      act(() => {
-        vi.advanceTimersByTime(61_000)
-      })
-      expect(screen.queryByRole('meter')).toBeNull()
-      expect(screen.getByText('context —')).toBeInTheDocument()
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('expires an extras-driven meter reading at the staleness bound when refreshes stop (quiet pane)', () => {
-    vi.useFakeTimers()
-    try {
-      const store = createStore()
-      render(
-        <Provider store={store}>
-          <FreshAgentView
-            tabId="tab-1"
-            paneId="pane-1"
-            paneContent={{
-              kind: 'fresh-agent',
-              sessionType: 'freshclaude',
-              provider: 'claude',
-              createRequestId: 'req-strip-extras-expiry',
-              sessionId: CLAUDE_THREAD_ID,
-              resumeSessionId: 'claude-strip-usage',
-              status: 'connected',
-            }}
-          />
-        </Provider>,
-      )
-      // No window row at all — the includeKeys side-channel is the live source.
-      act(() => {
-        store.dispatch(applyContextUsageExtras([{
-          provider: 'claude',
-          sessionId: 'claude-strip-usage',
-          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
-        }]))
-      })
-      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
-
-      // Refresh cadences stop and the pane stays completely quiet: the extras
-      // reading must still expire rather than riding forever.
-      act(() => {
-        vi.advanceTimersByTime(61_000)
-      })
-      expect(screen.queryByRole('meter')).toBeNull()
-      expect(screen.getByText('context —')).toBeInTheDocument()
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('expires an extras-driven meter reading exactly at the boundary tick (no stale exact-60s reading)', () => {
-    vi.useFakeTimers()
-    try {
-      const store = createStore()
-      render(
-        <Provider store={store}>
-          <FreshAgentView
-            tabId="tab-1"
-            paneId="pane-1"
-            paneContent={{
-              kind: 'fresh-agent',
-              sessionType: 'freshclaude',
-              provider: 'claude',
-              createRequestId: 'req-strip-extras-boundary',
-              sessionId: CLAUDE_THREAD_ID,
-              resumeSessionId: 'claude-strip-usage',
-              status: 'connected',
-            }}
-          />
-        </Provider>,
-      )
-      act(() => {
-        store.dispatch(applyContextUsageExtras([{
-          provider: 'claude',
-          sessionId: 'claude-strip-usage',
-          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
-        }]))
-      })
-      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
-
-      // Land exactly ON the 60s boundary: the boundary serving may render once
-      // (freshness is inclusive), but the timer arms for an immediate re-render
-      // and the stale reading must not survive past the tick.
-      act(() => {
-        vi.advanceTimersByTime(60_000)
-      })
-      expect(screen.queryByRole('meter')).toBeNull()
-      expect(screen.getByText('context —')).toBeInTheDocument()
-    } finally {
-      vi.useRealTimers()
-    }
   })
 
   it.each([

@@ -95,10 +95,9 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
-// A context usage reading serves only this long without a fresh commit —
-// bounded so a stale value can never hide a severity-threshold crossing
-// (amber ≥70%, red ≥90%) in a quiet pane.
-const CONTEXT_USAGE_STALE_MS = 60_000
+// Context usage: read `state.sessions.contextUsageByKey` via the view's selector.
+// No client-side expiry — refreshes are event-driven (sessions.changed), so the
+// newest entry the server has is still accurate until superseded.
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
@@ -768,38 +767,23 @@ export function FreshAgentView({
       ? `${stripModelId} · effort unknown`
       : `${stripModelId} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
-  const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
   // STATUS-STRIP: the strip reads ONLY the unified usage map
   // (state.sessions.contextUsageByKey). Entries are upserted by committed
-  // refreshes — fresh-page rows AND out-of-band extras alike — each carrying
-  // its own fetchedAt; retained deep-window rows structurally never enter, so
-  // an old reading can never be re-served past the 60s staleness bound (it
-  // expires to "context —" instead).
+  // refreshes — fresh-page rows AND out-of-band extras alike — and retained
+  // deep-window rows structurally never enter, so no reading can ever regress
+  // to older data. A reading is NEVER expired into "unknown": refreshes are
+  // event-driven (sessions.changed), so an entry the server has not superseded
+  // is still the newest value it knows — blanking it would only hide accurate
+  // data for idle sessions.
   const usageEntry = useAppSelector((state) => (
     contextSessionId
       ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
       : undefined
   ))
   const contextUsage = useMemo(
-    () => guardContextUsageTokenSummary(
-      usageEntry && Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
-        ? usageEntry.tokenUsage
-        : undefined,
-    ),
-    // usageTick forces the staleness filter to re-evaluate on the armed expiry
-    // timer's render (intentional trigger dep, not a read value).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [usageEntry, usageTick],
+    () => guardContextUsageTokenSummary(usageEntry?.tokenUsage),
+    [usageEntry],
   )
-  // Serving a bounded-staleness reading: re-render exactly at the expiry
-  // boundary so expiry is honored even in a completely quiet pane; the
-  // zero-remaining edge fires immediately instead of never.
-  useEffect(() => {
-    if (!usageEntry || !contextUsage) return
-    const remaining = usageEntry.fetchedAt + CONTEXT_USAGE_STALE_MS - Date.now()
-    const timer = window.setTimeout(forceUsageTick, Math.max(remaining, 0))
-    return () => window.clearTimeout(timer)
-  }, [usageEntry, contextUsage])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (

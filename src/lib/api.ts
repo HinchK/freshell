@@ -589,6 +589,8 @@ export type SearchResponse = {
   projectColors?: Record<string, string>
   /** STATUS-STRIP: usage for `includeKeys` sessions that fell outside the search results. */
   contextUsageExtras?: ReadModelSessionDirectoryContextUsageExtra[]
+  /** STATUS-STRIP: session-directory revision of the data snapshot — orders competing usage writes. */
+  revision?: number
 }
 
 export type SearchOptions = {
@@ -721,6 +723,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     partial: page.partial,
     partialReason: page.partialReason,
     integrityError: page.integrityError,
+    revision: page.revision,
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
 }
@@ -768,6 +771,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     totalScanned: page.items.length,
     nextCursor: page.nextCursor,
     hasMore: page.nextCursor !== null,
+    revision: page.revision,
     ...(page.projectColors ? { projectColors: page.projectColors } : {}),
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
