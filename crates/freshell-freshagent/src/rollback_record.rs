@@ -573,8 +573,14 @@ pub async fn destroy_redo_on_submit(
 /// possibly-destroyed tail, never a proven-survived one). `Ok(None)` is a
 /// no-op destroy (no sink/record,
 /// already destroyed, or nothing redo-capable); `Err` is a ledger write
-/// failure (warn-only, never blocks the compact — [`destroy_redo_on_submit`]'s
-/// degrade policy).
+/// failure — focused ep2-r1 F2: the caller REFUSES the compact on it (zero
+/// provider traffic, pane settles idle, loud typed error) — durable-BEFORE-
+/// mutation runs both ways, because continuing would let OpenCode delete the
+/// reverted tail while the durable row still advertises redo over it. (This
+/// deliberate refusal DIVERGES from [`destroy_redo_on_submit`]'s warn-only
+/// degrade: a send carries user intent and opencode deletes the tail natively
+/// on send regardless; a compact exists precisely to delete the tail, so the
+/// pre-drive moment is the last honest stop.)
 pub async fn destroy_redo_before_compact_drive(
     sink: &Option<crate::identity_sink::SharedPaneIdentitySink>,
     provider: &str,
@@ -1386,12 +1392,12 @@ mod tests {
         let outcome = destroy_redo_before_compact_drive(&Some(shared), "opencode", "s1", 100).await;
         assert!(
             outcome.is_err(),
-            "the write failure surfaces to the warn-log"
+            "the write failure surfaces to the caller (ep2-r1 F2: the compact is then REFUSED — zero provider traffic)"
         );
         let record = sink.load_rollback("opencode", "s1").expect("record");
         assert!(
             !record.redo_destroyed && record.can_redo(),
-            "a failed destroy never touches the row — redo stays live (degrade policy)"
+            "a failed destroy never touches the row — redo stays live (the caller's refusal keeps the row true)"
         );
     }
 

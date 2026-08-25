@@ -1140,7 +1140,12 @@ impl FreshOpencodeState {
         // byte left ⇒ the serve never saw the POST ⇒ the tail provably
         // survives); every post-send failure class (incl. ANY answered non-2xx —
         // OpenCode ≥1.18.21's summarize runs revertSvc.cleanup FIRST) lets the
-        // destroy stand.
+        // destroy stand. ep2-r1 F2: durable-BEFORE-mutation runs BOTH ways —
+        // when the pre-drive destroy CANNOT be persisted, the compact is
+        // REFUSED with zero provider traffic (never warn+continue: OpenCode
+        // would delete the reverted tail while the durable ledger still
+        // advertises redo over it, panes-wide and cross-device). Refusing
+        // keeps the untouched row TRUE exactly because nothing ran.
         let destroy_now = crate::rollback_record::now_ms();
         let pre_drive_record = match crate::rollback_record::destroy_redo_before_compact_drive(
             &self.identity_sink(),
@@ -1152,9 +1157,17 @@ impl FreshOpencodeState {
         {
             Ok(pre) => pre,
             Err(err) => {
-                // The send-path degrade policy: warn-only, never blocks the compact.
                 tracing::warn!(error = %err, session = %real_id, "freshagent.opencode.redo_destroy_before_compact_failed");
-                None
+                // Never leave the pane stuck busy on the refusal (nothing was
+                // ever registered on turn_task — the refusal is inline,
+                // pre-spawn).
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                self.emit_fresh_agent_error(
+                    &real_id,
+                    "OPENCODE_COMPACT_FAILED",
+                    crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY,
+                );
+                return;
             }
         };
 
@@ -5068,6 +5081,61 @@ mod tests {
         assert!(
             message.to_ascii_lowercase().contains("compact"),
             "the message names the failed compact: {message}"
+        );
+    }
+
+    /// Focused-review ep2-r1 F2: a compact whose pre-drive redo-destroy write
+    /// FAILS is REFUSED with zero provider traffic — durable-BEFORE-mutation
+    /// runs BOTH ways. Warn+continue would let OpenCode delete the reverted
+    /// tail while the durable ledger still says `canRedo: true` /
+    /// `redoDestroyed: false`, advertising redo across refreshes and other
+    /// devices that the provider can no longer perform. Refusing keeps the row
+    /// TRUE exactly because nothing ran (the tail provably survives).
+    #[tokio::test]
+    async fn compact_with_a_failed_redo_destroy_is_refused_and_never_posts() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+        sink.set_fail_writes(true);
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        assert!(
+            http.summarize_requests().is_empty(),
+            "NO summarize POST when the pre-drive destroy cannot be persisted: {:?}",
+            http.summarize_requests()
+        );
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "the pane is never left busy on the refusal: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "no false completion: {frames:?}"
+        );
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .unwrap_or_else(|| panic!("the refusal is LOUD: {frames:?}"));
+        assert_eq!(
+            error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED",
+            "{error_frame}"
+        );
+        assert_eq!(
+            error_frame["event"]["message"].as_str().unwrap_or_default(),
+            LEDGER_WRITE_REFUSAL_COPY,
+            "the refusal carries the pinned ledger-write copy: {error_frame}"
+        );
+        let record = sink.load_rollback(PROVIDER, "ses_1").expect("record");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "the row stands untouched — the write failed BEFORE anything ran: {record:?}"
         );
     }
 

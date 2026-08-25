@@ -129,12 +129,13 @@ fn jsonc_to_strict_json(raw: &str) -> String {
                 out.push(c);
                 i += 1;
             } else if c == '/' && chars.get(i + 1) == Some(&'/') {
-                // Line comment: ONE space; runs to (never consuming) the newline,
-                // or to EOF. A dangling `\r` rides inside the comment (harmless
-                // JSON whitespace either way).
+                // Line comment: ONE space; runs to (never consuming) the line
+                // break — LF or bare CR alike (ep2-r1 F3: jsonc-parser, the
+                // parser the vendored CLI's ConfigParse.jsonc delegates to,
+                // ends line comments on either), or to EOF.
                 out.push(' ');
                 i += 2;
-                while i < chars.len() && chars[i] != '\n' {
+                while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
                     i += 1;
                 }
             } else if c == '/' && chars.get(i + 1) == Some(&'*') {
@@ -2143,6 +2144,40 @@ mod tests {
         assert!(
             warn.values().all(|v| !v.contains("model")),
             "no content substring survives into the warning: {warn:?}"
+        );
+    }
+
+    /// Focused ep2-r1 F3: `jsonc-parser` (the parser OpenCode's 1.18.21
+    /// `ConfigParse.jsonc` actually uses) ends `//` line comments at LF **or
+    /// bare CR** (microsoft/node-jsonc-parser scanner) — the normalizer must
+    /// match, or a valid CR-only inline config loses everything after its
+    /// first comment (→ strict-parse miss → content-free replace, silently
+    /// dropping model/plugin/auth settings).
+    #[test]
+    fn jsonc_normalization_line_comments_end_at_lf_or_bare_cr() {
+        // LF (baseline, already covered) and CR both terminate; the terminator
+        // itself stays as document whitespace.
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//x\n{\"b\":2}"),
+            "{\"a\":1} \n{\"b\":2}"
+        );
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//x\r{\"b\":2}"),
+            "{\"a\":1} \r{\"b\":2}"
+        );
+        // CRLF terminates at the CR (the \n that follows is plain whitespace).
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//note\r\n{\"b\":2}"),
+            "{\"a\":1} \r\n{\"b\":2}"
+        );
+        // The full valid document on bare-CR line endings merges — never the
+        // malformed branch.
+        let cr_only = "{\r  // provider pin\r  \"model\": \"dev/m-x\",\r}\r";
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(cr_only)))
+            .expect("CR-only JSONC is valid after normalization");
+        assert_eq!(
+            merged,
+            serde_json::json!({ "model": "dev/m-x", "snapshot": false })
         );
     }
 
