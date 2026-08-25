@@ -231,13 +231,11 @@ function upsertUsageIntoContextMap(state: SessionsState, projects: ProjectGroup[
 }
 
 function commitWindowPayload(
-  state: SessionsState,
   window: SessionWindowState,
   payload: SessionWindowCommitPayload,
 ) {
   window.projects = normalizeProjects(payload.projects)
   window.lastLoadedAt = Date.now()
-  upsertUsageIntoContextMap(state, payload.projects)
   window.resultVersion = (window.resultVersion ?? 0) + 1
   window.totalSessions = payload.totalSessions
   window.oldestLoadedTimestamp = payload.oldestLoadedTimestamp
@@ -393,7 +391,7 @@ export const sessionsSlice = createSlice({
       action: PayloadAction<SessionWindowCommitPayload>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
-      commitWindowPayload(state, window, action.payload)
+      commitWindowPayload(window, action.payload)
       window.loading = false
       window.loadingKind = undefined
       if (action.payload.query !== undefined) {
@@ -413,7 +411,7 @@ export const sessionsSlice = createSlice({
       action: PayloadAction<SessionWindowCommitPayload & { preserveLoading?: boolean }>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
-      commitWindowPayload(state, window, action.payload)
+      commitWindowPayload(window, action.payload)
       if (!action.payload.preserveLoading) {
         window.loading = false
         window.loadingKind = undefined

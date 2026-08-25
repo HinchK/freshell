@@ -2677,5 +2677,80 @@ describe('sessionsThunks', () => {
       expect((store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(70)
       expect((store.getState() as any).sessions.projects[0].sessions[0].tokenUsage.compactPercent).toBe(70)
     })
+
+    it('an append merge with only other sessions never re-stamps a pane entry as fresh', async () => {
+      const panesReducer = (await import('@/store/panesSlice')).default
+      const freshAgentReducer = (await import('@/store/freshAgentSlice')).default
+      const store = configureStore({
+        reducer: {
+          sessions: sessionsReducer,
+          panes: panesReducer,
+          freshAgent: freshAgentReducer,
+        },
+        preloadedState: {
+          panes: {
+            layouts: {
+              'tab-9': {
+                type: 'leaf',
+                id: 'pane-9',
+                content: {
+                  kind: 'fresh-agent',
+                  sessionType: 'freshclaude',
+                  provider: 'claude',
+                  createRequestId: 'req-9',
+                  status: 'connected',
+                  resumeSessionId: 'claude-live-uuid',
+                },
+              },
+            },
+          },
+        } as any,
+        middleware: (getDefaultMiddleware) =>
+          getDefaultMiddleware({
+            serializableCheck: false,
+          }),
+      })
+
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: true,
+        contextUsageExtras: [{
+          provider: 'claude',
+          sessionId: 'claude-live-uuid',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
+        }],
+      })
+      store.dispatch(setActiveSessionSurface('sidebar'))
+      await store.dispatch(fetchSessionWindow({ surface: 'sidebar', priority: 'visible' }) as any)
+      const before = (store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']
+      expect(before?.tokenUsage?.compactPercent).toBe(47)
+
+      // Append page 2 whose fresh rows carry someone ELSE's usage — the pane's
+      // key must retain its entry object untouched (structurally shared), i.e.
+      // not re-marked fresh by the retained/merged window.
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{
+          projectPath: '/tmp/project-beta',
+          sessions: [{
+            provider: 'claude',
+            sessionId: 'session-beta',
+            projectPath: '/tmp/project-beta',
+            lastActivityAt: 1_000,
+            title: 'Beta',
+            tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 100, compactPercent: 5, compactThresholdTokens: 2000 },
+          }],
+        }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-beta',
+        hasMore: false,
+      })
+      await store.dispatch(fetchSessionWindow({ surface: 'sidebar', priority: 'visible', append: true }) as any)
+      const after = (store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']
+      expect(after).toBe(before)
+    })
   })
 })
