@@ -2599,5 +2599,80 @@ describe('sessionsThunks', () => {
       const extras = (store.getState() as any).sessions.contextUsageByKey
       expect(extras['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(47)
     })
+
+    it('evicts an extras entry once a fresh page covers its session (reverse ordering — older extras must never mask newer window data)', async () => {
+      const panesReducer = (await import('@/store/panesSlice')).default
+      const freshAgentReducer = (await import('@/store/freshAgentSlice')).default
+      const usage = {
+        inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+        contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000,
+      }
+      const coveredRow = {
+        provider: 'claude',
+        sessionId: 'claude-live-uuid',
+        projectPath: '/tmp/project-alpha',
+        lastActivityAt: 2_000,
+        title: 'Alpha',
+        tokenUsage: {
+          inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+          contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000,
+        },
+      }
+      const store = configureStore({
+        reducer: {
+          sessions: sessionsReducer,
+          panes: panesReducer,
+          freshAgent: freshAgentReducer,
+        },
+        preloadedState: {
+          panes: {
+            layouts: {
+              'tab-9': {
+                type: 'leaf',
+                id: 'pane-9',
+                content: {
+                  kind: 'fresh-agent',
+                  sessionType: 'freshclaude',
+                  provider: 'claude',
+                  createRequestId: 'req-9',
+                  status: 'connected',
+                  resumeSessionId: 'claude-live-uuid',
+                },
+              },
+            },
+          },
+        } as any,
+        middleware: (getDefaultMiddleware) =>
+          getDefaultMiddleware({
+            serializableCheck: false,
+          }),
+      })
+
+      // Fetch 1 (search era): row excluded; usage arrives as an extra at 47%.
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+        contextUsageExtras: [{ provider: 'claude', sessionId: 'claude-live-uuid', tokenUsage: usage }],
+      })
+      store.dispatch(setActiveSessionSurface('sidebar'))
+      await store.dispatch(fetchSessionWindow({ surface: 'sidebar', priority: 'visible' }) as any)
+      expect((store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(47)
+
+      // Fetch 2 (search cleared): the fresh page now covers the row at 70% —
+      // the stale extra must be evicted so the meter reads the window's 70%.
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{ projectPath: '/tmp/project-alpha', sessions: [coveredRow] }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 2_000,
+        oldestIncludedSessionId: 'claude:claude-live-uuid',
+        hasMore: false,
+      })
+      await store.dispatch(fetchSessionWindow({ surface: 'sidebar', priority: 'visible' }) as any)
+      expect((store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']).toBeUndefined()
+      expect((store.getState() as any).sessions.projects[0].sessions[0].tokenUsage.compactPercent).toBe(70)
+    })
   })
 })

@@ -616,6 +616,17 @@ export const sessionsSlice = createSlice({
         }
       }
     },
+    /**
+     * STATUS-STRIP: evict extras entries whose session was covered by the
+     * FRESH page of the just-returned fetch — that in-window row is newer, so
+     * the older out-of-band entry must stop outranking it.
+     */
+    clearContextUsageExtras: (state, action: PayloadAction<string[]>) => {
+      if (!state.contextUsageByKey) return
+      for (const key of action.payload) {
+        delete state.contextUsageByKey[key]
+      }
+    },
   },
 })
 
@@ -623,6 +634,7 @@ export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
   applyContextUsageExtras,
+  clearContextUsageExtras,
   setSessionWindowError,
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,
