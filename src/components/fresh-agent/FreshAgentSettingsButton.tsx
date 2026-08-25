@@ -327,7 +327,9 @@ export function FreshAgentSettingsButton({
                                 // Stamp the picked row's display label for the
                                 // status-strip chip (id-paired; a later model
                                 // change without a stamp can never mislabel).
-                                ...(nextRow
+                                // A label echoing the raw id is not a display
+                                // name (e.g. opencode's no-name fallback): skip.
+                                ...(nextRow && nextRow.label !== nextModel
                                   ? { modelLabel: { modelId: nextModel, label: nextRow.label } }
                                   : {}),
                                 effort: nextEffort,

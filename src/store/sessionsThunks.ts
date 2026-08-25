@@ -484,13 +484,16 @@ async function refreshVisibleSessionWindowSilently(args: {
             ...getContextUsageOpts(getState()),
           })
           const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-          commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
+          const committed = commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
             partial: deepResponse.partial,
             partialReason: deepResponse.partialReason,
             integrityError: deepResponse.integrityError ?? titleResponse.integrityError,
             projectColors: deepResponse.projectColors ?? titleResponse.projectColors,
           }))
-          commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
+          // A rejected (stale-generation / mismatched-identity) window commit
+          // must not still stamp its extras as fresh — old percentage would
+          // ride the 60s staleness window on top of newer data.
+          if (committed) commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
         } catch {
           commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
             projectColors: titleResponse.projectColors,
@@ -509,13 +512,13 @@ async function refreshVisibleSessionWindowSilently(args: {
         ...visibilityOpts,
         ...getContextUsageOpts(getState()),
       })
-      commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
+      const committed = commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
         partial: response.partial,
         partialReason: response.partialReason,
         integrityError: response.integrityError,
         projectColors: response.projectColors,
       }))
-      commitContextUsageExtras(dispatch, response.contextUsageExtras)
+      if (committed) commitContextUsageExtras(dispatch, response.contextUsageExtras)
       return
     }
 
@@ -551,7 +554,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       // append/pagination direction (`mergeProjects` doc).
       ? mergeProjects(nextProjects, prevWindow?.projects ?? [], { preferColorsFrom: 'existing' })
       : nextProjects
-    commitData({
+    const committed = commitData({
       surface,
       projects,
       totalSessions: hasDeeperWindow ? countSessions(projects) : response?.totalSessions,
@@ -568,7 +571,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       partialReason: response?.partialReason,
       integrityError: response?.integrityError,
     })
-    commitContextUsageExtras(dispatch, response?.contextUsageExtras)
+    if (committed) commitContextUsageExtras(dispatch, response?.contextUsageExtras)
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
     if (canCommit()) {

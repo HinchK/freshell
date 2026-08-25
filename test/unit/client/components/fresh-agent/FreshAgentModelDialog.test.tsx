@@ -712,6 +712,38 @@ describe('FreshAgentModelDialog (freshclaude)', () => {
     expect(onCatalogUnavailable).not.toHaveBeenCalled()
     expect(onClose).not.toHaveBeenCalled()
   })
+
+  it('stamps no modelLabel when the picked row\'s displayName echoes its raw id (raw ids are tooltip-only)', async () => {
+    const onClose = vi.fn()
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ...CLAUDE_CATALOG_RESPONSE,
+      models: [
+        {
+          // e.g. opencode's no-name fallback: the catalog itself has no real
+          // display name, so displayName === id. Stamping it would put a raw
+          // id on the status-strip chip.
+          id: 'claude-ish/unnamed-7',
+          displayName: 'claude-ish/unnamed-7',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose })
+
+    fireEvent.click(await screen.findByRole('option', { name: /^claude-ish\/unnamed-7$/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use claude-ish/unnamed-7 · Default' }))
+
+    expect(onClose).toHaveBeenCalled()
+    const content = paneContent(store)
+    expect(content.model).toBe('claude-ish/unnamed-7')
+    expect(content.modelLabel).toBeUndefined()
+  })
 })
 
 describe('FreshAgentModelDialog (kilroy)', () => {

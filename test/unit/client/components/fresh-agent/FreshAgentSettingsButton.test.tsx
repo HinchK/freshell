@@ -432,6 +432,44 @@ describe('FreshAgentSettingsButton', () => {
     expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
   })
 
+  it('stamps no modelLabel when the switched-to probed row\'s label echoes its raw id', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true as const,
+      sessionType: 'freshclaude' as const,
+      runtimeProvider: 'claude' as const,
+      status: 'fresh' as const,
+      fetchedAt: 1_234,
+      models: [
+        {
+          // no-name catalog fallback (e.g. opencode normalize): the "display
+          // name" IS the raw id — stamping it would put a raw id on the chip.
+          id: 'claude-ish/unnamed-7',
+          displayName: 'claude-ish/unnamed-7',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'max',
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    fireEvent.click(await screen.findByRole('radio', { name: 'claude-ish/unnamed-7' }))
+
+    const content = readPaneContent(store)
+    expect(content.model).toBe('claude-ish/unnamed-7')
+    expect(content.modelLabel).toBeUndefined()
+  })
+
   it('clears the pane effort when switching to a probed claude row that declares no effort levels', async () => {
     getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
       ok: true as const,

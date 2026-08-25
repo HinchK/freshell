@@ -6787,6 +6787,49 @@ describe('FreshAgentView session status strip', () => {
     }
   })
 
+  it('expires an extras-driven meter reading at the staleness bound when refreshes stop (quiet pane)', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-strip-extras-expiry',
+              sessionId: CLAUDE_THREAD_ID,
+              resumeSessionId: 'claude-strip-usage',
+              status: 'connected',
+            }}
+          />
+        </Provider>,
+      )
+      // No window row at all — the includeKeys side-channel is the live source.
+      act(() => {
+        store.dispatch(applyContextUsageExtras([{
+          provider: 'claude',
+          sessionId: 'claude-strip-usage',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
+        }]))
+      })
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // Refresh cadences stop and the pane stays completely quiet: the extras
+      // reading must still expire rather than riding forever.
+      act(() => {
+        vi.advanceTimersByTime(61_000)
+      })
+      expect(screen.queryByRole('meter')).toBeNull()
+      expect(screen.getByText('context —')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it.each([
     ['freshclaude', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
     ['kilroy', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
@@ -6911,5 +6954,53 @@ describe('FreshAgentView session status strip', () => {
 
     expect(screen.queryByRole('button', { name: /opencode-go\/glm-5\.2/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /GLM 5\.2/ })).toBeNull()
+  })
+
+  it('keeps the chip hidden when the catalog row\'s displayName echoes the raw id (no-name fallback)', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'opencode-go/unnamed-9',
+        displayName: 'opencode-go/unnamed-9',
+        provider: 'opencode',
+        supportsEffort: false,
+        supportedEffortLevels: [],
+        supportsAdaptiveThinking: false,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-echo-id',
+            sessionId: 'ses_strip_echo_id',
+            status: 'connected',
+            model: 'opencode-go/unnamed-9',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // The probed "display name" IS the raw id — the chip stays hidden rather
+    // than render it.
+    expect(screen.queryByRole('button', { name: /opencode-go\/unnamed-9/ })).toBeNull()
+    // The strip itself still renders with its unknown-context lug.
+    expect(screen.getByText('context —')).toBeInTheDocument()
   })
 })

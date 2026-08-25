@@ -343,9 +343,10 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
     };
 
     // STATUS-STRIP: `includeKeys` (comma-separated; `shared/read-models.ts`
-    // `z.array(z.string().min(1)).max(50)`). Issues join the SAME details
+    // `z.array(z.string().min(1)).max(200)` — the 200-pane ceiling). Issues
+    // join the SAME details
     // array as the fields above (zod collects issues across every violated
-    // field into one response). The client self-enforces ≤50 via its own
+    // field into one response). The client self-enforces ≤200 via its own
     // schema parse (`getSessionDirectoryPage`), so the over-limit issue text
     // is not wire-probed byte-for-byte — a hand-rolled request beyond the cap
     // gets a 400 with a zod-flavored issue, enough for a 400 contract check
@@ -354,14 +355,14 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         .get("includeKeys")
         .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
-    if include_keys.len() > 50 {
+    if include_keys.len() > 200 {
         details.push(json!({
             "code": "too_big",
-            "maximum": 50,
+            "maximum": 200,
             "path": ["includeKeys"],
-            "message": "Too big: expected array to have <=50 items",
+            "message": "Too big: expected array to have <=200 items",
         }));
-        include_keys.truncate(50);
+        include_keys.truncate(200);
     }
 
     if !details.is_empty() {
@@ -1510,6 +1511,18 @@ fn apply_query(
             .then_with(|| b.key().cmp(&a.key()))
     });
 
+    // STATUS-STRIP: snapshot the extras candidate list BEFORE the sidebar
+    // visibility filters too — a fresh-agent pane's own session may be
+    // subagent-classed, non-interactive, or untitled/idle, and its meter must
+    // stay live regardless of the sidebar window's filtering state. Extras are
+    // returned out-of-band and never merged into `items`, so lowering the
+    // visibility bar here cannot leak hidden rows into the sidebar.
+    let extras_candidates: Option<Vec<DirItem>> = if q.include_keys.is_empty() {
+        None
+    } else {
+        Some(items.clone())
+    };
+
     // Server-side visibility pre-filter (service.ts:244-252).
     if !q.include_subagents {
         items.retain(|i| !i.is_subagent);
@@ -1526,17 +1539,6 @@ fn apply_query(
                     .is_some_and(|t| !t.is_empty())
         });
     }
-
-    // STATUS-STRIP: snapshot the post-visibility candidate list BEFORE cursor
-    // + query filtering (service.ts) — fresh-agent panes need their own
-    // session's usage even when the sidebar search/pagination window excludes
-    // it. Those sessions are returned out-of-band as `contextUsageExtras`,
-    // never merged into `items`.
-    let extras_candidates: Option<Vec<DirItem>> = if q.include_keys.is_empty() {
-        None
-    } else {
-        Some(items.clone())
-    };
 
     // Cursor filter (service.ts:254-259).
     if let Some((c_last, c_key)) = &cursor {
@@ -2240,6 +2242,42 @@ mod tests {
         let page = apply_query(items, &q, &[]).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
         assert!(page.get("contextUsageExtras").is_none());
+    }
+
+    #[test]
+    fn include_keys_bypass_sidebar_visibility_filters() {
+        // Subagent-classed AND untitled/idle open-pane sessions get no row in
+        // the default sidebar window, but their meter must stay live — extras
+        // match above the visibility filters (service.ts).
+        let items = vec![
+            DirItem {
+                is_subagent: true,
+                ..usage_dir_item("meter-subagent", 300, "Subagent row")
+            },
+            DirItem {
+                title: None,
+                ..usage_dir_item("meter-untitled", 200, "ignored-title")
+            },
+        ];
+        let q = DirQuery {
+            include_keys: vec![
+                "claude:meter-subagent".to_string(),
+                "claude:meter-untitled".to_string(),
+            ],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        let extras: Vec<&str> = page["contextUsageExtras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sessionId"].as_str().unwrap())
+            .collect();
+        assert!(
+            extras.contains(&"meter-subagent") && extras.contains(&"meter-untitled"),
+            "visibility-filtered open-pane sessions still arrive as extras: {extras:?}"
+        );
     }
 
     #[test]

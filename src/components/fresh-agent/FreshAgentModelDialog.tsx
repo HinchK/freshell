@@ -343,8 +343,13 @@ export function FreshAgentModelDialog({
         modelSelection: { kind: 'exact', modelId: model.id },
         // Stamp the display name known at pick time so the status-strip chip
         // shows the label even for catalog-only ids — never a raw id while a
-        // history window restore or a probe is still settling.
-        modelLabel: { modelId: model.id, label: model.displayName },
+        // history window restore or a probe is still settling. A catalog row
+        // whose displayName IS the id (e.g. opencode's no-name fallback) is
+        // not a display name at all: stamp nothing, and the strip's probe must
+        // keep looking.
+        ...(model.displayName && model.displayName !== model.id
+          ? { modelLabel: { modelId: model.id, label: model.displayName } }
+          : {}),
         effort: level,
         // Claude providers stamp the switched-to row's known levels (static
         // or probed) so post-commit effort normalization clamps against THEM

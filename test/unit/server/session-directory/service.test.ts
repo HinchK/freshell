@@ -1465,5 +1465,34 @@ describe('querySessionDirectory file-based search', () => {
       expect(live.isRunning).toBe(true)
       expect(live.tokenUsage).toEqual(usage)
     })
+
+    it('extras bypass sidebar visibility filters (subagent / untitled-idle open-pane sessions stay live)', async () => {
+      const filteredProjects: ProjectGroup[] = [
+        makeProject('/repo/meter', [
+          makeSession({
+            sessionId: 'meter-subagent', projectPath: '/repo/meter', lastActivityAt: 300,
+            title: 'Subagent row', isSubagent: true, tokenUsage: usage,
+          }),
+          makeSession({
+            // No title and not running → dropped by the includeEmpty default.
+            sessionId: 'meter-untitled', projectPath: '/repo/meter', lastActivityAt: 200,
+            title: '',
+            tokenUsage: usage,
+          }),
+        ]),
+      ]
+      const page = await querySessionDirectory({
+        projects: filteredProjects,
+        terminalMeta: [],
+        query: { priority: 'visible', includeKeys: ['claude:meter-subagent', 'claude:meter-untitled'] },
+      })
+      // Neither row makes the default sidebar window…
+      expect(page.items).toHaveLength(0)
+      // …but both arrive as extras, so freshly opened panes for them still get a live meter.
+      expect(page.contextUsageExtras).toEqual([
+        { provider: 'claude', sessionId: 'meter-subagent', tokenUsage: usage },
+        { provider: 'claude', sessionId: 'meter-untitled', tokenUsage: usage },
+      ])
+    })
   })
 })

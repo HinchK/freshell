@@ -108,5 +108,8 @@ export function collectFreshAgentContextUsageKeys(args: {
       keys.add(`${fresh.provider}:${sessionId}`)
     }
   }
-  return [...keys]
+  // Client-side cap mirrors the wire schema (SessionDirectoryQuerySchema
+  // includeKeys max 200): never let a large workspace make its own
+  // sidebar/search fetches unparseable.
+  return [...keys].slice(0, 200)
 }

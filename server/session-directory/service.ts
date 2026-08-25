@@ -336,6 +336,14 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
 
   let items = toItems(persistedProjects, input.terminalMeta).sort(compareItems)
 
+  // STATUS-STRIP: snapshot the extras candidate list BEFORE the sidebar
+  // visibility filters too — a fresh-agent pane's own session may be
+  // subagent-classed, non-interactive, or untitled/idle, and its meter must
+  // stay live regardless of the sidebar window's filtering state. Extras are
+  // returned out-of-band and never merged into `items`, so lowering the
+  // visibility bar here cannot leak hidden rows into the sidebar.
+  const extrasCandidateItems = items
+
   // Server-side visibility pre-filtering to avoid wasting search budget on
   // sessions the client will hide. Matches the client's default sidebar settings.
   if (!input.query.includeSubagents) {
@@ -347,13 +355,6 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   if (!input.query.includeEmpty) {
     items = items.filter((item) => item.isRunning || !!item.title?.trim())
   }
-
-  // STATUS-STRIP: snapshot the post-visibility candidate list BEFORE cursor +
-  // query filtering. Fresh-agent panes need usage for their own session even
-  // when the sidebar search/pagination window excludes it; those sessions are
-  // returned out-of-band as `contextUsageExtras` (they are never merged into
-  // `items`, so sidebar rendering is untouched).
-  const extrasCandidateItems = items
 
   if (cursor) {
     items = items.filter((item) => (

@@ -734,11 +734,13 @@ export function FreshAgentView({
     void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
       .then((result) => {
         if (cancelled) return
-        setStripProbedModelLabel(
-          result.ok
-            ? result.models.find((model) => model.id === stripModelId)?.displayName ?? null
-            : null,
-        )
+        const probed = result.ok
+          ? result.models.find((model) => model.id === stripModelId)?.displayName ?? null
+          : null
+        // A displayName echoing the raw id is not a display name (e.g.
+        // opencode's no-name fallback) — the chip would render a raw id,
+        // which is tooltip-only by contract.
+        setStripProbedModelLabel(probed && probed !== stripModelId ? probed : null)
       })
       .catch(() => {
         if (!cancelled) setStripProbedModelLabel(null)
@@ -800,14 +802,24 @@ export function FreshAgentView({
     : null
   const contextUsage = liveContextUsage ?? cachedUsageFresh
   // Serving a bounded-staleness reading: re-render exactly at the expiry
-  // boundary so expiry is honored even in a completely quiet pane.
+  // boundary of WHICHEVER slice is live (extras side-channel or last-known
+  // cache) so expiry is honored even in a completely quiet pane. Without the
+  // extras deadline, a stale extras row could ride forever once refreshes
+  // stop (extras are "live" while fresh, so the cache-only timer never armed).
   useEffect(() => {
-    if (liveContextUsage || !cachedUsageEntry) return
-    const remaining = CONTEXT_USAGE_STALE_MS - (Date.now() - cachedUsageEntry.at)
+    const deadlines: number[] = []
+    if (extrasContextUsage && contextUsageExtraEntry) {
+      deadlines.push(contextUsageExtraEntry.fetchedAt + CONTEXT_USAGE_STALE_MS)
+    }
+    if (!liveContextUsage && cachedUsageEntry) {
+      deadlines.push(cachedUsageEntry.at + CONTEXT_USAGE_STALE_MS)
+    }
+    if (deadlines.length === 0) return
+    const remaining = Math.min(...deadlines) - Date.now()
     if (remaining <= 0) return
     const timer = window.setTimeout(forceUsageTick, remaining)
     return () => window.clearTimeout(timer)
-  }, [liveContextUsage, cachedUsageEntry])
+  }, [extrasContextUsage, contextUsageExtraEntry, liveContextUsage, cachedUsageEntry])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (

@@ -40,9 +40,10 @@ export const SessionDirectoryQuerySchema = z.object({
    * STATUS-STRIP (fresh-agent context meter): composite `provider:sessionId`
    * keys the client needs usage for regardless of sidebar search/pagination.
    * Matching sessions are returned in `contextUsageExtras` — never merged into
-   * `items`, so sidebar rendering is untouched.
+   * `items`, so sidebar rendering is untouched. Capped at the 200-pane ceiling
+   * (larger workspaces would otherwise reject every sidebar fetch).
    */
-  includeKeys: z.array(z.string().min(1)).max(50).optional(),
+  includeKeys: z.array(z.string().min(1)).max(200).optional(),
 })
 
 export const SessionDirectoryItemSchema = z.object({
