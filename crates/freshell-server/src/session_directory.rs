@@ -85,6 +85,9 @@ pub struct SessionDirectoryState {
     /// `buildLiveTerminalSessionItem`, `service.ts:77-151`). `O(terminals)` per
     /// request, no new I/O — reads the already-in-memory registry snapshot.
     pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// STATUS-STRIP: stamped on every session-directory page (`serverInstance`);
+    /// clients order pages by `snapshotSeq` only within one instance.
+    pub server_instance: Arc<String>,
     /// Task 20 (read-join): the SESSION-06 metadata store
     /// (`session-metadata.json`, same `.freshell` home dir as the POST route)
     /// whose `sessionType` tags [`apply_session_metadata`] overlays onto
@@ -406,6 +409,21 @@ fn js_number(raw: &str) -> f64 {
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
 
+/// STATUS-STRIP: monotonic per-process page sequence (`snapshotSeq`, stamped
+/// on every session-directory response). NEVER derives from data (revision is
+/// a max-activity timestamp and can decrease) — seeded from the wall clock so
+/// a restarted process of the same instance never restamps lower than any
+/// page it already served, then incremented per query via a single atomic.
+fn next_snapshot_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    SEQ.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// `z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS)` — checked in
 /// that order (verified: `limit=1.5` reports ONLY the int failure, never
 /// positive/max too).
@@ -467,6 +485,11 @@ async fn session_directory(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
+    // STATUS-STRIP: assign the monotonic snapshot sequence BEFORE the index
+    // snapshot is captured, so the stamp order matches the capture order
+    // (sessions-router.ts: `++directorySnapshotSeq` immediately before
+    // `getProjects()`).
+    let snapshot_seq = next_snapshot_seq();
     // R9: query-shape validation (`SessionDirectoryQuerySchema.safeParse`) BEFORE
     // any work -- mirrors `sessions-router.ts:74-88`'s early 400 return.
     let query = match validate_query(&raw) {
@@ -560,6 +583,8 @@ async fn session_directory(
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
             page["revision"] = json!(revision);
+            page["snapshotSeq"] = json!(snapshot_seq);
+            page["serverInstance"] = json!(state.server_instance.as_str());
             if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
                 // Keep an I/O/budget partial reason if the same request also
                 // encountered one. Collision identity travels only in the
@@ -2313,6 +2338,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn page_stamps_snapshot_seq_and_server_instance() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        let app = static_directory_app(Vec::new(), &home);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(page["snapshotSeq"].as_u64().unwrap() > 0);
+        assert_eq!(page["serverInstance"], json!("srv-test"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn snapshot_seq_counter_is_monotonic() {
+        // STATUS-STRIP: clients order competing pages by snapshotSeq within one
+        // server instance — the sequence must strictly increase per call and
+        // must not derive from data (activity timestamps).
+        let s1 = next_snapshot_seq();
+        let s2 = next_snapshot_seq();
+        assert!(s2 > s1, "sequence increases per page build: {s1} < {s2}");
+    }
+
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
         // Byte-matched against a live probe of the ORIGINAL: seeding
@@ -3033,6 +3096,7 @@ mod tests {
             session_index: Some(Arc::new(test_session_index(vec![Arc::new(source)]))),
             identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         })
     }
 
@@ -3141,6 +3205,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3544,6 +3609,7 @@ mod tests {
             // A FRESH store instance over the same dir (not the writer above):
             // proves the join reads the persisted file, not shared memory.
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3620,6 +3686,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3678,6 +3745,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3721,6 +3789,7 @@ mod tests {
             // No home: a unique, nonexistent dir -- the store tolerates a
             // missing file (empty metadata), matching the no-home page.
             metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3803,6 +3872,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -3905,6 +3975,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -4002,6 +4073,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -4096,6 +4168,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 

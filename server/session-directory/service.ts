@@ -21,6 +21,15 @@ type QuerySessionDirectoryInput = {
   terminalMeta: TerminalMeta[]
   providers?: CodingCliProvider[]
   signal?: AbortSignal
+  /**
+   * STATUS-STRIP: monotonic per-process sequence assigned by the router at
+   * query invocation — clients use it to order competing session-directory
+   * responses (a slow older response can never regress a newer one). Optional
+   * for direct/unit callers (local fallback counter keeps the output monotonic).
+   */
+  snapshotSeq?: number
+  /** The serving server's instance id — responses are only orderable within it. */
+  serverInstance?: string
 }
 
 type FileSearchResult = {
@@ -129,6 +138,10 @@ function throwIfAborted(signal?: AbortSignal): void {
     throw new Error('Session-directory request aborted')
   }
 }
+
+// STATUS-STRIP fallback when no router-assigned `snapshotSeq` is provided
+// (direct/unit callers): local per-process counter keeps page.seq monotonic.
+let localSnapshotSeqFallback = 0
 
 function compareItems(a: SessionDirectoryItem, b: SessionDirectoryItem): number {
   return compareSessionDirectoryComparableItems(a, b)
@@ -396,6 +409,8 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items: pageItems,
     nextCursor,
     revision,
+    snapshotSeq: input.snapshotSeq ?? ++localSnapshotSeqFallback,
+    ...(input.serverInstance ? { serverInstance: input.serverInstance } : {}),
   }
 
   const includeKeys = input.query.includeKeys

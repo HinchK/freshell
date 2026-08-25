@@ -589,8 +589,12 @@ export type SearchResponse = {
   projectColors?: Record<string, string>
   /** STATUS-STRIP: usage for `includeKeys` sessions that fell outside the search results. */
   contextUsageExtras?: ReadModelSessionDirectoryContextUsageExtra[]
-  /** STATUS-STRIP: session-directory revision of the data snapshot — orders competing usage writes. */
+  /** STATUS-STRIP: session-directory revision of the data snapshot (NOT monotonic — see snapshotSeq). */
   revision?: number
+  /** STATUS-STRIP: monotonic per-instance page sequence — the ordering key for competing usage writes. */
+  snapshotSeq?: number
+  /** STATUS-STRIP: the serving server's instance id — snapshotSeq comparisons within it only. */
+  serverInstance?: string
 }
 
 export type SearchOptions = {
@@ -724,6 +728,8 @@ export async function fetchSidebarSessionsSnapshot(options: {
     partialReason: page.partialReason,
     integrityError: page.integrityError,
     revision: page.revision,
+    ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
+    ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
 }
@@ -772,6 +778,8 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     nextCursor: page.nextCursor,
     hasMore: page.nextCursor !== null,
     revision: page.revision,
+    ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
+    ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
     ...(page.projectColors ? { projectColors: page.projectColors } : {}),
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }

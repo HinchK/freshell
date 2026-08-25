@@ -157,10 +157,15 @@ export interface SessionsState {
   /**
    * STATUS-STRIP: usage for open fresh-agent pane sessions. Keyed
    * `provider:sessionId`. Never merged into `projects`/windows; bounded to
-   * the current `includeKeys` set on every commit; `sourceRevision` orders
-   * competing writes (higher wins, ties first-come).
+   * the current `includeKeys` set on every commit. Competing writes are
+   * ordered by the page's per-instance monotonic `snapshotSeq` (same
+   * `serverInstance` only; cross-instance writes replace unconditionally).
    */
-  contextUsageByKey: Record<string, { tokenUsage: TokenSummary; sourceRevision: number }>
+  contextUsageByKey: Record<string, {
+    tokenUsage: TokenSummary
+    sourceSeq: number
+    serverInstance?: string
+  }>
 }
 
 const initialState: SessionsState = {
@@ -605,7 +610,7 @@ export const sessionsSlice = createSlice({
     /**
      * STATUS-STRIP: upsert usage into the unified map. `paneKeys` bounds the
      * map to the pane-relevant keys currently requested — retention stays at
-     * most one entry per open fresh-agent pane. `sourceRevision` is the
+     * most one entry per open fresh-agent pane. `sourceSeq`/`serverInstance` are the
      * session-directory revision of the response the entries came from; a
      * newer entry is never overwritten by an older one (cross-surface
      * completion inversion can't regress an entry).
@@ -614,11 +619,12 @@ export const sessionsSlice = createSlice({
       state,
       action: PayloadAction<{
         entries: SessionDirectoryContextUsageExtra[]
-        sourceRevision: number
+        sourceSeq: number
+        serverInstance?: string
         paneKeys: string[]
       }>,
     ) => {
-      const { entries, sourceRevision, paneKeys } = action.payload
+      const { entries, sourceSeq, serverInstance, paneKeys } = action.payload
       const keep = new Set(paneKeys)
       const next: SessionsState['contextUsageByKey'] = {}
       for (const key of Object.keys(state.contextUsageByKey ?? {})) {
@@ -630,10 +636,19 @@ export const sessionsSlice = createSlice({
         const key = `${extra.provider}:${extra.sessionId}`
         if (!keep.has(key)) continue
         const existing = state.contextUsageByKey[key]
-        if (existing && existing.sourceRevision > sourceRevision) continue
+        // Higher per-instance seq always wins; equal seq → last write wins;
+        // lower seq (same instance) is dropped outright. Cross-instance writes
+        // replace unconditionally (a restarted server re-seeds the seq clock
+        // above anything it previously served).
+        if (
+          existing
+          && existing.serverInstance === serverInstance
+          && existing.sourceSeq > sourceSeq
+        ) continue
         state.contextUsageByKey[key] = {
           tokenUsage: extra.tokenUsage as TokenSummary,
-          sourceRevision,
+          sourceSeq,
+          ...(serverInstance !== undefined ? { serverInstance } : {}),
         }
       }
     },

@@ -38,7 +38,7 @@ function seedStripUsage(
         contextTokens, compactPercent, compactThresholdTokens: 200_000,
       },
     }],
-    sourceRevision: 1,
+    sourceSeq: 0,
     paneKeys: [`claude:${sessionId}`],
   }))
 }
@@ -6696,7 +6696,7 @@ describe('FreshAgentView session status strip', () => {
           sessionId: 'claude-strip-usage',
           tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
         }],
-        sourceRevision: 1,
+        sourceSeq: 0,
         paneKeys: ['claude:claude-strip-usage'],
       }))
     })
@@ -6710,7 +6710,7 @@ describe('FreshAgentView session status strip', () => {
           sessionId: 'claude-strip-usage',
           tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
         }],
-        sourceRevision: 2,
+        sourceSeq: 0,
         paneKeys: ['claude:claude-strip-usage'],
       }))
     })

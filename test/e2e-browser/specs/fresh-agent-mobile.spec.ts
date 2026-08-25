@@ -200,7 +200,8 @@ test.describe('Fresh Agent Mobile', () => {
                 compactPercent: 47,
               },
             }],
-            sourceRevision: Date.now(),
+            sourceSeq: Date.now(),
+            serverInstance: '__e2e_seed__',
             paneKeys: [`claude:${currentSessionId}`],
           },
         })

@@ -121,6 +121,10 @@ export const SessionDirectoryPageSchema = z.object({
   projectColors: z.record(z.string(), z.string()).optional(),
   /** STATUS-STRIP: present only when `includeKeys` matched sessions that fell outside `items`. */
   contextUsageExtras: z.array(SessionDirectoryContextUsageExtraSchema).optional(),
+  /** STATUS-STRIP: monotonic per-process response sequence — clients order competing pages by it (unlike `revision`, which is a data-derived max timestamp and is NOT monotonic). */
+  snapshotSeq: z.number().int().positive().optional(),
+  /** The serving server's instance id — pages are only orderable by snapshotSeq within one instance. */
+  serverInstance: z.string().min(1).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({

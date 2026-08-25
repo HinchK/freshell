@@ -6,6 +6,7 @@ import sessionsReducer, {
   clearProjects,
   mergeProjects,
   applySessionsPatch,
+  applyContextUsageExtras,
   removeSessionFromProjects,
   toggleProjectExpanded,
   setProjectExpanded,
@@ -1121,6 +1122,55 @@ describe('sessionsSlice', () => {
       expect((state.windows.sidebar as any).appliedSearchTier).toBe('title')
       expect(state.windows.sidebar.loading).toBe(true)
       expect(state.windows.sidebar.loadingKind).toBe('search')
+    })
+  })
+
+  describe('usage map ordering rules', () => {
+    const usageAt = (compactPercent: number) => ({
+      inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+      contextTokens: 96000, compactPercent, compactThresholdTokens: 200000,
+    })
+    const stamp = (overrides: Partial<{
+      entries: Array<{ provider: string; sessionId: string; tokenUsage?: unknown }>
+      sourceSeq: number
+      serverInstance: string | undefined
+      paneKeys: string[]
+    }> = {}) => applyContextUsageExtras({
+      entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(50) as never }],
+      sourceSeq: 0,
+      serverInstance: undefined,
+      paneKeys: ['claude:s1'],
+      ...overrides,
+    } as never)
+
+    it('newer per-instance seq wins, same-instance older seq is dropped, cross-instance replaces', () => {
+      let state = sessionsReducer(undefined, stamp({ serverInstance: 'srv-1', sourceSeq: 10 }))
+      const first = state.contextUsageByKey['claude:s1']
+      expect(first?.sourceSeq).toBe(10)
+
+      // Same instance, lower seq: dropped entirely.
+      state = sessionsReducer(state, stamp({ serverInstance: 'srv-1', sourceSeq: 3, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(1) as never }] }))
+      expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(10)
+      expect(state.contextUsageByKey['claude:s1']).toBe(first)
+
+      // Same instance, higher seq: replaces.
+      state = sessionsReducer(state, stamp({ serverInstance: 'srv-1', sourceSeq: 12, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(70) as never }] }))
+      expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(12)
+      expect(state.contextUsageByKey['claude:s1']?.tokenUsage.compactPercent).toBe(70)
+
+      // New server instance (restart): replaces regardless of seq height.
+      state = sessionsReducer(state, stamp({ serverInstance: 'srv-2', sourceSeq: 1, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(30) as never }] }))
+      expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(1)
+      expect(state.contextUsageByKey['claude:s1']?.tokenUsage.compactPercent).toBe(30)
+    })
+
+    it('prunes entries outside the current pane keys and drops writes for them', () => {
+      let state = sessionsReducer(undefined, stamp({ paneKeys: ['claude:s1'] }))
+      expect(state.contextUsageByKey['claude:s1']).toBeDefined()
+      expect(state.contextUsageByKey['claude:other']).toBeUndefined()
+
+      state = sessionsReducer(state, stamp({ paneKeys: [] }))
+      expect(Object.keys(state.contextUsageByKey)).toEqual([])
     })
   })
 })

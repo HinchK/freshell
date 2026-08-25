@@ -386,7 +386,8 @@ type UsageBearingRow = {
 }
 
 type UsageStampResponse = {
-  revision?: number
+  snapshotSeq?: number
+  serverInstance?: string
   contextUsageExtras?: SearchResponse['contextUsageExtras']
 }
 
@@ -396,8 +397,9 @@ type UsageStampResponse = {
  * fresh). Extras are server-filtered off the page, so no overlap exists
  * between the two upsert sources. The stamp is bounded to the CURRENT
  * includeKeys (`paneKeys` — dropped-pane entries are pruned) and ordered by
- * the response's session-directory revision (`sourceRevision`) so a late
- * older response can never regress a newer entry.
+ * the response's per-instance monotonic page sequence (`snapshotSeq` — NEVER
+ * the data-derived `revision`, which can tie or decrease) so a late older
+ * response can never regress a newer entry.
  */
 function commitContextUsageFromRows(
   dispatch: AppDispatch,
@@ -416,7 +418,8 @@ function commitContextUsageFromRows(
   }
   dispatch(applyContextUsageExtras({
     entries,
-    sourceRevision: response.revision ?? 0,
+    sourceSeq: response.snapshotSeq ?? 0,
+    serverInstance: response.serverInstance,
     paneKeys: getContextUsageOpts(getState()).includeKeys ?? [],
   }))
 }

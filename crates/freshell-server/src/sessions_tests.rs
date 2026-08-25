@@ -581,6 +581,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         });
     let dir_resp = dir_app
         .oneshot(
@@ -832,6 +833,7 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         });
 
     // Present BEFORE the delete.
